@@ -1,0 +1,39 @@
+---
+title: "Prompt Streaming"
+description: "How native OpenCode updates reach ACP clients"
+icon: "radio"
+---
+
+OpenCode streams prompt progress through standard ACP `session/update`
+notifications. The wrapper proxy does not translate those notifications; it
+forwards the native JSON-RPC stream through to the host.
+
+## Observed update types
+
+Live integration and examples cover these native updates:
+
+| Update | Meaning |
+| --- | --- |
+| Agent message chunks | Assistant text streamed during `session/prompt`. |
+| Thought chunks | OpenCode thinking/progress text streamed before or between answer chunks. |
+| `tool_call` | A tool invocation has started or changed state. |
+| `tool_call_update` | Incremental tool output or completion state. |
+| `usage_update` | Token usage information emitted during or after a prompt. |
+
+`session/load` also replays prior messages as `session/update` events. That is
+native OpenCode behavior and is separate from `session/resume`, which restores
+the session for future prompting.
+
+## Example display behavior
+
+The examples contain client-side display helpers only. They combine small
+thought chunks into readable lines and keep raw terminal cursor handling out of
+the ACP stream:
+
+```sh
+go run ./examples/interactive-chat
+go run ./examples/minimal-client "Reply with hello from ACP"
+```
+
+Embedding hosts can format updates however they like because `Serve` leaves the
+native OpenCode ACP payloads untouched.

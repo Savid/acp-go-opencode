@@ -1,0 +1,106 @@
+---
+title: "Session Import"
+description: "Native OpenCode import/export/delete helpers"
+icon: "file-input"
+---
+
+OpenCode session import/export/delete are native CLI commands, not standard ACP
+methods. This wrapper exposes Go helpers and `_opencode/session/*` proxy
+extension methods so embedders can use the same capability without shelling out
+manually.
+
+## Export
+
+```go
+exported, err := opencodeacp.ExportSession(ctx, sessionID,
+    opencodeacp.WithCwd("/workspace/project"),
+)
+```
+
+`ExportSession` runs `opencode export [sessionID]` and returns only the JSON
+object. OpenCode prints a status line before the JSON; the helper strips it.
+
+To export the latest native OpenCode session, pass an empty session ID:
+
+```go
+exported, err := opencodeacp.ExportSession(ctx, "")
+```
+
+## Inspect the exported ID
+
+```go
+id, err := opencodeacp.SessionIDFromExport(exported)
+```
+
+`SessionIDFromExport` accepts either clean JSON or raw `opencode export`
+output.
+
+## Import
+
+```go
+_, err = opencodeacp.ImportSessionFile(ctx, "/path/to/opencode-session.json",
+    opencodeacp.WithCwd("/workspace/project"),
+)
+```
+
+`ImportSessionFile` runs `opencode import <path>` and returns the CLI output for
+diagnostics.
+
+The imported session can then be continued through native ACP:
+
+```go
+load := opencodeacp.LoadSessionRequest(id, "/workspace/project")
+resume := opencodeacp.ResumeSessionRequest(id, "/workspace/project")
+```
+
+## Delete
+
+```go
+err := opencodeacp.DeleteSession(ctx, id)
+```
+
+`DeleteSession` runs `opencode session delete <sessionID>`.
+
+## ACP proxy extensions
+
+When you use `Serve`, the wrapper advertises session file extension methods in
+the proxied `initialize` response:
+
+```json
+{
+  "agentCapabilities": {
+    "_meta": {
+      "github.com/savid/acp-go-opencode": {
+        "extensions": {
+          "sessionExport": { "method": "_opencode/session/export" },
+          "sessionImport": { "method": "_opencode/session/import" },
+          "sessionDelete": { "method": "_opencode/session/delete" }
+        }
+      }
+    }
+  }
+}
+```
+
+The proxy handles these JSON-RPC methods directly:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"_opencode/session/export","params":{"sessionId":"ses_..."}}
+{"jsonrpc":"2.0","id":2,"method":"_opencode/session/import","params":{"path":"/path/to/opencode-session.json"}}
+{"jsonrpc":"2.0","id":3,"method":"_opencode/session/delete","params":{"sessionId":"ses_..."}}
+```
+
+Export returns the parsed session ID, byte count, and raw session JSON. Import
+returns native CLI output. Delete returns the deleted session ID.
+
+## Repeated imports
+
+OpenCode imports the session ID from the JSON. Reimporting the same JSON can
+collide with an existing native session, so hosts should either delete the old
+session first or rewrite the exported IDs before import.
+
+The `examples/session-continuity` example demonstrates the rewrite approach. It
+loads `examples/session-continuity/session.json`, rewrites the session,
+message, and part IDs to fresh values, updates the cwd fields for the current
+run, imports the generated JSON, then calls `session/load` and
+`session/resume`.

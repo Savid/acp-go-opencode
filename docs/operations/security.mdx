@@ -1,0 +1,44 @@
+---
+title: "Security"
+description: "Trust boundary for the OpenCode ACP wrapper"
+icon: "shield"
+---
+
+`acp-go-opencode` starts the local `opencode` binary selected by PATH or
+`WithOpenCodePath`. Treat that binary and the selected working directory as the
+security boundary.
+
+If `WithOpenCodePath` / `-opencode` is empty, executable resolution follows the
+OpenCode wrapper environment rules, including `OPENCODE_EXECUTABLE` when it is
+present in the launched process environment.
+
+## Delegated to OpenCode
+
+- Authentication and provider credentials.
+- Permission evaluation.
+- File and shell tool execution.
+- MCP server configuration and credentials.
+- Session persistence and import/export.
+
+## Wrapper controls
+
+- Pass an explicit binary path with `WithOpenCodePath` or `-opencode`.
+- Pass an explicit `WithCwd` / `-cwd`.
+- Use `WithPure(true)` / `-pure` when you want to avoid external plugins.
+- Provide a controlled environment with `WithEnv`.
+- Use `WithIsolatedTempDir(true)` to keep OpenCode temporary files in a
+  wrapper-owned temp directory that is removed on exit. This is enabled by
+  default.
+- Keep stdout reserved for ACP and send logs to stderr.
+
+## Proxy boundary
+
+`Serve` parses newline-delimited JSON-RPC envelopes to route wrapper-owned
+`_opencode/session/export`, `_opencode/session/import`, and
+`_opencode/session/delete` methods. The import extension accepts a filesystem
+path and the export extension returns raw OpenCode session JSON, so hosts should
+treat those methods as access to the same session files exposed by the native
+OpenCode CLI.
+
+The wrapper does not inspect prompt or tool payloads and does not provide a
+second policy layer in front of OpenCode.

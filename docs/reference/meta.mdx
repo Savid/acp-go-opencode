@@ -1,0 +1,71 @@
+---
+title: "Metadata"
+description: "ACP _meta support in request builders"
+icon: "braces"
+---
+
+ACP requests can carry `_meta` fields for host-specific data. The wrapper does
+not interpret metadata, but its request builders expose typed helpers so
+embedders do not need to build raw structs by hand.
+
+## Wrapper initialize metadata
+
+`Serve` augments successful native `initialize` responses with wrapper extension
+metadata:
+
+```json
+{
+  "agentCapabilities": {
+    "_meta": {
+      "github.com/savid/acp-go-opencode": {
+        "extensions": {
+          "sessionExport": { "method": "_opencode/session/export" },
+          "sessionImport": { "method": "_opencode/session/import" },
+          "sessionDelete": { "method": "_opencode/session/delete" }
+        }
+      }
+    }
+  }
+}
+```
+
+Native OpenCode metadata is preserved. This metadata describes wrapper-owned
+JSON-RPC extension methods; it is separate from request `_meta` fields.
+
+## Session lifecycle metadata
+
+`WithSessionMeta` applies to `session/new`, `session/load`, `session/resume`,
+and `session/fork` builders:
+
+```go
+req := opencodeacp.NewSessionRequest(cwd,
+    opencodeacp.WithSessionMeta(map[string]any{
+        "host": map[string]any{
+            "id": "my-host",
+        },
+    }),
+)
+```
+
+Metadata maps are deep-cloned and merged when multiple metadata options are
+provided.
+
+## Session list metadata
+
+```go
+req := opencodeacp.ListSessionsRequest(
+    opencodeacp.WithListSessionsCwd(cwd),
+    opencodeacp.WithListSessionsMeta(map[string]any{
+        "host": "my-host",
+    }),
+)
+```
+
+## MCP metadata
+
+ACP SDK MCP server structs can contain metadata on server definitions, headers,
+and environment variables. `WithSessionMCPServers` clones those nested metadata
+maps before attaching them to a request.
+
+OpenCode decides whether any metadata affects native behavior. The wrapper
+preserves it and otherwise treats it as opaque.

@@ -1,0 +1,80 @@
+---
+title: "Sessions"
+description: "How native OpenCode sessions are exercised through the wrapper"
+icon: "messages-square"
+---
+
+OpenCode owns session creation, storage, load, resume, fork, prompt turns, tool
+execution, and usage accounting. The wrapper launches native `opencode acp` and
+keeps the ACP streams intact.
+
+## Lifecycle coverage
+
+The smoke integration suite verifies:
+
+- `initialize`
+- `session/new`
+- `session/list`
+- `session/load`
+- `session/resume`
+- `session/fork`
+- `session/cancel` as a notification
+- `session/close`
+- process restart followed by `list`, `load`, and `resume` for the same session
+
+OpenCode session import/export/delete are native CLI commands rather than ACP
+methods. The wrapper exposes thin Go helpers for those commands:
+
+```go
+exported, err := opencodeacp.ExportSession(ctx, sessionID)
+_, err = opencodeacp.ImportSessionFile(ctx, "/path/to/opencode-session.json")
+err = opencodeacp.DeleteSession(ctx, sessionID)
+```
+
+After `ImportSessionFile`, start or reuse `opencode acp` and call
+`session/load` or `session/resume` with the imported session ID.
+
+`session/fork` creates a new native OpenCode session branched from the source
+session. The original session remains unchanged; the fork gets a new session ID
+and can be prompted independently.
+
+The `examples/session-continuity` example exercises that full path and imports
+the saved OpenCode export fixture in `examples/session-continuity/session.json`.
+It rewrites the fixture to fresh session/message/part IDs and the current cwd
+before importing it, so repeated runs do not collide:
+
+```sh
+go run ./examples/session-continuity
+```
+
+After the saved session is loaded and resumed, the example asks for one prompt.
+Press Enter on a blank line to exit without spending model tokens. To send the
+resumed-session prompt non-interactively, pass an explicit prompt:
+
+```sh
+go run ./examples/session-continuity -prompt "What continuity phrase was saved earlier?"
+```
+
+The saved fixture contains a prior user/assistant turn with the phrase
+`ORCHID-HARBOR-42`. That gives the final prompt a concrete continuity check
+after import and resume.
+
+## Config helpers
+
+OpenCode advertises `model` and `mode` as session config options. The wrapper
+provides constants and request builders:
+
+```go
+opencodeacp.SetModelRequest(sessionID, "opencode/big-pickle")
+opencodeacp.SetModeConfigRequest(sessionID, opencodeacp.OpenCodeModeBuild)
+```
+
+## MCP helpers
+
+Native OpenCode ACP advertises HTTP and SSE MCP capability. The wrapper provides
+request builders for session lifecycle requests:
+
+```go
+server := opencodeacp.StdioMCPServer("tools", "tool-server", []string{"--stdio"}, nil)
+req := opencodeacp.NewSessionRequest(cwd, opencodeacp.WithSessionMCPServers(server))
+```

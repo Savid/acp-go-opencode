@@ -1,0 +1,38 @@
+---
+title: "Overview"
+description: "Embeddable Go wrapper for the native OpenCode ACP server"
+icon: "sparkles"
+---
+
+`acp-go-opencode` exposes the local `opencode acp` command as an embeddable Go
+entrypoint. OpenCode remains the ACP agent. This package owns process startup,
+proxy stream handling, option handling, examples, and compatibility helpers for
+Go hosts.
+
+Use it when you want OpenCode's native
+[Agent Client Protocol](https://agentclientprotocol.com/) support inside
+another Go application without shelling out from your host code.
+
+<CardGroup cols={2}>
+  <Card title="Two run modes" icon="route" href="/docs/get-started/run-modes">
+    Run as the standalone `acp-go-opencode` command or call `opencodeacp.Serve` with caller-owned streams.
+  </Card>
+  <Card title="Native ACP plus extensions" icon="plug" href="/docs/reference/acp-methods">
+    Initialize, sessions, prompts, updates, tools, and usage pass through native OpenCode ACP; session file helpers are exposed as wrapper extension methods.
+  </Card>
+  <Card title="Examples" icon="flask-conical" href="/docs/get-started/examples">
+    Minimal client, interactive chat, and session continuity examples cover embedding and native lifecycle calls.
+  </Card>
+  <Card title="Session continuity" icon="history" href="/docs/core/sessions">
+    OpenCode owns session persistence; the wrapper verifies list, load, resume, fork, export, import, and delete paths.
+  </Card>
+  <Card title="Operational boundary" icon="shield" href="/docs/operations/security">
+    The wrapper supervises `opencode acp`; filesystem, permissions, MCP, auth, models, and tools remain OpenCode concerns.
+  </Card>
+</CardGroup>
+
+<Note>
+  This project intentionally does not reimplement native OpenCode ACP lifecycle
+  methods. It delegates to `opencode acp` and adds Go embedding ergonomics plus
+  a narrow wrapper extension namespace.
+</Note>

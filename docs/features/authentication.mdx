@@ -1,0 +1,41 @@
+---
+title: "Authentication"
+description: "How OpenCode auth is exposed through the wrapper"
+icon: "key-round"
+---
+
+Authentication is owned by OpenCode.
+
+Native `initialize` advertises OpenCode auth support, and native ACP exposes
+`authenticate` when the installed OpenCode CLI supports it. The wrapper does not
+store credentials or implement login/logout flows.
+
+## Practical setup
+
+Use the normal OpenCode CLI flow for provider credentials:
+
+```sh
+opencode auth login
+opencode auth logout
+```
+
+Then run the wrapper:
+
+```sh
+acp-go-opencode -cwd /workspace/project
+```
+
+or embed it:
+
+```go
+err := opencodeacp.Serve(ctx, input, output,
+    opencodeacp.WithCwd("/workspace/project"),
+)
+```
+
+## Boundary
+
+- ACP `authenticate` is delegated to native `opencode acp`.
+- ACP logout is not implemented by this wrapper.
+- Host applications can control the launched process environment with
+  `WithEnv`, but credential interpretation remains OpenCode behavior.

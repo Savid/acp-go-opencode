@@ -1,0 +1,42 @@
+---
+title: "Observability"
+description: "Process-level observability for the wrapper"
+icon: "chart-line"
+---
+
+OpenCode has its own logging and internal profiling. This wrapper adds process
+startup and stream lifecycle controls. The `Serve` proxy parses JSON-RPC
+envelopes for routing, but it does not emit method-level spans.
+
+## Available today
+
+- Forward OpenCode logs to stderr with `WithStderr` and `WithPrintLogs`.
+- Configure native OpenCode telemetry environment with wrapper options.
+- Map common OTEL process env into OpenCode telemetry with `WithTelemetryFromEnv`.
+- Inject W3C trace context with `WithTraceContext`.
+- Capture process startup, exit status, and stderr from the host application.
+- Use integration tests to verify native `session/update` behavior.
+- Observe wrapper-owned `_opencode/session/*` extension calls in the host
+  application if you call them.
+
+## Verification targets
+
+```sh
+make test
+make test-integration-smoke
+make test-integration-cover
+make test-integration-live
+```
+
+`test-integration-smoke` and `test-integration-cover` do not enable the
+token-spending live prompt gate. `test-integration-live` sets
+`ACP_GO_OPENCODE_RUN_LIVE_TOKENS=1` and verifies prompt, tool, and usage
+streaming against native OpenCode ACP.
+
+`make audit` includes the 100% statement coverage gate used by this repo.
+
+## Intentional boundary
+
+The wrapper does not record ACP JSON-RPC payloads. That avoids duplicating
+OpenCode's native ACP server and avoids accidentally recording prompt, tool, or
+file contents in wrapper-level telemetry.

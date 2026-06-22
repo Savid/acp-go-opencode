@@ -1,0 +1,64 @@
+---
+title: "Quickstart"
+description: "Start the wrapper and verify the native OpenCode ACP path"
+icon: "rocket"
+---
+
+## Requirements
+
+- Go 1.25 or newer.
+- A local `opencode` binary on `PATH`, or pass `WithOpenCodePath` / `-opencode`.
+- OpenCode authentication and model configuration handled by your normal
+  OpenCode setup.
+
+## Run a local client
+
+```sh
+go run ./examples/minimal-client "Reply with a short hello from ACP"
+```
+
+For a prompt loop:
+
+```sh
+go run ./examples/interactive-chat
+```
+
+For session lifecycle and import/export checks:
+
+```sh
+go run ./examples/session-continuity
+```
+
+## Embed in a host
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+
+    opencodeacp "github.com/savid/acp-go-opencode"
+)
+
+func main() {
+    err := opencodeacp.Serve(context.Background(), os.Stdin, os.Stdout,
+        opencodeacp.WithCwd("/workspace/project"),
+        opencodeacp.WithPure(true),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+## Probe the local CLI
+
+```go
+probe, err := opencodeacp.ProbeCLI(context.Background())
+models, err := opencodeacp.NewModelCatalog().Load(context.Background())
+```
+
+`ProbeCLI` and model loading are inspection helpers. `Serve` only needs the
+`opencode acp` path to run.

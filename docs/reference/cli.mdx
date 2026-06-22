@@ -1,0 +1,35 @@
+---
+title: "CLI"
+description: "acp-go-opencode command flags"
+icon: "terminal"
+---
+
+`acp-go-opencode` is a small command wrapper around native `opencode acp`.
+Stdout is reserved for ACP JSON-RPC. Diagnostics go to stderr.
+
+```sh
+acp-go-opencode -opencode /usr/bin/opencode -cwd /workspace/project -pure
+```
+
+Common flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `-opencode` | Path to the OpenCode CLI. |
+| `-cwd` | Working directory passed to OpenCode. |
+| `-pure` | Run OpenCode without external plugins. |
+| `-print-logs` | Forward OpenCode logs to stderr. |
+| `-log-level` | OpenCode log level. |
+| `-hostname`, `-port`, `-mdns`, `-mdns-domain`, `-cors` | Native OpenCode listener/discovery options. |
+| `-question-tool` | Set OpenCode's question-tool environment flag. |
+| `-isolate-temp-dir` | Isolate `TMPDIR`, `TMP`, and `TEMP` for the child process. Enabled by default. |
+| `-enable-telemetry`, `-otlp-*`, `-resource-attributes`, `-disable-opencode-logs`, `-disable-traces` | Native OpenCode telemetry environment options. |
+| `-traceparent`, `-tracestate` | W3C trace context for the OpenCode process. |
+| `-debug` | Convenience flag for `-print-logs -log-level DEBUG`. |
+| `-version` | Print the wrapper version and exit. |
+
+Use `opencode acp --help` for the native flag surface that this wrapper
+delegates to.
+
+Any remaining positional arguments are appended after wrapper-managed
+`opencode acp` flags as an escape hatch for newer OpenCode options.

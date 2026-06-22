@@ -1,0 +1,54 @@
+---
+title: "Install"
+description: "Install the wrapper and verify the local OpenCode CLI"
+icon: "download"
+---
+
+## Requirements
+
+- Go 1.25 or newer.
+- A local `opencode` binary with `opencode acp` support.
+- Normal OpenCode auth/provider configuration for any live prompt runs.
+
+## Install the command
+
+```sh
+go install github.com/savid/acp-go-opencode/cmd/acp-go-opencode@latest
+```
+
+The installed `acp-go-opencode` command speaks ACP over stdin/stdout and keeps
+diagnostics on stderr.
+
+## Install as a Go module
+
+```sh
+go get github.com/savid/acp-go-opencode
+```
+
+Then embed the native OpenCode ACP server:
+
+```go
+err := opencodeacp.Serve(ctx, input, output,
+    opencodeacp.WithCwd("/workspace/project"),
+    opencodeacp.WithPure(true),
+)
+```
+
+## Verify the local CLI
+
+```sh
+opencode --version
+opencode acp --help
+acp-go-opencode -version
+```
+
+From Go, use the no-token probe helpers when a host wants diagnostics before
+starting ACP:
+
+```go
+probe, err := opencodeacp.ProbeCLI(ctx)
+path, err := opencodeacp.ResolveOpenCodePath(ctx)
+```
+
+`Serve` itself only needs to resolve and start `opencode acp`; probing is an
+optional host preflight.

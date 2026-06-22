@@ -1,0 +1,66 @@
+---
+title: "ACP methods"
+description: "Native OpenCode ACP coverage and wrapper-owned ergonomics"
+icon: "square-code"
+---
+
+The standard ACP method surface comes from native `opencode acp`.
+`acp-go-opencode` does not implement an in-process ACP dispatcher. `Serve` runs
+a narrow JSON-RPC proxy around native OpenCode ACP so the wrapper can advertise
+and handle its own `_opencode/session/*` extension methods.
+
+## Native OpenCode ACP methods
+
+| Method | Native status | Wrapper coverage |
+| --- | --- | --- |
+| `initialize` | Supported. Advertises OpenCode agent info, auth, loadSession, prompt image/embedded-context, MCP HTTP/SSE, and session close/list/resume/fork. | Smoke integration verifies native capabilities and wrapper `_meta` extension metadata. |
+| `session/new` | Supported. Returns a session ID and config options. | Request builder and smoke integration. |
+| `session/prompt` | Supported. Streams thoughts, messages, tool events, usage, and stop reason. | Gated live integration. |
+| `session/cancel` | Supported as a notification. | Smoke integration sends notification. |
+| `session/close` | Supported. | Smoke integration. |
+| `session/list` | Supported. | Request builder and smoke integration. |
+| `session/load` | Supported. Replays prior messages as `session/update` events. | Request builder and smoke integration. |
+| `session/resume` | Supported. | Request builder and smoke integration. |
+| `session/fork` | Supported. | Request builder and smoke integration. |
+| `session/set_config_option` | Supported for OpenCode config options such as `model` and `mode`. | `SetModelRequest`, `SetModeConfigRequest`, and smoke integration. |
+| `authenticate` | Supported when advertised by the installed OpenCode CLI. | Delegated to native OpenCode. |
+
+## Native behavior observed through updates
+
+| Area | Native status | Wrapper coverage |
+| --- | --- | --- |
+| Session durability | OpenCode persists sessions across `opencode acp` process restarts. | Smoke integration restarts the wrapper and reloads the same session. |
+| Tool events | OpenCode emits `tool_call` and `tool_call_update`. | Gated live integration prompts a file edit and verifies the resulting file. |
+| Usage updates | OpenCode emits `usage_update` and prompt response usage. | Gated live integration. |
+| Model/mode metadata | OpenCode returns `model` and `mode` config options; `opencode models --verbose` provides CLI metadata. | Config request builders and model catalog helpers. |
+| MCP | Native OpenCode advertises HTTP/SSE MCP support and accepts MCP server definitions on lifecycle requests. | MCP request builders; native pass-through. |
+
+## CLI-backed session file operations
+
+These are not standard ACP methods in native OpenCode, but the wrapper exposes
+Go helpers and proxy extension methods that call the corresponding OpenCode CLI
+commands:
+
+| Operation | Native OpenCode command | Wrapper helper | Proxy extension method |
+| --- | --- | --- | --- |
+| Export session JSON | `opencode export [sessionID]` | `ExportSession` | `_opencode/session/export` |
+| Import session JSON | `opencode import <file>` | `ImportSessionFile` | `_opencode/session/import` |
+| Delete session | `opencode session delete <sessionID>` | `DeleteSession` | `_opencode/session/delete` |
+
+`Serve` advertises the extension method names in
+`agentCapabilities._meta["github.com/savid/acp-go-opencode"].extensions` on
+successful `initialize` responses.
+
+## Not wrapper-owned
+
+These are intentionally not implemented by this wrapper:
+
+| Area | Reason |
+| --- | --- |
+| In-process `NewAgent` | OpenCode already ships a native ACP subprocess. |
+| Wrapper session store/replay | OpenCode owns durable sessions; import/export/delete are exposed through native CLI helpers and wrapper proxy extensions rather than a mirrored wrapper store. |
+| MCP proxy/ACP bridge | Native OpenCode manages configured MCP; the wrapper proxy does not bridge MCP over ACP. |
+| Permission/elicitation/goal translation | The wrapper proxy does not translate these native behaviors. |
+| ACP logout and providers/list | Not advertised by native OpenCode in observed testing. |
+| Method-level OpenTelemetry | The wrapper proxy only inspects JSON-RPC envelopes and wrapper extension params; it does not emit method spans/metrics. |
+| Raw native extension notifications | Observed native events come through standard `session/update`; wrapper session extensions are request/response methods, not event streams. |
