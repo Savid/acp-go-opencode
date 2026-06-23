@@ -216,15 +216,6 @@ func SetModeConfigRequest(sessionID acp.SessionId, mode acp.SessionConfigValueId
 	return SetConfigOptionRequest(sessionID, OpenCodeConfigMode, mode)
 }
 
-// SetSessionModeRequest constructs a session/set_mode request for agents that
-// expose ACP modes separately from config options.
-func SetSessionModeRequest(sessionID acp.SessionId, mode acp.SessionModeId) acp.SetSessionModeRequest {
-	return acp.SetSessionModeRequest{
-		SessionId: sessionID,
-		ModeId:    mode,
-	}
-}
-
 // ListSessionsRequestOption configures embedded-Go session/list requests.
 type ListSessionsRequestOption func(*acp.ListSessionsRequest)
 

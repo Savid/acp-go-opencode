@@ -607,8 +607,6 @@ func sessionUpdateKind(update acp.SessionUpdate) string {
 		return "plan_removed"
 	case update.AvailableCommandsUpdate != nil:
 		return "available_commands_update"
-	case update.CurrentModeUpdate != nil:
-		return "current_mode_update"
 	case update.ConfigOptionUpdate != nil:
 		return "config_option_update"
 	case update.SessionInfoUpdate != nil:

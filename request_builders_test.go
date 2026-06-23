@@ -325,9 +325,4 @@ func TestOpenCodeConfigRequestBuilders(t *testing.T) {
 	if mode.ValueId == nil || mode.ValueId.ConfigId != OpenCodeConfigMode || mode.ValueId.Value != OpenCodeModePlan {
 		t.Fatalf("mode config request = %#v", mode)
 	}
-
-	setMode := SetSessionModeRequest(sessionID, acp.SessionModeId(OpenCodeModeBuild))
-	if setMode.SessionId != sessionID || setMode.ModeId != acp.SessionModeId(OpenCodeModeBuild) {
-		t.Fatalf("set mode request = %#v", setMode)
-	}
 }
