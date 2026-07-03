@@ -45,6 +45,7 @@ var (
 	runtimeGOOS    = runtime.GOOS
 
 	processShutdownWaitDelay = 5 * time.Second
+	processExitGracePeriod   = 2 * time.Second
 	processTerminate         = terminateProcess
 	processKill              = killProcess
 )
@@ -261,7 +262,7 @@ func RunACP(ctx context.Context, input io.Reader, output io.Writer, stderr io.Wr
 	}
 	configureProcessCommand(cmd)
 
-	closeStdin, err := configureCommandStdin(cmd, input)
+	closeStdin, stdinEOF, err := configureCommandStdin(cmd, input)
 	if err != nil {
 		return err
 	}
@@ -279,7 +280,11 @@ func RunACP(ctx context.Context, input io.Reader, output io.Writer, stderr io.Wr
 	select {
 	case err = <-waitErr:
 	case <-ctx.Done():
-		err = errors.Join(ctx.Err(), shutdownProcess(cmd, waitErr))
+		eofClose := closeStdin
+		if !stdinEOF {
+			eofClose = nil
+		}
+		err = errors.Join(ctx.Err(), shutdownProcess(cmd, waitErr, eofClose))
 	}
 
 	return err
@@ -290,16 +295,20 @@ func configureProcessCommand(cmd *exec.Cmd) {
 	configureProcessCommandPlatform(cmd)
 }
 
-func configureCommandStdin(cmd *exec.Cmd, input io.Reader) (func(), error) {
+// configureCommandStdin wires input to the child's stdin. The returned bool
+// reports whether the returned close function delivers EOF to the child: a
+// direct *os.File stdin is inherited by the child, so closing the parent's
+// handle has no such effect.
+func configureCommandStdin(cmd *exec.Cmd, input io.Reader) (func(), bool, error) {
 	if file, ok := input.(*os.File); ok {
 		cmd.Stdin = file
 
-		return func() {}, nil
+		return func() {}, false, nil
 	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("create opencode stdin pipe: %w", err)
+		return nil, false, fmt.Errorf("create opencode stdin pipe: %w", err)
 	}
 
 	go func() {
@@ -309,10 +318,27 @@ func configureCommandStdin(cmd *exec.Cmd, input io.Reader) (func(), error) {
 
 	return func() {
 		_ = stdin.Close()
-	}, nil
+	}, true, nil
 }
 
-func shutdownProcess(cmd *exec.Cmd, waitErr <-chan error) error {
+// shutdownProcess escalates: stdin EOF → SIGTERM → SIGKILL. closeStdin, when
+// non-nil, closes the child's stdin pipe; the grace window after EOF lets the
+// process exit on its own so in-flight cleanup (e.g. MCP session termination)
+// completes instead of being cut short by a signal.
+func shutdownProcess(cmd *exec.Cmd, waitErr <-chan error, closeStdin func()) error {
+	if closeStdin != nil && processExitGracePeriod > 0 {
+		closeStdin()
+
+		timer := time.NewTimer(processExitGracePeriod)
+		defer timer.Stop()
+
+		select {
+		case <-waitErr:
+			return nil
+		case <-timer.C:
+		}
+	}
+
 	var shutdownErr error
 	if err := processTerminate(cmd); err != nil {
 		shutdownErr = errors.Join(shutdownErr, err)

@@ -297,6 +297,10 @@ func TestRunACP(t *testing.T) {
 		restore := stubCommandContext(t)
 		defer restore()
 
+		oldGrace := processExitGracePeriod
+		processExitGracePeriod = 20 * time.Millisecond
+		t.Cleanup(func() { processExitGracePeriod = oldGrace })
+
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 		go func() {
@@ -319,6 +323,10 @@ func TestRunACP(t *testing.T) {
 	t.Run("context cancellation with blocking non-file input", func(t *testing.T) {
 		restore := stubCommandContext(t)
 		defer restore()
+
+		oldGrace := processExitGracePeriod
+		processExitGracePeriod = 20 * time.Millisecond
+		t.Cleanup(func() { processExitGracePeriod = oldGrace })
 
 		done := make(chan struct{})
 		reader := &blockingReader{done: done}
@@ -346,6 +354,59 @@ func TestRunACP(t *testing.T) {
 			}
 		case <-time.After(time.Second):
 			t.Fatal("RunACP did not return after context cancellation")
+		}
+	})
+
+	t.Run("context cancellation exits on stdin EOF without signal", func(t *testing.T) {
+		restore := stubCommandContext(t)
+		defer restore()
+
+		// Generous window: the re-exec'd helper binary starts slowly under
+		// the race detector and must not be signalled before it reads stdin.
+		oldGrace := processExitGracePeriod
+		processExitGracePeriod = 30 * time.Second
+		t.Cleanup(func() { processExitGracePeriod = oldGrace })
+
+		oldTerminate := processTerminate
+		terminated := false
+		processTerminate = func(cmd *exec.Cmd) error {
+			terminated = true
+
+			return oldTerminate(cmd)
+		}
+		t.Cleanup(func() { processTerminate = oldTerminate })
+
+		done := make(chan struct{})
+		reader := &blockingReader{done: done}
+		defer close(done)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- RunACP(ctx, reader, io.Discard, io.Discard, Options{
+				CLIPath: os.Args[0],
+				Env: map[string]string{
+					"GO_WANT_OPENCODE_HELPER_PROCESS": "1",
+					"OPENCODE_HELPER_MODE":            "stdin-exit",
+				},
+			})
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want context.Canceled", err)
+			}
+		// Generous timeout: the re-exec'd helper binary starts slowly under
+		// the race detector, and EOF is only observed once it reads stdin.
+		case <-time.After(10 * time.Second):
+			t.Fatal("RunACP did not return after context cancellation")
+		}
+		if terminated {
+			t.Fatal("process exiting on stdin EOF should not be signalled")
 		}
 	})
 
@@ -450,25 +511,31 @@ func TestConfigureCommandStdin(t *testing.T) {
 	defer func() { _ = file.Close() }()
 
 	cmd := exec.Command("cat")
-	closeStdin, err := configureCommandStdin(cmd, file)
+	closeStdin, stdinEOF, err := configureCommandStdin(cmd, file)
 	if err != nil {
 		t.Fatalf("file stdin returned error: %v", err)
 	}
 	if cmd.Stdin != file {
 		t.Fatalf("cmd.Stdin = %#v, want file", cmd.Stdin)
 	}
+	if stdinEOF {
+		t.Fatal("file stdin reported EOF capability")
+	}
 	closeStdin()
 
 	cmd = exec.Command("cat")
-	closeStdin, err = configureCommandStdin(cmd, strings.NewReader(""))
+	closeStdin, stdinEOF, err = configureCommandStdin(cmd, strings.NewReader(""))
 	if err != nil {
 		t.Fatalf("pipe stdin returned error: %v", err)
+	}
+	if !stdinEOF {
+		t.Fatal("pipe stdin did not report EOF capability")
 	}
 	closeStdin()
 
 	cmd = exec.Command("cat")
 	cmd.Stdin = strings.NewReader("")
-	if _, err := configureCommandStdin(cmd, strings.NewReader("")); err == nil ||
+	if _, _, err := configureCommandStdin(cmd, strings.NewReader("")); err == nil ||
 		!strings.Contains(err.Error(), "create opencode stdin pipe") {
 		t.Fatalf("stdin pipe error = %v", err)
 	}
@@ -499,11 +566,26 @@ func TestShutdownProcess(t *testing.T) {
 	}
 	waitErr := make(chan error, 1)
 	waitErr <- nil
-	if err := shutdownProcess(&exec.Cmd{}, waitErr); err != nil {
+	if err := shutdownProcess(&exec.Cmd{}, waitErr, nil); err != nil {
 		t.Fatalf("shutdownProcess returned error: %v", err)
 	}
 	if !terminated || killed {
 		t.Fatalf("terminated=%v killed=%v", terminated, killed)
+	}
+
+	terminated = false
+	killed = false
+	waitErr = make(chan error, 1)
+	stdinClosed := false
+	closeStdin := func() {
+		stdinClosed = true
+		waitErr <- nil
+	}
+	if err := shutdownProcess(&exec.Cmd{}, waitErr, closeStdin); err != nil {
+		t.Fatalf("shutdownProcess after stdin EOF returned error: %v", err)
+	}
+	if !stdinClosed || terminated || killed {
+		t.Fatalf("stdinClosed=%v terminated=%v killed=%v", stdinClosed, terminated, killed)
 	}
 
 	terminated = false
@@ -515,7 +597,7 @@ func TestShutdownProcess(t *testing.T) {
 
 		return nil
 	}
-	if err := shutdownProcess(&exec.Cmd{}, waitErr); err != nil {
+	if err := shutdownProcess(&exec.Cmd{}, waitErr, nil); err != nil {
 		t.Fatalf("shutdownProcess after kill returned error: %v", err)
 	}
 	if !terminated || !killed {
@@ -529,7 +611,7 @@ func TestShutdownProcess(t *testing.T) {
 		return errors.New("kill failed")
 	}
 	waitErr = make(chan error)
-	err := shutdownProcess(&exec.Cmd{}, waitErr)
+	err := shutdownProcess(&exec.Cmd{}, waitErr, nil)
 	if err == nil ||
 		!strings.Contains(err.Error(), "terminate failed") ||
 		!strings.Contains(err.Error(), "kill failed") ||
@@ -643,6 +725,9 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(3)
 	case "sleep":
 		time.Sleep(time.Minute)
+		os.Exit(0)
+	case "stdin-exit":
+		_, _ = io.Copy(io.Discard, os.Stdin)
 		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
