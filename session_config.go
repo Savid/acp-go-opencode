@@ -221,50 +221,30 @@ func modelMeta(providerID string, modelID string, model providerModel) map[strin
 
 func modelCapabilities(model providerModel) []string {
 	var caps []string
-	if boolCapability(model.Capabilities, "reasoning") {
+	if model.Reasoning {
 		caps = append(caps, "reasoning")
 	}
-	if boolCapability(model.Capabilities, "tool_call") || boolCapability(model.Capabilities, "toolcall") {
+	if model.ToolCall {
 		caps = append(caps, "tools")
 	}
-	if input, _ := model.Capabilities["input"].(map[string]any); len(input) > 0 {
-		for _, key := range []string{"image", "audio", "pdf", "video"} {
-			if boolCapability(input, key) {
-				caps = append(caps, key)
-			}
+	for _, value := range model.Modalities.Input {
+		switch strings.ToLower(value) {
+		case "image", "audio", "pdf", "video":
+			caps = append(caps, strings.ToLower(value))
 		}
 	}
 	slices.Sort(caps)
 	return slices.Compact(caps)
 }
 
-func boolCapability(values map[string]any, key string) bool {
-	value, _ := values[key].(bool)
-	return value
-}
-
 func supportedEfforts(model providerModel) []string {
 	seen := map[string]struct{}{}
 	for key, raw := range model.Options {
-		if strings.Contains(strings.ToLower(key), "effort") {
-			if value, ok := raw.(string); ok && value != "" {
-				seen[value] = struct{}{}
-			}
+		if !strings.Contains(strings.ToLower(key), "effort") {
+			continue
 		}
-	}
-	for name, raw := range model.Variants {
-		if strings.TrimSpace(name) != "" {
-			seen[name] = struct{}{}
-		}
-		if value, ok := raw.(map[string]any); ok {
-			if effort, _ := value["reasoningEffort"].(string); effort != "" {
-				seen[effort] = struct{}{}
-			}
-			if reasoning, _ := value["reasoning"].(map[string]any); reasoning != nil {
-				if effort, _ := reasoning["effort"].(string); effort != "" {
-					seen[effort] = struct{}{}
-				}
-			}
+		for _, value := range optionStringValues(raw) {
+			seen[value] = struct{}{}
 		}
 	}
 	out := make([]string, 0, len(seen))
@@ -273,6 +253,40 @@ func supportedEfforts(model providerModel) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+func optionStringValues(raw any) []string {
+	switch value := raw.(type) {
+	case []string:
+		return compactNonEmptyStrings(value)
+	case []any:
+		out := make([]string, 0, len(value))
+		for _, item := range value {
+			if str, _ := item.(string); str != "" {
+				out = append(out, str)
+			}
+		}
+		return compactNonEmptyStrings(out)
+	case map[string]any:
+		for _, key := range []string{"options", "values", "enum"} {
+			if values := optionStringValues(value[key]); len(values) > 0 {
+				return values
+			}
+		}
+	}
+	return nil
+}
+
+func compactNonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 func unstableConfigOptions(options []acp.SessionConfigOption) []acp.UnstableSessionConfigOption {

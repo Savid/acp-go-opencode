@@ -235,6 +235,9 @@ func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID st
 	if idmap.Format != SessionStoreFormat || snapshot.Format != SessionStoreFormat {
 		return idmapRecord{}, stateSnapshot{}, false, fmt.Errorf("unsupported opencode store format")
 	}
+	if err := validateHydratedStateAgreement(sessionID, idmap, snapshot); err != nil {
+		return idmapRecord{}, stateSnapshot{}, false, err
+	}
 	for _, item := range []struct {
 		subpath string
 		target  string
@@ -447,10 +450,29 @@ func decodeXDGArchive(data []byte, target string) error {
 func shouldExcludeStatePath(rel string) bool {
 	rel = filepath.ToSlash(strings.ToLower(rel))
 	base := pathBase(rel)
-	if base == "auth.json" || strings.Contains(base, "credential") || strings.Contains(rel, "/credential") {
+	if base == "auth.json" || base == leaseFileName || strings.Contains(base, "credential") || strings.Contains(rel, "/credential") {
 		return true
 	}
 	return false
+}
+
+func validateHydratedStateAgreement(sessionID string, idmap idmapRecord, snapshot stateSnapshot) error {
+	if idmap.SessionID != sessionID {
+		return fmt.Errorf("opencode store idmap session mismatch: %q != %q", idmap.SessionID, sessionID)
+	}
+	if snapshot.Session.SessionID != sessionID {
+		return fmt.Errorf("opencode store snapshot session mismatch: %q != %q", snapshot.Session.SessionID, sessionID)
+	}
+	if snapshot.Session.NativeSessionID != idmap.NativeSessionID {
+		return fmt.Errorf("opencode store idmap/main native session mismatch")
+	}
+	if snapshot.Session.ParentSessionID != idmap.ParentSessionID {
+		return fmt.Errorf("opencode store idmap/main parent session mismatch")
+	}
+	if snapshot.Session.NativeParentSessionID != idmap.NativeParentSessionID {
+		return fmt.Errorf("opencode store idmap/main native parent session mismatch")
+	}
+	return nil
 }
 
 func shouldSkipSQLiteCompanion(rel string) bool {

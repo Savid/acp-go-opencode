@@ -265,7 +265,9 @@ func TestEventMappingMessagePartToolTodoUsageAndRaw(t *testing.T) {
 
 func TestPromptSSEDisconnectAbortsNativeTurn(t *testing.T) {
 	client := newFakeOpenCodeClient()
+	started := make(chan struct{})
 	client.sendMessage = func(ctx context.Context, _ string, _ openCodeMessageRequest) (nativeMessage, error) {
+		close(started)
 		<-ctx.Done()
 		return nativeMessage{}, ctx.Err()
 	}
@@ -282,6 +284,11 @@ func TestPromptSSEDisconnectAbortsNativeTurn(t *testing.T) {
 		_, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 		done <- err
 	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("Prompt did not start native send")
+	}
 	client.errs <- errors.New("stream closed")
 	select {
 	case err := <-done:
@@ -296,6 +303,608 @@ func TestPromptSSEDisconnectAbortsNativeTurn(t *testing.T) {
 	}
 }
 
+func TestPromptIdleSSEDisconnectDoesNotPoisonNextTurn(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.errs <- errors.New("idle stream closed")
+	client.events <- openCodeEvent{Type: "server.connected"}
+	client.sendMessage = func(_ context.Context, id string, _ openCodeMessageRequest) (nativeMessage, error) {
+		return nativeMessage{
+			Info:  nativeMessageInfo{ID: "assistant", SessionID: id, Role: "assistant", Finish: "stop"},
+			Parts: []nativePart{{ID: "final", SessionID: id, MessageID: "assistant", Type: "text", Text: "ok"}},
+		}, nil
+	}
+	conn := newRecordingAgentClient()
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	session := testSession(agent, client)
+
+	resp, err := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if resp.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("resp = %#v", resp)
+	}
+	if client.abortCount() != 0 {
+		t.Fatalf("idle disconnect aborted native turn %d times", client.abortCount())
+	}
+}
+
+func TestPromptSuppressesLateFailedEpochEvents(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	conn := newRecordingAgentClient()
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	session := testSession(agent, client)
+	started := make(chan struct{})
+	client.sendMessage = func(ctx context.Context, _ string, _ openCodeMessageRequest) (nativeMessage, error) {
+		close(started)
+		<-ctx.Done()
+		return nativeMessage{}, ctx.Err()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("Prompt did not start")
+	}
+	client.events <- openCodeEvent{
+		Type:        "message.part.created",
+		StreamEpoch: 7,
+		Properties:  json.RawMessage(`{"id":"stream-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"stream"}`),
+	}
+	deadline := time.After(time.Second)
+	for conn.updateCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("stream update was not emitted")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	client.errs <- streamError{epoch: 7, err: errors.New("stream failed")}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "opencode_sse_disconnect") {
+			t.Fatalf("Prompt error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Prompt did not fail on stream error")
+	}
+
+	client.events <- openCodeEvent{
+		Type:        "message.part.created",
+		StreamEpoch: 7,
+		Properties:  json.RawMessage(`{"id":"late-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"late"}`),
+	}
+	client.sendMessage = func(_ context.Context, id string, _ openCodeMessageRequest) (nativeMessage, error) {
+		return nativeMessage{Info: nativeMessageInfo{ID: "assistant-2", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
+	}
+	if _, err := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("again")}}); err != nil {
+		t.Fatalf("second Prompt: %v", err)
+	}
+	if conn.updateCount() != 1 {
+		t.Fatalf("late failed-epoch update was emitted: %#v", conn.updates)
+	}
+}
+
+func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		setup      func(*Agent)
+		sendEvent  func(*fakeOpenCodeClient)
+		assertDone func(*testing.T, *fakeOpenCodeClient, *recordingAgentClient)
+	}{
+		{
+			name: "permission",
+			sendEvent: func(client *fakeOpenCodeClient) {
+				client.events <- openCodeEvent{
+					Type:       "permission.v2.asked",
+					Properties: json.RawMessage(`{"id":"perm","sessionID":"native-1","action":"edit"}`),
+				}
+			},
+			assertDone: func(t *testing.T, client *fakeOpenCodeClient, conn *recordingAgentClient) {
+				t.Helper()
+				if conn.permissionRequestCount() != 1 {
+					t.Fatalf("permission requests = %#v", conn.permissions)
+				}
+				if client.permissionReplyCount() != 1 {
+					t.Fatalf("permission replies = %#v", client.permissionReplies)
+				}
+				reply := client.permissionReply(0)
+				if reply.reply != "reject" || reply.message != "cancelled" {
+					t.Fatalf("permission cancel reply = %#v", reply)
+				}
+			},
+		},
+		{
+			name: "question",
+			setup: func(agent *Agent) {
+				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+			},
+			sendEvent: func(client *fakeOpenCodeClient) {
+				client.events <- openCodeEvent{
+					Type:       "question.asked",
+					Properties: json.RawMessage(`{"id":"question","sessionID":"native-1","questions":[{"question":"Pick one","options":[{"label":"Yes"}]}]}`),
+				}
+			},
+			assertDone: func(t *testing.T, client *fakeOpenCodeClient, conn *recordingAgentClient) {
+				t.Helper()
+				if len(conn.elicitations) != 1 {
+					t.Fatalf("elicitations = %#v", conn.elicitations)
+				}
+				if client.questionRejectCount() != 1 {
+					t.Fatalf("question rejects = %#v", client.questionRejects)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newFakeOpenCodeClient()
+			conn := newRecordingAgentClient()
+			conn.permissionStarted = make(chan struct{}, 1)
+			conn.permissionRelease = make(chan struct{})
+			conn.elicitationStarted = make(chan struct{}, 1)
+			conn.elicitationRelease = make(chan struct{})
+			agent := NewAgent()
+			agent.setAgentClient(conn)
+			if tt.setup != nil {
+				tt.setup(agent)
+			}
+			session := testSession(agent, client)
+			agent.mu.Lock()
+			agent.sessions[session.id] = session
+			agent.mu.Unlock()
+
+			started := make(chan struct{})
+			client.sendMessage = func(ctx context.Context, _ string, _ openCodeMessageRequest) (nativeMessage, error) {
+				close(started)
+				<-ctx.Done()
+				return nativeMessage{}, ctx.Err()
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			done := make(chan acp.PromptResponse, 1)
+			go func() {
+				resp, _ := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+				done <- resp
+			}()
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("Prompt did not start")
+			}
+			tt.sendEvent(client)
+			switch tt.name {
+			case "permission":
+				select {
+				case <-conn.permissionStarted:
+				case <-ctx.Done():
+					t.Fatal("permission request did not start")
+				}
+			case "question":
+				select {
+				case <-conn.elicitationStarted:
+				case <-ctx.Done():
+					t.Fatal("elicitation request did not start")
+				}
+			}
+			if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: session.id}); err != nil {
+				t.Fatalf("Cancel: %v", err)
+			}
+			select {
+			case resp := <-done:
+				if resp.StopReason != acp.StopReasonCancelled {
+					t.Fatalf("prompt resp = %#v", resp)
+				}
+			case <-ctx.Done():
+				t.Fatal("Prompt did not return after cancel")
+			}
+			tt.assertDone(t, client, conn)
+		})
+	}
+}
+
+func TestPromptBacklogCancelledBeforeTurn(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	conn := newRecordingAgentClient()
+	conn.permErr = context.Canceled
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	session := testSession(agent, client)
+	session.mu.Lock()
+	session.cancelled = true
+	session.mu.Unlock()
+	client.events <- openCodeEvent{
+		Type:       "permission.v2.asked",
+		Properties: json.RawMessage(`{"id":"perm","sessionID":"native-1"}`),
+	}
+	resp, err := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+	if err != nil || resp.StopReason != acp.StopReasonCancelled {
+		t.Fatalf("resp=%#v err=%v", resp, err)
+	}
+}
+
+func TestPromptBacklogErrorBeforeTurn(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	session := testSession(NewAgent(), client)
+	client.events <- openCodeEvent{
+		Type:       "permission.v2.asked",
+		Properties: json.RawMessage(`{`),
+	}
+	if _, err := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}); err == nil {
+		t.Fatal("malformed backlog event was ignored")
+	}
+}
+
+func TestPromptReconcileCancelledBeforeSend(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		setup     func(*fakeOpenCodeClient, *recordingAgentClient, *Agent)
+		waitStart func(context.Context, *testing.T, *recordingAgentClient)
+	}{
+		{
+			name: "permission",
+			setup: func(client *fakeOpenCodeClient, conn *recordingAgentClient, _ *Agent) {
+				client.pendingPermissions = []permissionRequest{{ID: "perm", SessionID: "native-1"}}
+				conn.permissionStarted = make(chan struct{}, 1)
+				conn.permissionRelease = make(chan struct{})
+			},
+			waitStart: func(ctx context.Context, t *testing.T, conn *recordingAgentClient) {
+				t.Helper()
+				select {
+				case <-conn.permissionStarted:
+				case <-ctx.Done():
+					t.Fatal("permission request did not start")
+				}
+			},
+		},
+		{
+			name: "question",
+			setup: func(client *fakeOpenCodeClient, conn *recordingAgentClient, agent *Agent) {
+				client.pendingQuestions = []questionRequest{{ID: "question", SessionID: "native-1"}}
+				conn.elicitationStarted = make(chan struct{}, 1)
+				conn.elicitationRelease = make(chan struct{})
+				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+			},
+			waitStart: func(ctx context.Context, t *testing.T, conn *recordingAgentClient) {
+				t.Helper()
+				select {
+				case <-conn.elicitationStarted:
+				case <-ctx.Done():
+					t.Fatal("elicitation request did not start")
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newFakeOpenCodeClient()
+			conn := newRecordingAgentClient()
+			agent := NewAgent()
+			agent.setAgentClient(conn)
+			session := testSession(agent, client)
+			agent.sessions[session.id] = session
+			tt.setup(client, conn, agent)
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			done := make(chan acp.PromptResponse, 1)
+			go func() {
+				resp, _ := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+				done <- resp
+			}()
+			tt.waitStart(ctx, t, conn)
+			session.cancelTurn()
+			select {
+			case resp := <-done:
+				if resp.StopReason != acp.StopReasonCancelled {
+					t.Fatalf("resp = %#v", resp)
+				}
+			case <-ctx.Done():
+				t.Fatal("prompt did not return")
+			}
+		})
+	}
+}
+
+func TestTurnFenceHelperBranches(t *testing.T) {
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	session.markActiveMessageID("")
+	session.activeMessageIDs = nil
+	session.markActiveMessageID("message-1")
+	session.failedMessageIDs = nil
+	session.failedStreamEpochs = nil
+	session.markStreamFailed(9)
+	if !session.shouldSuppressEvent(openCodeEvent{StreamEpoch: 9}) {
+		t.Fatal("failed stream epoch was not suppressed")
+	}
+	if !session.shouldSuppressEvent(openCodeEvent{
+		Properties: json.RawMessage(`{"sessionID":"native-1","messageID":"message-1","type":"text","text":"late"}`),
+	}) {
+		t.Fatal("failed message id was not suppressed")
+	}
+	if session.shouldSuppressEvent(openCodeEvent{
+		Properties: json.RawMessage(`{"sessionID":"native-1","messageID":"message-2","type":"text","text":"ok"}`),
+	}) {
+		t.Fatal("unfailed message id was suppressed")
+	}
+	if err := session.handleEvent(context.Background(), openCodeEvent{
+		StreamEpoch: 9,
+		Properties:  json.RawMessage(`{"sessionID":"native-1","messageID":"message-1","type":"text","text":"late"}`),
+	}); err != nil {
+		t.Fatalf("suppressed handleEvent: %v", err)
+	}
+}
+
+func TestPermissionQuestionCancelledReplyBranches(t *testing.T) {
+	t.Run("permission without connection uses background when context cancelled", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		session := testSession(NewAgent(), client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		if err := session.handlePermission(turnCtx, permissionRequest{ID: "perm", SessionID: "native-1"}); err != nil {
+			t.Fatalf("handlePermission: %v", err)
+		}
+		if got := client.permissionReply(0).message; got != "client unavailable" {
+			t.Fatalf("permission reply = %q", got)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("permission client error after context cancellation resolves native request", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.permErr = context.Canceled
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		err := session.handlePermission(turnCtx, permissionRequest{ID: "perm", SessionID: "native-1"})
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handlePermission err = %v", err)
+		}
+		if got := client.permissionReply(0).message; got != "cancelled" {
+			t.Fatalf("permission reply = %q", got)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("permission client response after context cancellation is rejected", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		err := session.handlePermission(turnCtx, permissionRequest{ID: "perm", SessionID: "native-1"})
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handlePermission err = %v", err)
+		}
+		if got := client.permissionReply(0).message; got != "cancelled" {
+			t.Fatalf("permission reply = %q", got)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("permission cancellation reply error is returned", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.replyErr = errors.New("reply failed")
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		if err := session.handlePermission(turnCtx, permissionRequest{ID: "perm", SessionID: "native-1"}); err == nil {
+			t.Fatal("reply error was ignored")
+		}
+		session.finishTurn()
+	})
+
+	t.Run("permission late response after cancel is not double-replied", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.permissionStarted = make(chan struct{}, 1)
+		conn.permissionRelease = make(chan struct{})
+		conn.permissionIgnoreContext = true
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		turnCtx := session.beginTurn(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- session.handlePermission(turnCtx, permissionRequest{ID: "perm", SessionID: "native-1"})
+		}()
+		<-conn.permissionStarted
+		session.cancelTurn()
+		close(conn.permissionRelease)
+		err := <-done
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handlePermission err = %v", err)
+		}
+		if client.permissionReplyCount() != 1 {
+			t.Fatalf("permission replies = %#v", client.permissionReplies)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("question without form support uses background when context cancelled", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		session := testSession(NewAgent(), client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		if err := session.handleQuestion(turnCtx, questionRequest{ID: "question", SessionID: "native-1"}); err != nil {
+			t.Fatalf("handleQuestion: %v", err)
+		}
+		if client.questionRejectCount() != 1 {
+			t.Fatalf("question rejects = %#v", client.questionRejects)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("question client error after context cancellation rejects native request", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.elicitErr = context.Canceled
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		err := session.handleQuestion(turnCtx, questionRequest{ID: "question", SessionID: "native-1"})
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handleQuestion err = %v", err)
+		}
+		if client.questionRejectCount() != 1 {
+			t.Fatalf("question rejects = %#v", client.questionRejects)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("question decline error is returned", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.replyErr = errors.New("reject failed")
+		conn := newRecordingAgentClient()
+		conn.elicitation = acp.NewUnstableCreateElicitationResponseDecline()
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		if err := session.handleQuestion(context.Background(), questionRequest{ID: "question", SessionID: "native-1"}); err == nil {
+			t.Fatal("reject error was ignored")
+		}
+	})
+
+	t.Run("question decline after context cancellation returns cancelled", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.elicitation = acp.NewUnstableCreateElicitationResponseDecline()
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		err := session.handleQuestion(turnCtx, questionRequest{ID: "question", SessionID: "native-1"})
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handleQuestion err = %v", err)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("question late decline after cancel is not double-rejected", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.elicitation = acp.NewUnstableCreateElicitationResponseDecline()
+		conn.elicitationStarted = make(chan struct{}, 1)
+		conn.elicitationRelease = make(chan struct{})
+		conn.elicitationIgnoreContext = true
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		turnCtx := session.beginTurn(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- session.handleQuestion(turnCtx, questionRequest{ID: "question", SessionID: "native-1"})
+		}()
+		<-conn.elicitationStarted
+		session.cancelTurn()
+		close(conn.elicitationRelease)
+		err := <-done
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handleQuestion err = %v", err)
+		}
+		if client.questionRejectCount() != 1 {
+			t.Fatalf("question rejects = %#v", client.questionRejects)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("question accept after context cancellation rejects native request", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		err := session.handleQuestion(turnCtx, questionRequest{ID: "question", SessionID: "native-1"})
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handleQuestion err = %v", err)
+		}
+		if client.questionRejectCount() != 1 {
+			t.Fatalf("question rejects = %#v", client.questionRejects)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("question accept cancellation reject error is returned", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.replyErr = errors.New("reject failed")
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := session.beginTurn(ctx)
+		cancel()
+		if err := session.handleQuestion(turnCtx, questionRequest{ID: "question", SessionID: "native-1"}); err == nil {
+			t.Fatal("reject error was ignored")
+		}
+		session.finishTurn()
+	})
+
+	t.Run("question late response after cancel is not double-rejected", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.elicitationStarted = make(chan struct{}, 1)
+		conn.elicitationRelease = make(chan struct{})
+		conn.elicitationIgnoreContext = true
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		turnCtx := session.beginTurn(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- session.handleQuestion(turnCtx, questionRequest{ID: "question", SessionID: "native-1"})
+		}()
+		<-conn.elicitationStarted
+		session.cancelTurn()
+		close(conn.elicitationRelease)
+		err := <-done
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handleQuestion err = %v", err)
+		}
+		if client.questionRejectCount() != 1 {
+			t.Fatalf("question rejects = %#v", client.questionRejects)
+		}
+		session.finishTurn()
+	})
+}
+
 func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 	parts, err := promptToOpenCodeParts([]acp.ContentBlock{
 		acp.TextBlock("hello"),
@@ -306,12 +915,11 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 		{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
 			BlobResourceContents: &acp.BlobResourceContents{Blob: "AA==", Uri: "file:///tmp/blob"},
 		}}},
-		{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}},
 	})
 	if err != nil {
 		t.Fatalf("promptToOpenCodeParts: %v", err)
 	}
-	if len(parts) != 5 || parts[0]["text"] != "hello" || parts[1]["text"] != "file:///tmp/a" ||
+	if len(parts) != 4 || parts[0]["text"] != "hello" || parts[1]["text"] != "file:///tmp/a" ||
 		parts[2]["text"] != "embedded" || parts[3]["text"] != "file:///tmp/blob" {
 		t.Fatalf("parts = %#v", parts)
 	}
@@ -320,6 +928,9 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 	}
 	if _, err := promptToOpenCodeParts([]acp.ContentBlock{{Audio: &acp.ContentBlockAudio{Type: "audio", Data: "AA==", MimeType: "audio/wav"}}}); err == nil {
 		t.Fatal("audio prompt accepted")
+	}
+	if _, err := promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}}}); err == nil {
+		t.Fatal("image prompt accepted")
 	}
 	req, ids := questionElicitationRequest(questionRequest{ID: "q", SessionID: "s"})
 	if req.Form == nil || req.Form.Message != "OpenCode needs input" || !reflect.DeepEqual(ids, []string{"question_1"}) {
@@ -382,6 +993,19 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 		session := testSession(NewAgent(), client)
 		if _, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}); err == nil {
 			t.Fatal("send error prompt succeeded")
+		}
+	})
+
+	t.Run("snapshot error after final message", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		agent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("snapshot failed")}))
+		session := testSession(agent, client)
+		client.sendMessage = func(_ context.Context, id string, _ openCodeMessageRequest) (nativeMessage, error) {
+			return nativeMessage{Info: nativeMessageInfo{ID: "assistant", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
+		}
+		if _, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}); err == nil ||
+			!strings.Contains(err.Error(), "snapshot failed") {
+			t.Fatalf("snapshot error = %v", err)
 		}
 	})
 

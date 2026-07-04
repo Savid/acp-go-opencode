@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -299,6 +300,35 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		}
 		if _, err := startOpenCodeServer(ctx, openCodeStartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
 			t.Fatal("lease error was ignored")
+		}
+	})
+
+	t.Run("post-start lease write failure kills process", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		helper := fakeOpenCodeExecutable(t)
+		writeCount := 0
+		killed := false
+		openCodeWriteLease = func(string, serverLease) error {
+			writeCount++
+			if writeCount == 2 {
+				return errors.New("post-start lease failed")
+			}
+			return nil
+		}
+		openCodeKillProcess = func(*exec.Cmd) error {
+			killed = true
+			return nil
+		}
+		_, err := startOpenCodeServer(ctx, openCodeStartOptions{
+			Root:           t.TempDir(),
+			ExecutablePath: helper,
+			HealthTimeout:  5 * time.Second,
+		})
+		if err == nil || !strings.Contains(err.Error(), "post-start lease failed") {
+			t.Fatalf("post-start lease err = %v", err)
+		}
+		if !killed {
+			t.Fatal("post-start lease failure did not kill process")
 		}
 	})
 
@@ -717,6 +747,190 @@ func TestPortPasswordLeaseAndReaperFaultInjection(t *testing.T) {
 	}
 }
 
+func TestLeaseReaperVerifiesProcessIdentity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process identity is platform-specific")
+	}
+	t.Run("unrelated process survives", func(t *testing.T) {
+		root := t.TempDir()
+		xdg, err := createXDGDirs(root, "unrelated")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("sleep", "30")
+		cmd.Env = append(os.Environ(),
+			"XDG_STATE_HOME="+xdg.State,
+			"OPENCODE_SERVER_PASSWORD=secret",
+		)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start sleep: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		t.Cleanup(func() {
+			if cmd.ProcessState == nil {
+				_ = cmd.Process.Kill()
+				<-done
+			}
+		})
+		identity, err := openCodeInspectProcess(cmd.Process.Pid)
+		if err != nil {
+			t.Skipf("process identity unavailable: %v", err)
+		}
+		if err := writeLease(xdg.State, serverLease{
+			PID:              cmd.Process.Pid,
+			PasswordHash:     passwordHash("secret"),
+			XDGRoot:          xdg.Root,
+			ProcessStartTime: identity.StartTime,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
+			t.Fatalf("reapStaleLeases: %v", err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("unrelated process was killed: %v", err)
+		default:
+		}
+		if _, err := os.Stat(filepath.Join(xdg.State, leaseFileName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("lease after unrelated reap = %v", err)
+		}
+	})
+
+	t.Run("verified fake opencode is reaped", func(t *testing.T) {
+		root := t.TempDir()
+		xdg, err := createXDGDirs(root, "orphan")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=TestFakeOpenCodeServerProcessHelper", "--", "serve", "--port", "0")
+		configureOpenCodeProcess(cmd)
+		cmd.Env = append(os.Environ(),
+			"ACP_GO_OPENCODE_FAKE_SERVER_HELPER=1",
+			"XDG_STATE_HOME="+xdg.State,
+			"OPENCODE_SERVER_USERNAME=opencode",
+			"OPENCODE_SERVER_PASSWORD=secret",
+		)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start fake opencode: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		t.Cleanup(func() {
+			if cmd.ProcessState == nil {
+				_ = cmd.Process.Kill()
+				<-done
+			}
+		})
+		var identity processIdentity
+		for i := 0; i < 50; i++ {
+			identity, err = openCodeInspectProcess(cmd.Process.Pid)
+			if err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err != nil {
+			t.Skipf("process identity unavailable: %v", err)
+		}
+		if err := writeLease(xdg.State, serverLease{
+			PID:              cmd.Process.Pid,
+			PasswordHash:     passwordHash("secret"),
+			XDGRoot:          xdg.Root,
+			ProcessStartTime: identity.StartTime,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
+			t.Fatalf("reapStaleLeases: %v", err)
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("verified fake opencode was not reaped")
+		}
+		if _, err := os.Stat(filepath.Join(xdg.State, leaseFileName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("lease after verified reap = %v", err)
+		}
+	})
+}
+
+func TestLeaseIdentityBranchCoverage(t *testing.T) {
+	root := t.TempDir()
+	xdg, err := createXDGDirs(root, "lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	leasePath := filepath.Join(xdg.State, leaseFileName)
+	baseIdentity := processIdentity{
+		StartTime: "start",
+		Cmdline:   []string{"/usr/bin/opencode", "serve"},
+		Env: map[string]string{
+			"XDG_STATE_HOME":           xdg.State,
+			"OPENCODE_SERVER_PASSWORD": "secret",
+		},
+	}
+	baseLease := serverLease{
+		PID:              999999,
+		PasswordHash:     passwordHash("secret"),
+		XDGRoot:          xdg.Root,
+		ProcessStartTime: "start",
+	}
+
+	restoreOpenCodeClientSeams(t)
+	openCodeInspectProcess = func(int) (processIdentity, error) {
+		return baseIdentity, nil
+	}
+	if !leaseMatchesProcess(leasePath, baseLease) {
+		t.Fatal("matching lease did not match")
+	}
+	if cmdlineLooksLikeOpenCodeServe([]string{"/tmp/opencode"}) != true || cmdlineLooksLikeOpenCodeServe([]string{"node"}) {
+		t.Fatal("cmdline OpenCode detection mismatch")
+	}
+	if leaseMatchesProcess(leasePath, serverLease{PID: 0, ProcessStartTime: "start"}) {
+		t.Fatal("zero pid lease matched")
+	}
+	if leaseMatchesProcess(leasePath, serverLease{PID: 1}) {
+		t.Fatal("missing start time lease matched")
+	}
+
+	for _, tt := range []struct {
+		name     string
+		identity processIdentity
+		lease    serverLease
+		err      error
+	}{
+		{name: "inspect error", identity: baseIdentity, lease: baseLease, err: errors.New("inspect failed")},
+		{name: "start mismatch", identity: processIdentity{StartTime: "other", Cmdline: baseIdentity.Cmdline, Env: baseIdentity.Env}, lease: baseLease},
+		{name: "state mismatch", identity: processIdentity{StartTime: "start", Cmdline: baseIdentity.Cmdline, Env: map[string]string{"XDG_STATE_HOME": t.TempDir(), "OPENCODE_SERVER_PASSWORD": "secret"}}, lease: baseLease},
+		{name: "password mismatch", identity: processIdentity{StartTime: "start", Cmdline: baseIdentity.Cmdline, Env: map[string]string{"XDG_STATE_HOME": xdg.State, "OPENCODE_SERVER_PASSWORD": "wrong"}}, lease: baseLease},
+		{name: "root mismatch", identity: baseIdentity, lease: serverLease{PID: baseLease.PID, PasswordHash: baseLease.PasswordHash, XDGRoot: t.TempDir(), ProcessStartTime: baseLease.ProcessStartTime}},
+		{name: "cmdline mismatch", identity: processIdentity{StartTime: "start", Cmdline: []string{"node"}, Env: baseIdentity.Env}, lease: baseLease},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			openCodeInspectProcess = func(int) (processIdentity, error) {
+				return tt.identity, tt.err
+			}
+			if leaseMatchesProcess(leasePath, tt.lease) {
+				t.Fatal("mismatched lease matched")
+			}
+		})
+	}
+
+	openCodeInspectProcess = func(int) (processIdentity, error) {
+		return baseIdentity, nil
+	}
+	if err := writeLease(xdg.State, baseLease); err != nil {
+		t.Fatal(err)
+	}
+	reapLeaseFile(leasePath, slog.New(slog.DiscardHandler))
+	if _, err := os.Stat(leasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lease after reap = %v", err)
+	}
+	reapLeaseFile(t.TempDir(), nil)
+}
+
 func TestNativeUnmarshalErrors(t *testing.T) {
 	var part nativePart
 	if err := part.UnmarshalJSON([]byte("{")); err == nil {
@@ -814,6 +1028,8 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	writeLease := openCodeWriteLease
 	terminateProcess := openCodeTerminateProcess
 	killProcess := openCodeKillProcess
+	inspectProcess := openCodeInspectProcess
+	procReader := procReadFile
 	waitCommand := openCodeWaitCommand
 	after := openCodeAfter
 	readyPoll := openCodeReadyPollInterval
@@ -827,6 +1043,8 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodeWriteLease = writeLease
 		openCodeTerminateProcess = terminateProcess
 		openCodeKillProcess = killProcess
+		openCodeInspectProcess = inspectProcess
+		procReadFile = procReader
 		openCodeWaitCommand = waitCommand
 		openCodeAfter = after
 		openCodeReadyPollInterval = readyPoll

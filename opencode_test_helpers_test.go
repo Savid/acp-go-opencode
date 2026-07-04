@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"context"
+	"os"
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
@@ -197,6 +198,12 @@ func (c *fakeOpenCodeClient) permissionReply(index int) fakePermissionReply {
 	return c.permissionReplies[index]
 }
 
+func (c *fakeOpenCodeClient) permissionReplyCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.permissionReplies)
+}
+
 func (c *fakeOpenCodeClient) questionReply(index int) fakeQuestionReply {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -220,12 +227,18 @@ type recordingAgentClient struct {
 	elicitations []acp.UnstableCreateElicitationRequest
 	scopes       []elicitationScope
 
-	permission  acp.RequestPermissionResponse
-	elicitation acp.UnstableCreateElicitationResponse
-	permErr     error
-	elicitErr   error
-	updateErr   error
-	notifyErr   error
+	permission               acp.RequestPermissionResponse
+	elicitation              acp.UnstableCreateElicitationResponse
+	permissionStarted        chan struct{}
+	permissionRelease        chan struct{}
+	permissionIgnoreContext  bool
+	elicitationStarted       chan struct{}
+	elicitationRelease       chan struct{}
+	elicitationIgnoreContext bool
+	permErr                  error
+	elicitErr                error
+	updateErr                error
+	notifyErr                error
 }
 
 type extensionNotification struct {
@@ -255,7 +268,7 @@ func (c *recordingAgentClient) UnstableCreateElicitation(
 }
 
 func (c *recordingAgentClient) CreateElicitation(
-	_ context.Context,
+	ctx context.Context,
 	request acp.UnstableCreateElicitationRequest,
 	scope elicitationScope,
 ) (acp.UnstableCreateElicitationResponse, error) {
@@ -264,16 +277,46 @@ func (c *recordingAgentClient) CreateElicitation(
 	c.scopes = append(c.scopes, scope)
 	resp := c.elicitation
 	err := c.elicitErr
+	started := c.elicitationStarted
+	release := c.elicitationRelease
+	ignoreContext := c.elicitationIgnoreContext
 	c.mu.Unlock()
+	signalTestHook(started)
+	if release != nil {
+		if ignoreContext {
+			<-release
+			return resp, err
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return acp.UnstableCreateElicitationResponse{}, ctx.Err()
+		}
+	}
 	return resp, err
 }
 
-func (c *recordingAgentClient) RequestPermission(_ context.Context, request acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+func (c *recordingAgentClient) RequestPermission(ctx context.Context, request acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 	c.mu.Lock()
 	c.permissions = append(c.permissions, request)
 	resp := c.permission
 	err := c.permErr
+	started := c.permissionStarted
+	release := c.permissionRelease
+	ignoreContext := c.permissionIgnoreContext
 	c.mu.Unlock()
+	signalTestHook(started)
+	if release != nil {
+		if ignoreContext {
+			<-release
+			return resp, err
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return acp.RequestPermissionResponse{}, ctx.Err()
+		}
+	}
 	return resp, err
 }
 
@@ -299,6 +342,22 @@ func (c *recordingAgentClient) updateCount() int {
 	return len(c.updates)
 }
 
+func (c *recordingAgentClient) permissionRequestCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.permissions)
+}
+
+func signalTestHook(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
 func testNativeSession(id string) nativeSession {
 	native := nativeSession{ID: id, Title: "Test", Agent: "build"}
 	native.Model.ProviderID = "openai"
@@ -308,6 +367,12 @@ func testNativeSession(id string) nativeSession {
 }
 
 func testSession(agent *Agent, client *fakeOpenCodeClient) *session {
+	if client.xdg.Root == "" {
+		root, err := os.MkdirTemp("", "acp-go-opencode-test-*")
+		if err == nil {
+			client.xdg, _ = createXDGDirs(root, "session-1")
+		}
+	}
 	return newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
 		SessionID:       "session-1",
 		NativeSessionID: "native-1",

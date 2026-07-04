@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -111,6 +112,12 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	}
 	if _, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(forkResp.SessionId)); err != nil {
 		t.Fatalf("DeleteSession: %v", err)
+	}
+	if len(child.deleted) != 1 || child.deleted[0] != "native-child" {
+		t.Fatalf("native delete calls = %#v", child.deleted)
+	}
+	if _, err := os.Stat(child.xdg.Root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted child XDG root still exists: %v", err)
 	}
 	if _, err := agent.LoadSession(ctx, LoadSessionRequest(forkResp.SessionId, cwd)); err == nil {
 		t.Fatal("deleted session loaded")
@@ -523,6 +530,32 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 	cwd := t.TempDir()
 
 	t.Run("new session id and store errors", func(t *testing.T) {
+		defaultClient := newFakeOpenCodeClient()
+		defaultClient.createSession = nativeSession{ID: "native-default", Title: "Default"}
+		var defaultModel string
+		defaultAgent := NewAgent(WithDefaultModel("openai/gpt-default"), func(options *Options) {
+			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+				defaultModel = opts.DefaultModel
+				var err error
+				defaultClient.xdg, err = createXDGDirs(opts.Root, string(opts.ACPSessionID))
+				if err != nil {
+					return nil, err
+				}
+				return defaultClient, nil
+			}
+		})
+		defaultResp, err := defaultAgent.NewSession(ctx, NewSessionRequest(cwd))
+		if err != nil {
+			t.Fatalf("NewSession with default model: %v", err)
+		}
+		if defaultModel != "openai/gpt-default" {
+			t.Fatalf("start default model = %q", defaultModel)
+		}
+		defaultMeta, _ := defaultResp.Meta[opencodeMetaKey].(map[string]any)
+		if defaultMeta["modelId"] != "openai/gpt-default" {
+			t.Fatalf("default model meta = %#v", defaultMeta)
+		}
+
 		oldReader := sessionIDRandReader
 		sessionIDRandReader = errorReader{err: errors.New("id failed")}
 		if _, err := NewAgent().NewSession(ctx, NewSessionRequest(cwd)); err == nil {
@@ -648,6 +681,113 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("delete active ignores native delete error after tombstone", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.deleteErr = errors.New("native delete failed")
+		agent := NewAgent()
+		session := testSession(agent, client)
+		agent.sessions[session.id] = session
+		if _, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(session.id)); err != nil {
+			t.Fatalf("delete returned native delete error: %v", err)
+		}
+		if len(client.deleted) != 1 || client.deleted[0] != "native-1" {
+			t.Fatalf("native delete attempts = %#v", client.deleted)
+		}
+	})
+
+	t.Run("deleted cleanup retry entrypoints", func(t *testing.T) {
+		root := t.TempDir()
+		for _, name := range []string{"list", "load", "resume", "delete"} {
+			t.Run(name, func(t *testing.T) {
+				agent := NewAgent(WithHome(root))
+				xdg, err := createXDGDirs(root, name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				agent.deleteCleanup[acp.SessionId(name)] = deleteCleanupRecord{
+					SessionID: acp.SessionId(name),
+					XDGRoot:   xdg.Root,
+				}
+				switch name {
+				case "list":
+					_, _ = agent.ListSessions(ctx, ListSessionsRequest())
+				case "load":
+					agent.deleted[acp.SessionId(name)] = struct{}{}
+					_, _ = agent.LoadSession(ctx, LoadSessionRequest(acp.SessionId(name), cwd))
+				case "resume":
+					agent.deleted[acp.SessionId(name)] = struct{}{}
+					_, _ = agent.ResumeSession(ctx, ResumeSessionRequest(acp.SessionId(name), cwd))
+				case "delete":
+					_, _ = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(acp.SessionId(name)))
+				}
+				if _, err := os.Stat(xdg.Root); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("%s cleanup did not remove XDG root: %v", name, err)
+				}
+				if _, ok := agent.deleteCleanup[acp.SessionId(name)]; ok {
+					t.Fatalf("%s cleanup metadata was not cleared", name)
+				}
+			})
+		}
+	})
+
+	t.Run("deleted cleanup helper branches", func(t *testing.T) {
+		agent := NewAgent(WithHome(t.TempDir()))
+		agent.rememberDeleteCleanup(deleteCleanupRecord{})
+		if len(agent.deleteCleanup) != 0 {
+			t.Fatalf("empty cleanup record was remembered: %#v", agent.deleteCleanup)
+		}
+		agent.forgetDeleteCleanupIfDone("")
+
+		xdg, err := createXDGDirs(agent.options.Home, "keep")
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent.deleteCleanup["keep"] = deleteCleanupRecord{SessionID: "keep", XDGRoot: xdg.Root}
+		agent.forgetDeleteCleanupIfDone("keep")
+		if _, ok := agent.deleteCleanup["keep"]; !ok {
+			t.Fatal("cleanup metadata was forgotten while XDG root still existed")
+		}
+
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		if err := agent.retryDeletedSessionCleanup(cancelled); err == nil {
+			t.Fatal("cancelled cleanup retry returned nil")
+		}
+		errorAgent := NewAgent()
+		errorAgent.deleteCleanup["bad"] = deleteCleanupRecord{SessionID: "bad", XDGRoot: string([]byte{0})}
+		if err := errorAgent.retryDeletedSessionCleanup(ctx); err == nil {
+			t.Fatal("cleanup error retry returned nil")
+		}
+		for _, name := range []string{"list", "load", "delete"} {
+			t.Run("entrypoint retry error "+name, func(t *testing.T) {
+				entryAgent := NewAgent(WithHome(t.TempDir()))
+				entryXDG, err := createXDGDirs(entryAgent.options.Home, name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				entryAgent.deleteCleanup[acp.SessionId(name)] = deleteCleanupRecord{
+					SessionID: acp.SessionId(name),
+					XDGRoot:   entryXDG.Root,
+				}
+				switch name {
+				case "list":
+					_, _ = entryAgent.ListSessions(cancelled, ListSessionsRequest())
+				case "load":
+					_, _ = entryAgent.LoadSession(cancelled, LoadSessionRequest(acp.SessionId(name), cwd))
+				case "delete":
+					_, _ = entryAgent.UnstableDeleteSession(cancelled, DeleteSessionRequest(acp.SessionId(name)))
+				}
+			})
+		}
+
+		if err := agent.cleanupDeletedSession(deleteCleanupRecord{}); err != nil {
+			t.Fatalf("empty cleanup err = %v", err)
+		}
+		if err := agent.cleanupDeletedSession(deleteCleanupRecord{SessionID: "bad", XDGRoot: string([]byte{0})}); err == nil {
+			t.Fatal("invalid cleanup root returned nil")
+		}
+	})
+
 	t.Run("fork errors", func(t *testing.T) {
 		oldReader := sessionIDRandReader
 		t.Cleanup(func() { sessionIDRandReader = oldReader })
@@ -765,7 +905,8 @@ func testProviders() providersResponse {
 					"context": float64(1000),
 					"output":  float64(200),
 				},
-				Capabilities: map[string]any{"reasoning": true, "tool_call": true},
+				Reasoning: true,
+				ToolCall:  true,
 			},
 			"gpt-other": {ID: "gpt-other", Name: "GPT Other"},
 		},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,6 +28,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	meta, err := sessionMetaFromLifecycle(params.Meta)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
+	}
+	if meta.Model == "" {
+		meta.Model = a.options.DefaultModel
 	}
 	idValue, err := newSessionID()
 	if err != nil {
@@ -109,7 +113,11 @@ func (a *Agent) loadOrResumeSession(
 		return nil, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
 	if a.isDeleted(id) {
+		_ = a.retryDeletedSessionCleanup(ctx)
 		return nil, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: "deleted"})
+	}
+	if err := a.retryDeletedSessionCleanup(ctx); err != nil {
+		a.log.DebugContext(ctx, "retry deleted OpenCode session cleanup failed", slog.String("error", err.Error()))
 	}
 	if err := validateSessionStartPaths(cwd, additionalDirectories); err != nil {
 		return nil, err
@@ -165,6 +173,9 @@ func (a *Agent) loadOrResumeSession(
 func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
 	if err := a.ensureOpen(); err != nil {
 		return acp.ListSessionsResponse{}, err
+	}
+	if err := a.retryDeletedSessionCleanup(ctx); err != nil {
+		a.log.DebugContext(ctx, "retry deleted OpenCode session cleanup failed", slog.String("error", err.Error()))
 	}
 	if err := validateOptionalAbsolutePath(jsonFieldCwd, params.Cwd); err != nil {
 		return acp.ListSessionsResponse{}, err
@@ -237,8 +248,8 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 	if err != nil {
 		return acp.CloseSessionResponse{}, err
 	}
-	snapshotErr := session.snapshotToStore(context.WithoutCancel(ctx))
 	closeErr := session.Close(ctx)
+	snapshotErr := session.snapshotToStore(context.WithoutCancel(ctx))
 	a.removeSessionIf(params.SessionId, session)
 	return acp.CloseSessionResponse{}, errors.Join(snapshotErr, closeErr)
 }
@@ -247,6 +258,14 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	if params.SessionId == "" {
 		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
+	if err := a.retryDeletedSessionCleanup(ctx); err != nil {
+		a.log.DebugContext(ctx, "retry deleted OpenCode session cleanup failed", slog.String("error", err.Error()))
+	}
+	a.mu.Lock()
+	session := a.sessions[params.SessionId]
+	a.mu.Unlock()
+
+	record := a.deleteCleanupRecord(params.SessionId, session)
 	storeCtx, cancel := a.sessionStoreContext(ctx)
 	err := a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
 	cancel()
@@ -255,20 +274,24 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	}
 
 	a.mu.Lock()
-	session := a.sessions[params.SessionId]
-	delete(a.sessions, params.SessionId)
+	if session == nil || a.sessions[params.SessionId] == session {
+		delete(a.sessions, params.SessionId)
+	}
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
+
+	if record.SessionID != "" {
+		a.rememberDeleteCleanup(record)
+	}
 	if session != nil {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-		err = session.Close(closeCtx)
+		err = session.DeleteNativeAndClose(closeCtx)
 		closeCancel()
-		if err != nil {
-			return acp.UnstableDeleteSessionResponse{}, err
-		}
 	}
+	cleanupErr := a.cleanupDeletedSession(record)
+	a.forgetDeleteCleanupIfDone(record.SessionID)
 
-	return acp.UnstableDeleteSessionResponse{}, nil
+	return acp.UnstableDeleteSessionResponse{}, errors.Join(err, cleanupErr)
 }
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
@@ -368,6 +391,87 @@ func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd str
 		Logger:         a.log,
 		ExistingXDG:    existing,
 	})
+}
+
+type deleteCleanupRecord struct {
+	SessionID acp.SessionId
+	NativeID  string
+	XDGRoot   string
+}
+
+func (a *Agent) deleteCleanupRecord(id acp.SessionId, session *session) deleteCleanupRecord {
+	record := deleteCleanupRecord{
+		SessionID: id,
+		XDGRoot:   filepath.Join(a.homeRoot(), safePathName(string(id))),
+	}
+	if session == nil {
+		return record
+	}
+	snapshot := session.snapshot()
+	record.NativeID = snapshot.idmap.NativeSessionID
+	if snapshot.client != nil {
+		if xdg := snapshot.client.XDGDirs(); xdg.Root != "" {
+			record.XDGRoot = xdg.Root
+		}
+	}
+
+	return record
+}
+
+func (a *Agent) rememberDeleteCleanup(record deleteCleanupRecord) {
+	if record.SessionID == "" {
+		return
+	}
+	a.mu.Lock()
+	a.deleteCleanup[record.SessionID] = record
+	a.mu.Unlock()
+}
+
+func (a *Agent) forgetDeleteCleanupIfDone(id acp.SessionId) {
+	if id == "" {
+		return
+	}
+	record := a.deleteCleanupRecord(id, nil)
+	if _, err := os.Stat(record.XDGRoot); err == nil {
+		return
+	}
+	a.mu.Lock()
+	delete(a.deleteCleanup, id)
+	a.mu.Unlock()
+}
+
+func (a *Agent) retryDeletedSessionCleanup(ctx context.Context) error {
+	a.mu.Lock()
+	records := make([]deleteCleanupRecord, 0, len(a.deleteCleanup))
+	for _, record := range a.deleteCleanup {
+		records = append(records, record)
+	}
+	a.mu.Unlock()
+
+	var err error
+	for _, record := range records {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(err, ctxErr)
+		}
+		cleanupErr := a.cleanupDeletedSession(record)
+		if cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+			continue
+		}
+		a.mu.Lock()
+		delete(a.deleteCleanup, record.SessionID)
+		a.mu.Unlock()
+	}
+
+	return err
+}
+
+func (a *Agent) cleanupDeletedSession(record deleteCleanupRecord) error {
+	if record.SessionID == "" || record.XDGRoot == "" {
+		return nil
+	}
+	reapLeaseFile(filepath.Join(record.XDGRoot, "state", leaseFileName), a.log)
+	return os.RemoveAll(record.XDGRoot)
 }
 
 func (a *Agent) homeRoot() string {

@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -83,6 +84,9 @@ func TestOpenCodeHTTPFakeServerReadinessDocAndQuestionRoutes(t *testing.T) {
 		t.Fatalf("seen paths = %#v", seen)
 	}
 	close(client.closed)
+	if todos, err := client.Todos(ctx, "s"); !errors.Is(err, context.Canceled) || todos != nil {
+		t.Fatalf("closed Todos = %#v err=%v", todos, err)
+	}
 }
 
 func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
@@ -91,6 +95,191 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 	delete(paths, "/api/session/{sessionID}/question/{requestID}/reply")
 	if err := validateOpenCodeDoc(doc); err == nil || !strings.Contains(err.Error(), "question") {
 		t.Fatalf("validateOpenCodeDoc error = %v", err)
+	}
+	for _, tt := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "permission request wrong method",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				paths["/api/permission/request"] = map[string]any{"post": map[string]any{}}
+			},
+		},
+		{
+			name: "permission request wrong schema",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				paths["/api/permission/request"] = pendingRequestPath("WrongRequest")
+			},
+		},
+		{
+			name: "permission request missing success response",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				requestPath := paths["/api/permission/request"].(map[string]any)
+				requestPath["get"].(map[string]any)["responses"] = map[string]any{}
+			},
+		},
+		{
+			name: "permission request data not array",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				paths["/api/permission/request"] = map[string]any{"get": map[string]any{
+					"responses": map[string]any{"200": map[string]any{
+						"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"data": map[string]any{"type": "object"},
+							},
+						}}},
+					}},
+				}}
+			},
+		},
+		{
+			name: "permission reply wrong method",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/permission/{requestID}/reply"].(map[string]any)
+				replyPath["get"] = replyPath["post"]
+				delete(replyPath, "post")
+			},
+		},
+		{
+			name: "permission reply missing no-content response",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/permission/{requestID}/reply"].(map[string]any)
+				replyPath["post"].(map[string]any)["responses"] = map[string]any{}
+			},
+		},
+		{
+			name: "permission reply missing request body",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/permission/{requestID}/reply"].(map[string]any)
+				delete(replyPath["post"].(map[string]any), "requestBody")
+			},
+		},
+		{
+			name: "permission reply missing reply body",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/permission/{requestID}/reply"].(map[string]any)
+				post := replyPath["post"].(map[string]any)
+				body := post["requestBody"].(map[string]any)
+				content := body["content"].(map[string]any)
+				jsonContent := content["application/json"].(map[string]any)
+				schema := jsonContent["schema"].(map[string]any)
+				schema["required"] = []any{}
+			},
+		},
+		{
+			name: "permission reply missing reply property",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/permission/{requestID}/reply"].(map[string]any)
+				post := replyPath["post"].(map[string]any)
+				body := post["requestBody"].(map[string]any)
+				content := body["content"].(map[string]any)
+				jsonContent := content["application/json"].(map[string]any)
+				schema := jsonContent["schema"].(map[string]any)
+				delete(schema["properties"].(map[string]any), "reply")
+			},
+		},
+		{
+			name: "permission reply missing message property",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/permission/{requestID}/reply"].(map[string]any)
+				post := replyPath["post"].(map[string]any)
+				body := post["requestBody"].(map[string]any)
+				content := body["content"].(map[string]any)
+				jsonContent := content["application/json"].(map[string]any)
+				schema := jsonContent["schema"].(map[string]any)
+				delete(schema["properties"].(map[string]any), "message")
+			},
+		},
+		{
+			name: "question request wrong schema",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				paths["/api/question/request"] = pendingRequestPath("WrongRequest")
+			},
+		},
+		{
+			name: "question reply wrong method",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/question/{requestID}/reply"].(map[string]any)
+				replyPath["get"] = replyPath["post"]
+				delete(replyPath, "post")
+			},
+		},
+		{
+			name: "question reply missing no-content response",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/question/{requestID}/reply"].(map[string]any)
+				replyPath["post"].(map[string]any)["responses"] = map[string]any{}
+			},
+		},
+		{
+			name: "question reply missing request body",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/question/{requestID}/reply"].(map[string]any)
+				delete(replyPath["post"].(map[string]any), "requestBody")
+			},
+		},
+		{
+			name: "question reply bad ref",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/api/session/{sessionID}/question/{requestID}/reply"].(map[string]any)
+				post := replyPath["post"].(map[string]any)
+				body := post["requestBody"].(map[string]any)
+				content := body["content"].(map[string]any)
+				jsonContent := content["application/json"].(map[string]any)
+				jsonContent["schema"] = map[string]any{"$ref": "#/components/schemas/Missing"}
+			},
+		},
+		{
+			name: "question reply wrong schema",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				reply := schemas["QuestionV2Reply"].(map[string]any)
+				reply["required"] = []any{}
+			},
+		},
+		{
+			name: "question reject missing no-content response",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				rejectPath := paths["/api/session/{sessionID}/question/{requestID}/reject"].(map[string]any)
+				rejectPath["post"].(map[string]any)["responses"] = map[string]any{}
+			},
+		},
+		{
+			name: "question reject wrong method",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				rejectPath := paths["/api/session/{sessionID}/question/{requestID}/reject"].(map[string]any)
+				rejectPath["get"] = rejectPath["post"]
+				delete(rejectPath, "post")
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := cloneOpenCodeDoc(t, fullOpenCodeDoc())
+			tt.mutate(doc)
+			if err := validateOpenCodeDoc(doc); err == nil {
+				t.Fatal("validateOpenCodeDoc accepted invalid /doc")
+			}
+		})
 	}
 	if compareSemver("1.2.3", "1.2.4") >= 0 || compareSemver("1.3.0", "1.2.9") <= 0 || compareSemver("v1.2.3-beta", "1.2.3") != 0 {
 		t.Fatal("compareSemver returned unexpected ordering")
@@ -104,6 +293,35 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 	if passwordHash("secret") == "" {
 		t.Fatal("empty password hash")
 	}
+	wrapped := errors.New("wrapped")
+	if !errors.Is(streamError{epoch: 1, err: wrapped}, wrapped) {
+		t.Fatal("streamError did not unwrap")
+	}
+	if _, ok := openAPIOperation(map[string]any{}, "/missing", http.MethodGet); ok {
+		t.Fatal("missing OpenAPI path returned operation")
+	}
+	if !openAPIObjectHasRequiredProperty(map[string]any{
+		"properties": map[string]any{"reply": map[string]any{}},
+		"required":   []string{"reply"},
+	}, "reply") {
+		t.Fatal("required []string property was not recognized")
+	}
+	if _, ok := openAPIComponentSchema(fullOpenCodeDoc(), "QuestionV2Reply"); ok {
+		t.Fatal("non-component ref resolved")
+	}
+}
+
+func cloneOpenCodeDoc(t *testing.T, doc map[string]any) map[string]any {
+	t.Helper()
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cloned map[string]any
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		t.Fatal(err)
+	}
+	return cloned
 }
 
 func fullOpenCodeDoc() map[string]any {
@@ -127,7 +345,70 @@ func fullOpenCodeDoc() map[string]any {
 	} {
 		paths[path] = map[string]any{}
 	}
-	return map[string]any{"paths": paths}
+	paths["/api/permission/request"] = pendingRequestPath("PermissionV2Request")
+	paths["/api/session/{sessionID}/permission/{requestID}/reply"] = map[string]any{
+		"post": map[string]any{
+			"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
+			"requestBody": map[string]any{
+				"required": true,
+				"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"reply":   map[string]any{"$ref": "#/components/schemas/PermissionV2Reply"},
+						"message": map[string]any{"type": "string"},
+					},
+					"required": []any{"reply"},
+				}}},
+			},
+		},
+	}
+	paths["/api/question/request"] = pendingRequestPath("QuestionV2Request")
+	paths["/api/session/{sessionID}/question/{requestID}/reply"] = map[string]any{
+		"post": map[string]any{
+			"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
+			"requestBody": map[string]any{
+				"required": true,
+				"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+					"$ref": "#/components/schemas/QuestionV2Reply",
+				}}},
+			},
+		},
+	}
+	paths["/api/session/{sessionID}/question/{requestID}/reject"] = map[string]any{
+		"post": map[string]any{
+			"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
+		},
+	}
+	return map[string]any{
+		"paths": paths,
+		"components": map[string]any{"schemas": map[string]any{
+			"QuestionV2Reply": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"answers": map[string]any{"type": "array"},
+				},
+				"required": []any{"answers"},
+			},
+		}},
+	}
+}
+
+func pendingRequestPath(itemRef string) map[string]any {
+	return map[string]any{
+		"get": map[string]any{
+			"responses": map[string]any{"200": map[string]any{
+				"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"data": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"$ref": "#/components/schemas/" + itemRef},
+						},
+					},
+				}}},
+			}},
+		},
+	}
 }
 
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {

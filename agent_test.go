@@ -29,6 +29,12 @@ func TestInitializeCapabilitiesHardCutover(t *testing.T) {
 	if resp.AgentCapabilities.McpCapabilities.Sse {
 		t.Fatal("SSE MCP capability advertised")
 	}
+	if resp.AgentCapabilities.PromptCapabilities.Image {
+		t.Fatal("image prompt capability advertised without native image support")
+	}
+	if !resp.AgentCapabilities.PromptCapabilities.EmbeddedContext {
+		t.Fatal("embedded context capability missing")
+	}
 	meta, _ := resp.AgentCapabilities.Meta[opencodeMetaKey].(map[string]any)
 	if _, ok := meta["structuredOutput"]; ok {
 		t.Fatal("OpenCode structured output advertised")

@@ -95,13 +95,25 @@ func TestOpenCodeACPAgentFakeExecutableLeaseReaper(t *testing.T) {
 		t.Fatalf("new session: %v\nstderr:\n%s", err, agent.stderrString())
 	}
 
-	select {
-	case <-waitOrphan:
-	case <-time.After(5 * time.Second):
-		t.Fatal("stale lease process was not reaped")
+	leasePath := filepath.Join(leaseDir, "server.lease")
+	deadline := time.After(5 * time.Second)
+	for {
+		if _, err := os.Stat(leasePath); os.IsNotExist(err) {
+			break
+		}
+		select {
+		case err := <-waitOrphan:
+			t.Fatalf("unrelated stale-lease process was killed: %v", err)
+		case <-deadline:
+			t.Fatalf("stale lease file still present")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
-	if _, err := os.Stat(filepath.Join(leaseDir, "server.lease")); !os.IsNotExist(err) {
-		t.Fatalf("stale lease file still present: %v", err)
+	select {
+	case err := <-waitOrphan:
+		t.Fatalf("unrelated stale-lease process exited: %v", err)
+	default:
 	}
 }
 
@@ -260,7 +272,64 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 		}
 		paths[path] = map[string]any{}
 	}
-	return map[string]any{"paths": paths}
+	paths["/api/permission/request"] = fakePendingRequestPath("PermissionV2Request")
+	if mode != fakeModeMissingDoc {
+		paths["/api/session/{sessionID}/permission/{requestID}/reply"] = map[string]any{
+			"post": map[string]any{
+				"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
+				"requestBody": map[string]any{
+					"required": true,
+					"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"reply":   map[string]any{"$ref": "#/components/schemas/PermissionV2Reply"},
+							"message": map[string]any{"type": "string"},
+						},
+						"required": []any{"reply"},
+					}}},
+				},
+			},
+		}
+	}
+	paths["/api/question/request"] = fakePendingRequestPath("QuestionV2Request")
+	paths["/api/session/{sessionID}/question/{requestID}/reply"] = map[string]any{
+		"post": map[string]any{
+			"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
+			"requestBody": map[string]any{
+				"required": true,
+				"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+					"$ref": "#/components/schemas/QuestionV2Reply",
+				}}},
+			},
+		},
+	}
+	paths["/api/session/{sessionID}/question/{requestID}/reject"] = map[string]any{
+		"post": map[string]any{"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}}},
+	}
+	return map[string]any{
+		"paths": paths,
+		"components": map[string]any{"schemas": map[string]any{
+			"QuestionV2Reply": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"answers": map[string]any{"type": "array"}},
+				"required":   []any{"answers"},
+			},
+		}},
+	}
+}
+
+func fakePendingRequestPath(itemRef string) map[string]any {
+	return map[string]any{
+		"get": map[string]any{"responses": map[string]any{"200": map[string]any{
+			"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"data": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"$ref": "#/components/schemas/" + itemRef},
+				}},
+			}}},
+		}}},
+	}
 }
 
 func fakeNativeSession(id string) map[string]any {

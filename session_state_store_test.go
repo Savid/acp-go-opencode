@@ -79,7 +79,7 @@ func TestDecodeXDGArchiveRejectsTraversalAndBadChecksum(t *testing.T) {
 	store := NewInMemorySessionStore()
 	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
 	idmapData, _ := json.Marshal(idmapRecord{SessionID: "s", NativeSessionID: "n", Format: SessionStoreFormat})
-	mainData, _ := json.Marshal(stateSnapshot{Format: SessionStoreFormat})
+	mainData, _ := json.Marshal(validHydrateSnapshot())
 	badArchive, _ := json.Marshal(archiveEntry{Format: SessionStoreFormat, Encoding: "tar+zstd+base64", SHA256: "bad", Data: base64.StdEncoding.EncodeToString([]byte("not zstd"))})
 	if err := store.Replace(ctx, main, []SessionStoreReplacement{
 		{Key: main, Entries: []SessionStoreEntry{mainData}},
@@ -101,7 +101,7 @@ func TestDecodeXDGArchiveRejectsTraversalAndBadChecksum(t *testing.T) {
 		t.Fatal("bad archive checksum accepted")
 	}
 
-	if !shouldExcludeStatePath("nested/auth.json") || !shouldExcludeStatePath("x/credential-store.json") {
+	if !shouldExcludeStatePath("nested/auth.json") || !shouldExcludeStatePath("x/credential-store.json") || !shouldExcludeStatePath("server.lease") {
 		t.Fatal("credential state path exclusion failed")
 	}
 	if !shouldSkipSQLiteCompanion("opencode.db-wal") || shouldSkipSQLiteCompanion("opencode.db") {
@@ -188,7 +188,7 @@ func TestHydrateStateFromStoreErrors(t *testing.T) {
 
 	store = NewInMemorySessionStore()
 	idmapData, _ := json.Marshal(idmapRecord{SessionID: "s", NativeSessionID: "n", Format: SessionStoreFormat})
-	mainData, _ := json.Marshal(stateSnapshot{Format: SessionStoreFormat})
+	mainData, _ := json.Marshal(validHydrateSnapshot())
 	if err := store.Replace(ctx, main, []SessionStoreReplacement{
 		{Key: main, Entries: []SessionStoreEntry{mainData}},
 		{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{idmapData}},
@@ -197,6 +197,69 @@ func TestHydrateStateFromStoreErrors(t *testing.T) {
 	}
 	if _, _, _, err := hydrateStateFromStore(ctx, store, "s", xdg); err == nil {
 		t.Fatal("hydrate accepted missing archive")
+	}
+}
+
+func TestHydrateStateAgreementRejectsMismatches(t *testing.T) {
+	ctx := context.Background()
+	xdg, err := createXDGDirs(t.TempDir(), "hydrate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*idmapRecord, *stateSnapshot)
+		want   string
+	}{
+		{
+			name: "requested ACP id disagrees with idmap",
+			mutate: func(idmap *idmapRecord, _ *stateSnapshot) {
+				idmap.SessionID = "other"
+			},
+			want: "idmap session mismatch",
+		},
+		{
+			name: "requested ACP id disagrees with snapshot",
+			mutate: func(_ *idmapRecord, snapshot *stateSnapshot) {
+				snapshot.Session.SessionID = "other"
+			},
+			want: "snapshot session mismatch",
+		},
+		{
+			name: "native id disagrees",
+			mutate: func(_ *idmapRecord, snapshot *stateSnapshot) {
+				snapshot.Session.NativeSessionID = "other-native"
+			},
+			want: "native session mismatch",
+		},
+		{
+			name: "parent ACP id disagrees",
+			mutate: func(idmap *idmapRecord, snapshot *stateSnapshot) {
+				idmap.ParentSessionID = "parent"
+				snapshot.Session.ParentSessionID = "other-parent"
+			},
+			want: "parent session mismatch",
+		},
+		{
+			name: "parent native id disagrees",
+			mutate: func(idmap *idmapRecord, snapshot *stateSnapshot) {
+				idmap.NativeParentSessionID = "native-parent"
+				snapshot.Session.NativeParentSessionID = "other-native-parent"
+			},
+			want: "native parent session mismatch",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := validHydrateStore(t, ctx)
+			idmap := validHydrateIDMap()
+			snapshot := validHydrateSnapshot()
+			tt.mutate(&idmap, &snapshot)
+			replaceHydrateRecords(t, ctx, store, idmap, snapshot)
+			if _, _, _, err := hydrateStateFromStore(ctx, store, "s", xdg); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("hydrate mismatch err = %v, want %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -325,10 +388,10 @@ func TestHydrateStateFromStoreFaults(t *testing.T) {
 		for name, replacements := range map[string][]SessionStoreReplacement{
 			"idmap": {
 				{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{json.RawMessage(`{`)}},
-				{Key: SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, stateSnapshot{Format: SessionStoreFormat})}},
+				{Key: SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateSnapshot())}},
 			},
 			"main": {
-				{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, idmapRecord{SessionID: "s", NativeSessionID: "n", Format: SessionStoreFormat})}},
+				{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateIDMap())}},
 				{Key: SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{json.RawMessage(`{`)}},
 			},
 		} {
@@ -793,8 +856,8 @@ func validHydrateStore(t *testing.T, ctx context.Context) *InMemorySessionStore 
 	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
 	replacements := make([]SessionStoreReplacement, 0, 6)
 	replacements = append(replacements,
-		SessionStoreReplacement{Key: main, Entries: []SessionStoreEntry{mustStateJSON(t, stateSnapshot{Format: SessionStoreFormat})}},
-		SessionStoreReplacement{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, idmapRecord{SessionID: "s", NativeSessionID: "n", Format: SessionStoreFormat})}},
+		SessionStoreReplacement{Key: main, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateSnapshot())}},
+		SessionStoreReplacement{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateIDMap())}},
 	)
 	for _, subpath := range []string{xdgDataSubpath, xdgConfigSubpath, xdgCacheSubpath, xdgStateSubpath} {
 		replacements = append(replacements, SessionStoreReplacement{
@@ -808,13 +871,54 @@ func validHydrateStore(t *testing.T, ctx context.Context) *InMemorySessionStore 
 	return store
 }
 
+func validHydrateIDMap() idmapRecord {
+	return idmapRecord{
+		SessionID:       "s",
+		NativeSessionID: "n",
+		Format:          SessionStoreFormat,
+	}
+}
+
+func validHydrateSnapshot() stateSnapshot {
+	return stateSnapshot{
+		Format: SessionStoreFormat,
+		Session: stateSnapshotSession{
+			SessionID:       "s",
+			NativeSessionID: "n",
+		},
+	}
+}
+
+func replaceHydrateRecords(t *testing.T, ctx context.Context, store *InMemorySessionStore, idmap idmapRecord, snapshot stateSnapshot) {
+	t.Helper()
+	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
+	replacements := make([]SessionStoreReplacement, 0, 6)
+	replacements = append(replacements,
+		SessionStoreReplacement{Key: main, Entries: []SessionStoreEntry{mustStateJSON(t, snapshot)}},
+		SessionStoreReplacement{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, idmap)}},
+	)
+	for _, candidate := range []string{xdgDataSubpath, xdgConfigSubpath, xdgCacheSubpath, xdgStateSubpath} {
+		entries, err := store.Load(ctx, SessionKey{SessionID: "s", Subpath: candidate})
+		if err != nil {
+			t.Fatal(err)
+		}
+		replacements = append(replacements, SessionStoreReplacement{
+			Key:     SessionKey{SessionID: "s", Subpath: candidate},
+			Entries: entries,
+		})
+	}
+	if err := store.Replace(ctx, main, replacements); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func replaceArchiveEntry(t *testing.T, ctx context.Context, store *InMemorySessionStore, subpath string, entry SessionStoreEntry) {
 	t.Helper()
 	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
 	replacements := make([]SessionStoreReplacement, 0, 6)
 	replacements = append(replacements,
-		SessionStoreReplacement{Key: main, Entries: []SessionStoreEntry{mustStateJSON(t, stateSnapshot{Format: SessionStoreFormat})}},
-		SessionStoreReplacement{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, idmapRecord{SessionID: "s", NativeSessionID: "n", Format: SessionStoreFormat})}},
+		SessionStoreReplacement{Key: main, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateSnapshot())}},
+		SessionStoreReplacement{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateIDMap())}},
 	)
 	for _, candidate := range []string{xdgDataSubpath, xdgConfigSubpath, xdgCacheSubpath, xdgStateSubpath} {
 		entries, err := store.Load(ctx, SessionKey{SessionID: "s", Subpath: candidate})

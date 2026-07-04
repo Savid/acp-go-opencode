@@ -100,6 +100,9 @@ type openCodeServer struct {
 	errs   chan error
 	closed chan struct{}
 	once   sync.Once
+
+	streamMu    sync.Mutex
+	streamEpoch uint64
 }
 
 type nativeSession struct {
@@ -193,10 +196,11 @@ type nativeAgent struct {
 }
 
 type openCodeEvent struct {
-	ID         string          `json:"id"`
-	Type       string          `json:"type"`
-	Properties json.RawMessage `json:"properties"`
-	Raw        json.RawMessage `json:"-"`
+	ID          string          `json:"id"`
+	Type        string          `json:"type"`
+	Properties  json.RawMessage `json:"properties"`
+	Raw         json.RawMessage `json:"-"`
+	StreamEpoch uint64          `json:"-"`
 }
 
 func (e *openCodeEvent) UnmarshalJSON(data []byte) error {
@@ -284,12 +288,23 @@ type providerInfo struct {
 }
 
 type providerModel struct {
-	ID           string         `json:"id"`
-	Name         string         `json:"name"`
-	Limit        map[string]any `json:"limit"`
-	Capabilities map[string]any `json:"capabilities"`
-	Options      map[string]any `json:"options"`
-	Variants     map[string]any `json:"variants"`
+	ID         string                  `json:"id"`
+	Name       string                  `json:"name"`
+	Limit      map[string]any          `json:"limit"`
+	Reasoning  bool                    `json:"reasoning"`
+	ToolCall   bool                    `json:"tool_call"`
+	Modalities providerModelModalities `json:"modalities"`
+	Options    map[string]any          `json:"options"`
+}
+
+type providerModelModalities struct {
+	Input []string `json:"input"`
+}
+
+type processIdentity struct {
+	StartTime string
+	Cmdline   []string
+	Env       map[string]string
 }
 
 var (
@@ -300,6 +315,7 @@ var (
 	openCodeWriteLease                    = writeLease
 	openCodeTerminateProcess              = terminateOpenCodeProcess
 	openCodeKillProcess                   = killOpenCodeProcess
+	openCodeInspectProcess                = inspectOpenCodeProcess
 	openCodeWaitCommand                   = func(cmd *exec.Cmd) error { return cmd.Wait() }
 	openCodeAfter                         = time.After
 	openCodeReadyPollInterval             = 100 * time.Millisecond
@@ -389,6 +405,7 @@ func startOpenCodeServer(ctx context.Context, options openCodeStartOptions) (ope
 		Port:         port,
 		StartedAt:    time.Now().UnixMilli(),
 		PasswordHash: passwordHash(password),
+		XDGRoot:      xdg.Root,
 	}); err != nil {
 		cancel()
 		return nil, err
@@ -397,12 +414,21 @@ func startOpenCodeServer(ctx context.Context, options openCodeStartOptions) (ope
 		cancel()
 		return nil, err
 	}
-	_ = openCodeWriteLease(xdg.State, serverLease{
+	lease := serverLease{
 		PID:          cmd.Process.Pid,
 		Port:         port,
 		StartedAt:    time.Now().UnixMilli(),
 		PasswordHash: passwordHash(password),
-	})
+		XDGRoot:      xdg.Root,
+	}
+	if identity, err := openCodeInspectProcess(cmd.Process.Pid); err == nil {
+		lease.ProcessStartTime = identity.StartTime
+	}
+	if err := openCodeWriteLease(xdg.State, lease); err != nil {
+		cancel()
+		_ = openCodeKillProcess(cmd)
+		return nil, err
+	}
 	go drainProcessPipe(options.Logger, "opencode stdout", stdout)
 	go drainProcessPipe(options.Logger, "opencode stderr", stderr)
 
@@ -576,6 +602,11 @@ func (s *openCodeServer) Fork(ctx context.Context, id string, messageID string) 
 }
 
 func (s *openCodeServer) Todos(ctx context.Context, id string) ([]nativeTodo, error) {
+	select {
+	case <-s.closed:
+		return nil, context.Canceled
+	default:
+	}
 	var out []nativeTodo
 	err := s.getJSON(ctx, "/session/"+url.PathEscape(id)+"/todo", nil, &out)
 	return out, err
@@ -679,9 +710,10 @@ func (s *openCodeServer) doJSON(ctx context.Context, method string, path string,
 
 func (s *openCodeServer) readEvents(ctx context.Context) {
 	for {
-		if err := s.readEventStream(ctx); err != nil {
+		epoch := s.nextStreamEpoch()
+		if err := s.readEventStream(ctx, epoch); err != nil {
 			select {
-			case s.errs <- err:
+			case s.errs <- streamError{epoch: epoch, err: err}:
 			default:
 			}
 		}
@@ -693,7 +725,39 @@ func (s *openCodeServer) readEvents(ctx context.Context) {
 	}
 }
 
-func (s *openCodeServer) readEventStream(ctx context.Context) error {
+func (s *openCodeServer) nextStreamEpoch() uint64 {
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+	s.streamEpoch++
+	return s.streamEpoch
+}
+
+type streamError struct {
+	epoch uint64
+	err   error
+}
+
+func (e streamError) Error() string {
+	return e.err.Error()
+}
+
+func (e streamError) Unwrap() error {
+	return e.err
+}
+
+func streamErrorEpoch(err error) uint64 {
+	var streamErr streamError
+	if errors.As(err, &streamErr) {
+		return streamErr.epoch
+	}
+	return 0
+}
+
+func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) error {
+	var epoch uint64
+	if len(epochs) > 0 {
+		epoch = epochs[0]
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/event", http.NoBody)
 	if err != nil {
 		return err
@@ -722,6 +786,7 @@ func (s *openCodeServer) readEventStream(ctx context.Context) error {
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			return err
 		}
+		event.StreamEpoch = epoch
 		select {
 		case s.events <- event:
 		case <-s.closed:
@@ -776,8 +841,183 @@ func validateOpenCodeDoc(doc map[string]any) error {
 			return fmt.Errorf("opencode /doc missing required path %s", path)
 		}
 	}
+	if err := validateOpenCodeGetListOperation(rawPaths, "/api/permission/request", "PermissionV2Request"); err != nil {
+		return err
+	}
+	if err := validateOpenCodePermissionReply(rawPaths); err != nil {
+		return err
+	}
+	if err := validateOpenCodeGetListOperation(rawPaths, "/api/question/request", "QuestionV2Request"); err != nil {
+		return err
+	}
+	if err := validateOpenCodeQuestionReply(doc, rawPaths); err != nil {
+		return err
+	}
+	if err := validateOpenCodePostNoContent(rawPaths, "/api/session/{sessionID}/question/{requestID}/reject"); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func validateOpenCodeGetListOperation(paths map[string]any, path string, itemRef string) error {
+	operation, ok := openAPIOperation(paths, path, http.MethodGet)
+	if !ok {
+		return fmt.Errorf("opencode /doc path %s missing GET operation", path)
+	}
+	if !openAPIHasResponse(operation, "200") {
+		return fmt.Errorf("opencode /doc GET %s missing 200 response", path)
+	}
+	schema, ok := openAPIJSONResponseSchema(operation, "200")
+	if !ok || !openAPISchemaDataArrayRef(schema, itemRef) {
+		return fmt.Errorf("opencode /doc GET %s response schema is not pending %s list", path, itemRef)
+	}
+	return nil
+}
+
+func validateOpenCodePermissionReply(paths map[string]any) error {
+	const path = "/api/session/{sessionID}/permission/{requestID}/reply"
+	operation, ok := openAPIOperation(paths, path, http.MethodPost)
+	if !ok {
+		return fmt.Errorf("opencode /doc path %s missing POST operation", path)
+	}
+	if !openAPIHasResponse(operation, "204") {
+		return fmt.Errorf("opencode /doc POST %s missing 204 response", path)
+	}
+	schema, ok := openAPIJSONRequestSchema(operation)
+	if !ok {
+		return fmt.Errorf("opencode /doc POST %s missing JSON request schema", path)
+	}
+	if !openAPIObjectHasRequiredProperty(schema, "reply") {
+		return fmt.Errorf("opencode /doc POST %s request schema missing required reply", path)
+	}
+	if !openAPIObjectHasProperty(schema, "message") {
+		return fmt.Errorf("opencode /doc POST %s request schema missing message property", path)
+	}
+	return nil
+}
+
+func validateOpenCodeQuestionReply(doc map[string]any, paths map[string]any) error {
+	const path = "/api/session/{sessionID}/question/{requestID}/reply"
+	operation, ok := openAPIOperation(paths, path, http.MethodPost)
+	if !ok {
+		return fmt.Errorf("opencode /doc path %s missing POST operation", path)
+	}
+	if !openAPIHasResponse(operation, "204") {
+		return fmt.Errorf("opencode /doc POST %s missing 204 response", path)
+	}
+	schema, ok := openAPIJSONRequestSchema(operation)
+	if !ok {
+		return fmt.Errorf("opencode /doc POST %s missing JSON request schema", path)
+	}
+	if ref, _ := schema["$ref"].(string); ref != "" {
+		resolved, ok := openAPIComponentSchema(doc, ref)
+		if !ok {
+			return fmt.Errorf("opencode /doc POST %s request schema ref %s missing", path, ref)
+		}
+		schema = resolved
+	}
+	if !openAPIObjectHasRequiredProperty(schema, "answers") {
+		return fmt.Errorf("opencode /doc POST %s request schema missing required answers", path)
+	}
+	return nil
+}
+
+func validateOpenCodePostNoContent(paths map[string]any, path string) error {
+	operation, ok := openAPIOperation(paths, path, http.MethodPost)
+	if !ok {
+		return fmt.Errorf("opencode /doc path %s missing POST operation", path)
+	}
+	if !openAPIHasResponse(operation, "204") {
+		return fmt.Errorf("opencode /doc POST %s missing 204 response", path)
+	}
+	return nil
+}
+
+func openAPIOperation(paths map[string]any, path string, method string) (map[string]any, bool) {
+	pathItem, _ := paths[path].(map[string]any)
+	if pathItem == nil {
+		return nil, false
+	}
+	operation, _ := pathItem[strings.ToLower(method)].(map[string]any)
+	return operation, operation != nil
+}
+
+func openAPIHasResponse(operation map[string]any, status string) bool {
+	responses, _ := operation["responses"].(map[string]any)
+	_, ok := responses[status]
+	return ok
+}
+
+func openAPIJSONResponseSchema(operation map[string]any, status string) (map[string]any, bool) {
+	responses, _ := operation["responses"].(map[string]any)
+	response, _ := responses[status].(map[string]any)
+	return openAPIJSONContentSchema(response)
+}
+
+func openAPIJSONRequestSchema(operation map[string]any) (map[string]any, bool) {
+	body, _ := operation["requestBody"].(map[string]any)
+	if required, _ := body["required"].(bool); !required {
+		return nil, false
+	}
+	return openAPIJSONContentSchema(body)
+}
+
+func openAPIJSONContentSchema(container map[string]any) (map[string]any, bool) {
+	content, _ := container["content"].(map[string]any)
+	jsonContent, _ := content["application/json"].(map[string]any)
+	schema, _ := jsonContent["schema"].(map[string]any)
+	return schema, schema != nil
+}
+
+func openAPISchemaDataArrayRef(schema map[string]any, want string) bool {
+	properties, _ := schema["properties"].(map[string]any)
+	data, _ := properties["data"].(map[string]any)
+	if dataType, _ := data["type"].(string); dataType != "array" {
+		return false
+	}
+	items, _ := data["items"].(map[string]any)
+	ref, _ := items["$ref"].(string)
+	return strings.HasSuffix(ref, "/"+want)
+}
+
+func openAPIObjectHasRequiredProperty(schema map[string]any, property string) bool {
+	properties, _ := schema["properties"].(map[string]any)
+	if _, ok := properties[property]; !ok {
+		return false
+	}
+	switch required := schema["required"].(type) {
+	case []any:
+		for _, raw := range required {
+			if value, _ := raw.(string); value == property {
+				return true
+			}
+		}
+	case []string:
+		for _, value := range required {
+			if value == property {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openAPIObjectHasProperty(schema map[string]any, property string) bool {
+	properties, _ := schema["properties"].(map[string]any)
+	_, ok := properties[property]
+	return ok
+}
+
+func openAPIComponentSchema(doc map[string]any, ref string) (map[string]any, bool) {
+	const prefix = "#/components/schemas/"
+	if !strings.HasPrefix(ref, prefix) {
+		return nil, false
+	}
+	components, _ := doc["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	schema, _ := schemas[strings.TrimPrefix(ref, prefix)].(map[string]any)
+	return schema, schema != nil
 }
 
 func createXDGDirs(root string, sessionID string) (xdgDirs, error) {
@@ -834,10 +1074,12 @@ func passwordHash(password string) string {
 }
 
 type serverLease struct {
-	PID          int    `json:"pid"`
-	Port         int    `json:"port"`
-	StartedAt    int64  `json:"startedAtUnixMilli"`
-	PasswordHash string `json:"passwordHash"`
+	PID              int    `json:"pid"`
+	Port             int    `json:"port"`
+	StartedAt        int64  `json:"startedAtUnixMilli"`
+	PasswordHash     string `json:"passwordHash"`
+	XDGRoot          string `json:"xdgRoot,omitempty"`
+	ProcessStartTime string `json:"processStartTime,omitempty"`
 }
 
 func writeLease(stateDir string, lease serverLease) error {
@@ -860,23 +1102,68 @@ func reapStaleLeases(root string, log *slog.Logger) error {
 		return err
 	}
 	for _, match := range matches {
-		data, err := os.ReadFile(match)
-		if err != nil {
-			continue
-		}
-		var lease serverLease
-		if err := json.Unmarshal(data, &lease); err != nil {
-			_ = os.Remove(match)
-			continue
-		}
-		if lease.PID > 0 {
-			if err := killProcessID(lease.PID); err != nil && log != nil {
-				log.Debug("reap stale opencode lease failed", slog.Int("pid", lease.PID), slog.String("error", err.Error()))
-			}
-		}
-		_ = os.Remove(match)
+		reapLeaseFile(match, log)
 	}
 	return nil
+}
+
+func reapLeaseFile(path string, log *slog.Logger) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		return
+	}
+	var lease serverLease
+	if err := json.Unmarshal(data, &lease); err != nil {
+		_ = os.Remove(path)
+		return
+	}
+	if lease.PID > 0 && leaseMatchesProcess(path, lease) {
+		if err := killProcessID(lease.PID); err != nil && log != nil {
+			log.Debug("reap stale opencode lease failed", slog.Int("pid", lease.PID), slog.String("error", err.Error()))
+		}
+	}
+	_ = os.Remove(path)
+}
+
+func leaseMatchesProcess(path string, lease serverLease) bool {
+	if lease.PID <= 0 || lease.ProcessStartTime == "" {
+		return false
+	}
+	identity, err := openCodeInspectProcess(lease.PID)
+	if err != nil {
+		return false
+	}
+	if identity.StartTime != lease.ProcessStartTime {
+		return false
+	}
+	stateDir := filepath.Dir(path)
+	if identity.Env["XDG_STATE_HOME"] != stateDir {
+		return false
+	}
+	if passwordHash(identity.Env["OPENCODE_SERVER_PASSWORD"]) != lease.PasswordHash {
+		return false
+	}
+	if lease.XDGRoot != "" && filepath.Clean(lease.XDGRoot) != filepath.Clean(filepath.Dir(stateDir)) {
+		return false
+	}
+	return cmdlineLooksLikeOpenCodeServe(identity.Cmdline)
+}
+
+func cmdlineLooksLikeOpenCodeServe(args []string) bool {
+	for _, arg := range args {
+		if arg == "serve" {
+			return true
+		}
+	}
+	for _, arg := range args {
+		if strings.Contains(filepath.Base(arg), "opencode") {
+			return true
+		}
+	}
+	return false
 }
 
 func mergeProcessEnv(overlays ...map[string]string) map[string]string {

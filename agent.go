@@ -37,6 +37,7 @@ type Agent struct {
 	conn               agentClient
 	sessions           map[acp.SessionId]*session
 	deleted            map[acp.SessionId]struct{}
+	deleteCleanup      map[acp.SessionId]deleteCleanupRecord
 	clientCalls        chan struct{}
 	clientCapabilities acp.ClientCapabilities
 	positionEncoding   acp.PositionEncodingKind
@@ -62,12 +63,13 @@ func NewAgent(opts ...Option) *Agent {
 	}
 
 	return &Agent{
-		options:     options,
-		log:         log,
-		optionsErr:  optionsErr,
-		sessions:    make(map[acp.SessionId]*session),
-		deleted:     make(map[acp.SessionId]struct{}),
-		clientCalls: make(chan struct{}, limits.MaxConcurrentClientCalls),
+		options:       options,
+		log:           log,
+		optionsErr:    optionsErr,
+		sessions:      make(map[acp.SessionId]*session),
+		deleted:       make(map[acp.SessionId]struct{}),
+		deleteCleanup: make(map[acp.SessionId]deleteCleanupRecord),
+		clientCalls:   make(chan struct{}, limits.MaxConcurrentClientCalls),
 	}
 }
 
@@ -175,7 +177,6 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 			PositionEncoding: &positionEncoding,
 			PromptCapabilities: acp.PromptCapabilities{
 				EmbeddedContext: true,
-				Image:           true,
 			},
 			SessionCapabilities: acp.SessionCapabilities{
 				AdditionalDirectories: &acp.SessionAdditionalDirectoriesCapabilities{},

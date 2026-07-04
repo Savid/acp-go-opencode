@@ -151,10 +151,23 @@ func TestRequestErrorAndCapabilityHelpers(t *testing.T) {
 		t.Fatal("default position encoding mismatch")
 	}
 
-	agent := NewAgent()
-	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
-	if !agent.clientSupportsFormElicitation() {
-		t.Fatal("empty elicitation capability should support form by default")
+	for _, tt := range []struct {
+		name string
+		caps *acp.ElicitationCapabilities
+		want bool
+	}{
+		{name: "nil", caps: nil, want: false},
+		{name: "empty object", caps: &acp.ElicitationCapabilities{}, want: true},
+		{name: "url only", caps: &acp.ElicitationCapabilities{Url: &acp.ElicitationUrlCapabilities{}}, want: false},
+		{name: "form explicit", caps: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}, want: true},
+	} {
+		t.Run("elicitation "+tt.name, func(t *testing.T) {
+			agent := NewAgent()
+			agent.clientCapabilities.Elicitation = tt.caps
+			if got := agent.clientSupportsFormElicitation(); got != tt.want {
+				t.Fatalf("clientSupportsFormElicitation() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

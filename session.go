@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -26,16 +27,21 @@ type session struct {
 
 	client openCodeClient
 
-	turn      chan struct{}
-	mu        sync.Mutex
-	cancel    context.CancelFunc
-	turnDone  <-chan struct{}
-	cancelled bool
-	rawSeq    int64
-	seenParts map[string]string
-	pending   map[string]permissionRequest
-	questions map[string]questionRequest
-	closed    bool
+	turn                chan struct{}
+	mu                  sync.Mutex
+	cancel              context.CancelFunc
+	turnDone            <-chan struct{}
+	cancelled           bool
+	rawSeq              int64
+	seenParts           map[string]string
+	pending             map[string]permissionRequest
+	questions           map[string]questionRequest
+	turnEpoch           uint64
+	activeMessageIDs    map[string]struct{}
+	failedStreamEpochs  map[uint64]struct{}
+	failedMessageIDs    map[string]struct{}
+	suppressNextBacklog bool
+	closed              bool
 }
 
 type sessionSnapshot struct {
@@ -99,6 +105,9 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		seenParts:             map[string]string{},
 		pending:               map[string]permissionRequest{},
 		questions:             map[string]questionRequest{},
+		activeMessageIDs:      map[string]struct{}{},
+		failedStreamEpochs:    map[uint64]struct{}{},
+		failedMessageIDs:      map[string]struct{}{},
 	}
 }
 
@@ -134,6 +143,8 @@ func (s *session) beginTurn(ctx context.Context) context.Context {
 	s.cancel = cancel
 	s.turnDone = turnCtx.Done()
 	s.cancelled = false
+	s.turnEpoch++
+	s.activeMessageIDs = map[string]struct{}{}
 	return turnCtx
 }
 
@@ -146,6 +157,7 @@ func (s *session) finishTurn() {
 	s.updatedAt = time.Now().UTC().Format(time.RFC3339)
 	s.pending = map[string]permissionRequest{}
 	s.questions = map[string]questionRequest{}
+	s.activeMessageIDs = map[string]struct{}{}
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -162,10 +174,12 @@ func (s *session) cancelTurn() {
 	for _, req := range s.pending {
 		pending = append(pending, req)
 	}
+	s.pending = map[string]permissionRequest{}
 	questions := make([]questionRequest, 0, len(s.questions))
 	for _, req := range s.questions {
 		questions = append(questions, req)
 	}
+	s.questions = map[string]questionRequest{}
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -184,6 +198,101 @@ func (s *session) wasCancelled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cancelled
+}
+
+func (s *session) markActiveMessageID(messageID string) {
+	if messageID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.activeMessageIDs == nil {
+		s.activeMessageIDs = map[string]struct{}{}
+	}
+	s.activeMessageIDs[messageID] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *session) markStreamFailed(epoch uint64) {
+	s.mu.Lock()
+	if s.failedMessageIDs == nil {
+		s.failedMessageIDs = map[string]struct{}{}
+	}
+	for messageID := range s.activeMessageIDs {
+		s.failedMessageIDs[messageID] = struct{}{}
+	}
+	if epoch > 0 {
+		if s.failedStreamEpochs == nil {
+			s.failedStreamEpochs = map[uint64]struct{}{}
+		}
+		s.failedStreamEpochs[epoch] = struct{}{}
+	}
+	s.suppressNextBacklog = true
+	s.mu.Unlock()
+}
+
+func (s *session) shouldSuppressEvent(event openCodeEvent) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if event.StreamEpoch > 0 {
+		if _, ok := s.failedStreamEpochs[event.StreamEpoch]; ok {
+			return true
+		}
+	}
+	if part, ok := eventPart(event.Properties); ok && part.MessageID != "" {
+		_, ok := s.failedMessageIDs[part.MessageID]
+		return ok
+	}
+	return false
+}
+
+func (s *session) suppressBacklog() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.suppressNextBacklog
+}
+
+func (s *session) clearSuppressBacklog() {
+	s.mu.Lock()
+	s.suppressNextBacklog = false
+	s.mu.Unlock()
+}
+
+func (s *session) addPendingPermission(req permissionRequest) {
+	s.mu.Lock()
+	if s.pending == nil {
+		s.pending = map[string]permissionRequest{}
+	}
+	s.pending[req.ID] = req
+	s.mu.Unlock()
+}
+
+func (s *session) takePendingPermission(id string) (permissionRequest, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	req, ok := s.pending[id]
+	if ok {
+		delete(s.pending, id)
+	}
+	return req, ok, s.cancelled
+}
+
+func (s *session) addPendingQuestion(req questionRequest) {
+	s.mu.Lock()
+	if s.questions == nil {
+		s.questions = map[string]questionRequest{}
+	}
+	s.questions[req.ID] = req
+	s.mu.Unlock()
+}
+
+func (s *session) takePendingQuestion(id string) (questionRequest, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	req, ok := s.questions[id]
+	if ok {
+		delete(s.questions, id)
+	}
+	return req, ok, s.cancelled
 }
 
 func (s *session) snapshot() sessionSnapshot {
@@ -274,6 +383,25 @@ func (s *session) Close(ctx context.Context) error {
 		err = errors.Join(err, client.Close(ctx))
 	}
 	return err
+}
+
+func (s *session) DeleteNativeAndClose(ctx context.Context) error {
+	s.cancelTurn()
+	s.mu.Lock()
+	client := s.client
+	nativeID := s.idmap.NativeSessionID
+	s.mu.Unlock()
+
+	var err error
+	if client != nil && nativeID != "" {
+		deleteCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		if deleteErr := client.DeleteSession(deleteCtx, nativeID); deleteErr != nil && s.agent != nil && s.agent.log != nil {
+			s.agent.log.DebugContext(deleteCtx, "delete native OpenCode session failed", slog.String("error", deleteErr.Error()))
+		}
+		cancel()
+	}
+
+	return errors.Join(err, s.Close(ctx))
 }
 
 func (s *session) info() acp.SessionInfo {

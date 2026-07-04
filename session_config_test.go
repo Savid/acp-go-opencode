@@ -20,16 +20,11 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 					"context": float64(1000),
 					"output":  float64(200),
 				},
-				Capabilities: map[string]any{
-					"reasoning": true,
-					"toolcall":  true,
-					"input": map[string]any{
-						"image": true,
-						"pdf":   true,
-					},
-				},
-				Variants: map[string]any{
-					"low": map[string]any{"reasoningEffort": "low"},
+				Reasoning:  true,
+				ToolCall:   true,
+				Modalities: providerModelModalities{Input: []string{"image", "pdf"}},
+				Options: map[string]any{
+					"reasoningEffort": map[string]any{"options": []any{"low", "medium"}},
 				},
 			},
 		},
@@ -56,6 +51,13 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 	if got := meta["modelId"]; got != "openai/gpt-test" {
 		t.Fatalf("modelId = %#v", got)
 	}
+	if got := meta["capabilities"]; !containsStringAny(got, "tools") || !containsStringAny(got, "reasoning") ||
+		!containsStringAny(got, "image") || !containsStringAny(got, "pdf") {
+		t.Fatalf("capabilities meta = %#v", got)
+	}
+	if got := meta["supportedEffortLevels"]; !containsStringAny(got, "low") || !containsStringAny(got, "medium") {
+		t.Fatalf("effort meta = %#v", got)
+	}
 }
 
 func TestSessionConfigBranchesAndValidation(t *testing.T) {
@@ -65,13 +67,9 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 		{ID: "", Models: map[string]providerModel{"skip": {}}},
 		{ID: "p", Models: map[string]providerModel{
 			"m": {
-				Limit:        map[string]any{"context": int(42), "output": json.Number("7")},
-				Capabilities: map[string]any{"input": map[string]any{"audio": true, "video": true}},
-				Options:      map[string]any{"reasoningEffort": "medium"},
-				Variants: map[string]any{
-					"":       map[string]any{"reasoningEffort": "ignored-name"},
-					"nested": map[string]any{"reasoning": map[string]any{"effort": "high"}},
-				},
+				Limit:      map[string]any{"context": int(42), "output": json.Number("7")},
+				Modalities: providerModelModalities{Input: []string{"audio", "video"}},
+				Options:    map[string]any{"reasoningEffort": []any{"medium"}},
 			},
 		}},
 	}}
@@ -132,8 +130,22 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 		t.Fatalf("empty mode option = %#v", empty)
 	}
 	efforts := supportedEfforts(client.providers.Providers[1].Models["m"])
-	if len(efforts) == 0 {
-		t.Fatal("supportedEfforts returned none")
+	if len(efforts) != 1 || efforts[0] != "medium" {
+		t.Fatalf("supportedEfforts = %#v", efforts)
+	}
+	efforts = supportedEfforts(providerModel{Options: map[string]any{
+		"temperature":     []any{"ignored"},
+		"reasoningEffort": []string{"low", "", "high"},
+		"effortOptions":   map[string]any{"values": []any{"medium"}},
+	}})
+	if len(efforts) != 3 || efforts[0] != "high" || efforts[1] != "low" || efforts[2] != "medium" {
+		t.Fatalf("normalized efforts = %#v", efforts)
+	}
+	if values := optionStringValues(map[string]any{"unknown": []any{"x"}}); values != nil {
+		t.Fatalf("unknown option values = %#v", values)
+	}
+	if values := optionStringValues(42); values != nil {
+		t.Fatalf("numeric option values = %#v", values)
 	}
 	if unstableConfigOptions(nil) != nil {
 		t.Fatal("empty unstable config options returned non-nil")
@@ -149,4 +161,20 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	}}); len(got) != 0 {
 		t.Fatalf("bad unstable config option was not skipped: %#v", got)
 	}
+}
+
+func containsStringAny(value any, want string) bool {
+	values, _ := value.([]string)
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	anyValues, _ := value.([]any)
+	for _, value := range anyValues {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

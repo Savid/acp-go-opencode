@@ -8,6 +8,8 @@ import (
 	"os/exec"
 )
 
+var procReadFile = os.ReadFile
+
 func configureOpenCodeProcess(*exec.Cmd) {}
 
 func terminateOpenCodeProcess(cmd *exec.Cmd) error {
@@ -33,4 +35,8 @@ func killProcessID(pid int) error {
 		return err
 	}
 	return proc.Kill()
+}
+
+func inspectOpenCodeProcess(int) (processIdentity, error) {
+	return processIdentity{}, os.ErrNotExist
 }

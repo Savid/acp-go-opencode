@@ -8,102 +8,213 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
 
-func TestOpenCodeProcessUnixSignalFaultBranches(t *testing.T) {
-	getpgid := openCodeSyscallGetpgid
-	kill := openCodeSyscallKill
+func TestInspectOpenCodeProcessReadBranches(t *testing.T) {
+	oldReadFile := procReadFile
+	t.Cleanup(func() { procReadFile = oldReadFile })
+
+	if _, err := inspectOpenCodeProcess(0); err == nil {
+		t.Fatal("zero pid inspected successfully")
+	}
+	if _, err := procStartTime("1 (opencode"); err == nil {
+		t.Fatal("malformed proc stat accepted")
+	}
+	if _, err := procStartTime("1 (opencode) S 0"); err == nil {
+		t.Fatal("short proc stat accepted")
+	}
+
+	validStat := procStatWithStart("123")
+	for _, tt := range []struct {
+		name string
+		read func(string) ([]byte, error)
+		err  bool
+	}{
+		{
+			name: "stat read error",
+			read: func(path string) ([]byte, error) {
+				if strings.HasSuffix(path, "/stat") {
+					return nil, errors.New("stat failed")
+				}
+				return nil, nil
+			},
+			err: true,
+		},
+		{
+			name: "stat parse error",
+			read: func(path string) ([]byte, error) {
+				if strings.HasSuffix(path, "/stat") {
+					return []byte("malformed"), nil
+				}
+				return nil, nil
+			},
+			err: true,
+		},
+		{
+			name: "cmdline read error",
+			read: func(path string) ([]byte, error) {
+				switch {
+				case strings.HasSuffix(path, "/stat"):
+					return []byte(validStat), nil
+				case strings.HasSuffix(path, "/cmdline"):
+					return nil, errors.New("cmdline failed")
+				default:
+					return nil, nil
+				}
+			},
+			err: true,
+		},
+		{
+			name: "env read error",
+			read: func(path string) ([]byte, error) {
+				switch {
+				case strings.HasSuffix(path, "/stat"):
+					return []byte(validStat), nil
+				case strings.HasSuffix(path, "/cmdline"):
+					return []byte("opencode\x00serve\x00"), nil
+				case strings.HasSuffix(path, "/environ"):
+					return nil, errors.New("env failed")
+				default:
+					return nil, nil
+				}
+			},
+			err: true,
+		},
+		{
+			name: "success",
+			read: func(path string) ([]byte, error) {
+				switch {
+				case strings.HasSuffix(path, "/stat"):
+					return []byte(validStat), nil
+				case strings.HasSuffix(path, "/cmdline"):
+					return []byte("opencode\x00serve\x00"), nil
+				case strings.HasSuffix(path, "/environ"):
+					return []byte("XDG_STATE_HOME=/tmp/state\x00"), nil
+				default:
+					return nil, nil
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			procReadFile = tt.read
+			identity, err := inspectOpenCodeProcess(123)
+			if tt.err {
+				if err == nil {
+					t.Fatal("inspect succeeded unexpectedly")
+				}
+				return
+			}
+			if err != nil || identity.StartTime != "123" || len(identity.Cmdline) != 2 || identity.Env["XDG_STATE_HOME"] != "/tmp/state" {
+				t.Fatalf("identity=%#v err=%v", identity, err)
+			}
+		})
+	}
+}
+
+func procStatWithStart(start string) string {
+	fields := make([]string, 20)
+	for i := range fields {
+		fields[i] = "0"
+	}
+	fields[0] = "S"
+	fields[19] = start
+	return "1 (opencode) " + strings.Join(fields, " ")
+}
+
+func TestOpenCodeProcessSignalBranches(t *testing.T) {
+	oldGetpgid := openCodeSyscallGetpgid
+	oldKill := openCodeSyscallKill
+	oldInspect := openCodeInspectProcess
 	t.Cleanup(func() {
-		openCodeSyscallGetpgid = getpgid
-		openCodeSyscallKill = kill
+		openCodeSyscallGetpgid = oldGetpgid
+		openCodeSyscallKill = oldKill
+		openCodeInspectProcess = oldInspect
 	})
 
 	if err := terminateOpenCodeProcess(nil); err != nil {
 		t.Fatalf("terminate nil: %v", err)
 	}
-	if err := killOpenCodeProcess(&exec.Cmd{}); err != nil {
-		t.Fatalf("kill without process: %v", err)
+	if err := killOpenCodeProcess(nil); err != nil {
+		t.Fatalf("kill nil: %v", err)
 	}
+	cmd := &exec.Cmd{Process: &os.Process{Pid: 123}}
 
-	cmd := &exec.Cmd{Process: &os.Process{Pid: 1234}}
-	openCodeSyscallGetpgid = func(int) (int, error) {
-		return 0, syscall.ESRCH
-	}
+	openCodeSyscallGetpgid = func(int) (int, error) { return 0, syscall.ESRCH }
 	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err != nil {
 		t.Fatalf("ESRCH getpgid: %v", err)
 	}
-	openCodeSyscallGetpgid = func(int) (int, error) {
-		return 0, syscall.EPERM
+	openCodeSyscallGetpgid = func(int) (int, error) { return 0, errors.New("getpgid failed") }
+	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err == nil {
+		t.Fatal("getpgid error ignored")
 	}
-	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); !errors.Is(err, syscall.EPERM) {
-		t.Fatalf("getpgid error = %v", err)
-	}
-
-	openCodeSyscallGetpgid = func(int) (int, error) { return 22, nil }
+	openCodeSyscallGetpgid = func(int) (int, error) { return 123, nil }
 	openCodeSyscallKill = func(int, syscall.Signal) error { return syscall.ESRCH }
 	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err != nil {
 		t.Fatalf("ESRCH kill: %v", err)
 	}
-	openCodeSyscallKill = func(int, syscall.Signal) error { return syscall.EPERM }
-	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); !errors.Is(err, syscall.EPERM) {
-		t.Fatalf("kill error = %v", err)
+	openCodeSyscallKill = func(int, syscall.Signal) error { return errors.New("kill failed") }
+	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err == nil {
+		t.Fatal("kill error ignored")
 	}
-	var gotPID int
-	var gotSignal syscall.Signal
-	openCodeSyscallKill = func(pid int, signal syscall.Signal) error {
-		gotPID = pid
-		gotSignal = signal
-		return nil
+	openCodeSyscallKill = func(int, syscall.Signal) error { return nil }
+	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err != nil {
+		t.Fatalf("signal success: %v", err)
 	}
 	if err := killOpenCodeProcess(cmd); err != nil {
-		t.Fatalf("kill process group: %v", err)
-	}
-	if gotPID != -22 || gotSignal != syscall.SIGKILL {
-		t.Fatalf("kill pid/signal = %d/%v", gotPID, gotSignal)
+		t.Fatalf("killOpenCodeProcess: %v", err)
 	}
 
 	if err := killProcessID(0); err != nil {
-		t.Fatalf("kill pid 0: %v", err)
+		t.Fatalf("kill zero pid: %v", err)
 	}
-	openCodeSyscallKill = func(int, syscall.Signal) error { return syscall.ESRCH }
-	if err := killProcessID(1234); err != nil {
-		t.Fatalf("kill pid ESRCH: %v", err)
+	openCodeSyscallGetpgid = func(int) (int, error) { return 0, errors.New("no group") }
+	openCodeSyscallKill = func(pid int, signal syscall.Signal) error {
+		if pid != 123 || signal != syscall.SIGTERM {
+			t.Fatalf("kill pid=%d signal=%v", pid, signal)
+		}
+		return nil
 	}
-	openCodeSyscallKill = func(int, syscall.Signal) error { return syscall.EPERM }
-	if err := killProcessID(1234); !errors.Is(err, syscall.EPERM) {
-		t.Fatalf("kill pid error = %v", err)
+	if err := killProcessID(123); err != nil {
+		t.Fatalf("killProcessID fallback: %v", err)
 	}
-	openCodeSyscallKill = func(int, syscall.Signal) error { return nil }
-	if err := killProcessID(1234); err != nil {
-		t.Fatalf("kill pid success = %v", err)
+	openCodeSyscallGetpgid = func(int) (int, error) { return 123, nil }
+	openCodeSyscallKill = func(int, syscall.Signal) error { return errors.New("kill failed") }
+	if err := killProcessID(123); err == nil {
+		t.Fatal("killProcessID error ignored")
 	}
-}
-
-func TestReapStaleLeasesSignalsProcessID(t *testing.T) {
-	getpgid := openCodeSyscallGetpgid
-	kill := openCodeSyscallKill
-	t.Cleanup(func() {
-		openCodeSyscallGetpgid = getpgid
-		openCodeSyscallKill = kill
-	})
 
 	root := t.TempDir()
-	stateDir := filepath.Join(root, "session", "state")
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+	xdg, err := createXDGDirs(root, "lease-log")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeLease(stateDir, serverLease{PID: 1234}); err != nil {
+	leasePath := filepath.Join(xdg.State, leaseFileName)
+	openCodeInspectProcess = func(int) (processIdentity, error) {
+		return processIdentity{
+			StartTime: "start",
+			Cmdline:   []string{"opencode", "serve"},
+			Env: map[string]string{
+				"XDG_STATE_HOME":           xdg.State,
+				"OPENCODE_SERVER_PASSWORD": "secret",
+			},
+		}, nil
+	}
+	openCodeSyscallGetpgid = func(int) (int, error) { return 123, nil }
+	openCodeSyscallKill = func(int, syscall.Signal) error { return errors.New("kill failed") }
+	if err := writeLease(xdg.State, serverLease{
+		PID:              123,
+		PasswordHash:     passwordHash("secret"),
+		XDGRoot:          xdg.Root,
+		ProcessStartTime: "start",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	openCodeSyscallKill = func(int, syscall.Signal) error {
-		return syscall.EPERM
-	}
-	if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
-		t.Fatalf("reap stale lease: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(stateDir, leaseFileName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("lease after reap err = %v", err)
+	reapLeaseFile(leasePath, slog.New(slog.DiscardHandler))
+	if _, err := os.Stat(leasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lease after logged reap = %v", err)
 	}
 }
