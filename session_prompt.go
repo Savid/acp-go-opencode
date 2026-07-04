@@ -45,12 +45,20 @@ func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pro
 		return acp.PromptResponse{}, err
 	}
 	invocation, slashCandidate := slashCommandInvocation(params.Prompt)
+	_, matchedBeforeRefresh := s.cachedCommand(invocation.name)
 	if slashCandidate {
 		if err := s.refreshCommands(ctx); err != nil && s.agent != nil && s.agent.log != nil {
 			s.agent.log.DebugContext(ctx, "refresh OpenCode commands before prompt failed", slog.String("session_id", string(s.id)), slog.String("error", err.Error()))
 		}
 	}
 	command, matchedCommand := s.cachedCommand(invocation.name)
+	if slashCandidate && matchedBeforeRefresh && !matchedCommand {
+		return acp.PromptResponse{}, acp.NewInvalidParams(map[string]any{
+			jsonFieldError:   "opencode_command_removed",
+			jsonFieldMessage: fmt.Sprintf("OpenCode command %q is no longer available", invocation.name),
+			"command":        invocation.name,
+		})
+	}
 	acquire := s.acquireTurn
 	if matchedCommand {
 		acquire = s.acquireCommandTurn

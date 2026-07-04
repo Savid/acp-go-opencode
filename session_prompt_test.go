@@ -1594,6 +1594,42 @@ func TestPromptSlashCommandRouting(t *testing.T) {
 		}
 	})
 
+	t.Run("pre-prompt refresh removed cached command", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.commands = []nativeCommand{{Name: "stale", Description: "Stale", Source: "command"}}
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		if err := session.refreshCommands(ctx); err != nil {
+			t.Fatalf("initial refresh: %v", err)
+		}
+		if conn.updateCount() != 1 {
+			t.Fatalf("initial updates = %#v", conn.updates)
+		}
+		client.commands = nil
+		client.sendMessage = func(context.Context, string, openCodeMessageRequest) (nativeMessage, error) {
+			t.Fatal("removed command fell back to plain message")
+			return nativeMessage{}, nil
+		}
+		client.runCommand = func(context.Context, string, openCodeCommandRequest) (nativeMessage, error) {
+			t.Fatal("removed command was sent to native command endpoint")
+			return nativeMessage{}, nil
+		}
+
+		_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("/stale now")}})
+		if err == nil || !strings.Contains(err.Error(), "opencode_command_removed") || !strings.Contains(err.Error(), "stale") {
+			t.Fatalf("removed command error = %v", err)
+		}
+		if conn.updateCount() != 2 {
+			t.Fatalf("updates = %#v", conn.updates)
+		}
+		clearUpdate := conn.updates[1].Update.AvailableCommandsUpdate
+		if clearUpdate == nil || len(clearUpdate.AvailableCommands) != 0 {
+			t.Fatalf("refreshed clear update = %#v", clearUpdate)
+		}
+	})
+
 	t.Run("custom shadowing fixture routes exact name as data", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.commands = []nativeCommand{{Name: "init", Description: "Workspace init", Source: "command"}}
