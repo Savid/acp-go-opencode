@@ -31,6 +31,7 @@ type elicitationScope struct {
 type localAgentConnection struct {
 	agent       *Agent
 	conn        *acp.Connection
+	postWriter  *postResponseWriter
 	initialized atomic.Bool
 }
 
@@ -45,26 +46,33 @@ var (
 	_ agentClient = (*localAgentConnection)(nil)
 
 	localAgentHandlers = map[string]localAgentHandler{
-		acp.AgentMethodAuthenticate:           localResponse((*Agent).Authenticate),
-		acp.AgentMethodInitialize:             localResponse((*Agent).Initialize),
-		acp.AgentMethodLogout:                 localResponse((*Agent).Logout),
-		acp.AgentMethodSessionCancel:          localNotification((*Agent).Cancel),
-		acp.AgentMethodSessionClose:           localResponse((*Agent).CloseSession),
-		acp.AgentMethodSessionDelete:          localResponse((*Agent).UnstableDeleteSession),
-		acp.AgentMethodSessionList:            localResponse((*Agent).ListSessions),
-		acp.AgentMethodSessionLoad:            localResponse((*Agent).LoadSession),
-		acp.AgentMethodSessionNew:             localResponse((*Agent).NewSession),
-		acp.AgentMethodSessionPrompt:          localResponse((*Agent).Prompt),
-		acp.AgentMethodSessionResume:          localResponse((*Agent).ResumeSession),
+		acp.AgentMethodAuthenticate:  localResponse((*Agent).Authenticate),
+		acp.AgentMethodInitialize:    localResponse((*Agent).Initialize),
+		acp.AgentMethodLogout:        localResponse((*Agent).Logout),
+		acp.AgentMethodSessionCancel: localNotification((*Agent).Cancel),
+		acp.AgentMethodSessionClose:  localResponse((*Agent).CloseSession),
+		acp.AgentMethodSessionDelete: localResponse((*Agent).UnstableDeleteSession),
+		acp.AgentMethodSessionList:   localResponse((*Agent).ListSessions),
+		acp.AgentMethodSessionLoad: localLifecycleResponse((*Agent).LoadSession, func(req acp.LoadSessionRequest, _ acp.LoadSessionResponse) acp.SessionId {
+			return req.SessionId
+		}),
+		acp.AgentMethodSessionNew: localLifecycleResponse((*Agent).NewSession, func(_ acp.NewSessionRequest, resp acp.NewSessionResponse) acp.SessionId {
+			return resp.SessionId
+		}),
+		acp.AgentMethodSessionPrompt: localResponse((*Agent).Prompt),
+		acp.AgentMethodSessionResume: localLifecycleResponse((*Agent).ResumeSession, func(req acp.ResumeSessionRequest, _ acp.ResumeSessionResponse) acp.SessionId {
+			return req.SessionId
+		}),
 		acp.AgentMethodSessionSetConfigOption: localResponse((*Agent).SetSessionConfigOption),
 		acp.AgentMethodSessionSetMode:         localResponse((*Agent).SetSessionMode),
 	}
 )
 
 func newLocalAgentConnection(agent *Agent, output io.Writer, input io.Reader) *localAgentConnection {
-	conn := &localAgentConnection{agent: agent}
+	postWriter := newPostResponseWriter(output)
+	conn := &localAgentConnection{agent: agent, postWriter: postWriter}
 	inputGate := newConnectionInputGate(input)
-	conn.conn = acp.NewConnection(conn.handle, output, inputGate)
+	conn.conn = acp.NewConnection(conn.handle, postWriter, inputGate)
 	conn.conn.SetLogger(agent.log)
 	inputGate.open()
 
@@ -104,6 +112,17 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 	}
 	if strings.HasPrefix(method, "_") {
 		result, err := c.agent.HandleExtensionMethod(ctx, method, params)
+		if err == nil && method == ForkSessionMethod {
+			if resp, ok := result.(acp.UnstableForkSessionResponse); ok {
+				result = localPostResponse{
+					result: resp,
+					after:  []func(){c.agent.refreshCommandsAfterResponse(resp.SessionId)},
+				}
+			}
+		}
+		if err == nil {
+			result = c.unwrapPostResponse(result)
+		}
 		return result, requestError(err)
 	}
 
@@ -112,11 +131,64 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 		return nil, acp.NewMethodNotFound(method)
 	}
 	result, reqErr := handler(ctx, c.agent, params)
+	if reqErr == nil {
+		result = c.unwrapPostResponse(result)
+	}
 	if method == acp.AgentMethodInitialize && reqErr == nil {
 		c.initialized.Store(true)
 	}
 
 	return result, reqErr
+}
+
+func (c *localAgentConnection) unwrapPostResponse(result any) any {
+	post, ok := result.(localPostResponse)
+	if !ok {
+		return result
+	}
+	if len(post.after) > 0 && c.postWriter != nil {
+		c.postWriter.afterNextWrite(post.after...)
+	}
+	return post.result
+}
+
+type localPostResponse struct {
+	result any
+	after  []func()
+}
+
+type postResponseWriter struct {
+	w io.Writer
+
+	mu    sync.Mutex
+	after []func()
+}
+
+func newPostResponseWriter(w io.Writer) *postResponseWriter {
+	return &postResponseWriter{w: w}
+}
+
+func (w *postResponseWriter) afterNextWrite(after ...func()) {
+	w.mu.Lock()
+	w.after = append(w.after, after...)
+	w.mu.Unlock()
+}
+
+func (w *postResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	w.mu.Lock()
+	after := append([]func(){}, w.after...)
+	w.after = nil
+	w.mu.Unlock()
+	for _, hook := range after {
+		if hook != nil {
+			go hook()
+		}
+	}
+	return n, nil
 }
 
 func localResponse[Req any, ReqPtr localAgentParams[Req], Resp any](
@@ -133,6 +205,30 @@ func localResponse[Req any, ReqPtr localAgentParams[Req], Resp any](
 		}
 
 		return resp, nil
+	}
+}
+
+func localLifecycleResponse[Req any, ReqPtr localAgentParams[Req], Resp any](
+	call func(*Agent, context.Context, Req) (Resp, error),
+	sessionID func(Req, Resp) acp.SessionId,
+) localAgentHandler {
+	return func(ctx context.Context, agent *Agent, params json.RawMessage) (any, *acp.RequestError) {
+		value, reqErr := decodeLocalAgentParams[Req, ReqPtr](params)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		resp, err := call(agent, ctx, value)
+		if err != nil {
+			return nil, requestError(err)
+		}
+		id := sessionID(value, resp)
+		if id == "" {
+			return resp, nil
+		}
+		return localPostResponse{
+			result: resp,
+			after:  []func(){agent.refreshCommandsAfterResponse(id)},
+		}, nil
 	}
 }
 

@@ -230,6 +230,25 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 	if err := validateOpenCodeDoc(doc); err == nil || !strings.Contains(err.Error(), "question") {
 		t.Fatalf("validateOpenCodeDoc error = %v", err)
 	}
+	for _, path := range []string{"/command", "/session/{sessionID}/command", "/session/{sessionID}/message"} {
+		t.Run("route gate missing "+path, func(t *testing.T) {
+			doc := cloneOpenCodeDoc(t, fullOpenCodeDoc())
+			paths := doc["paths"].(map[string]any)
+			delete(paths, path)
+			err := validateOpenCodeDoc(doc)
+			if err == nil || !strings.Contains(err.Error(), path) {
+				t.Fatalf("validateOpenCodeDoc error = %v", err)
+			}
+		})
+	}
+	t.Run("deleted prompt route is not required", func(t *testing.T) {
+		doc := cloneOpenCodeDoc(t, fullOpenCodeDoc())
+		paths := doc["paths"].(map[string]any)
+		delete(paths, "/api/session/{sessionID}/prompt")
+		if err := validateOpenCodeDoc(doc); err != nil {
+			t.Fatalf("validateOpenCodeDoc without deleted prompt route: %v", err)
+		}
+	})
 	for _, tt := range []struct {
 		name   string
 		mutate func(map[string]any)
@@ -579,10 +598,12 @@ func fullOpenCodeDoc() map[string]any {
 	paths := map[string]any{}
 	for _, path := range []string{
 		"/config/providers",
+		"/command",
 		"/event",
 		"/session/status",
 		"/session",
 		"/session/{sessionID}",
+		"/session/{sessionID}/command",
 		"/session/{sessionID}/message",
 		"/session/{sessionID}/abort",
 		"/session/{sessionID}/fork",
@@ -597,7 +618,6 @@ func fullOpenCodeDoc() map[string]any {
 		"/api/session/{sessionID}/agent",
 		"/api/session/{sessionID}/message",
 		"/api/session/{sessionID}/model",
-		"/api/session/{sessionID}/prompt",
 		"/api/session/{sessionID}/permission/{requestID}/reply",
 		"/api/permission/request",
 		"/api/session/{sessionID}/question/{requestID}/reply",

@@ -23,6 +23,7 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 	ctx := context.Background()
 	var seen []string
 	var messageBody openCodeMessageRequest
+	var commandBody openCodeCommandRequest
 	var forkBody map[string]any
 	var createBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -59,9 +60,28 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 			})
 		case path == "/session/s%2F1/message" && r.Method == http.MethodGet:
 			writeJSON(t, w, []map[string]any{{
-				"info":  map[string]any{"id": "legacy", "sessionID": "s/1", "role": "assistant"},
-				"parts": []map[string]any{{"id": "legacy-part", "sessionID": "s/1", "messageID": "legacy", "type": "text", "text": "ok"}},
+				"info":  map[string]any{"id": "history", "sessionID": "s/1", "role": "assistant"},
+				"parts": []map[string]any{{"id": "history-part", "sessionID": "s/1", "messageID": "history", "type": "text", "text": "ok"}},
 			}})
+		case path == "/command" && r.Method == http.MethodGet:
+			writeJSON(t, w, []map[string]any{{
+				"name":        "review",
+				"description": "Review",
+				"agent":       "build",
+				"model":       "openai/gpt-test",
+				"source":      "command",
+				"template":    "hidden",
+				"subtask":     true,
+				"hints":       []string{"$ARGUMENTS"},
+			}})
+		case path == "/session/s%2F1/command" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&commandBody); err != nil {
+				t.Errorf("decode command body: %v", err)
+			}
+			writeJSON(t, w, map[string]any{
+				"info":  map[string]any{"id": "assistant-command", "sessionID": "s/1", "role": "assistant", "finish": "stop"},
+				"parts": []map[string]any{{"id": "part-command", "sessionID": "s/1", "messageID": "assistant-command", "type": "text", "text": "ok"}},
+			})
 		case path == "/session/status" && r.Method == http.MethodGet:
 			writeJSON(t, w, map[string]any{"s/1": map[string]any{"type": "idle"}})
 		case path == "/session/s%2F1/abort" && r.Method == http.MethodPost:
@@ -131,8 +151,25 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 		t.Fatalf("SendMessage = %#v body=%#v err=%v", message, messageBody, err)
 	}
 	messages, err := client.Messages(ctx, "s/1")
-	if err != nil || len(messages) != 1 || messages[0].Info.ID != "legacy" {
+	if err != nil || len(messages) != 1 || messages[0].Info.ID != "history" {
 		t.Fatalf("Messages = %#v err=%v", messages, err)
+	}
+	commands, err := client.Commands(ctx)
+	if err != nil || len(commands) != 1 || commands[0].Name != "review" || commands[0].Template == nil || len(commands[0].Hints) != 1 {
+		t.Fatalf("Commands = %#v err=%v", commands, err)
+	}
+	command, err := client.RunCommand(ctx, "s/1", openCodeCommandRequest{
+		MessageID: "user-2",
+		Agent:     "build",
+		Model:     "openai/gpt-test",
+		Command:   "review",
+		Arguments: "args",
+		Parts:     []map[string]any{{"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA=="}},
+	})
+	if err != nil || command.Info.ID != "assistant-command" || commandBody.MessageID != "user-2" ||
+		commandBody.Model != "openai/gpt-test" || commandBody.Command != "review" || commandBody.Arguments != "args" ||
+		len(commandBody.Parts) != 1 {
+		t.Fatalf("RunCommand = %#v body=%#v err=%v", command, commandBody, err)
 	}
 	status, err := client.SessionStatus(ctx)
 	if err != nil || status["s/1"].Type != "idle" {
@@ -201,12 +238,25 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		handler func(http.ResponseWriter, *http.Request)
+		command bool
 	}{
 		{
 			name: "post error",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/session/s/message" && r.Method == http.MethodPost {
 					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				http.NotFound(w, r)
+			},
+		},
+		{
+			name:    "command post error",
+			command: true,
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/session/s/command" && r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte("unknown command"))
 					return
 				}
 				http.NotFound(w, r)
@@ -222,6 +272,24 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 							"role":   "assistant",
 							"finish": "error",
 							"error":  map[string]any{"message": "provider failed"},
+						},
+					})
+					return
+				}
+				http.NotFound(w, r)
+			},
+		},
+		{
+			name:    "command assistant error",
+			command: true,
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/session/s/command" && r.Method == http.MethodPost {
+					writeJSON(t, w, map[string]any{
+						"info": map[string]any{
+							"id":     "assistant",
+							"role":   "assistant",
+							"finish": "error",
+							"error":  map[string]any{"message": "command failed"},
 						},
 					})
 					return
@@ -245,8 +313,14 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 				username:   "opencode",
 				password:   "secret",
 			}
-			if _, err := client.SendMessage(ctx, "s", openCodeMessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}}); err == nil {
-				t.Fatal("SendMessage unexpectedly succeeded")
+			var err error
+			if tt.command {
+				_, err = client.RunCommand(ctx, "s", openCodeCommandRequest{Command: "review", Arguments: ""})
+			} else {
+				_, err = client.SendMessage(ctx, "s", openCodeMessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}})
+			}
+			if err == nil {
+				t.Fatal("native send unexpectedly succeeded")
 			}
 		})
 	}

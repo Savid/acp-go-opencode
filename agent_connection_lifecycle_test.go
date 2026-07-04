@@ -1,11 +1,13 @@
 package opencodeacp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -183,6 +185,150 @@ func TestNewLocalAgentConnectionDone(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("local connection did not close after EOF input")
 	}
+}
+
+func TestLifecycleCommandUpdateAfterResponseBytes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	c2aR, c2aW := io.Pipe()
+	a2cR, a2cW := io.Pipe()
+	t.Cleanup(func() {
+		_ = c2aR.Close()
+		_ = c2aW.Close()
+		_ = a2cR.Close()
+		_ = a2cW.Close()
+	})
+
+	agent := NewAgent()
+	agent.options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+		client := newFakeOpenCodeClient()
+		xdg, err := createXDGDirs(t.TempDir(), string(opts.ACPSessionID))
+		if err != nil {
+			return nil, err
+		}
+		client.xdg = xdg
+		client.createSession = testNativeSession("native-1")
+		client.commands = []nativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+		return client, nil
+	}
+	conn := newLocalAgentConnection(agent, a2cW, c2aR)
+	agent.setAgentClient(conn)
+
+	lines := make(chan string, 4)
+	go func() {
+		scanner := bufio.NewScanner(a2cR)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+	}()
+	writeJSONRPC := func(payload string) {
+		t.Helper()
+		if _, err := io.WriteString(c2aW, payload+"\n"); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+	}
+	readLine := func() string {
+		t.Helper()
+		select {
+		case line := <-lines:
+			return line
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for JSON-RPC line")
+			return ""
+		}
+	}
+
+	writeJSONRPC(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`)
+	if line := readLine(); !strings.Contains(line, `"id":1`) || !strings.Contains(line, `"result"`) {
+		t.Fatalf("initialize line = %s", line)
+	}
+	cwd := t.TempDir()
+	writeJSONRPC(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":` + strconv.Quote(cwd) + `,"mcpServers":[]}}`)
+	responseLine := readLine()
+	if !strings.Contains(responseLine, `"id":2`) || !strings.Contains(responseLine, `"result"`) {
+		t.Fatalf("session/new response line = %s", responseLine)
+	}
+	updateLine := readLine()
+	if !strings.Contains(updateLine, `"method":"session/update"`) ||
+		!strings.Contains(updateLine, `"sessionUpdate":"available_commands_update"`) ||
+		!strings.Contains(updateLine, `"name":"review"`) {
+		t.Fatalf("post-response update line = %s", updateLine)
+	}
+}
+
+func TestPostResponseHookBranches(t *testing.T) {
+	ctx := context.Background()
+	writer := newPostResponseWriter(errWriter{})
+	writer.afterNextWrite(func() { t.Fatal("hook ran after failed write") })
+	if _, err := writer.Write([]byte("response\n")); err == nil {
+		t.Fatal("postResponseWriter write error = nil")
+	}
+
+	handler := localLifecycleResponse(
+		func(*Agent, context.Context, acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+			return acp.NewSessionResponse{}, errors.New("new failed")
+		},
+		func(_ acp.NewSessionRequest, resp acp.NewSessionResponse) acp.SessionId { return resp.SessionId },
+	)
+	_, reqErr := handler(ctx, NewAgent(), mustJSON(t, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}}))
+	if reqErr == nil || !strings.Contains(reqErr.Message, "Internal error") {
+		t.Fatalf("lifecycle call error = %#v", reqErr)
+	}
+
+	emptyIDHandler := localLifecycleResponse(
+		func(*Agent, context.Context, acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+			return acp.NewSessionResponse{}, nil
+		},
+		func(_ acp.NewSessionRequest, resp acp.NewSessionResponse) acp.SessionId { return resp.SessionId },
+	)
+	result, reqErr := emptyIDHandler(ctx, NewAgent(), mustJSON(t, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}}))
+	if reqErr != nil {
+		t.Fatalf("empty id handler: %#v", reqErr)
+	}
+	if _, ok := result.(localPostResponse); ok {
+		t.Fatal("empty session id registered post response hook")
+	}
+
+	missingAgent := NewAgent()
+	missingAgent.refreshCommandsAfterResponse("missing")()
+
+	refreshErrClient := newFakeOpenCodeClient()
+	refreshErrClient.commandsErr = errors.New("commands failed")
+	refreshErrAgent := NewAgent()
+	refreshErrSession := testSession(refreshErrAgent, refreshErrClient)
+	refreshErrAgent.sessions[refreshErrSession.id] = refreshErrSession
+	refreshErrAgent.refreshCommandsAfterResponse(refreshErrSession.id)()
+
+	parentClient := newFakeOpenCodeClient()
+	parentClient.forkSession = testNativeSession("native-child")
+	parentAgent := NewAgent()
+	parentAgent.options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+		child := newFakeOpenCodeClient()
+		xdg, err := createXDGDirs(t.TempDir(), string(opts.ACPSessionID))
+		if err != nil {
+			return nil, err
+		}
+		child.xdg = xdg
+		child.getSession = testNativeSession("native-child")
+		return child, nil
+	}
+	parent := testSession(parentAgent, parentClient)
+	parentAgent.sessions[parent.id] = parent
+	conn := &localAgentConnection{agent: parentAgent, postWriter: newPostResponseWriter(io.Discard)}
+	conn.initialized.Store(true)
+	result, reqErr = conn.handle(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, t.TempDir())))
+	if reqErr != nil {
+		t.Fatalf("fork extension handle: %#v", reqErr)
+	}
+	if _, ok := result.(acp.UnstableForkSessionResponse); !ok {
+		t.Fatalf("fork result = %#v", result)
+	}
+}
+
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
 }
 
 func TestLocalAgentConnectionClientCallsOverPipes(t *testing.T) {

@@ -21,6 +21,7 @@ type fakeOpenCodeClient struct {
 	todos         []nativeTodo
 	providers     providersResponse
 	agents        []nativeAgent
+	commands      []nativeCommand
 
 	pendingPermissions []permissionRequest
 	permissionReplies  []fakePermissionReply
@@ -29,6 +30,7 @@ type fakeOpenCodeClient struct {
 	questionRejects    []fakeQuestionReject
 
 	sendMessage func(context.Context, string, openCodeMessageRequest) (nativeMessage, error)
+	runCommand  func(context.Context, string, openCodeCommandRequest) (nativeMessage, error)
 
 	aborts         []string
 	deleted        []string
@@ -40,6 +42,8 @@ type fakeOpenCodeClient struct {
 	listErr        error
 	deleteErr      error
 	messagesErr    error
+	commandsErr    error
+	commandErr     error
 	abortErr       error
 	forkErr        error
 	todosErr       error
@@ -103,6 +107,17 @@ func (c *fakeOpenCodeClient) DeleteSession(_ context.Context, id string) error {
 	c.deleted = append(c.deleted, id)
 	c.mu.Unlock()
 	return c.deleteErr
+}
+
+func (c *fakeOpenCodeClient) Commands(context.Context) ([]nativeCommand, error) {
+	return append([]nativeCommand(nil), c.commands...), c.commandsErr
+}
+
+func (c *fakeOpenCodeClient) RunCommand(ctx context.Context, id string, req openCodeCommandRequest) (nativeMessage, error) {
+	if c.runCommand != nil {
+		return c.runCommand(ctx, id, req)
+	}
+	return nativeMessage{Info: nativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, c.commandErr
 }
 
 func (c *fakeOpenCodeClient) SendMessage(ctx context.Context, id string, req openCodeMessageRequest) (nativeMessage, error) {

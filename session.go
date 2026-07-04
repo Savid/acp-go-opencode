@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -43,6 +46,9 @@ type session struct {
 	failedStreamEpochs  map[uint64]struct{}
 	failedMessageIDs    map[string]struct{}
 	suppressNextBacklog bool
+	exclusiveTurn       bool
+	commandsByName      map[string]nativeCommand
+	availableCommands   []acp.AvailableCommand
 	closed              bool
 }
 
@@ -116,15 +122,44 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 }
 
 func (s *session) acquireTurn(ctx context.Context) (func(), error) {
+	return s.acquireTurnSlot(ctx, false)
+}
+
+func (s *session) acquireCommandTurn(ctx context.Context) (func(), error) {
+	return s.acquireTurnSlot(ctx, true)
+}
+
+func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), error) {
 	turn := s.turnQueue()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	select {
-	case turn <- struct{}{}:
-		return func() { <-turn }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
+	}
+	if exclusive {
+		if s.exclusiveTurn || len(turn) > 0 {
+			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: "backpressure", "limit": "session_prompt"})
+		}
+		s.exclusiveTurn = true
+		turn <- struct{}{}
+		return func() {
+			s.mu.Lock()
+			<-turn
+			s.exclusiveTurn = false
+			s.mu.Unlock()
+		}, nil
+	}
+	if s.exclusiveTurn || len(turn) >= cap(turn) {
 		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: "backpressure", "limit": "session_prompt"})
 	}
+	turn <- struct{}{}
+	return func() {
+		s.mu.Lock()
+		<-turn
+		s.mu.Unlock()
+	}, nil
 }
 
 func (s *session) turnQueue() chan struct{} {
@@ -377,6 +412,108 @@ func (s *session) currentMode() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mode
+}
+
+func (s *session) commandContext() (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mode, joinModelValue(s.providerID, s.modelID)
+}
+
+func (s *session) cachedCommand(name string) (nativeCommand, bool) {
+	if !validSlashCommandName(name) {
+		return nativeCommand{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cmd, ok := s.commandsByName[name]
+	return cmd, ok
+}
+
+func (s *session) refreshCommands(ctx context.Context) error {
+	commands, err := s.client.Commands(ctx)
+	if err != nil {
+		return err
+	}
+	commandsByName := make(map[string]nativeCommand, len(commands))
+	available := make([]acp.AvailableCommand, 0, len(commands))
+	for _, command := range commands {
+		if !validSlashCommandName(command.Name) {
+			continue
+		}
+		commandsByName[command.Name] = command
+		available = append(available, availableCommandFromNative(command))
+	}
+	if len(available) == 0 {
+		available = nil
+	}
+
+	s.mu.Lock()
+	changed := !reflect.DeepEqual(s.availableCommands, available)
+	if changed {
+		s.availableCommands = cloneAvailableCommands(available)
+	}
+	s.commandsByName = commandsByName
+	emit := cloneAvailableCommands(s.availableCommands)
+	s.mu.Unlock()
+
+	if !changed {
+		return nil
+	}
+	return s.emitUpdate(ctx, acp.SessionUpdate{
+		AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
+			SessionUpdate:     "available_commands_update",
+			AvailableCommands: emit,
+		},
+	})
+}
+
+func availableCommandFromNative(command nativeCommand) acp.AvailableCommand {
+	description := command.Description
+	if description == "" {
+		source := strings.TrimSpace(command.Source)
+		if source == "" {
+			description = "OpenCode command"
+		} else {
+			description = "OpenCode " + source + " command"
+		}
+	}
+	available := acp.AvailableCommand{
+		Name:        command.Name,
+		Description: description,
+	}
+	if len(command.Hints) > 0 {
+		available.Input = &acp.AvailableCommandInput{
+			Unstructured: &acp.UnstructuredCommandInput{Hint: strings.Join(command.Hints, " ")},
+		}
+	}
+	return available
+}
+
+func cloneAvailableCommands(in []acp.AvailableCommand) []acp.AvailableCommand {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]acp.AvailableCommand, len(in))
+	for i := range in {
+		out[i] = in[i]
+		if in[i].Meta != nil {
+			out[i].Meta = cloneAnyMap(in[i].Meta)
+		}
+	}
+	return out
+}
+
+func validSlashCommandName(name string) bool {
+	if name == "" || strings.Contains(name, "/") || !utf8.ValidString(name) {
+		return false
+	}
+	for _, r := range name {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *session) nextRawEventSequence() int64 {

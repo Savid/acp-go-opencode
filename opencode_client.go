@@ -41,6 +41,8 @@ type openCodeClient interface {
 	GetSession(context.Context, string) (nativeSession, error)
 	ListSessions(context.Context, string) ([]nativeSession, error)
 	DeleteSession(context.Context, string) error
+	Commands(context.Context) ([]nativeCommand, error)
+	RunCommand(context.Context, string, openCodeCommandRequest) (nativeMessage, error)
 	SendMessage(context.Context, string, openCodeMessageRequest) (nativeMessage, error)
 	Messages(context.Context, string) ([]nativeMessage, error)
 	Abort(context.Context, string) error
@@ -211,6 +213,17 @@ type nativeAgent struct {
 	Mode        string `json:"mode"`
 }
 
+type nativeCommand struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Agent       string   `json:"agent,omitempty"`
+	Model       string   `json:"model,omitempty"`
+	Source      string   `json:"source,omitempty"`
+	Template    any      `json:"template,omitempty"`
+	Subtask     bool     `json:"subtask,omitempty"`
+	Hints       []string `json:"hints"`
+}
+
 type openCodeEvent struct {
 	ID          string          `json:"id"`
 	Type        string          `json:"type"`
@@ -325,6 +338,15 @@ type openCodeMessageRequest struct {
 	Agent     string                 `json:"agent,omitempty"`
 	NoReply   bool                   `json:"noReply,omitempty"`
 	Parts     []map[string]any       `json:"parts"`
+}
+
+type openCodeCommandRequest struct {
+	MessageID string           `json:"messageID,omitempty"`
+	Agent     string           `json:"agent,omitempty"`
+	Model     string           `json:"model,omitempty"`
+	Command   string           `json:"command"`
+	Arguments string           `json:"arguments"`
+	Parts     []map[string]any `json:"parts,omitempty"`
 }
 
 type openCodeModelSelector struct {
@@ -651,6 +673,23 @@ func (s *openCodeServer) DeleteSession(ctx context.Context, id string) error {
 	return s.doJSON(ctx, http.MethodDelete, "/session/"+url.PathEscape(id), nil, nil, &ignored)
 }
 
+func (s *openCodeServer) Commands(ctx context.Context) ([]nativeCommand, error) {
+	var out []nativeCommand
+	err := s.getJSON(ctx, "/command", nil, &out)
+	return out, err
+}
+
+func (s *openCodeServer) RunCommand(ctx context.Context, id string, req openCodeCommandRequest) (nativeMessage, error) {
+	var out nativeMessage
+	if err := s.doJSONWithClient(ctx, s.blockingHTTPClient(), http.MethodPost, "/session/"+url.PathEscape(id)+"/command", nil, req, &out); err != nil {
+		return nativeMessage{}, err
+	}
+	if err := assistantMessageError(out); err != nil {
+		return nativeMessage{}, err
+	}
+	return out, nil
+}
+
 func (s *openCodeServer) SendMessage(ctx context.Context, id string, req openCodeMessageRequest) (nativeMessage, error) {
 	var out nativeMessage
 	if err := s.doJSONWithClient(ctx, s.blockingHTTPClient(), http.MethodPost, "/session/"+url.PathEscape(id)+"/message", nil, req, &out); err != nil {
@@ -856,7 +895,13 @@ func (s *openCodeServer) doJSONWithClient(
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("opencode %s %s returned %s: %s", method, path, resp.Status, strings.TrimSpace(string(data)))
+		return &openCodeHTTPError{
+			Method:     method,
+			Path:       path,
+			Status:     resp.Status,
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(data)),
+		}
 	}
 	if out == nil {
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
@@ -869,6 +914,23 @@ func (s *openCodeServer) doJSONWithClient(
 	}
 
 	return nil
+}
+
+type openCodeHTTPError struct {
+	Method     string
+	Path       string
+	Status     string
+	StatusCode int
+	Body       string
+}
+
+func (e *openCodeHTTPError) Error() string {
+	return fmt.Sprintf("opencode %s %s returned %s: %s", e.Method, e.Path, e.Status, e.Body)
+}
+
+func isOpenCodeBadRequest(err error) bool {
+	var httpErr *openCodeHTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusBadRequest
 }
 
 func (s *openCodeServer) blockingHTTPClient() *http.Client {
@@ -1013,10 +1075,12 @@ func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 	rawPaths, _ := doc["paths"].(map[string]any)
 	required := []string{
 		"/config/providers",
+		"/command",
 		"/event",
 		"/session/status",
 		"/session",
 		"/session/{sessionID}",
+		"/session/{sessionID}/command",
 		"/session/{sessionID}/message",
 		"/session/{sessionID}/abort",
 		"/session/{sessionID}/fork",
@@ -1036,7 +1100,7 @@ func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 	}
 	for _, path := range required {
 		if _, ok := rawPaths[path]; !ok {
-			return openCodeDocCapabilities{}, fmt.Errorf("opencode /doc missing required path %s", path)
+			return openCodeDocCapabilities{}, fmt.Errorf("opencode version mismatch: /doc missing required path %s", path)
 		}
 	}
 	if err := validateOpenCodeGetListOperation(rawPaths, "/api/permission/request", "PermissionV2Request"); err != nil {
