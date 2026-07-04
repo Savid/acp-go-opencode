@@ -1,39 +1,6 @@
----
-title: "MCP"
-description: "MCP server configuration through native OpenCode ACP"
-icon: "plug"
----
+# MCP
 
-MCP execution and credentials are native OpenCode behavior. The wrapper does
-not implement an ACP-over-ACP MCP bridge or proxy.
+ACP lifecycle requests accept stdio and HTTP MCP server definitions. SSE and
+ACP-transport MCP server definitions are rejected during session start.
 
-## Session request helpers
-
-The Go helpers construct ACP MCP server values for `session/new`,
-`session/load`, `session/resume`, and `session/fork`:
-
-```go
-stdio := opencodeacp.StdioMCPServer("tools", "tool-server", []string{"--stdio"}, map[string]string{
-    "TOKEN": "value",
-})
-
-http := opencodeacp.HTTPMCPServer("remote", "https://mcp.example.test", map[string]string{
-    "Authorization": "Bearer token",
-})
-
-sse := opencodeacp.SSEMCPServer("events", "https://mcp.example.test/sse", nil)
-
-req := opencodeacp.NewSessionRequest(cwd,
-    opencodeacp.WithSessionMCPServers(stdio, http, sse),
-)
-```
-
-The wrapper defensively copies MCP server definitions so callers can reuse or
-mutate their local values after building a request.
-
-## Boundary
-
-- Native OpenCode decides which MCP transports and server config are accepted.
-- Native OpenCode owns MCP tool execution and permissions.
-- The wrapper only provides typed request builders and does not forward MCP over
-  a separate ACP transport.
+The adapter does not expose a public MCP transport route.

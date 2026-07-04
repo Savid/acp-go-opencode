@@ -1,0 +1,17 @@
+# Raw Events
+
+Raw native events are emitted only after opt-in:
+
+```json
+{
+  "_meta": {
+    "opencode": {
+      "rawEvent": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+Events are sent as `_opencode/rawEvent` notifications and capped at 64 KiB.

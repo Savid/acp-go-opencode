@@ -1,32 +1,7 @@
----
-title: "Permissions"
-description: "OpenCode permission behavior through ACP"
-icon: "shield-question"
----
+# Permissions
 
-Permission evaluation is delegated to OpenCode.
+OpenCode permission v2 events are mapped to ACP `session/request_permission`.
+The adapter replies to OpenCode through the v2 permission reply route.
 
-The wrapper implements no additional policy engine and does not translate
-between a native protocol and ACP permission prompts. If native `opencode acp`
-emits ACP permission requests, the embedding ACP client should handle them
-directly.
-
-## Client methods in examples
-
-The examples implement ACP client-side permission callbacks so they can run as
-minimal hosts:
-
-```go
-func (c *client) RequestPermission(ctx context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error)
-```
-
-Those callbacks are example host behavior, not wrapper policy. Production hosts
-should decide whether to allow, deny, or ask a user based on their own trust
-model.
-
-## Operational controls
-
-- Use `WithCwd` / `-cwd` to scope the working directory.
-- Use `WithPure(true)` / `-pure` to avoid loading external plugins.
-- Use `WithEnv` to curate process environment variables.
-- Keep MCP credentials scoped to the servers that need them.
+On cancellation, pending native permission requests are rejected with a
+cancelled explanation and the ACP prompt returns `cancelled`.

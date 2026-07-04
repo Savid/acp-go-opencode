@@ -1,51 +1,13 @@
----
-title: "Examples"
-description: "Small examples for ACP host flows"
-icon: "flask-conical"
----
+# Examples
 
-## Minimal client
+The repository includes:
 
-```sh
-go run ./examples/minimal-client "Reply with hello from ACP"
-```
+- `examples/minimal-client`
+- `examples/interactive-chat`
+- `examples/resume-from-file`
 
-Smallest useful ACP host flow: start the embedded wrapper, initialize, create a
-session, send one prompt, print streamed updates, and close the session.
-
-## Interactive chat
+Run:
 
 ```sh
-go run ./examples/interactive-chat
+go run ./examples/minimal-client "Say hello"
 ```
-
-Line-based chat over ACP. It keeps OpenCode thoughts on one readable line per
-thought stream, prints tool and usage updates, sends `session/cancel` as an ACP
-notification on Ctrl-C while a prompt is active, and exits cleanly on Ctrl-C at
-the prompt.
-
-## Session continuity
-
-```sh
-go run ./examples/session-continuity
-```
-
-This example exercises the native lifecycle that matters for embedders:
-
-- create a fresh session
-- list, load, resume, fork, export, delete, and reimport it
-- import the saved OpenCode export fixture at `examples/session-continuity/session.json`
-- rewrite the saved fixture to fresh session/message/part IDs and the current cwd
-- load and resume the imported saved session
-- accept one optional prompt against the resumed saved session
-
-Press Enter on the final prompt to exit without spending model tokens. To run
-that final prompt non-interactively:
-
-```sh
-go run ./examples/session-continuity -prompt "What continuity phrase was saved earlier?"
-```
-
-The saved fixture contains a prior back-and-forth with the continuity phrase
-`ORCHID-HARBOR-42`, so it is useful for checking whether resume/import behavior
-is actually preserving conversation context.

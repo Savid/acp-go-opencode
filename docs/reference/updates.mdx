@@ -1,39 +1,12 @@
----
-title: "Updates"
-description: "Native OpenCode session/update behavior"
-icon: "activity"
----
+# Updates
 
-`opencode acp` emits standard ACP `session/update` notifications. The wrapper
-passes those notifications through unchanged.
+The adapter emits ACP `session/update` notifications for:
 
-## Common updates
+- user and agent message chunks
+- thought chunks
+- tool calls
+- plan updates
+- config option updates
+- usage updates
 
-| Update | Observed source |
-| --- | --- |
-| User message replay | `session/load` on an existing session. |
-| Agent message replay | `session/load` on an existing session. |
-| Agent message chunk | Live `session/prompt` response text. |
-| Thought chunk | Live OpenCode thinking/progress stream. |
-| Tool call | Native OpenCode tool execution. |
-| Tool call update | Native OpenCode tool progress/completion. |
-| Usage update | Token accounting from native OpenCode. |
-
-## Prompt response
-
-The final `session/prompt` response includes the native stop reason and may
-include usage:
-
-```go
-resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(sessionID, "hello"))
-fmt.Println(resp.StopReason)
-fmt.Println(resp.Usage)
-```
-
-## No raw extension stream
-
-The wrapper does not add private extension notifications around native events.
-The `_opencode/session/*` methods are request/response extensions for session
-file operations, not raw event streams. If OpenCode adds new standard ACP update
-fields, hosts receive them through the same JSON-RPC stream after the ACP SDK
-exposes the corresponding types.
+Usage metadata may include `_meta.opencode.messageId`.

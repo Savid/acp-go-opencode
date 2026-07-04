@@ -1,86 +1,64 @@
 package opencodeacp
 
 import (
-	"io"
+	"context"
+	"log/slog"
+	"time"
+
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
-const (
-	otelExporterOTLPEndpointKey = "OTEL_EXPORTER_OTLP_ENDPOINT"
-	otelExporterOTLPProtocolKey = "OTEL_EXPORTER_OTLP_PROTOCOL"
-	otelResourceAttributesKey   = "OTEL_RESOURCE_ATTRIBUTES"
-
-	defaultTelemetryProtocol        = "http/protobuf"
-	defaultTelemetryMetricsInterval = "1000"
-	defaultTelemetryDisableTraces   = "session"
-)
-
-// Option configures the OpenCode ACP wrapper.
+// Option configures the OpenCode ACP agent.
 type Option func(*Options)
 
-// TelemetryOptions configures OpenCode-native telemetry environment variables.
-type TelemetryOptions struct {
-	// Enabled sets OPENCODE_ENABLE_TELEMETRY=1 when true.
-	Enabled bool
-	// Endpoint sets OPENCODE_OTLP_ENDPOINT.
-	Endpoint string
-	// Protocol sets OPENCODE_OTLP_PROTOCOL.
-	Protocol string
-	// MetricsInterval sets OPENCODE_OTLP_METRICS_INTERVAL.
-	MetricsInterval string
-	// ResourceAttributes sets OPENCODE_RESOURCE_ATTRIBUTES.
-	ResourceAttributes string
-	// DisableLogs sets OPENCODE_DISABLE_LOGS=1 when true.
-	DisableLogs bool
-	// DisableTraces sets OPENCODE_DISABLE_TRACES to an OpenCode trace filter,
-	// for example "session".
-	DisableTraces string
-	// Traceparent sets OPENCODE_TRACEPARENT.
-	Traceparent string
-	// Tracestate sets OPENCODE_TRACESTATE.
-	Tracestate string
+// ConcurrencyLimits bounds work accepted by one Agent.
+type ConcurrencyLimits struct {
+	MaxActiveSessions        int
+	MaxConcurrentPrompts     int
+	MaxConcurrentClientCalls int
 }
 
-// Options configures the launched `opencode acp` process.
+// Options configures the ACP agent process and OpenCode sessions it starts.
 type Options struct {
-	// OpenCodePath is the OpenCode executable path. If empty, PATH is searched.
-	OpenCodePath string
-	// Cwd is passed to `opencode acp --cwd` and used as the child process
-	// working directory when non-empty.
-	Cwd string
-	// Pure runs OpenCode without external plugins.
-	Pure bool
-	// PrintLogs passes OpenCode's --print-logs flag.
-	PrintLogs bool
-	// LogLevel passes OpenCode's --log-level flag when non-empty.
-	LogLevel string
-	// Hostname passes OpenCode's --hostname flag when non-empty.
-	Hostname string
-	// Port passes OpenCode's --port flag when set. Use WithPort(0) to ask
-	// OpenCode to allocate a port.
-	Port *int
-	// MDNS passes OpenCode's --mdns flag.
-	MDNS bool
-	// MDNSDomain passes OpenCode's --mdns-domain flag when non-empty.
-	MDNSDomain string
-	// CORS passes one --cors flag for each configured domain.
-	CORS []string
-	// QuestionTool sets OPENCODE_ENABLE_QUESTION_TOOL when non-nil.
-	QuestionTool *bool
-	// Telemetry configures OpenCode-native telemetry environment variables.
-	Telemetry TelemetryOptions
-	// IsolateTempDir sets TMPDIR, TMP, and TEMP to a wrapper-owned temporary
-	// directory that is removed when the process exits.
-	IsolateTempDir bool
-	// Env is merged into the launched process environment.
-	Env map[string]string
-	// Stderr receives OpenCode stderr. If nil, stderr is discarded.
-	Stderr io.Writer
-	// ExtraArgs are appended after wrapper-managed `opencode acp` flags.
-	ExtraArgs []string
+	AgentName    string
+	AgentTitle   string
+	AgentVersion string
+
+	ExecutablePath string
+	Home           string
+	DefaultModel   string
+	Env            map[string]string
+
+	Logger            *slog.Logger
+	TracerProvider    trace.TracerProvider
+	MeterProvider     metric.MeterProvider
+	TextMapPropagator propagation.TextMapPropagator
+
+	SessionStore            SessionStore
+	SessionStoreLoadTimeout time.Duration
+	ConcurrencyLimits       ConcurrencyLimits
+
+	Pure               bool
+	QuestionTool       bool
+	LogLevel           string
+	MinimumVersion     string
+	HealthCheckTimeout time.Duration
+
+	clientFactory func(context.Context, openCodeStartOptions) (openCodeClient, error)
 }
 
 func applyOptions(opts []Option) Options {
-	options := Options{IsolateTempDir: true}
+	options := Options{
+		AgentName:               "acp-go-opencode",
+		AgentTitle:              "acp-go-opencode",
+		AgentVersion:            "0.1.0",
+		SessionStoreLoadTimeout: 10 * time.Second,
+		HealthCheckTimeout:      15 * time.Second,
+		MinimumVersion:          "1.17.11",
+		clientFactory:           startOpenCodeServer,
+	}
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -88,182 +66,118 @@ func applyOptions(opts []Option) Options {
 	return options
 }
 
-// WithOpenCodePath sets the OpenCode executable path.
-func WithOpenCodePath(path string) Option {
+func WithLogger(logger *slog.Logger) Option {
 	return func(options *Options) {
-		options.OpenCodePath = path
+		options.Logger = logger
 	}
 }
 
-// WithCwd sets the OpenCode working directory.
-func WithCwd(path string) Option {
+func WithAgentName(name string) Option {
 	return func(options *Options) {
-		options.Cwd = path
+		options.AgentName = name
 	}
 }
 
-// WithPure runs OpenCode without external plugins.
-func WithPure(enabled bool) Option {
+func WithAgentTitle(title string) Option {
 	return func(options *Options) {
-		options.Pure = enabled
+		options.AgentTitle = title
 	}
 }
 
-// WithPrintLogs forwards OpenCode logs to the configured stderr writer.
-func WithPrintLogs(enabled bool) Option {
+func WithAgentVersion(version string) Option {
 	return func(options *Options) {
-		options.PrintLogs = enabled
+		options.AgentVersion = version
 	}
 }
 
-// WithLogLevel sets OpenCode's log level. Supported values are defined by the
-// installed OpenCode CLI.
-func WithLogLevel(level string) Option {
+func WithExecutablePath(path string) Option {
 	return func(options *Options) {
-		options.LogLevel = level
+		options.ExecutablePath = path
 	}
 }
 
-// WithHostname sets OpenCode's ACP listener hostname.
-func WithHostname(hostname string) Option {
+// WithHome sets the parent root under which isolated per-session OpenCode XDG
+// data, config, cache, and state directories are created.
+func WithHome(path string) Option {
 	return func(options *Options) {
-		options.Hostname = hostname
+		options.Home = path
 	}
 }
 
-// WithPort sets OpenCode's ACP listener port. Use 0 to ask OpenCode to
-// allocate a port.
-func WithPort(port int) Option {
+func WithDefaultModel(model string) Option {
 	return func(options *Options) {
-		copied := port
-		options.Port = &copied
+		options.DefaultModel = model
 	}
 }
 
-// WithMDNS enables OpenCode mDNS service discovery.
-func WithMDNS(enabled bool) Option {
-	return func(options *Options) {
-		options.MDNS = enabled
-	}
-}
-
-// WithMDNSDomain sets OpenCode's mDNS domain.
-func WithMDNSDomain(domain string) Option {
-	return func(options *Options) {
-		options.MDNSDomain = domain
-	}
-}
-
-// WithCORS adds OpenCode CORS domains.
-func WithCORS(domains ...string) Option {
-	return func(options *Options) {
-		options.CORS = append([]string(nil), domains...)
-	}
-}
-
-// WithQuestionTool configures OpenCode's question tool environment flag.
-func WithQuestionTool(enabled bool) Option {
-	return func(options *Options) {
-		copied := enabled
-		options.QuestionTool = &copied
-	}
-}
-
-// WithTelemetry configures OpenCode-native telemetry environment variables.
-func WithTelemetry(telemetry TelemetryOptions) Option {
-	return func(options *Options) {
-		options.Telemetry = telemetry
-	}
-}
-
-// WithTelemetryFromEnv maps common OpenTelemetry process environment variables
-// into OpenCode-native telemetry variables. When any supported OTEL variable is
-// present, it applies OpenCode-friendly defaults for protocol, metrics
-// interval, log disabling, and session trace disabling.
-func WithTelemetryFromEnv(env map[string]string) Option {
-	telemetry := TelemetryOptionsFromEnv(env)
-
-	return func(options *Options) {
-		options.Telemetry = telemetry
-	}
-}
-
-// TelemetryOptionsFromEnv converts common OTEL environment variables into
-// OpenCode telemetry options. When any supported OTEL variable is present, the
-// returned options enable telemetry, default the protocol to "http/protobuf",
-// set the metrics interval to "1000", disable OpenCode logs, and disable
-// OpenCode session traces.
-func TelemetryOptionsFromEnv(env map[string]string) TelemetryOptions {
-	if len(env) == 0 {
-		return TelemetryOptions{}
-	}
-
-	telemetry := TelemetryOptions{
-		Endpoint:           env[otelExporterOTLPEndpointKey],
-		Protocol:           env[otelExporterOTLPProtocolKey],
-		ResourceAttributes: env[otelResourceAttributesKey],
-	}
-	if telemetry.Endpoint != "" || telemetry.Protocol != "" || telemetry.ResourceAttributes != "" {
-		telemetry.Enabled = true
-		if telemetry.Protocol == "" {
-			telemetry.Protocol = defaultTelemetryProtocol
-		}
-		telemetry.MetricsInterval = defaultTelemetryMetricsInterval
-		telemetry.DisableLogs = true
-		telemetry.DisableTraces = defaultTelemetryDisableTraces
-	}
-
-	return telemetry
-}
-
-// WithTraceContext injects W3C trace context into OpenCode's process
-// environment.
-func WithTraceContext(traceparent string, tracestate string) Option {
-	return func(options *Options) {
-		options.Telemetry.Traceparent = traceparent
-		options.Telemetry.Tracestate = tracestate
-	}
-}
-
-// WithIsolatedTempDir controls wrapper-owned temporary directory isolation.
-// It is enabled by default.
-func WithIsolatedTempDir(enabled bool) Option {
-	return func(options *Options) {
-		options.IsolateTempDir = enabled
-	}
-}
-
-// WithEnv merges environment variables into the launched OpenCode process.
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)
 	}
 }
 
-// WithStderr sets the writer used for OpenCode stderr.
-func WithStderr(stderr io.Writer) Option {
+func WithTracerProvider(provider trace.TracerProvider) Option {
 	return func(options *Options) {
-		options.Stderr = stderr
+		options.TracerProvider = provider
 	}
 }
 
-// WithExtraArgs appends raw arguments after wrapper-managed `opencode acp`
-// flags. Use this as an escape hatch for new OpenCode flags.
-func WithExtraArgs(args ...string) Option {
+func WithMeterProvider(provider metric.MeterProvider) Option {
 	return func(options *Options) {
-		options.ExtraArgs = append([]string(nil), args...)
+		options.MeterProvider = provider
 	}
 }
 
-func cloneStringMap(values map[string]string) map[string]string {
-	if values == nil {
-		return nil
+func WithTextMapPropagator(propagator propagation.TextMapPropagator) Option {
+	return func(options *Options) {
+		options.TextMapPropagator = propagator
 	}
+}
 
-	cloned := make(map[string]string, len(values))
-	for key, value := range values {
-		cloned[key] = value
+func WithSessionStore(store SessionStore) Option {
+	return func(options *Options) {
+		options.SessionStore = store
 	}
+}
 
-	return cloned
+func WithSessionStoreLoadTimeout(timeout time.Duration) Option {
+	return func(options *Options) {
+		options.SessionStoreLoadTimeout = timeout
+	}
+}
+
+func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
+	return func(options *Options) {
+		options.ConcurrencyLimits = limits
+	}
+}
+
+func WithOpenCodePure(enabled bool) Option {
+	return func(options *Options) {
+		options.Pure = enabled
+	}
+}
+
+func WithOpenCodeQuestionTool(enabled bool) Option {
+	return func(options *Options) {
+		options.QuestionTool = enabled
+	}
+}
+
+func WithOpenCodeLogLevel(level string) Option {
+	return func(options *Options) {
+		options.LogLevel = level
+	}
+}
+
+func WithOpenCodeMinimumVersion(version string) Option {
+	return func(options *Options) {
+		options.MinimumVersion = version
+	}
+}
+
+func WithOpenCodeHealthCheckTimeout(timeout time.Duration) Option {
+	return func(options *Options) {
+		options.HealthCheckTimeout = timeout
+	}
 }

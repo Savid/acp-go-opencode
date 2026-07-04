@@ -4,7 +4,6 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"syscall"
 )
 
@@ -21,8 +20,4 @@ func signalCode(sig os.Signal) int {
 	}
 
 	return 1
-}
-
-func signalExitCode(*exec.ExitError) int {
-	return 0
 }

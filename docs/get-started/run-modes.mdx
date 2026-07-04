@@ -1,49 +1,21 @@
----
-title: "Run modes"
-description: "Standalone command and embedded Go usage"
-icon: "route"
----
+# Run Modes
 
-## Standalone subprocess
+## Command
 
-Install or run the command when an editor or ACP host needs an executable:
+`acp-go-opencode` is intended to be launched by an ACP client.
 
 ```sh
-go install github.com/savid/acp-go-opencode/cmd/acp-go-opencode@latest
+acp-go-opencode -path /usr/bin/opencode -home /tmp/acp-opencode
 ```
 
-The command speaks ACP over stdin/stdout and writes diagnostics to stderr.
-
-```sh
-acp-go-opencode -cwd /workspace/project -pure
-```
-
-## Embedded Go
-
-Use `Serve` when another Go application already owns the ACP streams:
+## Embedded
 
 ```go
-err := opencodeacp.Serve(ctx, input, output,
-    opencodeacp.WithCwd("/workspace/project"),
-    opencodeacp.WithPure(true),
-    opencodeacp.WithHostname("127.0.0.1"),
-    opencodeacp.WithPort(0),
-)
+agent := opencodeacp.NewAgent(opencodeacp.WithHome(home))
 ```
 
-The wrapper starts `opencode acp` behind a narrow JSON-RPC proxy. Native OpenCode
-ACP methods pass through unchanged; wrapper-owned `_opencode/session/*`
-extension methods are handled by the proxy and advertised in `initialize`
-metadata.
+or:
 
-When `input` is not an `*os.File`, `Serve` copies it to the child through a
-pipe. Embedders should pass a reader that eventually returns data or EOF so
-shutdown can finish cleanly.
-
-## Local examples
-
-```sh
-go run ./examples/minimal-client "Reply with hello from ACP"
-go run ./examples/interactive-chat
-go run ./examples/session-continuity
+```go
+err := opencodeacp.Serve(ctx, input, output, opencodeacp.WithHome(home))
 ```

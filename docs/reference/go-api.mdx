@@ -1,109 +1,16 @@
----
-title: "Go API"
-description: "Public Go surface for embedding OpenCode ACP"
-icon: "code"
----
+# Go API
 
-## Serve
+Primary entry points:
 
 ```go
-func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) error
+agent := opencodeacp.NewAgent()
+err := opencodeacp.Serve(ctx, input, output)
 ```
 
-`Serve` launches native `opencode acp` behind a narrow JSON-RPC proxy. Native
-OpenCode ACP methods pass through unchanged. Wrapper-owned extension methods
-are handled by the proxy and successful `initialize` responses are augmented
-with extension metadata.
+Common options include `WithExecutablePath`, `WithHome`, `WithDefaultModel`,
+`WithEnv`, OpenTelemetry provider options, `WithSessionStore`, and
+`WithConcurrencyLimits`.
 
-When `input` is not an `*os.File`, `Serve` copies it to the child through a
-pipe. Embedders should pass a reader that eventually returns data or EOF so
-shutdown can finish cleanly.
-
-## Proxy extension methods
-
-```go
-const (
-    OpenCodeSessionExportMethod = "_opencode/session/export"
-    OpenCodeSessionImportMethod = "_opencode/session/import"
-    OpenCodeSessionDeleteMethod = "_opencode/session/delete"
-)
-```
-
-`Serve` advertises these methods under
-`agentCapabilities._meta["github.com/savid/acp-go-opencode"].extensions` in the
-proxied `initialize` response.
-
-| Method | Params | Result |
-| --- | --- | --- |
-| `_opencode/session/export` | `{ "sessionId": "ses_..." }`; omit or pass an empty ID to export the latest session. | `{ "sessionId": "ses_...", "bytes": 123, "rawJSON": "{...}" }` |
-| `_opencode/session/import` | `{ "path": "/path/to/opencode-session.json" }` | `{ "output": "..." }` |
-| `_opencode/session/delete` | `{ "sessionId": "ses_..." }` | `{ "deleted": true, "sessionId": "ses_..." }` |
-
-These methods wrap native OpenCode CLI session commands. They are wrapper
-extensions, not standard ACP methods.
-
-## Common options
-
-```go
-opencodeacp.WithOpenCodePath("/usr/bin/opencode")
-opencodeacp.WithCwd("/workspace/project")
-opencodeacp.WithPure(true)
-opencodeacp.WithStderr(os.Stderr)
-opencodeacp.WithEnv(map[string]string{"OPENCODE_DISABLE_AUTOUPDATE": "1"})
-opencodeacp.WithHostname("127.0.0.1")
-opencodeacp.WithPort(0)
-opencodeacp.WithQuestionTool(true)
-```
-
-Additional options cover OpenCode log forwarding, mDNS, CORS, isolated temp
-directories, native telemetry environment variables, W3C trace context, and raw
-extra OpenCode flags.
-
-## Request builders
-
-```go
-session := opencodeacp.NewSessionRequest(cwd)
-prompt := opencodeacp.TextPromptRequest(sessionID, "Summarize this repository")
-load := opencodeacp.LoadSessionRequest(sessionID, cwd)
-resume := opencodeacp.ResumeSessionRequest(sessionID, cwd)
-fork := opencodeacp.ForkSessionRequest(sessionID, cwd)
-list := opencodeacp.ListSessionsRequest(opencodeacp.WithListSessionsCwd(cwd))
-```
-
-Session builders initialize ACP-required empty slices and defensively copy
-metadata, additional directories, and MCP server definitions.
-
-## OpenCode config helpers
-
-```go
-setModel := opencodeacp.SetModelRequest(sessionID, "opencode/big-pickle")
-setMode := opencodeacp.SetModeConfigRequest(sessionID, opencodeacp.OpenCodeModePlan)
-```
-
-See [Models and Config](/docs/features/models-config) for the OpenCode-specific
-constants.
-
-## CLI inspection helpers
-
-```go
-probe, err := opencodeacp.ProbeCLI(ctx)
-version, err := opencodeacp.OpenCodeVersion(ctx)
-models, err := opencodeacp.OpenCodeModels(ctx)
-catalog := opencodeacp.NewModelCatalog()
-```
-
-Inspection helpers call OpenCode CLI commands. They are optional and not used by
-`Serve`.
-
-## Session file helpers
-
-```go
-exported, err := opencodeacp.ExportSession(ctx, sessionID)
-sessionID, err := opencodeacp.SessionIDFromExport(exported)
-_, err = opencodeacp.ImportSessionFile(ctx, "/path/to/opencode-session.json")
-err = opencodeacp.DeleteSession(ctx, sessionID)
-```
-
-These helpers call native OpenCode CLI commands for session import, export, and
-delete. Use ACP `session/load` or `session/resume` after importing when you want
-to continue the restored session through `opencode acp`.
+OpenCode options include `WithOpenCodePure`, `WithOpenCodeQuestionTool`,
+`WithOpenCodeLogLevel`, `WithOpenCodeMinimumVersion`, and
+`WithOpenCodeHealthCheckTimeout`.

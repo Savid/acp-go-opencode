@@ -1,0 +1,15 @@
+# Session Store
+
+`SessionStoreFormat` is `opencode-state-v1`.
+
+The store writes a complete snapshot after completed turns:
+
+- main snapshot entry
+- `idmap`
+- `xdg/data`
+- `xdg/config`
+- `xdg/cache`
+- `xdg/state`
+
+Archive entries are `tar+zstd+base64` and are restored into fresh per-session
+directories.

@@ -7,65 +7,57 @@
     "light": "#3B82F6",
     "dark": "#1D4ED8"
   },
-  "icons": {
-    "library": "lucide"
-  },
   "navigation": {
     "tabs": [
       {
         "tab": "Guides",
-        "icon": "book-open",
         "groups": [
           {
             "group": "Get started",
-            "icon": "rocket",
             "pages": [
               "docs/overview",
-              "docs/get-started/run-modes",
               "docs/get-started/quickstart",
               "docs/get-started/install",
+              "docs/get-started/run-modes",
               "docs/get-started/examples"
             ]
           },
           {
-            "group": "Core concepts",
-            "icon": "messages-square",
+            "group": "Core",
             "pages": [
               "docs/core/sessions",
               "docs/core/prompt-streaming"
             ]
           },
           {
-            "group": "OpenCode features",
-            "icon": "terminal",
+            "group": "Features",
             "pages": [
               "docs/features/authentication",
+              "docs/features/mcp",
               "docs/features/models-config",
               "docs/features/permissions",
-              "docs/features/mcp"
+              "docs/features/elicitation",
+              "docs/features/session-store",
+              "docs/features/raw-events"
             ]
           }
         ]
       },
       {
         "tab": "Reference",
-        "icon": "square-code",
         "groups": [
           {
-            "group": "API reference",
-            "icon": "code",
+            "group": "API",
             "pages": [
               "docs/reference/go-api",
               "docs/reference/cli",
               "docs/reference/acp-methods",
               "docs/reference/meta",
-              "docs/reference/session-import",
               "docs/reference/updates"
             ]
           },
           {
             "group": "Operations",
-            "icon": "shield",
             "pages": [
               "docs/operations/security",
               "docs/operations/observability"
@@ -74,27 +66,5 @@
         ]
       }
     ]
-  },
-  "navbar": {
-    "primary": {
-      "type": "button",
-      "label": "View source",
-      "href": "https://github.com/savid/acp-go-opencode"
-    }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/savid/acp-go-opencode"
-    }
   }
 }

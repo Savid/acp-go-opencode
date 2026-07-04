@@ -28,13 +28,10 @@ func TestOpenCodeACPAgentBinaryClosedInput(t *testing.T) {
 	defer cancel()
 
 	cmd := agentCommand(ctx,
-		"-opencode", integrationOpenCodePath(t),
-		"-cwd", t.TempDir(),
-		"-pure",
-		"-hostname", "127.0.0.1",
-		"-port", "0",
-		"-print-logs",
-		"-log-level", "INFO",
+		"-path", integrationOpenCodePath(t),
+		"-home", t.TempDir(),
+		"-opencode-pure",
+		"-opencode-log-level", "INFO",
 	)
 	cmd.Stdin = strings.NewReader("")
 
@@ -53,7 +50,6 @@ func TestOpenCodeACPAgentBinaryClosedInput(t *testing.T) {
 
 func requireRunIntegration(t *testing.T) {
 	t.Helper()
-
 	if os.Getenv(envRunIntegration) != "1" {
 		t.Skipf("set %s=1 to run live OpenCode integration tests", envRunIntegration)
 	}
@@ -61,7 +57,6 @@ func requireRunIntegration(t *testing.T) {
 
 func requireRunLiveTokens(t *testing.T) {
 	t.Helper()
-
 	requireRunIntegration(t)
 	if os.Getenv(envRunLiveTokens) != "1" {
 		t.Skipf("set %s=1 to run live OpenCode integration tests that spend model tokens", envRunLiveTokens)
@@ -70,7 +65,6 @@ func requireRunLiveTokens(t *testing.T) {
 
 func integrationOpenCodePath(t *testing.T) string {
 	t.Helper()
-
 	path := os.Getenv(envOpenCodePath)
 	if path == "" {
 		path = "opencode"
@@ -79,7 +73,6 @@ func integrationOpenCodePath(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("find opencode CLI: %v", err)
 	}
-
 	return resolved
 }
 
@@ -87,13 +80,11 @@ func agentCommand(ctx context.Context, args ...string) *exec.Cmd {
 	if binary := os.Getenv(envAgentBinary); binary != "" {
 		return exec.CommandContext(ctx, binary, args...) // #nosec G204,G702 -- opt-in integration test command.
 	}
-
 	commandArgs := make([]string, 0, 2+len(args))
 	commandArgs = append(commandArgs, "run", "./cmd/acp-go-opencode")
 	commandArgs = append(commandArgs, args...)
 	cmd := exec.CommandContext(ctx, "go", commandArgs...) // #nosec G204,G702 -- test runs the local wrapper command.
 	cmd.Dir = repoRoot()
-
 	return cmd
 }
 
@@ -102,6 +93,5 @@ func repoRoot() string {
 	if !ok {
 		return ".."
 	}
-
 	return filepath.Dir(filepath.Dir(file))
 }

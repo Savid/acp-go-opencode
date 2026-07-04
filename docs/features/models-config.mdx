@@ -1,44 +1,12 @@
----
-title: "Models and Config"
-description: "OpenCode model, mode, and metadata helpers"
-icon: "sliders-horizontal"
----
+# Models And Config
 
-OpenCode advertises session config options through native ACP. In current
-OpenCode builds, the important option IDs are `model` and `mode`.
+The model selector is an ACP config option with id `model` and category
+`model`. Values are built from authenticated `GET /config/providers` as
+`provider/model`.
 
-## Session config requests
+Mode selection uses config id `mode` and category `mode` when OpenCode agents
+are enumerable.
 
-```go
-setModel := opencodeacp.SetModelRequest(sessionID, "opencode/big-pickle")
-setMode := opencodeacp.SetModeConfigRequest(sessionID, opencodeacp.OpenCodeModePlan)
-```
-
-The exported constants are:
-
-| Constant | Value | Purpose |
-| --- | --- | --- |
-| `OpenCodeConfigModel` | `model` | Native OpenCode provider/model config option. |
-| `OpenCodeConfigMode` | `mode` | Native OpenCode session mode config option. |
-| `OpenCodeModeBuild` | `build` | OpenCode build mode. |
-| `OpenCodeModePlan` | `plan` | OpenCode plan mode. |
-
-`SetSessionModeRequest` is also available for ACP agents that expose mode as
-`session/set_mode`, but OpenCode's observed native path is
-`session/set_config_option`.
-
-## CLI model metadata
-
-For hosts that want local model metadata before creating a session:
-
-```go
-models, err := opencodeacp.OpenCodeModels(ctx)
-catalog := opencodeacp.NewModelCatalog(
-    opencodeacp.WithCwd("/workspace/project"),
-)
-models, err = catalog.Load(ctx)
-```
-
-`OpenCodeModels` parses `opencode models --verbose`. Parsing is intentionally
-soft-fail around optional fields so hosts can survive OpenCode output changes
-better than they would with direct ad hoc parsing.
+Structured output is not advertised for OpenCode. Supplying
+`_meta.opencode.options.outputSchema` returns the uniform unsupported-field
+error.

@@ -1,8 +1,9 @@
 # acp-go-opencode
 
-This repository provides a small Go wrapper around the native `opencode acp`
-server. Keep the wrapper thin: OpenCode owns ACP behavior; this package owns
-process launch, stream wiring, options, and embeddability.
+This repository provides a Go ACP agent around `opencode serve`. Keep the
+adapter focused: OpenCode owns model behavior; this package owns ACP dispatch,
+process launch, stream hygiene, per-session XDG isolation, options, storage,
+and embeddability.
 
 ## Development
 
@@ -10,4 +11,4 @@ process launch, stream wiring, options, and embeddability.
 - Run `make audit` before larger changes when time allows.
 - Keep stdout reserved for ACP JSON-RPC in the CLI. Logs and diagnostics belong
   on stderr.
-- Prefer adding new wrapper options before introducing ACP method translation.
+- Prefer new wrapper options before translating more native OpenCode behavior.
