@@ -22,6 +22,23 @@ func TestServeContextAndInputDone(t *testing.T) {
 	if err := Serve(cancelled, strings.NewReader(""), io.Discard); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Serve canceled error = %v", err)
 	}
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	waitReader, waitWriter := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(waitCtx, waitReader, io.Discard)
+	}()
+	waitCancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Serve wait canceled error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after context cancellation")
+	}
+	_ = waitReader.Close()
+	_ = waitWriter.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -256,19 +273,223 @@ func TestLifecycleCommandUpdateAfterResponseBytes(t *testing.T) {
 	}
 }
 
+func TestConcurrentLifecycleCommandUpdatesFollowOwnResponses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c2aR, c2aW := io.Pipe()
+	a2cR, a2cW := io.Pipe()
+	t.Cleanup(func() {
+		_ = c2aR.Close()
+		_ = c2aW.Close()
+		_ = a2cR.Close()
+		_ = a2cW.Close()
+	})
+
+	type createControl struct {
+		started  chan struct{}
+		release  chan struct{}
+		nativeID string
+		command  string
+	}
+	controls := make(chan *createControl, 2)
+	var factoryMu sync.Mutex
+	factoryCount := 0
+	agent := NewAgent()
+	agent.options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+		factoryMu.Lock()
+		factoryCount++
+		index := factoryCount
+		factoryMu.Unlock()
+
+		client := newFakeOpenCodeClient()
+		xdg, err := createXDGDirs(t.TempDir(), string(opts.ACPSessionID))
+		if err != nil {
+			return nil, err
+		}
+		client.xdg = xdg
+		control := &createControl{
+			started:  make(chan struct{}),
+			release:  make(chan struct{}),
+			nativeID: "native-" + strconv.Itoa(index),
+			command:  "cmd" + strconv.Itoa(index),
+		}
+		client.commands = []nativeCommand{{Name: control.command, Description: "Command", Source: "command"}}
+		client.createSessionFunc = func(ctx context.Context, _ string) (nativeSession, error) {
+			close(control.started)
+			select {
+			case <-control.release:
+				return testNativeSession(control.nativeID), nil
+			case <-ctx.Done():
+				return nativeSession{}, ctx.Err()
+			}
+		}
+		controls <- control
+		return client, nil
+	}
+	conn := newLocalAgentConnection(agent, a2cW, c2aR)
+	agent.setAgentClient(conn)
+
+	lines := make(chan string, 8)
+	go func() {
+		scanner := bufio.NewScanner(a2cR)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+	}()
+	writeJSONRPC := func(payload string) {
+		t.Helper()
+		if _, err := io.WriteString(c2aW, payload+"\n"); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+	}
+	readLine := func() string {
+		t.Helper()
+		select {
+		case line := <-lines:
+			return line
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for JSON-RPC line")
+			return ""
+		}
+	}
+
+	writeJSONRPC(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`)
+	if line := readLine(); !strings.Contains(line, `"id":1`) || !strings.Contains(line, `"result"`) {
+		t.Fatalf("initialize line = %s", line)
+	}
+	writeJSONRPC(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":` + strconv.Quote(t.TempDir()) + `,"mcpServers":[]}}`)
+	writeJSONRPC(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":` + strconv.Quote(t.TempDir()) + `,"mcpServers":[]}}`)
+	first := <-controls
+	second := <-controls
+	<-first.started
+	<-second.started
+	close(first.release)
+	close(second.release)
+
+	responseAt := map[acp.SessionId]int{}
+	updateAt := map[acp.SessionId]int{}
+	for i := 0; i < 4; i++ {
+		line := readLine()
+		var msg struct {
+			ID     *json.RawMessage `json:"id,omitempty"`
+			Method string           `json:"method,omitempty"`
+			Result struct {
+				SessionID acp.SessionId `json:"sessionId"`
+			} `json:"result,omitempty"`
+			Params struct {
+				SessionID acp.SessionId `json:"sessionId"`
+				Update    struct {
+					SessionUpdate string `json:"sessionUpdate"`
+				} `json:"update"`
+			} `json:"params,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			t.Fatalf("parse line %q: %v", line, err)
+		}
+		if msg.ID != nil && msg.Result.SessionID != "" {
+			responseAt[msg.Result.SessionID] = i
+		}
+		if msg.Method == "session/update" && msg.Params.Update.SessionUpdate == "available_commands_update" {
+			updateAt[msg.Params.SessionID] = i
+		}
+	}
+	if len(responseAt) != 2 || len(updateAt) != 2 {
+		t.Fatalf("responseAt=%#v updateAt=%#v", responseAt, updateAt)
+	}
+	for sessionID, updateIndex := range updateAt {
+		responseIndex, ok := responseAt[sessionID]
+		if !ok {
+			t.Fatalf("update for %q had no lifecycle response; responseAt=%#v updateAt=%#v", sessionID, responseAt, updateAt)
+		}
+		if updateIndex <= responseIndex {
+			t.Fatalf("update for %q at %d, response at %d; responseAt=%#v updateAt=%#v", sessionID, updateIndex, responseIndex, responseAt, updateAt)
+		}
+	}
+}
+
+func TestPostResponseWriterIgnoresUnrelatedWriteBeforeLifecycleResponse(t *testing.T) {
+	hooks := make(chan acp.SessionId, 1)
+	writer := newPostResponseWriter(io.Discard, func(id acp.SessionId) func() {
+		return func() { hooks <- id }
+	})
+	writer.observeRequestLine([]byte(`{"jsonrpc":"2.0","id":7,"method":"session/resume","params":{"sessionId":"session-7","cwd":"/tmp/project","mcpServers":[]}}`))
+	if _, err := writer.Write([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"other","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"unrelated"}}}}` + "\n")); err != nil {
+		t.Fatalf("write unrelated update: %v", err)
+	}
+	select {
+	case id := <-hooks:
+		t.Fatalf("unrelated write fired hook for %q", id)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	if _, err := writer.Write([]byte(`{"jsonrpc":"2.0","id":7,"result":{"configOptions":[]}}` + "\n")); err != nil {
+		t.Fatalf("write lifecycle response: %v", err)
+	}
+	select {
+	case id := <-hooks:
+		if id != "session-7" {
+			t.Fatalf("hook id = %q, want session-7", id)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle response did not fire hook")
+	}
+}
+
+func TestPostResponseWriterParserBranches(t *testing.T) {
+	if _, ok := postLifecycleRequestFromLine([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/list","params":{}}`)); ok {
+		t.Fatal("non-lifecycle request registered post-response hook")
+	}
+	if _, ok := postLifecycleRequestFromMessage(acp.AgentMethodSessionResume, json.RawMessage(`{`)); ok {
+		t.Fatal("malformed lifecycle params registered post-response hook")
+	}
+	if _, ok := postLifecycleRequestFromMessage(acp.AgentMethodSessionResume, json.RawMessage(`{"sessionId":""}`)); ok {
+		t.Fatal("empty lifecycle session id registered post-response hook")
+	}
+	if _, ok := jsonRPCIDKey(nil); ok {
+		t.Fatal("empty JSON-RPC id was accepted")
+	}
+	if _, ok := jsonRPCIDKey(json.RawMessage(`{`)); ok {
+		t.Fatal("malformed JSON-RPC id was accepted")
+	}
+
+	nilHookWriter := newPostResponseWriter(io.Discard, nil)
+	if hooks := nilHookWriter.hooksForResponseLine([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)); hooks != nil {
+		t.Fatalf("nil hook writer returned hooks: %#v", hooks)
+	}
+
+	writer := newPostResponseWriter(io.Discard, func(id acp.SessionId) func() {
+		return func() {}
+	})
+	writer.observeRequestLine([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp/project","mcpServers":[]}}`))
+	if hooks := writer.hooksForResponseLine([]byte(`{"jsonrpc":"2.0","id":1,"result":"bad"}`)); hooks != nil {
+		t.Fatalf("malformed lifecycle result returned hooks: %#v", hooks)
+	}
+	writer.observeRequestLine([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp/project","mcpServers":[]}}`))
+	if hooks := writer.hooksForResponseLine([]byte(`{"jsonrpc":"2.0","id":2,"result":{}}`)); hooks != nil {
+		t.Fatalf("empty lifecycle result session id returned hooks: %#v", hooks)
+	}
+}
+
 func TestPostResponseHookBranches(t *testing.T) {
 	ctx := context.Background()
-	writer := newPostResponseWriter(errWriter{})
-	writer.afterNextWrite(func() { t.Fatal("hook ran after failed write") })
-	if _, err := writer.Write([]byte("response\n")); err == nil {
+	hooks := make(chan acp.SessionId, 1)
+	writer := newPostResponseWriter(errWriter{}, func(id acp.SessionId) func() {
+		return func() { hooks <- id }
+	})
+	writer.observeRequestLine([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/resume","params":{"sessionId":"session-1"}}`))
+	if _, err := writer.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n")); err == nil {
 		t.Fatal("postResponseWriter write error = nil")
+	}
+	select {
+	case id := <-hooks:
+		t.Fatalf("hook ran after failed write for %q", id)
+	default:
 	}
 
 	handler := localLifecycleResponse(
 		func(*Agent, context.Context, acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 			return acp.NewSessionResponse{}, errors.New("new failed")
 		},
-		func(_ acp.NewSessionRequest, resp acp.NewSessionResponse) acp.SessionId { return resp.SessionId },
 	)
 	_, reqErr := handler(ctx, NewAgent(), mustJSON(t, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}}))
 	if reqErr == nil || !strings.Contains(reqErr.Message, "Internal error") {
@@ -279,14 +500,13 @@ func TestPostResponseHookBranches(t *testing.T) {
 		func(*Agent, context.Context, acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 			return acp.NewSessionResponse{}, nil
 		},
-		func(_ acp.NewSessionRequest, resp acp.NewSessionResponse) acp.SessionId { return resp.SessionId },
 	)
 	result, reqErr := emptyIDHandler(ctx, NewAgent(), mustJSON(t, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}}))
 	if reqErr != nil {
 		t.Fatalf("empty id handler: %#v", reqErr)
 	}
-	if _, ok := result.(localPostResponse); ok {
-		t.Fatal("empty session id registered post response hook")
+	if _, ok := result.(acp.NewSessionResponse); !ok {
+		t.Fatalf("empty id handler result = %#v", result)
 	}
 
 	missingAgent := NewAgent()
@@ -314,7 +534,7 @@ func TestPostResponseHookBranches(t *testing.T) {
 	}
 	parent := testSession(parentAgent, parentClient)
 	parentAgent.sessions[parent.id] = parent
-	conn := &localAgentConnection{agent: parentAgent, postWriter: newPostResponseWriter(io.Discard)}
+	conn := &localAgentConnection{agent: parentAgent}
 	conn.initialized.Store(true)
 	result, reqErr = conn.handle(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, t.TempDir())))
 	if reqErr != nil {

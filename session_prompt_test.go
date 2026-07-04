@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1508,6 +1509,16 @@ func TestSlashCommandRefreshEmptyClearAndFailureKeepsCache(t *testing.T) {
 	if clearUpdate == nil || len(clearUpdate.AvailableCommands) != 0 {
 		t.Fatalf("clear update = %#v", clearUpdate)
 	}
+	wire, err := json.Marshal(conn.updates[1])
+	if err != nil {
+		t.Fatalf("marshal clear update: %v", err)
+	}
+	if !strings.Contains(string(wire), `"availableCommands":[]`) {
+		t.Fatalf("clear update JSON = %s", wire)
+	}
+	if strings.Contains(string(wire), `"availableCommands":null`) {
+		t.Fatalf("clear update JSON used null: %s", wire)
+	}
 }
 
 func TestPromptSlashCommandRouting(t *testing.T) {
@@ -1924,6 +1935,181 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 			t.Fatal("unknown agent cancel succeeded")
 		}
 	})
+}
+
+func TestNativeSessionIDDriftPoisonsSession(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("mismatched final message info session id", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.commands = []nativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+		conn := newRecordingAgentClient()
+		store := newCountingSessionStore()
+		agent := NewAgent(WithSessionStore(store))
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		if err := session.refreshCommands(ctx); err != nil {
+			t.Fatalf("refreshCommands: %v", err)
+		}
+		client.sendMessage = func(_ context.Context, _ string, _ openCodeMessageRequest) (nativeMessage, error) {
+			return nativeMessage{
+				Info:  nativeMessageInfo{ID: "assistant", SessionID: "native-other", Role: "assistant", Finish: "stop"},
+				Parts: []nativePart{{SessionID: "native-1", MessageID: "assistant", Type: "text", Text: "should not emit"}},
+			}, nil
+		}
+
+		_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		assertNativeSessionDriftPoison(t, session, conn, store, err, "native-other")
+	})
+
+	t.Run("mismatched final message part session id", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.commands = []nativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+		conn := newRecordingAgentClient()
+		store := newCountingSessionStore()
+		agent := NewAgent(WithSessionStore(store))
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		if err := session.refreshCommands(ctx); err != nil {
+			t.Fatalf("refreshCommands: %v", err)
+		}
+		client.sendMessage = func(_ context.Context, _ string, _ openCodeMessageRequest) (nativeMessage, error) {
+			return nativeMessage{
+				Info:  nativeMessageInfo{ID: "assistant", SessionID: "native-1", Role: "assistant", Finish: "stop"},
+				Parts: []nativePart{{SessionID: "native-other", MessageID: "assistant", Type: "text", Text: "should not emit"}},
+			}, nil
+		}
+
+		_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		assertNativeSessionDriftPoison(t, session, conn, store, err, "native-other")
+	})
+
+	t.Run("mismatched replay message session id", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.commands = []nativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+		conn := newRecordingAgentClient()
+		store := newCountingSessionStore()
+		agent := NewAgent(WithSessionStore(store))
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		if err := session.refreshCommands(ctx); err != nil {
+			t.Fatalf("refreshCommands: %v", err)
+		}
+		client.messages = []nativeMessage{{
+			Info: nativeMessageInfo{ID: "user", SessionID: "native-other", Role: "user"},
+			Parts: []nativePart{{
+				SessionID: "native-other",
+				MessageID: "user",
+				Type:      "text",
+				Text:      "should not replay",
+			}},
+		}}
+
+		err := session.replayMessages(ctx)
+		assertNativeSessionDriftPoison(t, session, conn, store, err, "native-other")
+	})
+}
+
+func TestPoisonedSessionRejectsFollowUpOperations(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	conn := newRecordingAgentClient()
+	store := newCountingSessionStore()
+	agent := NewAgent(WithSessionStore(store))
+	agent.setAgentClient(conn)
+	s := testSession(agent, client)
+	agent.mu.Lock()
+	agent.sessions[s.id] = s
+	agent.mu.Unlock()
+
+	if err := s.poison(ctx, "native drift without advertisement"); err == nil ||
+		!strings.Contains(err.Error(), "opencode_native_session_id_drift") {
+		t.Fatalf("poison error = %v", err)
+	}
+	if conn.updateCount() != 0 {
+		t.Fatalf("poison without commands emitted updates: %#v", conn.updates)
+	}
+	if err := s.poison(ctx, "second poison"); err == nil ||
+		!strings.Contains(err.Error(), "session_poisoned") ||
+		!strings.Contains(err.Error(), "native drift without advertisement") {
+		t.Fatalf("second poison error = %v", err)
+	}
+	if _, err := s.acquireTurn(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
+		t.Fatalf("acquire poisoned session error = %v", err)
+	}
+	if err := s.refreshCommands(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
+		t.Fatalf("refresh poisoned session error = %v", err)
+	}
+	if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: s.id}); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
+		t.Fatalf("cancel poisoned session error = %v", err)
+	}
+	if _, err := agent.SetSessionConfigOption(ctx, SetModelRequest(s.id, "openai/gpt-test")); err == nil ||
+		!strings.Contains(err.Error(), "session_poisoned") {
+		t.Fatalf("set config poisoned session error = %v", err)
+	}
+	if err := s.replayMessages(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
+		t.Fatalf("replay poisoned session error = %v", err)
+	}
+	if err := s.snapshotToStore(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
+		t.Fatalf("snapshot poisoned session error = %v", err)
+	}
+	if store.replaceCount() != 0 {
+		t.Fatalf("store writes after poisoned follow-up = %d, want 0", store.replaceCount())
+	}
+	if err := (&session{}).validateNativeMessageSession(ctx, nativeMessage{Info: nativeMessageInfo{SessionID: "native-other"}}); err != nil {
+		t.Fatalf("empty expected native id validation error = %v", err)
+	}
+}
+
+func assertNativeSessionDriftPoison(
+	t *testing.T,
+	session *session,
+	conn *recordingAgentClient,
+	store *countingSessionStore,
+	err error,
+	gotNativeID string,
+) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), "opencode_native_session_id_drift") || !strings.Contains(err.Error(), gotNativeID) {
+		t.Fatalf("drift error = %v", err)
+	}
+	if conn.updateCount() != 2 {
+		t.Fatalf("updates after poison = %#v", conn.updates)
+	}
+	clearUpdate := conn.updates[1].Update.AvailableCommandsUpdate
+	if clearUpdate == nil || clearUpdate.AvailableCommands == nil || len(clearUpdate.AvailableCommands) != 0 {
+		t.Fatalf("poison clear update = %#v", clearUpdate)
+	}
+	if store.replaceCount() != 0 {
+		t.Fatalf("store writes after poison = %d, want 0", store.replaceCount())
+	}
+	_, nextErr := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("again")}})
+	if nextErr == nil || !strings.Contains(nextErr.Error(), "session_poisoned") || !strings.Contains(nextErr.Error(), gotNativeID) {
+		t.Fatalf("subsequent poison error = %v", nextErr)
+	}
+}
+
+type countingSessionStore struct {
+	*InMemorySessionStore
+	mu       sync.Mutex
+	replaces int
+}
+
+func newCountingSessionStore() *countingSessionStore {
+	return &countingSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+}
+
+func (s *countingSessionStore) Replace(ctx context.Context, main SessionKey, replacements []SessionStoreReplacement) error {
+	s.mu.Lock()
+	s.replaces++
+	s.mu.Unlock()
+	return s.InMemorySessionStore.Replace(ctx, main, replacements)
+}
+
+func (s *countingSessionStore) replaceCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.replaces
 }
 
 func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {

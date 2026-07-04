@@ -276,7 +276,6 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 		"/api/session/{sessionID}/agent",
 		"/api/session/{sessionID}/message",
 		"/api/session/{sessionID}/model",
-		"/api/session/{sessionID}/prompt",
 		"/api/session/{sessionID}/permission/{requestID}/reply",
 		"/api/permission/request",
 		"/api/session/{sessionID}/question/{requestID}/reply",

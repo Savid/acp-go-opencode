@@ -29,8 +29,9 @@ type fakeOpenCodeClient struct {
 	questionReplies    []fakeQuestionReply
 	questionRejects    []fakeQuestionReject
 
-	sendMessage func(context.Context, string, openCodeMessageRequest) (nativeMessage, error)
-	runCommand  func(context.Context, string, openCodeCommandRequest) (nativeMessage, error)
+	createSessionFunc func(context.Context, string) (nativeSession, error)
+	sendMessage       func(context.Context, string, openCodeMessageRequest) (nativeMessage, error)
+	runCommand        func(context.Context, string, openCodeCommandRequest) (nativeMessage, error)
 
 	aborts         []string
 	deleted        []string
@@ -90,7 +91,10 @@ func (c *fakeOpenCodeClient) Close(context.Context) error {
 	return c.closeErr
 }
 
-func (c *fakeOpenCodeClient) CreateSession(context.Context, string) (nativeSession, error) {
+func (c *fakeOpenCodeClient) CreateSession(ctx context.Context, title string) (nativeSession, error) {
+	if c.createSessionFunc != nil {
+		return c.createSessionFunc(ctx, title)
+	}
 	return c.createSession, c.createErr
 }
 

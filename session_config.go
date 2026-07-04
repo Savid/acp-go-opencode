@@ -20,6 +20,9 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	if err != nil {
 		return acp.SetSessionConfigOptionResponse{}, err
 	}
+	if err := session.ensureNotPoisoned(); err != nil {
+		return acp.SetSessionConfigOptionResponse{}, err
+	}
 	value := string(params.ValueId.Value)
 	if value == "" {
 		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{"field": "value"})

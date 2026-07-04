@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -49,6 +50,7 @@ type session struct {
 	exclusiveTurn       bool
 	commandsByName      map[string]nativeCommand
 	availableCommands   []acp.AvailableCommand
+	poisonCause         string
 	closed              bool
 }
 
@@ -137,6 +139,9 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
+	}
+	if err := s.poisonedErrorLocked(); err != nil {
+		return nil, err
 	}
 	if exclusive {
 		if s.exclusiveTurn || len(turn) > 0 {
@@ -237,6 +242,60 @@ func (s *session) wasCancelled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cancelled
+}
+
+func (s *session) ensureNotPoisoned() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.poisonedErrorLocked()
+}
+
+func (s *session) poisonedErrorLocked() error {
+	if s.poisonCause == "" {
+		return nil
+	}
+	return acp.NewInvalidRequest(map[string]any{
+		jsonFieldError: "session_poisoned",
+		"cause":        s.poisonCause,
+	})
+}
+
+func (s *session) poisonNativeSessionDrift(ctx context.Context, field string, actual string) error {
+	expected := s.idmap.NativeSessionID
+	cause := fmt.Sprintf("%s native session id drift: expected %q, got %q", field, expected, actual)
+	return s.poison(ctx, cause)
+}
+
+func (s *session) poison(ctx context.Context, cause string) error {
+	err := acp.NewInternalError(map[string]any{
+		jsonFieldError: "opencode_native_session_id_drift",
+		"cause":        cause,
+	})
+
+	s.mu.Lock()
+	if s.poisonCause != "" {
+		existing := s.poisonedErrorLocked()
+		s.mu.Unlock()
+		return existing
+	}
+	s.poisonCause = cause
+	shouldClear := len(s.availableCommands) > 0
+	if shouldClear {
+		s.availableCommands = []acp.AvailableCommand{}
+		s.commandsByName = map[string]nativeCommand{}
+	}
+	s.mu.Unlock()
+
+	if !shouldClear {
+		return err
+	}
+	clearErr := s.emitUpdate(ctx, acp.SessionUpdate{
+		AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
+			SessionUpdate:     "available_commands_update",
+			AvailableCommands: []acp.AvailableCommand{},
+		},
+	})
+	return errors.Join(err, clearErr)
 }
 
 func (s *session) markActiveMessageID(messageID string) {
@@ -431,6 +490,9 @@ func (s *session) cachedCommand(name string) (nativeCommand, bool) {
 }
 
 func (s *session) refreshCommands(ctx context.Context) error {
+	if err := s.ensureNotPoisoned(); err != nil {
+		return err
+	}
 	commands, err := s.client.Commands(ctx)
 	if err != nil {
 		return err
@@ -444,12 +506,8 @@ func (s *session) refreshCommands(ctx context.Context) error {
 		commandsByName[command.Name] = command
 		available = append(available, availableCommandFromNative(command))
 	}
-	if len(available) == 0 {
-		available = nil
-	}
-
 	s.mu.Lock()
-	changed := !reflect.DeepEqual(s.availableCommands, available)
+	changed := !sameAvailableCommands(s.availableCommands, available)
 	if changed {
 		s.availableCommands = cloneAvailableCommands(available)
 	}
@@ -491,7 +549,7 @@ func availableCommandFromNative(command nativeCommand) acp.AvailableCommand {
 }
 
 func cloneAvailableCommands(in []acp.AvailableCommand) []acp.AvailableCommand {
-	if len(in) == 0 {
+	if in == nil {
 		return nil
 	}
 	out := make([]acp.AvailableCommand, len(in))
@@ -502,6 +560,13 @@ func cloneAvailableCommands(in []acp.AvailableCommand) []acp.AvailableCommand {
 		}
 	}
 	return out
+}
+
+func sameAvailableCommands(left []acp.AvailableCommand, right []acp.AvailableCommand) bool {
+	if len(left) == 0 && len(right) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func validSlashCommandName(name string) bool {

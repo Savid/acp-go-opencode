@@ -74,6 +74,9 @@ func NewAgent(opts ...Option) *Agent {
 }
 
 func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	agent := newAgentForServe(opts...)
 	defer func() {
 		if err := agent.Close(); err != nil {

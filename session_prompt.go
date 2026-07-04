@@ -31,6 +31,9 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 	if err != nil {
 		return err
 	}
+	if err := session.ensureNotPoisoned(); err != nil {
+		return err
+	}
 	session.cancelTurn()
 	cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
@@ -38,6 +41,9 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 }
 
 func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
+	if err := s.ensureNotPoisoned(); err != nil {
+		return acp.PromptResponse{}, err
+	}
 	invocation, slashCandidate := slashCommandInvocation(params.Prompt)
 	if slashCandidate {
 		if err := s.refreshCommands(ctx); err != nil && s.agent != nil && s.agent.log != nil {
@@ -393,6 +399,9 @@ func embeddedResourceText(resource acp.EmbeddedResourceResource) string {
 }
 
 func (s *session) replayMessages(ctx context.Context) error {
+	if err := s.ensureNotPoisoned(); err != nil {
+		return err
+	}
 	messages, err := s.client.Messages(ctx, s.idmap.NativeSessionID)
 	if err != nil {
 		return err
@@ -406,6 +415,9 @@ func (s *session) replayMessages(ctx context.Context) error {
 }
 
 func (s *session) emitMessage(ctx context.Context, message nativeMessage, includeUser bool) error {
+	if err := s.validateNativeMessageSession(ctx, message); err != nil {
+		return err
+	}
 	isUser := message.Info.Role == "user"
 	if isUser && !includeUser {
 		return nil
@@ -431,6 +443,23 @@ func (s *session) emitMessage(ctx context.Context, message nativeMessage, includ
 		if update := usageUpdateFromTokens(message.Info.ID, message.Info.Tokens); update != nil {
 			return s.emitUpdate(ctx, *update)
 		}
+	}
+	return nil
+}
+
+func (s *session) validateNativeMessageSession(ctx context.Context, message nativeMessage) error {
+	expected := s.idmap.NativeSessionID
+	if expected == "" {
+		return nil
+	}
+	if message.Info.SessionID != "" && message.Info.SessionID != expected {
+		return s.poisonNativeSessionDrift(ctx, "message info.sessionID", message.Info.SessionID)
+	}
+	for _, part := range message.Parts {
+		if part.SessionID == "" || part.SessionID == expected {
+			continue
+		}
+		return s.poisonNativeSessionDrift(ctx, "message part sessionID", part.SessionID)
 	}
 	return nil
 }

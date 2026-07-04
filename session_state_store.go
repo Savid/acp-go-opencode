@@ -121,6 +121,9 @@ type archiveEntry struct {
 }
 
 func (s *session) snapshotToStore(ctx context.Context) error {
+	if err := s.ensureNotPoisoned(); err != nil {
+		return err
+	}
 	snapshot := s.snapshot()
 	if snapshot.client == nil {
 		return nil
