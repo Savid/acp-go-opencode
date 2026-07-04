@@ -20,6 +20,8 @@ const (
 	configModel             = "model"
 	configMode              = "mode"
 	configTypeSelect        = "select"
+	openCodePermissionAsk   = "ask"
+	openCodePermissionAllow = "allow"
 	idmapSubpath            = "idmap"
 	xdgDataSubpath          = "xdg/data"
 	xdgConfigSubpath        = "xdg/config"

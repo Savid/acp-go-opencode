@@ -27,12 +27,14 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	child.agents = parent.agents
 	store := NewInMemorySessionStore()
 	factoryCalls := 0
+	var permissions []string
 	agent := NewAgent(
 		WithHome(root),
 		WithSessionStore(store),
 		func(options *Options) {
 			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
 				factoryCalls++
+				permissions = append(permissions, opts.Permission)
 				client := parent
 				if factoryCalls > 1 {
 					client = child
@@ -57,12 +59,16 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	newResp, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionOpenCodeOptions(NewOpenCodeOptions(
 		WithOpenCodeModel("openai/gpt-test"),
 		WithOpenCodeMode("build"),
+		WithOpenCodePermission("allow"),
 	))))
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
 	if newResp.SessionId == "" || len(newResp.ConfigOptions) != 2 {
 		t.Fatalf("new response = %#v", newResp)
+	}
+	if len(permissions) != 1 || permissions[0] != "allow" {
+		t.Fatalf("start permissions = %#v", permissions)
 	}
 	if _, err := agent.SetSessionConfigOption(ctx, SetModelRequest(newResp.SessionId, "openai/gpt-other")); err != nil {
 		t.Fatalf("SetModel: %v", err)

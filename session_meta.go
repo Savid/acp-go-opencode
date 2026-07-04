@@ -12,6 +12,7 @@ type sessionMeta struct {
 	Env          map[string]string
 	OutputSchema any
 	Mode         string
+	Permission   string
 	RawMessages  rawMessageConfig
 }
 
@@ -31,6 +32,7 @@ func sessionMetaFromLifecycle(meta map[string]any) (sessionMeta, error) {
 		Model:       options.Model,
 		Env:         options.Env,
 		Mode:        options.Mode,
+		Permission:  normalizeOpenCodePermission(options.Permission),
 		RawMessages: rawMessageConfigFromMeta(meta),
 	}, nil
 }
@@ -40,6 +42,7 @@ type opencodeMetaOptions struct {
 	Env          map[string]string
 	OutputSchema any
 	Mode         string
+	Permission   string
 }
 
 func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
@@ -69,6 +72,16 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 	if mode, _ := optionsMap[metaModeKey].(string); mode != "" {
 		options.Mode = mode
 	}
+	if rawPermission, ok := optionsMap[metaPermissionKey]; ok {
+		permission, ok := rawPermission.(string)
+		if !ok {
+			return opencodeMetaOptions{}, unsupportedField("_meta.opencode.options.permission")
+		}
+		if err := validateOpenCodePermission(permission); err != nil {
+			return opencodeMetaOptions{}, err
+		}
+		options.Permission = normalizeOpenCodePermission(permission)
+	}
 
 	return options, nil
 }
@@ -96,7 +109,7 @@ func validateLifecycleMeta(meta map[string]any) error {
 			}
 			for optionKey := range optionsMap {
 				switch optionKey {
-				case "model", "env", "outputSchema", "mode":
+				case "model", "env", "outputSchema", "mode", "permission":
 				default:
 					return unsupportedField("_meta.opencode.options." + optionKey)
 				}
@@ -129,6 +142,22 @@ func unsupportedField(path string) error {
 		"error": "unsupported",
 		"field": path,
 	})
+}
+
+func validateOpenCodePermission(permission string) error {
+	switch permission {
+	case "", openCodePermissionAsk, openCodePermissionAllow:
+		return nil
+	default:
+		return unsupportedField("_meta.opencode.options.permission")
+	}
+}
+
+func normalizeOpenCodePermission(permission string) string {
+	if permission == "" {
+		return openCodePermissionAsk
+	}
+	return permission
 }
 
 func validateSchemaObject(schema any) error {

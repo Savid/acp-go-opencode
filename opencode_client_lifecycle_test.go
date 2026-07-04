@@ -176,6 +176,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		Pure:             true,
 		QuestionTool:     true,
 		LogLevel:         "DEBUG",
+		Permission:       "allow",
 		MinimumVersion:   "1.0.0",
 		HealthTimeout:    5 * time.Second,
 		Logger:           logger,
@@ -191,6 +192,13 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(server.xdg.State, leaseFileName)); err != nil {
 		t.Fatalf("lease was not written: %v", err)
+	}
+	configData, err := os.ReadFile(filepath.Join(server.xdg.Config, "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatalf("permission config was not written: %v", err)
+	}
+	if !strings.Contains(string(configData), `"*": "allow"`) {
+		t.Fatalf("permission config = %s", string(configData))
 	}
 	if server.Events() == nil || server.EventErrors() == nil || server.XDGDirs().Root == "" {
 		t.Fatalf("server channels/dirs not initialized: %#v", server)
@@ -661,6 +669,35 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	if err := ensureXDGDirs(xdgDirs{Root: "", Data: "x", Config: "x", Cache: "x", State: "x"}); err == nil {
 		t.Fatal("ensureXDGDirs accepted empty root")
 	}
+	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, "")
+	if err != nil || !strings.Contains(permissionConfig, `"*": "ask"`) {
+		t.Fatalf("default permission config = %q err=%v", permissionConfig, err)
+	}
+	permissionFile := filepath.Join(xdg.Config, "opencode", "opencode.json")
+	info, err := os.Stat(permissionFile)
+	if err != nil {
+		t.Fatalf("permission config file stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("permission config file mode = %v", info.Mode().Perm())
+	}
+	if _, err := materializeOpenCodePermissionConfig(xdg, "deny"); err == nil {
+		t.Fatal("unsupported permission config accepted")
+	}
+	configRootFile := filepath.Join(t.TempDir(), "config-file")
+	if err := os.WriteFile(configRootFile, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := materializeOpenCodePermissionConfig(xdgDirs{Config: configRootFile}, "ask"); err == nil {
+		t.Fatal("permission config mkdir failure ignored")
+	}
+	configRoot := filepath.Join(t.TempDir(), "config")
+	if err := os.MkdirAll(filepath.Join(configRoot, "opencode", "opencode.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := materializeOpenCodePermissionConfig(xdgDirs{Config: configRoot}, "ask"); err == nil {
+		t.Fatal("permission config write failure ignored")
+	}
 	port, err := allocatePort()
 	if err != nil || port <= 0 {
 		t.Fatalf("allocatePort = %d err=%v", port, err)
@@ -729,6 +766,9 @@ func TestPortPasswordLeaseAndReaperFaultInjection(t *testing.T) {
 	}
 	if err := writeLease(t.TempDir(), serverLease{}); err == nil {
 		t.Fatal("writeLease ignored marshal error")
+	}
+	if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask"); err == nil {
+		t.Fatal("permission config ignored marshal error")
 	}
 
 	if err := reapStaleLeases("[", slog.New(slog.DiscardHandler)); err == nil {

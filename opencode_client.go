@@ -74,6 +74,7 @@ type openCodeStartOptions struct {
 	AdditionalEnv     map[string]string
 	ExpectedNativeID  string
 	PermissionSurface bool
+	Permission        string
 }
 
 type acpSessionIDString string
@@ -348,6 +349,10 @@ func startOpenCodeServer(ctx context.Context, options openCodeStartOptions) (ope
 	if err := ensureXDGDirs(xdg); err != nil {
 		return nil, err
 	}
+	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, options.Permission)
+	if err != nil {
+		return nil, err
+	}
 
 	port, err := allocatePort()
 	if err != nil {
@@ -385,6 +390,7 @@ func startOpenCodeServer(ctx context.Context, options openCodeStartOptions) (ope
 	env["XDG_STATE_HOME"] = xdg.State
 	env["OPENCODE_SERVER_USERNAME"] = username
 	env["OPENCODE_SERVER_PASSWORD"] = password
+	env["OPENCODE_CONFIG_CONTENT"] = permissionConfig
 	if options.QuestionTool {
 		env["OPENCODE_ENABLE_QUESTION_TOOL"] = "1"
 	}
@@ -1045,6 +1051,32 @@ func ensureXDGDirs(dirs xdgDirs) error {
 		}
 	}
 	return nil
+}
+
+func materializeOpenCodePermissionConfig(dirs xdgDirs, permission string) (string, error) {
+	if err := validateOpenCodePermission(permission); err != nil {
+		return "", err
+	}
+	config := map[string]any{
+		"$schema": "https://opencode.ai/config.json",
+		"permission": map[string]string{
+			"*": normalizeOpenCodePermission(permission),
+		},
+	}
+	data, err := openCodeMarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	data = append(data, '\n')
+	configDir := filepath.Join(dirs.Config, "opencode")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "opencode.json"), data, 0o600); err != nil {
+		return "", err
+	}
+
+	return string(data), nil
 }
 
 func allocatePort() (int, error) {

@@ -390,6 +390,7 @@ func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd str
 		HealthTimeout:  a.options.HealthCheckTimeout,
 		Logger:         a.log,
 		ExistingXDG:    existing,
+		Permission:     meta.Permission,
 	})
 }
 

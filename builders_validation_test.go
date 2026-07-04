@@ -60,6 +60,7 @@ func TestOptionsAndRequestBuilders(t *testing.T) {
 			WithOpenCodeModel("openai/gpt"),
 			WithOpenCodeEnv(map[string]string{"K": "V"}),
 			WithOpenCodeMode("plan"),
+			WithOpenCodePermission("allow"),
 		)),
 	)
 	if req.Cwd != "/tmp/project" || len(req.McpServers) != 4 || len(req.AdditionalDirectories) != 1 {
@@ -67,6 +68,10 @@ func TestOptionsAndRequestBuilders(t *testing.T) {
 	}
 	if !rawMessageConfigFromMeta(req.Meta).Enabled() {
 		t.Fatalf("raw events not enabled in meta: %#v", req.Meta)
+	}
+	options := req.Meta[opencodeMetaKey].(map[string]any)[metaOptionsKey].(map[string]any)
+	if options[metaPermissionKey] != "allow" {
+		t.Fatalf("permission not set in meta: %#v", req.Meta)
 	}
 	if ResumeSessionRequest("s", "/tmp/project", WithSessionMCPServers(httpServer)).SessionId != "s" {
 		t.Fatal("ResumeSessionRequest did not set session id")
@@ -165,15 +170,26 @@ func TestValidationMetaAndHelperBranches(t *testing.T) {
 		t.Fatal("bad raw event meta accepted")
 	}
 	meta, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{
-		metaModelKey: "p/m",
-		metaEnvKey:   map[string]any{"A": "1"},
-		metaModeKey:  "plan",
+		metaModelKey:      "p/m",
+		metaEnvKey:        map[string]any{"A": "1"},
+		metaModeKey:       "plan",
+		metaPermissionKey: "ask",
 	}}})
-	if err != nil || meta.Model != "p/m" || meta.Env["A"] != "1" || meta.Mode != "plan" {
+	if err != nil || meta.Model != "p/m" || meta.Env["A"] != "1" || meta.Mode != "plan" || meta.Permission != "ask" {
 		t.Fatalf("session meta = %#v err=%v", meta, err)
+	}
+	meta, err = sessionMetaFromLifecycle(map[string]any{})
+	if err != nil || meta.Permission != "ask" {
+		t.Fatalf("default permission meta = %#v err=%v", meta, err)
 	}
 	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: "bad"}}}); err == nil {
 		t.Fatal("bad env meta accepted")
+	}
+	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: 1}}}); err == nil {
+		t.Fatal("non-string permission meta accepted")
+	}
+	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "deny"}}}); err == nil {
+		t.Fatal("unsupported permission meta accepted")
 	}
 	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: "bad"}}}); err == nil {
 		t.Fatal("bad env lifecycle meta accepted")

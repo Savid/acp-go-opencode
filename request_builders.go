@@ -13,6 +13,7 @@ const (
 	metaEnvKey          = "env"
 	metaOutputSchemaKey = "outputSchema"
 	metaModeKey         = "mode"
+	metaPermissionKey   = "permission"
 )
 
 // OpenCodeOptions is the stable OpenCode-specific subset accepted at
@@ -22,6 +23,7 @@ type OpenCodeOptions struct {
 	Env          map[string]string `json:"env,omitempty"`
 	OutputSchema map[string]any    `json:"outputSchema,omitempty"`
 	Mode         string            `json:"mode,omitempty"`
+	Permission   string            `json:"permission,omitempty"`
 }
 
 // Meta returns an ACP _meta object for the supported OpenCode-specific options.
@@ -38,6 +40,9 @@ func (options OpenCodeOptions) Meta() map[string]any {
 	}
 	if options.Mode != "" {
 		values[metaModeKey] = options.Mode
+	}
+	if options.Permission != "" {
+		values[metaPermissionKey] = options.Permission
 	}
 
 	return map[string]any{
@@ -294,6 +299,12 @@ func WithOpenCodeMode(mode string) OpenCodeOption {
 	}
 }
 
+func WithOpenCodePermission(permission string) OpenCodeOption {
+	return func(options *OpenCodeOptions) {
+		options.Permission = permission
+	}
+}
+
 func newSessionRequestConfig(opts ...SessionRequestOption) sessionRequestConfig {
 	config := sessionRequestConfig{}
 	for _, opt := range opts {
@@ -321,6 +332,7 @@ func cloneOpenCodeOptions(options OpenCodeOptions) OpenCodeOptions {
 		Env:          cloneStringMap(options.Env),
 		OutputSchema: cloneAnyMap(options.OutputSchema),
 		Mode:         options.Mode,
+		Permission:   options.Permission,
 	}
 }
 
