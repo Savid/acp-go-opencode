@@ -676,6 +676,9 @@ func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
 				if client.questionRejectCount() != 1 {
 					t.Fatalf("question rejects = %#v", client.questionRejects)
 				}
+				if client.questionRejects[0].route != questionRouteSession {
+					t.Fatalf("question reject route = %#v", client.questionRejects[0])
+				}
 			},
 		},
 	} {
@@ -1510,6 +1513,43 @@ func TestReplayAndEventEdgeBranches(t *testing.T) {
 	conn.elicitErr = nil
 	if err := session.handleEvent(ctx, openCodeEvent{Type: "permission.v2.asked", Properties: json.RawMessage(`{`)}); err == nil {
 		t.Fatal("malformed permission event succeeded")
+	}
+	conn.permission = acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected("once")}
+	if err := session.handleEvent(ctx, openCodeEvent{
+		Type: "permission.asked",
+		Properties: json.RawMessage(`{
+			"id":"p-session",
+			"sessionID":"native-1",
+			"permission":"edit",
+			"patterns":["acp-permission-probe.txt"],
+			"metadata":{"filepath":"acp-permission-probe.txt"},
+			"tool":{"messageID":"m1","callID":"c1"}
+		}`),
+	}); err != nil {
+		t.Fatalf("permission.asked event: %v", err)
+	}
+	reply := client.permissionReply(client.permissionReplyCount() - 1)
+	if reply.route != permissionRouteSession || reply.requestID != "p-session" || reply.reply != "once" {
+		t.Fatalf("permission.asked reply = %#v", reply)
+	}
+	permissionReq := conn.permissions[len(conn.permissions)-1]
+	if permissionReq.ToolCall.Title == nil || *permissionReq.ToolCall.Title != "edit" {
+		t.Fatalf("permission.asked ACP request = %#v", permissionReq)
+	}
+	rawInput, _ := permissionReq.ToolCall.RawInput.(map[string]any)
+	resources, _ := rawInput["resources"].([]string)
+	if len(resources) != 1 || resources[0] != "acp-permission-probe.txt" {
+		t.Fatalf("permission.asked resources = %#v", permissionReq.ToolCall.RawInput)
+	}
+	if err := session.handleEvent(ctx, openCodeEvent{
+		Type:       "question.v2.asked",
+		Properties: json.RawMessage(`{"id":"q-v2","sessionID":"native-1","questions":[{"question":"Continue?"}]}`),
+	}); err != nil {
+		t.Fatalf("question.v2.asked event: %v", err)
+	}
+	questionReply := client.questionReply(client.questionReplyCount() - 1)
+	if questionReply.route != questionRouteAPI || questionReply.requestID != "q-v2" {
+		t.Fatalf("question.v2 reply = %#v", questionReply)
 	}
 	if err := session.handleEvent(ctx, openCodeEvent{Type: "todo.updated", Properties: json.RawMessage(`{"sessionID":"other","todos":[{"content":"x"}]}`)}); err != nil {
 		t.Fatalf("foreign todo event: %v", err)

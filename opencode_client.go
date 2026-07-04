@@ -49,10 +49,10 @@ type openCodeClient interface {
 	ConfigProviders(context.Context) (providersResponse, error)
 	Agents(context.Context) ([]nativeAgent, error)
 	PendingPermissions(context.Context) ([]permissionRequest, error)
-	ReplyPermission(context.Context, string, string, string, string) error
+	ReplyPermission(context.Context, permissionRequest, string, string) error
 	PendingQuestions(context.Context) ([]questionRequest, error)
-	ReplyQuestion(context.Context, string, string, [][]string) error
-	RejectQuestion(context.Context, string, string) error
+	ReplyQuestion(context.Context, questionRequest, [][]string) error
+	RejectQuestion(context.Context, questionRequest) error
 	Events() <-chan openCodeEvent
 	EventErrors() <-chan error
 	XDGDirs() xdgDirs
@@ -141,10 +141,17 @@ type nativeMessageInfo struct {
 	Finish     string       `json:"finish"`
 	Cost       float64      `json:"cost"`
 	Tokens     nativeTokens `json:"tokens"`
+	Error      *nativeError `json:"error,omitempty"`
 	Time       struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
 	} `json:"time"`
+}
+
+type nativeError struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Message string `json:"message"`
 }
 
 type nativePart struct {
@@ -192,6 +199,10 @@ type nativeTodo struct {
 	Priority string `json:"priority"`
 }
 
+type nativeSessionStatus struct {
+	Type string `json:"type"`
+}
+
 type nativeAgent struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -219,20 +230,73 @@ func (e *openCodeEvent) UnmarshalJSON(data []byte) error {
 }
 
 type permissionRequest struct {
-	ID        string         `json:"id"`
-	SessionID string         `json:"sessionID"`
-	Action    string         `json:"action"`
-	Resources []string       `json:"resources"`
-	Save      []string       `json:"save"`
-	Metadata  map[string]any `json:"metadata"`
-	Source    map[string]any `json:"source"`
+	ID         string          `json:"id"`
+	SessionID  string          `json:"sessionID"`
+	Action     string          `json:"action"`
+	Permission string          `json:"permission"`
+	Resources  []string        `json:"resources"`
+	Patterns   []string        `json:"patterns"`
+	Save       []string        `json:"save"`
+	Always     []string        `json:"always"`
+	Metadata   map[string]any  `json:"metadata"`
+	Source     map[string]any  `json:"source"`
+	Tool       permissionTool  `json:"tool"`
+	ReplyRoute permissionRoute `json:"-"`
+}
+
+type permissionTool struct {
+	MessageID string `json:"messageID"`
+	CallID    string `json:"callID"`
+}
+
+type permissionRoute string
+
+const (
+	permissionRouteSession permissionRoute = "session"
+	permissionRouteAPI     permissionRoute = "api"
+)
+
+func (r permissionRequest) route() permissionRoute {
+	if r.ReplyRoute != "" {
+		return r.ReplyRoute
+	}
+	if r.Action != "" {
+		return permissionRouteAPI
+	}
+	return permissionRouteSession
+}
+
+func (r permissionRequest) actionName() string {
+	return firstNonEmpty(r.Action, r.Permission)
+}
+
+func (r permissionRequest) resourceList() []string {
+	if len(r.Resources) > 0 {
+		return append([]string(nil), r.Resources...)
+	}
+	return append([]string(nil), r.Patterns...)
 }
 
 type questionRequest struct {
-	ID        string         `json:"id"`
-	SessionID string         `json:"sessionID"`
-	Questions []questionInfo `json:"questions"`
-	Tool      questionTool   `json:"tool"`
+	ID         string         `json:"id"`
+	SessionID  string         `json:"sessionID"`
+	Questions  []questionInfo `json:"questions"`
+	Tool       questionTool   `json:"tool"`
+	ReplyRoute questionRoute  `json:"-"`
+}
+
+type questionRoute string
+
+const (
+	questionRouteSession questionRoute = "session"
+	questionRouteAPI     questionRoute = "api"
+)
+
+func (r questionRequest) route() questionRoute {
+	if r.ReplyRoute != "" {
+		return r.ReplyRoute
+	}
+	return questionRouteSession
 }
 
 type questionInfo struct {
@@ -584,13 +648,38 @@ func (s *openCodeServer) DeleteSession(ctx context.Context, id string) error {
 
 func (s *openCodeServer) SendMessage(ctx context.Context, id string, req openCodeMessageRequest) (nativeMessage, error) {
 	var out nativeMessage
-	err := s.doJSON(ctx, http.MethodPost, "/session/"+url.PathEscape(id)+"/message", nil, req, &out)
-	return out, err
+	if err := s.doJSON(ctx, http.MethodPost, "/session/"+url.PathEscape(id)+"/message", nil, req, &out); err != nil {
+		return nativeMessage{}, err
+	}
+	if err := assistantMessageError(out); err != nil {
+		return nativeMessage{}, err
+	}
+	return out, nil
+}
+
+func assistantMessageError(message nativeMessage) error {
+	if !strings.EqualFold(message.Info.Finish, "error") && message.Info.Error == nil {
+		return nil
+	}
+	if message.Info.Error == nil {
+		return fmt.Errorf("opencode assistant error")
+	}
+	detail := firstNonEmpty(message.Info.Error.Message, message.Info.Error.Type, message.Info.Error.Name)
+	if detail == "" {
+		return fmt.Errorf("opencode assistant error")
+	}
+	return fmt.Errorf("opencode assistant error: %s", detail)
 }
 
 func (s *openCodeServer) Messages(ctx context.Context, id string) ([]nativeMessage, error) {
 	var out []nativeMessage
 	err := s.getJSON(ctx, "/session/"+url.PathEscape(id)+"/message", nil, &out)
+	return out, err
+}
+
+func (s *openCodeServer) SessionStatus(ctx context.Context) (map[string]nativeSessionStatus, error) {
+	out := map[string]nativeSessionStatus{}
+	err := s.getJSON(ctx, "/session/status", nil, &out)
 	return out, err
 }
 
@@ -636,16 +725,25 @@ func (s *openCodeServer) PendingPermissions(ctx context.Context) ([]permissionRe
 	var response struct {
 		Data []permissionRequest `json:"data"`
 	}
-	err := s.getJSON(ctx, "/api/permission/request", nil, &response)
-	return response.Data, err
+	if err := s.getJSON(ctx, "/api/permission/request", nil, &response); err != nil {
+		return nil, err
+	}
+	for i := range response.Data {
+		response.Data[i].ReplyRoute = permissionRouteAPI
+	}
+	return response.Data, nil
 }
 
-func (s *openCodeServer) ReplyPermission(ctx context.Context, sessionID string, requestID string, reply string, message string) error {
+func (s *openCodeServer) ReplyPermission(ctx context.Context, req permissionRequest, reply string, message string) error {
 	body := map[string]any{"reply": reply}
 	if message != "" {
 		body["message"] = message
 	}
-	path := "/api/session/" + url.PathEscape(sessionID) + "/permission/" + url.PathEscape(requestID) + "/reply"
+	if req.route() == permissionRouteAPI {
+		path := "/api/session/" + url.PathEscape(req.SessionID) + "/permission/" + url.PathEscape(req.ID) + "/reply"
+		return s.doJSON(ctx, http.MethodPost, path, nil, body, nil)
+	}
+	path := "/permission/" + url.PathEscape(req.ID) + "/reply"
 	return s.doJSON(ctx, http.MethodPost, path, nil, body, nil)
 }
 
@@ -653,18 +751,31 @@ func (s *openCodeServer) PendingQuestions(ctx context.Context) ([]questionReques
 	var response struct {
 		Data []questionRequest `json:"data"`
 	}
-	err := s.getJSON(ctx, "/api/question/request", nil, &response)
-	return response.Data, err
+	if err := s.getJSON(ctx, "/api/question/request", nil, &response); err != nil {
+		return nil, err
+	}
+	for i := range response.Data {
+		response.Data[i].ReplyRoute = questionRouteAPI
+	}
+	return response.Data, nil
 }
 
-func (s *openCodeServer) ReplyQuestion(ctx context.Context, sessionID string, requestID string, answers [][]string) error {
+func (s *openCodeServer) ReplyQuestion(ctx context.Context, req questionRequest, answers [][]string) error {
 	body := map[string]any{"answers": answers}
-	path := "/api/session/" + url.PathEscape(sessionID) + "/question/" + url.PathEscape(requestID) + "/reply"
+	if req.route() == questionRouteAPI {
+		path := "/api/session/" + url.PathEscape(req.SessionID) + "/question/" + url.PathEscape(req.ID) + "/reply"
+		return s.doJSON(ctx, http.MethodPost, path, nil, body, nil)
+	}
+	path := "/question/" + url.PathEscape(req.ID) + "/reply"
 	return s.doJSON(ctx, http.MethodPost, path, nil, body, nil)
 }
 
-func (s *openCodeServer) RejectQuestion(ctx context.Context, sessionID string, requestID string) error {
-	path := "/api/session/" + url.PathEscape(sessionID) + "/question/" + url.PathEscape(requestID) + "/reject"
+func (s *openCodeServer) RejectQuestion(ctx context.Context, req questionRequest) error {
+	if req.route() == questionRouteAPI {
+		path := "/api/session/" + url.PathEscape(req.SessionID) + "/question/" + url.PathEscape(req.ID) + "/reject"
+		return s.doJSON(ctx, http.MethodPost, path, nil, map[string]any{}, nil)
+	}
+	path := "/question/" + url.PathEscape(req.ID) + "/reject"
 	return s.doJSON(ctx, http.MethodPost, path, nil, map[string]any{}, nil)
 }
 
@@ -772,7 +883,7 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 	}
 	req.SetBasicAuth(s.username, s.password)
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := s.httpClient.Do(req)
+	resp, err := s.eventHTTPClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -840,6 +951,7 @@ func validateOpenCodeDoc(doc map[string]any) error {
 	required := []string{
 		"/config/providers",
 		"/event",
+		"/session/status",
 		"/session",
 		"/session/{sessionID}",
 		"/session/{sessionID}/message",
@@ -848,6 +960,11 @@ func validateOpenCodeDoc(doc map[string]any) error {
 		"/session/{sessionID}/todo",
 		"/session/{sessionID}/revert",
 		"/session/{sessionID}/unrevert",
+		"/permission",
+		"/permission/{requestID}/reply",
+		"/question",
+		"/question/{requestID}/reply",
+		"/question/{requestID}/reject",
 		"/api/session/{sessionID}/permission/{requestID}/reply",
 		"/api/permission/request",
 		"/api/session/{sessionID}/question/{requestID}/reply",
@@ -865,10 +982,16 @@ func validateOpenCodeDoc(doc map[string]any) error {
 	if err := validateOpenCodePermissionReply(rawPaths); err != nil {
 		return err
 	}
+	if err := validateOpenCodeSessionPermissionReply(rawPaths); err != nil {
+		return err
+	}
 	if err := validateOpenCodeGetListOperation(rawPaths, "/api/question/request", "QuestionV2Request"); err != nil {
 		return err
 	}
 	if err := validateOpenCodeQuestionReply(doc, rawPaths); err != nil {
+		return err
+	}
+	if err := validateOpenCodeSessionQuestionRoutes(rawPaths); err != nil {
 		return err
 	}
 	if err := validateOpenCodePostNoContent(rawPaths, "/api/session/{sessionID}/question/{requestID}/reject"); err != nil {
@@ -881,6 +1004,15 @@ func validateOpenCodeDoc(doc map[string]any) error {
 	return nil
 }
 
+func (s *openCodeServer) eventHTTPClient() *http.Client {
+	if s.httpClient == nil {
+		return http.DefaultClient
+	}
+	client := *s.httpClient
+	client.Timeout = 0
+	return &client
+}
+
 type openCodeEventContract struct {
 	schema             string
 	event              string
@@ -891,6 +1023,8 @@ func validateOpenCodeEventSchemas(doc map[string]any) error {
 	for _, contract := range []openCodeEventContract{
 		{schema: "EventPermissionV2Asked", event: "permission.v2.asked", requiredProperties: []string{"id", "sessionID", "action", "resources"}},
 		{schema: "EventPermissionV2Replied", event: "permission.v2.replied", requiredProperties: []string{"sessionID", "requestID", "reply"}},
+		{schema: "EventPermissionAsked", event: "permission.asked", requiredProperties: []string{"id", "sessionID", "permission", "patterns"}},
+		{schema: "EventPermissionReplied", event: "permission.replied", requiredProperties: []string{"sessionID", "requestID", "reply"}},
 		{schema: "EventQuestionV2Asked", event: "question.v2.asked", requiredProperties: []string{"id", "sessionID", "questions"}},
 		{schema: "EventQuestionV2Replied", event: "question.v2.replied", requiredProperties: []string{"sessionID", "requestID", "answers"}},
 		{schema: "EventQuestionAsked", event: "question.asked", requiredProperties: []string{"id", "sessionID", "questions"}},
@@ -966,6 +1100,18 @@ func validateOpenCodePermissionReply(paths map[string]any) error {
 	return nil
 }
 
+func validateOpenCodeSessionPermissionReply(paths map[string]any) error {
+	const path = "/permission/{requestID}/reply"
+	operation, ok := openAPIOperation(paths, path, http.MethodPost)
+	if !ok {
+		return fmt.Errorf("opencode /doc path %s missing POST operation", path)
+	}
+	if !openAPIHasResponse(operation, "200") {
+		return fmt.Errorf("opencode /doc POST %s missing 200 response", path)
+	}
+	return nil
+}
+
 func validateOpenCodeQuestionReply(doc map[string]any, paths map[string]any) error {
 	const path = "/api/session/{sessionID}/question/{requestID}/reply"
 	operation, ok := openAPIOperation(paths, path, http.MethodPost)
@@ -988,6 +1134,19 @@ func validateOpenCodeQuestionReply(doc map[string]any, paths map[string]any) err
 	}
 	if !openAPIObjectHasRequiredProperty(schema, "answers") {
 		return fmt.Errorf("opencode /doc POST %s request schema missing required answers", path)
+	}
+	return nil
+}
+
+func validateOpenCodeSessionQuestionRoutes(paths map[string]any) error {
+	for _, path := range []string{"/question/{requestID}/reply", "/question/{requestID}/reject"} {
+		operation, ok := openAPIOperation(paths, path, http.MethodPost)
+		if !ok {
+			return fmt.Errorf("opencode /doc path %s missing POST operation", path)
+		}
+		if !openAPIHasResponse(operation, "200") {
+			return fmt.Errorf("opencode /doc POST %s missing 200 response", path)
+		}
 	}
 	return nil
 }

@@ -54,6 +54,7 @@ type fakeOpenCodeClient struct {
 type fakePermissionReply struct {
 	sessionID string
 	requestID string
+	route     permissionRoute
 	reply     string
 	message   string
 }
@@ -61,12 +62,14 @@ type fakePermissionReply struct {
 type fakeQuestionReply struct {
 	sessionID string
 	requestID string
+	route     questionRoute
 	answers   [][]string
 }
 
 type fakeQuestionReject struct {
 	sessionID string
 	requestID string
+	route     questionRoute
 }
 
 func newFakeOpenCodeClient() *fakeOpenCodeClient {
@@ -140,11 +143,12 @@ func (c *fakeOpenCodeClient) PendingPermissions(context.Context) ([]permissionRe
 	return append([]permissionRequest(nil), c.pendingPermissions...), c.permissionsErr
 }
 
-func (c *fakeOpenCodeClient) ReplyPermission(_ context.Context, sessionID string, requestID string, reply string, message string) error {
+func (c *fakeOpenCodeClient) ReplyPermission(_ context.Context, req permissionRequest, reply string, message string) error {
 	c.mu.Lock()
 	c.permissionReplies = append(c.permissionReplies, fakePermissionReply{
-		sessionID: sessionID,
-		requestID: requestID,
+		sessionID: req.SessionID,
+		requestID: req.ID,
+		route:     req.route(),
 		reply:     reply,
 		message:   message,
 	})
@@ -156,20 +160,20 @@ func (c *fakeOpenCodeClient) PendingQuestions(context.Context) ([]questionReques
 	return append([]questionRequest(nil), c.pendingQuestions...), c.questionsErr
 }
 
-func (c *fakeOpenCodeClient) ReplyQuestion(_ context.Context, sessionID string, requestID string, answers [][]string) error {
+func (c *fakeOpenCodeClient) ReplyQuestion(_ context.Context, req questionRequest, answers [][]string) error {
 	copied := make([][]string, len(answers))
 	for i := range answers {
 		copied[i] = append([]string(nil), answers[i]...)
 	}
 	c.mu.Lock()
-	c.questionReplies = append(c.questionReplies, fakeQuestionReply{sessionID: sessionID, requestID: requestID, answers: copied})
+	c.questionReplies = append(c.questionReplies, fakeQuestionReply{sessionID: req.SessionID, requestID: req.ID, route: req.route(), answers: copied})
 	c.mu.Unlock()
 	return c.replyErr
 }
 
-func (c *fakeOpenCodeClient) RejectQuestion(_ context.Context, sessionID string, requestID string) error {
+func (c *fakeOpenCodeClient) RejectQuestion(_ context.Context, req questionRequest) error {
 	c.mu.Lock()
-	c.questionRejects = append(c.questionRejects, fakeQuestionReject{sessionID: sessionID, requestID: requestID})
+	c.questionRejects = append(c.questionRejects, fakeQuestionReject{sessionID: req.SessionID, requestID: req.ID, route: req.route()})
 	c.mu.Unlock()
 	return c.replyErr
 }

@@ -251,6 +251,7 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 	required := []string{
 		"/config/providers",
 		"/event",
+		"/session/status",
 		"/session",
 		"/session/{sessionID}",
 		"/session/{sessionID}/message",
@@ -259,6 +260,15 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 		"/session/{sessionID}/todo",
 		"/session/{sessionID}/revert",
 		"/session/{sessionID}/unrevert",
+		"/permission",
+		"/permission/{requestID}/reply",
+		"/question",
+		"/question/{requestID}/reply",
+		"/question/{requestID}/reject",
+		"/api/session/{sessionID}/agent",
+		"/api/session/{sessionID}/message",
+		"/api/session/{sessionID}/model",
+		"/api/session/{sessionID}/prompt",
 		"/api/session/{sessionID}/permission/{requestID}/reply",
 		"/api/permission/request",
 		"/api/session/{sessionID}/question/{requestID}/reply",
@@ -291,6 +301,22 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 			},
 		}
 	}
+	paths["/permission/{requestID}/reply"] = map[string]any{
+		"post": map[string]any{
+			"responses": map[string]any{"200": map[string]any{"description": "Permission processed"}},
+			"requestBody": map[string]any{
+				"required": true,
+				"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"reply":   map[string]any{"type": "string"},
+						"message": map[string]any{"type": "string"},
+					},
+					"required": []any{"reply"},
+				}}},
+			},
+		},
+	}
 	paths["/api/question/request"] = fakePendingRequestPath("QuestionV2Request")
 	paths["/api/session/{sessionID}/question/{requestID}/reply"] = map[string]any{
 		"post": map[string]any{
@@ -306,12 +332,20 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 	paths["/api/session/{sessionID}/question/{requestID}/reject"] = map[string]any{
 		"post": map[string]any{"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}}},
 	}
+	paths["/question/{requestID}/reply"] = map[string]any{
+		"post": map[string]any{"responses": map[string]any{"200": map[string]any{"description": "Question answered"}}},
+	}
+	paths["/question/{requestID}/reject"] = map[string]any{
+		"post": map[string]any{"responses": map[string]any{"200": map[string]any{"description": "Question rejected"}}},
+	}
 	return map[string]any{
 		"paths": paths,
 		"components": map[string]any{"schemas": map[string]any{
 			"Event": fakeEventUnion(
 				"EventPermissionV2Asked",
 				"EventPermissionV2Replied",
+				"EventPermissionAsked",
+				"EventPermissionReplied",
 				"EventQuestionV2Asked",
 				"EventQuestionV2Replied",
 				"EventQuestionAsked",
@@ -321,6 +355,12 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 			),
 			"EventPermissionV2Asked": fakeEventSchema("permission.v2.asked", []string{"id", "sessionID", "action", "resources"}),
 			"EventPermissionV2Replied": fakeEventSchema("permission.v2.replied", []string{
+				"sessionID",
+				"requestID",
+				"reply",
+			}),
+			"EventPermissionAsked": fakeEventSchema("permission.asked", []string{"id", "sessionID", "permission", "patterns"}),
+			"EventPermissionReplied": fakeEventSchema("permission.replied", []string{
 				"sessionID",
 				"requestID",
 				"reply",

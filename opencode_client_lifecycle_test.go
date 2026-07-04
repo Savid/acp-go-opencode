@@ -53,9 +53,17 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&messageBody); err != nil {
 				t.Errorf("decode message body: %v", err)
 			}
-			writeJSON(t, w, map[string]any{"info": map[string]any{"id": "assistant", "sessionID": "s/1"}})
+			writeJSON(t, w, map[string]any{
+				"info":  map[string]any{"id": "assistant", "sessionID": "s/1", "role": "assistant", "finish": "stop"},
+				"parts": []map[string]any{{"id": "part-1", "sessionID": "s/1", "messageID": "assistant", "type": "text", "text": "ok"}},
+			})
 		case path == "/session/s%2F1/message" && r.Method == http.MethodGet:
-			writeJSON(t, w, []map[string]any{{"info": map[string]any{"id": "message"}}})
+			writeJSON(t, w, []map[string]any{{
+				"info":  map[string]any{"id": "legacy", "sessionID": "s/1", "role": "assistant"},
+				"parts": []map[string]any{{"id": "legacy-part", "sessionID": "s/1", "messageID": "legacy", "type": "text", "text": "ok"}},
+			}})
+		case path == "/session/status" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{"s/1": map[string]any{"type": "idle"}})
 		case path == "/session/s%2F1/abort" && r.Method == http.MethodPost:
 			writeJSON(t, w, map[string]any{"ok": true})
 		case path == "/session/s%2F1/fork" && r.Method == http.MethodPost:
@@ -112,13 +120,23 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 	if err := client.DeleteSession(ctx, "s/1"); err != nil {
 		t.Fatalf("DeleteSession: %v", err)
 	}
-	message, err := client.SendMessage(ctx, "s/1", openCodeMessageRequest{NoReply: true})
-	if err != nil || message.Info.ID != "assistant" || !messageBody.NoReply {
+	message, err := client.SendMessage(ctx, "s/1", openCodeMessageRequest{
+		MessageID: "user-1",
+		Model:     &openCodeModelSelector{ProviderID: "openai", ModelID: "gpt-test"},
+		Agent:     "build",
+		Parts:     []map[string]any{{"type": "text", "text": "hello"}},
+	})
+	if err != nil || message.Info.ID != "assistant" || messageBody.MessageID != "user-1" ||
+		messageBody.Model.ModelID != "gpt-test" || messageBody.Agent != "build" || len(messageBody.Parts) != 1 {
 		t.Fatalf("SendMessage = %#v body=%#v err=%v", message, messageBody, err)
 	}
 	messages, err := client.Messages(ctx, "s/1")
-	if err != nil || len(messages) != 1 || messages[0].Info.ID != "message" {
+	if err != nil || len(messages) != 1 || messages[0].Info.ID != "legacy" {
 		t.Fatalf("Messages = %#v err=%v", messages, err)
+	}
+	status, err := client.SessionStatus(ctx)
+	if err != nil || status["s/1"].Type != "idle" {
+		t.Fatalf("SessionStatus = %#v err=%v", status, err)
 	}
 	if err := client.Abort(ctx, "s/1"); err != nil {
 		t.Fatalf("Abort: %v", err)
@@ -158,6 +176,79 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 	}
 	if !containsString(seen, "GET /session?directory=%2Frepo") {
 		t.Fatalf("seen paths = %#v", seen)
+	}
+}
+
+func TestOpenCodeSendMessageErrors(t *testing.T) {
+	ctx := context.Background()
+	if err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{Role: "assistant", Finish: "error"}}); err == nil {
+		t.Fatal("assistant finish error accepted")
+	}
+	err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{
+		Role:  "assistant",
+		Error: &nativeError{Message: "provider failed"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "provider failed") {
+		t.Fatalf("assistant error = %v", err)
+	}
+	if err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{Error: &nativeError{}}}); err == nil {
+		t.Fatal("empty assistant error accepted")
+	}
+	if err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{Role: "assistant", Finish: "stop"}}); err != nil {
+		t.Fatalf("non-error assistant rejected: %v", err)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		handler func(http.ResponseWriter, *http.Request)
+	}{
+		{
+			name: "post error",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/session/s/message" && r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				http.NotFound(w, r)
+			},
+		},
+		{
+			name: "assistant error",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/session/s/message" && r.Method == http.MethodPost {
+					writeJSON(t, w, map[string]any{
+						"info": map[string]any{
+							"id":     "assistant",
+							"role":   "assistant",
+							"finish": "error",
+							"error":  map[string]any{"message": "provider failed"},
+						},
+					})
+					return
+				}
+				http.NotFound(w, r)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if username, password, ok := r.BasicAuth(); !ok || username != "opencode" || password != "secret" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				tt.handler(w, r)
+			}))
+			defer server.Close()
+			client := &openCodeServer{
+				httpClient: server.Client(),
+				baseURL:    server.URL,
+				username:   "opencode",
+				password:   "secret",
+			}
+			if _, err := client.SendMessage(ctx, "s", openCodeMessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}}); err == nil {
+				t.Fatal("SendMessage unexpectedly succeeded")
+			}
+		})
 	}
 }
 
@@ -558,6 +649,14 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 		events:   make(chan openCodeEvent),
 		errs:     make(chan error, 1),
 		closed:   make(chan struct{}),
+	}
+	client.httpClient.Timeout = 30 * time.Second
+	if eventClient := client.eventHTTPClient(); eventClient.Timeout != 0 || eventClient == client.httpClient || eventClient.Transport == nil {
+		t.Fatalf("eventHTTPClient = %#v", eventClient)
+	}
+	client.httpClient.Timeout = 0
+	if httpClient := (&openCodeServer{}).eventHTTPClient(); httpClient != http.DefaultClient {
+		t.Fatalf("nil eventHTTPClient = %#v", httpClient)
 	}
 	if err := client.doJSON(ctx, http.MethodPost, "/bad-body", nil, map[string]any{"bad": func() {}}, nil); err == nil {
 		t.Fatal("doJSON accepted unmarshalable request body")

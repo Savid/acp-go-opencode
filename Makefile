@@ -18,7 +18,7 @@ coverage-check:
 
 ## test-integration-smoke: run live integration tests that do not spend model tokens
 test-integration-smoke:
-	ACP_GO_OPENCODE_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=120s -v ./integration/...
+	ACP_GO_OPENCODE_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=240s -v ./integration/...
 
 ## test-integration-live: run live integration tests that spend model tokens
 test-integration-live:
@@ -29,7 +29,7 @@ test-integration-cover:
 	rm -rf .tmp/integration-cover coverage-integration.out
 	mkdir -p .tmp/integration-cover/data
 	go build -cover -coverpkg=./... -o .tmp/integration-cover/acp-go-opencode ./cmd/acp-go-opencode
-	ACP_GO_OPENCODE_RUN_INTEGRATION=1 ACP_GO_OPENCODE_AGENT_BINARY=$$(pwd)/.tmp/integration-cover/acp-go-opencode GOCOVERDIR=$$(pwd)/.tmp/integration-cover/data go test -race -count=1 -tags=integration -timeout=120s -v ./integration/...
+	ACP_GO_OPENCODE_RUN_INTEGRATION=1 ACP_GO_OPENCODE_AGENT_BINARY=$$(pwd)/.tmp/integration-cover/acp-go-opencode GOCOVERDIR=$$(pwd)/.tmp/integration-cover/data go test -race -count=1 -tags=integration -timeout=240s -v ./integration/...
 	go tool covdata percent -i=.tmp/integration-cover/data
 	go tool covdata textfmt -i=.tmp/integration-cover/data -o coverage-integration.out
 

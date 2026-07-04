@@ -187,10 +187,10 @@ func (s *session) cancelTurn() {
 	ctx, done := context.WithTimeout(context.Background(), closeTimeout)
 	defer done()
 	for _, req := range pending {
-		_ = s.client.ReplyPermission(ctx, req.SessionID, req.ID, "reject", "cancelled")
+		_ = s.client.ReplyPermission(ctx, req, "reject", "cancelled")
 	}
 	for _, req := range questions {
-		_ = s.client.RejectQuestion(ctx, req.SessionID, req.ID)
+		_ = s.client.RejectQuestion(ctx, req)
 	}
 }
 

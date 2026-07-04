@@ -1,7 +1,8 @@
 # Permissions
 
-OpenCode permission v2 events are mapped to ACP `session/request_permission`.
-The adapter replies to OpenCode through the v2 permission reply route.
+OpenCode permission events are mapped to ACP `session/request_permission`.
+The adapter replies through the native route that corresponds to the event
+shape emitted by OpenCode.
 
 On cancellation, pending native permission requests are rejected with a
 cancelled explanation and the ACP prompt returns `cancelled`.

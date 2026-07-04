@@ -339,10 +339,15 @@ func (s *session) handleEvent(ctx context.Context, event openCodeEvent) error {
 		return err
 	}
 	switch event.Type {
-	case "permission.v2.asked":
+	case "permission.v2.asked", "permission.asked":
 		var req permissionRequest
 		if err := json.Unmarshal(event.Properties, &req); err != nil {
 			return err
+		}
+		if event.Type == "permission.v2.asked" {
+			req.ReplyRoute = permissionRouteAPI
+		} else {
+			req.ReplyRoute = permissionRouteSession
 		}
 		if req.SessionID == s.idmap.NativeSessionID {
 			return s.handlePermission(ctx, req)
@@ -368,6 +373,11 @@ func (s *session) handleEvent(ctx context.Context, event openCodeEvent) error {
 	case "question.v2.asked", "question.asked":
 		req, ok := eventQuestion(event.Properties)
 		if ok && req.SessionID == s.idmap.NativeSessionID {
+			if event.Type == "question.v2.asked" {
+				req.ReplyRoute = questionRouteAPI
+			} else {
+				req.ReplyRoute = questionRouteSession
+			}
 			return s.handleQuestion(ctx, req)
 		}
 	}
@@ -452,9 +462,9 @@ func (s *session) handlePermission(ctx context.Context, req permissionRequest) e
 			defer cancel()
 			replyCtx = backgroundCtx
 		}
-		return s.client.ReplyPermission(replyCtx, req.SessionID, req.ID, "reject", "client unavailable")
+		return s.client.ReplyPermission(replyCtx, req, "reject", "client unavailable")
 	}
-	title := req.Action
+	title := req.actionName()
 	if title == "" {
 		title = "OpenCode permission"
 	}
@@ -468,9 +478,14 @@ func (s *session) handlePermission(ctx context.Context, req permissionRequest) e
 			Kind:       &kind,
 			Status:     &status,
 			RawInput: map[string]any{
-				"action":    req.Action,
-				"resources": req.Resources,
-				"metadata":  req.Metadata,
+				"action":     req.actionName(),
+				"resources":  req.resourceList(),
+				"metadata":   req.Metadata,
+				"source":     req.Source,
+				"save":       req.Save,
+				"always":     req.Always,
+				"toolCallId": req.Tool.CallID,
+				"messageId":  req.Tool.MessageID,
 			},
 		},
 		Options: []acp.PermissionOption{
@@ -484,7 +499,7 @@ func (s *session) handlePermission(ctx context.Context, req permissionRequest) e
 		if s.wasCancelled() || ctx.Err() != nil {
 			if _, ok, _ := s.takePendingPermission(req.ID); ok {
 				replyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-				_ = s.client.ReplyPermission(replyCtx, req.SessionID, req.ID, "reject", "cancelled")
+				_ = s.client.ReplyPermission(replyCtx, req, "reject", "cancelled")
 				cancel()
 			}
 			return errPromptCancelled
@@ -509,12 +524,12 @@ func (s *session) handlePermission(ctx context.Context, req permissionRequest) e
 	if cancelled || ctx.Err() != nil {
 		replyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 		defer cancel()
-		if err := s.client.ReplyPermission(replyCtx, req.SessionID, req.ID, "reject", "cancelled"); err != nil {
+		if err := s.client.ReplyPermission(replyCtx, req, "reject", "cancelled"); err != nil {
 			return err
 		}
 		return errPromptCancelled
 	}
-	return s.client.ReplyPermission(ctx, req.SessionID, req.ID, reply, "")
+	return s.client.ReplyPermission(ctx, req, reply, "")
 }
 
 func (s *session) handleQuestion(ctx context.Context, req questionRequest) error {
@@ -532,7 +547,7 @@ func (s *session) handleQuestion(ctx context.Context, req questionRequest) error
 			defer cancel()
 			rejectCtx = backgroundCtx
 		}
-		return s.client.RejectQuestion(rejectCtx, req.SessionID, req.ID)
+		return s.client.RejectQuestion(rejectCtx, req)
 	}
 	request, propertyIDs := questionElicitationRequest(req)
 	resp, err := conn.CreateElicitation(ctx, request, elicitationScope{
@@ -543,7 +558,7 @@ func (s *session) handleQuestion(ctx context.Context, req questionRequest) error
 		if s.wasCancelled() || ctx.Err() != nil {
 			if _, ok, _ := s.takePendingQuestion(req.ID); ok {
 				rejectCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-				_ = s.client.RejectQuestion(rejectCtx, req.SessionID, req.ID)
+				_ = s.client.RejectQuestion(rejectCtx, req)
 				cancel()
 			}
 			return errPromptCancelled
@@ -562,7 +577,7 @@ func (s *session) handleQuestion(ctx context.Context, req questionRequest) error
 			defer cancel()
 			rejectCtx = backgroundCtx
 		}
-		if err := s.client.RejectQuestion(rejectCtx, req.SessionID, req.ID); err != nil {
+		if err := s.client.RejectQuestion(rejectCtx, req); err != nil {
 			return err
 		}
 		if cancelled || ctx.Err() != nil {
@@ -578,12 +593,12 @@ func (s *session) handleQuestion(ctx context.Context, req questionRequest) error
 	if cancelled || ctx.Err() != nil {
 		rejectCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 		defer cancel()
-		if err := s.client.RejectQuestion(rejectCtx, req.SessionID, req.ID); err != nil {
+		if err := s.client.RejectQuestion(rejectCtx, req); err != nil {
 			return err
 		}
 		return errPromptCancelled
 	}
-	return s.client.ReplyQuestion(ctx, req.SessionID, req.ID, questionAnswersFromContent(resp.Accept.Content, propertyIDs))
+	return s.client.ReplyQuestion(ctx, req, questionAnswersFromContent(resp.Accept.Content, propertyIDs))
 }
 
 func (s *session) drainClientBacklog(ctx context.Context) error {

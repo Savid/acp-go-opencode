@@ -41,10 +41,16 @@ func TestOpenCodeHTTPFakeServerReadinessDocAndQuestionRoutes(t *testing.T) {
 			writeJSON(t, w, map[string]any{"ok": true})
 		case "/api/session/s/question/q/reject":
 			writeJSON(t, w, map[string]any{"ok": true})
+		case "/question/q-session/reply":
+			writeJSON(t, w, true)
+		case "/question/q-session/reject":
+			writeJSON(t, w, true)
 		case "/api/permission/request":
-			writeJSON(t, w, map[string]any{"data": []map[string]any{{"id": "p", "sessionID": "s"}}})
+			writeJSON(t, w, map[string]any{"data": []map[string]any{{"id": "p", "sessionID": "s", "action": "edit"}}})
 		case "/api/session/s/permission/p/reply":
 			writeJSON(t, w, map[string]any{"ok": true})
+		case "/permission/p-session/reply":
+			writeJSON(t, w, true)
 		default:
 			writeJSON(t, w, map[string]any{"id": "s"})
 		}
@@ -67,18 +73,27 @@ func TestOpenCodeHTTPFakeServerReadinessDocAndQuestionRoutes(t *testing.T) {
 	if err != nil || len(questions) != 1 || questions[0].ID != "q" {
 		t.Fatalf("PendingQuestions = %#v err=%v", questions, err)
 	}
-	if err := client.ReplyQuestion(ctx, "s", "q", [][]string{{"yes"}}); err != nil {
+	if err := client.ReplyQuestion(ctx, questionRequest{ID: "q", SessionID: "s", ReplyRoute: questionRouteAPI}, [][]string{{"yes"}}); err != nil {
 		t.Fatalf("ReplyQuestion: %v", err)
 	}
-	if err := client.RejectQuestion(ctx, "s", "q"); err != nil {
+	if err := client.RejectQuestion(ctx, questionRequest{ID: "q", SessionID: "s", ReplyRoute: questionRouteAPI}); err != nil {
 		t.Fatalf("RejectQuestion: %v", err)
+	}
+	if err := client.ReplyQuestion(ctx, questionRequest{ID: "q-session", SessionID: "s", ReplyRoute: questionRouteSession}, [][]string{{"yes"}}); err != nil {
+		t.Fatalf("ReplyQuestion session route: %v", err)
+	}
+	if err := client.RejectQuestion(ctx, questionRequest{ID: "q-session", SessionID: "s", ReplyRoute: questionRouteSession}); err != nil {
+		t.Fatalf("RejectQuestion session route: %v", err)
 	}
 	permissions, err := client.PendingPermissions(ctx)
 	if err != nil || len(permissions) != 1 || permissions[0].ID != "p" {
 		t.Fatalf("PendingPermissions = %#v err=%v", permissions, err)
 	}
-	if err := client.ReplyPermission(ctx, "s", "p", "once", "ok"); err != nil {
+	if err := client.ReplyPermission(ctx, permissions[0], "once", "ok"); err != nil {
 		t.Fatalf("ReplyPermission: %v", err)
+	}
+	if err := client.ReplyPermission(ctx, permissionRequest{ID: "p-session", SessionID: "s", ReplyRoute: permissionRouteSession}, "once", "ok"); err != nil {
+		t.Fatalf("ReplyPermission session route: %v", err)
 	}
 	if !containsString(seen, "GET /doc") || !containsString(seen, "POST /api/session/s/question/q/reply") {
 		t.Fatalf("seen paths = %#v", seen)
@@ -86,6 +101,27 @@ func TestOpenCodeHTTPFakeServerReadinessDocAndQuestionRoutes(t *testing.T) {
 	close(client.closed)
 	if todos, err := client.Todos(ctx, "s"); !errors.Is(err, context.Canceled) || todos != nil {
 		t.Fatalf("closed Todos = %#v err=%v", todos, err)
+	}
+}
+
+func TestOpenCodePendingRequestErrors(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := &openCodeServer{
+		httpClient: server.Client(),
+		baseURL:    server.URL,
+		username:   "opencode",
+		password:   "secret",
+	}
+	if _, err := client.PendingPermissions(ctx); err == nil {
+		t.Fatal("PendingPermissions unexpectedly succeeded")
+	}
+	if _, err := client.PendingQuestions(ctx); err == nil {
+		t.Fatal("PendingQuestions unexpectedly succeeded")
 	}
 }
 
@@ -203,6 +239,23 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 			},
 		},
 		{
+			name: "session permission reply wrong method",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/permission/{requestID}/reply"].(map[string]any)
+				replyPath["get"] = replyPath["post"]
+				delete(replyPath, "post")
+			},
+		},
+		{
+			name: "session permission reply missing success response",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/permission/{requestID}/reply"].(map[string]any)
+				replyPath["post"].(map[string]any)["responses"] = map[string]any{}
+			},
+		},
+		{
 			name: "question request wrong schema",
 			mutate: func(doc map[string]any) {
 				paths := doc["paths"].(map[string]any)
@@ -253,6 +306,23 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 				schemas := components["schemas"].(map[string]any)
 				reply := schemas["QuestionV2Reply"].(map[string]any)
 				reply["required"] = []any{}
+			},
+		},
+		{
+			name: "session question reply wrong method",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				replyPath := paths["/question/{requestID}/reply"].(map[string]any)
+				replyPath["get"] = replyPath["post"]
+				delete(replyPath, "post")
+			},
+		},
+		{
+			name: "session question reject missing success response",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				rejectPath := paths["/question/{requestID}/reject"].(map[string]any)
+				rejectPath["post"].(map[string]any)["responses"] = map[string]any{}
 			},
 		},
 		{
@@ -385,6 +455,7 @@ func fullOpenCodeDoc() map[string]any {
 	for _, path := range []string{
 		"/config/providers",
 		"/event",
+		"/session/status",
 		"/session",
 		"/session/{sessionID}",
 		"/session/{sessionID}/message",
@@ -393,6 +464,15 @@ func fullOpenCodeDoc() map[string]any {
 		"/session/{sessionID}/todo",
 		"/session/{sessionID}/revert",
 		"/session/{sessionID}/unrevert",
+		"/permission",
+		"/permission/{requestID}/reply",
+		"/question",
+		"/question/{requestID}/reply",
+		"/question/{requestID}/reject",
+		"/api/session/{sessionID}/agent",
+		"/api/session/{sessionID}/message",
+		"/api/session/{sessionID}/model",
+		"/api/session/{sessionID}/prompt",
 		"/api/session/{sessionID}/permission/{requestID}/reply",
 		"/api/permission/request",
 		"/api/session/{sessionID}/question/{requestID}/reply",
@@ -418,6 +498,22 @@ func fullOpenCodeDoc() map[string]any {
 			},
 		},
 	}
+	paths["/permission/{requestID}/reply"] = map[string]any{
+		"post": map[string]any{
+			"responses": map[string]any{"200": map[string]any{"description": "Permission processed"}},
+			"requestBody": map[string]any{
+				"required": true,
+				"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"reply":   map[string]any{"type": "string"},
+						"message": map[string]any{"type": "string"},
+					},
+					"required": []any{"reply"},
+				}}},
+			},
+		},
+	}
 	paths["/api/question/request"] = pendingRequestPath("QuestionV2Request")
 	paths["/api/session/{sessionID}/question/{requestID}/reply"] = map[string]any{
 		"post": map[string]any{
@@ -435,12 +531,24 @@ func fullOpenCodeDoc() map[string]any {
 			"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
 		},
 	}
+	paths["/question/{requestID}/reply"] = map[string]any{
+		"post": map[string]any{
+			"responses": map[string]any{"200": map[string]any{"description": "Question answered"}},
+		},
+	}
+	paths["/question/{requestID}/reject"] = map[string]any{
+		"post": map[string]any{
+			"responses": map[string]any{"200": map[string]any{"description": "Question rejected"}},
+		},
+	}
 	return map[string]any{
 		"paths": paths,
 		"components": map[string]any{"schemas": map[string]any{
 			"Event": eventUnion(
 				"EventPermissionV2Asked",
 				"EventPermissionV2Replied",
+				"EventPermissionAsked",
+				"EventPermissionReplied",
 				"EventQuestionV2Asked",
 				"EventQuestionV2Replied",
 				"EventQuestionAsked",
@@ -450,6 +558,12 @@ func fullOpenCodeDoc() map[string]any {
 			),
 			"EventPermissionV2Asked": eventSchema("permission.v2.asked", []string{"id", "sessionID", "action", "resources"}),
 			"EventPermissionV2Replied": eventSchema("permission.v2.replied", []string{
+				"sessionID",
+				"requestID",
+				"reply",
+			}),
+			"EventPermissionAsked": eventSchema("permission.asked", []string{"id", "sessionID", "permission", "patterns"}),
+			"EventPermissionReplied": eventSchema("permission.replied", []string{
 				"sessionID",
 				"requestID",
 				"reply",
