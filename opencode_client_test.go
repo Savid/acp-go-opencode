@@ -256,6 +256,53 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 			},
 		},
 		{
+			name: "event union missing permission event",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				event := schemas["Event"].(map[string]any)
+				event["anyOf"] = []any{}
+			},
+		},
+		{
+			name: "event schema missing component",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				delete(schemas, "EventPermissionV2Asked")
+			},
+		},
+		{
+			name: "event schema wrong type enum",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				event := schemas["EventPermissionV2Asked"].(map[string]any)
+				typeSchema := event["properties"].(map[string]any)["type"].(map[string]any)
+				typeSchema["enum"] = []any{"permission.asked"}
+			},
+		},
+		{
+			name: "event schema missing properties",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				event := schemas["EventPermissionV2Asked"].(map[string]any)
+				properties := event["properties"].(map[string]any)
+				delete(properties, "properties")
+			},
+		},
+		{
+			name: "event schema missing required property",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				event := schemas["EventQuestionV2Asked"].(map[string]any)
+				properties := event["properties"].(map[string]any)["properties"].(map[string]any)
+				properties["required"] = []any{"id", "sessionID"}
+			},
+		},
+		{
 			name: "question reject missing no-content response",
 			mutate: func(doc map[string]any) {
 				paths := doc["paths"].(map[string]any)
@@ -299,6 +346,15 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 	}
 	if _, ok := openAPIOperation(map[string]any{}, "/missing", http.MethodGet); ok {
 		t.Fatal("missing OpenAPI path returned operation")
+	}
+	if !openAPIStringEnumContains(map[string]any{"enum": []string{"wanted"}}, "wanted") {
+		t.Fatal("string enum helper missed wanted value")
+	}
+	if openAPIStringEnumContains(map[string]any{"enum": []string{"other"}}, "wanted") {
+		t.Fatal("string enum helper matched wrong value")
+	}
+	if openAPIEventUnionHasSchema(map[string]any{}, "EventPermissionV2Asked") {
+		t.Fatal("missing Event union unexpectedly matched")
 	}
 	if !openAPIObjectHasRequiredProperty(map[string]any{
 		"properties": map[string]any{"reply": map[string]any{}},
@@ -382,6 +438,28 @@ func fullOpenCodeDoc() map[string]any {
 	return map[string]any{
 		"paths": paths,
 		"components": map[string]any{"schemas": map[string]any{
+			"Event": eventUnion(
+				"EventPermissionV2Asked",
+				"EventPermissionV2Replied",
+				"EventQuestionV2Asked",
+				"EventQuestionV2Replied",
+				"EventQuestionAsked",
+				"EventQuestionReplied",
+				"EventMessagePartUpdated",
+				"EventServerConnected",
+			),
+			"EventPermissionV2Asked": eventSchema("permission.v2.asked", []string{"id", "sessionID", "action", "resources"}),
+			"EventPermissionV2Replied": eventSchema("permission.v2.replied", []string{
+				"sessionID",
+				"requestID",
+				"reply",
+			}),
+			"EventQuestionV2Asked":    eventSchema("question.v2.asked", []string{"id", "sessionID", "questions"}),
+			"EventQuestionV2Replied":  eventSchema("question.v2.replied", []string{"sessionID", "requestID", "answers"}),
+			"EventQuestionAsked":      eventSchema("question.asked", []string{"id", "sessionID", "questions"}),
+			"EventQuestionReplied":    eventSchema("question.replied", []string{"sessionID", "requestID", "answers"}),
+			"EventMessagePartUpdated": eventSchema("message.part.updated", []string{"sessionID", "part", "time"}),
+			"EventServerConnected":    eventSchema("server.connected", nil),
 			"QuestionV2Reply": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -390,6 +468,36 @@ func fullOpenCodeDoc() map[string]any {
 				"required": []any{"answers"},
 			},
 		}},
+	}
+}
+
+func eventUnion(names ...string) map[string]any {
+	refs := make([]any, 0, len(names))
+	for _, name := range names {
+		refs = append(refs, map[string]any{"$ref": "#/components/schemas/" + name})
+	}
+	return map[string]any{"anyOf": refs}
+}
+
+func eventSchema(eventType string, required []string) map[string]any {
+	properties := map[string]any{}
+	for _, property := range required {
+		properties[property] = map[string]any{"type": "string"}
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"id":   map[string]any{"type": "string"},
+			"type": map[string]any{"type": "string", "enum": []string{eventType}},
+			"properties": map[string]any{
+				"type":                 "object",
+				"properties":           properties,
+				"required":             required,
+				"additionalProperties": false,
+			},
+		},
+		"required":             []string{"id", "type", "properties"},
+		"additionalProperties": false,
 	}
 }
 

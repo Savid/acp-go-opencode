@@ -210,6 +210,12 @@ func (c *fakeOpenCodeClient) questionReply(index int) fakeQuestionReply {
 	return c.questionReplies[index]
 }
 
+func (c *fakeOpenCodeClient) questionReplyCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.questionReplies)
+}
+
 func (c *fakeOpenCodeClient) questionRejectCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -309,12 +309,64 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 	return map[string]any{
 		"paths": paths,
 		"components": map[string]any{"schemas": map[string]any{
+			"Event": fakeEventUnion(
+				"EventPermissionV2Asked",
+				"EventPermissionV2Replied",
+				"EventQuestionV2Asked",
+				"EventQuestionV2Replied",
+				"EventQuestionAsked",
+				"EventQuestionReplied",
+				"EventMessagePartUpdated",
+				"EventServerConnected",
+			),
+			"EventPermissionV2Asked": fakeEventSchema("permission.v2.asked", []string{"id", "sessionID", "action", "resources"}),
+			"EventPermissionV2Replied": fakeEventSchema("permission.v2.replied", []string{
+				"sessionID",
+				"requestID",
+				"reply",
+			}),
+			"EventQuestionV2Asked":    fakeEventSchema("question.v2.asked", []string{"id", "sessionID", "questions"}),
+			"EventQuestionV2Replied":  fakeEventSchema("question.v2.replied", []string{"sessionID", "requestID", "answers"}),
+			"EventQuestionAsked":      fakeEventSchema("question.asked", []string{"id", "sessionID", "questions"}),
+			"EventQuestionReplied":    fakeEventSchema("question.replied", []string{"sessionID", "requestID", "answers"}),
+			"EventMessagePartUpdated": fakeEventSchema("message.part.updated", []string{"sessionID", "part", "time"}),
+			"EventServerConnected":    fakeEventSchema("server.connected", nil),
 			"QuestionV2Reply": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{"answers": map[string]any{"type": "array"}},
 				"required":   []any{"answers"},
 			},
 		}},
+	}
+}
+
+func fakeEventUnion(names ...string) map[string]any {
+	refs := make([]any, 0, len(names))
+	for _, name := range names {
+		refs = append(refs, map[string]any{"$ref": "#/components/schemas/" + name})
+	}
+	return map[string]any{"anyOf": refs}
+}
+
+func fakeEventSchema(eventType string, required []string) map[string]any {
+	properties := map[string]any{}
+	for _, property := range required {
+		properties[property] = map[string]any{"type": "string"}
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"id":   map[string]any{"type": "string"},
+			"type": map[string]any{"type": "string", "enum": []string{eventType}},
+			"properties": map[string]any{
+				"type":                 "object",
+				"properties":           properties,
+				"required":             required,
+				"additionalProperties": false,
+			},
+		},
+		"required":             []string{"id", "type", "properties"},
+		"additionalProperties": false,
 	}
 }
 

@@ -152,20 +152,24 @@ func TestRequestErrorAndCapabilityHelpers(t *testing.T) {
 	}
 
 	for _, tt := range []struct {
-		name string
-		caps *acp.ElicitationCapabilities
-		want bool
+		name     string
+		caps     *acp.ElicitationCapabilities
+		wantForm bool
+		wantURL  bool
 	}{
-		{name: "nil", caps: nil, want: false},
-		{name: "empty object", caps: &acp.ElicitationCapabilities{}, want: true},
-		{name: "url only", caps: &acp.ElicitationCapabilities{Url: &acp.ElicitationUrlCapabilities{}}, want: false},
-		{name: "form explicit", caps: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}, want: true},
+		{name: "nil", caps: nil, wantForm: false, wantURL: false},
+		{name: "empty object", caps: &acp.ElicitationCapabilities{}, wantForm: true, wantURL: false},
+		{name: "url only", caps: &acp.ElicitationCapabilities{Url: &acp.ElicitationUrlCapabilities{}}, wantForm: false, wantURL: true},
+		{name: "form explicit", caps: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}, wantForm: true, wantURL: false},
 	} {
 		t.Run("elicitation "+tt.name, func(t *testing.T) {
 			agent := NewAgent()
 			agent.clientCapabilities.Elicitation = tt.caps
-			if got := agent.clientSupportsFormElicitation(); got != tt.want {
-				t.Fatalf("clientSupportsFormElicitation() = %v, want %v", got, tt.want)
+			if got := agent.clientSupportsFormElicitation(); got != tt.wantForm {
+				t.Fatalf("clientSupportsFormElicitation() = %v, want %v", got, tt.wantForm)
+			}
+			if got := agent.clientSupportsURLElicitation(); got != tt.wantURL {
+				t.Fatalf("clientSupportsURLElicitation() = %v, want %v", got, tt.wantURL)
 			}
 		})
 	}

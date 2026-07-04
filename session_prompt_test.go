@@ -395,6 +395,239 @@ func TestPromptSuppressesLateFailedEpochEvents(t *testing.T) {
 	}
 }
 
+func TestPromptCleanEOFSentinelDisconnectAbortsTurn(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	agent := NewAgent()
+	session := testSession(agent, client)
+	started := make(chan struct{})
+	client.sendMessage = func(ctx context.Context, _ string, _ openCodeMessageRequest) (nativeMessage, error) {
+		close(started)
+		<-ctx.Done()
+		return nativeMessage{}, ctx.Err()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("Prompt did not start")
+	}
+	client.errs <- streamError{epoch: 11, err: errOpenCodeSSEDisconnect}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "opencode_sse_disconnect") {
+			t.Fatalf("Prompt error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Prompt did not fail on clean EOF disconnect")
+	}
+	if client.abortCount() != 1 {
+		t.Fatalf("native aborts = %d, want 1", client.abortCount())
+	}
+}
+
+func TestPromptServerReconnectReconcilesPendingPermissionAndQuestion(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	conn := newRecordingAgentClient()
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+	session := testSession(agent, client)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client.sendMessage = func(_ context.Context, id string, _ openCodeMessageRequest) (nativeMessage, error) {
+		close(started)
+		<-release
+		return nativeMessage{Info: nativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("Prompt did not start")
+	}
+	client.pendingPermissions = []permissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit"}}
+	client.pendingQuestions = []questionRequest{{
+		ID:        "question",
+		SessionID: "native-1",
+		Questions: []questionInfo{{
+			Question: "Pick?",
+			Header:   "Pick",
+			Options:  []questionOption{{Label: "A", Description: "A"}},
+		}},
+	}}
+	client.events <- openCodeEvent{Type: "server.connected"}
+	deadline := time.After(time.Second)
+	for client.permissionReplyCount() == 0 || client.questionReplyCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("pending queues not reconciled permissions=%d questions=%d", client.permissionReplyCount(), client.questionReplyCount())
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Prompt did not finish")
+	}
+}
+
+func TestPromptServerReconnectReconcileFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		setup         func(*recordingAgentClient, *Agent) chan struct{}
+		pending       func(*fakeOpenCodeClient)
+		cancel        bool
+		wantErr       string
+		wantCancelled bool
+	}{
+		{
+			name: "permission error",
+			setup: func(conn *recordingAgentClient, _ *Agent) chan struct{} {
+				conn.permErr = errors.New("permission failed")
+				return nil
+			},
+			pending: func(client *fakeOpenCodeClient) {
+				client.pendingPermissions = []permissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit"}}
+			},
+			wantErr: "permission failed",
+		},
+		{
+			name: "permission cancelled",
+			setup: func(conn *recordingAgentClient, _ *Agent) chan struct{} {
+				conn.permissionStarted = make(chan struct{}, 1)
+				conn.permissionRelease = make(chan struct{})
+				return conn.permissionStarted
+			},
+			pending: func(client *fakeOpenCodeClient) {
+				client.pendingPermissions = []permissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit"}}
+			},
+			cancel:        true,
+			wantCancelled: true,
+		},
+		{
+			name: "question error",
+			setup: func(conn *recordingAgentClient, agent *Agent) chan struct{} {
+				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+				conn.elicitErr = errors.New("elicitation failed")
+				return nil
+			},
+			pending: func(client *fakeOpenCodeClient) {
+				client.pendingQuestions = []questionRequest{{
+					ID:        "question",
+					SessionID: "native-1",
+					Questions: []questionInfo{{
+						Question: "Pick?",
+						Header:   "Pick",
+						Options:  []questionOption{{Label: "A"}},
+					}},
+				}}
+			},
+			wantErr: "elicitation failed",
+		},
+		{
+			name: "question cancelled",
+			setup: func(conn *recordingAgentClient, agent *Agent) chan struct{} {
+				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+				conn.elicitationStarted = make(chan struct{}, 1)
+				conn.elicitationRelease = make(chan struct{})
+				return conn.elicitationStarted
+			},
+			pending: func(client *fakeOpenCodeClient) {
+				client.pendingQuestions = []questionRequest{{
+					ID:        "question",
+					SessionID: "native-1",
+					Questions: []questionInfo{{
+						Question: "Pick?",
+						Header:   "Pick",
+						Options:  []questionOption{{Label: "A"}},
+					}},
+				}}
+			},
+			cancel:        true,
+			wantCancelled: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newFakeOpenCodeClient()
+			conn := newRecordingAgentClient()
+			agent := NewAgent()
+			agent.setAgentClient(conn)
+			startedHook := tt.setup(conn, agent)
+			session := testSession(agent, client)
+			sendStarted := make(chan struct{})
+			client.sendMessage = func(ctx context.Context, _ string, _ openCodeMessageRequest) (nativeMessage, error) {
+				close(sendStarted)
+				<-ctx.Done()
+				return nativeMessage{}, ctx.Err()
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			done := make(chan struct {
+				resp acp.PromptResponse
+				err  error
+			}, 1)
+			go func() {
+				resp, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+				done <- struct {
+					resp acp.PromptResponse
+					err  error
+				}{resp: resp, err: err}
+			}()
+			select {
+			case <-sendStarted:
+			case <-ctx.Done():
+				t.Fatal("Prompt did not start")
+			}
+			tt.pending(client)
+			client.events <- openCodeEvent{Type: "server.connected"}
+			if startedHook != nil {
+				select {
+				case <-startedHook:
+				case <-ctx.Done():
+					t.Fatal("reconcile request did not start")
+				}
+			}
+			if tt.cancel {
+				cancel()
+			}
+			select {
+			case got := <-done:
+				if tt.wantCancelled {
+					if got.err != nil || got.resp.StopReason != acp.StopReasonCancelled {
+						t.Fatalf("Prompt cancelled resp=%#v err=%v", got.resp, got.err)
+					}
+					return
+				}
+				if got.err == nil || !strings.Contains(got.err.Error(), tt.wantErr) {
+					t.Fatalf("Prompt error = %v, want %q", got.err, tt.wantErr)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Prompt did not finish")
+			}
+		})
+	}
+}
+
 func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
@@ -915,12 +1148,14 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 		{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
 			BlobResourceContents: &acp.BlobResourceContents{Blob: "AA==", Uri: "file:///tmp/blob"},
 		}}},
+		{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}},
 	})
 	if err != nil {
 		t.Fatalf("promptToOpenCodeParts: %v", err)
 	}
-	if len(parts) != 4 || parts[0]["text"] != "hello" || parts[1]["text"] != "file:///tmp/a" ||
-		parts[2]["text"] != "embedded" || parts[3]["text"] != "file:///tmp/blob" {
+	if len(parts) != 5 || parts[0]["text"] != "hello" || parts[1]["text"] != "file:///tmp/a" ||
+		parts[2]["text"] != "embedded" || parts[3]["text"] != "file:///tmp/blob" ||
+		parts[4]["type"] != "file" || parts[4]["mime"] != "image/png" || parts[4]["url"] != "data:image/png;base64,AA==" {
 		t.Fatalf("parts = %#v", parts)
 	}
 	if _, err := promptToOpenCodeParts(nil); err == nil {
@@ -929,8 +1164,18 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 	if _, err := promptToOpenCodeParts([]acp.ContentBlock{{Audio: &acp.ContentBlockAudio{Type: "audio", Data: "AA==", MimeType: "audio/wav"}}}); err == nil {
 		t.Fatal("audio prompt accepted")
 	}
-	if _, err := promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}}}); err == nil {
-		t.Fatal("image prompt accepted")
+	if _, err := promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image"}}}); err == nil {
+		t.Fatal("empty image prompt accepted")
+	}
+	invalidURI := "%"
+	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Uri: &invalidURI}}})
+	if err != nil || parts[0]["filename"] != nil || parts[0]["mime"] != "application/octet-stream" || parts[0]["url"] != invalidURI {
+		t.Fatalf("invalid uri image parts = %#v err=%v", parts, err)
+	}
+	rootURI := "https://example.com"
+	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Uri: &rootURI}}})
+	if err != nil || parts[0]["filename"] != nil || parts[0]["url"] != rootURI {
+		t.Fatalf("root uri image parts = %#v err=%v", parts, err)
 	}
 	req, ids := questionElicitationRequest(questionRequest{ID: "q", SessionID: "s"})
 	if req.Form == nil || req.Form.Message != "OpenCode needs input" || !reflect.DeepEqual(ids, []string{"question_1"}) {
@@ -944,6 +1189,35 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 	}, []string{"question_1", "question_2", "question_3", "question_4"})
 	if !reflect.DeepEqual(answers, [][]string{{}, {"a"}, {"b", "3"}, {"4"}}) {
 		t.Fatalf("answers = %#v", answers)
+	}
+}
+
+func TestPromptSendsNativeImageFileParts(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	agent := NewAgent()
+	session := testSession(agent, client)
+	imageURI := "file:///tmp/screenshot.png"
+	client.sendMessage = func(_ context.Context, id string, req openCodeMessageRequest) (nativeMessage, error) {
+		want := []map[string]any{
+			{"type": "text", "text": "look"},
+			{"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA=="},
+			{"type": "file", "mime": "image/jpeg", "url": "file:///tmp/screenshot.png", "filename": "screenshot.png"},
+		}
+		if !reflect.DeepEqual(req.Parts, want) {
+			t.Fatalf("native parts = %#v, want %#v", req.Parts, want)
+		}
+		return nativeMessage{Info: nativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
+	}
+	_, err := session.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: session.id,
+		Prompt: []acp.ContentBlock{
+			acp.TextBlock("look"),
+			{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}},
+			{Image: &acp.ContentBlockImage{Type: "image", Uri: &imageURI, MimeType: "image/jpeg"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
 	}
 }
 

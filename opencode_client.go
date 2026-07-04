@@ -33,6 +33,8 @@ const (
 	leaseFileName           = "server.lease"
 )
 
+var errOpenCodeSSEDisconnect = errors.New("opencode SSE disconnected")
+
 type openCodeClient interface {
 	Close(context.Context) error
 	CreateSession(context.Context, string) (nativeSession, error)
@@ -820,7 +822,17 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	return flush()
+	if err := flush(); err != nil {
+		return err
+	}
+	select {
+	case <-s.closed:
+		return io.EOF
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return fmt.Errorf("%w: event stream closed", errOpenCodeSSEDisconnect)
+	}
 }
 
 func validateOpenCodeDoc(doc map[string]any) error {
@@ -862,7 +874,58 @@ func validateOpenCodeDoc(doc map[string]any) error {
 	if err := validateOpenCodePostNoContent(rawPaths, "/api/session/{sessionID}/question/{requestID}/reject"); err != nil {
 		return err
 	}
+	if err := validateOpenCodeEventSchemas(doc); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+type openCodeEventContract struct {
+	schema             string
+	event              string
+	requiredProperties []string
+}
+
+func validateOpenCodeEventSchemas(doc map[string]any) error {
+	for _, contract := range []openCodeEventContract{
+		{schema: "EventPermissionV2Asked", event: "permission.v2.asked", requiredProperties: []string{"id", "sessionID", "action", "resources"}},
+		{schema: "EventPermissionV2Replied", event: "permission.v2.replied", requiredProperties: []string{"sessionID", "requestID", "reply"}},
+		{schema: "EventQuestionV2Asked", event: "question.v2.asked", requiredProperties: []string{"id", "sessionID", "questions"}},
+		{schema: "EventQuestionV2Replied", event: "question.v2.replied", requiredProperties: []string{"sessionID", "requestID", "answers"}},
+		{schema: "EventQuestionAsked", event: "question.asked", requiredProperties: []string{"id", "sessionID", "questions"}},
+		{schema: "EventQuestionReplied", event: "question.replied", requiredProperties: []string{"sessionID", "requestID", "answers"}},
+		{schema: "EventMessagePartUpdated", event: "message.part.updated", requiredProperties: []string{"sessionID", "part", "time"}},
+		{schema: "EventServerConnected", event: "server.connected"},
+	} {
+		if err := validateOpenCodeEventSchema(doc, contract); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateOpenCodeEventSchema(doc map[string]any, contract openCodeEventContract) error {
+	if !openAPIEventUnionHasSchema(doc, contract.schema) {
+		return fmt.Errorf("opencode /doc Event union missing %s", contract.schema)
+	}
+	schema, ok := openAPIComponentSchema(doc, "#/components/schemas/"+contract.schema)
+	if !ok {
+		return fmt.Errorf("opencode /doc missing event schema %s", contract.schema)
+	}
+	typeSchema, ok := openAPIObjectProperty(schema, "type")
+	if !ok || !openAPIStringEnumContains(typeSchema, contract.event) {
+		return fmt.Errorf("opencode /doc event schema %s missing type %q", contract.schema, contract.event)
+	}
+	propertiesSchema, ok := openAPIObjectProperty(schema, "properties")
+	if !ok {
+		return fmt.Errorf("opencode /doc event schema %s missing properties schema", contract.schema)
+	}
+	for _, property := range contract.requiredProperties {
+		if !openAPIObjectHasRequiredProperty(propertiesSchema, property) {
+			return fmt.Errorf("opencode /doc event schema %s properties missing required %s", contract.schema, property)
+		}
+	}
 	return nil
 }
 
@@ -1013,6 +1076,48 @@ func openAPIObjectHasProperty(schema map[string]any, property string) bool {
 	properties, _ := schema["properties"].(map[string]any)
 	_, ok := properties[property]
 	return ok
+}
+
+func openAPIObjectProperty(schema map[string]any, property string) (map[string]any, bool) {
+	properties, _ := schema["properties"].(map[string]any)
+	value, _ := properties[property].(map[string]any)
+	return value, value != nil
+}
+
+func openAPIStringEnumContains(schema map[string]any, want string) bool {
+	switch values := schema["enum"].(type) {
+	case []any:
+		for _, raw := range values {
+			if value, _ := raw.(string); value == want {
+				return true
+			}
+		}
+	case []string:
+		for _, value := range values {
+			if value == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openAPIEventUnionHasSchema(doc map[string]any, schemaName string) bool {
+	event, ok := openAPIComponentSchema(doc, "#/components/schemas/Event")
+	if !ok {
+		return false
+	}
+	for _, key := range []string{"anyOf", "oneOf"} {
+		values, _ := event[key].([]any)
+		for _, raw := range values {
+			option, _ := raw.(map[string]any)
+			ref, _ := option["$ref"].(string)
+			if strings.HasSuffix(ref, "/"+schemaName) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func openAPIComponentSchema(doc map[string]any, ref string) (map[string]any, bool) {

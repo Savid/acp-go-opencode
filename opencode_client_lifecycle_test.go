@@ -259,6 +259,16 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		}
 	})
 
+	t.Run("permission config failure", func(t *testing.T) {
+		_, err := startOpenCodeServer(ctx, openCodeStartOptions{
+			ExistingXDG: testXDGDirs(t),
+			Permission:  "deny",
+		})
+		if err == nil {
+			t.Fatal("invalid permission unexpectedly started")
+		}
+	})
+
 	t.Run("allocate port failure", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeListen = func(string, string) (net.Listener, error) {
@@ -578,15 +588,52 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	client.httpClient = stream.Client()
 	client.baseURL = stream.URL
 	client.events = make(chan openCodeEvent, 1)
-	if err := client.readEventStream(ctx); err != nil {
-		t.Fatalf("multi-line readEventStream: %v", err)
+	if err := client.readEventStream(ctx); !errors.Is(err, errOpenCodeSSEDisconnect) {
+		t.Fatalf("multi-line clean EOF readEventStream error = %v", err)
 	}
 	if event := <-client.events; event.Type != "server.connected" {
 		t.Fatalf("event = %#v", event)
 	}
 
-	close(client.closed)
+	unterminatedStream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"server.connected\",\"properties\":{}}\n"))
+	}))
+	defer unterminatedStream.Close()
+	client.httpClient = unterminatedStream.Client()
+	client.baseURL = unterminatedStream.URL
+	client.events = make(chan openCodeEvent, 1)
+	if err := client.readEventStream(ctx); !errors.Is(err, errOpenCodeSSEDisconnect) {
+		t.Fatalf("unterminated clean EOF readEventStream error = %v", err)
+	}
+	if event := <-client.events; event.Type != "server.connected" {
+		t.Fatalf("unterminated event = %#v", event)
+	}
+
+	cancelOnEOF, cancelEOF := context.WithCancel(context.Background())
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     make(http.Header),
+			Body:       eofCancelReadCloser{cancel: cancelEOF},
+		}, nil
+	})}
+	client.baseURL = "http://opencode.test"
+	client.events = make(chan openCodeEvent, 1)
+	if err := client.readEventStream(cancelOnEOF); !errors.Is(err, context.Canceled) {
+		t.Fatalf("post-EOF cancelled stream error = %v", err)
+	}
+
+	closedFlushStream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"server.connected\",\"properties\":{}}\n"))
+	}))
+	defer closedFlushStream.Close()
+	client.httpClient = closedFlushStream.Client()
+	client.baseURL = closedFlushStream.URL
 	client.events = make(chan openCodeEvent)
+	close(client.closed)
 	if err := client.readEventStream(ctx); !errors.Is(err, io.EOF) {
 		t.Fatalf("closed stream error = %v", err)
 	}
@@ -620,6 +667,47 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancelled stream did not return")
+	}
+}
+
+func TestOpenCodeReadEventsDropsErrorWhenChannelFullAndReconnects(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+	requests := 0
+	var client *openCodeServer
+	client = &openCodeServer{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			if requests == 2 {
+				close(client.closed)
+			}
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Status:     "500 Internal Server Error",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("bad stream")),
+			}, nil
+		})},
+		baseURL:  "http://opencode.test",
+		username: "opencode",
+		password: "secret",
+		events:   make(chan openCodeEvent, 1),
+		errs:     make(chan error, 1),
+		closed:   make(chan struct{}),
+	}
+	client.errs <- errors.New("already full")
+	delayCalls := 0
+	openCodeAfter = func(time.Duration) <-chan time.Time {
+		delayCalls++
+		if delayCalls > 1 {
+			return make(chan time.Time)
+		}
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+	client.readEvents(context.Background())
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
 	}
 }
 
@@ -1122,6 +1210,19 @@ func (r errorReadCloser) Read([]byte) (int, error) {
 }
 
 func (r errorReadCloser) Close() error {
+	return nil
+}
+
+type eofCancelReadCloser struct {
+	cancel context.CancelFunc
+}
+
+func (r eofCancelReadCloser) Read([]byte) (int, error) {
+	r.cancel()
+	return 0, io.EOF
+}
+
+func (r eofCancelReadCloser) Close() error {
 	return nil
 }
 

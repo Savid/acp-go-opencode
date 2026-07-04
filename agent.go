@@ -176,6 +176,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 			},
 			PositionEncoding: &positionEncoding,
 			PromptCapabilities: acp.PromptCapabilities{
+				Image:           true,
 				EmbeddedContext: true,
 			},
 			SessionCapabilities: acp.SessionCapabilities{
@@ -189,8 +190,8 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 	}, nil
 }
 
-func (a *Agent) Authenticate(context.Context, acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
-	return acp.AuthenticateResponse{}, nil
+func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
+	return acp.AuthenticateResponse{}, acp.NewInvalidParams(map[string]any{"methodId": params.MethodId})
 }
 
 func (a *Agent) Logout(context.Context, acp.LogoutRequest) (acp.LogoutResponse, error) {
@@ -329,6 +330,11 @@ func (a *Agent) clientSupportsFormElicitation() bool {
 		return false
 	}
 	return caps.Form != nil || caps.Url == nil
+}
+
+func (a *Agent) clientSupportsURLElicitation() bool {
+	caps := a.clientElicitationCapabilities()
+	return caps != nil && caps.Url != nil
 }
 
 func selectPositionEncoding(values []acp.PositionEncodingKind) acp.PositionEncodingKind {

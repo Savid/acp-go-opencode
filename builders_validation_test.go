@@ -444,8 +444,8 @@ func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	agent.mu.Lock()
 	agent.sessions[session.id] = session
 	agent.mu.Unlock()
-	if _, err := agent.Authenticate(ctx, acp.AuthenticateRequest{}); err != nil {
-		t.Fatalf("Authenticate: %v", err)
+	if _, err := agent.Authenticate(ctx, acp.AuthenticateRequest{}); err == nil {
+		t.Fatal("Authenticate accepted unsupported method")
 	}
 	if _, err := agent.Logout(ctx, acp.LogoutRequest{}); err != nil {
 		t.Fatalf("Logout: %v", err)

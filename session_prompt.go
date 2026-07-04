@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -97,6 +99,18 @@ func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pro
 		select {
 		case event := <-s.client.Events():
 			if event.Type == "server.connected" {
+				if err := s.reconcilePermissions(turnCtx); err != nil {
+					if errors.Is(err, errPromptCancelled) {
+						return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
+					}
+					return acp.PromptResponse{}, err
+				}
+				if err := s.reconcileQuestions(turnCtx); err != nil {
+					if errors.Is(err, errPromptCancelled) {
+						return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
+					}
+					return acp.PromptResponse{}, err
+				}
 				continue
 			}
 			if err := s.handleEvent(turnCtx, event); err != nil {
@@ -150,7 +164,11 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock) ([]map[string]any, error) 
 				parts = append(parts, map[string]any{"type": "text", "text": text})
 			}
 		case block.Image != nil:
-			return nil, acp.NewInvalidParams(map[string]any{"error": "unsupported", "field": "prompt.image"})
+			part, err := imageOpenCodePart(block.Image)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, part)
 		default:
 			return nil, acp.NewInvalidParams(map[string]any{"error": "unsupported", "field": "prompt"})
 		}
@@ -159,6 +177,44 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock) ([]map[string]any, error) 
 		return nil, acp.NewInvalidParams(map[string]any{"field": "prompt"})
 	}
 	return parts, nil
+}
+
+func imageOpenCodePart(image *acp.ContentBlockImage) (map[string]any, error) {
+	mimeType := image.MimeType
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	part := map[string]any{
+		"type": "file",
+		"mime": mimeType,
+	}
+	switch {
+	case image.Data != "":
+		part["url"] = "data:" + mimeType + ";base64," + image.Data
+	case image.Uri != nil && *image.Uri != "":
+		part["url"] = *image.Uri
+	default:
+		return nil, acp.NewInvalidParams(map[string]any{"field": "prompt.image", "error": "missing image data or uri"})
+	}
+	if filename := imageFilename(image); filename != "" {
+		part["filename"] = filename
+	}
+	return part, nil
+}
+
+func imageFilename(image *acp.ContentBlockImage) string {
+	if image.Uri == nil || *image.Uri == "" {
+		return ""
+	}
+	parsed, err := url.Parse(*image.Uri)
+	if err != nil {
+		return ""
+	}
+	name := filepath.Base(parsed.Path)
+	if name == "." || name == "/" {
+		return ""
+	}
+	return name
 }
 
 func embeddedResourceText(resource acp.EmbeddedResourceResource) string {

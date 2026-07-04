@@ -1,7 +1,7 @@
 # Authentication
 
 OpenCode/provider authentication remains native to OpenCode. The ACP agent
-advertises no ACP auth methods.
+advertises no ACP auth methods and rejects every `authenticate` request.
 
 Every per-session OpenCode server receives a random
 `OPENCODE_SERVER_PASSWORD`, and all REST/SSE calls use HTTP basic auth.
