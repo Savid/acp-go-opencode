@@ -237,6 +237,8 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 					"gpt-test": map[string]any{"id": "gpt-test", "name": "GPT Test"},
 				},
 			}}})
+		case r.URL.Path == "/command" && r.Method == http.MethodGet:
+			writeFakeJSON(w, []any{})
 		case r.URL.Path == "/agent":
 			writeFakeJSON(w, []map[string]any{{"name": "build", "description": "Build"}})
 		case r.URL.Path == "/permission" && r.Method == http.MethodGet:
@@ -257,11 +259,13 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 
 func fakeOpenCodeDoc(mode string) map[string]any {
 	required := []string{
+		"/command",
 		"/config/providers",
 		"/event",
 		"/session/status",
 		"/session",
 		"/session/{sessionID}",
+		"/session/{sessionID}/command",
 		"/session/{sessionID}/message",
 		"/session/{sessionID}/abort",
 		"/session/{sessionID}/fork",
