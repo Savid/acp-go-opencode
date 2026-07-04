@@ -90,14 +90,16 @@ type xdgDirs struct {
 }
 
 type openCodeServer struct {
-	httpClient *http.Client
-	baseURL    string
-	username   string
-	password   string
-	cmd        *exec.Cmd
-	cancel     context.CancelFunc
-	xdg        xdgDirs
-	log        *slog.Logger
+	httpClient                   *http.Client
+	baseURL                      string
+	username                     string
+	password                     string
+	cmd                          *exec.Cmd
+	cancel                       context.CancelFunc
+	xdg                          xdgDirs
+	log                          *slog.Logger
+	sessionPermissionListSupport bool
+	sessionQuestionListSupport   bool
 
 	events chan openCodeEvent
 	errs   chan error
@@ -555,9 +557,12 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 	if err := s.getJSON(ctx, "/doc", nil, &doc); err != nil {
 		return fmt.Errorf("load opencode /doc: %w", err)
 	}
-	if err := validateOpenCodeDoc(doc); err != nil {
+	docCapabilities, err := inspectOpenCodeDoc(doc)
+	if err != nil {
 		return err
 	}
+	s.sessionPermissionListSupport = docCapabilities.sessionPermissionList
+	s.sessionQuestionListSupport = docCapabilities.sessionQuestionList
 	go s.readEvents(eventCtx)
 	select {
 	case event := <-s.events:
@@ -648,7 +653,7 @@ func (s *openCodeServer) DeleteSession(ctx context.Context, id string) error {
 
 func (s *openCodeServer) SendMessage(ctx context.Context, id string, req openCodeMessageRequest) (nativeMessage, error) {
 	var out nativeMessage
-	if err := s.doJSON(ctx, http.MethodPost, "/session/"+url.PathEscape(id)+"/message", nil, req, &out); err != nil {
+	if err := s.doJSONWithClient(ctx, s.blockingHTTPClient(), http.MethodPost, "/session/"+url.PathEscape(id)+"/message", nil, req, &out); err != nil {
 		return nativeMessage{}, err
 	}
 	if err := assistantMessageError(out); err != nil {
@@ -722,6 +727,17 @@ func (s *openCodeServer) Agents(ctx context.Context) ([]nativeAgent, error) {
 }
 
 func (s *openCodeServer) PendingPermissions(ctx context.Context) ([]permissionRequest, error) {
+	var out []permissionRequest
+	if s.sessionPermissionListSupport {
+		var sessionRequests []permissionRequest
+		if err := s.getJSON(ctx, "/permission", nil, &sessionRequests); err != nil {
+			return nil, err
+		}
+		for i := range sessionRequests {
+			sessionRequests[i].ReplyRoute = permissionRouteSession
+		}
+		out = append(out, sessionRequests...)
+	}
 	var response struct {
 		Data []permissionRequest `json:"data"`
 	}
@@ -731,7 +747,8 @@ func (s *openCodeServer) PendingPermissions(ctx context.Context) ([]permissionRe
 	for i := range response.Data {
 		response.Data[i].ReplyRoute = permissionRouteAPI
 	}
-	return response.Data, nil
+	out = append(out, response.Data...)
+	return out, nil
 }
 
 func (s *openCodeServer) ReplyPermission(ctx context.Context, req permissionRequest, reply string, message string) error {
@@ -748,6 +765,17 @@ func (s *openCodeServer) ReplyPermission(ctx context.Context, req permissionRequ
 }
 
 func (s *openCodeServer) PendingQuestions(ctx context.Context) ([]questionRequest, error) {
+	var out []questionRequest
+	if s.sessionQuestionListSupport {
+		var sessionRequests []questionRequest
+		if err := s.getJSON(ctx, "/question", nil, &sessionRequests); err != nil {
+			return nil, err
+		}
+		for i := range sessionRequests {
+			sessionRequests[i].ReplyRoute = questionRouteSession
+		}
+		out = append(out, sessionRequests...)
+	}
 	var response struct {
 		Data []questionRequest `json:"data"`
 	}
@@ -757,7 +785,8 @@ func (s *openCodeServer) PendingQuestions(ctx context.Context) ([]questionReques
 	for i := range response.Data {
 		response.Data[i].ReplyRoute = questionRouteAPI
 	}
-	return response.Data, nil
+	out = append(out, response.Data...)
+	return out, nil
 }
 
 func (s *openCodeServer) ReplyQuestion(ctx context.Context, req questionRequest, answers [][]string) error {
@@ -784,6 +813,18 @@ func (s *openCodeServer) getJSON(ctx context.Context, path string, query url.Val
 }
 
 func (s *openCodeServer) doJSON(ctx context.Context, method string, path string, query url.Values, body any, out any) error {
+	return s.doJSONWithClient(ctx, s.httpClient, method, path, query, body, out)
+}
+
+func (s *openCodeServer) doJSONWithClient(
+	ctx context.Context,
+	client *http.Client,
+	method string,
+	path string,
+	query url.Values,
+	body any,
+	out any,
+) error {
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -805,7 +846,10 @@ func (s *openCodeServer) doJSON(ctx context.Context, method string, path string,
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := s.httpClient.Do(req)
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -825,6 +869,15 @@ func (s *openCodeServer) doJSON(ctx context.Context, method string, path string,
 	}
 
 	return nil
+}
+
+func (s *openCodeServer) blockingHTTPClient() *http.Client {
+	if s.httpClient == nil {
+		return http.DefaultClient
+	}
+	client := *s.httpClient
+	client.Timeout = 0
+	return &client
 }
 
 func (s *openCodeServer) readEvents(ctx context.Context) {
@@ -946,7 +999,17 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 	}
 }
 
+type openCodeDocCapabilities struct {
+	sessionPermissionList bool
+	sessionQuestionList   bool
+}
+
 func validateOpenCodeDoc(doc map[string]any) error {
+	_, err := inspectOpenCodeDoc(doc)
+	return err
+}
+
+func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 	rawPaths, _ := doc["paths"].(map[string]any)
 	required := []string{
 		"/config/providers",
@@ -973,35 +1036,46 @@ func validateOpenCodeDoc(doc map[string]any) error {
 	}
 	for _, path := range required {
 		if _, ok := rawPaths[path]; !ok {
-			return fmt.Errorf("opencode /doc missing required path %s", path)
+			return openCodeDocCapabilities{}, fmt.Errorf("opencode /doc missing required path %s", path)
 		}
 	}
 	if err := validateOpenCodeGetListOperation(rawPaths, "/api/permission/request", "PermissionV2Request"); err != nil {
-		return err
+		return openCodeDocCapabilities{}, err
 	}
 	if err := validateOpenCodePermissionReply(rawPaths); err != nil {
-		return err
+		return openCodeDocCapabilities{}, err
 	}
 	if err := validateOpenCodeSessionPermissionReply(rawPaths); err != nil {
-		return err
+		return openCodeDocCapabilities{}, err
+	}
+	sessionPermissionList, err := validateOptionalOpenCodeGetArrayOperation(rawPaths, "/permission", "PermissionRequest")
+	if err != nil {
+		return openCodeDocCapabilities{}, err
 	}
 	if err := validateOpenCodeGetListOperation(rawPaths, "/api/question/request", "QuestionV2Request"); err != nil {
-		return err
+		return openCodeDocCapabilities{}, err
 	}
 	if err := validateOpenCodeQuestionReply(doc, rawPaths); err != nil {
-		return err
+		return openCodeDocCapabilities{}, err
 	}
 	if err := validateOpenCodeSessionQuestionRoutes(rawPaths); err != nil {
-		return err
+		return openCodeDocCapabilities{}, err
+	}
+	sessionQuestionList, err := validateOptionalOpenCodeGetArrayOperation(rawPaths, "/question", "QuestionRequest")
+	if err != nil {
+		return openCodeDocCapabilities{}, err
 	}
 	if err := validateOpenCodePostNoContent(rawPaths, "/api/session/{sessionID}/question/{requestID}/reject"); err != nil {
-		return err
+		return openCodeDocCapabilities{}, err
 	}
 	if err := validateOpenCodeEventSchemas(doc); err != nil {
-		return err
+		return openCodeDocCapabilities{}, err
 	}
 
-	return nil
+	return openCodeDocCapabilities{
+		sessionPermissionList: sessionPermissionList,
+		sessionQuestionList:   sessionQuestionList,
+	}, nil
 }
 
 func (s *openCodeServer) eventHTTPClient() *http.Client {
@@ -1076,6 +1150,21 @@ func validateOpenCodeGetListOperation(paths map[string]any, path string, itemRef
 		return fmt.Errorf("opencode /doc GET %s response schema is not pending %s list", path, itemRef)
 	}
 	return nil
+}
+
+func validateOptionalOpenCodeGetArrayOperation(paths map[string]any, path string, itemRef string) (bool, error) {
+	operation, ok := openAPIOperation(paths, path, http.MethodGet)
+	if !ok {
+		return false, nil
+	}
+	if !openAPIHasResponse(operation, "200") {
+		return false, fmt.Errorf("opencode /doc GET %s missing 200 response", path)
+	}
+	schema, ok := openAPIJSONResponseSchema(operation, "200")
+	if !ok || !openAPISchemaArrayRef(schema, itemRef) {
+		return false, fmt.Errorf("opencode /doc GET %s response schema is not pending %s array", path, itemRef)
+	}
+	return true, nil
 }
 
 func validateOpenCodePermissionReply(paths map[string]any) error {
@@ -1205,6 +1294,15 @@ func openAPISchemaDataArrayRef(schema map[string]any, want string) bool {
 		return false
 	}
 	items, _ := data["items"].(map[string]any)
+	ref, _ := items["$ref"].(string)
+	return strings.HasSuffix(ref, "/"+want)
+}
+
+func openAPISchemaArrayRef(schema map[string]any, want string) bool {
+	if schemaType, _ := schema["type"].(string); schemaType != "array" {
+		return false
+	}
+	items, _ := schema["items"].(map[string]any)
 	ref, _ := items["$ref"].(string)
 	return strings.HasSuffix(ref, "/"+want)
 }

@@ -200,6 +200,44 @@ func TestPermissionV2AskReplyReconcileAndCancelled(t *testing.T) {
 	}
 }
 
+func TestPermissionQuestionDuplicateRequestIDsAreFenced(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	conn := newRecordingAgentClient()
+	agent := NewAgent()
+	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
+	agent.setAgentClient(conn)
+	session := testSession(agent, client)
+
+	if err := session.handleEvent(ctx, openCodeEvent{
+		Type:       "permission.v2.asked",
+		Properties: json.RawMessage(`{"id":"perm-dup","sessionID":"native-1","action":"edit"}`),
+	}); err != nil {
+		t.Fatalf("permission event: %v", err)
+	}
+	client.pendingPermissions = []permissionRequest{{ID: "perm-dup", SessionID: "native-1", Action: "edit"}}
+	if err := session.reconcilePermissions(ctx); err != nil {
+		t.Fatalf("permission reconcile: %v", err)
+	}
+	if conn.permissionRequestCount() != 1 || client.permissionReplyCount() != 1 {
+		t.Fatalf("duplicate permission was not fenced requests=%d replies=%d", conn.permissionRequestCount(), client.permissionReplyCount())
+	}
+
+	if err := session.handleEvent(ctx, openCodeEvent{
+		Type:       "question.asked",
+		Properties: json.RawMessage(`{"id":"question-dup","sessionID":"native-1","questions":[{"question":"Continue?"}]}`),
+	}); err != nil {
+		t.Fatalf("question event: %v", err)
+	}
+	client.pendingQuestions = []questionRequest{{ID: "question-dup", SessionID: "native-1"}}
+	if err := session.reconcileQuestions(ctx); err != nil {
+		t.Fatalf("question reconcile: %v", err)
+	}
+	if len(conn.elicitations) != 1 || client.questionReplyCount() != 1 {
+		t.Fatalf("duplicate question was not fenced elicitations=%d replies=%d", len(conn.elicitations), client.questionReplyCount())
+	}
+}
+
 func TestEventMappingMessagePartToolTodoUsageAndRaw(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
@@ -853,6 +891,14 @@ func TestPromptReconcileCancelledBeforeSend(t *testing.T) {
 
 func TestTurnFenceHelperBranches(t *testing.T) {
 	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	if !session.claimPermissionRequest("") || !session.claimQuestionRequest("") {
+		t.Fatal("empty request ids should not be fenced")
+	}
+	session.processedPermission = nil
+	session.processedQuestion = nil
+	if !session.claimPermissionRequest("perm") || !session.claimQuestionRequest("question") {
+		t.Fatal("nil processed request maps were not initialized")
+	}
 	session.markActiveMessageID("")
 	session.activeMessageIDs = nil
 	session.markActiveMessageID("message-1")
@@ -951,9 +997,68 @@ func TestPermissionQuestionCancelledReplyBranches(t *testing.T) {
 		session.finishTurn()
 	})
 
+	t.Run("permission client error rejects native request", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.permErr = errors.New("permission failed")
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		err := session.handlePermission(context.Background(), permissionRequest{ID: "perm", SessionID: "native-1", ReplyRoute: permissionRouteSession})
+		if err == nil || !strings.Contains(err.Error(), "permission failed") {
+			t.Fatalf("handlePermission err = %v", err)
+		}
+		reply := client.permissionReply(0)
+		if reply.route != permissionRouteSession || reply.reply != "reject" || reply.message != "client permission request failed" {
+			t.Fatalf("permission fail-closed reply = %#v", reply)
+		}
+	})
+
+	t.Run("permission client error returns reject failure", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.replyErr = errors.New("reply failed")
+		conn := newRecordingAgentClient()
+		conn.permErr = errors.New("permission failed")
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		err := session.handlePermission(context.Background(), permissionRequest{ID: "perm", SessionID: "native-1"})
+		if err == nil || !strings.Contains(err.Error(), "permission failed") || !strings.Contains(err.Error(), "reply failed") {
+			t.Fatalf("handlePermission err = %v", err)
+		}
+	})
+
 	t.Run("permission late response after cancel is not double-replied", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		conn := newRecordingAgentClient()
+		conn.permissionStarted = make(chan struct{}, 1)
+		conn.permissionRelease = make(chan struct{})
+		conn.permissionIgnoreContext = true
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		turnCtx := session.beginTurn(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- session.handlePermission(turnCtx, permissionRequest{ID: "perm", SessionID: "native-1"})
+		}()
+		<-conn.permissionStarted
+		session.cancelTurn()
+		close(conn.permissionRelease)
+		err := <-done
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handlePermission err = %v", err)
+		}
+		if client.permissionReplyCount() != 1 {
+			t.Fatalf("permission replies = %#v", client.permissionReplies)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("permission late client error after cancel is not double-replied", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.permErr = errors.New("permission failed")
 		conn.permissionStarted = make(chan struct{}, 1)
 		conn.permissionRelease = make(chan struct{})
 		conn.permissionIgnoreContext = true
@@ -1075,6 +1180,38 @@ func TestPermissionQuestionCancelledReplyBranches(t *testing.T) {
 		session.finishTurn()
 	})
 
+	t.Run("question client error rejects native request", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.elicitErr = errors.New("elicitation failed")
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		err := session.handleQuestion(context.Background(), questionRequest{ID: "question", SessionID: "native-1", ReplyRoute: questionRouteAPI})
+		if err == nil || !strings.Contains(err.Error(), "elicitation failed") {
+			t.Fatalf("handleQuestion err = %v", err)
+		}
+		if client.questionRejectCount() != 1 || client.questionRejects[0].route != questionRouteAPI {
+			t.Fatalf("question fail-closed rejects = %#v", client.questionRejects)
+		}
+	})
+
+	t.Run("question client error returns reject failure", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.replyErr = errors.New("reject failed")
+		conn := newRecordingAgentClient()
+		conn.elicitErr = errors.New("elicitation failed")
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		err := session.handleQuestion(context.Background(), questionRequest{ID: "question", SessionID: "native-1"})
+		if err == nil || !strings.Contains(err.Error(), "elicitation failed") || !strings.Contains(err.Error(), "reject failed") {
+			t.Fatalf("handleQuestion err = %v", err)
+		}
+	})
+
 	t.Run("question accept after context cancellation rejects native request", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		conn := newRecordingAgentClient()
@@ -1115,6 +1252,35 @@ func TestPermissionQuestionCancelledReplyBranches(t *testing.T) {
 	t.Run("question late response after cancel is not double-rejected", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		conn := newRecordingAgentClient()
+		conn.elicitationStarted = make(chan struct{}, 1)
+		conn.elicitationRelease = make(chan struct{})
+		conn.elicitationIgnoreContext = true
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		turnCtx := session.beginTurn(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- session.handleQuestion(turnCtx, questionRequest{ID: "question", SessionID: "native-1"})
+		}()
+		<-conn.elicitationStarted
+		session.cancelTurn()
+		close(conn.elicitationRelease)
+		err := <-done
+		if !errors.Is(err, errPromptCancelled) {
+			t.Fatalf("handleQuestion err = %v", err)
+		}
+		if client.questionRejectCount() != 1 {
+			t.Fatalf("question rejects = %#v", client.questionRejects)
+		}
+		session.finishTurn()
+	})
+
+	t.Run("question late client error after cancel is not double-rejected", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		conn.elicitErr = errors.New("elicitation failed")
 		conn.elicitationStarted = make(chan struct{}, 1)
 		conn.elicitationRelease = make(chan struct{})
 		conn.elicitationIgnoreContext = true
@@ -1432,6 +1598,9 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 		if err := <-done; err == nil || !strings.Contains(err.Error(), "update failed") {
 			t.Fatalf("event error = %v", err)
 		}
+		if client.abortCount() != 1 {
+			t.Fatalf("event error aborts = %d, want 1", client.abortCount())
+		}
 	})
 
 	t.Run("final message update error returns", func(t *testing.T) {
@@ -1494,6 +1663,9 @@ func TestReplayAndEventEdgeBranches(t *testing.T) {
 
 	noConnClient := newFakeOpenCodeClient()
 	noConnSession := testSession(NewAgent(), noConnClient)
+	if err := noConnSession.handlePermission(ctx, permissionRequest{}); err != nil {
+		t.Fatalf("empty permission: %v", err)
+	}
 	noConnSession.pending = nil
 	if err := noConnSession.handlePermission(ctx, permissionRequest{ID: "p", SessionID: "native-1"}); err != nil {
 		t.Fatalf("nil conn permission: %v", err)

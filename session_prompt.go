@@ -53,17 +53,26 @@ func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pro
 	}
 	turnCtx := s.beginTurn(ctx)
 	defer s.finishTurn()
-	if err := s.reconcilePermissions(turnCtx); err != nil {
+	var abortOnce sync.Once
+	abortTurn := func() {
+		abortOnce.Do(func() {
+			abortCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+			_ = s.client.Abort(abortCtx, s.idmap.NativeSessionID)
+			cancel()
+		})
+	}
+	failTurn := func(err error) (acp.PromptResponse, error) {
 		if errors.Is(err, errPromptCancelled) {
 			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
 		}
+		abortTurn()
 		return acp.PromptResponse{}, err
 	}
+	if err := s.reconcilePermissions(turnCtx); err != nil {
+		return failTurn(err)
+	}
 	if err := s.reconcileQuestions(turnCtx); err != nil {
-		if errors.Is(err, errPromptCancelled) {
-			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
-		}
-		return acp.PromptResponse{}, err
+		return failTurn(err)
 	}
 
 	req := openCodeMessageRequest{
@@ -87,37 +96,20 @@ func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pro
 
 	var final nativeMessage
 	var usage *acp.Usage
-	var abortOnce sync.Once
-	abortTurn := func() {
-		abortOnce.Do(func() {
-			abortCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-			_ = s.client.Abort(abortCtx, s.idmap.NativeSessionID)
-			cancel()
-		})
-	}
 	for {
 		select {
 		case event := <-s.client.Events():
 			if event.Type == "server.connected" {
 				if err := s.reconcilePermissions(turnCtx); err != nil {
-					if errors.Is(err, errPromptCancelled) {
-						return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
-					}
-					return acp.PromptResponse{}, err
+					return failTurn(err)
 				}
 				if err := s.reconcileQuestions(turnCtx); err != nil {
-					if errors.Is(err, errPromptCancelled) {
-						return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
-					}
-					return acp.PromptResponse{}, err
+					return failTurn(err)
 				}
 				continue
 			}
 			if err := s.handleEvent(turnCtx, event); err != nil {
-				if errors.Is(err, errPromptCancelled) {
-					return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
-				}
-				return acp.PromptResponse{}, err
+				return failTurn(err)
 			}
 		case err := <-s.client.EventErrors():
 			s.markStreamFailed(streamErrorEpoch(err))
@@ -451,6 +443,12 @@ func (s *session) reconcileQuestions(ctx context.Context) error {
 }
 
 func (s *session) handlePermission(ctx context.Context, req permissionRequest) error {
+	if req.ID == "" || req.SessionID == "" {
+		return nil
+	}
+	if !s.claimPermissionRequest(req.ID) {
+		return nil
+	}
 	s.addPendingPermission(req)
 
 	conn := s.agent.connection()
@@ -496,15 +494,22 @@ func (s *session) handlePermission(ctx context.Context, req permissionRequest) e
 		Meta: map[string]any{opencodeMetaKey: map[string]any{"requestId": req.ID, "nativeSessionId": req.SessionID}},
 	})
 	if err != nil {
-		if s.wasCancelled() || ctx.Err() != nil {
-			if _, ok, _ := s.takePendingPermission(req.ID); ok {
-				replyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-				_ = s.client.ReplyPermission(replyCtx, req, "reject", "cancelled")
-				cancel()
-			}
+		_, ok, cancelled := s.takePendingPermission(req.ID)
+		if !ok {
 			return errPromptCancelled
 		}
-		s.takePendingPermission(req.ID)
+		if cancelled || s.wasCancelled() || ctx.Err() != nil {
+			replyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+			_ = s.client.ReplyPermission(replyCtx, req, "reject", "cancelled")
+			cancel()
+			return errPromptCancelled
+		}
+		replyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		replyErr := s.client.ReplyPermission(replyCtx, req, "reject", "client permission request failed")
+		cancel()
+		if replyErr != nil {
+			return errors.Join(err, replyErr)
+		}
 		return err
 	}
 	reply := "reject"
@@ -536,6 +541,9 @@ func (s *session) handleQuestion(ctx context.Context, req questionRequest) error
 	if req.ID == "" || req.SessionID == "" {
 		return nil
 	}
+	if !s.claimQuestionRequest(req.ID) {
+		return nil
+	}
 	s.addPendingQuestion(req)
 
 	conn := s.agent.connection()
@@ -555,15 +563,22 @@ func (s *session) handleQuestion(ctx context.Context, req questionRequest) error
 		ToolCallID: acp.ToolCallId(firstNonEmpty(req.Tool.CallID, req.ID)),
 	})
 	if err != nil {
-		if s.wasCancelled() || ctx.Err() != nil {
-			if _, ok, _ := s.takePendingQuestion(req.ID); ok {
-				rejectCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-				_ = s.client.RejectQuestion(rejectCtx, req)
-				cancel()
-			}
+		_, ok, cancelled := s.takePendingQuestion(req.ID)
+		if !ok {
 			return errPromptCancelled
 		}
-		s.takePendingQuestion(req.ID)
+		if cancelled || s.wasCancelled() || ctx.Err() != nil {
+			rejectCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+			_ = s.client.RejectQuestion(rejectCtx, req)
+			cancel()
+			return errPromptCancelled
+		}
+		rejectCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		rejectErr := s.client.RejectQuestion(rejectCtx, req)
+		cancel()
+		if rejectErr != nil {
+			return errors.Join(err, rejectErr)
+		}
 		return err
 	}
 	if resp.Accept == nil {

@@ -33,6 +33,8 @@ func TestOpenCodeHTTPFakeServerReadinessDocAndQuestionRoutes(t *testing.T) {
 			_, _ = w.Write([]byte(`data: {"type":"server.connected","properties":{}}` + "\n\n"))
 		case "/api/question/request":
 			writeJSON(t, w, map[string]any{"data": []map[string]any{{"id": "q", "sessionID": "s"}}})
+		case "/question":
+			writeJSON(t, w, []map[string]any{{"id": "q-session-list", "sessionID": "s"}})
 		case "/api/session/s/question/q/reply":
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -45,11 +47,17 @@ func TestOpenCodeHTTPFakeServerReadinessDocAndQuestionRoutes(t *testing.T) {
 			writeJSON(t, w, true)
 		case "/question/q-session/reject":
 			writeJSON(t, w, true)
+		case "/question/q-session-list/reject":
+			writeJSON(t, w, true)
 		case "/api/permission/request":
 			writeJSON(t, w, map[string]any{"data": []map[string]any{{"id": "p", "sessionID": "s", "action": "edit"}}})
+		case "/permission":
+			writeJSON(t, w, []map[string]any{{"id": "p-session-list", "sessionID": "s", "permission": "edit"}})
 		case "/api/session/s/permission/p/reply":
 			writeJSON(t, w, map[string]any{"ok": true})
 		case "/permission/p-session/reply":
+			writeJSON(t, w, true)
+		case "/permission/p-session-list/reply":
 			writeJSON(t, w, true)
 		default:
 			writeJSON(t, w, map[string]any{"id": "s"})
@@ -70,7 +78,7 @@ func TestOpenCodeHTTPFakeServerReadinessDocAndQuestionRoutes(t *testing.T) {
 		t.Fatalf("waitReady: %v", err)
 	}
 	questions, err := client.PendingQuestions(ctx)
-	if err != nil || len(questions) != 1 || questions[0].ID != "q" {
+	if err != nil || len(questions) != 2 || questions[0].ID != "q-session-list" || questions[0].route() != questionRouteSession || questions[1].ID != "q" {
 		t.Fatalf("PendingQuestions = %#v err=%v", questions, err)
 	}
 	if err := client.ReplyQuestion(ctx, questionRequest{ID: "q", SessionID: "s", ReplyRoute: questionRouteAPI}, [][]string{{"yes"}}); err != nil {
@@ -86,10 +94,10 @@ func TestOpenCodeHTTPFakeServerReadinessDocAndQuestionRoutes(t *testing.T) {
 		t.Fatalf("RejectQuestion session route: %v", err)
 	}
 	permissions, err := client.PendingPermissions(ctx)
-	if err != nil || len(permissions) != 1 || permissions[0].ID != "p" {
+	if err != nil || len(permissions) != 2 || permissions[0].ID != "p-session-list" || permissions[0].route() != permissionRouteSession || permissions[1].ID != "p" {
 		t.Fatalf("PendingPermissions = %#v err=%v", permissions, err)
 	}
-	if err := client.ReplyPermission(ctx, permissions[0], "once", "ok"); err != nil {
+	if err := client.ReplyPermission(ctx, permissions[1], "once", "ok"); err != nil {
 		t.Fatalf("ReplyPermission: %v", err)
 	}
 	if err := client.ReplyPermission(ctx, permissionRequest{ID: "p-session", SessionID: "s", ReplyRoute: permissionRouteSession}, "once", "ok"); err != nil {
@@ -122,6 +130,96 @@ func TestOpenCodePendingRequestErrors(t *testing.T) {
 	}
 	if _, err := client.PendingQuestions(ctx); err == nil {
 		t.Fatal("PendingQuestions unexpectedly succeeded")
+	}
+}
+
+func TestOpenCodePendingSessionListErrors(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name string
+		call func(*openCodeServer) error
+	}{
+		{
+			name: "permission",
+			call: func(client *openCodeServer) error {
+				_, err := client.PendingPermissions(ctx)
+				return err
+			},
+		},
+		{
+			name: "question",
+			call: func(client *openCodeServer) error {
+				_, err := client.PendingQuestions(ctx)
+				return err
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			client := &openCodeServer{
+				httpClient:                   server.Client(),
+				baseURL:                      server.URL,
+				sessionPermissionListSupport: true,
+				sessionQuestionListSupport:   true,
+			}
+			if err := tt.call(client); err == nil {
+				t.Fatal("session pending list error was ignored")
+			}
+		})
+	}
+}
+
+func TestOpenCodeSendMessageUsesNoDeadlineHTTPClient(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(25 * time.Millisecond)
+		switch r.URL.Path {
+		case "/session/s/message":
+			writeJSON(t, w, map[string]any{"info": map[string]any{
+				"id":        "assistant",
+				"sessionID": "s",
+				"role":      "assistant",
+				"finish":    "stop",
+			}})
+		case "/session/s":
+			writeJSON(t, w, map[string]any{"id": "s"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &openCodeServer{
+		httpClient: &http.Client{Timeout: time.Millisecond},
+		baseURL:    server.URL,
+		username:   "opencode",
+		password:   "secret",
+	}
+	if _, err := client.SendMessage(context.Background(), "s", openCodeMessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}}); err != nil {
+		t.Fatalf("SendMessage used deadline client: %v", err)
+	}
+	if _, err := client.GetSession(context.Background(), "s"); err == nil {
+		t.Fatal("regular REST call unexpectedly bypassed timeout")
+	}
+}
+
+func TestOpenCodeHTTPClientHelperBranches(t *testing.T) {
+	if got := (&openCodeServer{}).blockingHTTPClient(); got != http.DefaultClient {
+		t.Fatalf("nil blocking client = %#v, want default", got)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]any{"ok": true})
+	}))
+	defer server.Close()
+	client := &openCodeServer{baseURL: server.URL}
+	var out map[string]bool
+	if err := client.doJSONWithClient(context.Background(), nil, http.MethodGet, "/", nil, nil, &out); err != nil {
+		t.Fatalf("doJSONWithClient default client: %v", err)
+	}
+	if !out["ok"] {
+		t.Fatalf("decoded response = %#v", out)
 	}
 }
 
@@ -256,6 +354,13 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 			},
 		},
 		{
+			name: "session permission request wrong schema",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				paths["/permission"] = pendingArrayPath("WrongRequest")
+			},
+		},
+		{
 			name: "question request wrong schema",
 			mutate: func(doc map[string]any) {
 				paths := doc["paths"].(map[string]any)
@@ -323,6 +428,13 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 				paths := doc["paths"].(map[string]any)
 				rejectPath := paths["/question/{requestID}/reject"].(map[string]any)
 				rejectPath["post"].(map[string]any)["responses"] = map[string]any{}
+			},
+		},
+		{
+			name: "session question request wrong schema",
+			mutate: func(doc map[string]any) {
+				paths := doc["paths"].(map[string]any)
+				paths["/question"] = pendingArrayPath("WrongRequest")
 			},
 		},
 		{
@@ -435,6 +547,19 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 	if _, ok := openAPIComponentSchema(fullOpenCodeDoc(), "QuestionV2Reply"); ok {
 		t.Fatal("non-component ref resolved")
 	}
+	support, err := validateOptionalOpenCodeGetArrayOperation(map[string]any{"/permission": map[string]any{}}, "/permission", "PermissionRequest")
+	if err != nil || support {
+		t.Fatalf("optional missing GET support=%v err=%v", support, err)
+	}
+	_, err = validateOptionalOpenCodeGetArrayOperation(map[string]any{"/permission": map[string]any{
+		"get": map[string]any{"responses": map[string]any{}},
+	}}, "/permission", "PermissionRequest")
+	if err == nil {
+		t.Fatal("optional list missing 200 response was accepted")
+	}
+	if openAPISchemaArrayRef(map[string]any{"type": "object"}, "PermissionRequest") {
+		t.Fatal("object schema matched array ref")
+	}
 }
 
 func cloneOpenCodeDoc(t *testing.T, doc map[string]any) map[string]any {
@@ -482,6 +607,7 @@ func fullOpenCodeDoc() map[string]any {
 		paths[path] = map[string]any{}
 	}
 	paths["/api/permission/request"] = pendingRequestPath("PermissionV2Request")
+	paths["/permission"] = pendingArrayPath("PermissionRequest")
 	paths["/api/session/{sessionID}/permission/{requestID}/reply"] = map[string]any{
 		"post": map[string]any{
 			"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
@@ -515,6 +641,7 @@ func fullOpenCodeDoc() map[string]any {
 		},
 	}
 	paths["/api/question/request"] = pendingRequestPath("QuestionV2Request")
+	paths["/question"] = pendingArrayPath("QuestionRequest")
 	paths["/api/session/{sessionID}/question/{requestID}/reply"] = map[string]any{
 		"post": map[string]any{
 			"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
@@ -627,6 +754,19 @@ func pendingRequestPath(itemRef string) map[string]any {
 							"items": map[string]any{"$ref": "#/components/schemas/" + itemRef},
 						},
 					},
+				}}},
+			}},
+		},
+	}
+}
+
+func pendingArrayPath(itemRef string) map[string]any {
+	return map[string]any{
+		"get": map[string]any{
+			"responses": map[string]any{"200": map[string]any{
+				"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"$ref": "#/components/schemas/" + itemRef},
 				}}},
 			}},
 		},

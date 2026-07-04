@@ -36,6 +36,8 @@ type session struct {
 	seenParts           map[string]string
 	pending             map[string]permissionRequest
 	questions           map[string]questionRequest
+	processedPermission map[string]struct{}
+	processedQuestion   map[string]struct{}
 	turnEpoch           uint64
 	activeMessageIDs    map[string]struct{}
 	failedStreamEpochs  map[uint64]struct{}
@@ -105,6 +107,8 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		seenParts:             map[string]string{},
 		pending:               map[string]permissionRequest{},
 		questions:             map[string]questionRequest{},
+		processedPermission:   map[string]struct{}{},
+		processedQuestion:     map[string]struct{}{},
 		activeMessageIDs:      map[string]struct{}{},
 		failedStreamEpochs:    map[uint64]struct{}{},
 		failedMessageIDs:      map[string]struct{}{},
@@ -266,6 +270,22 @@ func (s *session) addPendingPermission(req permissionRequest) {
 	s.mu.Unlock()
 }
 
+func (s *session) claimPermissionRequest(id string) bool {
+	if id == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.processedPermission == nil {
+		s.processedPermission = map[string]struct{}{}
+	}
+	if _, ok := s.processedPermission[id]; ok {
+		return false
+	}
+	s.processedPermission[id] = struct{}{}
+	return true
+}
+
 func (s *session) takePendingPermission(id string) (permissionRequest, bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -283,6 +303,22 @@ func (s *session) addPendingQuestion(req questionRequest) {
 	}
 	s.questions[req.ID] = req
 	s.mu.Unlock()
+}
+
+func (s *session) claimQuestionRequest(id string) bool {
+	if id == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.processedQuestion == nil {
+		s.processedQuestion = map[string]struct{}{}
+	}
+	if _, ok := s.processedQuestion[id]; ok {
+		return false
+	}
+	s.processedQuestion[id] = struct{}{}
+	return true
 }
 
 func (s *session) takePendingQuestion(id string) (questionRequest, bool, bool) {

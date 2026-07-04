@@ -239,6 +239,14 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 			}}})
 		case r.URL.Path == "/agent":
 			writeFakeJSON(w, []map[string]any{{"name": "build", "description": "Build"}})
+		case r.URL.Path == "/permission" && r.Method == http.MethodGet:
+			writeFakeJSON(w, []any{})
+		case r.URL.Path == "/question" && r.Method == http.MethodGet:
+			writeFakeJSON(w, []any{})
+		case r.URL.Path == "/api/permission/request" && r.Method == http.MethodGet:
+			writeFakeJSON(w, map[string]any{"location": map[string]any{}, "data": []any{}})
+		case r.URL.Path == "/api/question/request" && r.Method == http.MethodGet:
+			writeFakeJSON(w, map[string]any{"location": map[string]any{}, "data": []any{}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -283,6 +291,7 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 		paths[path] = map[string]any{}
 	}
 	paths["/api/permission/request"] = fakePendingRequestPath("PermissionV2Request")
+	paths["/permission"] = fakePendingArrayPath("PermissionRequest")
 	if mode != fakeModeMissingDoc {
 		paths["/api/session/{sessionID}/permission/{requestID}/reply"] = map[string]any{
 			"post": map[string]any{
@@ -318,6 +327,7 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 		},
 	}
 	paths["/api/question/request"] = fakePendingRequestPath("QuestionV2Request")
+	paths["/question"] = fakePendingArrayPath("QuestionRequest")
 	paths["/api/session/{sessionID}/question/{requestID}/reply"] = map[string]any{
 		"post": map[string]any{
 			"responses": map[string]any{"204": map[string]any{"description": "<No Content>"}},
@@ -419,6 +429,17 @@ func fakePendingRequestPath(itemRef string) map[string]any {
 					"type":  "array",
 					"items": map[string]any{"$ref": "#/components/schemas/" + itemRef},
 				}},
+			}}},
+		}}},
+	}
+}
+
+func fakePendingArrayPath(itemRef string) map[string]any {
+	return map[string]any{
+		"get": map[string]any{"responses": map[string]any{"200": map[string]any{
+			"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"$ref": "#/components/schemas/" + itemRef},
 			}}},
 		}}},
 	}
