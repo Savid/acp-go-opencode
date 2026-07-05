@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: audit build clean coverage-check docs-audit fmt help lint modernize-check test test-integration-cover test-integration-live test-integration-smoke tidy vuln
+.PHONY: audit build clean coverage-check docs-audit fmt help lint modernize-check test test-cross-compile test-integration-cover test-integration-live test-integration-smoke tidy vuln
 
 REMOVED_PUBLIC_TERMS = opencode\x20acp|pro\x78y|compatibilit\x79|deprecat\x65d|legac\x79|migratio\x6e|session/imp\x6frt|sdkMessag\x65|emitRawSDKMessag\x65s|setGoa\x6c|goa\x6cs|\x4e\x45\x53|SSE\x20MCP|mcpCapabilities\x2eacp|ExportSessio\x6e|ImportSessio\x6e|DeleteSessio\x6e|ParseConfi\x67|OpenCodeSessio\x6e
 
@@ -10,6 +10,16 @@ build:
 ## test: run unit tests
 test:
 	go test ./...
+
+## test-cross-compile: compile-check platform branches for other GOOS targets
+test-cross-compile:
+	rm -rf .tmp/cross
+	mkdir -p .tmp/cross
+	GOOS=linux GOARCH=amd64 go test -c -o .tmp/cross/opencode-linux.test .
+	GOOS=darwin GOARCH=arm64 go test -c -o .tmp/cross/opencode-darwin.test .
+	GOOS=windows GOARCH=amd64 go test -c -o .tmp/cross/opencode-windows.test .
+	GOOS=freebsd GOARCH=amd64 go build ./...
+	GOOS=openbsd GOARCH=amd64 go build ./...
 
 ## coverage-check: enforce repository coverage gate
 coverage-check:
@@ -58,7 +68,7 @@ docs-audit:
 	@pattern=$$(printf '%b' '$(REMOVED_PUBLIC_TERMS)'); ! rg -n -- "$$pattern" README.md doc.go docs.json docs examples cmd/acp-go-opencode/*.go AGENTS.md
 
 ## audit: run local checks
-audit: fmt lint build test coverage-check vuln modernize-check docs-audit
+audit: fmt lint build test test-cross-compile coverage-check vuln modernize-check docs-audit
 	go mod tidy -diff
 	go mod verify
 
