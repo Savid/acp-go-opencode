@@ -20,6 +20,8 @@ const (
 	configModel             = "model"
 	configMode              = "mode"
 	configTypeSelect        = "select"
+	modelFieldSessionMeta   = "_meta.opencode.options.model"
+	modelFieldPrompt        = "model"
 	openCodePermissionAsk   = "ask"
 	openCodePermissionAllow = "allow"
 	idmapSubpath            = "idmap"

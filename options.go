@@ -55,7 +55,7 @@ func applyOptions(opts []Option) Options {
 		AgentTitle:              "acp-go-opencode",
 		AgentVersion:            "0.1.0",
 		SessionStoreLoadTimeout: 10 * time.Second,
-		HealthCheckTimeout:      15 * time.Second,
+		HealthCheckTimeout:      60 * time.Second,
 		MinimumVersion:          "1.17.13",
 		clientFactory:           startOpenCodeServer,
 	}

@@ -29,8 +29,8 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	}
 	switch params.ValueId.ConfigId {
 	case configModel:
-		if !session.hasConfigValue(ctx, configModel, value) {
-			return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{"field": "value"})
+		if err := session.validateModel(ctx, value, "value"); err != nil {
+			return acp.SetSessionConfigOptionResponse{}, err
 		}
 		session.setModel(value)
 	case configMode:
@@ -47,6 +47,54 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	})
 
 	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
+}
+
+func (s *session) validateModel(ctx context.Context, value string, field string) error {
+	if value == "" {
+		return nil
+	}
+	snapshot := s.snapshot()
+	return validateModel(ctx, snapshot.client, value, field)
+}
+
+func validateModel(ctx context.Context, client openCodeClient, value string, field string) error {
+	if value == "" || client == nil {
+		return nil
+	}
+	providers, err := client.ConfigProviders(ctx)
+	if err != nil {
+		return err
+	}
+	if providers.hasModel(value) {
+		return nil
+	}
+	return invalidModel(value, field)
+}
+
+func invalidModel(value string, field string) error {
+	return acp.NewInvalidParams(map[string]any{
+		"error": "invalid_model",
+		"field": field,
+		"model": value,
+	})
+}
+
+func (p providersResponse) hasModel(value string) bool {
+	providerID, modelID, ok := strings.Cut(value, "/")
+	if !ok || providerID == "" || modelID == "" {
+		return false
+	}
+	for _, provider := range p.Providers {
+		if provider.ID != providerID {
+			continue
+		}
+		for key, model := range provider.Models {
+			if firstNonEmpty(model.ID, key) == modelID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *session) hasConfigValue(ctx context.Context, configID acp.SessionConfigId, value string) bool {

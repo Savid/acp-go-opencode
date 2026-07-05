@@ -133,6 +133,34 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	}
 }
 
+func TestNewSessionRejectsInvalidRequestedModel(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSessionFunc = func(context.Context, string) (nativeSession, error) {
+		t.Fatal("CreateSession called after invalid model")
+		return nativeSession{}, nil
+	}
+	agent := NewAgent(func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+			var err error
+			client.xdg, err = createXDGDirs(opts.Root, string(opts.ACPSessionID))
+			if err != nil {
+				return nil, err
+			}
+			return client, nil
+		}
+	})
+
+	_, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionOpenCodeOptions(NewOpenCodeOptions(
+		WithOpenCodeModel("missing/model"),
+	))))
+	assertInvalidModelField(t, err, modelFieldSessionMeta)
+	if !client.closed {
+		t.Fatal("client was not closed after invalid model")
+	}
+}
+
 func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -174,6 +202,24 @@ func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
 	}
 	if resp.Meta[opencodeMetaKey] == nil || conn.updateCount() != 1 {
 		t.Fatalf("load resp=%#v updates=%#v", resp, conn.updates)
+	}
+
+	invalidClient := newFakeOpenCodeClient()
+	invalidClient.getSession = testNativeSession("native-1")
+	invalidClient.providers = providersResponse{Providers: []providerInfo{{
+		ID:     "openai",
+		Models: map[string]providerModel{"other": {ID: "other"}},
+	}}}
+	invalidAgent := NewAgent(WithHome(root), WithSessionStore(store), func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+			invalidClient.xdg = opts.ExistingXDG
+			return invalidClient, nil
+		}
+	})
+	_, err = invalidAgent.LoadSession(ctx, LoadSessionRequest("session-1", root))
+	assertInvalidModelField(t, err, modelFieldSessionMeta)
+	if !invalidClient.closed {
+		t.Fatal("invalid load did not close client")
 	}
 }
 
@@ -413,8 +459,8 @@ func TestAgentHelperAndLifecycleBranchCoverage(t *testing.T) {
 		defaultSession.idmap.NativeSessionID != "native" || defaultSession.idmap.Format != SessionStoreFormat {
 		t.Fatalf("default session fields = %#v", defaultSession)
 	}
-	if defaultSession.modelSelector() != nil {
-		t.Fatal("empty model selector was not nil")
+	if selector, ok, err := defaultSession.validatedModelSelector(ctx, modelFieldPrompt); err != nil || ok {
+		t.Fatalf("empty model selector = %#v ok=%v err=%v", selector, ok, err)
 	}
 	defaultSession.Close(ctx)
 	if err := defaultSession.Close(ctx); err != nil {
@@ -538,6 +584,10 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 	t.Run("new session id and store errors", func(t *testing.T) {
 		defaultClient := newFakeOpenCodeClient()
 		defaultClient.createSession = nativeSession{ID: "native-default", Title: "Default"}
+		defaultClient.providers = providersResponse{Providers: []providerInfo{{
+			ID:     "openai",
+			Models: map[string]providerModel{"gpt-default": {ID: "gpt-default"}},
+		}}}
 		var defaultModel string
 		defaultAgent := NewAgent(WithDefaultModel("openai/gpt-default"), func(options *Options) {
 			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
@@ -826,6 +876,25 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 		factoryErrAgent.sessions[factoryParent.id] = factoryParent
 		if _, err := factoryErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(factoryParent.id, cwd))); err == nil {
 			t.Fatal("fork ignored child factory error")
+		}
+
+		invalidChild := newFakeOpenCodeClient()
+		invalidChild.providers = providersResponse{Providers: []providerInfo{{
+			ID:     "openai",
+			Models: map[string]providerModel{"other": {ID: "other"}},
+		}}}
+		invalidAgent := NewAgent(func(options *Options) {
+			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+				invalidChild.xdg = opts.ExistingXDG
+				return invalidChild, nil
+			}
+		})
+		invalidParent := testSession(invalidAgent, parentClient)
+		invalidAgent.sessions[invalidParent.id] = invalidParent
+		_, err := invalidAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(invalidParent.id, cwd)))
+		assertInvalidModelField(t, err, modelFieldSessionMeta)
+		if !invalidChild.closed {
+			t.Fatal("invalid fork did not close child")
 		}
 
 		getErrClient := newFakeOpenCodeClient()

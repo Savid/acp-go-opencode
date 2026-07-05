@@ -41,6 +41,10 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
+	if err := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); err != nil {
+		_ = client.Close(context.Background())
+		return acp.NewSessionResponse{}, err
+	}
 	native, err := client.CreateSession(ctx, "")
 	if err != nil {
 		_ = client.Close(context.Background())
@@ -161,20 +165,24 @@ func (a *Agent) loadOrResumeSession(
 	if snapshot.Session.Cwd != "" && snapshot.Session.Cwd != cwd {
 		return nil, acp.NewInvalidParams(map[string]any{"error": "cwd_mismatch", "field": jsonFieldCwd})
 	}
+	if meta.Model == "" {
+		meta.Model = joinModelValue(snapshot.Session.Model.ProviderID, snapshot.Session.Model.ModelID)
+	}
+	if meta.Mode == "" {
+		meta.Mode = snapshot.Session.Model.Agent
+	}
 	client, err := a.newOpenCodeClient(ctx, id, cwd, meta, xdg)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); err != nil {
+		_ = client.Close(context.Background())
 		return nil, err
 	}
 	native, err := client.GetSession(ctx, idmap.NativeSessionID)
 	if err != nil {
 		_ = client.Close(context.Background())
 		return nil, err
-	}
-	if meta.Model == "" {
-		meta.Model = joinModelValue(snapshot.Session.Model.ProviderID, snapshot.Session.Model.ModelID)
-	}
-	if meta.Mode == "" {
-		meta.Mode = snapshot.Session.Model.Agent
 	}
 	session := newSession(a, id, cwd, additionalDirectories, native, client, meta, idmap)
 	if err := a.storeStartedSession(session); err != nil {
@@ -349,6 +357,10 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	}
 	client, err := a.newOpenCodeClient(ctx, id, params.Cwd, meta, xdg)
 	if err != nil {
+		return acp.UnstableForkSessionResponse{}, err
+	}
+	if err := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); err != nil {
+		_ = client.Close(context.Background())
 		return acp.UnstableForkSessionResponse{}, err
 	}
 	native, err := client.GetSession(ctx, nativeChild.ID)

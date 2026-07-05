@@ -18,6 +18,10 @@ import (
 )
 
 func TestOptionsAndRequestBuilders(t *testing.T) {
+	if defaults := applyOptions(nil); defaults.HealthCheckTimeout != 60*time.Second {
+		t.Fatalf("default health timeout = %s, want 60s", defaults.HealthCheckTimeout)
+	}
+
 	store := NewInMemorySessionStore()
 	opts := applyOptions([]Option{
 		WithLogger(slog.New(slog.DiscardHandler)),
