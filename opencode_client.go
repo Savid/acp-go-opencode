@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/savid/acp-go-opencode/internal/defaults"
 )
 
 const (
@@ -420,7 +422,7 @@ func startOpenCodeServer(ctx context.Context, options openCodeStartOptions) (ope
 		options.Logger = slog.Default()
 	}
 	if options.HealthTimeout <= 0 {
-		options.HealthTimeout = 15 * time.Second
+		options.HealthTimeout = defaults.HealthCheckTimeout
 	}
 	root := options.Root
 	if root == "" {
@@ -604,24 +606,30 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 func (s *openCodeServer) Close(ctx context.Context) error {
 	var err error
 	s.once.Do(func() {
+		terminateProcess := openCodeTerminateProcess
+		killProcess := openCodeKillProcess
+		waitCommand := openCodeWaitCommand
+		after := openCodeAfter
+		shutdownTimeout := openCodeShutdownTimeout
+
 		close(s.closed)
 		if s.cancel != nil {
 			s.cancel()
 		}
 		if s.cmd != nil && s.cmd.Process != nil {
-			_ = openCodeTerminateProcess(s.cmd)
+			_ = terminateProcess(s.cmd)
 			done := make(chan error, 1)
-			go func() { done <- openCodeWaitCommand(s.cmd) }()
+			go func() { done <- waitCommand(s.cmd) }()
 			select {
 			case waitErr := <-done:
 				if waitErr != nil && s.log != nil {
 					s.log.DebugContext(ctx, "opencode exited during shutdown", slog.Any("error", waitErr))
 				}
 			case <-ctx.Done():
-				_ = openCodeKillProcess(s.cmd)
+				_ = killProcess(s.cmd)
 				err = ctx.Err()
-			case <-openCodeAfter(openCodeShutdownTimeout):
-				_ = openCodeKillProcess(s.cmd)
+			case <-after(shutdownTimeout):
+				_ = killProcess(s.cmd)
 				err = errors.New("opencode process did not exit after shutdown")
 			}
 		}

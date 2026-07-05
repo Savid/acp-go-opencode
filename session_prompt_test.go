@@ -121,6 +121,41 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 	})
 }
 
+func TestPromptRejectsInvalidCurrentModel(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.providers = providersResponse{Providers: []providerInfo{{
+		ID:     "openai",
+		Models: map[string]providerModel{"other": {ID: "other"}},
+	}}}
+	client.sendMessage = func(context.Context, string, openCodeMessageRequest) (nativeMessage, error) {
+		t.Fatal("SendMessage called after invalid model")
+		return nativeMessage{}, nil
+	}
+	session := testSession(NewAgent(), client)
+
+	_, err := session.Prompt(ctx, TextPromptRequest(session.id, "hello"))
+	assertInvalidModelField(t, err, modelFieldPrompt)
+}
+
+func TestCommandPromptRejectsInvalidCurrentModel(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.commands = []nativeCommand{{Name: "review"}}
+	client.providers = providersResponse{Providers: []providerInfo{{
+		ID:     "openai",
+		Models: map[string]providerModel{"other": {ID: "other"}},
+	}}}
+	client.runCommand = func(context.Context, string, openCodeCommandRequest) (nativeMessage, error) {
+		t.Fatal("RunCommand called after invalid model")
+		return nativeMessage{}, nil
+	}
+	session := testSession(NewAgent(), client)
+
+	_, err := session.Prompt(ctx, TextPromptRequest(session.id, "/review"))
+	assertInvalidModelField(t, err, modelFieldPrompt)
+}
+
 func TestQuestionToolReconcileAndCancelRejectsPending(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()

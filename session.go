@@ -458,13 +458,16 @@ func (s *session) setMode(value string) {
 	s.mu.Unlock()
 }
 
-func (s *session) modelSelector() *openCodeModelSelector {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.providerID == "" || s.modelID == "" {
-		return nil
+func (s *session) validatedModelSelector(ctx context.Context, field string) (openCodeModelSelector, bool, error) {
+	snapshot := s.snapshot()
+	modelValue := snapshot.modelValue()
+	if err := validateModel(ctx, snapshot.client, modelValue, field); err != nil {
+		return openCodeModelSelector{}, false, err
 	}
-	return &openCodeModelSelector{ProviderID: s.providerID, ModelID: s.modelID}
+	if snapshot.providerID == "" || snapshot.modelID == "" {
+		return openCodeModelSelector{}, false, nil
+	}
+	return openCodeModelSelector{ProviderID: snapshot.providerID, ModelID: snapshot.modelID}, true, nil
 }
 
 func (s *session) currentMode() string {

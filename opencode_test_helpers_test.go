@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 
@@ -79,8 +80,9 @@ type fakeQuestionReject struct {
 
 func newFakeOpenCodeClient() *fakeOpenCodeClient {
 	return &fakeOpenCodeClient{
-		events: make(chan openCodeEvent, 16),
-		errs:   make(chan error, 16),
+		providers: testProviders(),
+		events:    make(chan openCodeEvent, 16),
+		errs:      make(chan error, 16),
 	}
 }
 
@@ -385,6 +387,29 @@ func signalTestHook(ch chan struct{}) {
 	case ch <- struct{}{}:
 	default:
 	}
+}
+
+func assertInvalidModelField(t testingT, err error, field string) {
+	t.Helper()
+	var reqErr *acp.RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("error = %v, want RequestError", err)
+	}
+	if reqErr.Code != -32602 {
+		t.Fatalf("error code = %d, want -32602", reqErr.Code)
+	}
+	data, ok := reqErr.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("error data = %#v, want map", reqErr.Data)
+	}
+	if data["error"] != "invalid_model" || data["field"] != field {
+		t.Fatalf("invalid model data = %#v, want field %q", data, field)
+	}
+}
+
+type testingT interface {
+	Helper()
+	Fatalf(string, ...any)
 }
 
 func testNativeSession(id string) nativeSession {

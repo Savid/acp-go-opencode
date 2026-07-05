@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -89,6 +90,33 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 
 	if options := (&session{agent: agent}).configOptions(ctx); options != nil {
 		t.Fatalf("nil client config options = %#v", options)
+	}
+	if !sess.hasConfigValue(ctx, configModel, "p/m") {
+		t.Fatal("known model config value was not found")
+	}
+	if sess.hasConfigValue(ctx, configModel, "missing/model") {
+		t.Fatal("missing model config value was found")
+	}
+	fallbackClient := newFakeOpenCodeClient()
+	fallbackClient.providers = providersResponse{}
+	fallbackSession := testSession(agent, fallbackClient)
+	if !fallbackSession.hasConfigValue(ctx, configModel, "openai/gpt-test") {
+		t.Fatal("fallback model config value was not found")
+	}
+	if err := fallbackSession.validateModel(ctx, "", "model"); err != nil {
+		t.Fatalf("empty model validation = %v", err)
+	}
+	if err := validateModel(ctx, nil, "openai/gpt-test", "model"); err != nil {
+		t.Fatalf("nil client model validation = %v", err)
+	}
+	errorClient := newFakeOpenCodeClient()
+	errorClient.providersErr = errors.New("providers failed")
+	errorSession := testSession(agent, errorClient)
+	if err := errorSession.validateModel(ctx, "openai/gpt-test", "model"); err == nil {
+		t.Fatal("provider catalog error was ignored")
+	}
+	if testProviders().hasModel("gpt-test") {
+		t.Fatal("provider-less model was accepted")
 	}
 	if _, err := agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{}); err == nil {
 		t.Fatal("missing value accepted")

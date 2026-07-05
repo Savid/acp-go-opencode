@@ -76,6 +76,9 @@ func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pro
 			return acp.PromptResponse{}, err
 		}
 		agent, model := s.commandContext()
+		if err := s.validateModel(ctx, model, modelFieldPrompt); err != nil {
+			return acp.PromptResponse{}, err
+		}
 		req := openCodeCommandRequest{
 			Agent:     agent,
 			Model:     model,
@@ -94,10 +97,16 @@ func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Pro
 		if err != nil {
 			return acp.PromptResponse{}, err
 		}
+		modelSelector, hasModel, err := s.validatedModelSelector(ctx, modelFieldPrompt)
+		if err != nil {
+			return acp.PromptResponse{}, err
+		}
 		req := openCodeMessageRequest{
 			Parts: parts,
-			Model: s.modelSelector(),
 			Agent: s.currentMode(),
+		}
+		if hasModel {
+			req.Model = &modelSelector
 		}
 		if params.MessageId != nil {
 			req.MessageID = *params.MessageId
