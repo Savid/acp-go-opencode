@@ -12,14 +12,15 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/defaults"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 func TestOptionsAndRequestBuilders(t *testing.T) {
-	if defaults := applyOptions(nil); defaults.HealthCheckTimeout != 60*time.Second {
-		t.Fatalf("default health timeout = %s, want 60s", defaults.HealthCheckTimeout)
+	if options := applyOptions(nil); options.HealthCheckTimeout != defaults.HealthCheckTimeout {
+		t.Fatalf("default health timeout = %s, want %s", options.HealthCheckTimeout, defaults.HealthCheckTimeout)
 	}
 
 	store := NewInMemorySessionStore()

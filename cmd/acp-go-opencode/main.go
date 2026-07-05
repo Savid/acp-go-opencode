@@ -8,9 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"time"
 
 	opencodeacp "github.com/savid/acp-go-opencode"
+	"github.com/savid/acp-go-opencode/internal/defaults"
 )
 
 var serve = opencodeacp.Serve
@@ -36,7 +36,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	questionTool := flags.Bool("opencode-question-tool", false, "enable OpenCode native question tool mapping")
 	logLevel := flags.String("opencode-log-level", "", "OpenCode native server log level")
 	minimumVersion := flags.String("opencode-minimum-version", "", "minimum accepted OpenCode version")
-	healthTimeout := flags.Duration("opencode-health-timeout", 60*time.Second, "OpenCode server readiness timeout")
+	healthTimeout := flags.Duration("opencode-health-timeout", defaults.HealthCheckTimeout, "OpenCode server readiness timeout")
 
 	if err := flags.Parse(args); err != nil {
 		return 2
