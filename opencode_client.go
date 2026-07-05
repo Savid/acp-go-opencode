@@ -407,6 +407,7 @@ var (
 	openCodeTerminateProcess              = terminateOpenCodeProcess
 	openCodeKillProcess                   = killOpenCodeProcess
 	openCodeInspectProcess                = inspectOpenCodeProcess
+	procReadFile                          = os.ReadFile
 	openCodeWaitCommand                   = func(cmd *exec.Cmd) error { return cmd.Wait() }
 	openCodeAfter                         = time.After
 	openCodeReadyPollInterval             = 100 * time.Millisecond

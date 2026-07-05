@@ -8,8 +8,6 @@ import (
 	"os/exec"
 )
 
-var procReadFile = os.ReadFile
-
 func configureOpenCodeProcess(*exec.Cmd) {}
 
 func terminateOpenCodeProcess(cmd *exec.Cmd) error {
