@@ -102,10 +102,6 @@ func validateLifecycleMeta(meta map[string]any) error {
 		return nil
 	}
 
-	if _, ok := meta["github.com/savid/acp-go-opencode"]; ok {
-		return unsupportedField("_meta.github.com/savid/acp-go-opencode")
-	}
-
 	opencodeMeta, ok := meta[opencodeMetaKey].(map[string]any)
 	if !ok {
 		if _, exists := meta[opencodeMetaKey]; exists {

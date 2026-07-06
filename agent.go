@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/observer"
 )
 
 const (
@@ -30,6 +31,7 @@ var (
 type Agent struct {
 	options    Options
 	log        *slog.Logger
+	observe    *observer.Observer
 	optionsErr error
 
 	mu                 sync.Mutex
@@ -64,9 +66,15 @@ func NewAgent(opts ...Option) *Agent {
 	}
 
 	return &Agent{
-		options:       options,
-		log:           log,
-		optionsErr:    optionsErr,
+		options:    options,
+		log:        log,
+		optionsErr: optionsErr,
+		observe: observer.New(observer.Config{
+			MeterProvider:  options.MeterProvider,
+			Propagator:     options.TextMapPropagator,
+			TracerProvider: options.TracerProvider,
+			Version:        options.AgentVersion,
+		}),
 		sessions:      make(map[acp.SessionId]*session),
 		deleted:       make(map[acp.SessionId]struct{}),
 		deleteCleanup: make(map[acp.SessionId]deleteCleanupRecord),
@@ -132,6 +140,8 @@ func (a *Agent) Close() error {
 
 		cancel()
 	}
+
+	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
 
 	return err
 }
@@ -306,6 +316,8 @@ func (a *Agent) storeStartedSession(session *session) error {
 
 	a.sessions[session.id] = session
 	delete(a.deleted, session.id)
+
+	a.observe.AddActiveSession(context.Background(), 1)
 
 	return nil
 }

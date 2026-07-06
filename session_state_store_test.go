@@ -82,7 +82,7 @@ func TestDecodeXDGArchiveRejectsTraversalAndBadChecksum(t *testing.T) {
 	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
 	idmapData, _ := json.Marshal(idmapRecord{SessionID: "s", NativeSessionID: "n", Format: SessionStoreFormat})
 	mainData, _ := json.Marshal(validHydrateSnapshot())
-	badArchive, _ := json.Marshal(archiveEntry{Format: SessionStoreFormat, Encoding: "tar+zstd+base64", SHA256: "bad", Data: base64.StdEncoding.EncodeToString([]byte("not zstd"))})
+	badArchive, _ := json.Marshal(archiveEntry{Format: SessionStoreFormat, Encoding: archiveEncodingTarZstdBase64, Final: true, SHA256: "bad", Data: base64.StdEncoding.EncodeToString([]byte("not zstd"))})
 	if err := store.Replace(ctx, main, []SessionStoreReplacement{
 		{Key: main, Entries: []SessionStoreEntry{mainData}},
 		{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{idmapData}},
@@ -265,6 +265,26 @@ func TestHydrateStateAgreementRejectsMismatches(t *testing.T) {
 	}
 }
 
+func TestSnapshotToStoreBlockedWhilePending(t *testing.T) {
+	ctx := context.Background()
+	agent := NewAgent()
+
+	permission := &session{agent: agent, pending: map[string]opencode.PermissionRequest{"p": {}}}
+	if err := permission.snapshotToStore(ctx); err == nil || !strings.Contains(err.Error(), "permission") {
+		t.Fatalf("pending permission snapshot err = %v", err)
+	}
+
+	question := &session{agent: agent, questions: map[string]opencode.QuestionRequest{"q": {}}}
+	if err := question.snapshotToStore(ctx); err == nil || !strings.Contains(err.Error(), "elicitation") {
+		t.Fatalf("pending question snapshot err = %v", err)
+	}
+
+	generation := &session{agent: agent, activeMessageIDs: map[string]struct{}{"m": {}}}
+	if err := generation.snapshotToStore(ctx); err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("active generation snapshot err = %v", err)
+	}
+}
+
 func TestSnapshotToStoreNilClientAndFileSQLiteErrors(t *testing.T) {
 	if err := (&session{agent: NewAgent(), client: nil}).snapshotToStore(context.Background()); err != nil {
 		t.Fatalf("nil client snapshot: %v", err)
@@ -420,15 +440,20 @@ func TestHydrateStateFromStoreFaults(t *testing.T) {
 				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, json.RawMessage(`{`))
 			},
 			"base64": func(store *InMemorySessionStore) {
-				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, mustStateJSON(t, archiveEntry{Format: SessionStoreFormat, Data: "not base64"}))
+				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, mustStateJSON(t, archiveEntry{Format: SessionStoreFormat, Encoding: archiveEncodingTarZstdBase64, Final: true, Data: "not base64"}))
+			},
+			"invalid": func(store *InMemorySessionStore) {
+				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, mustStateJSON(t, archiveEntry{Format: SessionStoreFormat, Encoding: "gzip", Final: true, Data: ""}))
 			},
 			"decode": func(store *InMemorySessionStore) {
 				data := []byte("not zstd")
 				sum := sha256.Sum256(data)
 				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, mustStateJSON(t, archiveEntry{
-					Format: SessionStoreFormat,
-					SHA256: hex.EncodeToString(sum[:]),
-					Data:   base64.StdEncoding.EncodeToString(data),
+					Format:   SessionStoreFormat,
+					Encoding: archiveEncodingTarZstdBase64,
+					Final:    true,
+					SHA256:   hex.EncodeToString(sum[:]),
+					Data:     base64.StdEncoding.EncodeToString(data),
 				}))
 			},
 		} {
@@ -859,9 +884,11 @@ func validHydrateStore(t *testing.T, ctx context.Context) *InMemorySessionStore 
 	data := testTarZstd(t, nil, nil)
 	sum := sha256.Sum256(data)
 	archive := mustStateJSON(t, archiveEntry{
-		Format: SessionStoreFormat,
-		SHA256: hex.EncodeToString(sum[:]),
-		Data:   base64.StdEncoding.EncodeToString(data),
+		Format:   SessionStoreFormat,
+		Encoding: archiveEncodingTarZstdBase64,
+		Final:    true,
+		SHA256:   hex.EncodeToString(sum[:]),
+		Data:     base64.StdEncoding.EncodeToString(data),
 	})
 	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
 	replacements := make([]SessionStoreReplacement, 0, 6)

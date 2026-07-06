@@ -554,6 +554,13 @@ func (s *session) currentMode() string {
 	return s.mode
 }
 
+func (s *session) currentModel() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return joinModelValue(s.providerID, s.modelID)
+}
+
 func (s *session) commandContext() (string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -224,4 +224,32 @@ func TestInMemoryStoreReplaceValidation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("replace with empty subkey: %v", err)
 	}
+
+	// A listed key survives even when its Entries are empty (docs/04:
+	// "exactly the listed keys survive"). The empty subkey must stay live,
+	// not be tombstoned.
+	subkeys, err := store.ListSubkeys(ctx, main)
+	if err != nil {
+		t.Fatalf("list subkeys: %v", err)
+	}
+
+	found := false
+	for _, subkey := range subkeys {
+		if subkey == "empty" {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatalf("listed empty-entry subkey did not survive: %v", subkeys)
+	}
+
+	entries, err := store.Load(ctx, SessionKey{SessionID: "s1", Subpath: "empty"})
+	if err != nil {
+		t.Fatalf("load empty subkey: %v", err)
+	}
+
+	if len(entries) != 0 {
+		t.Fatalf("empty subkey entries = %v", entries)
+	}
 }

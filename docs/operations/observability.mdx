@@ -1,7 +1,13 @@
 # Observability
 
 Use `WithLogger` for adapter diagnostics. The CLI `-debug` flag writes
-structured logs to stderr.
+structured logs to stderr so stdout stays reserved for ACP frames.
 
-OpenTelemetry provider options are part of the common public API, matching the
-other ACP sibling packages.
+Embedded hosts can supply OpenTelemetry providers with `WithTracerProvider`,
+`WithMeterProvider`, and `WithTextMapPropagator`. The command can also configure
+exporters from environment variables when OpenTelemetry support is available in
+the build.
+
+Telemetry records lifecycle timing, request outcomes, and counters. It avoids
+recording prompt text, tool inputs, tool outputs, and raw OpenCode event bodies
+by default.

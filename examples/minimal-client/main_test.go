@@ -8,265 +8,487 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/stretchr/testify/require"
 )
 
+type fakeAgentConnection struct {
+	initErr   error
+	newErr    error
+	promptErr error
+
+	cwd       string
+	prompt    string
+	closed    bool
+	sessionID acp.SessionId
+}
+
+func (f *fakeAgentConnection) Initialize(context.Context, acp.InitializeRequest) (acp.InitializeResponse, error) {
+	return acp.InitializeResponse{}, f.initErr
+}
+
+func (f *fakeAgentConnection) NewSession(_ context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+	f.cwd = params.Cwd
+	if f.sessionID == "" {
+		f.sessionID = "session-1"
+	}
+
+	return acp.NewSessionResponse{SessionId: f.sessionID}, f.newErr
+}
+
+func (f *fakeAgentConnection) Prompt(_ context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
+	if len(params.Prompt) > 0 && params.Prompt[0].Text != nil {
+		f.prompt = params.Prompt[0].Text.Text
+	}
+
+	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, f.promptErr
+}
+
+func (f *fakeAgentConnection) CloseSession(context.Context, acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
+	f.closed = true
+
+	return acp.CloseSessionResponse{}, nil
+}
+
+func TestClientFileMethods(t *testing.T) {
+	t.Parallel()
+
+	c := client{}
+	path := filepath.Join(t.TempDir(), "note.txt")
+
+	_, err := c.WriteTextFile(context.Background(), acp.WriteTextFileRequest{
+		Path:    path,
+		Content: "hello",
+	})
+	require.NoError(t, err)
+
+	read, err := c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{Path: path})
+	require.NoError(t, err)
+	require.Equal(t, "hello", read.Content)
+
+	_, err = c.WriteTextFile(context.Background(), acp.WriteTextFileRequest{Path: "relative"})
+	require.Error(t, err)
+
+	_, err = c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{Path: "relative"})
+	require.Error(t, err)
+
+	_, err = c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{Path: filepath.Join(t.TempDir(), "missing.txt")})
+	require.Error(t, err)
+
+	parentFile := filepath.Join(t.TempDir(), "parent")
+	require.NoError(t, os.WriteFile(parentFile, []byte("file"), 0o600))
+	_, err = c.WriteTextFile(context.Background(), acp.WriteTextFileRequest{
+		Path: filepath.Join(parentFile, "child.txt"),
+	})
+	require.Error(t, err)
+}
+
+func TestClientPermissionMethods(t *testing.T) {
+	t.Parallel()
+
+	c := client{}
+	resp, err := c.RequestPermission(context.Background(), acp.RequestPermissionRequest{
+		Options: []acp.PermissionOption{
+			{OptionId: "reject", Kind: acp.PermissionOptionKindRejectOnce},
+			{OptionId: "allow", Kind: acp.PermissionOptionKindAllowOnce},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, acp.PermissionOptionId("allow"), resp.Outcome.Selected.OptionId)
+
+	resp, err = c.RequestPermission(context.Background(), acp.RequestPermissionRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, resp.Outcome.Cancelled)
+}
+
+func TestClientSessionUpdatePrintsVisibleEvents(t *testing.T) {
+	c := client{}
+	status := acp.ToolCallStatusCompleted
+
+	output := captureStdout(t, func() {
+		require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+			Update: acp.SessionUpdate{
+				AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{Content: acp.TextBlock("hello")},
+			},
+		}))
+		require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+			Update: acp.SessionUpdate{
+				AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{Content: acp.TextBlock("thinking")},
+			},
+		}))
+		require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+			Update: acp.SessionUpdate{
+				ToolCall: &acp.SessionUpdateToolCall{ToolCallId: "tool-1", Title: "Read file"},
+			},
+		}))
+		require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+			Update: acp.SessionUpdate{
+				ToolCallUpdate: &acp.SessionToolCallUpdate{ToolCallId: "tool-1", Status: &status},
+			},
+		}))
+		require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{}))
+	})
+
+	require.Contains(t, output, "hello")
+	require.Contains(t, output, "[thought] thinking")
+	require.Contains(t, output, "[tool] tool-1 Read file")
+	require.Contains(t, output, "[tool] tool-1 completed")
+}
+
+func TestClientSessionUpdateReconcilesFinalMessageSnapshot(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	c := client{output: &output}
+
+	c.fallback.writeText(&output, "")
+	require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+		Update: acp.SessionUpdate{
+			AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+				Content: acp.TextBlock("Hello"),
+			},
+		},
+	}))
+	require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+		Update: acp.SessionUpdate{
+			AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+				Content: acp.TextBlock(" from ACP"),
+			},
+		},
+	}))
+	require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+		Update: acp.SessionUpdate{
+			AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+				Content: acp.TextBlock("Hello from ACP"),
+			},
+		},
+	}))
+
+	require.Equal(t, "Hello from ACP", output.String())
+}
+
+func TestClientSessionUpdateCompletesPartialFinalSnapshot(t *testing.T) {
+	t.Parallel()
+
+	messageID := "33333333-3333-4333-8333-333333333333"
+	var output bytes.Buffer
+	c := client{output: &output}
+
+	require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+		Update: acp.SessionUpdate{
+			AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+				MessageId: &messageID,
+				Content:   acp.TextBlock("Hello from"),
+			},
+		},
+	}))
+	require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+		Update: acp.SessionUpdate{
+			AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+				MessageId: &messageID,
+				Content:   acp.TextBlock("Hello from ACP"),
+			},
+		},
+	}))
+
+	require.Equal(t, "Hello from ACP", output.String())
+}
+
+func TestClientSessionUpdateUsesConfiguredWriter(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	c := client{output: &output}
+
+	require.Same(t, &output, c.writer())
+	require.NoError(t, c.SessionUpdate(context.Background(), acp.SessionNotification{
+		Update: acp.SessionUpdate{
+			AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{Content: acp.TextBlock("hello")},
+		},
+	}))
+
+	require.Equal(t, "hello", output.String())
+}
+
+func TestClientTerminalMethods(t *testing.T) {
+	t.Parallel()
+
+	c := client{}
+	terminal, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{})
+	require.NoError(t, err)
+	require.Equal(t, "terminal-1", terminal.TerminalId)
+
+	output, err := c.TerminalOutput(context.Background(), acp.TerminalOutputRequest{})
+	require.NoError(t, err)
+	require.False(t, output.Truncated)
+
+	_, err = c.KillTerminal(context.Background(), acp.KillTerminalRequest{})
+	require.NoError(t, err)
+
+	_, err = c.ReleaseTerminal(context.Background(), acp.ReleaseTerminalRequest{})
+	require.NoError(t, err)
+
+	_, err = c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{})
+	require.NoError(t, err)
+}
+
 func TestRunConversation(t *testing.T) {
+	t.Parallel()
+
 	conn := &fakeAgentConnection{}
-	var stdout bytes.Buffer
+	var output bytes.Buffer
 
-	if err := runConversation(context.Background(), conn, "hello", "/repo", &stdout); err != nil {
-		t.Fatalf("runConversation returned error: %v", err)
-	}
-	if !conn.initialized || conn.prompt != "hello" || !conn.closed {
-		t.Fatalf("conn state = %#v", conn)
-	}
-	if !strings.Contains(stdout.String(), "stop reason") {
-		t.Fatalf("stdout = %q", stdout.String())
-	}
+	err := runConversation(context.Background(), conn, "hello", "/repo", &output)
+	require.NoError(t, err)
+	require.Equal(t, "/repo", conn.cwd)
+	require.Equal(t, "hello", conn.prompt)
+	require.True(t, conn.closed)
+	require.Contains(t, output.String(), "stop reason: end_turn")
+}
 
-	for name, conn := range map[string]*fakeAgentConnection{
-		"initialize": {initErr: errors.New("init failed")},
-		"new":        {newErr: errors.New("new failed")},
-		"prompt":     {promptErr: errors.New("prompt failed")},
+func TestRunConversationErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, conn := range []*fakeAgentConnection{
+		{initErr: errors.New("init")},
+		{newErr: errors.New("new")},
+		{promptErr: errors.New("prompt")},
 	} {
-		if err := runConversation(context.Background(), conn, "hello", "/repo", io.Discard); err == nil {
-			t.Fatalf("%s error path succeeded", name)
-		}
+		var output bytes.Buffer
+		err := runConversation(context.Background(), conn, "hello", "/repo", &output)
+		require.Error(t, err)
 	}
 }
 
-func TestRunUsesInjectedAgentAndMain(t *testing.T) {
-	restore := replaceGlobals(t)
-	defer restore()
+func TestRun(t *testing.T) {
+	originalStartAgent := startAgent
+	originalGetwd := getwd
+	t.Cleanup(func() {
+		startAgent = originalStartAgent
+		getwd = originalGetwd
+	})
 
 	conn := &fakeAgentConnection{}
+	var closed bool
+	var waited bool
 	startAgent = func(context.Context, io.Writer, io.Writer) (*startedAgent, error) {
 		return &startedAgent{
-			conn:  conn,
-			close: func() { conn.closedStarter = true },
+			conn: conn,
+			close: func() {
+				closed = true
+			},
 			wait: func() error {
-				conn.waited = true
+				waited = true
 
 				return nil
 			},
 		}, nil
 	}
+	getwd = func() (string, error) {
+		return "/repo", nil
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run(context.Background(), nil, &stdout, &stderr)
+	require.Equal(t, 0, code)
+	require.Equal(t, "Reply with a short hello from ACP.", conn.prompt)
+	require.True(t, closed)
+	require.True(t, waited)
+	require.Empty(t, stderr.String())
+
+	startAgent = func(context.Context, io.Writer, io.Writer) (*startedAgent, error) {
+		return &startedAgent{conn: &fakeAgentConnection{}}, nil
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run(context.Background(), []string{"hello"}, &stdout, &stderr)
+	require.Equal(t, 0, code)
+	require.Empty(t, stderr.String())
+}
+
+func TestMain(t *testing.T) {
+	originalStartAgent := startAgent
+	originalGetwd := getwd
+	originalExit := exit
+	originalArgs := os.Args
+	t.Cleanup(func() {
+		startAgent = originalStartAgent
+		getwd = originalGetwd
+		exit = originalExit
+		os.Args = originalArgs
+	})
+
+	startAgent = func(context.Context, io.Writer, io.Writer) (*startedAgent, error) {
+		return &startedAgent{
+			conn:  &fakeAgentConnection{},
+			close: func() {},
+			wait:  func() error { return nil },
+		}, nil
+	}
 	getwd = func() (string, error) { return "/repo", nil }
 
-	var stdout, stderr bytes.Buffer
-	if code := run(context.Background(), []string{"hello", "opencode"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("run code = %d stderr=%q", code, stderr.String())
+	var gotCode int
+	exit = func(code int) {
+		gotCode = code
 	}
-	if conn.prompt != "hello opencode" || !conn.closedStarter || !conn.waited {
-		t.Fatalf("conn state = %#v", conn)
-	}
+	os.Args = []string{"minimal-client", "hello"}
 
-	exitCode := -1
-	exit = func(code int) { exitCode = code }
-	os.Args = []string{"minimal-client", "from-main"}
 	main()
-	if exitCode != 0 || conn.prompt != "from-main" {
-		t.Fatalf("main exit=%d prompt=%q", exitCode, conn.prompt)
-	}
-}
 
-func TestRunErrors(t *testing.T) {
-	restore := replaceGlobals(t)
-	defer restore()
-
-	getwd = func() (string, error) { return "", errors.New("cwd failed") }
-	var stdout, stderr bytes.Buffer
-	if code := run(context.Background(), nil, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cwd failed") {
-		t.Fatalf("cwd failure code=%d stderr=%q", code, stderr.String())
-	}
-
-	getwd = func() (string, error) { return "/repo", nil }
-	startAgent = func(context.Context, io.Writer, io.Writer) (*startedAgent, error) {
-		return nil, errors.New("start failed")
-	}
-	stderr.Reset()
-	if code := run(context.Background(), nil, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "start failed") {
-		t.Fatalf("start failure code=%d stderr=%q", code, stderr.String())
-	}
-
-	startAgent = func(context.Context, io.Writer, io.Writer) (*startedAgent, error) {
-		return &startedAgent{conn: &fakeAgentConnection{promptErr: errors.New("prompt failed")}}, nil
-	}
-	stderr.Reset()
-	if code := run(context.Background(), nil, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "prompt failed") {
-		t.Fatalf("prompt failure code=%d stderr=%q", code, stderr.String())
-	}
-}
-
-func TestClientHelpers(t *testing.T) {
-	var out bytes.Buffer
-	c := &client{output: &out}
-	if err := c.SessionUpdate(context.Background(), acp.SessionNotification{Update: acp.UpdateAgentMessageText("hello")}); err != nil {
-		t.Fatalf("SessionUpdate returned error: %v", err)
-	}
-	if !strings.Contains(out.String(), "hello") {
-		t.Fatalf("output = %q", out.String())
-	}
-
-	resp, err := c.RequestPermission(context.Background(), acp.RequestPermissionRequest{Options: []acp.PermissionOption{
-		{OptionId: "allow", Kind: acp.PermissionOptionKindAllowOnce},
-	}})
-	if err != nil || resp.Outcome.Selected == nil || resp.Outcome.Selected.OptionId != "allow" {
-		t.Fatalf("permission resp=%#v err=%v", resp, err)
-	}
-	cancelResp, err := c.RequestPermission(context.Background(), acp.RequestPermissionRequest{})
-	if err != nil || cancelResp.Outcome.Cancelled == nil {
-		t.Fatalf("cancel permission resp=%#v err=%v", cancelResp, err)
-	}
-
-	dir := t.TempDir()
-	file := filepath.Join(dir, "nested", "file.txt")
-	if _, err = c.WriteTextFile(context.Background(), acp.WriteTextFileRequest{Path: file, Content: "body"}); err != nil {
-		t.Fatalf("WriteTextFile returned error: %v", err)
-	}
-	read, err := c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{Path: file})
-	if err != nil || read.Content != "body" {
-		t.Fatalf("ReadTextFile = %#v err=%v", read, err)
-	}
-	if _, err := c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{Path: "relative"}); err == nil {
-		t.Fatal("ReadTextFile accepted relative path")
-	}
-	if _, err := c.WriteTextFile(context.Background(), acp.WriteTextFileRequest{Path: "relative"}); err == nil {
-		t.Fatal("WriteTextFile accepted relative path")
-	}
-	if _, err := c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{Path: filepath.Join(dir, "missing.txt")}); err == nil {
-		t.Fatal("ReadTextFile missing file succeeded")
-	}
-	notDir := filepath.Join(dir, "not-dir")
-	if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
-		t.Fatalf("write not-dir: %v", err)
-	}
-	if _, err := c.WriteTextFile(context.Background(), acp.WriteTextFileRequest{Path: filepath.Join(notDir, "child.txt"), Content: "body"}); err == nil {
-		t.Fatal("WriteTextFile under file path succeeded")
-	}
-
-	nilWriterClient := &client{}
-	if err := nilWriterClient.SessionUpdate(context.Background(), acp.SessionNotification{}); err != nil {
-		t.Fatalf("nil writer SessionUpdate returned error: %v", err)
-	}
-	if terminal, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{}); err != nil || terminal.TerminalId == "" {
-		t.Fatalf("CreateTerminal = %#v err=%v", terminal, err)
-	}
-	if _, err := c.KillTerminal(context.Background(), acp.KillTerminalRequest{}); err != nil {
-		t.Fatalf("KillTerminal returned error: %v", err)
-	}
-	if output, err := c.TerminalOutput(context.Background(), acp.TerminalOutputRequest{}); err != nil || output.Truncated {
-		t.Fatalf("TerminalOutput = %#v err=%v", output, err)
-	}
-	if _, err := c.ReleaseTerminal(context.Background(), acp.ReleaseTerminalRequest{}); err != nil {
-		t.Fatalf("ReleaseTerminal returned error: %v", err)
-	}
-	if _, err := c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{}); err != nil {
-		t.Fatalf("WaitForTerminalExit returned error: %v", err)
-	}
+	require.Equal(t, 0, gotCode)
 }
 
 func TestStartAgentProcess(t *testing.T) {
-	restore := replaceGlobals(t)
-	defer restore()
-
-	script := filepath.Join(t.TempDir(), "fake-agent")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat >/dev/null\n"), 0o700); err != nil {
-		t.Fatalf("write script: %v", err)
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell script")
 	}
-	commandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		return exec.CommandContext(ctx, script)
+
+	binDir := t.TempDir()
+	goPath := filepath.Join(binDir, "go")
+	err := os.WriteFile(goPath, []byte("#!/bin/sh\nwhile IFS= read -r _; do :; done\n"), 0o755)
+	require.NoError(t, err)
+
+	t.Setenv("PATH", binDir)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	agent, err := startAgentProcess(context.Background(), &stdout, &stderr)
+	require.NoError(t, err)
+	require.NotNil(t, agent.conn)
+
+	agent.close()
+	require.NoError(t, agent.wait())
+}
+
+func TestStartAgentProcessUsesModuleEntrypoint(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell")
+	}
+
+	originalCommandContext := commandContext
+	t.Cleanup(func() {
+		commandContext = originalCommandContext
+	})
+
+	var gotName string
+	var gotArgs []string
+	commandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+
+		return exec.CommandContext(ctx, "sh", "-c", "while IFS= read -r _; do :; done")
 	}
 
 	agent, err := startAgentProcess(context.Background(), io.Discard, io.Discard)
-	if err != nil {
-		t.Fatalf("startAgentProcess returned error: %v", err)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, agent.conn)
+
 	agent.close()
-	if err := agent.wait(); err != nil {
-		t.Fatalf("fake agent wait returned error: %v", err)
+	require.NoError(t, agent.wait())
+	require.Equal(t, "go", gotName)
+	require.Equal(t, []string{"run", agentPackage}, gotArgs)
+}
+
+func TestStartAgentProcessStartError(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+
+	agent, err := startAgentProcess(context.Background(), io.Discard, io.Discard)
+	require.Error(t, err)
+	require.Nil(t, agent)
+}
+
+func TestStartAgentProcessPipeErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell")
 	}
 
+	originalCommandContext := commandContext
+	t.Cleanup(func() {
+		commandContext = originalCommandContext
+	})
+
 	commandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, script)
+		cmd := exec.CommandContext(ctx, "sh", "-c", "cat")
 		cmd.Stdin = strings.NewReader("")
 
 		return cmd
 	}
-	if _, err := startAgentProcess(context.Background(), io.Discard, io.Discard); err == nil {
-		t.Fatal("startAgentProcess accepted StdinPipe failure")
-	}
+	agent, err := startAgentProcess(context.Background(), io.Discard, io.Discard)
+	require.Error(t, err)
+	require.Nil(t, agent)
 
 	commandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, script)
+		cmd := exec.CommandContext(ctx, "sh", "-c", "cat")
 		cmd.Stdout = io.Discard
 
 		return cmd
 	}
-	if _, err := startAgentProcess(context.Background(), io.Discard, io.Discard); err == nil {
-		t.Fatal("startAgentProcess accepted StdoutPipe failure")
-	}
-
-	commandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		return exec.CommandContext(ctx, filepath.Join(t.TempDir(), "missing-agent"))
-	}
-	if _, err := startAgentProcess(context.Background(), io.Discard, io.Discard); err == nil {
-		t.Fatal("startAgentProcess accepted Start failure")
-	}
+	agent, err = startAgentProcess(context.Background(), io.Discard, io.Discard)
+	require.Error(t, err)
+	require.Nil(t, agent)
 }
 
-func replaceGlobals(t *testing.T) func() {
-	t.Helper()
-	originalStart := startAgent
+func TestRunErrors(t *testing.T) {
+	originalStartAgent := startAgent
 	originalGetwd := getwd
-	originalExit := exit
-	originalArgs := os.Args
-	originalCommand := commandContext
-
-	return func() {
-		startAgent = originalStart
+	t.Cleanup(func() {
+		startAgent = originalStartAgent
 		getwd = originalGetwd
-		exit = originalExit
-		os.Args = originalArgs
-		commandContext = originalCommand
-	}
-}
+	})
 
-type fakeAgentConnection struct {
-	initialized   bool
-	closed        bool
-	closedStarter bool
-	waited        bool
-	prompt        string
-	initErr       error
-	newErr        error
-	promptErr     error
-}
-
-func (c *fakeAgentConnection) Initialize(context.Context, acp.InitializeRequest) (acp.InitializeResponse, error) {
-	c.initialized = true
-
-	return acp.InitializeResponse{}, c.initErr
-}
-
-func (c *fakeAgentConnection) NewSession(context.Context, acp.NewSessionRequest) (acp.NewSessionResponse, error) {
-	return acp.NewSessionResponse{SessionId: "session-1"}, c.newErr
-}
-
-func (c *fakeAgentConnection) Prompt(_ context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
-	if len(params.Prompt) > 0 && params.Prompt[0].Text != nil {
-		c.prompt = params.Prompt[0].Text.Text
+	getwd = func() (string, error) {
+		return "", errors.New("cwd")
 	}
 
-	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, c.promptErr
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	require.Equal(t, 1, run(context.Background(), []string{"hello"}, &stdout, &stderr))
+	require.Contains(t, stderr.String(), "cwd")
+
+	getwd = func() (string, error) {
+		return "/repo", nil
+	}
+	startAgent = func(context.Context, io.Writer, io.Writer) (*startedAgent, error) {
+		return nil, errors.New("start")
+	}
+
+	stderr.Reset()
+	require.Equal(t, 1, run(context.Background(), []string{"hello"}, &stdout, &stderr))
+	require.Contains(t, stderr.String(), "start")
+
+	startAgent = func(context.Context, io.Writer, io.Writer) (*startedAgent, error) {
+		return &startedAgent{conn: &fakeAgentConnection{initErr: errors.New("init")}}, nil
+	}
+
+	stderr.Reset()
+	require.Equal(t, 1, run(context.Background(), []string{"hello"}, &stdout, &stderr))
+	require.Contains(t, stderr.String(), "init")
 }
 
-func (c *fakeAgentConnection) CloseSession(context.Context, acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	c.closed = true
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
 
-	return acp.CloseSessionResponse{}, nil
+	original := os.Stdout
+	reader, writer, err := os.Pipe()
+	require.NoError(t, err)
+
+	os.Stdout = writer
+	defer func() {
+		os.Stdout = original
+	}()
+
+	fn()
+
+	require.NoError(t, writer.Close())
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+
+	return strings.TrimSpace(string(data))
 }

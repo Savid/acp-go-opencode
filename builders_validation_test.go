@@ -156,6 +156,15 @@ func TestValidationMetaAndHelperBranches(t *testing.T) {
 	if err := validateMCPServers([]acp.McpServer{{Acp: &acp.McpServerAcpInline{Name: "acp"}}}); err == nil {
 		t.Fatal("unsupported ACP MCP server accepted")
 	}
+	if err := validateMCPServers([]acp.McpServer{{}}); err == nil {
+		t.Fatal("empty MCP server accepted")
+	}
+	if err := validateMCPServers([]acp.McpServer{
+		{Http: &acp.McpServerHttpInline{Name: "http", Url: "https://mcp.example"}},
+		{Stdio: &acp.McpServerStdio{Name: "stdio", Command: "server"}},
+	}); err != nil {
+		t.Fatalf("valid MCP servers rejected: %v", err)
+	}
 	if _, err := normalizeConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: -1}); err == nil {
 		t.Fatal("negative concurrency accepted")
 	}
@@ -168,8 +177,8 @@ func TestValidationMetaAndHelperBranches(t *testing.T) {
 	if err := validateLifecycleMeta(map[string]any{opencodeMetaKey: "bad"}); err == nil {
 		t.Fatal("bad opencode meta accepted")
 	}
-	if err := validateLifecycleMeta(map[string]any{"github.com/savid/acp-go-opencode": map[string]any{}}); err == nil {
-		t.Fatal("old full package meta accepted")
+	if err := validateLifecycleMeta(map[string]any{"github.com/savid/acp-go-opencode": map[string]any{}}); err != nil {
+		t.Fatalf("foreign module-path meta not ignored: %v", err)
 	}
 	if err := validateLifecycleMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: "bad"}}); err == nil {
 		t.Fatal("bad options meta accepted")

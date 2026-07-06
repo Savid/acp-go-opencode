@@ -17,6 +17,7 @@ import (
 )
 
 func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+	ctx = a.observe.Extract(ctx, params.Meta)
 	if err := a.ensureOpen(); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -90,6 +91,8 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 }
 
 func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	ctx = a.observe.Extract(ctx, params.Meta)
+
 	session, err := a.loadOrResumeSession(ctx, params.SessionId, params.Cwd, params.AdditionalDirectories, params.McpServers, params.Meta)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
@@ -106,6 +109,7 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 }
 
 func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
+	ctx = a.observe.Extract(ctx, params.Meta)
 	if err := validateMCPServers(params.McpServers); err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
@@ -335,12 +339,16 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 
 	closeErr := session.Close(ctx)
 	snapshotErr := session.snapshotToStore(context.WithoutCancel(ctx))
-	a.removeSessionIf(params.SessionId, session)
+
+	if a.removeSessionIf(params.SessionId, session) {
+		a.observe.AddActiveSession(ctx, -1)
+	}
 
 	return acp.CloseSessionResponse{}, errors.Join(snapshotErr, closeErr)
 }
 
 func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
+	ctx = a.observe.Extract(ctx, params.Meta)
 	if params.SessionId == "" {
 		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
@@ -380,6 +388,8 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 		err = session.DeleteNativeAndClose(closeCtx)
 
 		closeCancel()
+
+		a.observe.AddActiveSession(ctx, -1)
 	}
 
 	cleanupErr := a.cleanupDeletedSession(record)
@@ -389,6 +399,7 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 }
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
+	ctx = a.observe.Extract(ctx, params.Meta)
 	if err := validateSessionStartPaths(params.Cwd, params.AdditionalDirectories); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -499,13 +510,15 @@ func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd str
 		env[key] = value
 	}
 
+	a.observe.RecordOpenCodeProcessStart(ctx)
+
 	return factory(ctx, opencode.StartOptions{
 		ACPSessionID:   opencode.ACPSessionID(id),
 		Root:           a.homeRoot(),
 		Cwd:            cwd,
 		ExecutablePath: a.options.ExecutablePath,
 		DefaultModel:   firstNonEmpty(meta.Model, a.options.DefaultModel),
-		Env:            env,
+		Env:            a.observe.InjectTraceEnv(ctx, env),
 		Pure:           a.options.Pure,
 		QuestionTool:   a.options.QuestionTool,
 		LogLevel:       a.options.LogLevel,

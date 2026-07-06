@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/observer"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
@@ -58,13 +59,47 @@ const (
 	priorityLow           = "low"
 )
 
-func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
+func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (resp acp.PromptResponse, err error) {
 	session, err := a.session(params.SessionId)
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
 
-	return session.Prompt(ctx, params)
+	ctx, finish := a.observe.StartPrompt(ctx, params.Meta, session.currentModel())
+	defer func() { finish(promptResultForObserver(resp, err, session.currentModel())) }()
+
+	resp, err = session.Prompt(ctx, params)
+
+	return resp, err
+}
+
+func promptResultForObserver(resp acp.PromptResponse, err error, model string) observer.PromptResult {
+	result := observer.PromptResult{
+		Err:        err,
+		Model:      model,
+		StopReason: string(resp.StopReason),
+	}
+	if resp.Usage == nil {
+		return result
+	}
+
+	result.InputTokens = resp.Usage.InputTokens
+	result.OutputTokens = resp.Usage.OutputTokens
+	result.TotalTokens = resp.Usage.TotalTokens
+
+	if resp.Usage.CachedReadTokens != nil {
+		result.CachedReadTokens = *resp.Usage.CachedReadTokens
+	}
+
+	if resp.Usage.CachedWriteTokens != nil {
+		result.CachedWriteTokens = *resp.Usage.CachedWriteTokens
+	}
+
+	if resp.Usage.ThoughtTokens != nil {
+		result.ThoughtTokens = *resp.Usage.ThoughtTokens
+	}
+
+	return result
 }
 
 func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error {
@@ -277,6 +312,7 @@ func (s *session) runPromptTurn(
 			}
 		case err := <-s.client.EventErrors():
 			s.markStreamFailed(opencode.StreamErrorEpoch(err))
+			s.cancelTurn()
 			abortTurn()
 
 			return acp.PromptResponse{}, acp.NewInternalError(map[string]any{jsonFieldError: "opencode_sse_disconnect", jsonFieldMessage: err.Error()})
@@ -333,6 +369,8 @@ func (s *session) finishPromptTurn(
 	if s.wasCancelled() || turnCtx.Err() != nil {
 		stopReason = acp.StopReasonCancelled
 	}
+
+	s.finishTurn()
 
 	if err := s.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
 		return acp.PromptResponse{}, err
@@ -1264,6 +1302,8 @@ func (s *session) emitPlan(ctx context.Context, todos []opencode.NativeTodo) err
 }
 
 func (s *session) emitUpdate(ctx context.Context, update acp.SessionUpdate) error {
+	s.agent.observe.ObserveFirstPromptUpdate(ctx)
+
 	conn := s.agent.connection()
 	if conn == nil {
 		return nil

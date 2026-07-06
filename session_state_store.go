@@ -29,6 +29,8 @@ const maxHydrateFileBytes int64 = 128 * 1024 * 1024
 
 const credentialTableAccount = "account"
 
+const archiveEncodingTarZstdBase64 = "tar+zstd+base64"
+
 type archiveTarWriter interface {
 	io.Writer
 	WriteHeader(*tar.Header) error
@@ -129,6 +131,10 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 		return err
 	}
 
+	if reason := s.snapshotBlockedReason(); reason != "" {
+		return fmt.Errorf("cannot snapshot OpenCode session while %s pending", reason)
+	}
+
 	snapshot := s.snapshot()
 	if snapshot.client == nil {
 		return nil
@@ -194,7 +200,7 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 
 		entry, err := stateJSONMarshal(archiveEntry{
 			Format:   SessionStoreFormat,
-			Encoding: "tar+zstd+base64",
+			Encoding: archiveEncodingTarZstdBase64,
 			Sequence: 0,
 			Final:    true,
 			SHA256:   sha,
@@ -229,6 +235,22 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 	defer cancel()
 
 	return s.agent.sessionStore().Replace(storeCtx, mainKey, replacements)
+}
+
+func (s *session) snapshotBlockedReason() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch {
+	case len(s.pending) > 0:
+		return metaPermissionKey
+	case len(s.questions) > 0:
+		return "elicitation"
+	case len(s.activeMessageIDs) > 0:
+		return "generation"
+	default:
+		return ""
+	}
 }
 
 func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID string, xdg opencode.XDGDirs) (idmapRecord, stateSnapshot, bool, error) {
@@ -285,6 +307,10 @@ func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID st
 		var archive archiveEntry
 		if unmarshalErr := json.Unmarshal(entries[len(entries)-1], &archive); unmarshalErr != nil {
 			return idmapRecord{}, stateSnapshot{}, false, unmarshalErr
+		}
+
+		if archive.Format != SessionStoreFormat || archive.Encoding != archiveEncodingTarZstdBase64 || !archive.Final {
+			return idmapRecord{}, stateSnapshot{}, false, fmt.Errorf("invalid archive entry %s", item.subpath)
 		}
 
 		data, err := base64.StdEncoding.DecodeString(archive.Data)
