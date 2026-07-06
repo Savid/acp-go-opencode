@@ -24,6 +24,7 @@ func TestOptionsAndRequestBuilders(t *testing.T) {
 	}
 
 	store := NewInMemorySessionStore()
+	seedSource := map[string]string{"opencode.json": `{"provider":{}}`}
 	opts := applyOptions([]Option{
 		WithLogger(slog.New(slog.DiscardHandler)),
 		WithAgentName("name"),
@@ -39,6 +40,7 @@ func TestOptionsAndRequestBuilders(t *testing.T) {
 		WithSessionStore(store),
 		WithSessionStoreLoadTimeout(time.Second),
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentPrompts: 2, MaxConcurrentClientCalls: 3}),
+		WithSeedFiles(seedSource),
 		WithOpenCodePure(true),
 		WithOpenCodeQuestionTool(true),
 		WithOpenCodeLogLevel("INFO"),
@@ -48,6 +50,13 @@ func TestOptionsAndRequestBuilders(t *testing.T) {
 	if opts.AgentName != "name" || opts.AgentTitle != "title" || opts.ExecutablePath != "opencode" ||
 		opts.Env["A"] != "1" || !opts.Pure || !opts.QuestionTool || opts.SessionStore != store {
 		t.Fatalf("options = %#v", opts)
+	}
+	if opts.SeedFiles["opencode.json"] != `{"provider":{}}` {
+		t.Fatalf("seed files = %#v", opts.SeedFiles)
+	}
+	seedSource["opencode.json"] = "mutated"
+	if opts.SeedFiles["opencode.json"] != `{"provider":{}}` {
+		t.Fatalf("WithSeedFiles did not clone the map: %#v", opts.SeedFiles)
 	}
 
 	httpServer := HTTPMCPServer("http", "https://example.com", map[string]string{"X": "Y"})

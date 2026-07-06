@@ -2558,3 +2558,185 @@ func eventFromJSON(t *testing.T, raw string) openCodeEvent {
 	}
 	return event
 }
+
+func TestPromptStructuredOutput(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("schema forwarded and result surfaced", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		session.outputSchema = map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"answer": map[string]any{"type": "string"}},
+		}
+		agent.mu.Lock()
+		agent.sessions[session.id] = session
+		agent.mu.Unlock()
+		client.sendMessage = func(_ context.Context, id string, req openCodeMessageRequest) (nativeMessage, error) {
+			if req.Format == nil || req.Format.Type != "json_schema" || req.Format.Schema["type"] != "object" {
+				t.Fatalf("format = %#v", req.Format)
+			}
+			msg := nativeMessage{Info: nativeMessageInfo{
+				ID:         "assistant-1",
+				SessionID:  id,
+				Role:       "assistant",
+				Finish:     "stop",
+				Structured: json.RawMessage(`{"answer":"hi"}`),
+			}}
+			msg.Parts = []nativePart{{SessionID: id, MessageID: "assistant-1", Type: "text", Text: `{"answer":"hi"}`}}
+			return msg, nil
+		}
+		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		if err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+		opencodeMeta, _ := resp.Meta[opencodeMetaKey].(map[string]any)
+		structured, _ := opencodeMeta[structuredOutputMetaKey].(map[string]any)
+		if structured["answer"] != "hi" {
+			t.Fatalf("structured output meta = %#v", resp.Meta)
+		}
+	})
+
+	t.Run("no schema sends no format and no meta", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		agent.mu.Lock()
+		agent.sessions[session.id] = session
+		agent.mu.Unlock()
+		client.sendMessage = func(_ context.Context, id string, req openCodeMessageRequest) (nativeMessage, error) {
+			if req.Format != nil {
+				t.Fatalf("format unexpectedly set: %#v", req.Format)
+			}
+			msg := nativeMessage{Info: nativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}
+			msg.Parts = []nativePart{{SessionID: id, MessageID: "assistant-1", Type: "text", Text: "hi"}}
+			return msg, nil
+		}
+		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		if err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+		if resp.Meta != nil {
+			t.Fatalf("meta unexpectedly set: %#v", resp.Meta)
+		}
+	})
+
+	t.Run("schema with invalid structured payload omits meta", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(agent, client)
+		session.outputSchema = map[string]any{"type": "object"}
+		agent.mu.Lock()
+		agent.sessions[session.id] = session
+		agent.mu.Unlock()
+		client.sendMessage = func(_ context.Context, id string, _ openCodeMessageRequest) (nativeMessage, error) {
+			msg := nativeMessage{Info: nativeMessageInfo{
+				ID:         "assistant-1",
+				SessionID:  id,
+				Role:       "assistant",
+				Finish:     "stop",
+				Structured: json.RawMessage(`not-json`),
+			}}
+			msg.Parts = []nativePart{{SessionID: id, MessageID: "assistant-1", Type: "text", Text: "hi"}}
+			return msg, nil
+		}
+		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		if err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+		if resp.Meta != nil {
+			t.Fatalf("meta unexpectedly set: %#v", resp.Meta)
+		}
+	})
+}
+
+func TestPromptAssistantErrorStructured(t *testing.T) {
+	ctx := context.Background()
+
+	const (
+		providerDetail = "Error from provider (Console): Upstream request failed"
+		responseBody   = `{"error":{"message":"Error from provider (Console): Upstream request failed","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}`
+	)
+	apiError := func() *nativeError {
+		e := &nativeError{Name: "APIError"}
+		e.Data.Message = providerDetail
+		e.Data.StatusCode = 400
+		e.Data.ResponseBody = responseBody
+		return e
+	}
+
+	for _, tt := range []struct {
+		name       string
+		withSchema bool
+	}{
+		{name: "schema requested surfaces structuredOutputRequested true", withSchema: true},
+		{name: "no schema surfaces structuredOutputRequested false", withSchema: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newFakeOpenCodeClient()
+			session := testSession(NewAgent(), client)
+			if tt.withSchema {
+				session.outputSchema = map[string]any{"type": "object"}
+			}
+			client.sendMessage = func(_ context.Context, id string, _ openCodeMessageRequest) (nativeMessage, error) {
+				msg := nativeMessage{Info: nativeMessageInfo{
+					ID:        "assistant-1",
+					SessionID: id,
+					Role:      "assistant",
+					Finish:    "error",
+					Error:     apiError(),
+				}}
+				// Route through the real translation so the test exercises the
+				// full native-error decode and typed-error path.
+				return nativeMessage{}, assistantMessageError(msg)
+			}
+
+			_, err := session.Prompt(ctx, acp.PromptRequest{
+				SessionId: session.id,
+				Prompt:    []acp.ContentBlock{acp.TextBlock("hello")},
+			})
+			var reqErr *acp.RequestError
+			if !errors.As(err, &reqErr) {
+				t.Fatalf("expected *acp.RequestError, got %T: %v", err, err)
+			}
+			data, ok := reqErr.Data.(map[string]any)
+			if !ok {
+				t.Fatalf("Data = %#v", reqErr.Data)
+			}
+			if data["error"] != "opencode_assistant_error" {
+				t.Fatalf("error token = %#v", data["error"])
+			}
+			if data["structuredOutputRequested"] != tt.withSchema {
+				t.Fatalf("structuredOutputRequested = %#v, want %v", data["structuredOutputRequested"], tt.withSchema)
+			}
+			if data["statusCode"] != 400 {
+				t.Fatalf("statusCode = %#v", data["statusCode"])
+			}
+			if data["providerCode"] != "invalid_request_error" {
+				t.Fatalf("providerCode = %#v", data["providerCode"])
+			}
+			detail, _ := data["message"].(string)
+			if !strings.Contains(detail, providerDetail) {
+				t.Fatalf("message = %#v", detail)
+			}
+		})
+	}
+
+	t.Run("Error string preserves legacy format", func(t *testing.T) {
+		err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{
+			Role:   "assistant",
+			Finish: "error",
+			Error:  apiError(),
+		}})
+		if err == nil || !strings.HasPrefix(err.Error(), "opencode assistant error:") {
+			t.Fatalf("Error() = %v", err)
+		}
+	})
+}

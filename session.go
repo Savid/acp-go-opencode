@@ -27,6 +27,7 @@ type session struct {
 	modelID               string
 	mode                  string
 	env                   map[string]string
+	outputSchema          map[string]any
 	rawMessages           rawMessageConfig
 
 	client openCodeClient
@@ -110,6 +111,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		modelID:               modelID,
 		mode:                  firstNonEmpty(meta.Mode, native.Agent, "build"),
 		env:                   cloneStringMap(meta.Env),
+		outputSchema:          cloneAnyMap(meta.OutputSchema),
 		rawMessages:           meta.RawMessages,
 		client:                client,
 		seenParts:             map[string]string{},

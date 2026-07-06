@@ -16,3 +16,12 @@ Flags:
 - `-opencode-log-level`
 - `-opencode-minimum-version`
 - `-opencode-health-timeout` (default `60s`)
+- `-seed-file <relpath>=<hostpath>` (repeatable)
+
+`-seed-file` reads the host file at `<hostpath>` and seeds its contents at the
+relative path `<relpath>` inside each session's isolated OpenCode config root
+(`<XDG_CONFIG_HOME>/opencode/`) before the server starts. Repeat the flag to
+seed several files. The seeded `opencode.json` is deep-merged with the wrapper's
+managed `$schema` and `permission` keys (the wrapper wins for those); every
+other seeded file is written verbatim. Absolute paths, `..` escapes, and empty
+keys are rejected.

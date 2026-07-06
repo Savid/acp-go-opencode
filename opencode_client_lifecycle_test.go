@@ -930,7 +930,7 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	if err := ensureXDGDirs(xdgDirs{Root: "", Data: "x", Config: "x", Cache: "x", State: "x"}); err == nil {
 		t.Fatal("ensureXDGDirs accepted empty root")
 	}
-	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, "")
+	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, "", nil)
 	if err != nil || !strings.Contains(permissionConfig, `"*": "ask"`) {
 		t.Fatalf("default permission config = %q err=%v", permissionConfig, err)
 	}
@@ -942,21 +942,21 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("permission config file mode = %v", info.Mode().Perm())
 	}
-	if _, err := materializeOpenCodePermissionConfig(xdg, "deny"); err == nil {
+	if _, err := materializeOpenCodePermissionConfig(xdg, "deny", nil); err == nil {
 		t.Fatal("unsupported permission config accepted")
 	}
 	configRootFile := filepath.Join(t.TempDir(), "config-file")
 	if err := os.WriteFile(configRootFile, []byte("file"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := materializeOpenCodePermissionConfig(xdgDirs{Config: configRootFile}, "ask"); err == nil {
+	if _, err := materializeOpenCodePermissionConfig(xdgDirs{Config: configRootFile}, "ask", nil); err == nil {
 		t.Fatal("permission config mkdir failure ignored")
 	}
 	configRoot := filepath.Join(t.TempDir(), "config")
 	if err := os.MkdirAll(filepath.Join(configRoot, "opencode", "opencode.json"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := materializeOpenCodePermissionConfig(xdgDirs{Config: configRoot}, "ask"); err == nil {
+	if _, err := materializeOpenCodePermissionConfig(xdgDirs{Config: configRoot}, "ask", nil); err == nil {
 		t.Fatal("permission config write failure ignored")
 	}
 	port, err := allocatePort()
@@ -1001,6 +1001,390 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	}
 }
 
+func TestOpenCodeSeedFilesMergeAndConfinement(t *testing.T) {
+	xdg := testXDGDirs(t)
+	seed := map[string]string{
+		"opencode.json": `{
+  "provider": {
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {"baseURL": "https://proxy.example/v1"}
+    }
+  },
+  "permission": {"*": "allow"}
+}`,
+		"themes/custom.json":        `{"name":"custom"}`,
+		"agents/subdir/reviewer.md": "seeded agent",
+	}
+
+	config, err := materializeOpenCodePermissionConfig(xdg, "ask", seed)
+	if err != nil {
+		t.Fatalf("materializeOpenCodePermissionConfig: %v", err)
+	}
+
+	// The returned OPENCODE_CONFIG_CONTENT must carry the wrapper-managed keys
+	// merged on top of the seeded provider block.
+	var merged map[string]any
+	if err := json.Unmarshal([]byte(config), &merged); err != nil {
+		t.Fatalf("returned config is not JSON: %v", err)
+	}
+	if merged["$schema"] != "https://opencode.ai/config.json" {
+		t.Fatalf("merged config missing wrapper $schema: %#v", merged)
+	}
+	permission, ok := merged["permission"].(map[string]any)
+	if !ok || permission["*"] != "ask" {
+		t.Fatalf("wrapper permission did not win the merge: %#v", merged["permission"])
+	}
+	provider, ok := merged["provider"].(map[string]any)
+	if !ok || provider["litellm"] == nil {
+		t.Fatalf("seeded provider block was dropped: %#v", merged["provider"])
+	}
+
+	// The on-disk opencode.json must equal the returned content exactly.
+	onDisk, err := os.ReadFile(filepath.Join(xdg.Config, "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatalf("read opencode.json: %v", err)
+	}
+	if string(onDisk) != config {
+		t.Fatalf("on-disk opencode.json != OPENCODE_CONFIG_CONTENT\n disk=%q\n env =%q", onDisk, config)
+	}
+
+	// Other seeded files land verbatim under the config root, including nested dirs.
+	for rel, want := range map[string]string{
+		"themes/custom.json":        `{"name":"custom"}`,
+		"agents/subdir/reviewer.md": "seeded agent",
+	} {
+		got, err := os.ReadFile(filepath.Join(xdg.Config, "opencode", filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("read seeded %s: %v", rel, err)
+		}
+		if string(got) != want {
+			t.Fatalf("seeded %s = %q, want %q", rel, got, want)
+		}
+	}
+
+	// Path confinement: absolute, parent escapes, dot, and empty keys fail closed.
+	for _, bad := range []string{"/etc/passwd", "../escape.json", "a/../../escape", ".", ""} {
+		if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", map[string]string{bad: "x"}); err == nil {
+			t.Fatalf("seed path %q was not rejected", bad)
+		}
+	}
+
+	// A malformed seeded opencode.json also fails closed.
+	if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", map[string]string{"opencode.json": "not json"}); err == nil {
+		t.Fatal("malformed seeded opencode.json was accepted")
+	}
+
+	// Filesystem faults while writing a verbatim seed surface as errors.
+	faultXDG := testXDGDirs(t)
+	configDir := filepath.Join(faultXDG.Config, "opencode")
+	if err := os.MkdirAll(filepath.Join(configDir, "isdir"), 0o700); err != nil {
+		t.Fatalf("prepare seed dir clash: %v", err)
+	}
+	if _, err := materializeOpenCodePermissionConfig(faultXDG, "ask", map[string]string{"isdir": "x"}); err == nil {
+		t.Fatal("seed write over existing directory was accepted")
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "afile"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("prepare seed parent clash: %v", err)
+	}
+	if _, err := materializeOpenCodePermissionConfig(faultXDG, "ask", map[string]string{"afile/child.json": "x"}); err == nil {
+		t.Fatal("seed mkdir over existing file was accepted")
+	}
+}
+
+// readOpenCodeSeedManifestForTest returns the sorted managed relpaths recorded
+// in the seed-root ownership manifest.
+func readOpenCodeSeedManifestForTest(t *testing.T, configDir string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(configDir, openCodeSeedManifestName))
+	if err != nil {
+		t.Fatalf("read seed manifest: %v", err)
+	}
+	var manifest []string
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("seed manifest is not a JSON array: %v", err)
+	}
+
+	return manifest
+}
+
+func TestOpenCodeSeedGuardManifestAndBackups(t *testing.T) {
+	t.Run("empty root records every write in the manifest", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		seed := map[string]string{
+			"opencode.json":      `{"provider":{"litellm":{"npm":"@ai-sdk/openai-compatible"}}}`,
+			"themes/custom.json": `{"name":"custom"}`,
+		}
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", seed); err != nil {
+			t.Fatalf("materializeOpenCodePermissionConfig: %v", err)
+		}
+
+		want := []string{"opencode.json", "themes/custom.json"}
+		if got := readOpenCodeSeedManifestForTest(t, configDir); !slicesEqualForTest(got, want) {
+			t.Fatalf("manifest = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("re-seeding identical content creates no backup", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		seed := map[string]string{
+			"opencode.json":      `{"provider":{"litellm":{"npm":"@ai-sdk/openai-compatible"}}}`,
+			"themes/custom.json": `{"name":"custom"}`,
+		}
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", seed); err != nil {
+			t.Fatalf("first seed: %v", err)
+		}
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", seed); err != nil {
+			t.Fatalf("second seed: %v", err)
+		}
+
+		for _, rel := range []string{"opencode.json", "themes/custom.json"} {
+			backup := filepath.Join(configDir, filepath.FromSlash(rel)+openCodeSeedBackupSuffix)
+			if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("idempotent re-seed created backup for %s (err=%v)", rel, err)
+			}
+		}
+	})
+
+	t.Run("changed managed content backs up prior bytes", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
+			"themes/custom.json": `{"name":"first"}`,
+		}); err != nil {
+			t.Fatalf("first seed: %v", err)
+		}
+		firstOnDisk, err := os.ReadFile(filepath.Join(configDir, "themes", "custom.json"))
+		if err != nil {
+			t.Fatalf("read first seed: %v", err)
+		}
+
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
+			"themes/custom.json": `{"name":"second"}`,
+		}); err != nil {
+			t.Fatalf("second seed: %v", err)
+		}
+
+		backup, err := os.ReadFile(filepath.Join(configDir, "themes", "custom.json"+openCodeSeedBackupSuffix))
+		if err != nil {
+			t.Fatalf("read backup: %v", err)
+		}
+		if string(backup) != string(firstOnDisk) {
+			t.Fatalf("backup = %q, want prior bytes %q", backup, firstOnDisk)
+		}
+		updated, err := os.ReadFile(filepath.Join(configDir, "themes", "custom.json"))
+		if err != nil {
+			t.Fatalf("read updated seed: %v", err)
+		}
+		if string(updated) != `{"name":"second"}` {
+			t.Fatalf("updated seed = %q, want second content", updated)
+		}
+	})
+
+	t.Run("merged opencode.json is guarded and backed up on change", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		first, err := materializeOpenCodePermissionConfig(xdg, "ask", nil)
+		if err != nil {
+			t.Fatalf("first seed: %v", err)
+		}
+		// A different permission changes the merged bytes, so the guard must back
+		// up the prior merged opencode.json.
+		if _, err := materializeOpenCodePermissionConfig(xdg, "allow", nil); err != nil {
+			t.Fatalf("second seed: %v", err)
+		}
+		backup, err := os.ReadFile(filepath.Join(configDir, openCodeConfigFileName+openCodeSeedBackupSuffix))
+		if err != nil {
+			t.Fatalf("read merged backup: %v", err)
+		}
+		if string(backup) != first {
+			t.Fatalf("merged backup = %q, want prior merged bytes %q", backup, first)
+		}
+	})
+
+	t.Run("pre-existing unmanaged file fails closed", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		if err := os.MkdirAll(filepath.Join(configDir, "themes"), 0o700); err != nil {
+			t.Fatalf("prepare operator dir: %v", err)
+		}
+		operator := filepath.Join(configDir, "themes", "custom.json")
+		operatorBytes := []byte(`{"name":"operator-authored"}`)
+		if err := os.WriteFile(operator, operatorBytes, 0o600); err != nil {
+			t.Fatalf("write operator file: %v", err)
+		}
+
+		_, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
+			"themes/custom.json": `{"name":"wagie"}`,
+		})
+		if err == nil {
+			t.Fatal("seed over unmanaged operator file was accepted")
+		}
+		if !strings.Contains(err.Error(), "themes/custom.json") {
+			t.Fatalf("error does not name offending relpath: %v", err)
+		}
+
+		// Nothing was written or changed: the operator file is intact, no merged
+		// opencode.json was authored, and no manifest was created.
+		if got, err := os.ReadFile(operator); err != nil || string(got) != string(operatorBytes) {
+			t.Fatalf("operator file changed: got=%q err=%v", got, err)
+		}
+		if _, err := os.Stat(filepath.Join(configDir, openCodeConfigFileName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("merged opencode.json was written on fail-closed (err=%v)", err)
+		}
+		if _, err := os.Stat(filepath.Join(configDir, openCodeSeedManifestName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("manifest was created on fail-closed (err=%v)", err)
+		}
+	})
+
+	t.Run("manifest survives across passes so managed files reseed", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
+			"themes/custom.json": `{"name":"first"}`,
+		}); err != nil {
+			t.Fatalf("first pass: %v", err)
+		}
+		// Second pass rewrites the same managed relpath: because the manifest
+		// persisted, it is treated as owned rather than fail-closed.
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
+			"themes/custom.json": `{"name":"second"}`,
+		}); err != nil {
+			t.Fatalf("second pass rejected an owned file: %v", err)
+		}
+		manifest := readOpenCodeSeedManifestForTest(t, configDir)
+		if !slicesContainsForTest(manifest, "themes/custom.json") {
+			t.Fatalf("manifest lost managed relpath: %v", manifest)
+		}
+	})
+
+	t.Run("corrupt manifest fails closed", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		if err := os.MkdirAll(configDir, 0o700); err != nil {
+			t.Fatalf("prepare config dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(configDir, openCodeSeedManifestName), []byte("{not json"), 0o600); err != nil {
+			t.Fatalf("write corrupt manifest: %v", err)
+		}
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", nil); err == nil {
+			t.Fatal("corrupt manifest was accepted")
+		}
+	})
+}
+
+func slicesEqualForTest(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func slicesContainsForTest(haystack []string, needle string) bool {
+	for _, item := range haystack {
+		if item == needle {
+			return true
+		}
+	}
+
+	return false
+}
+
+func TestOpenCodeSeedGuardWriteFaults(t *testing.T) {
+	t.Run("backup write failure surfaces", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
+			"themes/custom.json": `{"name":"first"}`,
+		}); err != nil {
+			t.Fatalf("first seed: %v", err)
+		}
+		// Occupy the backup path with a directory so the .wagie.bak write fails
+		// when the managed file's content changes.
+		backup := filepath.Join(configDir, "themes", "custom.json"+openCodeSeedBackupSuffix)
+		if err := os.MkdirAll(backup, 0o700); err != nil {
+			t.Fatalf("prepare backup clash: %v", err)
+		}
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
+			"themes/custom.json": `{"name":"second"}`,
+		}); err == nil {
+			t.Fatal("backup write failure was ignored")
+		}
+	})
+
+	t.Run("mkdir failure surfaces", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		if err := os.MkdirAll(configDir, 0o700); err != nil {
+			t.Fatalf("prepare config dir: %v", err)
+		}
+		// A read-only intermediate dir makes MkdirAll for a nested seed target fail.
+		roDir := filepath.Join(configDir, "ro")
+		if err := os.Mkdir(roDir, 0o500); err != nil {
+			t.Fatalf("prepare read-only dir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
+			"ro/sub/child.json": "x",
+		}); err == nil {
+			t.Fatal("mkdir failure was ignored")
+		}
+	})
+
+	t.Run("target write failure surfaces", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		if err := os.MkdirAll(configDir, 0o700); err != nil {
+			t.Fatalf("prepare config dir: %v", err)
+		}
+		// A read-only config root makes the opencode.json write fail.
+		if err := os.Chmod(configDir, 0o500); err != nil {
+			t.Fatalf("chmod config dir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(configDir, 0o700) })
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", nil); err == nil {
+			t.Fatal("target write failure was ignored")
+		}
+	})
+
+	t.Run("manifest marshal failure surfaces", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		openCodeMarshalIndent = func(value any, prefix, indent string) ([]byte, error) {
+			if _, ok := value.([]string); ok {
+				return nil, errors.New("manifest marshal failed")
+			}
+
+			return json.MarshalIndent(value, prefix, indent)
+		}
+		if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", map[string]string{
+			"themes/custom.json": `{"name":"x"}`,
+		}); err == nil {
+			t.Fatal("manifest marshal failure was ignored")
+		}
+	})
+
+	t.Run("manifest read failure surfaces", func(t *testing.T) {
+		xdg := testXDGDirs(t)
+		configDir := filepath.Join(xdg.Config, "opencode")
+		// A directory at the manifest path makes ReadFile fail with a
+		// non-NotExist error, which must surface rather than be treated as absent.
+		if err := os.MkdirAll(filepath.Join(configDir, openCodeSeedManifestName), 0o700); err != nil {
+			t.Fatalf("prepare manifest clash: %v", err)
+		}
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", nil); err == nil {
+			t.Fatal("manifest read failure was ignored")
+		}
+	})
+}
+
 func TestPortPasswordLeaseAndReaperFaultInjection(t *testing.T) {
 	restoreOpenCodeClientSeams(t)
 
@@ -1028,7 +1412,7 @@ func TestPortPasswordLeaseAndReaperFaultInjection(t *testing.T) {
 	if err := writeLease(t.TempDir(), serverLease{}); err == nil {
 		t.Fatal("writeLease ignored marshal error")
 	}
-	if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask"); err == nil {
+	if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", nil); err == nil {
 		t.Fatal("permission config ignored marshal error")
 	}
 

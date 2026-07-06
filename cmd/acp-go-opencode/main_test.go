@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -45,6 +46,10 @@ func TestRunServeSuccessAndError(t *testing.T) {
 		}
 		return nil
 	}
+	seedHost := filepath.Join(t.TempDir(), "opencode.json")
+	if err := os.WriteFile(seedHost, []byte(`{"provider":{}}`), 0o600); err != nil {
+		t.Fatalf("write seed host: %v", err)
+	}
 	if code := run(context.Background(), []string{
 		"-path", "opencode",
 		"-home", "/tmp/home",
@@ -55,6 +60,7 @@ func TestRunServeSuccessAndError(t *testing.T) {
 		"-opencode-log-level", "INFO",
 		"-opencode-minimum-version", "1.2.3",
 		"-opencode-health-timeout", "1s",
+		"-seed-file", "opencode.json=" + seedHost,
 	}, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
 		t.Fatalf("serve success code = %d", code)
 	}
@@ -95,6 +101,33 @@ func TestRunServeSuccessAndError(t *testing.T) {
 	}
 	if code := run(context.Background(), nil, strings.NewReader(""), io.Discard, io.Discard); code != 143 {
 		t.Fatalf("signalled serve code = %d", code)
+	}
+}
+
+func TestSeedFileFlag(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "opencode.json")
+	if err := os.WriteFile(host, []byte(`{"provider":{}}`), 0o600); err != nil {
+		t.Fatalf("write host seed: %v", err)
+	}
+
+	var flag seedFileFlag
+	if err := flag.Set("opencode.json=" + host); err != nil {
+		t.Fatalf("Set valid seed-file: %v", err)
+	}
+	if flag.files["opencode.json"] != `{"provider":{}}` {
+		t.Fatalf("seed contents = %#v", flag.files)
+	}
+	if flag.String() != "" {
+		t.Fatalf("String() = %q", flag.String())
+	}
+
+	for _, bad := range []string{"noeq", "=host", "rel=", ""} {
+		if err := (&seedFileFlag{}).Set(bad); err == nil {
+			t.Fatalf("Set(%q) accepted malformed value", bad)
+		}
+	}
+	if err := (&seedFileFlag{}).Set("rel=/no/such/seed/file"); err == nil {
+		t.Fatal("Set accepted unreadable host path")
 	}
 }
 

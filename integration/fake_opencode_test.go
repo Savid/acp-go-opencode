@@ -389,6 +389,15 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 				"properties": map[string]any{"answers": map[string]any{"type": "array"}},
 				"required":   []any{"answers"},
 			},
+			"OutputFormatJsonSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"type":       map[string]any{"type": "string", "enum": []any{"json_schema"}},
+					"schema":     map[string]any{"$ref": "#/components/schemas/JSONSchema"},
+					"retryCount": map[string]any{"type": "integer"},
+				},
+				"required": []any{"type", "schema"},
+			},
 		}},
 	}
 }

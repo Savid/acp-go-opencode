@@ -161,6 +161,11 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 			"format": SessionStoreFormat,
 			"key":    []string{"sessionId", "subpath"},
 		},
+		structuredOutputMetaKey: map[string]any{
+			"config": outputSchemaOptionPath,
+			"result": structuredOutputPath,
+			"schema": openCodeOutputFormatJSONSchema,
+		},
 	}
 
 	return acp.InitializeResponse{

@@ -40,6 +40,7 @@ type Options struct {
 	SessionStore            SessionStore
 	SessionStoreLoadTimeout time.Duration
 	ConcurrencyLimits       ConcurrencyLimits
+	SeedFiles               map[string]string
 
 	Pure               bool
 	QuestionTool       bool
@@ -150,6 +151,21 @@ func WithSessionStoreLoadTimeout(timeout time.Duration) Option {
 func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
 	return func(options *Options) {
 		options.ConcurrencyLimits = limits
+	}
+}
+
+// WithSeedFiles writes files into each session's isolated OpenCode config root
+// before launching opencode serve, so the native server reads them as its own
+// config. Keys are paths relative to the per-session
+// <XDG_CONFIG_HOME>/opencode/ directory mapped to file contents; absolute
+// paths, parent-directory escapes, and empty keys are rejected with the uniform
+// unsupported error. The seeded opencode.json is deep-merged with the wrapper's
+// managed $schema and permission keys (the wrapper wins for those keys, the
+// seed supplies the rest, e.g. a custom provider block); every other seeded
+// file is written verbatim. The map is cloned like WithEnv.
+func WithSeedFiles(files map[string]string) Option {
+	return func(options *Options) {
+		options.SeedFiles = cloneStringMap(files)
 	}
 }
 

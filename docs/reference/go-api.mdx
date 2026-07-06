@@ -8,8 +8,17 @@ err := opencodeacp.Serve(ctx, input, output)
 ```
 
 Common options include `WithExecutablePath`, `WithHome`, `WithDefaultModel`,
-`WithEnv`, OpenTelemetry provider options, `WithSessionStore`, and
-`WithConcurrencyLimits`.
+`WithEnv`, OpenTelemetry provider options, `WithSessionStore`,
+`WithConcurrencyLimits`, and `WithSeedFiles`.
+
+`WithSeedFiles` maps relative paths to file contents written into each session's
+isolated OpenCode config root (`<XDG_CONFIG_HOME>/opencode/`) before the server
+starts. The seeded `opencode.json` is deep-merged with the wrapper's managed
+`$schema` and `permission` keys (the wrapper wins for those keys, the seed
+supplies the rest, e.g. a custom `provider` block); every other seeded file is
+written verbatim. Absolute paths, `..` escapes, and empty keys are rejected with
+the uniform unsupported-field error. See Models And Config for a seeded
+`provider` example.
 
 OpenCode options include `WithOpenCodePure`, `WithOpenCodeQuestionTool`,
 `WithOpenCodeLogLevel`, `WithOpenCodeMinimumVersion`, and

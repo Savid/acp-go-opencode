@@ -520,6 +520,33 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 				delete(rejectPath, "post")
 			},
 		},
+		{
+			name: "structured output schema missing",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				delete(schemas, "OutputFormatJsonSchema")
+			},
+		},
+		{
+			name: "structured output schema wrong type enum",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				format := schemas["OutputFormatJsonSchema"].(map[string]any)
+				typeSchema := format["properties"].(map[string]any)["type"].(map[string]any)
+				typeSchema["enum"] = []any{"text"}
+			},
+		},
+		{
+			name: "structured output schema missing schema property",
+			mutate: func(doc map[string]any) {
+				components := doc["components"].(map[string]any)
+				schemas := components["schemas"].(map[string]any)
+				format := schemas["OutputFormatJsonSchema"].(map[string]any)
+				delete(format["properties"].(map[string]any), "schema")
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := cloneOpenCodeDoc(t, fullOpenCodeDoc())
@@ -727,6 +754,15 @@ func fullOpenCodeDoc() map[string]any {
 					"answers": map[string]any{"type": "array"},
 				},
 				"required": []any{"answers"},
+			},
+			"OutputFormatJsonSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"type":       map[string]any{"type": "string", "enum": []any{"json_schema"}},
+					"schema":     map[string]any{"$ref": "#/components/schemas/JSONSchema"},
+					"retryCount": map[string]any{"type": "integer"},
+				},
+				"required": []any{"type", "schema"},
 			},
 		}},
 	}
