@@ -65,7 +65,10 @@ func TestOpenCodeACPAgentFakeExecutableLeaseReaper(t *testing.T) {
 	waitOrphan := make(chan error, 1)
 	go func() { waitOrphan <- orphan.Wait() }()
 	t.Cleanup(func() {
-		if orphan.ProcessState == nil {
+		select {
+		case <-waitOrphan:
+			// orphan already exited; Wait has returned
+		default:
 			_ = orphan.Process.Kill()
 			<-waitOrphan
 		}
