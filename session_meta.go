@@ -10,7 +10,7 @@ import (
 type sessionMeta struct {
 	Model        string
 	Env          map[string]string
-	OutputSchema any
+	OutputSchema map[string]any
 	Mode         string
 	Permission   string
 	RawMessages  rawMessageConfig
@@ -26,16 +26,15 @@ func sessionMetaFromLifecycle(meta map[string]any) (sessionMeta, error) {
 		return sessionMeta{}, err
 	}
 
-	if options.OutputSchema != nil {
-		return sessionMeta{}, unsupportedField("_meta.opencode.options.outputSchema")
-	}
+	outputSchema, _ := options.OutputSchema.(map[string]any)
 
 	return sessionMeta{
-		Model:       options.Model,
-		Env:         options.Env,
-		Mode:        options.Mode,
-		Permission:  normalizeOpenCodePermission(options.Permission),
-		RawMessages: rawMessageConfigFromMeta(meta),
+		Model:        options.Model,
+		Env:          options.Env,
+		OutputSchema: outputSchema,
+		Mode:         options.Mode,
+		Permission:   normalizeOpenCodePermission(options.Permission),
+		RawMessages:  rawMessageConfigFromMeta(meta),
 	}, nil
 }
 

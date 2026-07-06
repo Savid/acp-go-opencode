@@ -59,6 +59,34 @@ const (
 	priorityLow           = "low"
 )
 
+// assistantErrorData builds the structured ACP error Data payload for a native
+// OpenCode assistant/provider failure. structuredOutputRequested reports whether
+// this turn sent a native output-format schema.
+func assistantErrorData(err *opencode.AssistantError, structuredOutputRequested bool) map[string]any {
+	data := map[string]any{
+		jsonFieldError:              "opencode_assistant_error",
+		jsonFieldMessage:            err.Detail(),
+		"structuredOutputRequested": structuredOutputRequested,
+	}
+	mergeAssistantErrorFields(data, err, structuredOutputRequested)
+
+	return data
+}
+
+// mergeAssistantErrorFields adds the optional machine-readable assistant-error
+// fields (statusCode, providerCode) and structuredOutputRequested onto an
+// existing ACP error Data map. Optional fields are included only when present.
+func mergeAssistantErrorFields(data map[string]any, err *opencode.AssistantError, structuredOutputRequested bool) {
+	data["structuredOutputRequested"] = structuredOutputRequested
+	if err.StatusCode() > 0 {
+		data["statusCode"] = err.StatusCode()
+	}
+
+	if err.ProviderCode() != "" {
+		data["providerCode"] = err.ProviderCode()
+	}
+}
+
 func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (resp acp.PromptResponse, err error) {
 	session, err := a.session(params.SessionId)
 	if err != nil {
@@ -231,6 +259,13 @@ func (s *session) messageNativeRun(ctx context.Context, params acp.PromptRequest
 		Parts: parts,
 		Agent: s.currentMode(),
 	}
+	if len(s.outputSchema) > 0 {
+		req.Format = &opencode.OutputFormat{
+			Type:   opencode.OutputFormatJSONSchema,
+			Schema: cloneAnyMap(s.outputSchema),
+		}
+	}
+
 	if hasModel {
 		req.Model = &modelSelector
 	}
@@ -340,6 +375,9 @@ func (s *session) finishPromptTurn(
 			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
 		}
 
+		var assistantErr *opencode.AssistantError
+
+		isAssistantErr := errors.As(result.err, &assistantErr)
 		if matchedCommand && opencode.IsBadRequest(result.err) {
 			refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
 			if err := s.refreshCommands(refreshCtx); err != nil && s.agent != nil && s.agent.log != nil {
@@ -348,11 +386,22 @@ func (s *session) finishPromptTurn(
 
 			cancel()
 
-			return acp.PromptResponse{}, acp.NewInvalidParams(map[string]any{
+			data := map[string]any{
 				jsonFieldError:   "opencode_command_bad_request",
 				jsonFieldMessage: result.err.Error(),
 				jsonFieldCommand: command.Name,
-			})
+			}
+			if isAssistantErr {
+				mergeAssistantErrorFields(data, assistantErr, false)
+			}
+
+			return acp.PromptResponse{}, acp.NewInvalidParams(data)
+		}
+
+		if isAssistantErr {
+			structuredOutputRequested := !matchedCommand && len(s.outputSchema) > 0
+
+			return acp.PromptResponse{}, acp.NewInternalError(assistantErrorData(assistantErr, structuredOutputRequested))
 		}
 
 		return acp.PromptResponse{}, result.err
@@ -376,7 +425,25 @@ func (s *session) finishPromptTurn(
 		return acp.PromptResponse{}, err
 	}
 
-	return acp.PromptResponse{StopReason: stopReason, Usage: usage, UserMessageId: params.MessageId}, nil
+	return acp.PromptResponse{
+		StopReason:    stopReason,
+		Usage:         usage,
+		UserMessageId: params.MessageId,
+		Meta:          s.structuredOutputMeta(final),
+	}, nil
+}
+
+func (s *session) structuredOutputMeta(final opencode.NativeMessage) map[string]any {
+	if len(s.outputSchema) == 0 || len(final.Info.Structured) == 0 {
+		return nil
+	}
+
+	var value any
+	if err := json.Unmarshal(final.Info.Structured, &value); err != nil || value == nil {
+		return nil
+	}
+
+	return map[string]any{opencodeMetaKey: map[string]any{structuredOutputMetaKey: value}}
 }
 
 type slashCommandPrompt struct {

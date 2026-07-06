@@ -17,6 +17,8 @@ const (
 	rawEventMaxBytes        = 64 * 1024
 	opencodeNativeIDMetaKey = "nativeSessionId"
 	structuredOutputMetaKey = "structuredOutput"
+	outputSchemaOptionPath  = "_meta.opencode.options.outputSchema"
+	structuredOutputPath    = "_meta.opencode.structuredOutput"
 	configModel             = "model"
 	configMode              = "mode"
 	configTypeSelect        = "select"

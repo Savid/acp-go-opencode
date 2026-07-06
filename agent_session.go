@@ -527,6 +527,7 @@ func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd str
 		Logger:         a.log,
 		ExistingXDG:    existing,
 		Permission:     meta.Permission,
+		SeedFiles:      a.options.SeedFiles,
 	})
 }
 

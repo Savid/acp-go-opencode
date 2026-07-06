@@ -7,6 +7,60 @@ The model selector is an ACP config option with id `model` and category
 Mode selection uses config id `mode` and category `mode` when OpenCode agents
 are enumerable.
 
-Structured output is not advertised for OpenCode. Supplying
-`_meta.opencode.options.outputSchema` returns the uniform unsupported-field
-error.
+Structured output is native. Supplying a JSON Schema object at
+`_meta.opencode.options.outputSchema` (or via `WithOpenCodeOutputSchema` /
+`WithSessionOutputSchema`) makes every non-command prompt request the native
+`format: {"type": "json_schema", "schema": ...}` output mode on
+`POST /session/{id}/message`. The validated result is returned on the prompt
+response at `_meta.opencode.structuredOutput`. If OpenCode fails to produce
+valid structured output after its native retries, the turn fails with the
+assistant error surfaced verbatim (`StructuredOutputError`). Slash-command
+turns never request structured output. Startup fails closed unless the
+server's `/doc` advertises the `OutputFormatJsonSchema` component.
+
+When the selected model rejects structured output (the provider returns an
+assistant/provider error, common with free Zen models), the turn fails with a
+structured ACP internal error whose `data` carries
+`error: "opencode_assistant_error"`, the native `message`, and—when the
+provider reports them—`statusCode` (int) and `providerCode` (string). The
+`data` also carries `structuredOutputRequested: true` when this turn sent a
+native schema, letting a host detect that the structured-output turn was the
+trigger; slash-command turns always report `false`.
+
+## Seeding a custom provider
+
+The wrapper authors each session's `opencode.json` (it owns `$schema` and
+`permission`). To add native config the wrapper does not manage — such as a
+custom `provider` — seed an `opencode.json` with `WithSeedFiles` (Go) or
+`-seed-file opencode.json=<hostpath>` (CLI). For the `opencode.json` filename
+the seed is deep-merged: your keys are kept and the wrapper's `$schema` and
+`permission` keys are merged on top, so the injected `permission` block still
+wins. Keep secrets in the environment (`WithEnv`) and reference them from the
+seed with OpenCode's `{env:...}` indirection.
+
+The example below registers an OpenAI-style provider served by a self-hosted
+LiteLLM gateway. `options.baseURL` ends in `/v1`, and `apiKey` reads
+`LITELLM_API_KEY` from the environment rather than embedding a secret:
+
+```json
+{
+  "provider": {
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM",
+      "options": {
+        "baseURL": "https://litellm.internal.example/v1",
+        "apiKey": "{env:LITELLM_API_KEY}"
+      },
+      "models": {
+        "gpt-4o": {}
+      }
+    }
+  }
+}
+```
+
+The wrapper still injects its `permission` block via the merge, so seeded models
+respect the session's permission policy. Models seeded this way appear as
+`litellm/<model>` in the `model` config option, populated from authenticated
+`GET /config/providers` like every other provider.

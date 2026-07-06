@@ -11,6 +11,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/observer"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const (
@@ -180,6 +181,11 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		"sessionStore": map[string]any{
 			"format": SessionStoreFormat,
 			"key":    []string{jsonFieldSessionID, "subpath"},
+		},
+		structuredOutputMetaKey: map[string]any{
+			"config": outputSchemaOptionPath,
+			"result": structuredOutputPath,
+			"schema": opencode.OutputFormatJSONSchema,
 		},
 	}
 

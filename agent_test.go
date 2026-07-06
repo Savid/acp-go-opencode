@@ -36,8 +36,11 @@ func TestInitializeCapabilitiesHardCutover(t *testing.T) {
 		t.Fatal("embedded context capability missing")
 	}
 	meta, _ := resp.AgentCapabilities.Meta[opencodeMetaKey].(map[string]any)
-	if _, ok := meta["structuredOutput"]; ok {
-		t.Fatal("OpenCode structured output advertised")
+	structured, _ := meta["structuredOutput"].(map[string]any)
+	if structured["config"] != "_meta.opencode.options.outputSchema" ||
+		structured["result"] != "_meta.opencode.structuredOutput" ||
+		structured["schema"] != "json_schema" {
+		t.Fatalf("structuredOutput meta = %#v", structured)
 	}
 	if store, _ := meta["sessionStore"].(map[string]any); store["format"] != SessionStoreFormat {
 		t.Fatalf("sessionStore meta = %#v", store)
@@ -81,17 +84,27 @@ func TestLifecycleMetaStrictAllowlist(t *testing.T) {
 	}
 }
 
-func TestOutputSchemaUnsupported(t *testing.T) {
-	_, err := sessionMetaFromLifecycle(OpenCodeOptions{OutputSchema: map[string]any{"type": "object"}}.Meta())
+func TestOutputSchemaAccepted(t *testing.T) {
+	schema := map[string]any{"type": "object"}
+	meta, err := sessionMetaFromLifecycle(OpenCodeOptions{OutputSchema: schema}.Meta())
+	if err != nil {
+		t.Fatalf("outputSchema rejected: %v", err)
+	}
+	if meta.OutputSchema["type"] != "object" {
+		t.Fatalf("output schema meta = %#v", meta.OutputSchema)
+	}
+	schema["type"] = "mutated"
+	if meta.OutputSchema["type"] != "object" {
+		t.Fatalf("output schema was not cloned: %#v", meta.OutputSchema)
+	}
+}
+
+func TestOutputSchemaInvalidRejected(t *testing.T) {
+	_, err := sessionMetaFromLifecycle(map[string]any{
+		opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: "not-an-object"}},
+	})
 	if err == nil {
-		t.Fatal("outputSchema unexpectedly accepted")
-	}
-	var reqErr *acp.RequestError
-	if !errors.As(err, &reqErr) {
-		t.Fatalf("error type = %T", err)
-	}
-	if reqErr.Data == nil {
-		t.Fatalf("missing error data: %#v", reqErr)
+		t.Fatal("invalid outputSchema unexpectedly accepted")
 	}
 }
 

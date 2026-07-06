@@ -133,6 +133,7 @@ type StartOptions struct {
 	ExpectedNativeID  string
 	PermissionSurface bool
 	Permission        string
+	SeedFiles         map[string]string
 }
 
 type ACPSessionID string
@@ -188,18 +189,19 @@ type NativeMessage struct {
 }
 
 type NativeMessageInfo struct {
-	ID         string       `json:"id"`
-	SessionID  string       `json:"sessionID"`
-	Role       string       `json:"role"`
-	ParentID   string       `json:"parentID"`
-	ModelID    string       `json:"modelID"`
-	ProviderID string       `json:"providerID"`
-	Mode       string       `json:"mode"`
-	Agent      string       `json:"agent"`
-	Finish     string       `json:"finish"`
-	Cost       float64      `json:"cost"`
-	Tokens     NativeTokens `json:"tokens"`
-	Error      *NativeError `json:"error,omitempty"`
+	ID         string          `json:"id"`
+	SessionID  string          `json:"sessionID"`
+	Role       string          `json:"role"`
+	ParentID   string          `json:"parentID"`
+	ModelID    string          `json:"modelID"`
+	ProviderID string          `json:"providerID"`
+	Mode       string          `json:"mode"`
+	Agent      string          `json:"agent"`
+	Finish     string          `json:"finish"`
+	Cost       float64         `json:"cost"`
+	Tokens     NativeTokens    `json:"tokens"`
+	Structured json.RawMessage `json:"structured,omitempty"`
+	Error      *NativeError    `json:"error,omitempty"`
 	Time       struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
@@ -210,6 +212,75 @@ type NativeError struct {
 	Type    string `json:"type"`
 	Name    string `json:"name"`
 	Message string `json:"message"`
+	Data    struct {
+		Message      string `json:"message"`
+		StatusCode   int    `json:"statusCode"`
+		ResponseBody string `json:"responseBody"`
+	} `json:"data"`
+}
+
+// providerCode parses the native error's provider response body and returns the
+// provider error code, falling back to the provider error type. It is lenient:
+// a missing or malformed responseBody yields an empty string rather than an
+// error, so other error-union shapes never break decoding.
+func (e *NativeError) providerCode() string {
+	if e == nil || e.Data.ResponseBody == "" {
+		return ""
+	}
+
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(e.Data.ResponseBody), &body); err != nil {
+		return ""
+	}
+
+	return firstNonEmpty(body.Error.Code, body.Error.Type)
+}
+
+// AssistantError is the typed error returned when an OpenCode
+// assistant/provider turn fails. It carries the machine-readable native fields
+// so the prompt site can surface a structured ACP error.
+type AssistantError struct {
+	detail       string
+	statusCode   int
+	providerCode string
+	name         string
+}
+
+func (e *AssistantError) Error() string {
+	if e.detail == "" {
+		return "opencode assistant error"
+	}
+
+	return fmt.Sprintf("opencode assistant error: %s", e.detail)
+}
+
+func (e *AssistantError) Detail() string {
+	if e == nil {
+		return ""
+	}
+
+	return e.detail
+}
+
+func (e *AssistantError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+
+	return e.statusCode
+}
+
+func (e *AssistantError) ProviderCode() string {
+	if e == nil {
+		return ""
+	}
+
+	return e.providerCode
 }
 
 type NativePart struct {
@@ -400,6 +471,14 @@ type MessageRequest struct {
 	Agent     string           `json:"agent,omitempty"`
 	NoReply   bool             `json:"noReply,omitempty"`
 	Parts     []map[string]any `json:"parts"`
+	Format    *OutputFormat    `json:"format,omitempty"`
+}
+
+const OutputFormatJSONSchema = "json_schema"
+
+type OutputFormat struct {
+	Type   string         `json:"type"`
+	Schema map[string]any `json:"schema"`
 }
 
 type CommandRequest struct {
@@ -511,7 +590,7 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		return nil, err
 	}
 
-	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, options.Permission)
+	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, options.Permission, options.SeedFiles)
 	if err != nil {
 		return nil, err
 	}
@@ -812,7 +891,7 @@ func (s *openCodeServer) RunCommand(ctx context.Context, id string, req CommandR
 		return NativeMessage{}, err
 	}
 
-	if err := assistantMessageError(out); err != nil {
+	if err := AssistantMessageError(out); err != nil {
 		return NativeMessage{}, err
 	}
 
@@ -825,28 +904,36 @@ func (s *openCodeServer) SendMessage(ctx context.Context, id string, req Message
 		return NativeMessage{}, err
 	}
 
-	if err := assistantMessageError(out); err != nil {
+	if err := AssistantMessageError(out); err != nil {
 		return NativeMessage{}, err
 	}
 
 	return out, nil
 }
 
-func assistantMessageError(message NativeMessage) error {
+func AssistantMessageError(message NativeMessage) error {
 	if !strings.EqualFold(message.Info.Finish, "error") && message.Info.Error == nil {
 		return nil
 	}
 
 	if message.Info.Error == nil {
-		return fmt.Errorf("opencode assistant error")
+		return &AssistantError{}
 	}
 
-	detail := firstNonEmpty(message.Info.Error.Message, message.Info.Error.Type, message.Info.Error.Name)
-	if detail == "" {
-		return fmt.Errorf("opencode assistant error")
-	}
+	nerr := message.Info.Error
+	detail := firstNonEmpty(
+		nerr.Message,
+		nerr.Data.Message,
+		nerr.Type,
+		nerr.Name,
+	)
 
-	return fmt.Errorf("opencode assistant error: %s", detail)
+	return &AssistantError{
+		detail:       detail,
+		statusCode:   nerr.Data.StatusCode,
+		providerCode: nerr.providerCode(),
+		name:         nerr.Name,
+	}
 }
 
 func (s *openCodeServer) Messages(ctx context.Context, id string) ([]NativeMessage, error) {
@@ -1361,6 +1448,10 @@ func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 		return openCodeDocCapabilities{}, err
 	}
 
+	if err := validateOpenCodeStructuredOutputSchema(doc); err != nil {
+		return openCodeDocCapabilities{}, err
+	}
+
 	return openCodeDocCapabilities{
 		sessionPermissionList: sessionPermissionList,
 		sessionQuestionList:   sessionQuestionList,
@@ -1400,6 +1491,27 @@ func validateOpenCodeEventSchemas(doc map[string]any) error {
 		if err := validateOpenCodeEventSchema(doc, contract); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+func validateOpenCodeStructuredOutputSchema(doc map[string]any) error {
+	schema, ok := openAPIComponentSchema(doc, "#/components/schemas/OutputFormatJsonSchema")
+	if !ok {
+		return fmt.Errorf("opencode /doc missing structured output schema OutputFormatJsonSchema")
+	}
+
+	typeSchema, ok := openAPIObjectProperty(schema, "type")
+	if !ok || !openAPIStringEnumContains(typeSchema, OutputFormatJSONSchema) {
+		return fmt.Errorf(
+			"opencode /doc structured output schema missing type %q",
+			OutputFormatJSONSchema,
+		)
+	}
+
+	if _, ok := openAPIObjectProperty(schema, "schema"); !ok {
+		return fmt.Errorf("opencode /doc structured output schema missing schema property")
 	}
 
 	return nil
@@ -1763,17 +1875,43 @@ func ensureXDGDirs(dirs XDGDirs) error {
 	return nil
 }
 
-func materializeOpenCodePermissionConfig(dirs XDGDirs, permission string) (string, error) {
+const (
+	openCodeConfigFileName    = "opencode.json"
+	openCodeSeedManifestName  = ".wagie-seed-manifest.json"
+	openCodeSeedBackupSuffix  = ".wagie.bak"
+	openCodeSeedManifestField = "seedFiles"
+)
+
+// materializeOpenCodePermissionConfig writes the per-session opencode.json into
+// the isolated OpenCode config root and returns its contents so the caller can
+// export them via OPENCODE_CONFIG_CONTENT. The wrapper's managed keys ($schema
+// and permission) are deep-merged on top of any seeded opencode.json — the
+// wrapper wins for those keys, the seed supplies the rest (e.g. a provider
+// block). Every other seeded file is written verbatim under the same config
+// root. All writes — including the merged opencode.json — are routed through the
+// provenance guard so a seed pass can never clobber an operator-authored file.
+func materializeOpenCodePermissionConfig(dirs XDGDirs, permission string, seedFiles map[string]string) (string, error) {
 	if err := validateOpenCodePermission(permission); err != nil {
 		return "", err
 	}
 
-	config := map[string]any{
+	configDir := filepath.Join(dirs.Config, opencodeExecutableName)
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return "", err
+	}
+
+	writes, seededConfig, err := planOpenCodeSeedWrites(seedFiles)
+	if err != nil {
+		return "", err
+	}
+
+	managed := map[string]any{
 		"$schema": "https://opencode.ai/config.json",
-		fieldPermission: map[string]string{
+		fieldPermission: map[string]any{
 			"*": normalizeOpenCodePermission(permission),
 		},
 	}
+	config := deepMergeJSON(seededConfig, managed)
 
 	data, err := openCodeMarshalIndent(config, "", "  ")
 	if err != nil {
@@ -1782,16 +1920,222 @@ func materializeOpenCodePermissionConfig(dirs XDGDirs, permission string) (strin
 
 	data = append(data, '\n')
 
-	configDir := filepath.Join(dirs.Config, opencodeExecutableName)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		return "", err
-	}
+	// The merged opencode.json is itself a wagie-managed file: route the final
+	// bytes through the guard so the manifest owns it and prior operator content
+	// is backed up rather than clobbered.
+	writes[openCodeConfigFileName] = data
 
-	if err := os.WriteFile(filepath.Join(configDir, "opencode.json"), data, 0o600); err != nil {
+	if err := applyOpenCodeSeedGuard(configDir, writes); err != nil {
 		return "", err
 	}
 
 	return string(data), nil
+}
+
+// planOpenCodeSeedWrites validates and collects every seeded file into a
+// relpath→bytes plan without touching disk. The seeded opencode.json is not
+// added to the plan: its parsed contents are returned so the caller can
+// deep-merge the wrapper's managed keys on top before authoring the final file.
+// Relpath keys are slash-normalized so the manifest and guard are deterministic
+// across platforms.
+func planOpenCodeSeedWrites(seedFiles map[string]string) (map[string][]byte, map[string]any, error) {
+	writes := make(map[string][]byte, len(seedFiles))
+
+	var seededConfig map[string]any
+
+	for rel, contents := range seedFiles {
+		clean, err := validateOpenCodeSeedPath(rel)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if clean == openCodeConfigFileName {
+			parsed := map[string]any{}
+			if err := json.Unmarshal([]byte(contents), &parsed); err != nil {
+				return nil, nil, unsupportedField(seedFileField(rel))
+			}
+
+			seededConfig = parsed
+
+			continue
+		}
+
+		writes[filepath.ToSlash(clean)] = []byte(contents)
+	}
+
+	return writes, seededConfig, nil
+}
+
+// applyOpenCodeSeedGuard writes the planned files under configDir behind an
+// ownership manifest so a seed pass never overwrites a file the wrapper did not
+// create. Per relpath: a missing target is written and recorded; a target the
+// manifest already owns is overwritten (keeping a .wagie.bak of the prior bytes
+// when they change, or skipped entirely when identical); a target that exists
+// but is absent from the manifest — an operator-authored file — fails closed
+// with the uniform unsupported error, leaving every file untouched. The manifest
+// and .wagie.bak sidecars are wagie-owned and never treated as seed targets.
+func applyOpenCodeSeedGuard(configDir string, writes map[string][]byte) error {
+	manifest, err := loadOpenCodeSeedManifest(configDir)
+	if err != nil {
+		return err
+	}
+
+	managed := make(map[string]struct{}, len(manifest))
+	for _, rel := range manifest {
+		managed[rel] = struct{}{}
+	}
+
+	rels := make([]string, 0, len(writes))
+	for rel := range writes {
+		rels = append(rels, rel)
+	}
+
+	slices.Sort(rels)
+
+	// Phase 1: fail closed before any write if a target is an unmanaged file.
+	for _, rel := range rels {
+		target := filepath.Join(configDir, filepath.FromSlash(rel))
+		if _, statErr := os.Stat(target); statErr == nil {
+			if _, ok := managed[rel]; !ok {
+				return unsupportedField(seedFileField(rel))
+			}
+		}
+	}
+
+	// Phase 2: back up changed managed files, then write.
+	added := false
+
+	for _, rel := range rels {
+		target := filepath.Join(configDir, filepath.FromSlash(rel))
+		contents := writes[rel]
+
+		existing, readErr := os.ReadFile(target)
+		switch {
+		case readErr == nil:
+			if bytes.Equal(existing, contents) {
+				continue
+			}
+			// #nosec G703 -- target is confined to configDir by validateOpenCodeSeedPath; the suffix is a constant.
+			if err := os.WriteFile(target+openCodeSeedBackupSuffix, existing, 0o600); err != nil {
+				return err
+			}
+		case errors.Is(readErr, os.ErrNotExist):
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				return err
+			}
+		default:
+			return readErr
+		}
+
+		if err := os.WriteFile(target, contents, 0o600); err != nil {
+			return err
+		}
+
+		if _, ok := managed[rel]; !ok {
+			managed[rel] = struct{}{}
+			manifest = append(manifest, rel)
+			added = true
+		}
+	}
+
+	if added {
+		if err := writeOpenCodeSeedManifest(configDir, manifest); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// loadOpenCodeSeedManifest reads the seed-root ownership manifest, returning an
+// empty list when it is absent so a fresh per-session root treats every write as
+// a first write.
+func loadOpenCodeSeedManifest(configDir string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(configDir, openCodeSeedManifestName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	var manifest []string
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, unsupportedField(openCodeSeedManifestField)
+	}
+
+	return manifest, nil
+}
+
+// writeOpenCodeSeedManifest persists the ownership manifest as a sorted,
+// deterministic JSON array of managed relative paths.
+func writeOpenCodeSeedManifest(configDir string, manifest []string) error {
+	sorted := slices.Clone(manifest)
+	slices.Sort(sorted)
+
+	data, err := openCodeMarshalIndent(sorted, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	data = append(data, '\n')
+
+	return os.WriteFile(filepath.Join(configDir, openCodeSeedManifestName), data, 0o600)
+}
+
+// validateOpenCodeSeedPath confines a seeded relative path to the config root,
+// rejecting empty keys, absolute paths, and parent-directory escapes with the
+// uniform unsupported error. It returns the cleaned, slash-normalized path.
+func validateOpenCodeSeedPath(rel string) (string, error) {
+	if rel == "" || filepath.IsAbs(rel) {
+		return "", unsupportedField(seedFileField(rel))
+	}
+
+	for _, segment := range strings.Split(filepath.ToSlash(rel), "/") {
+		if segment == ".." {
+			return "", unsupportedField(seedFileField(rel))
+		}
+	}
+
+	clean := filepath.Clean(rel)
+	if clean == "." || clean == ".." || filepath.IsAbs(clean) ||
+		strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", unsupportedField(seedFileField(rel))
+	}
+
+	return clean, nil
+}
+
+func seedFileField(rel string) string {
+	return fmt.Sprintf("seedFiles[%s]", rel)
+}
+
+func unsupportedField(path string) error {
+	return fmt.Errorf("unsupported field %s", path)
+}
+
+// deepMergeJSON returns base with override applied on top: nested maps are
+// merged recursively, and override wins for every conflicting key.
+func deepMergeJSON(base, override map[string]any) map[string]any {
+	merged := make(map[string]any, len(base)+len(override))
+	for key, value := range base {
+		merged[key] = value
+	}
+
+	for key, value := range override {
+		if existing, ok := merged[key].(map[string]any); ok {
+			if next, ok := value.(map[string]any); ok {
+				merged[key] = deepMergeJSON(existing, next)
+
+				continue
+			}
+		}
+
+		merged[key] = value
+	}
+
+	return merged
 }
 
 func allocatePort() (int, error) {

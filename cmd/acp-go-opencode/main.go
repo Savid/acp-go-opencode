@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 
 	opencodeacp "github.com/savid/acp-go-opencode"
 	"github.com/savid/acp-go-opencode/internal/defaults"
@@ -38,6 +39,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	logLevel := flags.String("opencode-log-level", "", "OpenCode native server log level")
 	minimumVersion := flags.String("opencode-minimum-version", "", "minimum accepted OpenCode version")
 	healthTimeout := flags.Duration("opencode-health-timeout", defaults.HealthCheckTimeout, "OpenCode server readiness timeout")
+
+	var seedFiles seedFileFlag
+
+	flags.Var(&seedFiles, "seed-file", "seed a file into the session config root as <relpath>=<hostpath> (repeatable)")
 
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -87,8 +92,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		opencodeacp.WithOpenCodeLogLevel(*logLevel),
 		opencodeacp.WithOpenCodeHealthCheckTimeout(*healthTimeout),
 	)
+
 	if *minimumVersion != "" {
 		opts = append(opts, opencodeacp.WithOpenCodeMinimumVersion(*minimumVersion))
+	}
+
+	if len(seedFiles.files) > 0 {
+		opts = append(opts, opencodeacp.WithSeedFiles(seedFiles.files))
 	}
 
 	opts = append(opts, telemetry.options...)
@@ -113,6 +123,37 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	}
 
 	return 0
+}
+
+// seedFileFlag is a repeatable -seed-file flag. Each value is
+// <relpath>=<hostpath>: the host file is read at parse time and its contents are
+// mapped to the relative path passed to WithSeedFiles.
+type seedFileFlag struct {
+	files map[string]string
+}
+
+func (s *seedFileFlag) String() string {
+	return ""
+}
+
+func (s *seedFileFlag) Set(value string) error {
+	rel, host, ok := strings.Cut(value, "=")
+	if !ok || rel == "" || host == "" {
+		return fmt.Errorf("seed-file must be <relpath>=<hostpath>, got %q", value)
+	}
+
+	contents, err := os.ReadFile(host)
+	if err != nil {
+		return fmt.Errorf("read seed file %q: %w", host, err)
+	}
+
+	if s.files == nil {
+		s.files = make(map[string]string, 1)
+	}
+
+	s.files[rel] = string(contents)
+
+	return nil
 }
 
 func pendingSignal(signals <-chan os.Signal) os.Signal {
