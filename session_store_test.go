@@ -54,6 +54,7 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 		},
 		"load": func(ctx context.Context) error {
 			_, err := nilStore.Load(ctx, key)
+
 			return err
 		},
 		"replace": func(ctx context.Context) error {
@@ -62,10 +63,12 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 		"delete": func(ctx context.Context) error { return nilStore.Delete(ctx, key) },
 		"list": func(ctx context.Context) error {
 			_, err := nilStore.ListSessions(ctx)
+
 			return err
 		},
 		"subkeys": func(ctx context.Context) error {
 			_, err := nilStore.ListSubkeys(ctx, key)
+
 			return err
 		},
 	} {
@@ -108,10 +111,10 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 	if loadedAgain[0][0] == '[' {
 		t.Fatal("loaded entry was not cloned")
 	}
-	if err := store.Append(ctx, subkey, []SessionStoreEntry{json.RawMessage(`{"sub":true}`)}); err != nil {
+	if err = store.Append(ctx, subkey, []SessionStoreEntry{json.RawMessage(`{"sub":true}`)}); err != nil {
 		t.Fatalf("append subkey: %v", err)
 	}
-	if err := store.Append(ctx, SessionKey{SessionID: "s0", Subpath: SessionStoreMainSubpath}, []SessionStoreEntry{json.RawMessage(`{bad}`)}); err != nil {
+	if err = store.Append(ctx, SessionKey{SessionID: "s0", Subpath: SessionStoreMainSubpath}, []SessionStoreEntry{json.RawMessage(`{bad}`)}); err != nil {
 		t.Fatalf("append invalid summary: %v", err)
 	}
 	summaries, err := store.ListSessions(ctx)
@@ -134,6 +137,11 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 	if len(subkeys) != 1 || subkeys[0] != "idmap" {
 		t.Fatalf("subkeys = %#v", subkeys)
 	}
+	assertStoreTombstoneAndTieBreak(t, ctx, store, key, subkey)
+}
+
+func assertStoreTombstoneAndTieBreak(t *testing.T, ctx context.Context, store *InMemorySessionStore, key, subkey SessionKey) {
+	t.Helper()
 	if err := store.Delete(ctx, SessionKey{SessionID: "missing", Subpath: "sub"}); err != nil {
 		t.Fatalf("delete missing: %v", err)
 	}
@@ -150,10 +158,10 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 	if len(loadedSubkey) != 0 {
 		t.Fatalf("tombstoned subkey loaded entries: %#v", loadedSubkey)
 	}
-	if err := store.Delete(ctx, key); err != nil {
+	if err = store.Delete(ctx, key); err != nil {
 		t.Fatalf("delete main: %v", err)
 	}
-	if err := store.Append(ctx, SessionKey{SessionID: "s1", Subpath: "other"}, []SessionStoreEntry{json.RawMessage(`{"ignored":true}`)}); err != nil {
+	if err = store.Append(ctx, SessionKey{SessionID: "s1", Subpath: "other"}, []SessionStoreEntry{json.RawMessage(`{"ignored":true}`)}); err != nil {
 		t.Fatalf("append tombstoned main subkey: %v", err)
 	}
 	loadedMain, err := store.Load(ctx, key)
@@ -166,7 +174,7 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 
 	tieStore := NewInMemorySessionStore()
 	for _, id := range []string{"b", "a"} {
-		if err := tieStore.Append(ctx, SessionKey{SessionID: id, Subpath: SessionStoreMainSubpath}, []SessionStoreEntry{json.RawMessage(`{}`)}); err != nil {
+		if err = tieStore.Append(ctx, SessionKey{SessionID: id, Subpath: SessionStoreMainSubpath}, []SessionStoreEntry{json.RawMessage(`{}`)}); err != nil {
 			t.Fatalf("append tie %s: %v", id, err)
 		}
 	}

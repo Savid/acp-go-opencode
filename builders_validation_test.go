@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/defaults"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
@@ -74,7 +75,14 @@ func TestOptionsAndRequestBuilders(t *testing.T) {
 	if !rawMessageConfigFromMeta(req.Meta).Enabled() {
 		t.Fatalf("raw events not enabled in meta: %#v", req.Meta)
 	}
-	options := req.Meta[opencodeMetaKey].(map[string]any)[metaOptionsKey].(map[string]any)
+	meta, ok := req.Meta[opencodeMetaKey].(map[string]any)
+	if !ok {
+		t.Fatalf("meta missing opencode key: %#v", req.Meta)
+	}
+	options, ok := meta[metaOptionsKey].(map[string]any)
+	if !ok {
+		t.Fatalf("meta missing options key: %#v", req.Meta)
+	}
 	if options[metaPermissionKey] != "allow" {
 		t.Fatalf("permission not set in meta: %#v", req.Meta)
 	}
@@ -122,7 +130,8 @@ func TestRequestBuilderCloneEdgeBranches(t *testing.T) {
 	meta := map[string]any{opencodeMetaKey: map[string]any{"a": "b"}}
 	ensured := ensureMetaMap(meta, opencodeMetaKey)
 	ensured["a"] = "changed"
-	if meta[opencodeMetaKey].(map[string]any)["a"] != "changed" {
+	stored, ok := meta[opencodeMetaKey].(map[string]any)
+	if !ok || stored["a"] != "changed" {
 		t.Fatalf("ensureMetaMap did not store clone: %#v", meta)
 	}
 }
@@ -174,6 +183,11 @@ func TestValidationMetaAndHelperBranches(t *testing.T) {
 	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{rawEventKey: map[string]any{rawEventEnabledKey: "bad"}}}); err == nil {
 		t.Fatal("bad raw event meta accepted")
 	}
+	assertSessionMetaAndSchemaHelpers(t)
+}
+
+func assertSessionMetaAndSchemaHelpers(t *testing.T) {
+	t.Helper()
 	meta, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{
 		metaModelKey:      "p/m",
 		metaEnvKey:        map[string]any{"A": "1"},
@@ -233,10 +247,10 @@ func TestPromptMappingHelpers(t *testing.T) {
 	if got := embeddedResourceText(resource); got == "" {
 		t.Fatalf("embeddedResourceText = %q", got)
 	}
-	if update := usageUpdateFromTokens("m", nativeTokens{}); update != nil {
+	if update := usageUpdateFromTokens("m", opencode.NativeTokens{}); update != nil {
 		t.Fatalf("empty usage update = %#v", update)
 	}
-	usage := usageFromTokens(nativeTokens{Input: 1, Output: 2, Reasoning: 3})
+	usage := usageFromTokens(opencode.NativeTokens{Input: 1, Output: 2, Reasoning: 3})
 	if usage == nil || usage.TotalTokens != 6 {
 		t.Fatalf("usage = %#v", usage)
 	}
@@ -265,10 +279,10 @@ func TestPromptMappingHelpers(t *testing.T) {
 			t.Fatalf("empty plan status for %q", status)
 		}
 	}
-	if questionElicitationMessage([]questionInfo{{Question: "Only?"}}) != "Only?" {
+	if questionElicitationMessage([]opencode.QuestionInfo{{Question: "Only?"}}) != "Only?" {
 		t.Fatal("single question message mismatch")
 	}
-	if got := questionOptionSchemas([]questionOption{{Label: ""}, {Label: "A"}}); len(got) != 1 {
+	if got := questionOptionSchemas([]opencode.QuestionOption{{Label: ""}, {Label: "A"}}); len(got) != 1 {
 		t.Fatalf("questionOptionSchemas = %#v", got)
 	}
 	if req, ok := eventQuestion(json.RawMessage(`{"request":{"id":"q","sessionID":"s"}}`)); !ok || req.ID != "q" {
@@ -320,12 +334,12 @@ func TestAgentConnectionHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquireClientCall: %v", err)
 	}
-	if _, err := agent.acquireClientCall(ctx); err == nil {
+	if _, err = agent.acquireClientCall(ctx); err == nil {
 		t.Fatal("client call backpressure not enforced")
 	}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := agent.acquireClientCall(cancelled); err == nil {
+	if _, err = agent.acquireClientCall(cancelled); err == nil {
 		t.Fatal("cancelled acquire succeeded")
 	}
 	release()
@@ -395,6 +409,7 @@ func forkClientConnection(t *testing.T, agent forkExtensionAgent) (*acp.ClientSi
 	agentToClientReader, agentToClientWriter := io.Pipe()
 	_ = acp.NewAgentSideConnection(agent, agentToClientWriter, clientToAgentReader)
 	conn := acp.NewClientSideConnection(noopACPClient{}, clientToAgentWriter, agentToClientReader)
+
 	return conn, func() {
 		_ = clientToAgentWriter.Close()
 		_ = clientToAgentReader.Close()

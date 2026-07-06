@@ -14,7 +14,24 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
+
+// startSignalReader closes started on the first Read call, then blocks until
+// release is closed so Serve stays parked in its select until the test cancels
+// the context.
+type startSignalReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *startSignalReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+
+	return 0, io.EOF
+}
 
 func TestServeContextAndInputDone(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
@@ -23,11 +40,12 @@ func TestServeContextAndInputDone(t *testing.T) {
 		t.Fatalf("Serve canceled error = %v", err)
 	}
 	waitCtx, waitCancel := context.WithCancel(context.Background())
-	waitReader, waitWriter := io.Pipe()
+	waitReader := &startSignalReader{started: make(chan struct{}), release: make(chan struct{})}
 	done := make(chan error, 1)
 	go func() {
 		done <- Serve(waitCtx, waitReader, io.Discard)
 	}()
+	<-waitReader.started
 	waitCancel()
 	select {
 	case err := <-done:
@@ -37,8 +55,7 @@ func TestServeContextAndInputDone(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Serve did not return after context cancellation")
 	}
-	_ = waitReader.Close()
-	_ = waitWriter.Close()
+	close(waitReader.release)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -67,7 +84,8 @@ func TestLocalAgentConnectionHandleRoutesAndErrors(t *testing.T) {
 	if reqErr != nil {
 		t.Fatalf("initialize reqErr = %v", reqErr)
 	}
-	if initResp.(acp.InitializeResponse).AgentCapabilities.PositionEncoding == nil {
+	initResponse, ok := initResp.(acp.InitializeResponse)
+	if !ok || initResponse.AgentCapabilities.PositionEncoding == nil {
 		t.Fatalf("initialize response = %#v", initResp)
 	}
 	if _, reqErr := conn.handle(ctx, "missing/method", json.RawMessage(`{}`)); reqErr == nil || reqErr.Code != -32601 {
@@ -217,15 +235,16 @@ func TestLifecycleCommandUpdateAfterResponseBytes(t *testing.T) {
 	})
 
 	agent := NewAgent()
-	agent.options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+	agent.options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 		client := newFakeOpenCodeClient()
-		xdg, err := createXDGDirs(t.TempDir(), string(opts.ACPSessionID))
+		xdg, err := opencode.CreateXDGDirs(t.TempDir(), string(opts.ACPSessionID))
 		if err != nil {
 			return nil, err
 		}
 		client.xdg = xdg
 		client.createSession = testNativeSession("native-1")
-		client.commands = []nativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+
 		return client, nil
 	}
 	conn := newLocalAgentConnection(agent, a2cW, c2aR)
@@ -251,6 +270,7 @@ func TestLifecycleCommandUpdateAfterResponseBytes(t *testing.T) {
 			return line
 		case <-ctx.Done():
 			t.Fatal("timed out waiting for JSON-RPC line")
+
 			return ""
 		}
 	}
@@ -295,14 +315,14 @@ func TestConcurrentLifecycleCommandUpdatesFollowOwnResponses(t *testing.T) {
 	var factoryMu sync.Mutex
 	factoryCount := 0
 	agent := NewAgent()
-	agent.options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+	agent.options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 		factoryMu.Lock()
 		factoryCount++
 		index := factoryCount
 		factoryMu.Unlock()
 
 		client := newFakeOpenCodeClient()
-		xdg, err := createXDGDirs(t.TempDir(), string(opts.ACPSessionID))
+		xdg, err := opencode.CreateXDGDirs(t.TempDir(), string(opts.ACPSessionID))
 		if err != nil {
 			return nil, err
 		}
@@ -313,17 +333,18 @@ func TestConcurrentLifecycleCommandUpdatesFollowOwnResponses(t *testing.T) {
 			nativeID: "native-" + strconv.Itoa(index),
 			command:  "cmd" + strconv.Itoa(index),
 		}
-		client.commands = []nativeCommand{{Name: control.command, Description: "Command", Source: "command"}}
-		client.createSessionFunc = func(ctx context.Context, _ string) (nativeSession, error) {
+		client.commands = []opencode.NativeCommand{{Name: control.command, Description: "Command", Source: "command"}}
+		client.createSessionFunc = func(ctx context.Context, _ string) (opencode.NativeSession, error) {
 			close(control.started)
 			select {
 			case <-control.release:
 				return testNativeSession(control.nativeID), nil
 			case <-ctx.Done():
-				return nativeSession{}, ctx.Err()
+				return opencode.NativeSession{}, ctx.Err()
 			}
 		}
 		controls <- control
+
 		return client, nil
 	}
 	conn := newLocalAgentConnection(agent, a2cW, c2aR)
@@ -349,6 +370,7 @@ func TestConcurrentLifecycleCommandUpdatesFollowOwnResponses(t *testing.T) {
 			return line
 		case <-ctx.Done():
 			t.Fatal("timed out waiting for JSON-RPC line")
+
 			return ""
 		}
 	}
@@ -522,14 +544,15 @@ func TestPostResponseHookBranches(t *testing.T) {
 	parentClient := newFakeOpenCodeClient()
 	parentClient.forkSession = testNativeSession("native-child")
 	parentAgent := NewAgent()
-	parentAgent.options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+	parentAgent.options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 		child := newFakeOpenCodeClient()
-		xdg, err := createXDGDirs(t.TempDir(), string(opts.ACPSessionID))
+		xdg, err := opencode.CreateXDGDirs(t.TempDir(), string(opts.ACPSessionID))
 		if err != nil {
 			return nil, err
 		}
 		child.xdg = xdg
 		child.getSession = testNativeSession("native-child")
+
 		return child, nil
 	}
 	parent := testSession(parentAgent, parentClient)
@@ -577,10 +600,10 @@ func TestLocalAgentConnectionClientCallsOverPipes(t *testing.T) {
 	if permission.Outcome.Selected == nil || permission.Outcome.Selected.OptionId != "once" {
 		t.Fatalf("permission = %#v", permission)
 	}
-	if err := conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: "s", Update: acp.UpdateAgentMessageText("hello")}); err != nil {
+	if err = conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: "s", Update: acp.UpdateAgentMessageText("hello")}); err != nil {
 		t.Fatalf("SessionUpdate: %v", err)
 	}
-	if err := conn.NotifyExtension(ctx, "_opencode/test", map[string]any{"ok": true}); err != nil {
+	if err = conn.NotifyExtension(ctx, "_opencode/test", map[string]any{"ok": true}); err != nil {
 		t.Fatalf("NotifyExtension: %v", err)
 	}
 	resp, err := conn.UnstableCreateElicitation(ctx, acp.UnstableCreateElicitationRequest{
@@ -611,6 +634,7 @@ func mustJSON(t *testing.T, value any) json.RawMessage {
 	if err != nil {
 		t.Fatalf("marshal %T: %v", value, err)
 	}
+
 	return data
 }
 
@@ -641,6 +665,7 @@ func (c *pipeACPClient) SessionUpdate(context.Context, acp.SessionNotification) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.updates++
+
 	return nil
 }
 
@@ -672,6 +697,7 @@ func (c *pipeACPClient) UnstableCreateElicitation(context.Context, acp.UnstableC
 	c.mu.Lock()
 	c.elicitations++
 	c.mu.Unlock()
+
 	return acp.UnstableCreateElicitationResponse{
 		Accept: &acp.UnstableCreateElicitationAccept{Action: "accept", Content: map[string]any{}},
 	}, nil
@@ -689,5 +715,6 @@ func (c *pipeACPClient) HandleExtensionMethod(_ context.Context, method string, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.extensions = append(c.extensions, method)
+
 	return map[string]any{"ok": true}, nil
 }

@@ -1,4 +1,4 @@
-package opencodeacp
+package opencode
 
 import (
 	"context"
@@ -19,51 +19,53 @@ import (
 	"time"
 )
 
-func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
-	ctx := context.Background()
-	var seen []string
-	var messageBody openCodeMessageRequest
-	var commandBody openCodeCommandRequest
-	var forkBody map[string]any
-	var createBody map[string]any
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if username, password, ok := r.BasicAuth(); !ok || username != "opencode" || password != "secret" {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte("bad auth"))
-			return
-		}
-		seen = append(seen, r.Method+" "+r.URL.RequestURI())
-		path := r.URL.EscapedPath()
-		switch {
-		case path == "/session" && r.Method == http.MethodPost:
-			createBody = map[string]any{}
-			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
+type openCodeMethodsRecorder struct {
+	seen        []string
+	messageBody MessageRequest
+	commandBody CommandRequest
+	forkBody    map[string]any
+	createBody  map[string]any
+}
+
+func openCodeMethodsRoutes(t *testing.T, rec *openCodeMethodsRecorder) map[string]http.HandlerFunc {
+	t.Helper()
+
+	return map[string]http.HandlerFunc{
+		"POST /session": func(w http.ResponseWriter, r *http.Request) {
+			rec.createBody = map[string]any{}
+			if err := json.NewDecoder(r.Body).Decode(&rec.createBody); err != nil {
 				t.Errorf("decode create body: %v", err)
 			}
 			writeJSON(t, w, map[string]any{"id": "created", "title": "Created"})
-		case path == "/session" && r.Method == http.MethodGet:
+		},
+		"GET /session": func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Query().Get("directory") != "/repo" {
 				t.Errorf("directory query = %q", r.URL.RawQuery)
 			}
 			writeJSON(t, w, []map[string]any{{"id": "listed"}})
-		case path == "/session/s%2F1" && r.Method == http.MethodGet:
+		},
+		"GET /session/s%2F1": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, map[string]any{"id": "s/1", "title": "Loaded"})
-		case path == "/session/s%2F1" && r.Method == http.MethodDelete:
+		},
+		"DELETE /session/s%2F1": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, map[string]any{"ok": true})
-		case path == "/session/s%2F1/message" && r.Method == http.MethodPost:
-			if err := json.NewDecoder(r.Body).Decode(&messageBody); err != nil {
+		},
+		"POST /session/s%2F1/message": func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&rec.messageBody); err != nil {
 				t.Errorf("decode message body: %v", err)
 			}
 			writeJSON(t, w, map[string]any{
 				"info":  map[string]any{"id": "assistant", "sessionID": "s/1", "role": "assistant", "finish": "stop"},
 				"parts": []map[string]any{{"id": "part-1", "sessionID": "s/1", "messageID": "assistant", "type": "text", "text": "ok"}},
 			})
-		case path == "/session/s%2F1/message" && r.Method == http.MethodGet:
+		},
+		"GET /session/s%2F1/message": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{
 				"info":  map[string]any{"id": "history", "sessionID": "s/1", "role": "assistant"},
 				"parts": []map[string]any{{"id": "history-part", "sessionID": "s/1", "messageID": "history", "type": "text", "text": "ok"}},
 			}})
-		case path == "/command" && r.Method == http.MethodGet:
+		},
+		"GET /command": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{
 				"name":        "review",
 				"description": "Review",
@@ -74,60 +76,97 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 				"subtask":     true,
 				"hints":       []string{"$ARGUMENTS"},
 			}})
-		case path == "/session/s%2F1/command" && r.Method == http.MethodPost:
-			if err := json.NewDecoder(r.Body).Decode(&commandBody); err != nil {
+		},
+		"POST /session/s%2F1/command": func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&rec.commandBody); err != nil {
 				t.Errorf("decode command body: %v", err)
 			}
 			writeJSON(t, w, map[string]any{
 				"info":  map[string]any{"id": "assistant-command", "sessionID": "s/1", "role": "assistant", "finish": "stop"},
 				"parts": []map[string]any{{"id": "part-command", "sessionID": "s/1", "messageID": "assistant-command", "type": "text", "text": "ok"}},
 			})
-		case path == "/session/status" && r.Method == http.MethodGet:
+		},
+		"GET /session/status": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, map[string]any{"s/1": map[string]any{"type": "idle"}})
-		case path == "/session/s%2F1/abort" && r.Method == http.MethodPost:
+		},
+		"POST /session/s%2F1/abort": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, map[string]any{"ok": true})
-		case path == "/session/s%2F1/fork" && r.Method == http.MethodPost:
-			forkBody = map[string]any{}
-			if err := json.NewDecoder(r.Body).Decode(&forkBody); err != nil {
+		},
+		"POST /session/s%2F1/fork": func(w http.ResponseWriter, r *http.Request) {
+			rec.forkBody = map[string]any{}
+			if err := json.NewDecoder(r.Body).Decode(&rec.forkBody); err != nil {
 				t.Errorf("decode fork body: %v", err)
 			}
 			writeJSON(t, w, map[string]any{"id": "forked"})
-		case path == "/session/s%2F1/todo" && r.Method == http.MethodGet:
+		},
+		"GET /session/s%2F1/todo": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{"id": "todo", "content": "Do it"}})
-		case path == "/config/providers" && r.Method == http.MethodGet:
+		},
+		"GET /config/providers": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, map[string]any{"providers": []map[string]any{{"id": "openai", "models": map[string]any{}}}})
-		case path == "/agent" && r.Method == http.MethodGet:
+		},
+		"GET /agent": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{"name": "build"}})
-		case path == "/empty" && r.Method == http.MethodGet:
+		},
+		"GET /empty": func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
-		case path == "/invalid-json" && r.Method == http.MethodGet:
+		},
+		"GET /invalid-json": func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte("{"))
-		case path == "/status" && r.Method == http.MethodGet:
+		},
+		"GET /status": func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusTeapot)
 			_, _ = w.Write([]byte("short and stout"))
-		default:
-			w.WriteHeader(http.StatusNotFound)
+		},
+	}
+}
+
+func newOpenCodeMethodsClient(t *testing.T) (*openCodeServer, *openCodeMethodsRecorder) {
+	t.Helper()
+	rec := &openCodeMethodsRecorder{}
+	routes := openCodeMethodsRoutes(t, rec)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if username, password, ok := r.BasicAuth(); !ok || username != "opencode" || password != "secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("bad auth"))
+
+			return
 		}
+		rec.seen = append(rec.seen, r.Method+" "+r.URL.RequestURI())
+		route, ok := routes[r.Method+" "+r.URL.EscapedPath()]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+
+			return
+		}
+		route(w, r)
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 
 	client := &openCodeServer{
 		httpClient: server.Client(),
 		baseURL:    server.URL,
 		username:   "opencode",
 		password:   "secret",
-		events:     make(chan openCodeEvent),
+		events:     make(chan Event),
 		errs:       make(chan error),
 		closed:     make(chan struct{}),
 	}
 
+	return client, rec
+}
+
+func TestOpenCodeServerSessionMethods(t *testing.T) {
+	ctx := context.Background()
+	client, rec := newOpenCodeMethodsClient(t)
+
 	created, err := client.CreateSession(ctx, "Created")
-	if err != nil || created.ID != "created" || createBody["title"] != "Created" {
-		t.Fatalf("CreateSession = %#v body=%#v err=%v", created, createBody, err)
+	if err != nil || created.ID != "created" || rec.createBody["title"] != "Created" {
+		t.Fatalf("CreateSession = %#v body=%#v err=%v", created, rec.createBody, err)
 	}
 	created, err = client.CreateSession(ctx, "")
-	if err != nil || len(createBody) != 0 {
-		t.Fatalf("CreateSession empty = %#v body=%#v err=%v", created, createBody, err)
+	if err != nil || len(rec.createBody) != 0 {
+		t.Fatalf("CreateSession empty = %#v body=%#v err=%v", created, rec.createBody, err)
 	}
 	got, err := client.GetSession(ctx, "s/1")
 	if err != nil || got.ID != "s/1" {
@@ -137,18 +176,27 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 	if err != nil || len(listed) != 1 || listed[0].ID != "listed" {
 		t.Fatalf("ListSessions = %#v err=%v", listed, err)
 	}
-	if err := client.DeleteSession(ctx, "s/1"); err != nil {
-		t.Fatalf("DeleteSession: %v", err)
+	if deleteErr := client.DeleteSession(ctx, "s/1"); deleteErr != nil {
+		t.Fatalf("DeleteSession: %v", deleteErr)
 	}
-	message, err := client.SendMessage(ctx, "s/1", openCodeMessageRequest{
+	if !containsString(rec.seen, "GET /session?directory=%2Frepo") {
+		t.Fatalf("seen paths = %#v", rec.seen)
+	}
+}
+
+func TestOpenCodeServerMessageAndCommandMethods(t *testing.T) {
+	ctx := context.Background()
+	client, rec := newOpenCodeMethodsClient(t)
+
+	message, err := client.SendMessage(ctx, "s/1", MessageRequest{
 		MessageID: "user-1",
-		Model:     &openCodeModelSelector{ProviderID: "openai", ModelID: "gpt-test"},
+		Model:     &ModelSelector{ProviderID: "openai", ModelID: "gpt-test"},
 		Agent:     "build",
 		Parts:     []map[string]any{{"type": "text", "text": "hello"}},
 	})
-	if err != nil || message.Info.ID != "assistant" || messageBody.MessageID != "user-1" ||
-		messageBody.Model.ModelID != "gpt-test" || messageBody.Agent != "build" || len(messageBody.Parts) != 1 {
-		t.Fatalf("SendMessage = %#v body=%#v err=%v", message, messageBody, err)
+	if err != nil || message.Info.ID != "assistant" || rec.messageBody.MessageID != "user-1" ||
+		rec.messageBody.Model.ModelID != "gpt-test" || rec.messageBody.Agent != "build" || len(rec.messageBody.Parts) != 1 {
+		t.Fatalf("SendMessage = %#v body=%#v err=%v", message, rec.messageBody, err)
 	}
 	messages, err := client.Messages(ctx, "s/1")
 	if err != nil || len(messages) != 1 || messages[0].Info.ID != "history" {
@@ -158,7 +206,7 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 	if err != nil || len(commands) != 1 || commands[0].Name != "review" || commands[0].Template == nil || len(commands[0].Hints) != 1 {
 		t.Fatalf("Commands = %#v err=%v", commands, err)
 	}
-	command, err := client.RunCommand(ctx, "s/1", openCodeCommandRequest{
+	command, err := client.RunCommand(ctx, "s/1", CommandRequest{
 		MessageID: "user-2",
 		Agent:     "build",
 		Model:     "openai/gpt-test",
@@ -166,25 +214,31 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 		Arguments: "args",
 		Parts:     []map[string]any{{"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA=="}},
 	})
-	if err != nil || command.Info.ID != "assistant-command" || commandBody.MessageID != "user-2" ||
-		commandBody.Model != "openai/gpt-test" || commandBody.Command != "review" || commandBody.Arguments != "args" ||
-		len(commandBody.Parts) != 1 {
-		t.Fatalf("RunCommand = %#v body=%#v err=%v", command, commandBody, err)
+	if err != nil || command.Info.ID != "assistant-command" || rec.commandBody.MessageID != "user-2" ||
+		rec.commandBody.Model != "openai/gpt-test" || rec.commandBody.Command != "review" || rec.commandBody.Arguments != "args" ||
+		len(rec.commandBody.Parts) != 1 {
+		t.Fatalf("RunCommand = %#v body=%#v err=%v", command, rec.commandBody, err)
 	}
+}
+
+func TestOpenCodeServerControlAndInfoMethods(t *testing.T) {
+	ctx := context.Background()
+	client, rec := newOpenCodeMethodsClient(t)
+
 	status, err := client.SessionStatus(ctx)
 	if err != nil || status["s/1"].Type != "idle" {
 		t.Fatalf("SessionStatus = %#v err=%v", status, err)
 	}
-	if err := client.Abort(ctx, "s/1"); err != nil {
-		t.Fatalf("Abort: %v", err)
+	if abortErr := client.Abort(ctx, "s/1"); abortErr != nil {
+		t.Fatalf("Abort: %v", abortErr)
 	}
 	forked, err := client.Fork(ctx, "s/1", "message-1")
-	if err != nil || forked.ID != "forked" || forkBody["messageID"] != "message-1" {
-		t.Fatalf("Fork = %#v body=%#v err=%v", forked, forkBody, err)
+	if err != nil || forked.ID != "forked" || rec.forkBody["messageID"] != "message-1" {
+		t.Fatalf("Fork = %#v body=%#v err=%v", forked, rec.forkBody, err)
 	}
 	forked, err = client.Fork(ctx, "s/1", "")
-	if err != nil || len(forkBody) != 0 {
-		t.Fatalf("Fork empty = %#v body=%#v err=%v", forked, forkBody, err)
+	if err != nil || len(rec.forkBody) != 0 {
+		t.Fatalf("Fork empty = %#v body=%#v err=%v", forked, rec.forkBody, err)
 	}
 	todos, err := client.Todos(ctx, "s/1")
 	if err != nil || len(todos) != 1 || todos[0].ID != "todo" {
@@ -198,6 +252,12 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 	if err != nil || len(agents) != 1 || agents[0].Name != "build" {
 		t.Fatalf("Agents = %#v err=%v", agents, err)
 	}
+}
+
+func TestOpenCodeServerRawJSONErrors(t *testing.T) {
+	ctx := context.Background()
+	client, _ := newOpenCodeMethodsClient(t)
+
 	if err := client.getJSON(ctx, "/empty", nil, nil); err != nil {
 		t.Fatalf("empty getJSON: %v", err)
 	}
@@ -211,27 +271,24 @@ func TestOpenCodeServerHTTPMethodsAndErrors(t *testing.T) {
 	if err := client.getJSON(ctx, "/bad", nil, &map[string]any{}); err == nil {
 		t.Fatal("bad request URL unexpectedly succeeded")
 	}
-	if !containsString(seen, "GET /session?directory=%2Frepo") {
-		t.Fatalf("seen paths = %#v", seen)
-	}
 }
 
 func TestOpenCodeSendMessageErrors(t *testing.T) {
 	ctx := context.Background()
-	if err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{Role: "assistant", Finish: "error"}}); err == nil {
+	if err := assistantMessageError(NativeMessage{Info: NativeMessageInfo{Role: "assistant", Finish: "error"}}); err == nil {
 		t.Fatal("assistant finish error accepted")
 	}
-	err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{
+	err := assistantMessageError(NativeMessage{Info: NativeMessageInfo{
 		Role:  "assistant",
-		Error: &nativeError{Message: "provider failed"},
+		Error: &NativeError{Message: "provider failed"},
 	}})
 	if err == nil || !strings.Contains(err.Error(), "provider failed") {
 		t.Fatalf("assistant error = %v", err)
 	}
-	if err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{Error: &nativeError{}}}); err == nil {
+	if err := assistantMessageError(NativeMessage{Info: NativeMessageInfo{Error: &NativeError{}}}); err == nil {
 		t.Fatal("empty assistant error accepted")
 	}
-	if err := assistantMessageError(nativeMessage{Info: nativeMessageInfo{Role: "assistant", Finish: "stop"}}); err != nil {
+	if err := assistantMessageError(NativeMessage{Info: NativeMessageInfo{Role: "assistant", Finish: "stop"}}); err != nil {
 		t.Fatalf("non-error assistant rejected: %v", err)
 	}
 
@@ -245,6 +302,7 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/session/s/message" && r.Method == http.MethodPost {
 					w.WriteHeader(http.StatusInternalServerError)
+
 					return
 				}
 				http.NotFound(w, r)
@@ -257,6 +315,7 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 				if r.URL.Path == "/session/s/command" && r.Method == http.MethodPost {
 					w.WriteHeader(http.StatusBadRequest)
 					_, _ = w.Write([]byte("unknown command"))
+
 					return
 				}
 				http.NotFound(w, r)
@@ -274,6 +333,7 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 							"error":  map[string]any{"message": "provider failed"},
 						},
 					})
+
 					return
 				}
 				http.NotFound(w, r)
@@ -292,6 +352,7 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 							"error":  map[string]any{"message": "command failed"},
 						},
 					})
+
 					return
 				}
 				http.NotFound(w, r)
@@ -302,6 +363,7 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if username, password, ok := r.BasicAuth(); !ok || username != "opencode" || password != "secret" {
 					w.WriteHeader(http.StatusUnauthorized)
+
 					return
 				}
 				tt.handler(w, r)
@@ -315,9 +377,9 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 			}
 			var err error
 			if tt.command {
-				_, err = client.RunCommand(ctx, "s", openCodeCommandRequest{Command: "review", Arguments: ""})
+				_, err = client.RunCommand(ctx, "s", CommandRequest{Command: "review", Arguments: ""})
 			} else {
-				_, err = client.SendMessage(ctx, "s", openCodeMessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}})
+				_, err = client.SendMessage(ctx, "s", MessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}})
 			}
 			if err == nil {
 				t.Fatal("native send unexpectedly succeeded")
@@ -330,7 +392,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	helper := fakeOpenCodeExecutable(t)
 	root := t.TempDir()
 	logger := slog.New(slog.DiscardHandler)
-	client, err := startOpenCodeServer(context.Background(), openCodeStartOptions{
+	client, err := StartServer(context.Background(), StartOptions{
 		ACPSessionID:     "session/one",
 		Root:             root,
 		Cwd:              t.TempDir(),
@@ -349,14 +411,17 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		ExpectedNativeID: "native",
 	})
 	if err != nil {
-		t.Fatalf("startOpenCodeServer: %v", err)
+		t.Fatalf("StartServer: %v", err)
 	}
-	server := client.(*openCodeServer)
+	server, ok := client.(*openCodeServer)
+	if !ok {
+		t.Fatalf("client type = %T, want *openCodeServer", client)
+	}
 	if server.xdg.Root == "" || !strings.Contains(filepath.Base(server.xdg.Root), "session_one") {
 		t.Fatalf("xdg dirs = %#v", server.xdg)
 	}
-	if _, err := os.Stat(filepath.Join(server.xdg.State, leaseFileName)); err != nil {
-		t.Fatalf("lease was not written: %v", err)
+	if _, statErr := os.Stat(filepath.Join(server.xdg.State, LeaseFileName)); statErr != nil {
+		t.Fatalf("lease was not written: %v", statErr)
 	}
 	configData, err := os.ReadFile(filepath.Join(server.xdg.Config, "opencode", "opencode.json"))
 	if err != nil {
@@ -374,7 +439,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	if err := server.Close(context.Background()); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(server.xdg.State, leaseFileName)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(server.xdg.State, LeaseFileName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("lease after close err = %v", err)
 	}
 }
@@ -388,9 +453,10 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		var executable string
 		openCodeCommandContext = func(ctx context.Context, name string, _ ...string) *exec.Cmd {
 			executable = name
+
 			return exec.CommandContext(ctx, filepath.Join(t.TempDir(), "missing-opencode"))
 		}
-		_, err := startOpenCodeServer(ctx, openCodeStartOptions{ExistingXDG: xdg})
+		_, err := StartServer(ctx, StartOptions{ExistingXDG: xdg})
 		if err == nil {
 			t.Fatal("missing executable unexpectedly started")
 		}
@@ -400,15 +466,15 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	})
 
 	t.Run("reap failure", func(t *testing.T) {
-		if _, err := startOpenCodeServer(ctx, openCodeStartOptions{Root: "["}); err == nil {
+		if _, err := StartServer(ctx, StartOptions{Root: "["}); err == nil {
 			t.Fatal("invalid reap glob unexpectedly succeeded")
 		}
 	})
 
 	t.Run("create xdg failure", func(t *testing.T) {
-		_, err := startOpenCodeServer(ctx, openCodeStartOptions{
+		_, err := StartServer(ctx, StartOptions{
 			Root:         t.TempDir(),
-			ACPSessionID: acpSessionIDString(string([]byte{0})),
+			ACPSessionID: ACPSessionID(string([]byte{0})),
 		})
 		if err == nil {
 			t.Fatal("invalid session xdg path unexpectedly succeeded")
@@ -416,8 +482,8 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	})
 
 	t.Run("ensure existing xdg failure", func(t *testing.T) {
-		_, err := startOpenCodeServer(ctx, openCodeStartOptions{
-			ExistingXDG: xdgDirs{Root: filepath.Join(t.TempDir(), "root")},
+		_, err := StartServer(ctx, StartOptions{
+			ExistingXDG: XDGDirs{Root: filepath.Join(t.TempDir(), "root")},
 		})
 		if err == nil {
 			t.Fatal("incomplete existing xdg unexpectedly succeeded")
@@ -425,7 +491,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	})
 
 	t.Run("permission config failure", func(t *testing.T) {
-		_, err := startOpenCodeServer(ctx, openCodeStartOptions{
+		_, err := StartServer(ctx, StartOptions{
 			ExistingXDG: testXDGDirs(t),
 			Permission:  "deny",
 		})
@@ -439,7 +505,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		openCodeListen = func(string, string) (net.Listener, error) {
 			return nil, errors.New("listen failed")
 		}
-		if _, err := startOpenCodeServer(ctx, openCodeStartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
 			t.Fatal("listen error was ignored")
 		}
 	})
@@ -447,7 +513,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	t.Run("password entropy failure", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeRandReader = errorReader{err: errors.New("entropy failed")}
-		if _, err := startOpenCodeServer(ctx, openCodeStartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
 			t.Fatal("entropy error was ignored")
 		}
 	})
@@ -457,9 +523,10 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestFakeOpenCodeServerProcessHelper")
 			cmd.Stdout = io.Discard
+
 			return cmd
 		}
-		if _, err := startOpenCodeServer(ctx, openCodeStartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
 			t.Fatal("stdout pipe error was ignored")
 		}
 	})
@@ -469,9 +536,10 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestFakeOpenCodeServerProcessHelper")
 			cmd.Stderr = io.Discard
+
 			return cmd
 		}
-		if _, err := startOpenCodeServer(ctx, openCodeStartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
 			t.Fatal("stderr pipe error was ignored")
 		}
 	})
@@ -481,7 +549,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		openCodeWriteLease = func(string, serverLease) error {
 			return errors.New("lease failed")
 		}
-		if _, err := startOpenCodeServer(ctx, openCodeStartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
 			t.Fatal("lease error was ignored")
 		}
 	})
@@ -496,13 +564,15 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 			if writeCount == 2 {
 				return errors.New("post-start lease failed")
 			}
+
 			return nil
 		}
 		openCodeKillProcess = func(*exec.Cmd) error {
 			killed = true
+
 			return nil
 		}
-		_, err := startOpenCodeServer(ctx, openCodeStartOptions{
+		_, err := StartServer(ctx, StartOptions{
 			Root:           t.TempDir(),
 			ExecutablePath: helper,
 			HealthTimeout:  5 * time.Second,
@@ -517,7 +587,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 	t.Run("readiness failure closes process", func(t *testing.T) {
 		helper := fakeOpenCodeExecutable(t)
-		_, err := startOpenCodeServer(ctx, openCodeStartOptions{
+		_, err := StartServer(ctx, StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  helper,
 			MinimumVersion:  "99.0.0",
@@ -531,7 +601,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	})
 }
 
-func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
+func TestOpenCodeServerReadinessGateAndStreamFailures(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -549,7 +619,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 			}
 		})
 		defer closeServer()
-		if err := client.waitReady(ctx, ctx, openCodeStartOptions{MinimumVersion: "9.0.0"}); err == nil {
+		if err := client.waitReady(ctx, ctx, StartOptions{MinimumVersion: "9.0.0"}); err == nil {
 			t.Fatal("old version unexpectedly passed readiness")
 		}
 	})
@@ -568,7 +638,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 			}
 		})
 		defer closeServer()
-		if err := client.waitReady(ctx, ctx, openCodeStartOptions{SkipVersionGate: true}); err == nil {
+		if err := client.waitReady(ctx, ctx, StartOptions{SkipVersionGate: true}); err == nil {
 			t.Fatal("wrong first event unexpectedly passed readiness")
 		}
 	})
@@ -591,6 +661,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 		client, closeServer = readinessClient(t, func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/event" {
 				writeSSE(t, w, `{`)
+
 				return
 			}
 			w.WriteHeader(http.StatusNotFound)
@@ -600,12 +671,18 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 			t.Fatal("malformed event stream unexpectedly succeeded")
 		}
 	})
+}
+
+func TestOpenCodeServerReadinessHealthDocAndEventFailures(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 
 	t.Run("health timeout with last error", func(t *testing.T) {
 		client, closeServer := readinessClient(t, func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/global/health" {
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte("bad health"))
+
 				return
 			}
 			w.WriteHeader(http.StatusNotFound)
@@ -613,7 +690,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 		defer closeServer()
 		shortCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 		defer cancel()
-		if err := client.waitReady(shortCtx, shortCtx, openCodeStartOptions{SkipVersionGate: true}); err == nil ||
+		if err := client.waitReady(shortCtx, shortCtx, StartOptions{SkipVersionGate: true}); err == nil ||
 			!strings.Contains(err.Error(), "health check failed") {
 			t.Fatalf("health error = %v", err)
 		}
@@ -623,6 +700,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 		client, closeServer := readinessClient(t, func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/global/health" {
 				writeJSON(t, w, map[string]any{"healthy": false, "version": "9.0.0"})
+
 				return
 			}
 			w.WriteHeader(http.StatusNotFound)
@@ -630,7 +708,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 		defer closeServer()
 		shortCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 		defer cancel()
-		if err := client.waitReady(shortCtx, shortCtx, openCodeStartOptions{SkipVersionGate: true}); !errors.Is(err, context.DeadlineExceeded) {
+		if err := client.waitReady(shortCtx, shortCtx, StartOptions{SkipVersionGate: true}); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("unhealthy timeout error = %v", err)
 		}
 	})
@@ -656,7 +734,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 					}
 				})
 				defer closeServer()
-				if err := client.waitReady(ctx, ctx, openCodeStartOptions{SkipVersionGate: true}); err == nil {
+				if err := client.waitReady(ctx, ctx, StartOptions{SkipVersionGate: true}); err == nil {
 					t.Fatal("doc readiness error was ignored")
 				}
 			})
@@ -678,7 +756,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 			}
 		})
 		defer closeServer()
-		if err := client.waitReady(ctx, ctx, openCodeStartOptions{SkipVersionGate: true}); err == nil ||
+		if err := client.waitReady(ctx, ctx, StartOptions{SkipVersionGate: true}); err == nil ||
 			!strings.Contains(err.Error(), "event stream failed") {
 			t.Fatalf("event readiness error = %v", err)
 		}
@@ -700,7 +778,7 @@ func TestOpenCodeServerReadinessFailuresAndStreams(t *testing.T) {
 		defer closeServer()
 		shortCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 		defer cancel()
-		if err := client.waitReady(shortCtx, context.Background(), openCodeStartOptions{SkipVersionGate: true}); !errors.Is(err, context.DeadlineExceeded) {
+		if err := client.waitReady(shortCtx, context.Background(), StartOptions{SkipVersionGate: true}); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("event wait error = %v", err)
 		}
 	})
@@ -720,7 +798,7 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 		baseURL:  "http://opencode.test",
 		username: "opencode",
 		password: "secret",
-		events:   make(chan openCodeEvent),
+		events:   make(chan Event),
 		errs:     make(chan error, 1),
 		closed:   make(chan struct{}),
 	}
@@ -760,8 +838,8 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	defer stream.Close()
 	client.httpClient = stream.Client()
 	client.baseURL = stream.URL
-	client.events = make(chan openCodeEvent, 1)
-	if err := client.readEventStream(ctx); !errors.Is(err, errOpenCodeSSEDisconnect) {
+	client.events = make(chan Event, 1)
+	if err := client.readEventStream(ctx); !errors.Is(err, ErrSSEDisconnect) {
 		t.Fatalf("multi-line clean EOF readEventStream error = %v", err)
 	}
 	if event := <-client.events; event.Type != "server.connected" {
@@ -775,8 +853,8 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	defer unterminatedStream.Close()
 	client.httpClient = unterminatedStream.Client()
 	client.baseURL = unterminatedStream.URL
-	client.events = make(chan openCodeEvent, 1)
-	if err := client.readEventStream(ctx); !errors.Is(err, errOpenCodeSSEDisconnect) {
+	client.events = make(chan Event, 1)
+	if err := client.readEventStream(ctx); !errors.Is(err, ErrSSEDisconnect) {
 		t.Fatalf("unterminated clean EOF readEventStream error = %v", err)
 	}
 	if event := <-client.events; event.Type != "server.connected" {
@@ -793,7 +871,7 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 		}, nil
 	})}
 	client.baseURL = "http://opencode.test"
-	client.events = make(chan openCodeEvent, 1)
+	client.events = make(chan Event, 1)
 	if err := client.readEventStream(cancelOnEOF); !errors.Is(err, context.Canceled) {
 		t.Fatalf("post-EOF cancelled stream error = %v", err)
 	}
@@ -805,7 +883,7 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	defer closedFlushStream.Close()
 	client.httpClient = closedFlushStream.Client()
 	client.baseURL = closedFlushStream.URL
-	client.events = make(chan openCodeEvent)
+	client.events = make(chan Event)
 	close(client.closed)
 	if err := client.readEventStream(ctx); !errors.Is(err, io.EOF) {
 		t.Fatalf("closed stream error = %v", err)
@@ -824,7 +902,7 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 		baseURL:    cancelledStream.URL,
 		username:   "opencode",
 		password:   "secret",
-		events:     make(chan openCodeEvent),
+		events:     make(chan Event),
 		errs:       make(chan error, 1),
 		closed:     make(chan struct{}),
 	}
@@ -853,6 +931,7 @@ func TestOpenCodeReadEventsDropsErrorWhenChannelFullAndReconnects(t *testing.T) 
 			if requests == 2 {
 				close(client.closed)
 			}
+
 			return &http.Response{
 				StatusCode: http.StatusInternalServerError,
 				Status:     "500 Internal Server Error",
@@ -863,7 +942,7 @@ func TestOpenCodeReadEventsDropsErrorWhenChannelFullAndReconnects(t *testing.T) 
 		baseURL:  "http://opencode.test",
 		username: "opencode",
 		password: "secret",
-		events:   make(chan openCodeEvent, 1),
+		events:   make(chan Event, 1),
 		errs:     make(chan error, 1),
 		closed:   make(chan struct{}),
 	}
@@ -876,6 +955,7 @@ func TestOpenCodeReadEventsDropsErrorWhenChannelFullAndReconnects(t *testing.T) 
 		}
 		ch := make(chan time.Time, 1)
 		ch <- time.Now()
+
 		return ch
 	}
 	client.readEvents(context.Background())
@@ -920,14 +1000,14 @@ func TestOpenCodeServerCloseTimeoutAndContext(t *testing.T) {
 
 func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	root := t.TempDir()
-	xdg, err := createXDGDirs(root, "")
+	xdg, err := CreateXDGDirs(root, "")
 	if err != nil {
-		t.Fatalf("createXDGDirs: %v", err)
+		t.Fatalf("CreateXDGDirs: %v", err)
 	}
 	if filepath.Base(xdg.Root) != "session" {
 		t.Fatalf("default xdg root = %#v", xdg)
 	}
-	if err := ensureXDGDirs(xdgDirs{Root: "", Data: "x", Config: "x", Cache: "x", State: "x"}); err == nil {
+	if ensureErr := ensureXDGDirs(XDGDirs{Root: "", Data: "x", Config: "x", Cache: "x", State: "x"}); ensureErr == nil {
 		t.Fatal("ensureXDGDirs accepted empty root")
 	}
 	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, "")
@@ -942,21 +1022,21 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("permission config file mode = %v", info.Mode().Perm())
 	}
-	if _, err := materializeOpenCodePermissionConfig(xdg, "deny"); err == nil {
+	if _, denyErr := materializeOpenCodePermissionConfig(xdg, "deny"); denyErr == nil {
 		t.Fatal("unsupported permission config accepted")
 	}
 	configRootFile := filepath.Join(t.TempDir(), "config-file")
-	if err := os.WriteFile(configRootFile, []byte("file"), 0o600); err != nil {
-		t.Fatal(err)
+	if writeErr := os.WriteFile(configRootFile, []byte("file"), 0o600); writeErr != nil {
+		t.Fatal(writeErr)
 	}
-	if _, err := materializeOpenCodePermissionConfig(xdgDirs{Config: configRootFile}, "ask"); err == nil {
+	if _, mkdirErr := materializeOpenCodePermissionConfig(XDGDirs{Config: configRootFile}, "ask"); mkdirErr == nil {
 		t.Fatal("permission config mkdir failure ignored")
 	}
 	configRoot := filepath.Join(t.TempDir(), "config")
-	if err := os.MkdirAll(filepath.Join(configRoot, "opencode", "opencode.json"), 0o700); err != nil {
-		t.Fatal(err)
+	if mkErr := os.MkdirAll(filepath.Join(configRoot, "opencode", "opencode.json"), 0o700); mkErr != nil {
+		t.Fatal(mkErr)
 	}
-	if _, err := materializeOpenCodePermissionConfig(xdgDirs{Config: configRoot}, "ask"); err == nil {
+	if _, writeFailErr := materializeOpenCodePermissionConfig(XDGDirs{Config: configRoot}, "ask"); writeFailErr == nil {
 		t.Fatal("permission config write failure ignored")
 	}
 	port, err := allocatePort()
@@ -977,7 +1057,7 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "bad", "state"), 0o700); err != nil {
 		t.Fatalf("mkdir bad lease: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "bad", "state", leaseFileName), []byte("{"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "bad", "state", LeaseFileName), []byte("{"), 0o600); err != nil {
 		t.Fatalf("write bad lease: %v", err)
 	}
 	if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
@@ -992,12 +1072,12 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	}
 	drainProcessPipe(slog.New(slog.DiscardHandler), "test", strings.NewReader("one\ntwo\n"))
 	for _, value := range []any{float64(-1), int(-1), json.Number("bad")} {
-		if got, ok := intFromNumber(value); ok || got != 0 {
-			t.Fatalf("intFromNumber(%#v) = %d, %v", value, got, ok)
+		if got, ok := IntFromNumber(value); ok || got != 0 {
+			t.Fatalf("IntFromNumber(%#v) = %d, %v", value, got, ok)
 		}
 	}
-	if got, ok := intFromNumber(json.Number("12")); !ok || got != 12 {
-		t.Fatalf("intFromNumber json number = %d, %v", got, ok)
+	if got, ok := IntFromNumber(json.Number("12")); !ok || got != 12 {
+		t.Fatalf("IntFromNumber json number = %d, %v", got, ok)
 	}
 }
 
@@ -1040,7 +1120,7 @@ func TestPortPasswordLeaseAndReaperFaultInjection(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("missing", filepath.Join(stateDir, leaseFileName)); err != nil {
+	if err := os.Symlink("missing", filepath.Join(stateDir, LeaseFileName)); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
 	if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
@@ -1054,7 +1134,7 @@ func TestLeaseReaperVerifiesProcessIdentity(t *testing.T) {
 	}
 	t.Run("unrelated process survives", func(t *testing.T) {
 		root := t.TempDir()
-		xdg, err := createXDGDirs(root, "unrelated")
+		xdg, err := CreateXDGDirs(root, "unrelated")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1063,8 +1143,8 @@ func TestLeaseReaperVerifiesProcessIdentity(t *testing.T) {
 			"XDG_STATE_HOME="+xdg.State,
 			"OPENCODE_SERVER_PASSWORD=secret",
 		)
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start sleep: %v", err)
+		if startErr := cmd.Start(); startErr != nil {
+			t.Fatalf("start sleep: %v", startErr)
 		}
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
@@ -1094,14 +1174,14 @@ func TestLeaseReaperVerifiesProcessIdentity(t *testing.T) {
 			t.Fatalf("unrelated process was killed: %v", err)
 		default:
 		}
-		if _, err := os.Stat(filepath.Join(xdg.State, leaseFileName)); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(filepath.Join(xdg.State, LeaseFileName)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("lease after unrelated reap = %v", err)
 		}
 	})
 
 	t.Run("verified fake opencode is reaped", func(t *testing.T) {
 		root := t.TempDir()
-		xdg, err := createXDGDirs(root, "orphan")
+		xdg, err := CreateXDGDirs(root, "orphan")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1113,8 +1193,8 @@ func TestLeaseReaperVerifiesProcessIdentity(t *testing.T) {
 			"OPENCODE_SERVER_USERNAME=opencode",
 			"OPENCODE_SERVER_PASSWORD=secret",
 		)
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start fake opencode: %v", err)
+		if startErr := cmd.Start(); startErr != nil {
+			t.Fatalf("start fake opencode: %v", startErr)
 		}
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
@@ -1151,7 +1231,7 @@ func TestLeaseReaperVerifiesProcessIdentity(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("verified fake opencode was not reaped")
 		}
-		if _, err := os.Stat(filepath.Join(xdg.State, leaseFileName)); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(filepath.Join(xdg.State, LeaseFileName)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("lease after verified reap = %v", err)
 		}
 	})
@@ -1159,11 +1239,11 @@ func TestLeaseReaperVerifiesProcessIdentity(t *testing.T) {
 
 func TestLeaseIdentityBranchCoverage(t *testing.T) {
 	root := t.TempDir()
-	xdg, err := createXDGDirs(root, "lease")
+	xdg, err := CreateXDGDirs(root, "lease")
 	if err != nil {
 		t.Fatal(err)
 	}
-	leasePath := filepath.Join(xdg.State, leaseFileName)
+	leasePath := filepath.Join(xdg.State, LeaseFileName)
 	baseIdentity := processIdentity{
 		StartTime: "start",
 		Cmdline:   []string{"/usr/bin/opencode", "serve"},
@@ -1225,25 +1305,25 @@ func TestLeaseIdentityBranchCoverage(t *testing.T) {
 	if err := writeLease(xdg.State, baseLease); err != nil {
 		t.Fatal(err)
 	}
-	reapLeaseFile(leasePath, slog.New(slog.DiscardHandler))
+	ReapLeaseFile(leasePath, slog.New(slog.DiscardHandler))
 	if _, err := os.Stat(leasePath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("lease after reap = %v", err)
 	}
-	reapLeaseFile(t.TempDir(), nil)
+	ReapLeaseFile(t.TempDir(), nil)
 }
 
 func TestNativeUnmarshalErrors(t *testing.T) {
-	var part nativePart
+	var part NativePart
 	if err := part.UnmarshalJSON([]byte("{")); err == nil {
-		t.Fatal("nativePart accepted malformed JSON")
+		t.Fatal("NativePart accepted malformed JSON")
 	}
-	var event openCodeEvent
+	var event Event
 	if err := event.UnmarshalJSON([]byte("{")); err == nil {
-		t.Fatal("openCodeEvent accepted malformed JSON")
+		t.Fatal("Event accepted malformed JSON")
 	}
-	var providers providersResponse
+	var providers ProvidersResponse
 	if err := providers.UnmarshalJSON([]byte("{")); err == nil {
-		t.Fatal("providersResponse accepted malformed JSON")
+		t.Fatal("ProvidersResponse accepted malformed JSON")
 	}
 }
 
@@ -1266,6 +1346,7 @@ func fakeOpenCodeExecutable(t *testing.T) string {
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write fake executable: %v", err)
 	}
+
 	return script
 }
 
@@ -1296,6 +1377,7 @@ func runFakeOpenCodeServerProcess() {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if gotUser, gotPassword, ok := r.BasicAuth(); !ok || gotUser != username || gotPassword != password {
 			w.WriteHeader(http.StatusUnauthorized)
+
 			return
 		}
 		switch r.URL.Path {
@@ -1326,7 +1408,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	listen := openCodeListen
 	randReader := openCodeRandReader
 	marshalIndent := openCodeMarshalIndent
-	writeLease := openCodeWriteLease
+	leaseWriter := openCodeWriteLease
 	terminateProcess := openCodeTerminateProcess
 	killProcess := openCodeKillProcess
 	inspectProcess := openCodeInspectProcess
@@ -1341,7 +1423,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodeListen = listen
 		openCodeRandReader = randReader
 		openCodeMarshalIndent = marshalIndent
-		openCodeWriteLease = writeLease
+		openCodeWriteLease = leaseWriter
 		openCodeTerminateProcess = terminateProcess
 		openCodeKillProcess = killProcess
 		openCodeInspectProcess = inspectProcess
@@ -1354,10 +1436,11 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	})
 }
 
-func testXDGDirs(t *testing.T) xdgDirs {
+func testXDGDirs(t *testing.T) XDGDirs {
 	t.Helper()
 	root := t.TempDir()
-	return xdgDirs{
+
+	return XDGDirs{
 		Root:   root,
 		Data:   filepath.Join(root, "data"),
 		Config: filepath.Join(root, "config"),
@@ -1392,6 +1475,7 @@ type eofCancelReadCloser struct {
 
 func (r eofCancelReadCloser) Read([]byte) (int, error) {
 	r.cancel()
+
 	return 0, io.EOF
 }
 
@@ -1439,10 +1523,11 @@ func readinessClient(t *testing.T, handler http.HandlerFunc) (*openCodeServer, f
 		baseURL:    server.URL,
 		username:   "opencode",
 		password:   "secret",
-		events:     make(chan openCodeEvent, 8),
+		events:     make(chan Event, 8),
 		errs:       make(chan error, 8),
 		closed:     make(chan struct{}),
 	}
+
 	return client, func() {
 		close(client.closed)
 		server.Close()
@@ -1469,5 +1554,6 @@ func slicesIndex(values []string, want string) int {
 			return i
 		}
 	}
+
 	return -1
 }

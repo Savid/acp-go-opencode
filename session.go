@@ -13,7 +13,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
+
+const sessionUpdateAvailableCommands = "available_commands_update"
 
 type session struct {
 	agent                 *Agent
@@ -29,7 +32,7 @@ type session struct {
 	env                   map[string]string
 	rawMessages           rawMessageConfig
 
-	client openCodeClient
+	client opencode.Client
 
 	turn                chan struct{}
 	mu                  sync.Mutex
@@ -38,8 +41,8 @@ type session struct {
 	cancelled           bool
 	rawSeq              int64
 	seenParts           map[string]string
-	pending             map[string]permissionRequest
-	questions           map[string]questionRequest
+	pending             map[string]opencode.PermissionRequest
+	questions           map[string]opencode.QuestionRequest
 	processedPermission map[string]struct{}
 	processedQuestion   map[string]struct{}
 	turnEpoch           uint64
@@ -48,7 +51,7 @@ type session struct {
 	failedMessageIDs    map[string]struct{}
 	suppressNextBacklog bool
 	exclusiveTurn       bool
-	commandsByName      map[string]nativeCommand
+	commandsByName      map[string]opencode.NativeCommand
 	availableCommands   []acp.AvailableCommand
 	poisonCause         string
 	closed              bool
@@ -66,36 +69,44 @@ type sessionSnapshot struct {
 	mode                  string
 	env                   map[string]string
 	rawMessages           rawMessageConfig
-	client                openCodeClient
+	client                opencode.Client
 }
 
-func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectories []string, native nativeSession, client openCodeClient, meta sessionMeta, idmap idmapRecord) *session {
+func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectories []string, native opencode.NativeSession, client opencode.Client, meta sessionMeta, idmap idmapRecord) *session {
 	title := native.Title
 	if title == "" {
 		title = "OpenCode session"
 	}
+
 	updatedAt := time.Now().UTC().Format(time.RFC3339)
 	if native.Time.Updated > 0 {
 		updatedAt = time.UnixMilli(native.Time.Updated).UTC().Format(time.RFC3339)
 	}
+
 	providerID := native.Model.ProviderID
+
 	modelID := firstNonEmpty(native.Model.ModelID, native.Model.ID)
 	if meta.Model != "" {
 		providerID, modelID = splitModelValue(meta.Model, providerID, modelID)
 	}
+
 	if idmap.SessionID == "" {
 		idmap.SessionID = string(id)
 	}
+
 	if idmap.NativeSessionID == "" {
 		idmap.NativeSessionID = native.ID
 	}
+
 	if idmap.Format == "" {
 		idmap.Format = SessionStoreFormat
 	}
+
 	now := time.Now().UnixMilli()
 	if idmap.CreatedAtUnixMilli == 0 {
 		idmap.CreatedAtUnixMilli = now
 	}
+
 	idmap.UpdatedAtUnixMilli = now
 
 	return &session{
@@ -113,8 +124,8 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		rawMessages:           meta.RawMessages,
 		client:                client,
 		seenParts:             map[string]string{},
-		pending:               map[string]permissionRequest{},
-		questions:             map[string]questionRequest{},
+		pending:               map[string]opencode.PermissionRequest{},
+		questions:             map[string]opencode.QuestionRequest{},
 		processedPermission:   map[string]struct{}{},
 		processedQuestion:     map[string]struct{}{},
 		activeMessageIDs:      map[string]struct{}{},
@@ -135,31 +146,41 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 	turn := s.turnQueue()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
+
 	if err := s.poisonedErrorLocked(); err != nil {
 		return nil, err
 	}
+
 	if exclusive {
 		if s.exclusiveTurn || len(turn) > 0 {
-			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: "backpressure", "limit": "session_prompt"})
+			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "session_prompt"})
 		}
+
 		s.exclusiveTurn = true
+
 		turn <- struct{}{}
+
 		return func() {
 			s.mu.Lock()
 			<-turn
+
 			s.exclusiveTurn = false
 			s.mu.Unlock()
 		}, nil
 	}
+
 	if s.exclusiveTurn || len(turn) >= cap(turn) {
-		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: "backpressure", "limit": "session_prompt"})
+		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "session_prompt"})
 	}
+
 	turn <- struct{}{}
+
 	return func() {
 		s.mu.Lock()
 		<-turn
@@ -170,25 +191,30 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 func (s *session) turnQueue() chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.turn == nil {
 		limit := defaultMaxConcurrentPrompts
 		if s.agent != nil && s.agent.options.ConcurrencyLimits.MaxConcurrentPrompts > 0 {
 			limit = s.agent.options.ConcurrencyLimits.MaxConcurrentPrompts
 		}
+
 		s.turn = make(chan struct{}, limit)
 	}
+
 	return s.turn
 }
 
 func (s *session) beginTurn(ctx context.Context) context.Context {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	turnCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	s.turnDone = turnCtx.Done()
 	s.cancelled = false
 	s.turnEpoch++
 	s.activeMessageIDs = map[string]struct{}{}
+
 	return turnCtx
 }
 
@@ -199,10 +225,11 @@ func (s *session) finishTurn() {
 	s.turnDone = nil
 	s.cancelled = false
 	s.updatedAt = time.Now().UTC().Format(time.RFC3339)
-	s.pending = map[string]permissionRequest{}
-	s.questions = map[string]questionRequest{}
+	s.pending = map[string]opencode.PermissionRequest{}
+	s.questions = map[string]opencode.QuestionRequest{}
 	s.activeMessageIDs = map[string]struct{}{}
 	s.mu.Unlock()
+
 	if cancel != nil {
 		cancel()
 	}
@@ -210,29 +237,38 @@ func (s *session) finishTurn() {
 
 func (s *session) cancelTurn() {
 	s.mu.Lock()
+
 	cancel := s.cancel
 	if cancel != nil {
 		s.cancelled = true
 	}
-	pending := make([]permissionRequest, 0, len(s.pending))
-	for _, req := range s.pending {
-		pending = append(pending, req)
+
+	pending := make([]opencode.PermissionRequest, 0, len(s.pending))
+	for id := range s.pending {
+		pending = append(pending, s.pending[id])
 	}
-	s.pending = map[string]permissionRequest{}
-	questions := make([]questionRequest, 0, len(s.questions))
+
+	s.pending = map[string]opencode.PermissionRequest{}
+
+	questions := make([]opencode.QuestionRequest, 0, len(s.questions))
 	for _, req := range s.questions {
 		questions = append(questions, req)
 	}
-	s.questions = map[string]questionRequest{}
+
+	s.questions = map[string]opencode.QuestionRequest{}
 	s.mu.Unlock()
+
 	if cancel != nil {
 		cancel()
 	}
+
 	ctx, done := context.WithTimeout(context.Background(), closeTimeout)
 	defer done()
-	for _, req := range pending {
-		_ = s.client.ReplyPermission(ctx, req, "reject", "cancelled")
+
+	for i := range pending {
+		_ = s.client.ReplyPermission(ctx, pending[i], permissionReplyReject, reasonCancelled)
 	}
+
 	for _, req := range questions {
 		_ = s.client.RejectQuestion(ctx, req)
 	}
@@ -241,12 +277,14 @@ func (s *session) cancelTurn() {
 func (s *session) wasCancelled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.cancelled
 }
 
 func (s *session) ensureNotPoisoned() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.poisonedErrorLocked()
 }
 
@@ -254,6 +292,7 @@ func (s *session) poisonedErrorLocked() error {
 	if s.poisonCause == "" {
 		return nil
 	}
+
 	return acp.NewInvalidRequest(map[string]any{
 		jsonFieldError: "session_poisoned",
 		"cause":        s.poisonCause,
@@ -263,6 +302,7 @@ func (s *session) poisonedErrorLocked() error {
 func (s *session) poisonNativeSessionDrift(ctx context.Context, field string, actual string) error {
 	expected := s.idmap.NativeSessionID
 	cause := fmt.Sprintf("%s native session id drift: expected %q, got %q", field, expected, actual)
+
 	return s.poison(ctx, cause)
 }
 
@@ -276,25 +316,30 @@ func (s *session) poison(ctx context.Context, cause string) error {
 	if s.poisonCause != "" {
 		existing := s.poisonedErrorLocked()
 		s.mu.Unlock()
+
 		return existing
 	}
+
 	s.poisonCause = cause
+
 	shouldClear := len(s.availableCommands) > 0
 	if shouldClear {
 		s.availableCommands = []acp.AvailableCommand{}
-		s.commandsByName = map[string]nativeCommand{}
+		s.commandsByName = map[string]opencode.NativeCommand{}
 	}
 	s.mu.Unlock()
 
 	if !shouldClear {
 		return err
 	}
+
 	clearErr := s.emitUpdate(ctx, acp.SessionUpdate{
 		AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
-			SessionUpdate:     "available_commands_update",
+			SessionUpdate:     sessionUpdateAvailableCommands,
 			AvailableCommands: []acp.AvailableCommand{},
 		},
 	})
+
 	return errors.Join(err, clearErr)
 }
 
@@ -302,10 +347,12 @@ func (s *session) markActiveMessageID(messageID string) {
 	if messageID == "" {
 		return
 	}
+
 	s.mu.Lock()
 	if s.activeMessageIDs == nil {
 		s.activeMessageIDs = map[string]struct{}{}
 	}
+
 	s.activeMessageIDs[messageID] = struct{}{}
 	s.mu.Unlock()
 }
@@ -315,37 +362,46 @@ func (s *session) markStreamFailed(epoch uint64) {
 	if s.failedMessageIDs == nil {
 		s.failedMessageIDs = map[string]struct{}{}
 	}
+
 	for messageID := range s.activeMessageIDs {
 		s.failedMessageIDs[messageID] = struct{}{}
 	}
+
 	if epoch > 0 {
 		if s.failedStreamEpochs == nil {
 			s.failedStreamEpochs = map[uint64]struct{}{}
 		}
+
 		s.failedStreamEpochs[epoch] = struct{}{}
 	}
+
 	s.suppressNextBacklog = true
 	s.mu.Unlock()
 }
 
-func (s *session) shouldSuppressEvent(event openCodeEvent) bool {
+func (s *session) shouldSuppressEvent(event opencode.Event) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if event.StreamEpoch > 0 {
 		if _, ok := s.failedStreamEpochs[event.StreamEpoch]; ok {
 			return true
 		}
 	}
+
 	if part, ok := eventPart(event.Properties); ok && part.MessageID != "" {
 		_, ok := s.failedMessageIDs[part.MessageID]
+
 		return ok
 	}
+
 	return false
 }
 
 func (s *session) suppressBacklog() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.suppressNextBacklog
 }
 
@@ -355,11 +411,12 @@ func (s *session) clearSuppressBacklog() {
 	s.mu.Unlock()
 }
 
-func (s *session) addPendingPermission(req permissionRequest) {
+func (s *session) addPendingPermission(req opencode.PermissionRequest) {
 	s.mu.Lock()
 	if s.pending == nil {
-		s.pending = map[string]permissionRequest{}
+		s.pending = map[string]opencode.PermissionRequest{}
 	}
+
 	s.pending[req.ID] = req
 	s.mu.Unlock()
 }
@@ -368,33 +425,41 @@ func (s *session) claimPermissionRequest(id string) bool {
 	if id == "" {
 		return true
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.processedPermission == nil {
 		s.processedPermission = map[string]struct{}{}
 	}
+
 	if _, ok := s.processedPermission[id]; ok {
 		return false
 	}
+
 	s.processedPermission[id] = struct{}{}
+
 	return true
 }
 
-func (s *session) takePendingPermission(id string) (permissionRequest, bool, bool) {
+func (s *session) takePendingPermission(id string) (opencode.PermissionRequest, bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	req, ok := s.pending[id]
 	if ok {
 		delete(s.pending, id)
 	}
+
 	return req, ok, s.cancelled
 }
 
-func (s *session) addPendingQuestion(req questionRequest) {
+func (s *session) addPendingQuestion(req opencode.QuestionRequest) {
 	s.mu.Lock()
 	if s.questions == nil {
-		s.questions = map[string]questionRequest{}
+		s.questions = map[string]opencode.QuestionRequest{}
 	}
+
 	s.questions[req.ID] = req
 	s.mu.Unlock()
 }
@@ -403,31 +468,39 @@ func (s *session) claimQuestionRequest(id string) bool {
 	if id == "" {
 		return true
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.processedQuestion == nil {
 		s.processedQuestion = map[string]struct{}{}
 	}
+
 	if _, ok := s.processedQuestion[id]; ok {
 		return false
 	}
+
 	s.processedQuestion[id] = struct{}{}
+
 	return true
 }
 
-func (s *session) takePendingQuestion(id string) (questionRequest, bool, bool) {
+func (s *session) takePendingQuestion(id string) (opencode.QuestionRequest, bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	req, ok := s.questions[id]
 	if ok {
 		delete(s.questions, id)
 	}
+
 	return req, ok, s.cancelled
 }
 
 func (s *session) snapshot() sessionSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return sessionSnapshot{
 		id:                    s.id,
 		cwd:                   s.cwd,
@@ -446,6 +519,7 @@ func (s *session) snapshot() sessionSnapshot {
 
 func (s *session) setModel(value string) {
 	provider, model := splitModelValue(value, "", "")
+
 	s.mu.Lock()
 	s.providerID = provider
 	s.modelID = model
@@ -458,37 +532,45 @@ func (s *session) setMode(value string) {
 	s.mu.Unlock()
 }
 
-func (s *session) validatedModelSelector(ctx context.Context, field string) (openCodeModelSelector, bool, error) {
+func (s *session) validatedModelSelector(ctx context.Context, field string) (opencode.ModelSelector, bool, error) {
 	snapshot := s.snapshot()
+
 	modelValue := snapshot.modelValue()
 	if err := validateModel(ctx, snapshot.client, modelValue, field); err != nil {
-		return openCodeModelSelector{}, false, err
+		return opencode.ModelSelector{}, false, err
 	}
+
 	if snapshot.providerID == "" || snapshot.modelID == "" {
-		return openCodeModelSelector{}, false, nil
+		return opencode.ModelSelector{}, false, nil
 	}
-	return openCodeModelSelector{ProviderID: snapshot.providerID, ModelID: snapshot.modelID}, true, nil
+
+	return opencode.ModelSelector{ProviderID: snapshot.providerID, ModelID: snapshot.modelID}, true, nil
 }
 
 func (s *session) currentMode() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.mode
 }
 
 func (s *session) commandContext() (string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.mode, joinModelValue(s.providerID, s.modelID)
 }
 
-func (s *session) cachedCommand(name string) (nativeCommand, bool) {
+func (s *session) cachedCommand(name string) (opencode.NativeCommand, bool) {
 	if !validSlashCommandName(name) {
-		return nativeCommand{}, false
+		return opencode.NativeCommand{}, false
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	cmd, ok := s.commandsByName[name]
+
 	return cmd, ok
 }
 
@@ -496,24 +578,32 @@ func (s *session) refreshCommands(ctx context.Context) error {
 	if err := s.ensureNotPoisoned(); err != nil {
 		return err
 	}
+
 	commands, err := s.client.Commands(ctx)
 	if err != nil {
 		return err
 	}
-	commandsByName := make(map[string]nativeCommand, len(commands))
+
+	commandsByName := make(map[string]opencode.NativeCommand, len(commands))
+
 	available := make([]acp.AvailableCommand, 0, len(commands))
-	for _, command := range commands {
+	for i := range commands {
+		command := &commands[i]
 		if !validSlashCommandName(command.Name) {
 			continue
 		}
-		commandsByName[command.Name] = command
-		available = append(available, availableCommandFromNative(command))
+
+		commandsByName[command.Name] = *command
+		available = append(available, availableCommandFromNative(*command))
 	}
+
 	s.mu.Lock()
+
 	changed := !sameAvailableCommands(s.availableCommands, available)
 	if changed {
 		s.availableCommands = cloneAvailableCommands(available)
 	}
+
 	s.commandsByName = commandsByName
 	emit := cloneAvailableCommands(s.availableCommands)
 	s.mu.Unlock()
@@ -521,15 +611,16 @@ func (s *session) refreshCommands(ctx context.Context) error {
 	if !changed {
 		return nil
 	}
+
 	return s.emitUpdate(ctx, acp.SessionUpdate{
 		AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
-			SessionUpdate:     "available_commands_update",
+			SessionUpdate:     sessionUpdateAvailableCommands,
 			AvailableCommands: emit,
 		},
 	})
 }
 
-func availableCommandFromNative(command nativeCommand) acp.AvailableCommand {
+func availableCommandFromNative(command opencode.NativeCommand) acp.AvailableCommand {
 	description := command.Description
 	if description == "" {
 		source := strings.TrimSpace(command.Source)
@@ -539,6 +630,7 @@ func availableCommandFromNative(command nativeCommand) acp.AvailableCommand {
 			description = "OpenCode " + source + " command"
 		}
 	}
+
 	available := acp.AvailableCommand{
 		Name:        command.Name,
 		Description: description,
@@ -548,6 +640,7 @@ func availableCommandFromNative(command nativeCommand) acp.AvailableCommand {
 			Unstructured: &acp.UnstructuredCommandInput{Hint: strings.Join(command.Hints, " ")},
 		}
 	}
+
 	return available
 }
 
@@ -555,6 +648,7 @@ func cloneAvailableCommands(in []acp.AvailableCommand) []acp.AvailableCommand {
 	if in == nil {
 		return nil
 	}
+
 	out := make([]acp.AvailableCommand, len(in))
 	for i := range in {
 		out[i] = in[i]
@@ -562,6 +656,7 @@ func cloneAvailableCommands(in []acp.AvailableCommand) []acp.AvailableCommand {
 			out[i].Meta = cloneAnyMap(in[i].Meta)
 		}
 	}
+
 	return out
 }
 
@@ -569,6 +664,7 @@ func sameAvailableCommands(left []acp.AvailableCommand, right []acp.AvailableCom
 	if len(left) == 0 && len(right) == 0 {
 		return true
 	}
+
 	return reflect.DeepEqual(left, right)
 }
 
@@ -576,32 +672,41 @@ func validSlashCommandName(name string) bool {
 	if name == "" || strings.Contains(name, "/") || !utf8.ValidString(name) {
 		return false
 	}
+
 	for _, r := range name {
 		if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
 			return false
 		}
 	}
+
 	return true
 }
 
 func (s *session) nextRawEventSequence() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.rawSeq++
+
 	return s.rawSeq
 }
 
-func (s *session) markPart(part nativePart) bool {
+func (s *session) markPart(part opencode.NativePart) bool {
 	if part.ID == "" {
 		return true
 	}
+
 	encoded := string(part.Raw)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.seenParts[part.ID] == encoded {
 		return false
 	}
+
 	s.seenParts[part.ID] = encoded
+
 	return true
 }
 
@@ -610,19 +715,26 @@ func (s *session) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+
 		return nil
 	}
+
 	s.closed = true
 	client := s.client
 	nativeID := s.idmap.NativeSessionID
 	s.mu.Unlock()
+
 	var err error
+
 	if client != nil && nativeID != "" {
 		abortCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 		_ = client.Abort(abortCtx, nativeID)
+
 		cancel()
+
 		err = errors.Join(err, client.Close(ctx))
 	}
+
 	return err
 }
 
@@ -634,11 +746,13 @@ func (s *session) DeleteNativeAndClose(ctx context.Context) error {
 	s.mu.Unlock()
 
 	var err error
+
 	if client != nil && nativeID != "" {
 		deleteCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 		if deleteErr := client.DeleteSession(deleteCtx, nativeID); deleteErr != nil && s.agent != nil && s.agent.log != nil {
 			s.agent.log.DebugContext(deleteCtx, "delete native OpenCode session failed", slog.String("error", deleteErr.Error()))
 		}
+
 		cancel()
 	}
 
@@ -649,6 +763,7 @@ func (s *session) info() acp.SessionInfo {
 	snapshot := s.snapshot()
 	title := snapshot.title
 	updatedAt := snapshot.updatedAt
+
 	return acp.SessionInfo{
 		SessionId:             snapshot.id,
 		Cwd:                   snapshot.cwd,
@@ -665,6 +780,7 @@ func firstNonEmpty(values ...string) string {
 			return value
 		}
 	}
+
 	return ""
 }
 
@@ -672,10 +788,12 @@ func splitModelValue(value string, fallbackProvider string, fallbackModel string
 	if value == "" {
 		return fallbackProvider, fallbackModel
 	}
+
 	provider, model, ok := strings.Cut(value, "/")
 	if !ok || provider == "" || model == "" {
 		return fallbackProvider, value
 	}
+
 	return provider, model
 }
 
@@ -683,8 +801,10 @@ func joinModelValue(provider string, model string) string {
 	if provider == "" {
 		return model
 	}
+
 	if model == "" {
 		return provider
 	}
+
 	return provider + "/" + model
 }

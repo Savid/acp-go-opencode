@@ -7,37 +7,38 @@ import (
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 type fakeOpenCodeClient struct {
 	mu sync.Mutex
 
-	xdg xdgDirs
+	xdg opencode.XDGDirs
 
-	createSession nativeSession
-	getSession    nativeSession
-	listSessions  []nativeSession
-	forkSession   nativeSession
-	messages      []nativeMessage
-	todos         []nativeTodo
-	providers     providersResponse
-	agents        []nativeAgent
-	commands      []nativeCommand
+	createSession opencode.NativeSession
+	getSession    opencode.NativeSession
+	listSessions  []opencode.NativeSession
+	forkSession   opencode.NativeSession
+	messages      []opencode.NativeMessage
+	todos         []opencode.NativeTodo
+	providers     opencode.ProvidersResponse
+	agents        []opencode.NativeAgent
+	commands      []opencode.NativeCommand
 
-	pendingPermissions []permissionRequest
+	pendingPermissions []opencode.PermissionRequest
 	permissionReplies  []fakePermissionReply
-	pendingQuestions   []questionRequest
+	pendingQuestions   []opencode.QuestionRequest
 	questionReplies    []fakeQuestionReply
 	questionRejects    []fakeQuestionReject
 
-	createSessionFunc func(context.Context, string) (nativeSession, error)
-	sendMessage       func(context.Context, string, openCodeMessageRequest) (nativeMessage, error)
-	runCommand        func(context.Context, string, openCodeCommandRequest) (nativeMessage, error)
+	createSessionFunc func(context.Context, string) (opencode.NativeSession, error)
+	sendMessage       func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
+	runCommand        func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
 
 	aborts         []string
 	deleted        []string
 	closed         bool
-	events         chan openCodeEvent
+	events         chan opencode.Event
 	errs           chan error
 	createErr      error
 	getErr         error
@@ -60,7 +61,7 @@ type fakeOpenCodeClient struct {
 type fakePermissionReply struct {
 	sessionID string
 	requestID string
-	route     permissionRoute
+	route     opencode.PermissionRoute
 	reply     string
 	message   string
 }
@@ -68,20 +69,20 @@ type fakePermissionReply struct {
 type fakeQuestionReply struct {
 	sessionID string
 	requestID string
-	route     questionRoute
+	route     opencode.QuestionRoute
 	answers   [][]string
 }
 
 type fakeQuestionReject struct {
 	sessionID string
 	requestID string
-	route     questionRoute
+	route     opencode.QuestionRoute
 }
 
 func newFakeOpenCodeClient() *fakeOpenCodeClient {
 	return &fakeOpenCodeClient{
 		providers: testProviders(),
-		events:    make(chan openCodeEvent, 16),
+		events:    make(chan opencode.Event, 16),
 		errs:      make(chan error, 16),
 	}
 }
@@ -90,116 +91,125 @@ func (c *fakeOpenCodeClient) Close(context.Context) error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
+
 	return c.closeErr
 }
 
-func (c *fakeOpenCodeClient) CreateSession(ctx context.Context, title string) (nativeSession, error) {
+func (c *fakeOpenCodeClient) CreateSession(ctx context.Context, title string) (opencode.NativeSession, error) {
 	if c.createSessionFunc != nil {
 		return c.createSessionFunc(ctx, title)
 	}
+
 	return c.createSession, c.createErr
 }
 
-func (c *fakeOpenCodeClient) GetSession(context.Context, string) (nativeSession, error) {
+func (c *fakeOpenCodeClient) GetSession(context.Context, string) (opencode.NativeSession, error) {
 	return c.getSession, c.getErr
 }
 
-func (c *fakeOpenCodeClient) ListSessions(context.Context, string) ([]nativeSession, error) {
-	return append([]nativeSession(nil), c.listSessions...), c.listErr
+func (c *fakeOpenCodeClient) ListSessions(context.Context, string) ([]opencode.NativeSession, error) {
+	return append([]opencode.NativeSession(nil), c.listSessions...), c.listErr
 }
 
 func (c *fakeOpenCodeClient) DeleteSession(_ context.Context, id string) error {
 	c.mu.Lock()
 	c.deleted = append(c.deleted, id)
 	c.mu.Unlock()
+
 	return c.deleteErr
 }
 
-func (c *fakeOpenCodeClient) Commands(context.Context) ([]nativeCommand, error) {
-	return append([]nativeCommand(nil), c.commands...), c.commandsErr
+func (c *fakeOpenCodeClient) Commands(context.Context) ([]opencode.NativeCommand, error) {
+	return append([]opencode.NativeCommand(nil), c.commands...), c.commandsErr
 }
 
-func (c *fakeOpenCodeClient) RunCommand(ctx context.Context, id string, req openCodeCommandRequest) (nativeMessage, error) {
+func (c *fakeOpenCodeClient) RunCommand(ctx context.Context, id string, req opencode.CommandRequest) (opencode.NativeMessage, error) {
 	if c.runCommand != nil {
 		return c.runCommand(ctx, id, req)
 	}
-	return nativeMessage{Info: nativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, c.commandErr
+
+	return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, c.commandErr
 }
 
-func (c *fakeOpenCodeClient) SendMessage(ctx context.Context, id string, req openCodeMessageRequest) (nativeMessage, error) {
+func (c *fakeOpenCodeClient) SendMessage(ctx context.Context, id string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
 	if c.sendMessage != nil {
 		return c.sendMessage(ctx, id, req)
 	}
-	return nativeMessage{Info: nativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
+
+	return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
 }
 
-func (c *fakeOpenCodeClient) Messages(context.Context, string) ([]nativeMessage, error) {
-	return append([]nativeMessage(nil), c.messages...), c.messagesErr
+func (c *fakeOpenCodeClient) Messages(context.Context, string) ([]opencode.NativeMessage, error) {
+	return append([]opencode.NativeMessage(nil), c.messages...), c.messagesErr
 }
 
 func (c *fakeOpenCodeClient) Abort(_ context.Context, id string) error {
 	c.mu.Lock()
 	c.aborts = append(c.aborts, id)
 	c.mu.Unlock()
+
 	return c.abortErr
 }
 
-func (c *fakeOpenCodeClient) Fork(context.Context, string, string) (nativeSession, error) {
+func (c *fakeOpenCodeClient) Fork(context.Context, string, string) (opencode.NativeSession, error) {
 	return c.forkSession, c.forkErr
 }
 
-func (c *fakeOpenCodeClient) Todos(context.Context, string) ([]nativeTodo, error) {
-	return append([]nativeTodo(nil), c.todos...), c.todosErr
+func (c *fakeOpenCodeClient) Todos(context.Context, string) ([]opencode.NativeTodo, error) {
+	return append([]opencode.NativeTodo(nil), c.todos...), c.todosErr
 }
 
-func (c *fakeOpenCodeClient) ConfigProviders(context.Context) (providersResponse, error) {
+func (c *fakeOpenCodeClient) ConfigProviders(context.Context) (opencode.ProvidersResponse, error) {
 	return c.providers, c.providersErr
 }
 
-func (c *fakeOpenCodeClient) Agents(context.Context) ([]nativeAgent, error) {
-	return append([]nativeAgent(nil), c.agents...), c.agentsErr
+func (c *fakeOpenCodeClient) Agents(context.Context) ([]opencode.NativeAgent, error) {
+	return append([]opencode.NativeAgent(nil), c.agents...), c.agentsErr
 }
 
-func (c *fakeOpenCodeClient) PendingPermissions(context.Context) ([]permissionRequest, error) {
-	return append([]permissionRequest(nil), c.pendingPermissions...), c.permissionsErr
+func (c *fakeOpenCodeClient) PendingPermissions(context.Context) ([]opencode.PermissionRequest, error) {
+	return append([]opencode.PermissionRequest(nil), c.pendingPermissions...), c.permissionsErr
 }
 
-func (c *fakeOpenCodeClient) ReplyPermission(_ context.Context, req permissionRequest, reply string, message string) error {
+func (c *fakeOpenCodeClient) ReplyPermission(_ context.Context, req opencode.PermissionRequest, reply string, message string) error {
 	c.mu.Lock()
 	c.permissionReplies = append(c.permissionReplies, fakePermissionReply{
 		sessionID: req.SessionID,
 		requestID: req.ID,
-		route:     req.route(),
+		route:     req.Route(),
 		reply:     reply,
 		message:   message,
 	})
 	c.mu.Unlock()
+
 	return c.replyErr
 }
 
-func (c *fakeOpenCodeClient) PendingQuestions(context.Context) ([]questionRequest, error) {
-	return append([]questionRequest(nil), c.pendingQuestions...), c.questionsErr
+func (c *fakeOpenCodeClient) PendingQuestions(context.Context) ([]opencode.QuestionRequest, error) {
+	return append([]opencode.QuestionRequest(nil), c.pendingQuestions...), c.questionsErr
 }
 
-func (c *fakeOpenCodeClient) ReplyQuestion(_ context.Context, req questionRequest, answers [][]string) error {
+func (c *fakeOpenCodeClient) ReplyQuestion(_ context.Context, req opencode.QuestionRequest, answers [][]string) error {
 	copied := make([][]string, len(answers))
 	for i := range answers {
 		copied[i] = append([]string(nil), answers[i]...)
 	}
 	c.mu.Lock()
-	c.questionReplies = append(c.questionReplies, fakeQuestionReply{sessionID: req.SessionID, requestID: req.ID, route: req.route(), answers: copied})
+	c.questionReplies = append(c.questionReplies, fakeQuestionReply{sessionID: req.SessionID, requestID: req.ID, route: req.Route(), answers: copied})
 	c.mu.Unlock()
+
 	return c.replyErr
 }
 
-func (c *fakeOpenCodeClient) RejectQuestion(_ context.Context, req questionRequest) error {
+func (c *fakeOpenCodeClient) RejectQuestion(_ context.Context, req opencode.QuestionRequest) error {
 	c.mu.Lock()
-	c.questionRejects = append(c.questionRejects, fakeQuestionReject{sessionID: req.SessionID, requestID: req.ID, route: req.route()})
+	c.questionRejects = append(c.questionRejects, fakeQuestionReject{sessionID: req.SessionID, requestID: req.ID, route: req.Route()})
 	c.mu.Unlock()
+
 	return c.replyErr
 }
 
-func (c *fakeOpenCodeClient) Events() <-chan openCodeEvent {
+func (c *fakeOpenCodeClient) Events() <-chan opencode.Event {
 	return c.events
 }
 
@@ -207,43 +217,49 @@ func (c *fakeOpenCodeClient) EventErrors() <-chan error {
 	return c.errs
 }
 
-func (c *fakeOpenCodeClient) XDGDirs() xdgDirs {
+func (c *fakeOpenCodeClient) XDGDirs() opencode.XDGDirs {
 	return c.xdg
 }
 
 func (c *fakeOpenCodeClient) abortCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return len(c.aborts)
 }
 
 func (c *fakeOpenCodeClient) permissionReply(index int) fakePermissionReply {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return c.permissionReplies[index]
 }
 
 func (c *fakeOpenCodeClient) permissionReplyCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return len(c.permissionReplies)
 }
 
 func (c *fakeOpenCodeClient) questionReply(index int) fakeQuestionReply {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return c.questionReplies[index]
 }
 
 func (c *fakeOpenCodeClient) questionReplyCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return len(c.questionReplies)
 }
 
 func (c *fakeOpenCodeClient) questionRejectCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return len(c.questionRejects)
 }
 
@@ -316,6 +332,7 @@ func (c *recordingAgentClient) CreateElicitation(
 	if release != nil {
 		if ignoreContext {
 			<-release
+
 			return resp, err
 		}
 		select {
@@ -324,6 +341,7 @@ func (c *recordingAgentClient) CreateElicitation(
 			return acp.UnstableCreateElicitationResponse{}, ctx.Err()
 		}
 	}
+
 	return resp, err
 }
 
@@ -340,6 +358,7 @@ func (c *recordingAgentClient) RequestPermission(ctx context.Context, request ac
 	if release != nil {
 		if ignoreContext {
 			<-release
+
 			return resp, err
 		}
 		select {
@@ -348,6 +367,7 @@ func (c *recordingAgentClient) RequestPermission(ctx context.Context, request ac
 			return acp.RequestPermissionResponse{}, ctx.Err()
 		}
 	}
+
 	return resp, err
 }
 
@@ -356,6 +376,7 @@ func (c *recordingAgentClient) SessionUpdate(_ context.Context, notification acp
 	c.updates = append(c.updates, notification)
 	err := c.updateErr
 	c.mu.Unlock()
+
 	return err
 }
 
@@ -364,18 +385,21 @@ func (c *recordingAgentClient) NotifyExtension(_ context.Context, method string,
 	c.extensions = append(c.extensions, extensionNotification{method: method, params: params})
 	err := c.notifyErr
 	c.mu.Unlock()
+
 	return err
 }
 
 func (c *recordingAgentClient) updateCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return len(c.updates)
 }
 
 func (c *recordingAgentClient) permissionRequestCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	return len(c.permissions)
 }
 
@@ -412,11 +436,12 @@ type testingT interface {
 	Fatalf(string, ...any)
 }
 
-func testNativeSession(id string) nativeSession {
-	native := nativeSession{ID: id, Title: "Test", Agent: "build"}
+func testNativeSession(id string) opencode.NativeSession {
+	native := opencode.NativeSession{ID: id, Title: "Test", Agent: "build"}
 	native.Model.ProviderID = "openai"
 	native.Model.ModelID = "gpt-test"
 	native.Time.Updated = 1_700_000_000_000
+
 	return native
 }
 
@@ -424,12 +449,33 @@ func testSession(agent *Agent, client *fakeOpenCodeClient) *session {
 	if client.xdg.Root == "" {
 		root, err := os.MkdirTemp("", "acp-go-opencode-test-*")
 		if err == nil {
-			client.xdg, _ = createXDGDirs(root, "session-1")
+			client.xdg, _ = opencode.CreateXDGDirs(root, "session-1")
 		}
 	}
+
 	return newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
 		SessionID:       "session-1",
 		NativeSessionID: "native-1",
 		Format:          SessionStoreFormat,
 	})
+}
+
+type errorReader struct {
+	err error
+}
+
+func (r errorReader) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+type errorReadCloser struct {
+	err error
+}
+
+func (r errorReadCloser) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+func (r errorReadCloser) Close() error {
+	return nil
 }

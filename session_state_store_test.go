@@ -18,18 +18,20 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/savid/acp-go-opencode/internal/opencode"
+
 	"github.com/klauspost/compress/zstd"
 )
 
 func TestSnapshotHydrateScrubsSQLiteCredentialTables(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	xdg, err := createXDGDirs(root, "session-1")
+	xdg, err := opencode.CreateXDGDirs(root, "session-1")
 	if err != nil {
-		t.Fatalf("createXDGDirs: %v", err)
+		t.Fatalf("opencode.CreateXDGDirs: %v", err)
 	}
 	dbPath := filepath.Join(xdg.Data, "opencode", "opencode.db")
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+	if err = os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	seedSQLiteStore(t, dbPath)
@@ -37,10 +39,10 @@ func TestSnapshotHydrateScrubsSQLiteCredentialTables(t *testing.T) {
 	store := NewInMemorySessionStore()
 	client := newFakeOpenCodeClient()
 	client.xdg = xdg
-	client.todos = []nativeTodo{{ID: "todo-1", Content: "Remember", Status: "pending", Priority: "medium"}}
+	client.todos = []opencode.NativeTodo{{ID: "todo-1", Content: "Remember", Status: "pending", Priority: "medium"}}
 	agent := NewAgent(WithSessionStore(store))
 	session := testSession(agent, client)
-	if err := session.snapshotToStore(ctx); err != nil {
+	if err = session.snapshotToStore(ctx); err != nil {
 		t.Fatalf("snapshotToStore: %v", err)
 	}
 
@@ -48,10 +50,10 @@ func TestSnapshotHydrateScrubsSQLiteCredentialTables(t *testing.T) {
 		t.Fatal("snapshot modified live credential tables")
 	}
 
-	if err := os.RemoveAll(xdg.Root); err != nil {
+	if err = os.RemoveAll(xdg.Root); err != nil {
 		t.Fatalf("remove original xdg: %v", err)
 	}
-	restored, err := createXDGDirs(root, "session-1-restored")
+	restored, err := opencode.CreateXDGDirs(root, "session-1-restored")
 	if err != nil {
 		t.Fatalf("create restored xdg: %v", err)
 	}
@@ -91,7 +93,7 @@ func TestDecodeXDGArchiveRejectsTraversalAndBadChecksum(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
-	_, _, ok, err := hydrateStateFromStore(ctx, store, "s", xdgDirs{
+	_, _, ok, err := hydrateStateFromStore(ctx, store, "s", opencode.XDGDirs{
 		Data:   filepath.Join(t.TempDir(), "data"),
 		Config: filepath.Join(t.TempDir(), "config"),
 		Cache:  filepath.Join(t.TempDir(), "cache"),
@@ -135,7 +137,7 @@ func TestStateStoreArchiveRoundTripAndHelpers(t *testing.T) {
 		t.Fatalf("sha = %q", sha)
 	}
 	target := t.TempDir()
-	if err := decodeXDGArchive(archive, target); err != nil {
+	if err = decodeXDGArchive(archive, target); err != nil {
 		t.Fatalf("decodeXDGArchive: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(target, "nested", "file.txt"))
@@ -162,7 +164,7 @@ func TestStateStoreArchiveRoundTripAndHelpers(t *testing.T) {
 
 func TestHydrateStateFromStoreErrors(t *testing.T) {
 	ctx := context.Background()
-	xdg, err := createXDGDirs(t.TempDir(), "hydrate")
+	xdg, err := opencode.CreateXDGDirs(t.TempDir(), "hydrate")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +204,7 @@ func TestHydrateStateFromStoreErrors(t *testing.T) {
 
 func TestHydrateStateAgreementRejectsMismatches(t *testing.T) {
 	ctx := context.Background()
-	xdg, err := createXDGDirs(t.TempDir(), "hydrate")
+	xdg, err := opencode.CreateXDGDirs(t.TempDir(), "hydrate")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,10 +300,10 @@ func TestSnapshotToStoreNilClientAndFileSQLiteErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE regular (id TEXT PRIMARY KEY, body TEXT)`); err != nil {
+	if _, err = db.Exec(`CREATE TABLE regular (id TEXT PRIMARY KEY, body TEXT)`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
+	if err = db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	db, err = sql.Open("sqlite", dbPath)
@@ -360,6 +362,7 @@ func TestSnapshotToStoreMarshalAndArchiveFaults(t *testing.T) {
 				if calls == failAt {
 					return nil, errors.New("marshal failed")
 				}
+
 				return json.Marshal(value)
 			}
 			if err := snapshotFaultSession(t).snapshotToStore(ctx); err == nil {
@@ -371,7 +374,7 @@ func TestSnapshotToStoreMarshalAndArchiveFaults(t *testing.T) {
 
 func TestHydrateStateFromStoreFaults(t *testing.T) {
 	ctx := context.Background()
-	xdg, err := createXDGDirs(t.TempDir(), "hydrate")
+	xdg, err := opencode.CreateXDGDirs(t.TempDir(), "hydrate")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,6 +443,7 @@ func TestHydrateStateFromStoreFaults(t *testing.T) {
 					if _, _, _, err := hydrateStateFromStore(ctx, errStore, "s", xdg); err == nil {
 						t.Fatal("hydrate ignored archive load error")
 					}
+
 					return
 				}
 				mutate(store)
@@ -579,6 +583,7 @@ func TestDecodeXDGArchiveFaults(t *testing.T) {
 				if calls == 2 {
 					return "", errors.New("child abs failed")
 				}
+
 				return filepath.Clean(path), nil
 			}
 		}},
@@ -589,6 +594,7 @@ func TestDecodeXDGArchiveFaults(t *testing.T) {
 				if calls == 2 {
 					return filepath.Join(string(os.PathSeparator), "elsewhere"), nil
 				}
+
 				return filepath.Clean(path), nil
 			}
 		}},
@@ -599,6 +605,7 @@ func TestDecodeXDGArchiveFaults(t *testing.T) {
 				if calls == 2 {
 					return errors.New("dir mkdir failed")
 				}
+
 				return nil
 			}
 		}},
@@ -610,6 +617,7 @@ func TestDecodeXDGArchiveFaults(t *testing.T) {
 				if calls == 2 {
 					return errors.New("parent mkdir failed")
 				}
+
 				return nil
 			}
 		}},
@@ -669,6 +677,7 @@ func TestSQLiteArchiveAndCopyFaults(t *testing.T) {
 				if calls > 1 {
 					return errors.New("copy companion failed")
 				}
+
 				return copyFile(source, target, mode)
 			}
 		},
@@ -833,13 +842,14 @@ func restoreStateStoreSeams(t *testing.T) {
 func snapshotFaultSession(t *testing.T) *session {
 	t.Helper()
 	root := t.TempDir()
-	xdg, err := createXDGDirs(root, "session-1")
+	xdg, err := opencode.CreateXDGDirs(root, "session-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	client := newFakeOpenCodeClient()
 	client.xdg = xdg
 	agent := NewAgent(WithSessionStore(NewInMemorySessionStore()))
+
 	return testSession(agent, client)
 }
 
@@ -868,6 +878,7 @@ func validHydrateStore(t *testing.T, ctx context.Context) *InMemorySessionStore 
 	if err := store.Replace(ctx, main, replacements); err != nil {
 		t.Fatal(err)
 	}
+
 	return store
 }
 
@@ -944,6 +955,7 @@ func mustStateJSON(t *testing.T, value any) SessionStoreEntry {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return SessionStoreEntry(data)
 }
 
@@ -957,6 +969,7 @@ func (s selectiveLoadErrorStore) Load(ctx context.Context, key SessionKey) ([]Se
 	if key == s.key {
 		return nil, s.err
 	}
+
 	return s.SessionStore.Load(ctx, key)
 }
 
@@ -974,6 +987,7 @@ func (w fakeTarWriter) Write(p []byte) (int, error) {
 	if w.writeErr != nil {
 		return 0, w.writeErr
 	}
+
 	return len(p), nil
 }
 
@@ -990,6 +1004,7 @@ func (w fakeZstdWriter) Write(p []byte) (int, error) {
 	if w.writeErr != nil {
 		return 0, w.writeErr
 	}
+
 	return len(p), nil
 }
 
@@ -1031,6 +1046,7 @@ func testZstdBytes(t *testing.T, data []byte) []byte {
 	if err := zw.Close(); err != nil {
 		t.Fatalf("zstd close: %v", err)
 	}
+
 	return zbuf.Bytes()
 }
 
@@ -1041,6 +1057,7 @@ func testTarZstdPartial(t *testing.T, header tar.Header) []byte {
 	if err := tw.WriteHeader(&header); err != nil {
 		t.Fatalf("write partial header: %v", err)
 	}
+
 	return testZstdBytes(t, tarbuf.Bytes())
 }
 
@@ -1056,6 +1073,7 @@ func openFaultSQL(t *testing.T, scenario string) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return db
 }
 
@@ -1161,6 +1179,7 @@ func (r *faultRows) Next(dest []driver.Value) error {
 	if r.nextErr != nil {
 		err := r.nextErr
 		r.nextErr = nil
+
 		return err
 	}
 	if r.index >= len(r.rows) {
@@ -1168,6 +1187,7 @@ func (r *faultRows) Next(dest []driver.Value) error {
 	}
 	copy(dest, r.rows[r.index])
 	r.index++
+
 	return nil
 }
 
@@ -1207,6 +1227,7 @@ func countSQLiteRows(t *testing.T, path string, table string) int {
 	if err := db.QueryRow("SELECT count(*) FROM " + quoteSQLiteIdent(table)).Scan(&count); err != nil {
 		t.Fatalf("count %s: %v", table, err)
 	}
+
 	return count
 }
 
@@ -1266,5 +1287,6 @@ func testTarZstd(t *testing.T, headers []tar.Header, bodies map[string]string) [
 	if err := zw.Close(); err != nil {
 		t.Fatalf("zstd close: %v", err)
 	}
+
 	return zbuf.Bytes()
 }

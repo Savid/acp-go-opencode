@@ -5,11 +5,15 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/savid/acp-go-opencode/internal/opencode"
+
 	"github.com/savid/acp-go-opencode/internal/defaults"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
+
+const defaultAgentName = "acp-go-opencode"
 
 // Option configures the OpenCode ACP agent.
 type Option func(*Options)
@@ -47,18 +51,18 @@ type Options struct {
 	MinimumVersion     string
 	HealthCheckTimeout time.Duration
 
-	clientFactory func(context.Context, openCodeStartOptions) (openCodeClient, error)
+	clientFactory func(context.Context, opencode.StartOptions) (opencode.Client, error)
 }
 
 func applyOptions(opts []Option) Options {
 	options := Options{
-		AgentName:               "acp-go-opencode",
-		AgentTitle:              "acp-go-opencode",
+		AgentName:               defaultAgentName,
+		AgentTitle:              defaultAgentName,
 		AgentVersion:            "0.1.0",
 		SessionStoreLoadTimeout: 10 * time.Second,
 		HealthCheckTimeout:      defaults.HealthCheckTimeout,
 		MinimumVersion:          "1.17.13",
-		clientFactory:           startOpenCodeServer,
+		clientFactory:           opencode.StartServer,
 	}
 	for _, opt := range opts {
 		opt(&options)

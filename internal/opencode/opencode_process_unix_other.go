@@ -1,6 +1,6 @@
 //go:build unix && !linux && !freebsd && !darwin
 
-package opencodeacp
+package opencode
 
 import (
 	"errors"

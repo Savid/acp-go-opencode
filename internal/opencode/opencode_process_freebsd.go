@@ -1,6 +1,6 @@
 //go:build freebsd
 
-package opencodeacp
+package opencode
 
 import (
 	"errors"

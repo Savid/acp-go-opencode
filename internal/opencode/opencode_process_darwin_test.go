@@ -1,6 +1,6 @@
 //go:build darwin
 
-package opencodeacp
+package opencode
 
 import (
 	"errors"
@@ -137,5 +137,6 @@ func procArgs2Buffer(argc byte, execPath string, args, env []string) []byte {
 		data = append(data, 0)
 	}
 	data = append(data, 0)
+
 	return data
 }

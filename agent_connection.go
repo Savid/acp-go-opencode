@@ -96,6 +96,7 @@ func (g *connectionInputGate) Read(p []byte) (int, error) {
 	if n > 0 {
 		g.observeInput(p[:n])
 	}
+
 	return n, err
 }
 
@@ -103,12 +104,14 @@ func (g *connectionInputGate) observeInput(data []byte) {
 	if g.postWriter == nil {
 		return
 	}
+
 	g.pending = append(g.pending, data...)
 	for {
 		index := bytes.IndexByte(g.pending, '\n')
 		if index < 0 {
 			return
 		}
+
 		line := append([]byte(nil), g.pending[:index]...)
 		g.pending = g.pending[index+1:]
 		g.postWriter.observeRequestLine(line)
@@ -126,8 +129,10 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 			jsonFieldError:  "initialize must be called before other ACP methods",
 		})
 	}
+
 	if strings.HasPrefix(method, "_") {
 		result, err := c.agent.HandleExtensionMethod(ctx, method, params)
+
 		return result, requestError(err)
 	}
 
@@ -135,6 +140,7 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 	if !ok {
 		return nil, acp.NewMethodNotFound(method)
 	}
+
 	result, reqErr := handler(ctx, c.agent, params)
 	if method == acp.AgentMethodInitialize && reqErr == nil {
 		c.initialized.Store(true)
@@ -173,6 +179,7 @@ func (w *postResponseWriter) observeRequestLine(line []byte) {
 	if !ok {
 		return
 	}
+
 	key, _ := jsonRPCIDKey(target.id)
 
 	w.mu.Lock()
@@ -185,11 +192,13 @@ func (w *postResponseWriter) Write(p []byte) (int, error) {
 	if err != nil {
 		return n, err
 	}
+
 	for _, hook := range w.hooksForResponseLine(p) {
 		if hook != nil {
 			go hook()
 		}
 	}
+
 	return n, nil
 }
 
@@ -203,10 +212,12 @@ func postLifecycleRequestFromLine(line []byte) (postLifecycleLineTarget, bool) {
 	if err := json.Unmarshal(bytes.TrimSpace(line), &msg); err != nil || msg.ID == nil || msg.Method == "" {
 		return postLifecycleLineTarget{}, false
 	}
+
 	request, ok := postLifecycleRequestFromMessage(msg.Method, msg.Params)
 	if !ok {
 		return postLifecycleLineTarget{}, false
 	}
+
 	return postLifecycleLineTarget{id: *msg.ID, request: request}, true
 }
 
@@ -221,6 +232,7 @@ func postLifecycleRequestFromMessage(method string, params json.RawMessage) (pos
 		if err := json.Unmarshal(params, &req); err != nil || req.SessionID == "" {
 			return postLifecycleRequest{}, false
 		}
+
 		return postLifecycleRequest{sessionID: req.SessionID}, true
 	default:
 		return postLifecycleRequest{}, false
@@ -231,18 +243,22 @@ func (w *postResponseWriter) hooksForResponseLine(line []byte) []func() {
 	if w.hookForID == nil {
 		return nil
 	}
+
 	var msg jsonRPCWireMessage
 	if err := json.Unmarshal(bytes.TrimSpace(line), &msg); err != nil || msg.ID == nil || msg.Method != "" {
 		return nil
 	}
+
 	key, _ := jsonRPCIDKey(*msg.ID)
 
 	w.mu.Lock()
+
 	request, ok := w.lifecycle[key]
 	if ok {
 		delete(w.lifecycle, key)
 	}
 	w.mu.Unlock()
+
 	if !ok || len(msg.Error) > 0 || len(msg.Result) == 0 {
 		return nil
 	}
@@ -255,11 +271,14 @@ func (w *postResponseWriter) hooksForResponseLine(line []byte) []func() {
 		if err := json.Unmarshal(msg.Result, &result); err != nil {
 			return nil
 		}
+
 		sessionID = result.SessionID
 	}
+
 	if sessionID == "" {
 		return nil
 	}
+
 	return []func(){w.hookForID(sessionID)}
 }
 
@@ -268,10 +287,12 @@ func jsonRPCIDKey(raw json.RawMessage) (string, bool) {
 	if len(trimmed) == 0 {
 		return "", false
 	}
+
 	var compacted bytes.Buffer
 	if err := json.Compact(&compacted, trimmed); err != nil {
 		return "", false
 	}
+
 	return compacted.String(), true
 }
 
@@ -283,6 +304,7 @@ func localResponse[Req any, ReqPtr localAgentParams[Req], Resp any](
 		if reqErr != nil {
 			return nil, reqErr
 		}
+
 		resp, err := call(agent, ctx, value)
 		if err != nil {
 			return nil, requestError(err)
@@ -300,10 +322,12 @@ func localLifecycleResponse[Req any, ReqPtr localAgentParams[Req], Resp any](
 		if reqErr != nil {
 			return nil, reqErr
 		}
+
 		resp, err := call(agent, ctx, value)
 		if err != nil {
 			return nil, requestError(err)
 		}
+
 		return resp, nil
 	}
 }
@@ -316,6 +340,7 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 		if reqErr != nil {
 			return nil, reqErr
 		}
+
 		if err := call(agent, ctx, value); err != nil {
 			return nil, requestError(err)
 		}
@@ -329,6 +354,7 @@ func decodeLocalAgentParams[Req any, ReqPtr localAgentParams[Req]](params json.R
 	if err := json.Unmarshal(params, &value); err != nil {
 		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
 	}
+
 	if err := ReqPtr(&value).Validate(); err != nil {
 		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
 	}
@@ -352,6 +378,7 @@ func (c *localAgentConnection) CreateElicitation(
 	if err != nil {
 		return acp.UnstableCreateElicitationResponse{}, err
 	}
+
 	release, err := c.agent.acquireClientCall(ctx)
 	if err != nil {
 		return acp.UnstableCreateElicitationResponse{}, err
@@ -388,6 +415,7 @@ func (c *localAgentConnection) NotifyExtension(ctx context.Context, method strin
 	if method == "" || !strings.HasPrefix(method, "_") {
 		return fmt.Errorf("extension method name must start with '_' (got %q)", method)
 	}
+
 	release, err := c.agent.acquireClientCall(ctx)
 	if err != nil {
 		return err
@@ -401,10 +429,12 @@ func requestError(err error) *acp.RequestError {
 	if err == nil {
 		return nil
 	}
+
 	var reqErr *acp.RequestError
 	if errors.As(err, &reqErr) {
 		return reqErr
 	}
+
 	if errors.Is(err, context.Canceled) {
 		return acp.NewRequestCancelled(map[string]any{jsonFieldError: err.Error()})
 	}
@@ -422,7 +452,7 @@ func scopedElicitationParams(
 	case params.Form != nil:
 		payload = map[string]any{
 			jsonFieldMessage:  params.Form.Message,
-			"mode":            "form",
+			jsonFieldMode:     elicitationModeForm,
 			"requestedSchema": params.Form.RequestedSchema,
 		}
 		if len(params.Form.Meta) > 0 {
@@ -432,8 +462,8 @@ func scopedElicitationParams(
 		payload = map[string]any{
 			"elicitationId":  params.Url.ElicitationId,
 			jsonFieldMessage: params.Url.Message,
-			"mode":           "url",
-			"url":            params.Url.Url,
+			jsonFieldMode:    elicitationModeURL,
+			jsonFieldURL:     params.Url.Url,
 		}
 		if len(params.Url.Meta) > 0 {
 			payload["_meta"] = params.Url.Meta
@@ -445,9 +475,11 @@ func scopedElicitationParams(
 	if scope.SessionID != "" {
 		payload[jsonFieldSessionID] = scope.SessionID
 	}
+
 	if scope.ToolCallID != "" {
 		payload["toolCallId"] = scope.ToolCallID
 	}
+
 	if scope.RequestID != nil {
 		payload["requestId"] = scope.RequestID
 	}

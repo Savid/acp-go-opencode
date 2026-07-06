@@ -34,7 +34,28 @@ const (
 	jsonFieldMethod         = "method"
 	jsonFieldSessionID      = "sessionId"
 	jsonFieldCwd            = "cwd"
+	jsonFieldSequence       = "sequence"
+	jsonFieldEvent          = "event"
+	jsonFieldSource         = "source"
+	jsonFieldField          = "field"
+	jsonFieldServer         = "server"
+	jsonFieldCommand        = "command"
+	jsonFieldMessageID      = "messageId"
+	jsonFieldMode           = "mode"
+	jsonFieldURL            = "url"
+	jsonFieldMime           = "mime"
+	jsonFieldTool           = "tool"
+	jsonFieldType           = "type"
+	jsonFieldValue          = "value"
+	jsonFieldLimit          = "limit"
+	jsonFieldTitle          = "title"
 	validationRequired      = "required"
+	errValueBackpressure    = "backpressure"
+	errValueUnsupported     = "unsupported"
+	errValueSessionDeleted  = "deleted"
+	errValueSessionUnknown  = "unknown"
+	elicitationModeForm     = "form"
+	elicitationModeURL      = "url"
 )
 
 type rawMessageConfig struct {
@@ -46,7 +67,9 @@ func rawMessageConfigFromMeta(meta map[string]any) rawMessageConfig {
 	if opencodeMeta == nil {
 		return rawMessageConfig{}
 	}
+
 	rawEvent, _ := opencodeMeta[rawEventKey].(map[string]any)
+
 	enabled, _ := rawEvent[rawEventEnabledKey].(bool)
 	if enabled {
 		return rawMessageConfig{enabled: true}
@@ -66,12 +89,12 @@ func capRawEventPayload(payload map[string]any) map[string]any {
 	}
 
 	return map[string]any{
-		"sessionId": payload["sessionId"],
-		"sequence":  payload["sequence"],
-		"source":    payload["source"],
-		"event": map[string]any{
-			"truncated": true,
-			"error":     fmt.Sprintf("raw event exceeded %d bytes", rawEventMaxBytes),
+		jsonFieldSessionID: payload[jsonFieldSessionID],
+		jsonFieldSequence:  payload[jsonFieldSequence],
+		jsonFieldSource:    payload[jsonFieldSource],
+		jsonFieldEvent: map[string]any{
+			"truncated":    true,
+			jsonFieldError: fmt.Sprintf("raw event exceeded %d bytes", rawEventMaxBytes),
 		},
 	}
 }

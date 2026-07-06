@@ -1,6 +1,6 @@
 //go:build unix
 
-package opencodeacp
+package opencode
 
 import (
 	"errors"
@@ -63,6 +63,7 @@ func TestOpenCodeProcessSignalBranches(t *testing.T) {
 		if pid != 123 || signal != syscall.SIGTERM {
 			t.Fatalf("kill pid=%d signal=%v", pid, signal)
 		}
+
 		return nil
 	}
 	if err := killProcessID(123); err != nil {
@@ -75,11 +76,11 @@ func TestOpenCodeProcessSignalBranches(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	xdg, err := createXDGDirs(root, "lease-log")
+	xdg, err := CreateXDGDirs(root, "lease-log")
 	if err != nil {
 		t.Fatal(err)
 	}
-	leasePath := filepath.Join(xdg.State, leaseFileName)
+	leasePath := filepath.Join(xdg.State, LeaseFileName)
 	openCodeInspectProcess = func(int) (processIdentity, error) {
 		return processIdentity{
 			StartTime: "start",
@@ -100,7 +101,7 @@ func TestOpenCodeProcessSignalBranches(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	reapLeaseFile(leasePath, slog.New(slog.DiscardHandler))
+	ReapLeaseFile(leasePath, slog.New(slog.DiscardHandler))
 	if _, err := os.Stat(leasePath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("lease after logged reap = %v", err)
 	}

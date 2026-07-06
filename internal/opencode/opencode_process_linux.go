@@ -1,6 +1,6 @@
 //go:build linux
 
-package opencodeacp
+package opencode
 
 import (
 	"errors"

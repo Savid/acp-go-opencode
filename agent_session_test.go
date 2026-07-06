@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
@@ -20,7 +21,7 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	parent.getSession = parent.createSession
 	parent.forkSession = testNativeSession("native-child")
 	parent.providers = testProviders()
-	parent.agents = []nativeAgent{{Name: "build", Description: "Build"}, {Name: "plan", Description: "Plan"}}
+	parent.agents = []opencode.NativeAgent{{Name: "build", Description: "Build"}, {Name: "plan", Description: "Plan"}}
 	child := newFakeOpenCodeClient()
 	child.getSession = testNativeSession("native-child")
 	child.providers = parent.providers
@@ -32,7 +33,7 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 		WithHome(root),
 		WithSessionStore(store),
 		func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 				factoryCalls++
 				permissions = append(permissions, opts.Permission)
 				client := parent
@@ -42,12 +43,13 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 				xdg := opts.ExistingXDG
 				if xdg.Root == "" {
 					var err error
-					xdg, err = createXDGDirs(opts.Root, string(opts.ACPSessionID))
+					xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
 					if err != nil {
 						return nil, err
 					}
 				}
 				client.xdg = xdg
+
 				return client, nil
 			}
 		},
@@ -70,13 +72,13 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	if len(permissions) != 1 || permissions[0] != "allow" {
 		t.Fatalf("start permissions = %#v", permissions)
 	}
-	if _, err := agent.SetSessionConfigOption(ctx, SetModelRequest(newResp.SessionId, "openai/gpt-other")); err != nil {
+	if _, err = agent.SetSessionConfigOption(ctx, SetModelRequest(newResp.SessionId, "openai/gpt-other")); err != nil {
 		t.Fatalf("SetModel: %v", err)
 	}
-	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(newResp.SessionId, configMode, "plan")); err != nil {
+	if _, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(newResp.SessionId, configMode, "plan")); err != nil {
 		t.Fatalf("SetMode: %v", err)
 	}
-	if _, err := agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
+	if _, err = agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
 		Boolean: &acp.SetSessionConfigOptionBoolean{SessionId: newResp.SessionId, ConfigId: configMode, Type: "boolean", Value: true},
 	}); err == nil {
 		t.Fatal("boolean config option unexpectedly accepted")
@@ -97,8 +99,8 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fork extension: %v", err)
 	}
-	forkResp := forkAny.(acp.UnstableForkSessionResponse)
-	if forkResp.SessionId == "" || forkResp.SessionId == newResp.SessionId {
+	forkResp, ok := forkAny.(acp.UnstableForkSessionResponse)
+	if !ok || forkResp.SessionId == "" || forkResp.SessionId == newResp.SessionId {
 		t.Fatalf("fork response = %#v", forkResp)
 	}
 	idEntries, err := store.Load(ctx, SessionKey{SessionID: string(forkResp.SessionId), Subpath: idmapSubpath})
@@ -113,6 +115,11 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 		t.Fatalf("child idmap lineage = %#v", idmap)
 	}
 
+	assertCloseDeleteAndLineage(t, ctx, agent, newResp, forkResp, cwd, root, parent, child)
+}
+
+func assertCloseDeleteAndLineage(t *testing.T, ctx context.Context, agent *Agent, newResp acp.NewSessionResponse, forkResp acp.UnstableForkSessionResponse, cwd, root string, parent, child *fakeOpenCodeClient) {
+	t.Helper()
 	if _, err := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: newResp.SessionId}); err != nil {
 		t.Fatalf("CloseSession: %v", err)
 	}
@@ -137,17 +144,19 @@ func TestNewSessionRejectsInvalidRequestedModel(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
 	client := newFakeOpenCodeClient()
-	client.createSessionFunc = func(context.Context, string) (nativeSession, error) {
+	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
 		t.Fatal("CreateSession called after invalid model")
-		return nativeSession{}, nil
+
+		return opencode.NativeSession{}, nil
 	}
 	agent := NewAgent(func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			var err error
-			client.xdg, err = createXDGDirs(opts.Root, string(opts.ACPSessionID))
+			client.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
 			if err != nil {
 				return nil, err
 			}
+
 			return client, nil
 		}
 	})
@@ -166,7 +175,7 @@ func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
 	root := t.TempDir()
 	store := NewInMemorySessionStore()
 	sourceClient := newFakeOpenCodeClient()
-	sourceXDG, err := createXDGDirs(root, "source")
+	sourceXDG, err := opencode.CreateXDGDirs(root, "source")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,24 +183,25 @@ func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
 	agent := NewAgent(WithHome(root), WithSessionStore(store))
 	session := testSession(agent, sourceClient)
 	session.cwd = root
-	if err := session.snapshotToStore(ctx); err != nil {
+	if err = session.snapshotToStore(ctx); err != nil {
 		t.Fatalf("snapshotToStore: %v", err)
 	}
 
 	loadedClient := newFakeOpenCodeClient()
 	loadedClient.getSession = testNativeSession("native-1")
 	loadedClient.providers = testProviders()
-	loadedClient.agents = []nativeAgent{{Name: "build"}}
-	var replayPart nativePart
-	if err := json.Unmarshal([]byte(`{"id":"part-1","sessionID":"native-1","messageID":"user-1","type":"text","text":"hello"}`), &replayPart); err != nil {
+	loadedClient.agents = []opencode.NativeAgent{{Name: "build"}}
+	var replayPart opencode.NativePart
+	if err = json.Unmarshal([]byte(`{"id":"part-1","sessionID":"native-1","messageID":"user-1","type":"text","text":"hello"}`), &replayPart); err != nil {
 		t.Fatal(err)
 	}
-	loadedClient.messages = []nativeMessage{{
-		Info:  nativeMessageInfo{ID: "user-1", SessionID: "native-1", Role: "user"},
-		Parts: []nativePart{replayPart},
+	loadedClient.messages = []opencode.NativeMessage{{
+		Info:  opencode.NativeMessageInfo{ID: "user-1", SessionID: "native-1", Role: "user"},
+		Parts: []opencode.NativePart{replayPart},
 	}}
-	agent.options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+	agent.options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 		loadedClient.xdg = opts.ExistingXDG
+
 		return loadedClient, nil
 	}
 	conn := newRecordingAgentClient()
@@ -206,13 +216,14 @@ func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
 
 	invalidClient := newFakeOpenCodeClient()
 	invalidClient.getSession = testNativeSession("native-1")
-	invalidClient.providers = providersResponse{Providers: []providerInfo{{
+	invalidClient.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
 		ID:     "openai",
-		Models: map[string]providerModel{"other": {ID: "other"}},
+		Models: map[string]opencode.ProviderModel{"other": {ID: "other"}},
 	}}}
 	invalidAgent := NewAgent(WithHome(root), WithSessionStore(store), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			invalidClient.xdg = opts.ExistingXDG
+
 			return invalidClient, nil
 		}
 	})
@@ -245,7 +256,7 @@ func TestAgentSessionLifecycleErrorBranches(t *testing.T) {
 			t.Fatal("bad meta accepted")
 		}
 		factoryErr := NewAgent(func(options *Options) {
-			options.clientFactory = func(context.Context, openCodeStartOptions) (openCodeClient, error) {
+			options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 				return nil, errors.New("factory failed")
 			}
 		})
@@ -255,8 +266,9 @@ func TestAgentSessionLifecycleErrorBranches(t *testing.T) {
 		createErrClient := newFakeOpenCodeClient()
 		createErrClient.createErr = errors.New("create failed")
 		agent := NewAgent(func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
-				createErrClient.xdg, _ = createXDGDirs(opts.Root, string(opts.ACPSessionID))
+			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
+				createErrClient.xdg, _ = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
+
 				return createErrClient, nil
 			}
 		})
@@ -301,7 +313,7 @@ func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
 	cwd := t.TempDir()
 	store := NewInMemorySessionStore()
 	sourceClient := newFakeOpenCodeClient()
-	sourceXDG, err := createXDGDirs(root, "source")
+	sourceXDG, err := opencode.CreateXDGDirs(root, "source")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,36 +321,38 @@ func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
 	seedAgent := NewAgent(WithHome(root), WithSessionStore(store))
 	seed := testSession(seedAgent, sourceClient)
 	seed.cwd = cwd
-	if err := seed.snapshotToStore(ctx); err != nil {
+	if err = seed.snapshotToStore(ctx); err != nil {
 		t.Fatalf("snapshotToStore: %v", err)
 	}
 
 	loadedClient := newFakeOpenCodeClient()
 	loadedClient.getSession = testNativeSession("native-1")
 	loadedClient.providers = testProviders()
-	loadedClient.agents = []nativeAgent{{Name: "build"}}
+	loadedClient.agents = []opencode.NativeAgent{{Name: "build"}}
 	loadAgent := NewAgent(WithHome(root), WithSessionStore(store), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			loadedClient.xdg = opts.ExistingXDG
+
 			return loadedClient, nil
 		}
 	})
-	if _, err := loadAgent.ResumeSession(ctx, ResumeSessionRequest("session-1", cwd)); err != nil {
+	if _, err = loadAgent.ResumeSession(ctx, ResumeSessionRequest("session-1", cwd)); err != nil {
 		t.Fatalf("ResumeSession: %v", err)
 	}
-	if _, err := loadAgent.LoadSession(ctx, LoadSessionRequest("session-1", t.TempDir())); err == nil {
+	if _, err = loadAgent.LoadSession(ctx, LoadSessionRequest("session-1", t.TempDir())); err == nil {
 		t.Fatal("cwd mismatch load succeeded")
 	}
 
 	getErrClient := newFakeOpenCodeClient()
 	getErrClient.getErr = errors.New("get failed")
 	getErrAgent := NewAgent(WithHome(root), WithSessionStore(store), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			getErrClient.xdg = opts.ExistingXDG
+
 			return getErrClient, nil
 		}
 	})
-	if _, err := getErrAgent.LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
+	if _, err = getErrAgent.LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
 		t.Fatal("get error load succeeded")
 	}
 	if !getErrClient.closed {
@@ -353,7 +367,7 @@ func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
 			CapturedAtUnixMilli: int64(10_000 - i),
 			Session:             stateSnapshotSession{SessionID: id, Cwd: cwd, Title: id},
 		})
-		if err := listStore.Replace(ctx, SessionKey{SessionID: id}, []SessionStoreReplacement{{Key: SessionKey{SessionID: id}, Entries: []SessionStoreEntry{entry}}}); err != nil {
+		if err = listStore.Replace(ctx, SessionKey{SessionID: id}, []SessionStoreReplacement{{Key: SessionKey{SessionID: id}, Entries: []SessionStoreEntry{entry}}}); err != nil {
 			t.Fatalf("replace list store: %v", err)
 		}
 	}
@@ -365,7 +379,7 @@ func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
 	if len(listResp.Sessions) != listSessionsPageSize || listResp.NextCursor == nil {
 		t.Fatalf("list resp len=%d next=%v", len(listResp.Sessions), listResp.NextCursor)
 	}
-	if _, err := listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("bad"))); err == nil {
+	if _, err = listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("bad"))); err == nil {
 		t.Fatal("bad cursor accepted")
 	}
 	cursor := "999"
@@ -454,7 +468,7 @@ func TestAgentHelperAndLifecycleBranchCoverage(t *testing.T) {
 	}
 
 	client := newFakeOpenCodeClient()
-	defaultSession := newSession(NewAgent(), "wrapper", cwd, nil, nativeSession{ID: "native"}, client, sessionMeta{}, idmapRecord{})
+	defaultSession := newSession(NewAgent(), "wrapper", cwd, nil, opencode.NativeSession{ID: "native"}, client, sessionMeta{}, idmapRecord{})
 	if defaultSession.title != "OpenCode session" || defaultSession.idmap.SessionID != "wrapper" ||
 		defaultSession.idmap.NativeSessionID != "native" || defaultSession.idmap.Format != SessionStoreFormat {
 		t.Fatalf("default session fields = %#v", defaultSession)
@@ -482,17 +496,23 @@ func TestAgentHelperAndLifecycleBranchCoverage(t *testing.T) {
 		t.Fatalf("empty split fallback = %q/%q", provider, model)
 	}
 
+	assertNewLoadForkErrorBranches(t, ctx, cwd, closed)
+}
+
+func assertNewLoadForkErrorBranches(t *testing.T, ctx context.Context, cwd string, closed *Agent) {
+	t.Helper()
 	createClient := newFakeOpenCodeClient()
 	createClient.createSession = testNativeSession("native-created")
 	snapshotErrAgent := NewAgent(
 		WithSessionStore(&errorSessionStore{err: errors.New("replace failed")}),
 		func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 				var err error
-				createClient.xdg, err = createXDGDirs(opts.Root, string(opts.ACPSessionID))
+				createClient.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
 				if err != nil {
 					return nil, err
 				}
+
 				return createClient, nil
 			}
 		},
@@ -506,7 +526,7 @@ func TestAgentHelperAndLifecycleBranchCoverage(t *testing.T) {
 
 	store := NewInMemorySessionStore()
 	sourceClient := newFakeOpenCodeClient()
-	sourceXDG, err := createXDGDirs(t.TempDir(), "source")
+	sourceXDG, err := opencode.CreateXDGDirs(t.TempDir(), "source")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,29 +534,30 @@ func TestAgentHelperAndLifecycleBranchCoverage(t *testing.T) {
 	seedAgent := NewAgent(WithSessionStore(store))
 	seed := testSession(seedAgent, sourceClient)
 	seed.cwd = cwd
-	if err := seed.snapshotToStore(ctx); err != nil {
+	if err = seed.snapshotToStore(ctx); err != nil {
 		t.Fatalf("seed snapshot: %v", err)
 	}
 	replayErrClient := newFakeOpenCodeClient()
 	replayErrClient.getSession = testNativeSession("native-1")
 	replayErrClient.messagesErr = errors.New("messages failed")
 	replayErrAgent := NewAgent(WithSessionStore(store), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			replayErrClient.xdg = opts.ExistingXDG
+
 			return replayErrClient, nil
 		}
 	})
-	if _, err := replayErrAgent.LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
+	if _, err = replayErrAgent.LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
 		t.Fatal("load replay error was ignored")
 	}
 
-	if _, err := closed.ResumeSession(ctx, ResumeSessionRequest("session-1", cwd)); err == nil {
+	if _, err = closed.ResumeSession(ctx, ResumeSessionRequest("session-1", cwd)); err == nil {
 		t.Fatal("closed agent resumed session")
 	}
-	if _, err := NewAgent(WithHome(string([]byte{0}))).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
+	if _, err = NewAgent(WithHome(string([]byte{0}))).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
 		t.Fatal("invalid home root did not fail load")
 	}
-	if _, err := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("load failed")})).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
+	if _, err = NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("load failed")})).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
 		t.Fatal("hydrate store error was ignored")
 	}
 
@@ -545,34 +566,34 @@ func TestAgentHelperAndLifecycleBranchCoverage(t *testing.T) {
 	parent := testSession(NewAgent(WithHome(string([]byte{0}))), parentClient)
 	parentAgent := parent.agent
 	parentAgent.sessions[parent.id] = parent
-	if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
+	if _, err = parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
 		t.Fatal("invalid fork home root did not fail")
 	}
-	if _, err := NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMCPServers(acp.McpServer{Sse: &acp.McpServerSseInline{Name: "sse"}})))); err == nil {
+	if _, err = NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMCPServers(acp.McpServer{Sse: &acp.McpServerSseInline{Name: "sse"}})))); err == nil {
 		t.Fatal("unstable fork accepted SSE MCP")
 	}
-	if _, err := NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMCPServers(acp.McpServer{Acp: &acp.McpServerAcpInline{Name: "acp"}})))); err == nil {
+	if _, err = NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMCPServers(acp.McpServer{Acp: &acp.McpServerAcpInline{Name: "acp"}})))); err == nil {
 		t.Fatal("unstable fork accepted ACP MCP")
 	}
-	if _, err := NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMeta(map[string]any{opencodeMetaKey: map[string]any{"bad": true}})))); err == nil {
+	if _, err = NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMeta(map[string]any{opencodeMetaKey: map[string]any{"bad": true}})))); err == nil {
 		t.Fatal("unstable fork accepted invalid meta")
 	}
 
-	missingSource := xdgDirs{Data: filepath.Join(t.TempDir(), "missing"), Config: t.TempDir(), Cache: t.TempDir(), State: t.TempDir()}
-	validTarget, err := createXDGDirs(t.TempDir(), "target")
+	missingSource := opencode.XDGDirs{Data: filepath.Join(t.TempDir(), "missing"), Config: t.TempDir(), Cache: t.TempDir(), State: t.TempDir()}
+	validTarget, err := opencode.CreateXDGDirs(t.TempDir(), "target")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := copyXDGDirs(missingSource, validTarget); err == nil {
+	if err = copyXDGDirs(missingSource, validTarget); err == nil {
 		t.Fatal("copyXDGDirs accepted missing source")
 	}
 	restoreStateStoreSeams(t)
 	stateRemoveAll = func(string) error { return errors.New("remove failed") }
-	validSource, err := createXDGDirs(t.TempDir(), "source")
+	validSource, err := opencode.CreateXDGDirs(t.TempDir(), "source")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := copyXDGDirs(validSource, validTarget); err == nil {
+	if err = copyXDGDirs(validSource, validTarget); err == nil {
 		t.Fatal("copyXDGDirs ignored decode error")
 	}
 }
@@ -582,62 +603,7 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 	cwd := t.TempDir()
 
 	t.Run("new session id and store errors", func(t *testing.T) {
-		defaultClient := newFakeOpenCodeClient()
-		defaultClient.createSession = nativeSession{ID: "native-default", Title: "Default"}
-		defaultClient.providers = providersResponse{Providers: []providerInfo{{
-			ID:     "openai",
-			Models: map[string]providerModel{"gpt-default": {ID: "gpt-default"}},
-		}}}
-		var defaultModel string
-		defaultAgent := NewAgent(WithDefaultModel("openai/gpt-default"), func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
-				defaultModel = opts.DefaultModel
-				var err error
-				defaultClient.xdg, err = createXDGDirs(opts.Root, string(opts.ACPSessionID))
-				if err != nil {
-					return nil, err
-				}
-				return defaultClient, nil
-			}
-		})
-		defaultResp, err := defaultAgent.NewSession(ctx, NewSessionRequest(cwd))
-		if err != nil {
-			t.Fatalf("NewSession with default model: %v", err)
-		}
-		if defaultModel != "openai/gpt-default" {
-			t.Fatalf("start default model = %q", defaultModel)
-		}
-		defaultMeta, _ := defaultResp.Meta[opencodeMetaKey].(map[string]any)
-		if defaultMeta["modelId"] != "openai/gpt-default" {
-			t.Fatalf("default model meta = %#v", defaultMeta)
-		}
-
-		oldReader := sessionIDRandReader
-		sessionIDRandReader = errorReader{err: errors.New("id failed")}
-		if _, err := NewAgent().NewSession(ctx, NewSessionRequest(cwd)); err == nil {
-			t.Fatal("NewSession ignored session id error")
-		}
-		sessionIDRandReader = oldReader
-
-		client := newFakeOpenCodeClient()
-		client.createSession = testNativeSession("native-created")
-		agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
-				var err error
-				client.xdg, err = createXDGDirs(opts.Root, string(opts.ACPSessionID))
-				if err != nil {
-					return nil, err
-				}
-				return client, nil
-			}
-		})
-		agent.sessions["existing"] = testSession(agent, newFakeOpenCodeClient())
-		if _, err := agent.NewSession(ctx, NewSessionRequest(cwd)); err == nil {
-			t.Fatal("NewSession ignored storeStartedSession error")
-		}
-		if !client.closed {
-			t.Fatal("storeStartedSession error did not close client")
-		}
+		testNewSessionIDAndStoreErrors(t, ctx, cwd)
 	})
 
 	t.Run("load validation and startup errors", func(t *testing.T) {
@@ -654,7 +620,7 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 
 		store := validHydrateStore(t, ctx)
 		factoryErrAgent := NewAgent(WithSessionStore(store), func(options *Options) {
-			options.clientFactory = func(context.Context, openCodeStartOptions) (openCodeClient, error) {
+			options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 				return nil, errors.New("factory failed")
 			}
 		})
@@ -665,8 +631,9 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 		loadedClient := newFakeOpenCodeClient()
 		loadedClient.getSession = testNativeSession("n")
 		limitAgent := NewAgent(WithSessionStore(store), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 				loadedClient.xdg = opts.ExistingXDG
+
 				return loadedClient, nil
 			}
 		})
@@ -756,7 +723,7 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 		for _, name := range []string{"list", "load", "resume", "delete"} {
 			t.Run(name, func(t *testing.T) {
 				agent := NewAgent(WithHome(root))
-				xdg, err := createXDGDirs(root, name)
+				xdg, err := opencode.CreateXDGDirs(root, name)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -787,179 +754,28 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 	})
 
 	t.Run("deleted cleanup helper branches", func(t *testing.T) {
-		agent := NewAgent(WithHome(t.TempDir()))
-		agent.rememberDeleteCleanup(deleteCleanupRecord{})
-		if len(agent.deleteCleanup) != 0 {
-			t.Fatalf("empty cleanup record was remembered: %#v", agent.deleteCleanup)
-		}
-		agent.forgetDeleteCleanupIfDone("")
-
-		xdg, err := createXDGDirs(agent.options.Home, "keep")
-		if err != nil {
-			t.Fatal(err)
-		}
-		agent.deleteCleanup["keep"] = deleteCleanupRecord{SessionID: "keep", XDGRoot: xdg.Root}
-		agent.forgetDeleteCleanupIfDone("keep")
-		if _, ok := agent.deleteCleanup["keep"]; !ok {
-			t.Fatal("cleanup metadata was forgotten while XDG root still existed")
-		}
-
-		cancelled, cancel := context.WithCancel(ctx)
-		cancel()
-		if err := agent.retryDeletedSessionCleanup(cancelled); err == nil {
-			t.Fatal("cancelled cleanup retry returned nil")
-		}
-		errorAgent := NewAgent()
-		errorAgent.deleteCleanup["bad"] = deleteCleanupRecord{SessionID: "bad", XDGRoot: string([]byte{0})}
-		if err := errorAgent.retryDeletedSessionCleanup(ctx); err == nil {
-			t.Fatal("cleanup error retry returned nil")
-		}
-		for _, name := range []string{"list", "load", "delete"} {
-			t.Run("entrypoint retry error "+name, func(t *testing.T) {
-				entryAgent := NewAgent(WithHome(t.TempDir()))
-				entryXDG, err := createXDGDirs(entryAgent.options.Home, name)
-				if err != nil {
-					t.Fatal(err)
-				}
-				entryAgent.deleteCleanup[acp.SessionId(name)] = deleteCleanupRecord{
-					SessionID: acp.SessionId(name),
-					XDGRoot:   entryXDG.Root,
-				}
-				switch name {
-				case "list":
-					_, _ = entryAgent.ListSessions(cancelled, ListSessionsRequest())
-				case "load":
-					_, _ = entryAgent.LoadSession(cancelled, LoadSessionRequest(acp.SessionId(name), cwd))
-				case "delete":
-					_, _ = entryAgent.UnstableDeleteSession(cancelled, DeleteSessionRequest(acp.SessionId(name)))
-				}
-			})
-		}
-
-		if err := agent.cleanupDeletedSession(deleteCleanupRecord{}); err != nil {
-			t.Fatalf("empty cleanup err = %v", err)
-		}
-		if err := agent.cleanupDeletedSession(deleteCleanupRecord{SessionID: "bad", XDGRoot: string([]byte{0})}); err == nil {
-			t.Fatal("invalid cleanup root returned nil")
-		}
+		testDeletedCleanupHelperBranches(t, ctx, cwd)
 	})
 
 	t.Run("fork errors", func(t *testing.T) {
-		oldReader := sessionIDRandReader
-		t.Cleanup(func() { sessionIDRandReader = oldReader })
-
-		parentClient := newFakeOpenCodeClient()
-		parentClient.forkSession = testNativeSession("native-child")
-		parentClient.xdg, _ = createXDGDirs(t.TempDir(), "parent")
-		parentAgent := NewAgent()
-		parent := testSession(parentAgent, parentClient)
-		parentAgent.sessions[parent.id] = parent
-
-		sessionIDRandReader = errorReader{err: errors.New("id failed")}
-		if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
-			t.Fatal("fork ignored session id error")
-		}
-		sessionIDRandReader = oldReader
-
-		parentClient.xdg = xdgDirs{}
-		if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
-			t.Fatal("fork ignored XDG copy error")
-		}
-		parentClient.xdg, _ = createXDGDirs(t.TempDir(), "parent")
-
-		factoryErrAgent := NewAgent(func(options *Options) {
-			options.clientFactory = func(context.Context, openCodeStartOptions) (openCodeClient, error) {
-				return nil, errors.New("child factory failed")
-			}
-		})
-		factoryParent := testSession(factoryErrAgent, parentClient)
-		factoryErrAgent.sessions[factoryParent.id] = factoryParent
-		if _, err := factoryErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(factoryParent.id, cwd))); err == nil {
-			t.Fatal("fork ignored child factory error")
-		}
-
-		invalidChild := newFakeOpenCodeClient()
-		invalidChild.providers = providersResponse{Providers: []providerInfo{{
-			ID:     "openai",
-			Models: map[string]providerModel{"other": {ID: "other"}},
-		}}}
-		invalidAgent := NewAgent(func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
-				invalidChild.xdg = opts.ExistingXDG
-				return invalidChild, nil
-			}
-		})
-		invalidParent := testSession(invalidAgent, parentClient)
-		invalidAgent.sessions[invalidParent.id] = invalidParent
-		_, err := invalidAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(invalidParent.id, cwd)))
-		assertInvalidModelField(t, err, modelFieldSessionMeta)
-		if !invalidChild.closed {
-			t.Fatal("invalid fork did not close child")
-		}
-
-		getErrClient := newFakeOpenCodeClient()
-		getErrClient.getErr = errors.New("get failed")
-		getErrAgent := NewAgent(func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
-				getErrClient.xdg = opts.ExistingXDG
-				return getErrClient, nil
-			}
-		})
-		getParent := testSession(getErrAgent, parentClient)
-		getErrAgent.sessions[getParent.id] = getParent
-		if _, err := getErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(getParent.id, cwd))); err == nil {
-			t.Fatal("fork ignored child get error")
-		}
-		if !getErrClient.closed {
-			t.Fatal("child get error did not close client")
-		}
-
-		limitChild := newFakeOpenCodeClient()
-		limitChild.getSession = testNativeSession("native-child")
-		limitAgent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
-				limitChild.xdg = opts.ExistingXDG
-				return limitChild, nil
-			}
-		})
-		limitParent := testSession(limitAgent, parentClient)
-		limitAgent.sessions[limitParent.id] = limitParent
-		if _, err := limitAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(limitParent.id, cwd))); err == nil {
-			t.Fatal("fork ignored active-session limit")
-		}
-
-		snapshotErrChild := newFakeOpenCodeClient()
-		snapshotErrChild.getSession = testNativeSession("native-child")
-		snapshotErrAgent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("replace failed")}), func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
-				snapshotErrChild.xdg = opts.ExistingXDG
-				return snapshotErrChild, nil
-			}
-		})
-		snapshotParent := testSession(snapshotErrAgent, parentClient)
-		snapshotErrAgent.sessions[snapshotParent.id] = snapshotParent
-		if _, err := snapshotErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(snapshotParent.id, cwd))); err == nil {
-			t.Fatal("fork ignored snapshot error")
-		}
-		if !snapshotErrChild.closed {
-			t.Fatal("fork snapshot error did not close child")
-		}
+		testForkErrorBranches(t, ctx, cwd)
 	})
 
 	t.Run("client factory defaults and env merge", func(t *testing.T) {
 		defaultAgent := NewAgent()
 		defaultAgent.options.clientFactory = nil
-		if _, err := defaultAgent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{}, xdgDirs{Root: filepath.Join(t.TempDir(), "root")}); err == nil {
+		if _, err := defaultAgent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{}, opencode.XDGDirs{Root: filepath.Join(t.TempDir(), "root")}); err == nil {
 			t.Fatal("default client factory unexpectedly succeeded with incomplete XDG")
 		}
-		var captured openCodeStartOptions
+		var captured opencode.StartOptions
 		agent := NewAgent(func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts openCodeStartOptions) (openCodeClient, error) {
+			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 				captured = opts
+
 				return newFakeOpenCodeClient(), nil
 			}
 		})
-		if _, err := agent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{Env: map[string]string{"A": "1"}}, xdgDirs{}); err != nil {
+		if _, err := agent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{Env: map[string]string{"A": "1"}}, opencode.XDGDirs{}); err != nil {
 			t.Fatalf("newOpenCodeClient env: %v", err)
 		}
 		if captured.Env["A"] != "1" {
@@ -968,11 +784,238 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 	})
 }
 
-func testProviders() providersResponse {
-	return providersResponse{Providers: []providerInfo{{
+func testForkErrorBranches(t *testing.T, ctx context.Context, cwd string) {
+	t.Helper()
+	oldReader := sessionIDRandReader
+	t.Cleanup(func() { sessionIDRandReader = oldReader })
+
+	parentClient := newFakeOpenCodeClient()
+	parentClient.forkSession = testNativeSession("native-child")
+	parentClient.xdg, _ = opencode.CreateXDGDirs(t.TempDir(), "parent")
+	parentAgent := NewAgent()
+	parent := testSession(parentAgent, parentClient)
+	parentAgent.sessions[parent.id] = parent
+
+	sessionIDRandReader = errorReader{err: errors.New("id failed")}
+	if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
+		t.Fatal("fork ignored session id error")
+	}
+	sessionIDRandReader = oldReader
+
+	parentClient.xdg = opencode.XDGDirs{}
+	if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
+		t.Fatal("fork ignored XDG copy error")
+	}
+	parentClient.xdg, _ = opencode.CreateXDGDirs(t.TempDir(), "parent")
+
+	factoryErrAgent := NewAgent(func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return nil, errors.New("child factory failed")
+		}
+	})
+	factoryParent := testSession(factoryErrAgent, parentClient)
+	factoryErrAgent.sessions[factoryParent.id] = factoryParent
+	if _, err := factoryErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(factoryParent.id, cwd))); err == nil {
+		t.Fatal("fork ignored child factory error")
+	}
+
+	invalidChild := newFakeOpenCodeClient()
+	invalidChild.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
+		ID:     "openai",
+		Models: map[string]opencode.ProviderModel{"other": {ID: "other"}},
+	}}}
+	invalidAgent := NewAgent(func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
+			invalidChild.xdg = opts.ExistingXDG
+
+			return invalidChild, nil
+		}
+	})
+	invalidParent := testSession(invalidAgent, parentClient)
+	invalidAgent.sessions[invalidParent.id] = invalidParent
+	_, err := invalidAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(invalidParent.id, cwd)))
+	assertInvalidModelField(t, err, modelFieldSessionMeta)
+	if !invalidChild.closed {
+		t.Fatal("invalid fork did not close child")
+	}
+
+	getErrClient := newFakeOpenCodeClient()
+	getErrClient.getErr = errors.New("get failed")
+	getErrAgent := NewAgent(func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
+			getErrClient.xdg = opts.ExistingXDG
+
+			return getErrClient, nil
+		}
+	})
+	getParent := testSession(getErrAgent, parentClient)
+	getErrAgent.sessions[getParent.id] = getParent
+	if _, err := getErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(getParent.id, cwd))); err == nil {
+		t.Fatal("fork ignored child get error")
+	}
+	if !getErrClient.closed {
+		t.Fatal("child get error did not close client")
+	}
+
+	limitChild := newFakeOpenCodeClient()
+	limitChild.getSession = testNativeSession("native-child")
+	limitAgent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
+			limitChild.xdg = opts.ExistingXDG
+
+			return limitChild, nil
+		}
+	})
+	limitParent := testSession(limitAgent, parentClient)
+	limitAgent.sessions[limitParent.id] = limitParent
+	if _, err := limitAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(limitParent.id, cwd))); err == nil {
+		t.Fatal("fork ignored active-session limit")
+	}
+
+	snapshotErrChild := newFakeOpenCodeClient()
+	snapshotErrChild.getSession = testNativeSession("native-child")
+	snapshotErrAgent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("replace failed")}), func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
+			snapshotErrChild.xdg = opts.ExistingXDG
+
+			return snapshotErrChild, nil
+		}
+	})
+	snapshotParent := testSession(snapshotErrAgent, parentClient)
+	snapshotErrAgent.sessions[snapshotParent.id] = snapshotParent
+	if _, err := snapshotErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(snapshotParent.id, cwd))); err == nil {
+		t.Fatal("fork ignored snapshot error")
+	}
+	if !snapshotErrChild.closed {
+		t.Fatal("fork snapshot error did not close child")
+	}
+}
+
+func testDeletedCleanupHelperBranches(t *testing.T, ctx context.Context, cwd string) {
+	t.Helper()
+	agent := NewAgent(WithHome(t.TempDir()))
+	agent.rememberDeleteCleanup(deleteCleanupRecord{})
+	if len(agent.deleteCleanup) != 0 {
+		t.Fatalf("empty cleanup record was remembered: %#v", agent.deleteCleanup)
+	}
+	agent.forgetDeleteCleanupIfDone("")
+
+	xdg, err := opencode.CreateXDGDirs(agent.options.Home, "keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.deleteCleanup["keep"] = deleteCleanupRecord{SessionID: "keep", XDGRoot: xdg.Root}
+	agent.forgetDeleteCleanupIfDone("keep")
+	if _, ok := agent.deleteCleanup["keep"]; !ok {
+		t.Fatal("cleanup metadata was forgotten while XDG root still existed")
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := agent.retryDeletedSessionCleanup(cancelled); err == nil {
+		t.Fatal("cancelled cleanup retry returned nil")
+	}
+	errorAgent := NewAgent()
+	errorAgent.deleteCleanup["bad"] = deleteCleanupRecord{SessionID: "bad", XDGRoot: string([]byte{0})}
+	if err := errorAgent.retryDeletedSessionCleanup(ctx); err == nil {
+		t.Fatal("cleanup error retry returned nil")
+	}
+	for _, name := range []string{"list", "load", "delete"} {
+		t.Run("entrypoint retry error "+name, func(t *testing.T) {
+			entryAgent := NewAgent(WithHome(t.TempDir()))
+			entryXDG, err := opencode.CreateXDGDirs(entryAgent.options.Home, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entryAgent.deleteCleanup[acp.SessionId(name)] = deleteCleanupRecord{
+				SessionID: acp.SessionId(name),
+				XDGRoot:   entryXDG.Root,
+			}
+			switch name {
+			case "list":
+				_, _ = entryAgent.ListSessions(cancelled, ListSessionsRequest())
+			case "load":
+				_, _ = entryAgent.LoadSession(cancelled, LoadSessionRequest(acp.SessionId(name), cwd))
+			case "delete":
+				_, _ = entryAgent.UnstableDeleteSession(cancelled, DeleteSessionRequest(acp.SessionId(name)))
+			}
+		})
+	}
+
+	if err := agent.cleanupDeletedSession(deleteCleanupRecord{}); err != nil {
+		t.Fatalf("empty cleanup err = %v", err)
+	}
+	if err := agent.cleanupDeletedSession(deleteCleanupRecord{SessionID: "bad", XDGRoot: string([]byte{0})}); err == nil {
+		t.Fatal("invalid cleanup root returned nil")
+	}
+}
+
+func testNewSessionIDAndStoreErrors(t *testing.T, ctx context.Context, cwd string) {
+	t.Helper()
+	defaultClient := newFakeOpenCodeClient()
+	defaultClient.createSession = opencode.NativeSession{ID: "native-default", Title: "Default"}
+	defaultClient.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
+		ID:     "openai",
+		Models: map[string]opencode.ProviderModel{"gpt-default": {ID: "gpt-default"}},
+	}}}
+	var defaultModel string
+	defaultAgent := NewAgent(WithDefaultModel("openai/gpt-default"), func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
+			defaultModel = opts.DefaultModel
+			var err error
+			defaultClient.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
+			if err != nil {
+				return nil, err
+			}
+
+			return defaultClient, nil
+		}
+	})
+	defaultResp, err := defaultAgent.NewSession(ctx, NewSessionRequest(cwd))
+	if err != nil {
+		t.Fatalf("NewSession with default model: %v", err)
+	}
+	if defaultModel != "openai/gpt-default" {
+		t.Fatalf("start default model = %q", defaultModel)
+	}
+	defaultMeta, _ := defaultResp.Meta[opencodeMetaKey].(map[string]any)
+	if defaultMeta["modelId"] != "openai/gpt-default" {
+		t.Fatalf("default model meta = %#v", defaultMeta)
+	}
+
+	oldReader := sessionIDRandReader
+	sessionIDRandReader = errorReader{err: errors.New("id failed")}
+	if _, err := NewAgent().NewSession(ctx, NewSessionRequest(cwd)); err == nil {
+		t.Fatal("NewSession ignored session id error")
+	}
+	sessionIDRandReader = oldReader
+
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-created")
+	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
+			var err error
+			client.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
+			if err != nil {
+				return nil, err
+			}
+
+			return client, nil
+		}
+	})
+	agent.sessions["existing"] = testSession(agent, newFakeOpenCodeClient())
+	if _, err := agent.NewSession(ctx, NewSessionRequest(cwd)); err == nil {
+		t.Fatal("NewSession ignored storeStartedSession error")
+	}
+	if !client.closed {
+		t.Fatal("storeStartedSession error did not close client")
+	}
+}
+func testProviders() opencode.ProvidersResponse {
+	return opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
 		ID:   "openai",
 		Name: "OpenAI",
-		Models: map[string]providerModel{
+		Models: map[string]opencode.ProviderModel{
 			"gpt-test": {
 				ID:   "gpt-test",
 				Name: "GPT Test",

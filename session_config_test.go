@@ -7,13 +7,14 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 func TestModelConfigOptionMetadataMapping(t *testing.T) {
-	providers := providersResponse{Providers: []providerInfo{{
+	providers := opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
 		ID:   "openai",
 		Name: "OpenAI",
-		Models: map[string]providerModel{
+		Models: map[string]opencode.ProviderModel{
 			"gpt-test": {
 				ID:   "gpt-test",
 				Name: "GPT Test",
@@ -23,7 +24,7 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 				},
 				Reasoning:  true,
 				ToolCall:   true,
-				Modalities: providerModelModalities{Input: []string{"image", "pdf"}},
+				Modalities: opencode.ProviderModelModalities{Input: []string{"image", "pdf"}},
 				Options: map[string]any{
 					"reasoningEffort": map[string]any{"options": []any{"low", "medium"}},
 				},
@@ -45,7 +46,10 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 	if value.Value != "openai/gpt-test" {
 		t.Fatalf("value = %s", value.Value)
 	}
-	meta := value.Meta[opencodeMetaKey].(map[string]any)
+	meta, ok := value.Meta[opencodeMetaKey].(map[string]any)
+	if !ok {
+		t.Fatalf("meta missing opencode key: %#v", value.Meta)
+	}
 	if meta["contextWindow"] != 1000 || meta["maxOutputTokens"] != 200 {
 		t.Fatalf("limits meta = %#v", meta)
 	}
@@ -64,17 +68,17 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.providers = providersResponse{Providers: []providerInfo{
-		{ID: "", Models: map[string]providerModel{"skip": {}}},
-		{ID: "p", Models: map[string]providerModel{
+	client.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{
+		{ID: "", Models: map[string]opencode.ProviderModel{"skip": {}}},
+		{ID: "p", Models: map[string]opencode.ProviderModel{
 			"m": {
 				Limit:      map[string]any{"context": int(42), "output": json.Number("7")},
-				Modalities: providerModelModalities{Input: []string{"audio", "video"}},
+				Modalities: opencode.ProviderModelModalities{Input: []string{"audio", "video"}},
 				Options:    map[string]any{"reasoningEffort": []any{"medium"}},
 			},
 		}},
 	}}
-	client.agents = []nativeAgent{
+	client.agents = []opencode.NativeAgent{
 		{Name: "", Mode: ""},
 		{Name: "build", Description: "Build"},
 		{Name: "build", Description: "Duplicate"},
@@ -98,7 +102,7 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 		t.Fatal("missing model config value was found")
 	}
 	fallbackClient := newFakeOpenCodeClient()
-	fallbackClient.providers = providersResponse{}
+	fallbackClient.providers = opencode.ProvidersResponse{}
 	fallbackSession := testSession(agent, fallbackClient)
 	if !fallbackSession.hasConfigValue(ctx, configModel, "openai/gpt-test") {
 		t.Fatal("fallback model config value was not found")
@@ -115,9 +119,15 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	if err := errorSession.validateModel(ctx, "openai/gpt-test", "model"); err == nil {
 		t.Fatal("provider catalog error was ignored")
 	}
-	if testProviders().hasModel("gpt-test") {
+	if testProviders().HasModel("gpt-test") {
 		t.Fatal("provider-less model was accepted")
 	}
+	assertSetSessionConfigOptionBranches(t, ctx, agent, sess, conn)
+	assertConfigOptionBuilders(t, client)
+}
+
+func assertSetSessionConfigOptionBranches(t *testing.T, ctx context.Context, agent *Agent, sess *session, conn *recordingAgentClient) {
+	t.Helper()
 	if _, err := agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{}); err == nil {
 		t.Fatal("missing value accepted")
 	}
@@ -142,26 +152,29 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	if conn.updateCount() == 0 {
 		t.Fatal("set model did not emit config update")
 	}
+}
 
-	fallback := modelConfigOption(sessionSnapshot{providerID: "p", modelID: "m"}, providersResponse{})
+func assertConfigOptionBuilders(t *testing.T, client *fakeOpenCodeClient) {
+	t.Helper()
+	fallback := modelConfigOption(sessionSnapshot{providerID: "p", modelID: "m"}, opencode.ProvidersResponse{})
 	if fallback.Select == nil || fallback.Select.Options.Ungrouped == nil || fallback.Select.CurrentValue != "p/m" {
 		t.Fatalf("fallback model option = %#v", fallback)
 	}
-	if empty := modelConfigOption(sessionSnapshot{}, providersResponse{}); empty.Select != nil {
+	if empty := modelConfigOption(sessionSnapshot{}, opencode.ProvidersResponse{}); empty.Select != nil {
 		t.Fatalf("empty model option = %#v", empty)
 	}
 	mode := modeConfigOption(sessionSnapshot{mode: "missing"}, client.agents)
 	if mode.Select == nil || len(*mode.Select.Options.Ungrouped) != 2 || mode.Select.CurrentValue != "build" {
 		t.Fatalf("mode option = %#v", mode)
 	}
-	if empty := modeConfigOption(sessionSnapshot{}, []nativeAgent{{}}); empty.Select != nil {
+	if empty := modeConfigOption(sessionSnapshot{}, []opencode.NativeAgent{{}}); empty.Select != nil {
 		t.Fatalf("empty mode option = %#v", empty)
 	}
 	efforts := supportedEfforts(client.providers.Providers[1].Models["m"])
 	if len(efforts) != 1 || efforts[0] != "medium" {
 		t.Fatalf("supportedEfforts = %#v", efforts)
 	}
-	efforts = supportedEfforts(providerModel{Options: map[string]any{
+	efforts = supportedEfforts(opencode.ProviderModel{Options: map[string]any{
 		"temperature":     []any{"ignored"},
 		"reasoningEffort": []string{"low", "", "high"},
 		"effortOptions":   map[string]any{"values": []any{"medium"}},
@@ -204,5 +217,6 @@ func containsStringAny(value any, want string) bool {
 			return true
 		}
 	}
+
 	return false
 }
