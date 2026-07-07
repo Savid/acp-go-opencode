@@ -717,7 +717,8 @@ func (s *session) emitMessage(ctx context.Context, message opencode.NativeMessag
 		}
 
 		if part.Type == partTypeStepFinish {
-			if update := usageUpdateFromTokens(part.MessageID, part.Tokens); update != nil {
+			size := s.contextWindow(ctx, message.Info.ProviderID, message.Info.ModelID)
+			if update := usageUpdateFromTokens(part.MessageID, part.Tokens, size); update != nil {
 				if err := s.emitUpdate(ctx, *update); err != nil {
 					return err
 				}
@@ -726,7 +727,8 @@ func (s *session) emitMessage(ctx context.Context, message opencode.NativeMessag
 	}
 
 	if message.Info.Tokens.Total > 0 {
-		if update := usageUpdateFromTokens(message.Info.ID, message.Info.Tokens); update != nil {
+		size := s.contextWindow(ctx, message.Info.ProviderID, message.Info.ModelID)
+		if update := usageUpdateFromTokens(message.Info.ID, message.Info.Tokens, size); update != nil {
 			return s.emitUpdate(ctx, *update)
 		}
 	}
@@ -1404,7 +1406,7 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 	return conn.NotifyExtension(ctx, RawEventMethod, capRawEventPayload(payload))
 }
 
-func usageUpdateFromTokens(messageID string, tokens opencode.NativeTokens) *acp.SessionUpdate {
+func usageUpdateFromTokens(messageID string, tokens opencode.NativeTokens, size int) *acp.SessionUpdate {
 	used := int(tokens.Total)
 	if used <= 0 {
 		used = int(tokens.Input + tokens.Output + tokens.Reasoning)
@@ -1414,7 +1416,6 @@ func usageUpdateFromTokens(messageID string, tokens opencode.NativeTokens) *acp.
 		return nil
 	}
 
-	size := used
 	meta := map[string]any{opencodeMetaKey: map[string]any{"messageId": messageID}}
 
 	return &acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{

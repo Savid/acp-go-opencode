@@ -17,8 +17,8 @@ import (
 const (
 	listSessionsPageSize            = 50
 	defaultMaxActiveSessions        = 32
-	defaultMaxConcurrentPrompts     = 1
 	defaultMaxConcurrentClientCalls = 16
+	sessionTurnCapacity             = 1
 	closeTimeout                    = 5 * time.Second
 )
 
@@ -297,12 +297,12 @@ func (a *Agent) session(id acp.SessionId) (*session, error) {
 	defer a.mu.Unlock()
 
 	if _, ok := a.deleted[id]; ok {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: errValueSessionDeleted})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	session := a.sessions[id]
 	if session == nil {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: errValueSessionUnknown})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	return session, nil

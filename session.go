@@ -54,6 +54,7 @@ type session struct {
 	exclusiveTurn       bool
 	commandsByName      map[string]opencode.NativeCommand
 	availableCommands   []acp.AvailableCommand
+	contextWindows      map[string]int
 	poisonCause         string
 	closed              bool
 }
@@ -190,17 +191,53 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 	}, nil
 }
 
+// contextWindow returns the model's true context-window size in tokens for the
+// given native provider/model, caching the lookup per model. It returns 0 when
+// the size is genuinely unavailable, never a fabricated value.
+func (s *session) contextWindow(ctx context.Context, providerID string, modelID string) int {
+	value := joinModelValue(providerID, modelID)
+	if value == "" {
+		return 0
+	}
+
+	s.mu.Lock()
+	if s.contextWindows == nil {
+		s.contextWindows = make(map[string]int, 1)
+	}
+
+	if size, ok := s.contextWindows[value]; ok {
+		s.mu.Unlock()
+
+		return size
+	}
+
+	client := s.client
+	s.mu.Unlock()
+
+	if client == nil {
+		return 0
+	}
+
+	providers, err := client.ConfigProviders(ctx)
+	if err != nil {
+		return 0
+	}
+
+	size, _ := providers.ModelContextWindow(value)
+
+	s.mu.Lock()
+	s.contextWindows[value] = size
+	s.mu.Unlock()
+
+	return size
+}
+
 func (s *session) turnQueue() chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.turn == nil {
-		limit := defaultMaxConcurrentPrompts
-		if s.agent != nil && s.agent.options.ConcurrencyLimits.MaxConcurrentPrompts > 0 {
-			limit = s.agent.options.ConcurrencyLimits.MaxConcurrentPrompts
-		}
-
-		s.turn = make(chan struct{}, limit)
+		s.turn = make(chan struct{}, sessionTurnCapacity)
 	}
 
 	return s.turn

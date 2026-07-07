@@ -431,6 +431,24 @@ func assertInvalidModelField(t testingT, err error, field string) {
 	}
 }
 
+func assertUnknownSessionError(t testingT, err error) {
+	t.Helper()
+	var reqErr *acp.RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("error = %v, want RequestError", err)
+	}
+	if reqErr.Code != -32602 {
+		t.Fatalf("error code = %d, want -32602", reqErr.Code)
+	}
+	data, ok := reqErr.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("error data = %#v, want map", reqErr.Data)
+	}
+	if data[jsonFieldError] != errValueSessionUnknown || data[jsonFieldField] != jsonFieldSessionID {
+		t.Fatalf("unknown session data = %#v, want {error:unknown session, field:sessionId}", data)
+	}
+}
+
 type testingT interface {
 	Helper()
 	Fatalf(string, ...any)

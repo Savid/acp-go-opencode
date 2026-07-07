@@ -66,7 +66,7 @@ func TestServeContextAndInputDone(t *testing.T) {
 
 func TestLocalAgentConnectionHandleRoutesAndErrors(t *testing.T) {
 	ctx := context.Background()
-	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentPrompts: 1, MaxConcurrentClientCalls: 1}))
+	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
 	conn := &localAgentConnection{agent: agent}
 
 	if _, reqErr := conn.handle(ctx, acp.AgentMethodSessionList, json.RawMessage(`{}`)); reqErr == nil {
@@ -123,7 +123,7 @@ func TestLocalAgentConnectionHandleRoutesAndErrors(t *testing.T) {
 }
 
 func TestLocalAgentConnectionClientCallErrors(t *testing.T) {
-	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentPrompts: 1, MaxConcurrentClientCalls: 1}))
+	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
 	conn := &localAgentConnection{agent: agent}
 
 	if err := conn.NotifyExtension(context.Background(), "bad/method", nil); err == nil {
@@ -183,6 +183,9 @@ func TestRequestErrorAndCapabilityHelpers(t *testing.T) {
 	}
 	if selectPositionEncoding([]acp.PositionEncodingKind{acp.PositionEncodingKindUtf16}) != acp.PositionEncodingKindUtf16 {
 		t.Fatal("utf16 position encoding not selected")
+	}
+	if selectPositionEncoding([]acp.PositionEncodingKind{"bad", acp.PositionEncodingKindUtf32}) != acp.PositionEncodingKindUtf16 {
+		t.Fatal("utf32 must never be selected; expected utf16 fallback")
 	}
 	if selectPositionEncoding(nil) != acp.PositionEncodingKindUtf16 {
 		t.Fatal("default position encoding mismatch")

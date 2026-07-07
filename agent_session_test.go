@@ -134,6 +134,13 @@ func assertCloseDeleteAndLineage(t *testing.T, ctx context.Context, agent *Agent
 	}
 	if _, err := agent.LoadSession(ctx, LoadSessionRequest(forkResp.SessionId, cwd)); err == nil {
 		t.Fatal("deleted session loaded")
+	} else {
+		assertUnknownSessionError(t, err)
+	}
+	if _, err := agent.ResumeSession(ctx, ResumeSessionRequest(forkResp.SessionId, cwd)); err == nil {
+		t.Fatal("deleted session resumed")
+	} else {
+		assertUnknownSessionError(t, err)
 	}
 	if parent.xdg.Root == "" || child.xdg.Root == "" || filepath.Dir(parent.xdg.Root) != root {
 		t.Fatalf("xdg roots parent=%#v child=%#v root=%q", parent.xdg, child.xdg, root)
@@ -290,6 +297,13 @@ func TestAgentSessionLifecycleErrorBranches(t *testing.T) {
 		}
 		if _, err := agent.LoadSession(ctx, LoadSessionRequest("missing", cwd)); err == nil {
 			t.Fatal("unknown load succeeded")
+		} else {
+			assertUnknownSessionError(t, err)
+		}
+		if _, err := agent.ResumeSession(ctx, ResumeSessionRequest("missing", cwd)); err == nil {
+			t.Fatal("unknown resume succeeded")
+		} else {
+			assertUnknownSessionError(t, err)
 		}
 		if _, err := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: "missing"}); err == nil {
 			t.Fatal("unknown close succeeded")
@@ -457,10 +471,14 @@ func TestAgentHelperAndLifecycleBranchCoverage(t *testing.T) {
 	}
 	if _, err := limitAgent.session("deleted"); err == nil {
 		t.Fatal("unknown deleted session unexpectedly resolved before deletion mark")
+	} else {
+		assertUnknownSessionError(t, err)
 	}
 	limitAgent.deleted["deleted"] = struct{}{}
 	if _, err := limitAgent.session("deleted"); err == nil {
 		t.Fatal("deleted session unexpectedly resolved")
+	} else {
+		assertUnknownSessionError(t, err)
 	}
 	limitAgent.closed = true
 	if err := limitAgent.storeStartedSession(second); err == nil {

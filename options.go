@@ -21,7 +21,6 @@ type Option func(*Options)
 // ConcurrencyLimits bounds work accepted by one Agent.
 type ConcurrencyLimits struct {
 	MaxActiveSessions        int
-	MaxConcurrentPrompts     int
 	MaxConcurrentClientCalls int
 }
 

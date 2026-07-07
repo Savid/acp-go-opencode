@@ -40,7 +40,7 @@ func TestOptionsAndRequestBuilders(t *testing.T) {
 		WithTextMapPropagator(propagation.TraceContext{}),
 		WithSessionStore(store),
 		WithSessionStoreLoadTimeout(time.Second),
-		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentPrompts: 2, MaxConcurrentClientCalls: 3}),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 3}),
 		WithSeedFiles(seedSource),
 		WithOpenCodePure(true),
 		WithOpenCodeQuestionTool(true),
@@ -265,7 +265,7 @@ func TestPromptMappingHelpers(t *testing.T) {
 	if got := embeddedResourceText(resource); got == "" {
 		t.Fatalf("embeddedResourceText = %q", got)
 	}
-	if update := usageUpdateFromTokens("m", opencode.NativeTokens{}); update != nil {
+	if update := usageUpdateFromTokens("m", opencode.NativeTokens{}, 0); update != nil {
 		t.Fatalf("empty usage update = %#v", update)
 	}
 	usage := usageFromTokens(opencode.NativeTokens{Input: 1, Output: 2, Reasoning: 3})

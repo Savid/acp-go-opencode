@@ -1916,7 +1916,7 @@ func TestPromptSlashCommandExclusiveTurn(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
-	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxConcurrentPrompts: 2}))
+	agent := NewAgent()
 	session := testSession(agent, client)
 	release, err := session.acquireTurn(ctx)
 	if err != nil {
@@ -1927,6 +1927,90 @@ func TestPromptSlashCommandExclusiveTurn(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "backpressure") {
 		t.Fatalf("command during active prompt error = %v", err)
 	}
+}
+
+func TestUsageUpdateSizeIsContextWindow(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name       string
+		providerID string
+		modelID    string
+		wantSize   int
+	}{
+		{name: "known model reports context window", providerID: "openai", modelID: "gpt-test", wantSize: 1000},
+		{name: "model without limit reports unknown", providerID: "openai", modelID: "gpt-other", wantSize: 0},
+		{name: "missing model reports unknown", providerID: "", modelID: "", wantSize: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newFakeOpenCodeClient()
+			conn := newRecordingAgentClient()
+			agent := NewAgent()
+			agent.setAgentClient(conn)
+			session := testSession(agent, client)
+
+			if err := session.emitMessage(ctx, opencode.NativeMessage{
+				Info: opencode.NativeMessageInfo{
+					ID:         "message-1",
+					SessionID:  "native-1",
+					Role:       "assistant",
+					ProviderID: tt.providerID,
+					ModelID:    tt.modelID,
+					Tokens:     opencode.NativeTokens{Total: 42},
+				},
+			}, false); err != nil {
+				t.Fatalf("emitMessage: %v", err)
+			}
+
+			var usage *acp.SessionUsageUpdate
+			for _, update := range conn.updates {
+				if update.Update.UsageUpdate != nil {
+					usage = update.Update.UsageUpdate
+				}
+			}
+			if usage == nil {
+				t.Fatalf("no usage update emitted: %#v", conn.updates)
+			}
+			if usage.Used != 42 {
+				t.Fatalf("usage used = %d, want 42", usage.Used)
+			}
+			if usage.Size != tt.wantSize {
+				t.Fatalf("usage size = %d, want %d (context window, never fabricated from used)", usage.Size, tt.wantSize)
+			}
+		})
+	}
+}
+
+func TestSessionContextWindow(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("caches lookups per model", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		session := testSession(NewAgent(), client)
+		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 1000 {
+			t.Fatalf("first lookup = %d, want 1000", got)
+		}
+		client.providersErr = errors.New("boom")
+		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 1000 {
+			t.Fatalf("cached lookup = %d, want 1000 (must not re-fetch)", got)
+		}
+	})
+
+	t.Run("provider error reports unknown", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.providersErr = errors.New("boom")
+		session := testSession(NewAgent(), client)
+		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 0 {
+			t.Fatalf("provider error lookup = %d, want 0", got)
+		}
+	})
+
+	t.Run("nil client reports unknown", func(t *testing.T) {
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		session.client = nil
+		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 0 {
+			t.Fatalf("nil client lookup = %d, want 0", got)
+		}
+	})
 }
 
 func commandNames(commands []acp.AvailableCommand) []string {

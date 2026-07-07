@@ -77,6 +77,36 @@ func TestProvidersResponseHasModel(t *testing.T) {
 	}
 }
 
+func TestProvidersResponseModelContextWindow(t *testing.T) {
+	providers := ProvidersResponse{Providers: []ProviderInfo{{
+		ID: "openai",
+		Models: map[string]ProviderModel{
+			"gpt-test": {ID: "gpt-test", Limit: map[string]any{"context": float64(1000)}},
+			"gpt-bare": {ID: "gpt-bare"},
+		},
+	}}}
+
+	if size, ok := providers.ModelContextWindow("openai/gpt-test"); !ok || size != 1000 {
+		t.Fatalf("ModelContextWindow = %d, %v; want 1000, true", size, ok)
+	}
+
+	if size, ok := providers.ModelContextWindow("openai/gpt-bare"); ok || size != 0 {
+		t.Fatalf("ModelContextWindow bare = %d, %v; want 0, false", size, ok)
+	}
+
+	if _, ok := providers.ModelContextWindow("no-slash"); ok {
+		t.Fatal("ModelContextWindow should reject value without a slash")
+	}
+
+	if _, ok := providers.ModelContextWindow("other/gpt-test"); ok {
+		t.Fatal("ModelContextWindow should not match a different provider id")
+	}
+
+	if _, ok := providers.ModelContextWindow("openai/missing"); ok {
+		t.Fatal("ModelContextWindow should not match an unknown model")
+	}
+}
+
 func TestIsBadRequest(t *testing.T) {
 	badRequest := &HTTPError{StatusCode: http.StatusBadRequest}
 	if !IsBadRequest(badRequest) {

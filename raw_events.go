@@ -54,8 +54,7 @@ const (
 	validationRequired      = "required"
 	errValueBackpressure    = "backpressure"
 	errValueUnsupported     = "unsupported"
-	errValueSessionDeleted  = "deleted"
-	errValueSessionUnknown  = "unknown"
+	errValueSessionUnknown  = "unknown session"
 	elicitationModeForm     = "form"
 	elicitationModeURL      = "url"
 )
