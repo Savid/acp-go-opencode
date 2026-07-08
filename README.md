@@ -35,6 +35,12 @@ it as a subprocess rather than a human-facing chat UI.
 
 ## Quickstart
 
+The example programs run from a checkout of this repo, so clone it first:
+
+```sh
+git clone https://github.com/savid/acp-go-opencode && cd acp-go-opencode
+```
+
 Run a tiny local client against the agent:
 
 ```sh
