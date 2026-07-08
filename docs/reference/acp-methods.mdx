@@ -1,19 +1,36 @@
-# ACP Methods
+---
+title: ACP Methods
+description: The ACP methods the adapter implements and the one namespaced extension it adds.
+---
 
-Stable methods:
+The adapter implements the standard ACP method set plus one namespaced fork
+extension. This page lists each method and its behavior.
 
-- `initialize`
-- `authenticate`
-- `logout`
-- `session/new`
-- `session/load`
-- `session/resume`
-- `session/list`
-- `session/prompt`
-- `session/cancel`
-- `session/close`
-- `session/delete`
-- `session/set_config_option`
+## Stable methods
 
-`session/set_mode` returns method-not-found. Fork is only
-`_opencode/session/fork`.
+| Method | Behavior |
+|---|---|
+| `initialize` | Advertises capabilities, empty `authMethods`, and `_meta.opencode`. |
+| `authenticate` | Rejected with invalid-params echoing the requested `methodId`. |
+| `logout` | No-op; clears only adapter-owned session state. |
+| `session/new` | Create a session and launch its OpenCode process. |
+| `session/load` | Recreate a stored session and replay its history. |
+| `session/resume` | Restore a stored session without replay. |
+| `session/list` | Enumerate stored sessions. |
+| `session/prompt` | Run a prompt turn against the native session. |
+| `session/cancel` | Cancel the running turn. |
+| `session/close` | End the session and take a final snapshot. |
+| `session/delete` | Remove a stored session, leaving a tombstone. |
+| `session/set_config_option` | Change the `model` or `mode` option live. |
+
+## Extensions and unsupported methods
+
+- `_opencode/session/fork` — the only fork surface; branches a session's native
+  state into a new session.
+- `_opencode/rawEvent` — an outbound notification, not a request (see
+  [Raw events](/docs/features/raw-events)).
+- `session/set_mode` — returns method-not-found; mode is a config option set
+  through `session/set_config_option`, not a dedicated method.
+
+Unknown methods and foreign `_meta` namespaces are rejected or ignored per the
+ACP contract.

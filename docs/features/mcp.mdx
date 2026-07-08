@@ -1,15 +1,40 @@
-# MCP
+---
+title: MCP
+description: Forward stdio and streamable HTTP MCP servers from an ACP session into OpenCode's native config.
+---
 
-ACP lifecycle requests accept stdio and HTTP MCP server definitions. SSE and
-ACP-transport MCP server definitions are rejected during session start, as are
-servers without a name.
+Attach MCP servers to a session and the adapter wires them into that session's
+native OpenCode config, so OpenCode's own MCP client connects to them. You
+declare servers on the ACP lifecycle request (`WithSessionMCPServers`, or the
+`mcpServers` field); the adapter translates and forwards them.
 
-Accepted servers are forwarded to the native OpenCode process through the
-generated per-session `opencode.json`: HTTP servers become `"type": "remote"`
-entries (with their request headers) and stdio servers become
-`"type": "local"` entries (command, arguments, and environment). The
-wrapper-managed `mcp` key is deep-merged on top of any seeded
-`opencode.json`, so a seeded server with the same name is overridden while
-other seeded servers are preserved.
+## Supported transports
 
-The adapter does not expose a public MCP transport route.
+| Transport | Accepted | Native entry |
+|---|---|---|
+| stdio | Yes | `"type": "local"` |
+| streamable HTTP | Yes | `"type": "remote"` |
+| SSE | No — rejected at session start | — |
+| ACP-transport | No — rejected at session start | — |
+
+A server without a name is also rejected at session start.
+
+## How forwarding works
+
+Accepted servers are written into the generated per-session `opencode.json`
+under the wrapper-managed `mcp` key:
+
+- **HTTP servers** become `"type": "remote"` entries carrying their `url` and
+  any request `headers`.
+- **stdio servers** become `"type": "local"` entries with a `command` array (the
+  executable followed by its arguments) and an `environment` map. There is no
+  separate `arguments` key — the command and its args are one array.
+
+The `mcp` key is deep-merged on top of any seeded `opencode.json`, so a seeded
+server with the same name is overridden while other seeded servers are
+preserved.
+
+<Note>
+The adapter forwards MCP servers into OpenCode's native config; it does not
+expose a public MCP transport route of its own.
+</Note>

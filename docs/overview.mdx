@@ -1,17 +1,46 @@
-# Overview
+---
+title: Overview
+description: How acp-go-opencode turns a local OpenCode install into an embeddable ACP agent, and what it owns.
+---
 
-`acp-go-opencode` exposes OpenCode as an embeddable ACP agent. The adapter
-creates one loopback `opencode serve` process per ACP session and talks to it
-through authenticated REST and SSE.
+`acp-go-opencode` exposes [OpenCode](https://opencode.ai) as an
+[Agent Client Protocol](https://agentclientprotocol.com/) agent. It runs one
+authenticated loopback `opencode serve` process per ACP session and maps that
+process's native REST and SSE state onto ACP methods and notifications, so an
+ACP host can drive OpenCode without speaking OpenCode's native protocol.
 
-The package provides:
+Use it two ways: as a standalone subprocess an editor or host launches
+(`acp-go-opencode`), or as an embedded Go adapter through `opencodeacp.Serve`.
 
-- ACP `Serve` and `Agent` APIs
-- isolated per-session XDG data, config, cache, and state directories
-- native OpenCode message replay for `session/load`
-- `session/resume` without replay
-- `session/delete` with store tombstones
-- `_opencode/session/fork`
-- `_opencode/rawEvent` after per-session opt-in
-- native structured output via `_meta.opencode.options.outputSchema`
-- `opencode-state-v1` session storage
+## What it owns
+
+The adapter is a thin translation layer. Its responsibilities stop at the ACP
+boundary:
+
+- **The adapter owns** ACP dispatch, per-session process launch, per-session
+  XDG isolation, REST/SSE event mapping, permission and question bridging,
+  config-option resolution, and `opencode-state-v1` session storage.
+- **OpenCode owns** model execution, provider authentication, and native
+  session state. The adapter never manages provider credentials or signs in to
+  a provider on your behalf.
+
+Each session is fully isolated: its own `opencode serve` process bound to
+`127.0.0.1`, its own random basic-auth password, and its own XDG data, config,
+cache, and state directories under a configurable home root.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" href="/docs/get-started/quickstart">
+    Run your first ACP turn against OpenCode in a handful of steps.
+  </Card>
+  <Card title="Sessions" href="/docs/core/sessions">
+    The session lifecycle, isolation model, and load-versus-resume.
+  </Card>
+  <Card title="Models and config" href="/docs/features/models-config">
+    Select models, seed providers, and use native structured output.
+  </Card>
+  <Card title="Go API reference" href="/docs/reference/go-api">
+    The public package surface, indexed to pkg.go.dev.
+  </Card>
+</CardGroup>

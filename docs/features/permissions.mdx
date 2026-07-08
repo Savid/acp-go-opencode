@@ -1,8 +1,46 @@
-# Permissions
+---
+title: Permissions
+description: Set a session's default permission policy and bridge OpenCode's runtime permission prompts to ACP.
+---
 
-OpenCode permission events are mapped to ACP `session/request_permission`.
-The adapter replies through the current native route families that correspond
-to the event shape emitted by OpenCode.
+Permissions work at two levels: a static per-session policy that OpenCode
+applies, and runtime prompts OpenCode raises for individual actions that the
+adapter forwards to the ACP client.
 
-On cancellation, pending native permission requests are rejected with a
-cancelled explanation and the ACP prompt returns `cancelled`.
+## Session permission policy
+
+Set a session's default policy with `_meta.opencode.options.permission` at
+session start (or `WithOpenCodePermission` on an `OpenCodeOptions`). The adapter
+writes it into the isolated per-session `opencode.json` as
+`permission: {"*": "<value>"}` before launching `opencode serve`.
+
+| Value | Effect |
+|---|---|
+| `ask` | OpenCode prompts for each guarded action (the default; an empty value is treated as `ask`). |
+| `allow` | OpenCode proceeds without prompting. |
+
+Only `ask` and `allow` are accepted. `deny` and any other value are rejected
+with the uniform unsupported-field error.
+
+## Runtime permission prompts
+
+When the policy is `ask`, OpenCode emits native permission events
+(`permission.v2.asked` / `permission.asked`) during a turn. The adapter maps
+each to an ACP `session/request_permission` request carrying the action, the
+affected resources, and native metadata, and offers three options:
+
+| Option id | ACP kind | Meaning |
+|---|---|---|
+| `once` | Allow once | Permit this action only. |
+| `always` | Always allow | Permit and remember. |
+| `reject` | Reject | Deny the action. |
+
+The client's selection is relayed back to OpenCode. If the client cancels or the
+request otherwise fails, the adapter replies `reject` to the native prompt.
+
+<Warning>
+The permission flow is load-bearing for user trust: the adapter never silently
+auto-approves a runtime prompt. On cancellation, every pending native permission
+request is rejected with a cancelled explanation and the prompt returns
+`cancelled`.
+</Warning>

@@ -1,16 +1,64 @@
-# Quickstart
+---
+title: Quickstart
+description: Go from a fresh checkout to your first successful ACP turn against OpenCode.
+---
 
-Install or build the command, then let an ACP host run it over stdin/stdout.
+This tutorial drives OpenCode through the bundled `minimal-client` example,
+which starts the adapter in-process and runs a single prompt to completion. The
+example programs are repo-relative, so you run them from a checkout of this
+repository.
+
+## Prerequisites
+
+- Go matching the module's `go` directive (see `go.mod`).
+- An `opencode` CLI with `serve` support on your `PATH`, version `1.17.13` or
+  newer.
+- Provider credentials already configured in OpenCode for the model you prompt.
+
+## Steps
+
+<Steps>
+  <Step title="Clone the repository">
+    The example commands run from inside the checkout:
+
+    ```sh
+    git clone https://github.com/savid/acp-go-opencode && cd acp-go-opencode
+    ```
+  </Step>
+  <Step title="Confirm OpenCode is reachable">
+    The adapter launches whatever `opencode` binary it is pointed at:
+
+    ```sh
+    opencode --version
+    ```
+  </Step>
+  <Step title="Run a single prompt">
+    The `minimal-client` example starts the adapter, opens a session, and sends
+    one prompt:
+
+    ```sh
+    go run ./examples/minimal-client "Reply with a short hello from ACP."
+    ```
+  </Step>
+</Steps>
+
+## Verify
+
+The example prints the streamed agent reply to stdout and exits `0`. A greeting
+line derived from your prompt confirms the full path worked: session creation,
+the native `opencode serve` launch, the prompt turn, and SSE streaming back
+through ACP.
+
+If you instead launch the raw command for an ACP host to drive, it blocks on
+stdin waiting for JSON-RPC frames and writes ACP frames only to stdout; add
+`-debug` to send diagnostics to stderr:
 
 ```sh
-go run ./cmd/acp-go-opencode -path "$(command -v opencode)" -home /tmp/acp-opencode
+go run ./cmd/acp-go-opencode -path "$(command -v opencode)" -home /tmp/acp-opencode -debug
 ```
 
-For a local end-to-end client:
+## Next steps
 
-```sh
-go run ./examples/minimal-client "Reply with hello from ACP"
-```
-
-The command writes ACP JSON-RPC only to stdout. Use `-debug` for diagnostic logs
-on stderr.
+- [Run modes](/docs/get-started/run-modes) — standalone binary versus embedded `Serve`.
+- [Examples](/docs/get-started/examples) — the interactive-chat and resume clients.
+- [Sessions](/docs/core/sessions) — the lifecycle behind that first turn.

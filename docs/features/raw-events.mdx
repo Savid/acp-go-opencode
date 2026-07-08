@@ -1,6 +1,16 @@
-# Raw Events
+---
+title: Raw Events
+description: Opt a session in to receive OpenCode's raw native events as ACP notifications for debugging.
+---
 
-Raw native events are emitted only after opt-in:
+For debugging and observability, a session can opt in to receive OpenCode's raw
+native SSE events, forwarded verbatim as ACP notifications. This is off by
+default — raw event bodies are never emitted unless a session enables them.
+
+## Enabling raw events
+
+Set `_meta.opencode.rawEvent.enabled` to `true` on a lifecycle request (or use
+`WithSessionRawEvents(true)`):
 
 ```json
 {
@@ -14,4 +24,21 @@ Raw native events are emitted only after opt-in:
 }
 ```
 
-Events are sent as `_opencode/rawEvent` notifications and capped at 64 KiB.
+## Payload and limits
+
+| Property | Value |
+|---|---|
+| Notification method | `_opencode/rawEvent` |
+| Default | Disabled (`defaultEnabled: false`) |
+| Maximum size | 64 KiB per event |
+
+An event whose JSON exceeds the 64 KiB cap is replaced with a small marker
+payload (`truncated: true`, `maxBytes`, `reason`, and the original `sizeBytes`)
+rather than sending the oversized body. The capability, its enable path, and the
+byte cap are advertised under `_meta.opencode.rawEvent` in the initialize
+response.
+
+<Warning>
+Raw events carry unredacted native OpenCode event bodies, which can include
+prompt and tool content. Enable them only for trusted debugging.
+</Warning>

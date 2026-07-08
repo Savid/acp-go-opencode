@@ -1,13 +1,39 @@
-# Observability
+---
+title: Observability
+description: Wire logs, metrics, and traces for the adapter without leaking prompt or tool content.
+---
 
-Use `WithLogger` for adapter diagnostics. The CLI `-debug` flag writes
-structured logs to stderr so stdout stays reserved for ACP frames.
+The adapter emits diagnostics two ways: structured logs and OpenTelemetry
+signals. Both are opt-in and both redact sensitive content by default.
 
-Embedded hosts can supply OpenTelemetry providers with `WithTracerProvider`,
-`WithMeterProvider`, and `WithTextMapPropagator`. The command can also configure
-exporters from environment variables when OpenTelemetry support is available in
-the build.
+## Logging
 
-Telemetry records lifecycle timing, request outcomes, and counters. It avoids
-recording prompt text, tool inputs, tool outputs, and raw OpenCode event bodies
-by default.
+Supply a `*slog.Logger` with `WithLogger` for adapter diagnostics. From the CLI,
+`-debug` installs a debug-level text handler on stderr.
+
+<Warning>
+stdout is reserved for ACP JSON-RPC. Diagnostics MUST go to stderr; logging to
+stdout corrupts the protocol stream. The CLI enforces this, and embedded hosts
+should point their logger at stderr or another non-stdout sink.
+</Warning>
+
+## OpenTelemetry
+
+Embedded hosts pass providers directly:
+
+- `WithTracerProvider`
+- `WithMeterProvider`
+- `WithTextMapPropagator`
+
+The command can also configure exporters from standard OpenTelemetry environment
+variables when the build includes OTel support.
+
+Telemetry records lifecycle timing, request outcomes, and counters — enough to
+observe latency and error rates.
+
+## What is not recorded
+
+By default telemetry and logs avoid recording prompt text, tool inputs, tool
+outputs, and raw OpenCode event bodies, so enabling observability does not leak
+conversation content. Raw native event bodies are emitted only through the
+explicit [raw events](/docs/features/raw-events) opt-in, never through telemetry.

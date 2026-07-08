@@ -1,17 +1,44 @@
-# Sessions
+---
+title: Sessions
+description: The mental model behind an ACP session, its isolated OpenCode process, and how load differs from resume.
+---
 
-Each ACP session owns one OpenCode server process and four isolated XDG
-directories under the configured home parent.
+An ACP session is the unit of isolation. Each session owns exactly one
+`opencode serve` process and its own set of four XDG directories — data, config,
+cache, and state — created under the configured home root. Two sessions never
+share a process or a state directory, so their native histories, credentials at
+rest, and running work stay separate.
 
-Lifecycle support:
+## Lifecycle
 
-- `session/new`
-- `session/load`
-- `session/resume`
-- `session/list`
-- `session/close`
-- `session/delete`
-- `_opencode/session/fork`
+The adapter implements the full ACP session lifecycle plus one namespaced
+extension for fork:
 
-`session/load` replays messages from OpenCode REST. `session/resume` restores
-native state and returns without replay.
+- `session/new` — create a session and launch its OpenCode process.
+- `session/load` — recreate a stored session and replay its history.
+- `session/resume` — restore a stored session without replaying history.
+- `session/list` — enumerate stored sessions.
+- `session/close` — end a session and take a final snapshot.
+- `session/delete` — remove a stored session, leaving a tombstone.
+- `_opencode/session/fork` — branch a session's native state into a new session.
+
+## Load versus resume
+
+Both `session/load` and `session/resume` hydrate a stored session's native state
+into fresh per-session directories. They differ in what the host sees:
+
+- **`session/load`** replays the stored conversation back to the client as
+  `session/update` notifications (user and agent message chunks) so the host can
+  rebuild its transcript view.
+- **`session/resume`** restores the same native state but returns without
+  replaying, for hosts that already hold the transcript and only need the
+  session live again.
+
+## Storage and hydration
+
+Session persistence is optional and host-provided through a `SessionStore`. When
+one is wired, the adapter snapshots native state after completed turns and on
+lifecycle boundaries, then restores it into clean directories on load, resume,
+or fork. See [Session store](/docs/features/session-store) for the snapshot
+contents and wiring, and [Sessions storage format](/docs/reference/meta) for the
+`opencode-state-v1` advertisement.

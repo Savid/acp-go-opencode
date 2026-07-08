@@ -1,12 +1,24 @@
-# Updates
+---
+title: Updates
+description: The session/update notification variants the adapter emits and what each maps from.
+---
 
-The adapter emits ACP `session/update` notifications for:
+During a session the adapter emits ACP `session/update` notifications. This
+table lists every variant and its native source.
 
-- user and agent message chunks
-- thought chunks
-- tool calls
-- plan updates
-- config option updates
-- usage updates
+## Update variants
 
-Usage metadata may include `_meta.opencode.messageId`.
+| Variant | Emitted from |
+|---|---|
+| `user_message_chunk` | Replayed user messages during `session/load`. |
+| `agent_message_chunk` | Native text parts. |
+| `agent_thought_chunk` | Native reasoning parts. |
+| `tool_call` / `tool_call_update` | Native tool parts. |
+| `plan` | Native todos. |
+| `usage_update` | Native token totals. |
+| `available_commands_update` | Changes to the session's native slash-command set. |
+| config option update | Model/mode option changes (including on `session/set_config_option`). |
+
+`usage_update` notifications may carry `_meta.opencode.messageId`. See
+[Prompt streaming](/docs/core/prompt-streaming) for how the message parts map
+during a live turn.

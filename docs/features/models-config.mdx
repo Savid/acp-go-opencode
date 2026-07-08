@@ -1,4 +1,13 @@
-# Models And Config
+---
+title: Models and Config
+description: Select the model and mode for a session, request native structured output, and seed a custom provider.
+---
+
+Model and mode are ACP config options; structured output is a native OpenCode
+feature the adapter turns on per session. This page covers each and how a failed
+structured-output turn surfaces to the host.
+
+## Model and mode options
 
 The model selector is an ACP config option with id `model` and category
 `model`. Values are built from authenticated `GET /config/providers` as
@@ -7,6 +16,16 @@ The model selector is an ACP config option with id `model` and category
 Mode selection uses config id `mode` and category `mode` when OpenCode agents
 are enumerable.
 
+| Option | Config id | Category | Values |
+|---|---|---|---|
+| Model | `model` | `model` | `provider/model`, from authenticated providers |
+| Mode | `mode` | `mode` | Enumerable OpenCode agents, when available |
+
+Set either at session start via `_meta.opencode.options` or on a running session
+with `session/set_config_option`.
+
+## Structured output
+
 Structured output is native. Supplying a JSON Schema object at
 `_meta.opencode.options.outputSchema` (or via `WithOpenCodeOutputSchema` /
 `WithSessionOutputSchema`) makes every non-command prompt request the native
@@ -14,7 +33,7 @@ Structured output is native. Supplying a JSON Schema object at
 `POST /session/{id}/message`. The validated result is returned on the prompt
 response at `_meta.opencode.structuredOutput`. If OpenCode fails to produce
 valid structured output after its native retries, the turn fails with the
-assistant error surfaced verbatim (`StructuredOutputError`). Slash-command
+uniform `opencode_turn_failed` provider error described below. Slash-command
 turns never request structured output. Startup fails closed unless the
 server's `/doc` advertises the `OutputFormatJsonSchema` component.
 

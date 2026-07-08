@@ -1,21 +1,45 @@
-# Run Modes
+---
+title: Run Modes
+description: Choose between the standalone subprocess and embedding the adapter directly in your Go host.
+---
 
-## Command
+The adapter offers the same behavior through two entry points. Pick by where the
+ACP transport lives: use the standalone binary when an editor or host spawns a
+subprocess and pipes JSON-RPC over stdio, and embed `Serve` when your host owns
+the streams directly.
 
-`acp-go-opencode` is intended to be launched by an ACP client.
+## Standalone binary
+
+`acp-go-opencode` is launched by an ACP client, which drives it over
+stdin/stdout. stdout carries ACP JSON-RPC only; diagnostics go to stderr.
 
 ```sh
 acp-go-opencode -path /usr/bin/opencode -home /tmp/acp-opencode
 ```
 
-## Embedded
+## Embedded Serve
 
-```go
-agent := opencodeacp.NewAgent(opencodeacp.WithHome(home))
+`Serve` runs the agent against reader/writer streams you supply, so your host
+can back the transport with any pipe, socket, or in-memory buffer. `NewAgent`
+builds the same agent when you need to hold a reference before serving.
+
+<CodeGroup>
+
+```go Serve
+err := opencodeacp.Serve(ctx, input, output,
+	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
+	opencodeacp.WithHome(home),
+)
 ```
 
-or:
-
-```go
-err := opencodeacp.Serve(ctx, input, output, opencodeacp.WithHome(home))
+```go NewAgent
+agent := opencodeacp.NewAgent(
+	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
+	opencodeacp.WithHome(home),
+)
 ```
+
+</CodeGroup>
+
+Both entry points accept the same `Option` values. See the
+[Go API reference](/docs/reference/go-api) for the full catalog.

@@ -1,8 +1,39 @@
-# Security
+---
+title: Security
+description: The adapter's trust boundaries, stdout discipline, and how credentials stay out of the store.
+---
 
-Each OpenCode server binds to `127.0.0.1` and uses a per-session random basic
-auth password. Child stdout and stderr are never connected to the ACP stdout
-stream.
+The adapter's security posture rests on isolating each session and keeping
+provider credentials out of anything it persists or streams. This page is the
+operator's view of those boundaries.
 
-Session snapshots exclude obvious credential-bearing files such as `auth.json`
-and credential-named files.
+## Trust boundaries
+
+Every session runs its own `opencode serve` process, and that process is the
+adapter's only trusted peer:
+
+- Each server binds to `127.0.0.1` and is reachable only over loopback.
+- Each server receives a per-session random basic-auth password; all REST and
+  SSE calls authenticate with it.
+- Each session has its own XDG data, config, cache, and state directories, so
+  one session cannot read another's native state.
+
+## stdout is protocol-only
+
+stdout carries ACP JSON-RPC frames exclusively. The child OpenCode process's
+stdout and stderr are never connected to the ACP stdout stream, and adapter
+diagnostics go to stderr. Anything written to stdout other than ACP frames
+corrupts the session.
+
+## Credentials and snapshots
+
+Session snapshots exclude credential-bearing native files such as `auth.json`
+and other credential-named files. Provider auth is native to OpenCode and is
+re-injected from the host environment at hydrate time rather than persisted in
+the store.
+
+<Warning>
+The runtime permission flow is load-bearing for user trust: the adapter never
+silently auto-approves a native permission prompt. Keep the session policy at
+`ask` unless a trusted host is meant to run unattended.
+</Warning>

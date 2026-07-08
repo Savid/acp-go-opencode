@@ -1,15 +1,55 @@
-# Session Store
+---
+title: Session Store
+description: Persist and restore native OpenCode session state across process restarts through a host-provided store.
+---
 
-`SessionStoreFormat` is `opencode-state-v1`.
+Session persistence is opt-in and host-owned. Wire a `SessionStore` and the
+adapter snapshots each session's native OpenCode state into it, then restores
+that state on `session/load`, `session/resume`, and `_opencode/session/fork`.
+Without a store, an in-memory implementation is used and state does not survive
+the process.
 
-The store writes a complete snapshot after completed turns:
+## Wiring a store
 
-- main snapshot entry
-- `idmap`
-- `xdg/data`
-- `xdg/config`
-- `xdg/cache`
-- `xdg/state`
+Pass an implementation with `WithSessionStore`. The package ships
+`NewInMemorySessionStore` as the default and as a reference implementation of the
+`SessionStore` interface. Stored rows use the `opencode-state-v1` format
+(`SessionStoreFormat`), keyed by `{SessionID, Subpath}`.
 
-Archive entries are `tar+zstd+base64` and are restored into fresh per-session
-directories.
+```go
+store := opencodeacp.NewInMemorySessionStore()
+agent := opencodeacp.NewAgent(
+	opencodeacp.WithSessionStore(store),
+	opencodeacp.WithSessionStoreLoadTimeout(10*time.Second),
+)
+```
+
+`WithSessionStoreLoadTimeout` bounds each store read during hydration; it
+defaults to `10s`.
+
+## Snapshot contents
+
+A snapshot is taken after a completed turn and on lifecycle boundaries
+(new, load, fork, close), so an unexpected exit still leaves a recent snapshot.
+Each snapshot writes these subpath entries:
+
+| Subpath | Contents |
+|---|---|
+| main | The session snapshot record. |
+| `idmap` | The ACP-to-native id mapping, consulted on every REST, SSE, permission, and delete path. |
+| `xdg/data` | Native data directory archive. |
+| `xdg/config` | Native config directory archive. |
+| `xdg/cache` | Native cache directory archive. |
+| `xdg/state` | Native state directory archive. |
+
+The four `xdg/*` archives are deterministic `tar+zstd+base64` blobs and are
+restored into fresh per-session directories on hydration. Credential-bearing
+files such as `auth.json` are excluded from the archive; provider auth is
+re-injected from the environment at hydrate time.
+
+<Note>
+A snapshot is blocked while any input, permission, or message generation is
+pending, so a snapshot never captures a half-finished turn. `session/delete`
+removes a stored session and leaves a tombstone so the id is not silently
+reused.
+</Note>

@@ -1,14 +1,53 @@
-# Prompt Streaming
+---
+title: Prompt Streaming
+description: How OpenCode's native REST and SSE output becomes ACP session updates, and how a turn ends.
+---
 
-Prompt turns post to OpenCode REST and consume the session SSE stream. Text
-parts become ACP message chunks, reasoning parts become thought chunks, tool
-parts become tool-call updates, todos become plan updates, and token data
-becomes `usage_update`.
+A prompt turn posts the user message to OpenCode's REST API and then consumes
+the session's SSE event stream, translating native events into ACP
+`session/update` notifications as they arrive. The turn ends when the native
+message completes, when the stream fails, when a deadline elapses, or when the
+host cancels.
 
-The native stream also echoes the just-posted user message as part events;
-those are suppressed during live turns — the client already owns that content
-— so only agent output streams back. User messages still replay as
-`user_message_chunk` during `session/load`.
+## Stream mapping
 
-If the SSE stream fails during a turn, the adapter aborts the native turn and
-returns one terminal ACP error for that prompt. The session remains usable.
+Native part events map onto ACP update variants:
+
+| Native part | ACP update |
+|---|---|
+| Text | `agent_message_chunk` |
+| Reasoning | `agent_thought_chunk` |
+| Tool call | `tool_call` / `tool_call_update` |
+| Todos | `plan` |
+| Token totals | `usage_update` |
+
+The native stream also echoes the just-posted user message back as part events.
+During a live turn those are suppressed — the client already owns that content,
+so only agent output streams back. The suppression is turn-local: user messages
+still replay as `user_message_chunk` during `session/load`.
+
+## How a turn ends
+
+A turn resolves to exactly one outcome, and cancellation always wins a tie with
+any concurrent failure:
+
+- **Success** — the native message completes; the prompt returns its stop
+  reason and usage.
+- **Cancelled** — the host cancelled, or a coinciding deadline resolves as
+  cancelled rather than timeout; the prompt returns `cancelled`.
+- **Failure** — the turn returns one terminal ACP internal error carrying a
+  uniform `opencode_turn_failed` payload. The session stays usable.
+
+The failure payload's `cause` names the failure class:
+
+| `cause` | Meaning |
+|---|---|
+| `provider` | The model or provider raised an assistant error; carries the native `message`, plus `statusCode`/`providerCode` when reported. |
+| `transport` | The SSE stream or REST call failed; carries the real transport detail, never a bare `EOF`. |
+| `timeout` | The turn exceeded the deadline set by `WithTurnTimeout`. |
+
+By default there is no deadline. `WithTurnTimeout` bounds a single turn; when it
+elapses the adapter aborts the native turn and fails the prompt with
+`cause: "timeout"`. See [Models and config](/docs/features/models-config) for the
+provider-error and structured-output details, and
+[Metadata](/docs/reference/meta) for the full error payload.

@@ -1,22 +1,32 @@
-# CLI
+---
+title: CLI
+description: Every flag the acp-go-opencode command accepts, with defaults.
+---
 
 ```sh
 acp-go-opencode [flags]
 ```
 
-Flags:
+The binary speaks ACP over stdin/stdout; stdout carries JSON-RPC only and
+diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 
-- `-path`
-- `-home`
-- `-model`
-- `-debug`
-- `-version`
-- `-opencode-pure`
-- `-opencode-question-tool`
-- `-opencode-log-level`
-- `-opencode-minimum-version`
-- `-opencode-health-timeout` (default `60s`)
-- `-seed-file <relpath>=<hostpath>` (repeatable)
+## Flags
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `-path` | Path to the `opencode` CLI. | resolved from `PATH` |
+| `-home` | Parent root for isolated per-session OpenCode state. | — |
+| `-model` | Default model as `provider/model`. | — |
+| `-debug` | Write debug logs to stderr. | off |
+| `-version` | Print the adapter version and exit. | — |
+| `-opencode-pure` | Start OpenCode without external plugins. | off |
+| `-opencode-question-tool` | Enable native question-tool elicitation mapping. | off |
+| `-opencode-log-level` | Native OpenCode server log level. | native default |
+| `-opencode-minimum-version` | Minimum accepted OpenCode version. | `1.17.13` |
+| `-opencode-health-timeout` | OpenCode server readiness timeout. | `60s` |
+| `-seed-file <relpath>=<hostpath>` | Seed a file into the session config root (repeatable). | — |
+
+## Seeding files
 
 `-seed-file` reads the host file at `<hostpath>` and seeds its contents at the
 relative path `<relpath>` inside each session's isolated OpenCode config root
@@ -25,3 +35,6 @@ seed several files. The seeded `opencode.json` is deep-merged with the wrapper's
 managed `$schema` and `permission` keys (the wrapper wins for those); every
 other seeded file is written verbatim. Absolute paths, `..` escapes, and empty
 keys are rejected.
+
+For a worked example see
+[Models and config](/docs/features/models-config).
