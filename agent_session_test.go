@@ -279,6 +279,15 @@ func TestNativeMCPServerConfigConversion(t *testing.T) {
 	if err := validateUnstableMCPServers(unstable[:2]); err != nil {
 		t.Fatalf("named unstable MCP servers rejected: %v", err)
 	}
+
+	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
+		{Http: &acp.UnstableMcpServerHttp{Name: "dup", Url: "http://127.0.0.1:9/mcp"}},
+		{Stdio: &acp.McpServerStdio{Name: "dup", Command: "server-files"}},
+	}); err == nil {
+		t.Fatal("duplicate-name unstable MCP servers accepted")
+	} else {
+		requireInvalidParamsData(t, err, map[string]any{"mcpServers[1].name": "duplicate"})
+	}
 }
 
 func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {

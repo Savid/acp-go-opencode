@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -429,6 +430,30 @@ func assertInvalidModelField(t testingT, err error, field string) {
 	}
 	if data["error"] != "invalid_model" || data["field"] != field {
 		t.Fatalf("invalid model data = %#v, want field %q", data, field)
+	}
+}
+
+// requireInvalidParamsData asserts err is an ACP invalid-params error (code
+// -32602) whose data map equals want exactly.
+func requireInvalidParamsData(t testingT, err error, want map[string]any) {
+	t.Helper()
+
+	var reqErr *acp.RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("error = %v, want RequestError", err)
+	}
+
+	if reqErr.Code != -32602 {
+		t.Fatalf("error code = %d, want -32602", reqErr.Code)
+	}
+
+	data, ok := reqErr.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("error data = %#v, want map", reqErr.Data)
+	}
+
+	if !reflect.DeepEqual(data, want) {
+		t.Fatalf("invalid params data = %#v, want %#v", data, want)
 	}
 }
 

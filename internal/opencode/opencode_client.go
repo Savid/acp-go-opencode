@@ -1980,11 +1980,17 @@ func materializeOpenCodePermissionConfig(
 			"*": normalizeOpenCodePermission(permission),
 		},
 	}
-	if mcpBlock := openCodeMCPConfigBlock(mcpServers); len(mcpBlock) > 0 {
-		managed[fieldMCP] = mcpBlock
-	}
 
 	config := deepMergeJSON(seededConfig, managed)
+
+	// The mcp block is overlaid separately from the generic deep-merge: a
+	// forwarded server must REPLACE any same-named seeded server wholesale, never
+	// recurse into it. Deep-merging server objects would let a seeded local
+	// server's stale "command" bleed into a forwarded remote server and hand
+	// OpenCode a hybrid entry.
+	if mcpBlock := openCodeMCPConfigBlock(mcpServers); len(mcpBlock) > 0 {
+		config[fieldMCP] = overlayManagedMCPBlock(config[fieldMCP], mcpBlock)
+	}
 
 	data, err := openCodeMarshalIndent(config, "", "  ")
 	if err != nil {
@@ -2219,6 +2225,26 @@ func seedFileField(rel string) string {
 
 func unsupportedField(path string) error {
 	return fmt.Errorf("unsupported field %s", path)
+}
+
+// overlayManagedMCPBlock overlays the wrapper-managed mcp servers onto any
+// seeded mcp block. Same-named entries are REPLACED WHOLESALE — never
+// deep-merged — so a seeded local server and a forwarded remote server sharing a
+// name can never combine into a hybrid entry (e.g. a "remote" block carrying a
+// stale "command"). Seeded servers with other names are preserved verbatim.
+func overlayManagedMCPBlock(seeded any, managed map[string]any) map[string]any {
+	existing, _ := seeded.(map[string]any)
+	merged := make(map[string]any, len(existing)+len(managed))
+
+	for name, entry := range existing {
+		merged[name] = entry
+	}
+
+	for name, entry := range managed {
+		merged[name] = entry
+	}
+
+	return merged
 }
 
 // deepMergeJSON returns base with override applied on top: nested maps are

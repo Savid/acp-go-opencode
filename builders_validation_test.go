@@ -174,6 +174,19 @@ func TestValidationMetaAndHelperBranches(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("valid MCP servers rejected: %v", err)
 	}
+	if err := validateMCPServers([]acp.McpServer{{Http: &acp.McpServerHttpInline{Name: "", Url: "https://mcp.example"}}}); err == nil {
+		t.Fatal("empty-name MCP server accepted")
+	} else {
+		requireInvalidParamsData(t, err, map[string]any{"mcpServers[0].name": "required"})
+	}
+	if err := validateMCPServers([]acp.McpServer{
+		{Http: &acp.McpServerHttpInline{Name: "dup", Url: "https://mcp.example"}},
+		{Stdio: &acp.McpServerStdio{Name: "dup", Command: "server"}},
+	}); err == nil {
+		t.Fatal("duplicate-name MCP servers accepted")
+	} else {
+		requireInvalidParamsData(t, err, map[string]any{"mcpServers[1].name": "duplicate"})
+	}
 	if _, err := normalizeConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: -1}); err == nil {
 		t.Fatal("negative concurrency accepted")
 	}

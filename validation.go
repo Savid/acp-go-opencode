@@ -42,20 +42,16 @@ func validateOptionalAbsolutePath(field string, value *string) error {
 }
 
 func validateMCPServers(servers []acp.McpServer) error {
+	seen := make(map[string]struct{}, len(servers))
+
 	for index, server := range servers {
+		var name string
+
 		switch {
 		case server.Stdio != nil:
-			if server.Stdio.Name == "" {
-				return acp.NewInvalidParams(map[string]any{
-					fmt.Sprintf("mcpServers[%d].name", index): validationRequired,
-				})
-			}
+			name = server.Stdio.Name
 		case server.Http != nil:
-			if server.Http.Name == "" {
-				return acp.NewInvalidParams(map[string]any{
-					fmt.Sprintf("mcpServers[%d].name", index): validationRequired,
-				})
-			}
+			name = server.Http.Name
 		case server.Sse != nil:
 			return acp.NewInvalidParams(map[string]any{
 				jsonFieldError:  errValueUnsupported,
@@ -74,6 +70,20 @@ func validateMCPServers(servers []acp.McpServer) error {
 				jsonFieldField: fmt.Sprintf("mcpServers[%d]", index),
 			})
 		}
+
+		if name == "" {
+			return acp.NewInvalidParams(map[string]any{
+				fmt.Sprintf("mcpServers[%d].name", index): validationRequired,
+			})
+		}
+
+		if _, ok := seen[name]; ok {
+			return acp.NewInvalidParams(map[string]any{
+				fmt.Sprintf("mcpServers[%d].name", index): validationDuplicate,
+			})
+		}
+
+		seen[name] = struct{}{}
 	}
 
 	return nil

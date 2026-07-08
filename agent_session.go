@@ -716,6 +716,8 @@ func (a *Agent) homeRoot() string {
 }
 
 func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
+	seen := make(map[string]struct{}, len(servers))
+
 	for index, server := range servers {
 		if server.Sse != nil {
 			return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Sse.Name})
@@ -725,9 +727,26 @@ func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
 			return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Acp.Name})
 		}
 
-		if (server.Http != nil && server.Http.Name == "") || (server.Stdio != nil && server.Stdio.Name == "") {
+		var name string
+
+		switch {
+		case server.Http != nil:
+			name = server.Http.Name
+		case server.Stdio != nil:
+			name = server.Stdio.Name
+		default:
+			continue
+		}
+
+		if name == "" {
 			return acp.NewInvalidParams(map[string]any{fmt.Sprintf("mcpServers[%d].name", index): validationRequired})
 		}
+
+		if _, ok := seen[name]; ok {
+			return acp.NewInvalidParams(map[string]any{fmt.Sprintf("mcpServers[%d].name", index): validationDuplicate})
+		}
+
+		seen[name] = struct{}{}
 	}
 
 	return nil

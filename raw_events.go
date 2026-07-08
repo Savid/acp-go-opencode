@@ -56,6 +56,7 @@ const (
 	jsonFieldLimit                     = "limit"
 	jsonFieldTitle                     = "title"
 	validationRequired                 = "required"
+	validationDuplicate                = "duplicate"
 	errValueBackpressure               = "backpressure"
 	errValueUnsupported                = "unsupported"
 	errValueSessionUnknown             = "unknown session"

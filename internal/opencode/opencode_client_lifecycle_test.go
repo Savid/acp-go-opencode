@@ -1136,7 +1136,7 @@ func TestMaterializeOpenCodeConfigMCPServers(t *testing.T) {
 	seed := map[string]string{"opencode.json": `{
   "mcp": {
     "seeded": {"type": "remote", "url": "http://seed.example/mcp"},
-    "wagie": {"type": "remote", "url": "http://stale.example/mcp"}
+    "wagie": {"type": "local", "command": ["stale-binary", "--flag"]}
   }
 }`}
 	servers := []MCPServerConfig{
@@ -1167,6 +1167,11 @@ func TestMaterializeOpenCodeConfigMCPServers(t *testing.T) {
 	remote, ok := mcp["wagie"].(map[string]any)
 	if !ok || remote["type"] != "remote" || remote["url"] != "http://127.0.0.1:9/mcp" || remote["enabled"] != true {
 		t.Fatalf("wrapper remote MCP server did not win the merge: %#v", mcp["wagie"])
+	}
+	// The forwarded remote server must REPLACE the same-named seeded local server
+	// wholesale: no stale "command" from the seed may survive into the hybrid.
+	if _, stale := remote["command"]; stale {
+		t.Fatalf("seeded local command bled into forwarded remote server: %#v", remote)
 	}
 	headers, ok := remote["headers"].(map[string]any)
 	if !ok || headers["Authorization"] != "Bearer t" {
