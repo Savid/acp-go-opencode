@@ -979,6 +979,67 @@ func TestOpenCodeBlockingPostRecoversPersistedCause(t *testing.T) {
 	}
 }
 
+// TestOpenCodeBlockingPostDoubleFailureNamesBoth proves that when the blocking
+// message POST is severed mid-body (client sees an unexpected EOF) AND the
+// recovery re-fetch GET /session/{id}/message also fails, the surfaced transport
+// error names both failures with context and is never a bare stream error such
+// as "unexpected EOF". A double failure is genuinely unrecoverable, but the cause
+// text must still carry the route and the re-fetch failure so the caller
+// classifies it as cause "transport" with a self-describing message.
+func TestOpenCodeBlockingPostDoubleFailureNamesBoth(t *testing.T) {
+	ctx := context.Background()
+
+	severMidBody := func(w http.ResponseWriter) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("response writer is not a Hijacker")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 512\r\n\r\n{\"info\":{\"id\":\"assist"))
+		_ = conn.Close()
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session/s/message":
+			severMidBody(w)
+		case r.Method == http.MethodGet && r.URL.Path == "/session/s/message":
+			// The recovery re-fetch also fails: the server is effectively dead.
+			http.Error(w, "gateway is down", http.StatusBadGateway)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &openCodeServer{
+		httpClient: server.Client(),
+		baseURL:    server.URL,
+		username:   "opencode",
+		password:   "secret",
+	}
+
+	_, err := client.SendMessage(ctx, "s", MessageRequest{Parts: []map[string]any{{"type": "text", "text": "hi"}}})
+	if err == nil {
+		t.Fatal("double failure unexpectedly succeeded")
+	}
+
+	var assistantErr *AssistantError
+	if errors.As(err, &assistantErr) {
+		t.Fatalf("double failure misreported as an assistant error: %v", err)
+	}
+
+	msg := err.Error()
+	for _, want := range []string{"opencode message POST", "unexpected EOF", "message re-fetch failed", "502"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error = %q, want substring %q (must name both the POST and the re-fetch failure)", msg, want)
+		}
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")

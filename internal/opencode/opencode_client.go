@@ -920,7 +920,9 @@ func (s *openCodeServer) SendMessage(ctx context.Context, id string, req Message
 // session messages and surface the persisted assistant error when present. An
 // HTTP status error is a completed response rather than a transport failure and
 // passes through unchanged; when no persisted assistant error is recoverable the
-// original transport error is returned so the caller can classify it.
+// transport failure is surfaced with route context so the caller classifies it
+// as cause "transport" and never sees a bare stream error such as "unexpected
+// EOF".
 func (s *openCodeServer) recoverBlockingTurnFailure(ctx context.Context, id string, transportErr error) (NativeMessage, error) {
 	var httpErr *HTTPError
 	if errors.As(transportErr, &httpErr) {
@@ -928,13 +930,20 @@ func (s *openCodeServer) recoverBlockingTurnFailure(ctx context.Context, id stri
 	}
 
 	messages, err := s.Messages(ctx, id)
-	if err == nil {
-		if assistantErr := lastAssistantError(messages); assistantErr != nil {
-			return NativeMessage{}, assistantErr
-		}
+	if err != nil {
+		// Both the blocking POST and the recovery re-fetch failed: name both
+		// failures with context so the surfaced transport cause is never a bare
+		// stream error such as "unexpected EOF".
+		return NativeMessage{}, fmt.Errorf("opencode message POST: %w; message re-fetch failed: %v", transportErr, err)
 	}
 
-	return NativeMessage{}, transportErr
+	if assistantErr := lastAssistantError(messages); assistantErr != nil {
+		return NativeMessage{}, assistantErr
+	}
+
+	// The re-fetch succeeded but persisted no assistant error: surface the POST
+	// transport failure with route context rather than a bare stream error.
+	return NativeMessage{}, fmt.Errorf("opencode message POST: %w", transportErr)
 }
 
 // lastAssistantError runs AssistantMessageError against the most recent

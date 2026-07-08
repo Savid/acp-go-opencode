@@ -3,7 +3,9 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,5 +207,106 @@ func TestPromptTurnTimeoutFailsWithTimeoutCause(t *testing.T) {
 	assertTurnFailed(t, err, causeTimeout, "deadline")
 	if client.abortCount() != 1 {
 		t.Fatalf("abort count = %d, want 1 (timeout aborts the native turn)", client.abortCount())
+	}
+}
+
+// T7 — when a user cancel and the WithTurnTimeout deadline coincide, the cancel
+// guard wins deterministically: the turn resolves to StopReason cancelled with a
+// nil error (never cause "timeout"), and the native turn is aborted exactly once
+// (no double-send). This pins the timeout branch's cancel re-check.
+//
+// The coincidence is reproduced deterministically by marking the cancel pending
+// (the flag cancelTurn sets under the session lock) without yet cancelling
+// turnCtx, so the fired deadline is the only ready select case: the timeout
+// branch must observe the pending cancel and yield cancelled rather than a
+// timeout failure.
+func TestPromptCancelWinsCoincidentTimeout(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	client.sendMessage = func(_ context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		close(started)
+		<-release
+
+		return opencode.NativeMessage{}, errors.New("native error raised at coincident cancel+timeout")
+	}
+	agent := NewAgent(WithTurnTimeout(15 * time.Millisecond))
+	session := testSession(agent, client)
+	agent.mu.Lock()
+	agent.sessions[session.id] = session
+	agent.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan struct {
+		resp acp.PromptResponse
+		err  error
+	}, 1)
+	go func() {
+		resp, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hi")}})
+		done <- struct {
+			resp acp.PromptResponse
+			err  error
+		}{resp, err}
+	}()
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("Prompt did not start")
+	}
+
+	// Cancel is pending (flag set under lock, as cancelTurn does) at the instant
+	// the deadline fires; turnCtx stays live so the timeout branch is the case
+	// that must honor the cancel guard.
+	session.mu.Lock()
+	session.cancelled = true
+	session.mu.Unlock()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("coincident cancel+timeout returned error: %v", got.err)
+		}
+		if got.resp.StopReason != acp.StopReasonCancelled {
+			t.Fatalf("StopReason = %q, want cancelled (cancel wins over coincident timeout)", got.resp.StopReason)
+		}
+	case <-ctx.Done():
+		t.Fatal("Prompt did not return after coincident cancel+timeout")
+	}
+
+	if client.abortCount() != 1 {
+		t.Fatalf("abort count = %d, want 1 (single abort, no double-send)", client.abortCount())
+	}
+}
+
+// T8 — a double transport failure (blocking POST severed mid-body AND recovery
+// re-fetch failed) surfaces as the uniform turn-failure error (cause
+// "transport") whose message names both failures with context, never a bare
+// stream error such as "unexpected EOF". The native client wraps the two
+// failures (see TestOpenCodeBlockingPostDoubleFailureNamesBoth); this pins that
+// the wrapped cause flows verbatim into the ACP error data.message.
+func TestPromptDoubleTransportFailureNamesBoth(t *testing.T) {
+	ctx := context.Background()
+
+	client := newFakeOpenCodeClient()
+	client.sendMessage = func(_ context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		return opencode.NativeMessage{}, fmt.Errorf(
+			"opencode message POST: %w; message re-fetch failed: %v",
+			io.ErrUnexpectedEOF,
+			errors.New("opencode GET /session/native-1/message returned 502 Bad Gateway: gateway is down"),
+		)
+	}
+	session := testSession(NewAgent(), client)
+
+	_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hi")}})
+	data := assertTurnFailed(t, err, causeTransport, "unexpected EOF")
+
+	message, _ := data[jsonFieldMessage].(string)
+	for _, want := range []string{"opencode message POST", "unexpected EOF", "message re-fetch failed", "502"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("data.message = %q, want substring %q (must name both failures)", message, want)
+		}
 	}
 }

@@ -394,6 +394,13 @@ func (s *session) runPromptTurn(
 		case <-timeoutC:
 			abortTurn()
 
+			// The cancel guard runs before all failure mapping: when a user
+			// cancel and the turn deadline coincide, the turn resolves
+			// deterministically to cancelled, never cause "timeout".
+			if s.wasCancelled() || turnCtx.Err() != nil {
+				return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
+			}
+
 			return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(causeTimeout, fmt.Sprintf("turn exceeded %s deadline", timeout), 0, ""))
 		case <-turnCtx.Done():
 			abortTurn()
