@@ -44,8 +44,18 @@ func validateOptionalAbsolutePath(field string, value *string) error {
 func validateMCPServers(servers []acp.McpServer) error {
 	for index, server := range servers {
 		switch {
-		case server.Stdio != nil, server.Http != nil:
-			continue
+		case server.Stdio != nil:
+			if server.Stdio.Name == "" {
+				return acp.NewInvalidParams(map[string]any{
+					fmt.Sprintf("mcpServers[%d].name", index): validationRequired,
+				})
+			}
+		case server.Http != nil:
+			if server.Http.Name == "" {
+				return acp.NewInvalidParams(map[string]any{
+					fmt.Sprintf("mcpServers[%d].name", index): validationRequired,
+				})
+			}
 		case server.Sse != nil:
 			return acp.NewInvalidParams(map[string]any{
 				jsonFieldError:  errValueUnsupported,

@@ -25,6 +25,8 @@ const (
 	eventServerConnected    = "server.connected"
 	eventPermissionV2Asked  = "permission.v2.asked"
 	eventMessagePartCreated = "message.part.created"
+	eventMessagePartUpdated = "message.part.updated"
+	eventMessageUpdated     = "message.updated"
 	eventQuestionAsked      = "question.asked"
 	eventQuestionV2Asked    = "question.v2.asked"
 
@@ -920,9 +922,20 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 		if err := json.Unmarshal(event.Properties, &payload); err == nil && payload.SessionID == s.idmap.NativeSessionID {
 			return s.emitPlan(ctx, payload.Todos)
 		}
-	case "message.part.updated", eventMessagePartCreated:
+	case eventMessageUpdated:
+		if info, ok := eventMessageInfo(event.Properties); ok && info.SessionID == s.idmap.NativeSessionID {
+			s.recordMessageRole(info)
+		}
+	case eventMessagePartUpdated, eventMessagePartCreated:
 		part, ok := eventPart(event.Properties)
 		if ok && part.SessionID == s.idmap.NativeSessionID && s.markPart(part) {
+			// The native stream echoes the just-posted user message parts; the
+			// ACP client already owns that content, so only non-user parts are
+			// forwarded. Roles arrive via message.updated before any part event.
+			if s.messageRole(part.MessageID) == roleUser {
+				return nil
+			}
+
 			s.markActiveMessageID(part.MessageID)
 
 			for _, update := range partUpdates("assistant", part) {
@@ -945,6 +958,22 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 	}
 
 	return nil
+}
+
+func eventMessageInfo(data json.RawMessage) (opencode.NativeMessageInfo, bool) {
+	var wrapper struct {
+		Info opencode.NativeMessageInfo `json:"info"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err == nil && wrapper.Info.ID != "" {
+		return wrapper.Info, true
+	}
+
+	var info opencode.NativeMessageInfo
+	if err := json.Unmarshal(data, &info); err == nil && info.ID != "" {
+		return info, true
+	}
+
+	return opencode.NativeMessageInfo{}, false
 }
 
 func eventPart(data json.RawMessage) (opencode.NativePart, bool) {

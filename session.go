@@ -55,6 +55,7 @@ type session struct {
 	commandsByName      map[string]opencode.NativeCommand
 	availableCommands   []acp.AvailableCommand
 	contextWindows      map[string]int
+	messageRoles        map[string]string
 	poisonCause         string
 	closed              bool
 }
@@ -394,6 +395,30 @@ func (s *session) markActiveMessageID(messageID string) {
 
 	s.activeMessageIDs[messageID] = struct{}{}
 	s.mu.Unlock()
+}
+
+// recordMessageRole remembers the native role declared for a message so live
+// part events can be attributed. OpenCode emits `message.updated` (carrying
+// the role) before any `message.part.*` event for that message.
+func (s *session) recordMessageRole(info opencode.NativeMessageInfo) {
+	if info.ID == "" || info.Role == "" {
+		return
+	}
+
+	s.mu.Lock()
+	if s.messageRoles == nil {
+		s.messageRoles = map[string]string{}
+	}
+
+	s.messageRoles[info.ID] = info.Role
+	s.mu.Unlock()
+}
+
+func (s *session) messageRole(messageID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.messageRoles[messageID]
 }
 
 func (s *session) markStreamFailed(epoch uint64) {

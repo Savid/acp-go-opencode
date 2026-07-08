@@ -46,7 +46,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 	id := acp.SessionId(idValue)
 
-	client, err := a.newOpenCodeClient(ctx, id, params.Cwd, meta, opencode.XDGDirs{})
+	client, err := a.newOpenCodeClient(ctx, id, params.Cwd, meta, opencode.XDGDirs{}, nativeMCPServerConfigs(params.McpServers))
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -212,7 +212,7 @@ func (a *Agent) loadOrResumeSession(
 		meta.Mode = snapshot.Session.Model.Agent
 	}
 
-	client, err := a.newOpenCodeClient(ctx, id, cwd, meta, xdg)
+	client, err := a.newOpenCodeClient(ctx, id, cwd, meta, xdg, nativeMCPServerConfigs(mcpServers))
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +449,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		meta.Mode = parentSnapshot.mode
 	}
 
-	client, err := a.newOpenCodeClient(ctx, id, params.Cwd, meta, xdg)
+	client, err := a.newOpenCodeClient(ctx, id, params.Cwd, meta, xdg, nativeMCPServerConfigsFromUnstable(params.McpServers))
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -495,7 +495,89 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	}, nil
 }
 
-func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd string, meta sessionMeta, existing opencode.XDGDirs) (opencode.Client, error) {
+// nativeMCPServerConfigs maps validated ACP MCP server declarations onto the
+// native launch config: HTTP servers become remote entries, stdio servers
+// become local entries. Call validateMCPServers first; unsupported transports
+// are skipped here.
+func nativeMCPServerConfigs(servers []acp.McpServer) []opencode.MCPServerConfig {
+	if len(servers) == 0 {
+		return nil
+	}
+
+	configs := make([]opencode.MCPServerConfig, 0, len(servers))
+
+	for _, server := range servers {
+		switch {
+		case server.Http != nil:
+			configs = append(configs, opencode.MCPServerConfig{
+				Name:    server.Http.Name,
+				URL:     server.Http.Url,
+				Headers: httpHeaderMap(server.Http.Headers),
+			})
+		case server.Stdio != nil:
+			configs = append(configs, nativeStdioMCPServerConfig(server.Stdio))
+		}
+	}
+
+	return configs
+}
+
+// nativeMCPServerConfigsFromUnstable is the fork-path equivalent of
+// nativeMCPServerConfigs for the unstable MCP server union.
+func nativeMCPServerConfigsFromUnstable(servers []acp.UnstableMcpServer) []opencode.MCPServerConfig {
+	if len(servers) == 0 {
+		return nil
+	}
+
+	configs := make([]opencode.MCPServerConfig, 0, len(servers))
+
+	for _, server := range servers {
+		switch {
+		case server.Http != nil:
+			configs = append(configs, opencode.MCPServerConfig{
+				Name:    server.Http.Name,
+				URL:     server.Http.Url,
+				Headers: httpHeaderMap(server.Http.Headers),
+			})
+		case server.Stdio != nil:
+			configs = append(configs, nativeStdioMCPServerConfig(server.Stdio))
+		}
+	}
+
+	return configs
+}
+
+func nativeStdioMCPServerConfig(server *acp.McpServerStdio) opencode.MCPServerConfig {
+	command := make([]string, 0, len(server.Args)+1)
+	command = append(command, server.Command)
+	command = append(command, server.Args...)
+
+	var env map[string]string
+
+	if len(server.Env) > 0 {
+		env = make(map[string]string, len(server.Env))
+		for _, variable := range server.Env {
+			env[variable.Name] = variable.Value
+		}
+	}
+
+	return opencode.MCPServerConfig{Name: server.Name, Command: command, Env: env}
+}
+
+func httpHeaderMap(headers []acp.HttpHeader) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	values := make(map[string]string, len(headers))
+	for _, header := range headers {
+		values[header.Name] = header.Value
+	}
+
+	return values
+}
+
+func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd string, meta sessionMeta, existing opencode.XDGDirs, mcpServers []opencode.MCPServerConfig) (opencode.Client, error) {
 	factory := a.options.clientFactory
 	if factory == nil {
 		factory = opencode.StartServer
@@ -528,6 +610,7 @@ func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd str
 		ExistingXDG:    existing,
 		Permission:     meta.Permission,
 		SeedFiles:      a.options.SeedFiles,
+		MCPServers:     mcpServers,
 	})
 }
 
@@ -640,6 +723,10 @@ func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
 
 		if server.Acp != nil {
 			return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Acp.Name})
+		}
+
+		if (server.Http != nil && server.Http.Name == "") || (server.Stdio != nil && server.Stdio.Name == "") {
+			return acp.NewInvalidParams(map[string]any{fmt.Sprintf("mcpServers[%d].name", index): validationRequired})
 		}
 	}
 

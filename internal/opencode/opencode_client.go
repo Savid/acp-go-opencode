@@ -79,6 +79,7 @@ const (
 	fieldAction     = "action"
 	fieldAnswers    = "answers"
 	fieldID         = "id"
+	fieldMCP        = "mcp"
 	fieldPermission = "permission"
 	fieldQuestions  = "questions"
 	fieldReply      = "reply"
@@ -136,6 +137,18 @@ type StartOptions struct {
 	PermissionSurface bool
 	Permission        string
 	SeedFiles         map[string]string
+	MCPServers        []MCPServerConfig
+}
+
+// MCPServerConfig describes one MCP server exposed to the native OpenCode
+// process through the generated opencode.json. URL selects the remote
+// transport; otherwise Command selects the local (stdio) transport.
+type MCPServerConfig struct {
+	Name    string
+	URL     string
+	Headers map[string]string
+	Command []string
+	Env     map[string]string
 }
 
 type ACPSessionID string
@@ -592,7 +605,7 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		return nil, err
 	}
 
-	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, options.Permission, options.SeedFiles)
+	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, options.Permission, options.SeedFiles, options.MCPServers)
 	if err != nil {
 		return nil, err
 	}
@@ -1934,13 +1947,19 @@ const (
 
 // materializeOpenCodePermissionConfig writes the per-session opencode.json into
 // the isolated OpenCode config root and returns its contents so the caller can
-// export them via OPENCODE_CONFIG_CONTENT. The wrapper's managed keys ($schema
-// and permission) are deep-merged on top of any seeded opencode.json — the
-// wrapper wins for those keys, the seed supplies the rest (e.g. a provider
-// block). Every other seeded file is written verbatim under the same config
-// root. All writes — including the merged opencode.json — are routed through the
-// provenance guard so a seed pass can never clobber an operator-authored file.
-func materializeOpenCodePermissionConfig(dirs XDGDirs, permission string, seedFiles map[string]string) (string, error) {
+// export them via OPENCODE_CONFIG_CONTENT. The wrapper's managed keys ($schema,
+// permission, and mcp when session MCP servers are present) are deep-merged on
+// top of any seeded opencode.json — the wrapper wins for those keys, the seed
+// supplies the rest (e.g. a provider block). Every other seeded file is written
+// verbatim under the same config root. All writes — including the merged
+// opencode.json — are routed through the provenance guard so a seed pass can
+// never clobber an operator-authored file.
+func materializeOpenCodePermissionConfig(
+	dirs XDGDirs,
+	permission string,
+	seedFiles map[string]string,
+	mcpServers []MCPServerConfig,
+) (string, error) {
 	if err := validateOpenCodePermission(permission); err != nil {
 		return "", err
 	}
@@ -1961,6 +1980,10 @@ func materializeOpenCodePermissionConfig(dirs XDGDirs, permission string, seedFi
 			"*": normalizeOpenCodePermission(permission),
 		},
 	}
+	if mcpBlock := openCodeMCPConfigBlock(mcpServers); len(mcpBlock) > 0 {
+		managed[fieldMCP] = mcpBlock
+	}
+
 	config := deepMergeJSON(seededConfig, managed)
 
 	data, err := openCodeMarshalIndent(config, "", "  ")
@@ -1980,6 +2003,39 @@ func materializeOpenCodePermissionConfig(dirs XDGDirs, permission string, seedFi
 	}
 
 	return string(data), nil
+}
+
+// openCodeMCPConfigBlock renders session MCP servers as the native opencode.json
+// "mcp" object: remote entries for HTTP servers, local entries for stdio ones.
+func openCodeMCPConfigBlock(servers []MCPServerConfig) map[string]any {
+	if len(servers) == 0 {
+		return nil
+	}
+
+	block := make(map[string]any, len(servers))
+
+	for _, server := range servers {
+		entry := map[string]any{"enabled": true}
+		if server.URL != "" {
+			entry["type"] = "remote"
+			entry["url"] = server.URL
+
+			if len(server.Headers) > 0 {
+				entry["headers"] = server.Headers
+			}
+		} else {
+			entry["type"] = "local"
+			entry["command"] = server.Command
+
+			if len(server.Env) > 0 {
+				entry["environment"] = server.Env
+			}
+		}
+
+		block[server.Name] = entry
+	}
+
+	return block
 }
 
 // planOpenCodeSeedWrites validates and collects every seeded file into a

@@ -340,6 +340,94 @@ func TestEventMappingMessagePartToolTodoUsageAndRaw(t *testing.T) {
 	}
 }
 
+func TestLiveUserMessagePartsAreNotEchoed(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	conn := newRecordingAgentClient()
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	session := testSession(agent, client)
+
+	// The native stream declares the user message (wrapped payload) before its
+	// part events; the prompt echo must not stream back as an agent chunk.
+	if err := session.handleEvent(ctx, opencode.Event{
+		Type:       eventMessageUpdated,
+		Properties: json.RawMessage(`{"info":{"id":"user-1","sessionID":"native-1","role":"user"}}`),
+	}); err != nil {
+		t.Fatalf("message.updated event: %v", err)
+	}
+	if err := session.handleEvent(ctx, opencode.Event{
+		Type:       "message.part.updated",
+		Properties: json.RawMessage(`{"part":{"id":"pu-1","sessionID":"native-1","messageID":"user-1","type":"text","text":"the prompt"}}`),
+	}); err != nil {
+		t.Fatalf("user part event: %v", err)
+	}
+	if conn.updateCount() != 0 {
+		t.Fatalf("user prompt echoed: %#v", conn.updates)
+	}
+
+	// Bare (unwrapped) message.updated payloads are also recognized.
+	if err := session.handleEvent(ctx, opencode.Event{
+		Type:       eventMessageUpdated,
+		Properties: json.RawMessage(`{"id":"user-2","sessionID":"native-1","role":"user"}`),
+	}); err != nil {
+		t.Fatalf("bare message.updated event: %v", err)
+	}
+	if err := session.handleEvent(ctx, opencode.Event{
+		Type:       "message.part.updated",
+		Properties: json.RawMessage(`{"part":{"id":"pu-2","sessionID":"native-1","messageID":"user-2","type":"text","text":"another prompt"}}`),
+	}); err != nil {
+		t.Fatalf("second user part event: %v", err)
+	}
+	if conn.updateCount() != 0 {
+		t.Fatalf("bare-role user prompt echoed: %#v", conn.updates)
+	}
+
+	// Assistant parts (role declared or unknown) still stream.
+	if err := session.handleEvent(ctx, opencode.Event{
+		Type:       eventMessageUpdated,
+		Properties: json.RawMessage(`{"info":{"id":"asst-1","sessionID":"native-1","role":"assistant"}}`),
+	}); err != nil {
+		t.Fatalf("assistant message.updated event: %v", err)
+	}
+	if err := session.handleEvent(ctx, opencode.Event{
+		Type:       "message.part.updated",
+		Properties: json.RawMessage(`{"part":{"id":"pa-1","sessionID":"native-1","messageID":"asst-1","type":"text","text":"reply"}}`),
+	}); err != nil {
+		t.Fatalf("assistant part event: %v", err)
+	}
+	if err := session.handleEvent(ctx, opencode.Event{
+		Type:       "message.part.updated",
+		Properties: json.RawMessage(`{"part":{"id":"pa-2","sessionID":"native-1","messageID":"unknown-role","type":"text","text":"more"}}`),
+	}); err != nil {
+		t.Fatalf("unknown-role part event: %v", err)
+	}
+	if conn.updateCount() != 2 ||
+		conn.updates[0].Update.AgentMessageChunk == nil || conn.updates[1].Update.AgentMessageChunk == nil {
+		t.Fatalf("assistant parts not streamed: %#v", conn.updates)
+	}
+
+	// Foreign-session and malformed message.updated payloads are ignored, as
+	// are infos without an id or role.
+	for _, properties := range []string{
+		`{"info":{"id":"other","sessionID":"native-other","role":"user"}}`,
+		`{"info":{"sessionID":"native-1","role":"user"}}`,
+		`not json`,
+	} {
+		if err := session.handleEvent(ctx, opencode.Event{
+			Type:       eventMessageUpdated,
+			Properties: json.RawMessage(properties),
+		}); err != nil {
+			t.Fatalf("message.updated %q: %v", properties, err)
+		}
+	}
+
+	session.recordMessageRole(opencode.NativeMessageInfo{ID: "no-role", SessionID: "native-1"})
+	if role := session.messageRole("no-role"); role != "" {
+		t.Fatalf("role recorded without value: %q", role)
+	}
+}
+
 func TestPromptSSEDisconnectAbortsNativeTurn(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	started := make(chan struct{})

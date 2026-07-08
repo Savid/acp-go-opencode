@@ -1,6 +1,15 @@
 # MCP
 
 ACP lifecycle requests accept stdio and HTTP MCP server definitions. SSE and
-ACP-transport MCP server definitions are rejected during session start.
+ACP-transport MCP server definitions are rejected during session start, as are
+servers without a name.
+
+Accepted servers are forwarded to the native OpenCode process through the
+generated per-session `opencode.json`: HTTP servers become `"type": "remote"`
+entries (with their request headers) and stdio servers become
+`"type": "local"` entries (command, arguments, and environment). The
+wrapper-managed `mcp` key is deep-merged on top of any seeded
+`opencode.json`, so a seeded server with the same name is overridden while
+other seeded servers are preserved.
 
 The adapter does not expose a public MCP transport route.

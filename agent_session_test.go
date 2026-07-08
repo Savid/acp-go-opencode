@@ -177,6 +177,110 @@ func TestNewSessionRejectsInvalidRequestedModel(t *testing.T) {
 	}
 }
 
+func TestNewSessionForwardsMCPServersToNativeLaunch(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-1")
+	client.getSession = client.createSession
+	client.providers = testProviders()
+	client.agents = []opencode.NativeAgent{{Name: "build", Description: "Build"}}
+
+	var captured []opencode.MCPServerConfig
+
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
+			captured = opts.MCPServers
+
+			var err error
+			client.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
+			if err != nil {
+				return nil, err
+			}
+
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	_, err := agent.NewSession(ctx, NewSessionRequest(cwd,
+		WithSessionMCPServers(
+			HTTPMCPServer("wagie", "http://127.0.0.1:9/mcp", map[string]string{"Authorization": "Bearer t"}),
+			StdioMCPServer("files", "server-files", []string{"--root", "/tmp"}, map[string]string{"DEBUG": "1"}),
+		),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
+	))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if len(captured) != 2 {
+		t.Fatalf("MCP servers forwarded = %#v", captured)
+	}
+	remote := captured[0]
+	if remote.Name != "wagie" || remote.URL != "http://127.0.0.1:9/mcp" ||
+		remote.Headers["Authorization"] != "Bearer t" || len(remote.Command) != 0 {
+		t.Fatalf("remote MCP config = %#v", remote)
+	}
+	local := captured[1]
+	if local.Name != "files" || local.URL != "" || len(local.Command) != 3 ||
+		local.Command[0] != "server-files" || local.Command[1] != "--root" || local.Command[2] != "/tmp" ||
+		local.Env["DEBUG"] != "1" {
+		t.Fatalf("local MCP config = %#v", local)
+	}
+
+	if _, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionMCPServers(
+		HTTPMCPServer("", "http://127.0.0.1:9/mcp", nil),
+	))); err == nil {
+		t.Fatal("unnamed HTTP MCP server accepted")
+	}
+
+	if _, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionMCPServers(
+		StdioMCPServer("", "server-files", nil, nil),
+	))); err == nil {
+		t.Fatal("unnamed stdio MCP server accepted")
+	}
+}
+
+func TestNativeMCPServerConfigConversion(t *testing.T) {
+	if nativeMCPServerConfigs(nil) != nil || nativeMCPServerConfigsFromUnstable(nil) != nil {
+		t.Fatal("empty conversions returned non-nil")
+	}
+
+	unstable := []acp.UnstableMcpServer{
+		{Http: &acp.UnstableMcpServerHttp{Name: "wagie", Url: "http://127.0.0.1:9/mcp"}},
+		{Stdio: &acp.McpServerStdio{
+			Name:    "files",
+			Command: "server-files",
+			Args:    []string{"--root"},
+			Env:     []acp.EnvVariable{{Name: "DEBUG", Value: "1"}},
+		}},
+		{Sse: &acp.UnstableMcpServerSse{Name: "sse"}},
+	}
+	configs := nativeMCPServerConfigsFromUnstable(unstable)
+	if len(configs) != 2 || configs[0].Name != "wagie" || configs[0].URL != "http://127.0.0.1:9/mcp" ||
+		configs[0].Headers != nil || len(configs[1].Command) != 2 ||
+		configs[1].Command[0] != "server-files" || configs[1].Env["DEBUG"] != "1" {
+		t.Fatalf("unstable MCP conversion = %#v", configs)
+	}
+
+	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
+		{Http: &acp.UnstableMcpServerHttp{Name: "", Url: "http://127.0.0.1:9/mcp"}},
+	}); err == nil {
+		t.Fatal("unnamed unstable HTTP MCP server accepted")
+	}
+
+	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
+		{Stdio: &acp.McpServerStdio{Name: "", Command: "server-files"}},
+	}); err == nil {
+		t.Fatal("unnamed unstable stdio MCP server accepted")
+	}
+
+	if err := validateUnstableMCPServers(unstable[:2]); err != nil {
+		t.Fatalf("named unstable MCP servers rejected: %v", err)
+	}
+}
+
 func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -782,7 +886,7 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 	t.Run("client factory defaults and env merge", func(t *testing.T) {
 		defaultAgent := NewAgent()
 		defaultAgent.options.clientFactory = nil
-		if _, err := defaultAgent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{}, opencode.XDGDirs{Root: filepath.Join(t.TempDir(), "root")}); err == nil {
+		if _, err := defaultAgent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{}, opencode.XDGDirs{Root: filepath.Join(t.TempDir(), "root")}, nil); err == nil {
 			t.Fatal("default client factory unexpectedly succeeded with incomplete XDG")
 		}
 		var captured opencode.StartOptions
@@ -793,7 +897,7 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 				return newFakeOpenCodeClient(), nil
 			}
 		})
-		if _, err := agent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{Env: map[string]string{"A": "1"}}, opencode.XDGDirs{}); err != nil {
+		if _, err := agent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{Env: map[string]string{"A": "1"}}, opencode.XDGDirs{}, nil); err != nil {
 			t.Fatalf("newOpenCodeClient env: %v", err)
 		}
 		if captured.Env["A"] != "1" {

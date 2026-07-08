@@ -5,5 +5,10 @@ parts become ACP message chunks, reasoning parts become thought chunks, tool
 parts become tool-call updates, todos become plan updates, and token data
 becomes `usage_update`.
 
+The native stream also echoes the just-posted user message as part events;
+those are suppressed during live turns — the client already owns that content
+— so only agent output streams back. User messages still replay as
+`user_message_chunk` during `session/load`.
+
 If the SSE stream fails during a turn, the adapter aborts the native turn and
 returns one terminal ACP error for that prompt. The session remains usable.
