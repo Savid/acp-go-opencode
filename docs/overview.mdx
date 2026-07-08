@@ -12,21 +12,22 @@ ACP host can drive OpenCode without speaking OpenCode's native protocol.
 Use it two ways: as a standalone subprocess an editor or host launches
 (`acp-go-opencode`), or as an embedded Go adapter through `opencodeacp.Serve`.
 
-## What it owns
+## What the adapter owns
 
 The adapter is a thin translation layer. Its responsibilities stop at the ACP
-boundary:
-
-- **The adapter owns** ACP dispatch, per-session process launch, per-session
-  XDG isolation, REST/SSE event mapping, permission and question bridging,
-  config-option resolution, and `opencode-state-v1` session storage.
-- **OpenCode owns** model execution, provider authentication, and native
-  session state. The adapter never manages provider credentials or signs in to
-  a provider on your behalf.
+boundary: ACP dispatch, per-session process launch, per-session XDG isolation,
+REST/SSE event mapping, permission and question bridging, config-option
+resolution, and `opencode-state-v1` session storage.
 
 Each session is fully isolated: its own `opencode serve` process bound to
 `127.0.0.1`, its own random basic-auth password, and its own XDG data, config,
 cache, and state directories under a configurable home root.
+
+## What the adapter does not own
+
+OpenCode owns model execution, provider authentication, and native session
+state. The adapter never manages provider credentials or signs in to a provider
+on your behalf.
 
 ## Where to go next
 

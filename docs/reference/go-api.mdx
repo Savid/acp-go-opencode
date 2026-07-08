@@ -29,7 +29,7 @@ agent when you need a reference first. Both take the same `Option` values.
 | `WithSeedFiles` | Files written into each session's config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
-| `WithConcurrencyLimits` | Cap concurrent client calls and turns. |
+| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions. |
 | `WithTurnTimeout` | Per-turn deadline; `0` (default) disables it. |
 | `WithAgentName` / `WithAgentTitle` / `WithAgentVersion` | Identity in the initialize response. |
 | `WithLogger` | `*slog.Logger` for adapter diagnostics. |

@@ -8,7 +8,7 @@ ACP transport lives: use the standalone binary when an editor or host spawns a
 subprocess and pipes JSON-RPC over stdio, and embed `Serve` when your host owns
 the streams directly.
 
-## Standalone binary
+## Standalone
 
 `acp-go-opencode` is launched by an ACP client, which drives it over
 stdin/stdout. stdout carries ACP JSON-RPC only; diagnostics go to stderr.
@@ -17,7 +17,7 @@ stdin/stdout. stdout carries ACP JSON-RPC only; diagnostics go to stderr.
 acp-go-opencode -path /usr/bin/opencode -home /tmp/acp-opencode
 ```
 
-## Embedded Serve
+## Embedded
 
 `Serve` runs the agent against reader/writer streams you supply, so your host
 can back the transport with any pipe, socket, or in-memory buffer. `NewAgent`

@@ -32,11 +32,11 @@ Set `_meta.opencode.rawEvent.enabled` to `true` on a lifecycle request (or use
 | Default | Disabled (`defaultEnabled: false`) |
 | Maximum size | 64 KiB per event |
 
-An event whose JSON exceeds the 64 KiB cap is replaced with a small marker
-payload (`truncated: true`, `maxBytes`, `reason`, and the original `sizeBytes`)
-rather than sending the oversized body. The capability, its enable path, and the
-byte cap are advertised under `_meta.opencode.rawEvent` in the initialize
-response.
+When an event's JSON exceeds the 64 KiB cap, its `event` field is swapped for a
+small marker (`truncated: true`, `maxBytes`, `reason`, and the original
+`sizeBytes`) while `sessionId`, `sequence`, and `source` are preserved, rather
+than sending the oversized body. The capability, its enable path, and the byte
+cap are advertised under `_meta.opencode.rawEvent` in the initialize response.
 
 <Warning>
 Raw events carry unredacted native OpenCode event bodies, which can include
