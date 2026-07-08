@@ -11,9 +11,9 @@ REMOVED_PUBLIC_TERMS = opencode\x20acp|pro\x78y|compatibilit\x79|deprecat\x65d|l
 build:
 	go build ./...
 
-## test: run unit tests
+## test: run unit tests with race detector and shuffled order
 test:
-	go test ./...
+	go test -race -shuffle=on ./...
 
 ## test-cross-compile: compile-check platform branches for other GOOS targets
 test-cross-compile:
@@ -24,11 +24,12 @@ test-cross-compile:
 	GOOS=windows GOARCH=amd64 go test -c -o .tmp/cross/opencode-windows.test .
 	GOOS=freebsd GOARCH=amd64 go build ./...
 	GOOS=openbsd GOARCH=amd64 go build ./...
+	GOOS=windows GOARCH=amd64 go build ./...
 
-## coverage-check: enforce repository coverage gate
+## coverage-check: require 100% statement coverage with race instrumentation
 coverage-check:
-	go test -coverprofile=coverage.out -covermode=atomic ./...
-	@go tool cover -func=coverage.out | awk 'BEGIN { found = 0; min = 100.0 } /^total:/ { found = 1; coverage = $$3; sub(/%/, "", coverage); if (coverage + 0 < min) { printf "total coverage %s, want at least %.1f%%\n", $$3, min; exit 1 } printf "total coverage %s\n", $$3 } END { if (!found) { print "missing total coverage line"; exit 1 } }'
+	go test -race -coverprofile=coverage.out -covermode=atomic ./...
+	@go tool cover -func=coverage.out | awk 'BEGIN { found = 0 } /^total:/ { found = 1; if ($$3 != "100.0%") { printf "total coverage %s, want 100.0%%\n", $$3; exit 1 } printf "total coverage %s\n", $$3 } END { if (!found) { print "missing total coverage line"; exit 1 } }'
 
 ## test-integration-smoke: run live integration tests that do not spend model tokens
 test-integration-smoke:

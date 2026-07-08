@@ -782,6 +782,7 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 	s.sessionPermissionListSupport = docCapabilities.sessionPermissionList
 
 	s.sessionQuestionListSupport = docCapabilities.sessionQuestionList
+
 	go s.readEvents(eventCtx)
 
 	select {
@@ -1283,6 +1284,12 @@ func (s *openCodeServer) blockingHTTPClient() *http.Client {
 }
 
 func (s *openCodeServer) readEvents(ctx context.Context) {
+	// Capture the reconnect-timing seams once, at entry, so this long-lived
+	// goroutine never reads the package-level test seams again — a running
+	// reader would otherwise race tests that restore those globals in cleanup.
+	after := openCodeAfter
+	reconnectDelay := openCodeEventReconnectDelay
+
 	for {
 		epoch := s.nextStreamEpoch()
 		if err := s.readEventStream(ctx, epoch); err != nil {
@@ -1295,7 +1302,7 @@ func (s *openCodeServer) readEvents(ctx context.Context) {
 		select {
 		case <-s.closed:
 			return
-		case <-openCodeAfter(openCodeEventReconnectDelay):
+		case <-after(reconnectDelay):
 		}
 	}
 }

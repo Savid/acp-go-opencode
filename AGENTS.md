@@ -62,7 +62,7 @@ make test
 make audit
 ```
 
-`make test` runs the unit suite (`go test ./...`). `make audit` runs the full
+`make test` runs the unit suite (`go test -race -shuffle=on ./...`). `make audit` runs the full
 local gate: format, lint, build, unit tests, cross-compile checks, coverage
 gate, vulnerability scan, modernization check, docs audit, and module tidy and
 verification. `make lint`, `make fmt`, and `make vuln` are available
