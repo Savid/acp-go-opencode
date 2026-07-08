@@ -370,9 +370,7 @@ func TestPromptSSEDisconnectAbortsNativeTurn(t *testing.T) {
 	client.errs <- errors.New("stream closed")
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "opencode_sse_disconnect") {
-			t.Fatalf("Prompt error = %v", err)
-		}
+		assertTurnFailed(t, err, causeTransport, "stream closed")
 	case <-ctx.Done():
 		t.Fatal("Prompt did not return")
 	}
@@ -451,9 +449,7 @@ func TestPromptSuppressesLateFailedEpochEvents(t *testing.T) {
 	client.errs <- opencode.StreamError{Epoch: 7, Err: errors.New("stream failed")}
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "opencode_sse_disconnect") {
-			t.Fatalf("Prompt error = %v", err)
-		}
+		assertTurnFailed(t, err, causeTransport, "stream failed")
 	case <-ctx.Done():
 		t.Fatal("Prompt did not fail on stream error")
 	}
@@ -501,9 +497,7 @@ func TestPromptCleanEOFSentinelDisconnectAbortsTurn(t *testing.T) {
 	client.errs <- opencode.StreamError{Epoch: 11, Err: opencode.ErrSSEDisconnect}
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "opencode_sse_disconnect") {
-			t.Fatalf("Prompt error = %v", err)
-		}
+		assertTurnFailed(t, err, causeTransport, "opencode SSE disconnected")
 	case <-ctx.Done():
 		t.Fatal("Prompt did not fail on clean EOF disconnect")
 	}
@@ -2670,10 +2664,12 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 		if err := session.emitMessage(ctx, opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant", Role: "assistant"}, Parts: []opencode.NativePart{part, part}}, false); err != nil {
 			t.Fatalf("duplicate emitMessage: %v", err)
 		}
+		// A raw-event emit failure is non-authoritative debug output and must
+		// not abort the turn: handleEvent records it internally and continues.
 		conn.notifyErr = errors.New("notify failed")
 		session.rawMessages = rawMessageConfig{enabled: true}
-		if err := session.handleEvent(ctx, opencode.Event{Type: "unknown", Raw: json.RawMessage(`{"type":"unknown"}`)}); err == nil {
-			t.Fatal("handleEvent ignored raw notify error")
+		if err := session.handleEvent(ctx, opencode.Event{Type: "unknown", Raw: json.RawMessage(`{"type":"unknown"}`)}); err != nil {
+			t.Fatalf("raw notify error aborted the turn: %v", err)
 		}
 	})
 
@@ -2873,17 +2869,7 @@ func TestPromptAssistantErrorStructured(t *testing.T) {
 				SessionId: session.id,
 				Prompt:    []acp.ContentBlock{acp.TextBlock("hello")},
 			})
-			var reqErr *acp.RequestError
-			if !errors.As(err, &reqErr) {
-				t.Fatalf("expected *acp.RequestError, got %T: %v", err, err)
-			}
-			data, ok := reqErr.Data.(map[string]any)
-			if !ok {
-				t.Fatalf("Data = %#v", reqErr.Data)
-			}
-			if data["error"] != "opencode_assistant_error" {
-				t.Fatalf("error token = %#v", data["error"])
-			}
+			data := assertTurnFailed(t, err, causeProvider, providerDetail)
 			if data["structuredOutputRequested"] != tt.withSchema {
 				t.Fatalf("structuredOutputRequested = %#v, want %v", data["structuredOutputRequested"], tt.withSchema)
 			}
@@ -2893,14 +2879,10 @@ func TestPromptAssistantErrorStructured(t *testing.T) {
 			if data["providerCode"] != "invalid_request_error" {
 				t.Fatalf("providerCode = %#v", data["providerCode"])
 			}
-			detail, _ := data["message"].(string)
-			if !strings.Contains(detail, providerDetail) {
-				t.Fatalf("message = %#v", detail)
-			}
 		})
 	}
 
-	t.Run("Error string preserves legacy format", func(t *testing.T) {
+	t.Run("Error string carries opencode assistant error prefix", func(t *testing.T) {
 		err := opencode.AssistantMessageError(opencode.NativeMessage{Info: opencode.NativeMessageInfo{
 			Role:   "assistant",
 			Finish: "error",

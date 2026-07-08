@@ -863,6 +863,122 @@ func pendingArrayPath(itemRef string) map[string]any {
 	}
 }
 
+// TestOpenCodeBlockingPostRecoversPersistedCause proves the wagie-bug fix: when
+// the blocking message/command POST is severed mid-body (client sees an
+// unexpected EOF), the client re-fetches GET /session/{id}/message and surfaces
+// the persisted assistant error instead of a bare transport error. When nothing
+// is persisted, the raw transport error passes through so the caller classifies
+// it as cause "transport" rather than a fabricated provider failure.
+func TestOpenCodeBlockingPostRecoversPersistedCause(t *testing.T) {
+	ctx := context.Background()
+
+	severMidBody := func(w http.ResponseWriter) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("response writer is not a Hijacker")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		// Announce a longer body than we actually write, then close: the
+		// client reads a truncated body and decode fails with unexpected EOF.
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 512\r\n\r\n{\"info\":{\"id\":\"assist"))
+		_ = conn.Close()
+	}
+
+	for _, tt := range []struct {
+		name        string
+		command     bool
+		persist     bool
+		wantErr     string
+		wantStatus  int
+		wantCode    string
+		transparent bool
+	}{
+		{name: "message recovers persisted provider error", persist: true, wantErr: "provider exploded", wantStatus: 429, wantCode: "rate_limit_exceeded"},
+		{name: "command recovers persisted provider error", command: true, persist: true, wantErr: "provider exploded", wantStatus: 429, wantCode: "rate_limit_exceeded"},
+		{name: "message surfaces transport error when nothing persisted", transparent: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			postPath := "/session/s/message"
+			if tt.command {
+				postPath = "/session/s/command"
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == postPath:
+					severMidBody(w)
+				case r.Method == http.MethodGet && r.URL.Path == "/session/s/message":
+					if !tt.persist {
+						writeJSON(t, w, []map[string]any{{"info": map[string]any{"id": "u", "sessionID": "s", "role": "user"}}})
+
+						return
+					}
+					writeJSON(t, w, []map[string]any{{
+						"info": map[string]any{
+							"id":        "assistant",
+							"sessionID": "s",
+							"role":      "assistant",
+							"finish":    "error",
+							"error": map[string]any{
+								"name": "APIError",
+								"data": map[string]any{
+									"message":      "provider exploded",
+									"statusCode":   429,
+									"responseBody": `{"error":{"code":"rate_limit_exceeded"}}`,
+								},
+							},
+						},
+					}})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client := &openCodeServer{
+				httpClient: server.Client(),
+				baseURL:    server.URL,
+				username:   "opencode",
+				password:   "secret",
+			}
+
+			var err error
+			if tt.command {
+				_, err = client.RunCommand(ctx, "s", CommandRequest{Command: "review"})
+			} else {
+				_, err = client.SendMessage(ctx, "s", MessageRequest{Parts: []map[string]any{{"type": "text", "text": "hi"}}})
+			}
+
+			var assistantErr *AssistantError
+			if tt.transparent {
+				if errors.As(err, &assistantErr) {
+					t.Fatalf("transport failure was misreported as an assistant error: %v", err)
+				}
+				if err == nil {
+					t.Fatal("severed POST unexpectedly succeeded")
+				}
+
+				return
+			}
+
+			if !errors.As(err, &assistantErr) {
+				t.Fatalf("err = %v, want *AssistantError recovered from re-fetch", err)
+			}
+			if !strings.Contains(assistantErr.Detail(), tt.wantErr) {
+				t.Fatalf("Detail = %q, want substring %q", assistantErr.Detail(), tt.wantErr)
+			}
+			if assistantErr.StatusCode() != tt.wantStatus {
+				t.Fatalf("StatusCode = %d, want %d", assistantErr.StatusCode(), tt.wantStatus)
+			}
+			if assistantErr.ProviderCode() != tt.wantCode {
+				t.Fatalf("ProviderCode = %q, want %q", assistantErr.ProviderCode(), tt.wantCode)
+			}
+		})
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")

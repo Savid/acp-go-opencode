@@ -61,6 +61,8 @@ const (
 	routeQuestion             = "/question"
 	routeAPIPermissionRequest = "/api/permission/request"
 	routeAPIQuestionRequest   = "/api/question/request"
+
+	roleAssistant = "assistant"
 )
 
 // Native OpenCode /doc path templates validated during readiness.
@@ -888,7 +890,7 @@ func (s *openCodeServer) Commands(ctx context.Context) ([]NativeCommand, error) 
 func (s *openCodeServer) RunCommand(ctx context.Context, id string, req CommandRequest) (NativeMessage, error) {
 	var out NativeMessage
 	if err := s.doJSONWithClient(ctx, s.blockingHTTPClient(), http.MethodPost, "/session/"+url.PathEscape(id)+routeCommand, nil, req, &out); err != nil {
-		return NativeMessage{}, err
+		return s.recoverBlockingTurnFailure(ctx, id, err)
 	}
 
 	if err := AssistantMessageError(out); err != nil {
@@ -901,7 +903,7 @@ func (s *openCodeServer) RunCommand(ctx context.Context, id string, req CommandR
 func (s *openCodeServer) SendMessage(ctx context.Context, id string, req MessageRequest) (NativeMessage, error) {
 	var out NativeMessage
 	if err := s.doJSONWithClient(ctx, s.blockingHTTPClient(), http.MethodPost, "/session/"+url.PathEscape(id)+"/message", nil, req, &out); err != nil {
-		return NativeMessage{}, err
+		return s.recoverBlockingTurnFailure(ctx, id, err)
 	}
 
 	if err := AssistantMessageError(out); err != nil {
@@ -909,6 +911,45 @@ func (s *openCodeServer) SendMessage(ctx context.Context, id string, req Message
 	}
 
 	return out, nil
+}
+
+// recoverBlockingTurnFailure resolves the real cause of a transport failure on
+// the blocking message/command POST. OpenCode completes the turn server-side
+// even when the client connection drops mid-body, persisting the true cause on
+// the assistant message, so on any non-HTTP transport error we re-fetch the
+// session messages and surface the persisted assistant error when present. An
+// HTTP status error is a completed response rather than a transport failure and
+// passes through unchanged; when no persisted assistant error is recoverable the
+// original transport error is returned so the caller can classify it.
+func (s *openCodeServer) recoverBlockingTurnFailure(ctx context.Context, id string, transportErr error) (NativeMessage, error) {
+	var httpErr *HTTPError
+	if errors.As(transportErr, &httpErr) {
+		return NativeMessage{}, transportErr
+	}
+
+	messages, err := s.Messages(ctx, id)
+	if err == nil {
+		if assistantErr := lastAssistantError(messages); assistantErr != nil {
+			return NativeMessage{}, assistantErr
+		}
+	}
+
+	return NativeMessage{}, transportErr
+}
+
+// lastAssistantError runs AssistantMessageError against the most recent
+// assistant message and returns its typed error, or nil when the latest
+// assistant message carries no error.
+func lastAssistantError(messages []NativeMessage) error {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Info.Role != roleAssistant {
+			continue
+		}
+
+		return AssistantMessageError(messages[i])
+	}
+
+	return nil
 }
 
 func AssistantMessageError(message NativeMessage) error {

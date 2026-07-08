@@ -50,6 +50,7 @@ type Options struct {
 	LogLevel           string
 	MinimumVersion     string
 	HealthCheckTimeout time.Duration
+	TurnTimeout        time.Duration
 
 	clientFactory func(context.Context, opencode.StartOptions) (opencode.Client, error)
 }
@@ -199,5 +200,14 @@ func WithOpenCodeMinimumVersion(version string) Option {
 func WithOpenCodeHealthCheckTimeout(timeout time.Duration) Option {
 	return func(options *Options) {
 		options.HealthCheckTimeout = timeout
+	}
+}
+
+// WithTurnTimeout bounds how long a single prompt turn may run before the
+// wrapper aborts the native turn and fails the prompt with a turn-failure error
+// carrying cause "timeout". The default of 0 disables the deadline.
+func WithTurnTimeout(timeout time.Duration) Option {
+	return func(options *Options) {
+		options.TurnTimeout = timeout
 	}
 }

@@ -2,7 +2,6 @@ package opencodeacp
 
 import (
 	"encoding/json"
-	"fmt"
 )
 
 const (
@@ -39,24 +38,39 @@ const (
 	jsonFieldSequence       = "sequence"
 	jsonFieldEvent          = "event"
 	jsonFieldSource         = "source"
-	jsonFieldField          = "field"
-	jsonFieldServer         = "server"
-	jsonFieldCommand        = "command"
-	jsonFieldMessageID      = "messageId"
-	jsonFieldMode           = "mode"
-	jsonFieldURL            = "url"
-	jsonFieldMime           = "mime"
-	jsonFieldTool           = "tool"
-	jsonFieldType           = "type"
-	jsonFieldValue          = "value"
-	jsonFieldLimit          = "limit"
-	jsonFieldTitle          = "title"
-	validationRequired      = "required"
-	errValueBackpressure    = "backpressure"
-	errValueUnsupported     = "unsupported"
-	errValueSessionUnknown  = "unknown session"
-	elicitationModeForm     = "form"
-	elicitationModeURL      = "url"
+	jsonFieldCause          = "cause"
+	jsonFieldStatusCode     = "statusCode"
+	jsonFieldProviderCode   = "providerCode"
+
+	jsonFieldStructuredOutputRequested = "structuredOutputRequested"
+	jsonFieldField                     = "field"
+	jsonFieldServer                    = "server"
+	jsonFieldCommand                   = "command"
+	jsonFieldMessageID                 = "messageId"
+	jsonFieldMode                      = "mode"
+	jsonFieldURL                       = "url"
+	jsonFieldMime                      = "mime"
+	jsonFieldTool                      = "tool"
+	jsonFieldType                      = "type"
+	jsonFieldValue                     = "value"
+	jsonFieldLimit                     = "limit"
+	jsonFieldTitle                     = "title"
+	validationRequired                 = "required"
+	errValueBackpressure               = "backpressure"
+	errValueUnsupported                = "unsupported"
+	errValueSessionUnknown             = "unknown session"
+	elicitationModeForm                = "form"
+	elicitationModeURL                 = "url"
+
+	rawMarkerTruncated      = "truncated"
+	rawMarkerReason         = "reason"
+	rawMarkerMaxBytes       = "maxBytes"
+	rawMarkerSizeBytes      = "sizeBytes"
+	rawReasonOversize       = "oversize"
+	rawReasonUnserializable = "unserializable"
+
+	rawEventSource     = "opencode-serve"
+	limitSessionPrompt = "session_prompt"
 )
 
 type rawMessageConfig struct {
@@ -89,13 +103,21 @@ func capRawEventPayload(payload map[string]any) map[string]any {
 		return payload
 	}
 
+	marker := map[string]any{
+		rawMarkerTruncated: true,
+		rawMarkerMaxBytes:  rawEventMaxBytes,
+	}
+	if err != nil {
+		marker[rawMarkerReason] = rawReasonUnserializable
+	} else {
+		marker[rawMarkerReason] = rawReasonOversize
+		marker[rawMarkerSizeBytes] = len(encoded)
+	}
+
 	return map[string]any{
 		jsonFieldSessionID: payload[jsonFieldSessionID],
 		jsonFieldSequence:  payload[jsonFieldSequence],
 		jsonFieldSource:    payload[jsonFieldSource],
-		jsonFieldEvent: map[string]any{
-			"truncated":    true,
-			jsonFieldError: fmt.Sprintf("raw event exceeded %d bytes", rawEventMaxBytes),
-		},
+		jsonFieldEvent:     marker,
 	}
 }

@@ -1,0 +1,243 @@
+package opencodeacp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
+)
+
+// rawEventNotifications returns the event payloads (envelope maps) emitted for
+// the given ACP session id, in order.
+func rawEventNotifications(conn *recordingAgentClient, sessionID acp.SessionId) []map[string]any {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	out := make([]map[string]any, 0, len(conn.extensions))
+	for _, ext := range conn.extensions {
+		if ext.method != RawEventMethod {
+			continue
+		}
+		payload, ok := ext.params.(map[string]any)
+		if !ok || payload[jsonFieldSessionID] != sessionID {
+			continue
+		}
+		out = append(out, payload)
+	}
+
+	return out
+}
+
+func rawEventSession(t *testing.T, id acp.SessionId, conn *recordingAgentClient) *session {
+	t.Helper()
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	client := newFakeOpenCodeClient()
+	sess := newSession(agent, id, "/tmp/project", nil, testNativeSession(string(id)), client, sessionMeta{}, idmapRecord{
+		SessionID:       string(id),
+		NativeSessionID: string(id),
+		Format:          SessionStoreFormat,
+	})
+	sess.rawMessages = rawMessageConfig{enabled: true}
+
+	return sess
+}
+
+func oversizeRawEvent() opencode.Event {
+	big := strings.Repeat("x", rawEventMaxBytes+1024)
+
+	return opencode.Event{Type: "message.updated", Raw: json.RawMessage(`{"blob":"` + big + `"}`)}
+}
+
+func normalRawEvent(marker string) opencode.Event {
+	return opencode.Event{Type: "message.updated", Raw: json.RawMessage(`{"tag":"` + marker + `"}`)}
+}
+
+// The six functions below implement the raw-event spec from
+// persona-raw-events.md (§Uniform test spec).
+
+// Case 1 — oversized event emits exactly one fixed marker notification with the
+// envelope intact.
+func TestRawEventOversizeEmitsFixedMarker(t *testing.T) {
+	conn := newRecordingAgentClient()
+	sess := rawEventSession(t, "session-1", conn)
+	if err := sess.emitRawOpenCodeEvent(context.Background(), oversizeRawEvent()); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	events := rawEventNotifications(conn, "session-1")
+	if len(events) != 1 {
+		t.Fatalf("emitted %d notifications, want 1", len(events))
+	}
+	payload := events[0]
+	if payload[jsonFieldSequence] != int64(1) || payload[jsonFieldSource] != rawEventSource {
+		t.Fatalf("envelope not intact: %#v", payload)
+	}
+	marker, ok := payload[jsonFieldEvent].(map[string]any)
+	if !ok {
+		t.Fatalf("event is not a marker map: %#v", payload[jsonFieldEvent])
+	}
+	if marker[rawMarkerTruncated] != true || marker[rawMarkerReason] != rawReasonOversize {
+		t.Fatalf("marker = %#v", marker)
+	}
+	if marker[rawMarkerMaxBytes] != rawEventMaxBytes {
+		t.Fatalf("maxBytes = %#v, want %d", marker[rawMarkerMaxBytes], rawEventMaxBytes)
+	}
+	size, ok := marker[rawMarkerSizeBytes].(int)
+	if !ok || size <= rawEventMaxBytes {
+		t.Fatalf("sizeBytes = %#v, want int > %d", marker[rawMarkerSizeBytes], rawEventMaxBytes)
+	}
+}
+
+// Case 2 — a mix of normal and oversized events yields a contiguous per-session
+// sequence 1..N with no gaps.
+func TestRawEventSequenceIsContiguous(t *testing.T) {
+	conn := newRecordingAgentClient()
+	sess := rawEventSession(t, "session-1", conn)
+	const total = 5
+	for i := 0; i < total; i++ {
+		event := normalRawEvent("n")
+		if i == 2 {
+			event = oversizeRawEvent()
+		}
+		if err := sess.emitRawOpenCodeEvent(context.Background(), event); err != nil {
+			t.Fatalf("emit %d: %v", i, err)
+		}
+	}
+	events := rawEventNotifications(conn, "session-1")
+	if len(events) != total {
+		t.Fatalf("emitted %d notifications, want %d", len(events), total)
+	}
+	for i, payload := range events {
+		if payload[jsonFieldSequence] != int64(i+1) {
+			t.Fatalf("sequence[%d] = %#v, want %d", i, payload[jsonFieldSequence], i+1)
+		}
+	}
+}
+
+// Case 3 — two concurrent sessions each keep an independent sequence that starts
+// at 1 and is contiguous.
+func TestRawEventCrossSessionSequenceIsolation(t *testing.T) {
+	conn := newRecordingAgentClient()
+	sessA := rawEventSession(t, "session-a", conn)
+	sessB := rawEventSession(t, "session-b", conn)
+	for i := 0; i < 3; i++ {
+		if err := sessA.emitRawOpenCodeEvent(context.Background(), normalRawEvent("a")); err != nil {
+			t.Fatalf("emit a %d: %v", i, err)
+		}
+		if err := sessB.emitRawOpenCodeEvent(context.Background(), normalRawEvent("b")); err != nil {
+			t.Fatalf("emit b %d: %v", i, err)
+		}
+	}
+	for _, id := range []acp.SessionId{"session-a", "session-b"} {
+		events := rawEventNotifications(conn, id)
+		if len(events) != 3 {
+			t.Fatalf("session %s emitted %d, want 3", id, len(events))
+		}
+		for i, payload := range events {
+			if payload[jsonFieldSequence] != int64(i+1) {
+				t.Fatalf("session %s sequence[%d] = %#v, want %d", id, i, payload[jsonFieldSequence], i+1)
+			}
+		}
+	}
+}
+
+// Case 4 — every emitted event field is valid JSON, including an oversized event
+// and one that fails to marshal (unserializable marker, no sizeBytes).
+func TestRawEventValidJSONInvariant(t *testing.T) {
+	conn := newRecordingAgentClient()
+	sess := rawEventSession(t, "session-1", conn)
+	if err := sess.emitRawOpenCodeEvent(context.Background(), normalRawEvent("ok")); err != nil {
+		t.Fatalf("emit normal: %v", err)
+	}
+	if err := sess.emitRawOpenCodeEvent(context.Background(), oversizeRawEvent()); err != nil {
+		t.Fatalf("emit oversize: %v", err)
+	}
+	for _, payload := range rawEventNotifications(conn, "session-1") {
+		encoded, err := json.Marshal(payload[jsonFieldEvent])
+		if err != nil || !json.Valid(encoded) {
+			t.Fatalf("event field is not valid JSON: %#v err=%v", payload[jsonFieldEvent], err)
+		}
+	}
+
+	marked := capRawEventPayload(map[string]any{
+		jsonFieldSessionID: "session-1",
+		jsonFieldSequence:  int64(9),
+		jsonFieldSource:    rawEventSource,
+		jsonFieldEvent:     map[string]any{"bad": make(chan int)},
+	})
+	marker, ok := marked[jsonFieldEvent].(map[string]any)
+	if !ok || marker[rawMarkerReason] != rawReasonUnserializable {
+		t.Fatalf("unserializable marker = %#v", marked[jsonFieldEvent])
+	}
+	if _, hasSize := marker[rawMarkerSizeBytes]; hasSize {
+		t.Fatalf("unserializable marker unexpectedly carries sizeBytes: %#v", marker)
+	}
+	if encoded, err := json.Marshal(marker); err != nil || !json.Valid(encoded) {
+		t.Fatalf("unserializable marker is not valid JSON: %#v err=%v", marker, err)
+	}
+}
+
+// Case 5 — a NotifyExtension failure is recorded internally and does NOT abort
+// the prompt turn.
+func TestRawEventEmitFailureDoesNotFailTurn(t *testing.T) {
+	conn := newRecordingAgentClient()
+	conn.notifyErr = errors.New("client notify failed")
+	sess := rawEventSession(t, "session-1", conn)
+	if err := sess.handleEvent(context.Background(), normalRawEvent("boom")); err != nil {
+		t.Fatalf("raw emit failure aborted the turn: %v", err)
+	}
+}
+
+// Case 6 — with raw events default-off, no notifications are emitted regardless
+// of native event volume.
+func TestRawEventDefaultOffEmitsNothing(t *testing.T) {
+	conn := newRecordingAgentClient()
+	sess := rawEventSession(t, "session-1", conn)
+	sess.rawMessages = rawMessageConfig{}
+	for i := 0; i < 4; i++ {
+		if err := sess.emitRawOpenCodeEvent(context.Background(), oversizeRawEvent()); err != nil {
+			t.Fatalf("emit: %v", err)
+		}
+	}
+	if events := rawEventNotifications(conn, "session-1"); len(events) != 0 {
+		t.Fatalf("default-off emitted %d notifications, want 0", len(events))
+	}
+}
+
+// TestSessionPromptBackpressureLimitString pins the exact -32600 backpressure
+// payload for the session_prompt turn limit.
+func TestSessionPromptBackpressureLimitString(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	agent := NewAgent()
+	session := testSession(agent, client)
+
+	release, err := session.acquireTurn(ctx)
+	if err != nil {
+		t.Fatalf("first acquireTurn: %v", err)
+	}
+	defer release()
+
+	_, err = session.acquireTurn(ctx)
+	var reqErr *acp.RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("backpressure error = %v, want RequestError", err)
+	}
+	if reqErr.Code != -32600 {
+		t.Fatalf("backpressure code = %d, want -32600", reqErr.Code)
+	}
+	data, ok := reqErr.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("backpressure data = %#v, want map", reqErr.Data)
+	}
+	if data[jsonFieldError] != errValueBackpressure {
+		t.Fatalf("backpressure error tag = %#v, want %q", data[jsonFieldError], errValueBackpressure)
+	}
+	if data[jsonFieldLimit] != limitSessionPrompt {
+		t.Fatalf("backpressure limit = %#v, want %q", data[jsonFieldLimit], limitSessionPrompt)
+	}
+}

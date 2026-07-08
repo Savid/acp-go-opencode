@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
@@ -429,6 +430,37 @@ func assertInvalidModelField(t testingT, err error, field string) {
 	if data["error"] != "invalid_model" || data["field"] != field {
 		t.Fatalf("invalid model data = %#v, want field %q", data, field)
 	}
+}
+
+// assertTurnFailed asserts err is the uniform OpenCode turn-failure error:
+// code -32603, data.error == "opencode_turn_failed", data.cause == wantCause,
+// and data.message contains wantMessageSubstr (skipped when empty). It returns
+// the decoded data map for any additional field assertions.
+func assertTurnFailed(t testingT, err error, wantCause string, wantMessageSubstr string) map[string]any {
+	t.Helper()
+	var reqErr *acp.RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("error = %v, want RequestError", err)
+	}
+	if reqErr.Code != -32603 {
+		t.Fatalf("error code = %d, want -32603", reqErr.Code)
+	}
+	data, ok := reqErr.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("error data = %#v, want map", reqErr.Data)
+	}
+	if data[jsonFieldError] != turnFailedErrorTag {
+		t.Fatalf("data.error = %#v, want %q", data[jsonFieldError], turnFailedErrorTag)
+	}
+	if data[jsonFieldCause] != wantCause {
+		t.Fatalf("data.cause = %#v, want %q", data[jsonFieldCause], wantCause)
+	}
+	message, _ := data[jsonFieldMessage].(string)
+	if wantMessageSubstr != "" && !strings.Contains(message, wantMessageSubstr) {
+		t.Fatalf("data.message = %q, want substring %q", message, wantMessageSubstr)
+	}
+
+	return data
 }
 
 func assertUnknownSessionError(t testingT, err error) {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/coder/acp-go-sdk"
@@ -59,16 +60,42 @@ const (
 	priorityLow           = "low"
 )
 
-// assistantErrorData builds the structured ACP error Data payload for a native
-// OpenCode assistant/provider failure. structuredOutputRequested reports whether
-// this turn sent a native output-format schema.
-func assistantErrorData(err *opencode.AssistantError, structuredOutputRequested bool) map[string]any {
+const (
+	turnFailedErrorTag = "opencode_turn_failed"
+	causeProvider      = "provider"
+	causeTransport     = "transport"
+	causeTimeout       = "timeout"
+)
+
+// turnFailedData builds the uniform ACP error Data payload for a native
+// OpenCode turn failure. cause is the machine-readable failure class
+// (provider/transport/timeout); message carries the real native cause text and
+// is never a fixed placeholder or bare transport string like "EOF".
+// statusCode/providerCode are included only when the harness supplies them.
+func turnFailedData(cause, message string, statusCode int, providerCode string) map[string]any {
 	data := map[string]any{
-		jsonFieldError:              "opencode_assistant_error",
-		jsonFieldMessage:            err.Detail(),
-		"structuredOutputRequested": structuredOutputRequested,
+		jsonFieldError:   turnFailedErrorTag,
+		jsonFieldCause:   cause,
+		jsonFieldMessage: message,
 	}
-	mergeAssistantErrorFields(data, err, structuredOutputRequested)
+	if statusCode > 0 {
+		data[jsonFieldStatusCode] = statusCode
+	}
+
+	if providerCode != "" {
+		data[jsonFieldProviderCode] = providerCode
+	}
+
+	return data
+}
+
+// assistantErrorData builds the uniform turn-failure Data payload for a native
+// OpenCode assistant/provider failure (cause "provider").
+// structuredOutputRequested reports whether this turn sent a native
+// output-format schema.
+func assistantErrorData(err *opencode.AssistantError, structuredOutputRequested bool) map[string]any {
+	data := turnFailedData(causeProvider, err.Detail(), err.StatusCode(), err.ProviderCode())
+	data[jsonFieldStructuredOutputRequested] = structuredOutputRequested
 
 	return data
 }
@@ -77,13 +104,13 @@ func assistantErrorData(err *opencode.AssistantError, structuredOutputRequested 
 // fields (statusCode, providerCode) and structuredOutputRequested onto an
 // existing ACP error Data map. Optional fields are included only when present.
 func mergeAssistantErrorFields(data map[string]any, err *opencode.AssistantError, structuredOutputRequested bool) {
-	data["structuredOutputRequested"] = structuredOutputRequested
+	data[jsonFieldStructuredOutputRequested] = structuredOutputRequested
 	if err.StatusCode() > 0 {
-		data["statusCode"] = err.StatusCode()
+		data[jsonFieldStatusCode] = err.StatusCode()
 	}
 
 	if err.ProviderCode() != "" {
-		data["providerCode"] = err.ProviderCode()
+		data[jsonFieldProviderCode] = err.ProviderCode()
 	}
 }
 
@@ -327,6 +354,17 @@ func (s *session) runPromptTurn(
 		done <- promptTurnResult{message: message, err: err}
 	}()
 
+	timeout := s.turnTimeout()
+
+	var timeoutC <-chan time.Time
+
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		timeoutC = timer.C
+	}
+
 	for {
 		select {
 		case event := <-s.client.Events():
@@ -350,15 +388,29 @@ func (s *session) runPromptTurn(
 			s.cancelTurn()
 			abortTurn()
 
-			return acp.PromptResponse{}, acp.NewInternalError(map[string]any{jsonFieldError: "opencode_sse_disconnect", jsonFieldMessage: err.Error()})
+			return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(causeTransport, err.Error(), 0, ""))
 		case result := <-done:
 			return s.finishPromptTurn(ctx, turnCtx, params, result, command, matchedCommand)
+		case <-timeoutC:
+			abortTurn()
+
+			return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(causeTimeout, fmt.Sprintf("turn exceeded %s deadline", timeout), 0, ""))
 		case <-turnCtx.Done():
 			abortTurn()
 
 			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
 		}
 	}
+}
+
+// turnTimeout returns the configured per-turn deadline, or 0 when no deadline
+// is set (the default).
+func (s *session) turnTimeout() time.Duration {
+	if s.agent == nil {
+		return 0
+	}
+
+	return s.agent.options.TurnTimeout
 }
 
 func (s *session) finishPromptTurn(
@@ -404,7 +456,7 @@ func (s *session) finishPromptTurn(
 			return acp.PromptResponse{}, acp.NewInternalError(assistantErrorData(assistantErr, structuredOutputRequested))
 		}
 
-		return acp.PromptResponse{}, result.err
+		return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(causeTransport, result.err.Error(), 0, ""))
 	}
 
 	final := result.message
@@ -828,8 +880,13 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 		return nil
 	}
 
-	if err := s.emitRawOpenCodeEvent(ctx, event); err != nil {
-		return err
+	// Raw events are non-authoritative debug output: a failed emit is recorded
+	// internally and the authoritative prompt turn continues regardless.
+	if err := s.emitRawOpenCodeEvent(ctx, event); err != nil && s.agent != nil && s.agent.log != nil {
+		s.agent.log.DebugContext(ctx, "emit opencode raw event failed",
+			slog.String("session_id", string(s.id)),
+			slog.String("error", err.Error()),
+		)
 	}
 
 	switch event.Type {
@@ -1397,10 +1454,10 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 	}
 
 	payload := map[string]any{
-		"sessionId": s.id,
-		"sequence":  s.nextRawEventSequence(),
-		"source":    "opencode-serve",
-		"event":     raw,
+		jsonFieldSessionID: s.id,
+		jsonFieldSequence:  s.nextRawEventSequence(),
+		jsonFieldSource:    rawEventSource,
+		jsonFieldEvent:     raw,
 	}
 
 	return conn.NotifyExtension(ctx, RawEventMethod, capRawEventPayload(payload))

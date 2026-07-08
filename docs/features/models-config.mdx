@@ -21,8 +21,9 @@ server's `/doc` advertises the `OutputFormatJsonSchema` component.
 When the selected model rejects structured output (the provider returns an
 assistant/provider error, common with free Zen models), the turn fails with a
 structured ACP internal error whose `data` carries
-`error: "opencode_assistant_error"`, the native `message`, and—when the
-provider reports them—`statusCode` (int) and `providerCode` (string). The
+`error: "opencode_turn_failed"`, `cause: "provider"`, the native `message`,
+and—when the provider reports them—`statusCode` (int) and `providerCode`
+(string). The
 `data` also carries `structuredOutputRequested: true` when this turn sent a
 native schema, letting a host detect that the structured-output turn was the
 trigger; slash-command turns always report `false`.

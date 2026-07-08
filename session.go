@@ -162,7 +162,7 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 
 	if exclusive {
 		if s.exclusiveTurn || len(turn) > 0 {
-			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "session_prompt"})
+			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: limitSessionPrompt})
 		}
 
 		s.exclusiveTurn = true
@@ -179,7 +179,7 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 	}
 
 	if s.exclusiveTurn || len(turn) >= cap(turn) {
-		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "session_prompt"})
+		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: limitSessionPrompt})
 	}
 
 	turn <- struct{}{}
