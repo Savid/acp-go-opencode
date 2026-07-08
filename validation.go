@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -71,7 +72,7 @@ func validateMCPServers(servers []acp.McpServer) error {
 			})
 		}
 
-		if name == "" {
+		if strings.TrimSpace(name) == "" {
 			return acp.NewInvalidParams(map[string]any{
 				fmt.Sprintf("mcpServers[%d].name", index): validationRequired,
 			})

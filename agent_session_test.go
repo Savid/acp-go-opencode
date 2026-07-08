@@ -276,6 +276,22 @@ func TestNativeMCPServerConfigConversion(t *testing.T) {
 		t.Fatal("unnamed unstable stdio MCP server accepted")
 	}
 
+	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
+		{Http: &acp.UnstableMcpServerHttp{Name: "   ", Url: "http://127.0.0.1:9/mcp"}},
+	}); err == nil {
+		t.Fatal("whitespace-only-name unstable HTTP MCP server accepted")
+	} else {
+		requireInvalidParamsData(t, err, map[string]any{"mcpServers[0].name": "required"})
+	}
+
+	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
+		{Stdio: &acp.McpServerStdio{Name: "   ", Command: "server-files"}},
+	}); err == nil {
+		t.Fatal("whitespace-only-name unstable stdio MCP server accepted")
+	} else {
+		requireInvalidParamsData(t, err, map[string]any{"mcpServers[0].name": "required"})
+	}
+
 	if err := validateUnstableMCPServers(unstable[:2]); err != nil {
 		t.Fatalf("named unstable MCP servers rejected: %v", err)
 	}

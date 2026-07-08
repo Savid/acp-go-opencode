@@ -738,7 +738,7 @@ func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
 			continue
 		}
 
-		if name == "" {
+		if strings.TrimSpace(name) == "" {
 			return acp.NewInvalidParams(map[string]any{fmt.Sprintf("mcpServers[%d].name", index): validationRequired})
 		}
 

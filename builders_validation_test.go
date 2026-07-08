@@ -179,6 +179,11 @@ func TestValidationMetaAndHelperBranches(t *testing.T) {
 	} else {
 		requireInvalidParamsData(t, err, map[string]any{"mcpServers[0].name": "required"})
 	}
+	if err := validateMCPServers([]acp.McpServer{{Http: &acp.McpServerHttpInline{Name: "   ", Url: "https://mcp.example"}}}); err == nil {
+		t.Fatal("whitespace-only-name MCP server accepted")
+	} else {
+		requireInvalidParamsData(t, err, map[string]any{"mcpServers[0].name": "required"})
+	}
 	if err := validateMCPServers([]acp.McpServer{
 		{Http: &acp.McpServerHttpInline{Name: "dup", Url: "https://mcp.example"}},
 		{Stdio: &acp.McpServerStdio{Name: "dup", Command: "server"}},
