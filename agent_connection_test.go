@@ -721,3 +721,69 @@ func (c *pipeACPClient) HandleExtensionMethod(_ context.Context, method string, 
 
 	return map[string]any{"ok": true}, nil
 }
+
+func TestAgentConnectionHelpers(t *testing.T) {
+	ctx := context.Background()
+	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxConcurrentClientCalls: 1}))
+	release, err := agent.acquireClientCall(ctx)
+	if err != nil {
+		t.Fatalf("acquireClientCall: %v", err)
+	}
+	if _, err = agent.acquireClientCall(ctx); err == nil {
+		t.Fatal("client call backpressure not enforced")
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err = agent.acquireClientCall(cancelled); err == nil {
+		t.Fatal("cancelled acquire succeeded")
+	}
+	release()
+
+	form := acp.UnstableCreateElicitationRequest{Form: &acp.UnstableCreateElicitationForm{
+		Message: "m",
+		Mode:    "form",
+		RequestedSchema: acp.UnstableElicitationSchema{
+			Type: acp.UnstableElicitationSchemaTypeObject,
+		},
+		Meta: map[string]any{"m": true},
+	}}
+	raw, err := scopedElicitationParams(form, elicitationScope{SessionID: "s", ToolCallID: "tool"})
+	if err != nil {
+		t.Fatalf("scopedElicitationParams form: %v", err)
+	}
+	if !strings.Contains(string(raw), `"sessionId":"s"`) || !strings.Contains(string(raw), `"toolCallId":"tool"`) {
+		t.Fatalf("scoped form = %s", raw)
+	}
+	urlReq := acp.NewUnstableCreateElicitationRequestUrl("e1", "https://example.com")
+	if _, err := scopedElicitationParams(urlReq, elicitationScope{}); err != nil {
+		t.Fatalf("scopedElicitationParams url: %v", err)
+	}
+	if _, err := scopedElicitationParams(acp.UnstableCreateElicitationRequest{}, elicitationScope{}); err == nil {
+		t.Fatal("empty elicitation request accepted")
+	}
+	if requestError(context.Canceled).Code != -32800 {
+		t.Fatal("context cancellation did not map to request cancelled")
+	}
+	if requestError(errors.New("boom")).Code != -32603 {
+		t.Fatal("generic error did not map to internal error")
+	}
+	gate := newConnectionInputGate(strings.NewReader("x"), nil)
+	gate.open()
+	buf := make([]byte, 1)
+	if n, err := gate.Read(buf); n != 1 || err != nil || string(buf) != "x" {
+		t.Fatalf("gate read n=%d err=%v buf=%q", n, err, string(buf))
+	}
+	conn := &localAgentConnection{agent: agent}
+	agent.clientCalls <- struct{}{}
+	if _, err := conn.CreateElicitation(ctx, form, elicitationScope{}); err == nil {
+		t.Fatal("CreateElicitation ignored client-call backpressure")
+	}
+	<-agent.clientCalls
+	if _, reqErr := conn.handle(ctx, acp.AgentMethodAuthenticate, json.RawMessage(`{}`)); reqErr == nil {
+		t.Fatal("uninitialized connection accepted authenticate")
+	}
+	conn.initialized.Store(true)
+	if _, reqErr := conn.handle(ctx, "missing/method", json.RawMessage(`{}`)); reqErr == nil || reqErr.Code != -32601 {
+		t.Fatalf("missing method error = %#v", reqErr)
+	}
+}

@@ -10,7 +10,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/coder/acp-go-sdk"
 	opencodeacp "github.com/savid/acp-go-opencode"
@@ -21,29 +23,83 @@ const (
 	defaultPrompt      = "Reply with exactly RESUME_OK and do not use tools."
 )
 
-type agentConnection interface {
-	Initialize(context.Context, acp.InitializeRequest) (acp.InitializeResponse, error)
-	LoadSession(context.Context, acp.LoadSessionRequest) (acp.LoadSessionResponse, error)
-	Prompt(context.Context, acp.PromptRequest) (acp.PromptResponse, error)
-	CloseSession(context.Context, acp.CloseSessionRequest) (acp.CloseSessionResponse, error)
+type client struct {
+	output io.Writer
+	mu     sync.Mutex
+	text   strings.Builder
 }
 
-var _ agentConnection = (*opencodeacp.Agent)(nil)
+var _ acp.Client = (*client)(nil)
 
 var (
 	runMain   = run
 	runLoaded = runLoadedSession
 	getwd     = os.Getwd
 	exit      = os.Exit
-	newAgent  = func(store opencodeacp.SessionStore, opencodePath string, opencodeHome string) agentConnection {
-		return opencodeacp.NewAgent(
-			opencodeacp.WithSessionStore(store),
-			opencodeacp.WithExecutablePath(opencodePath),
-			opencodeacp.WithHome(opencodeHome),
-			opencodeacp.WithLogger(slog.New(slog.DiscardHandler)),
-		)
-	}
+	serve     = opencodeacp.Serve
 )
+
+func (*client) ReadTextFile(_ context.Context, params acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
+	data, err := os.ReadFile(params.Path)
+	if err != nil {
+		return acp.ReadTextFileResponse{}, err
+	}
+
+	return acp.ReadTextFileResponse{Content: string(data)}, nil
+}
+
+func (*client) WriteTextFile(_ context.Context, params acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
+	if err := os.MkdirAll(filepath.Dir(params.Path), 0o755); err != nil {
+		return acp.WriteTextFileResponse{}, err
+	}
+
+	return acp.WriteTextFileResponse{}, os.WriteFile(params.Path, []byte(params.Content), 0o600)
+}
+
+func (*client) RequestPermission(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+}
+
+func (c *client) SessionUpdate(_ context.Context, params acp.SessionNotification) error {
+	if params.Update.AgentMessageChunk == nil || params.Update.AgentMessageChunk.Content.Text == nil {
+		return nil
+	}
+
+	text := params.Update.AgentMessageChunk.Content.Text.Text
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	writer := c.output
+	if writer == nil {
+		writer = os.Stdout
+	}
+
+	fmt.Fprint(writer, text)
+	c.text.WriteString(text)
+
+	return nil
+}
+
+func (*client) CreateTerminal(context.Context, acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
+	return acp.CreateTerminalResponse{TerminalId: "terminal-1"}, nil
+}
+
+func (*client) KillTerminal(context.Context, acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
+	return acp.KillTerminalResponse{}, nil
+}
+
+func (*client) TerminalOutput(context.Context, acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
+	return acp.TerminalOutputResponse{Output: "", Truncated: false}, nil
+}
+
+func (*client) ReleaseTerminal(context.Context, acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
+	return acp.ReleaseTerminalResponse{}, nil
+}
+
+func (*client) WaitForTerminalExit(context.Context, acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
+	return acp.WaitForTerminalExitResponse{}, nil
+}
 
 func main() {
 	if err := runMain(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -112,25 +168,58 @@ func runLoadedSession(
 	opencodeHome string,
 	stdout io.Writer,
 ) error {
-	agent := newAgent(store, opencodePath, opencodeHome)
+	clientInput, agentOutput := io.Pipe()
+	agentInput, clientOutput := io.Pipe()
 
-	if _, err := agent.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}); err != nil {
+	defer clientInput.Close()
+	defer clientOutput.Close()
+
+	c := &client{output: stdout}
+	conn := acp.NewClientSideConnection(c, clientOutput, clientInput)
+	conn.SetLogger(slog.New(slog.DiscardHandler))
+
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- serve(
+			serveCtx,
+			agentInput,
+			agentOutput,
+			opencodeacp.WithExecutablePath(opencodePath),
+			opencodeacp.WithHome(opencodeHome),
+			opencodeacp.WithSessionStore(store),
+			opencodeacp.WithLogger(slog.New(slog.DiscardHandler)),
+		)
+	}()
+
+	_, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	if err != nil {
 		return err
 	}
 
 	id := acp.SessionId(sessionID)
 
-	if _, err := agent.LoadSession(ctx, opencodeacp.LoadSessionRequest(id, cwd)); err != nil {
+	_, err = conn.LoadSession(ctx, opencodeacp.LoadSessionRequest(id, cwd))
+	if err != nil {
 		return err
 	}
 
 	defer func() {
-		_, _ = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: id})
+		_, _ = conn.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: id})
+
+		cancel()
+
+		_ = agentInput.Close()
+		_ = agentOutput.Close()
+
+		<-errs
 	}()
 
 	fmt.Fprintln(stdout, "== resume smoke test ==")
 
-	resp, err := agent.Prompt(ctx, opencodeacp.TextPromptRequest(id, prompt))
+	resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(id, prompt))
 	if err != nil {
 		return err
 	}

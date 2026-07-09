@@ -146,3 +146,46 @@ func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 		t.Fatal("clientElicitationCapabilities unmarshal fallback returned nil")
 	}
 }
+
+func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	agent := NewAgent()
+	session := testSession(agent, client)
+	agent.mu.Lock()
+	agent.sessions[session.id] = session
+	agent.mu.Unlock()
+	if _, err := agent.Authenticate(ctx, acp.AuthenticateRequest{}); err == nil {
+		t.Fatal("Authenticate accepted unsupported method")
+	}
+	if _, err := agent.Logout(ctx, acp.LogoutRequest{}); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if _, err := agent.SetSessionMode(ctx, acp.SetSessionModeRequest{}); err == nil {
+		t.Fatal("SetSessionMode accepted")
+	}
+	if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: session.id}); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if !session.wasCancelled() && client.abortCount() == 0 {
+		t.Fatal("Cancel did not touch session/client")
+	}
+	if err := agent.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !client.closed {
+		t.Fatal("client not closed")
+	}
+	payload := capRawEventPayload(map[string]any{
+		"sessionId": "s",
+		"sequence":  int64(1),
+		"source":    "test",
+		"event":     strings.Repeat("x", rawEventMaxBytes),
+	})
+	if event, _ := payload["event"].(map[string]any); event["truncated"] != true {
+		t.Fatalf("raw event was not capped: %#v", payload)
+	}
+	if _, err := io.Copy(io.Discard, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+}
