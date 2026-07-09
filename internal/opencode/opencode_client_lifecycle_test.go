@@ -1136,11 +1136,11 @@ func TestMaterializeOpenCodeConfigMCPServers(t *testing.T) {
 	seed := map[string]string{"opencode.json": `{
   "mcp": {
     "seeded": {"type": "remote", "url": "http://seed.example/mcp"},
-    "wagie": {"type": "local", "command": ["stale-binary", "--flag"]}
+    "gateway": {"type": "local", "command": ["stale-binary", "--flag"]}
   }
 }`}
 	servers := []MCPServerConfig{
-		{Name: "wagie", URL: "http://127.0.0.1:9/mcp", Headers: map[string]string{"Authorization": "Bearer t"}},
+		{Name: "gateway", URL: "http://127.0.0.1:9/mcp", Headers: map[string]string{"Authorization": "Bearer t"}},
 		{Name: "files", Command: []string{"server-files", "--root", "/tmp"}, Env: map[string]string{"DEBUG": "1"}},
 	}
 
@@ -1164,9 +1164,9 @@ func TestMaterializeOpenCodeConfigMCPServers(t *testing.T) {
 		t.Fatalf("seeded MCP server dropped: %#v", mcp["seeded"])
 	}
 
-	remote, ok := mcp["wagie"].(map[string]any)
+	remote, ok := mcp["gateway"].(map[string]any)
 	if !ok || remote["type"] != "remote" || remote["url"] != "http://127.0.0.1:9/mcp" || remote["enabled"] != true {
-		t.Fatalf("wrapper remote MCP server did not win the merge: %#v", mcp["wagie"])
+		t.Fatalf("wrapper remote MCP server did not win the merge: %#v", mcp["gateway"])
 	}
 	// The forwarded remote server must REPLACE the same-named seeded local server
 	// wholesale: no stale "command" from the seed may survive into the hybrid.
@@ -1425,7 +1425,7 @@ func TestOpenCodeSeedGuardOwnershipAndManifest(t *testing.T) {
 		}
 
 		_, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
-			"themes/custom.json": `{"name":"wagie"}`,
+			"themes/custom.json": `{"name":"gateway"}`,
 		}, nil)
 		if err == nil {
 			t.Fatal("seed over unmanaged operator file was accepted")
@@ -1515,7 +1515,7 @@ func TestOpenCodeSeedGuardWriteFaults(t *testing.T) {
 		}, nil); err != nil {
 			t.Fatalf("first seed: %v", err)
 		}
-		// Occupy the backup path with a directory so the .wagie.bak write fails
+		// Occupy the backup path with a directory so the .seed.bak write fails
 		// when the managed file's content changes.
 		backup := filepath.Join(configDir, "themes", "custom.json"+openCodeSeedBackupSuffix)
 		if err := os.MkdirAll(backup, 0o700); err != nil {

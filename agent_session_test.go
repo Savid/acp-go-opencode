@@ -205,7 +205,7 @@ func TestNewSessionForwardsMCPServersToNativeLaunch(t *testing.T) {
 
 	_, err := agent.NewSession(ctx, NewSessionRequest(cwd,
 		WithSessionMCPServers(
-			HTTPMCPServer("wagie", "http://127.0.0.1:9/mcp", map[string]string{"Authorization": "Bearer t"}),
+			HTTPMCPServer("gateway", "http://127.0.0.1:9/mcp", map[string]string{"Authorization": "Bearer t"}),
 			StdioMCPServer("files", "server-files", []string{"--root", "/tmp"}, map[string]string{"DEBUG": "1"}),
 		),
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
@@ -218,7 +218,7 @@ func TestNewSessionForwardsMCPServersToNativeLaunch(t *testing.T) {
 		t.Fatalf("MCP servers forwarded = %#v", captured)
 	}
 	remote := captured[0]
-	if remote.Name != "wagie" || remote.URL != "http://127.0.0.1:9/mcp" ||
+	if remote.Name != "gateway" || remote.URL != "http://127.0.0.1:9/mcp" ||
 		remote.Headers["Authorization"] != "Bearer t" || len(remote.Command) != 0 {
 		t.Fatalf("remote MCP config = %#v", remote)
 	}
@@ -248,7 +248,7 @@ func TestNativeMCPServerConfigConversion(t *testing.T) {
 	}
 
 	unstable := []acp.UnstableMcpServer{
-		{Http: &acp.UnstableMcpServerHttp{Name: "wagie", Url: "http://127.0.0.1:9/mcp"}},
+		{Http: &acp.UnstableMcpServerHttp{Name: "gateway", Url: "http://127.0.0.1:9/mcp"}},
 		{Stdio: &acp.McpServerStdio{
 			Name:    "files",
 			Command: "server-files",
@@ -258,7 +258,7 @@ func TestNativeMCPServerConfigConversion(t *testing.T) {
 		{Sse: &acp.UnstableMcpServerSse{Name: "sse"}},
 	}
 	configs := nativeMCPServerConfigsFromUnstable(unstable)
-	if len(configs) != 2 || configs[0].Name != "wagie" || configs[0].URL != "http://127.0.0.1:9/mcp" ||
+	if len(configs) != 2 || configs[0].Name != "gateway" || configs[0].URL != "http://127.0.0.1:9/mcp" ||
 		configs[0].Headers != nil || len(configs[1].Command) != 2 ||
 		configs[1].Command[0] != "server-files" || configs[1].Env["DEBUG"] != "1" {
 		t.Fatalf("unstable MCP conversion = %#v", configs)

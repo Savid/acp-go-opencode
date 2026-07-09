@@ -1947,8 +1947,8 @@ func ensureXDGDirs(dirs XDGDirs) error {
 
 const (
 	openCodeConfigFileName    = "opencode.json"
-	openCodeSeedManifestName  = ".wagie-seed-manifest.json"
-	openCodeSeedBackupSuffix  = ".wagie.bak"
+	openCodeSeedManifestName  = ".seed-manifest.json"
+	openCodeSeedBackupSuffix  = ".seed.bak"
 	openCodeSeedManifestField = "seedFiles"
 )
 
@@ -2006,7 +2006,7 @@ func materializeOpenCodePermissionConfig(
 
 	data = append(data, '\n')
 
-	// The merged opencode.json is itself a wagie-managed file: route the final
+	// The merged opencode.json is itself a manifest-managed file: route the final
 	// bytes through the guard so the manifest owns it and prior operator content
 	// is backed up rather than clobbered.
 	writes[openCodeConfigFileName] = data
@@ -2088,11 +2088,11 @@ func planOpenCodeSeedWrites(seedFiles map[string]string) (map[string][]byte, map
 // applyOpenCodeSeedGuard writes the planned files under configDir behind an
 // ownership manifest so a seed pass never overwrites a file the wrapper did not
 // create. Per relpath: a missing target is written and recorded; a target the
-// manifest already owns is overwritten (keeping a .wagie.bak of the prior bytes
+// manifest already owns is overwritten (keeping a .seed.bak of the prior bytes
 // when they change, or skipped entirely when identical); a target that exists
 // but is absent from the manifest — an operator-authored file — fails closed
 // with the uniform unsupported error, leaving every file untouched. The manifest
-// and .wagie.bak sidecars are wagie-owned and never treated as seed targets.
+// and .seed.bak sidecars are seed-owned and never treated as seed targets.
 func applyOpenCodeSeedGuard(configDir string, writes map[string][]byte) error {
 	manifest, err := loadOpenCodeSeedManifest(configDir)
 	if err != nil {

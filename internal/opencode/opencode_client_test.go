@@ -863,7 +863,8 @@ func pendingArrayPath(itemRef string) map[string]any {
 	}
 }
 
-// TestOpenCodeBlockingPostRecoversPersistedCause proves the wagie-bug fix: when
+// TestOpenCodeBlockingPostRecoversPersistedCause proves the blocking-POST
+// recovery fix: when
 // the blocking message/command POST is severed mid-body (client sees an
 // unexpected EOF), the client re-fetches GET /session/{id}/message and surfaces
 // the persisted assistant error instead of a bare transport error. When nothing
