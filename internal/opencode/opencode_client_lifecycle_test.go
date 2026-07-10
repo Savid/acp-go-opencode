@@ -1269,8 +1269,9 @@ func TestOpenCodeSeedFilesMergeAndConfinement(t *testing.T) {
 		}
 	}
 
-	// Path confinement: absolute, parent escapes, dot, and empty keys fail closed.
-	for _, bad := range []string{"/etc/passwd", "../escape.json", "a/../../escape", ".", ""} {
+	// Path confinement: absolute, parent escapes, dot, empty, and
+	// whitespace-only keys fail closed.
+	for _, bad := range []string{"/etc/passwd", "../escape.json", "a/../../escape", ".", "", "   ", "\t"} {
 		if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", map[string]string{bad: "x"}, nil); err == nil {
 			t.Fatalf("seed path %q was not rejected", bad)
 		}

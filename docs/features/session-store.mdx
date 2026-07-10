@@ -25,7 +25,11 @@ agent := opencodeacp.NewAgent(
 ```
 
 `WithSessionStoreLoadTimeout` bounds each store read during hydration; it
-defaults to `10s`.
+defaults to `10s`. Store writes are bounded separately by a fixed `60s`
+deadline, so a slow store can never stall a snapshot commit indefinitely.
+
+Store keys require a non-empty `SessionID`: `Append` and `Replace` with an
+empty session id fail, and `Delete` of an empty-id key is a pure no-op.
 
 ## Snapshot contents
 

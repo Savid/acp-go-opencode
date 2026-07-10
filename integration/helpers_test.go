@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -24,6 +25,28 @@ const (
 )
 
 var integrationLogger = slog.New(slog.DiscardHandler)
+
+// requireMethodNotFound dispatches a raw method name over the wire and asserts
+// the agent rejects it with method-not-found (-32601).
+func requireMethodNotFound(
+	t *testing.T,
+	conn *acp.ClientSideConnection,
+	ctx context.Context,
+	method string,
+	params any,
+) {
+	t.Helper()
+
+	_, err := conn.CallExtension(ctx, method, params)
+	if err == nil {
+		t.Fatalf("%s unexpectedly succeeded", method)
+	}
+
+	var reqErr *acp.RequestError
+	if !errors.As(err, &reqErr) || reqErr.Code != -32601 {
+		t.Fatalf("%s error = %#v, want method-not-found", method, err)
+	}
+}
 
 func TestMain(m *testing.M) {
 	previousLogger := slog.Default()

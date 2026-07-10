@@ -118,6 +118,38 @@ func TestRawEventSequenceIsContiguous(t *testing.T) {
 	}
 }
 
+// Nil payloads (missing, JSON null, or undecodable) are skipped WITHOUT
+// consuming a sequence number: `"event": null` is never emitted and the
+// sequence stays contiguous over the notifications that are actually emitted.
+func TestRawEventNilPayloadSkippedWithoutSequence(t *testing.T) {
+	conn := newRecordingAgentClient()
+	sess := rawEventSession(t, "session-1", conn)
+	events := []opencode.Event{
+		normalRawEvent("first"),
+		{Type: "message.updated"},
+		{Type: "message.updated", Raw: json.RawMessage(`null`)},
+		{Type: "message.updated", Raw: json.RawMessage(`{bad`)},
+		normalRawEvent("second"),
+	}
+	for i, event := range events {
+		if err := sess.emitRawOpenCodeEvent(context.Background(), event); err != nil {
+			t.Fatalf("emit %d: %v", i, err)
+		}
+	}
+	emitted := rawEventNotifications(conn, "session-1")
+	if len(emitted) != 2 {
+		t.Fatalf("emitted %d notifications, want 2", len(emitted))
+	}
+	for i, payload := range emitted {
+		if payload[jsonFieldSequence] != int64(i+1) {
+			t.Fatalf("sequence[%d] = %#v, want %d", i, payload[jsonFieldSequence], i+1)
+		}
+		if payload[jsonFieldEvent] == nil {
+			t.Fatalf("event[%d] payload is null: %#v", i, payload)
+		}
+	}
+}
+
 // Case 3 — two concurrent sessions each keep an independent sequence that starts
 // at 1 and is contiguous.
 func TestRawEventCrossSessionSequenceIsolation(t *testing.T) {

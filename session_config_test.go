@@ -220,3 +220,9 @@ func containsStringAny(value any, want string) bool {
 
 	return false
 }
+
+func TestTitleASCII(t *testing.T) {
+	if titleASCII("") != "" || titleASCII("plan") != "Plan" {
+		t.Fatal("titleASCII mismatch")
+	}
+}

@@ -2,8 +2,10 @@
 
 This example reads an OpenCode `opencode-state-v1` transcript from
 `session.jsonl` in this directory into a `SessionStore`, loads the session
-through ACP `session/load` so previous state is rehydrated, then sends one
-no-tools smoke-test prompt and reports the stop reason.
+through ACP so previous state is rehydrated, then sends one no-tools
+smoke-test prompt in-process. It denies tool permissions by default so a
+copied session cannot silently run commands while you are checking resume
+behavior.
 
 Use it with a saved OpenCode session-state transcript:
 
@@ -12,19 +14,12 @@ cd examples/resume-from-file
 go run . -session <session-id> -cwd /absolute/path/to/project
 ```
 
-Flags:
+If the JSONL rows carry a `sessionId` (the idmap row) or a `session.sessionId`
+snapshot field, `-session` can be omitted and the id is inferred; `-cwd`
+likewise defaults to the snapshot cwd or the current directory. Loading uses
+normal ACP `session/load`, and the prompt uses normal ACP `session/prompt`.
 
-- `-file` — path to the transcript JSONL (defaults to `session.jsonl`).
-- `-session` — session id; if omitted, it is inferred from the `sessionId`
-  field found in the JSONL rows.
-- `-cwd` — session cwd; if omitted, it is inferred from the JSONL `cwd`, then
-  falls back to the current working directory.
-- `-prompt` — prompt sent after loading (defaults to a no-tools smoke test).
-- `-path` — path to the `opencode` CLI.
-- `-home` — parent root for isolated OpenCode session state.
-
-Each JSONL row is a valid `opencode-state-v1` `SessionStoreEntry`: the state
-snapshot carries `session.sessionId` and `session.cwd`, and the idmap row
-carries the top-level `sessionId`. Loading uses normal ACP `session/load`, and
-the smoke turn uses normal ACP `session/prompt`. A local `opencode` CLI must be
-installed and authenticated to load a real session and run the prompt.
+Pass `-prompt "..."` to change the smoke-test turn, `-path` to point at a
+specific `opencode` CLI, and `-home` to set the parent root for isolated
+OpenCode session state. A local `opencode` CLI must be installed and
+authenticated to load a real session and run the prompt.

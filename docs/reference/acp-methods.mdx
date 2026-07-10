@@ -16,7 +16,7 @@ extension. This page lists each method and its behavior.
 | `session/new` | Create a session and launch its OpenCode process. |
 | `session/load` | Recreate a stored session and replay its history. |
 | `session/resume` | Restore a stored session without replay. |
-| `session/list` | Enumerate stored sessions. |
+| `session/list` | Enumerate stored sessions. Pages carry an opaque base64 cursor; a cursor past the end is invalid params. |
 | `session/prompt` | Run a prompt turn against the native session. |
 | `session/cancel` | Cancel the running turn. |
 | `session/close` | End the session and take a final snapshot. |

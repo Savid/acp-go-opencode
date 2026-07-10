@@ -1,6 +1,6 @@
 # acp-go-opencode
 
-Go ACP agent that exposes OpenCode as an [Agent Client Protocol](https://agentclientprotocol.com/) agent.
+Go ACP agent that exposes the local OpenCode CLI as an [Agent Client Protocol](https://agentclientprotocol.com/) agent.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/savid/acp-go-opencode.svg)](https://pkg.go.dev/github.com/savid/acp-go-opencode)
 [![CI](https://github.com/savid/acp-go-opencode/actions/workflows/go-test.yml/badge.svg)](https://github.com/savid/acp-go-opencode/actions/workflows/go-test.yml)

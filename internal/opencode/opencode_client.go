@@ -26,8 +26,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/savid/acp-go-opencode/internal/defaults"
 )
 
 const (
@@ -573,13 +571,16 @@ var (
 	openCodeShutdownTimeout               = 5 * time.Second
 )
 
+// HealthCheckTimeout is the default bound on OpenCode server readiness checks.
+const HealthCheckTimeout = 60 * time.Second
+
 func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
 
 	if options.HealthTimeout <= 0 {
-		options.HealthTimeout = defaults.HealthCheckTimeout
+		options.HealthTimeout = HealthCheckTimeout
 	}
 
 	root := options.Root
@@ -2207,7 +2208,7 @@ func writeOpenCodeSeedManifest(configDir string, manifest []string) error {
 // rejecting empty keys, absolute paths, and parent-directory escapes with the
 // uniform unsupported error. It returns the cleaned, slash-normalized path.
 func validateOpenCodeSeedPath(rel string) (string, error) {
-	if rel == "" || filepath.IsAbs(rel) {
+	if strings.TrimSpace(rel) == "" || filepath.IsAbs(rel) {
 		return "", unsupportedField(seedFileField(rel))
 	}
 

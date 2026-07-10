@@ -30,13 +30,13 @@ const (
 	eventQuestionAsked      = "question.asked"
 	eventQuestionV2Asked    = "question.v2.asked"
 
+	fieldPrompt        = "prompt"
 	partTypeText       = "text"
 	partTypeFile       = "file"
 	partTypeTool       = "tool"
 	partTypeStepFinish = "step-finish"
 	contentTypeAudio   = "audio"
 	mediaTypeImage     = "image"
-	blockTypeUnknown   = "unknown"
 	roleUser           = "user"
 	defaultMimeType    = "application/octet-stream"
 
@@ -352,6 +352,14 @@ func (s *session) runPromptTurn(
 	done := make(chan promptTurnResult, 1)
 
 	go func() {
+		// A panic in the native turn is logged and converted into a turn
+		// result so the prompt select loop can never block forever.
+		defer func() {
+			handleAgentGoroutinePanic(turnCtx, agentLogger(s.agent), "OpenCode native turn", func(recovered any) {
+				done <- promptTurnResult{err: fmt.Errorf("opencode native turn panicked: %v", recovered)}
+			}, recover())
+		}()
+
 		message, err := runNative(turnCtx)
 		done <- promptTurnResult{message: message, err: err}
 	}()
@@ -553,12 +561,12 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock) ([]map[string]any, error) 
 
 			parts = append(parts, part)
 		default:
-			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "prompt"})
+			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fieldPrompt})
 		}
 	}
 
 	if len(parts) == 0 {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldField: "prompt"})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fieldPrompt})
 	}
 
 	return parts, nil
@@ -579,7 +587,7 @@ func commandPromptParts(blocks []acp.ContentBlock) ([]map[string]any, error) {
 		if !ok {
 			return nil, acp.NewInvalidParams(map[string]any{
 				jsonFieldError: errValueUnsupported,
-				"blockType":    contentBlockType(block),
+				jsonFieldField: fieldPrompt,
 			})
 		}
 
@@ -651,23 +659,6 @@ func blobResourceOpenCodePart(resource *acp.BlobResourceContents) (map[string]an
 	}
 
 	return part, nil
-}
-
-func contentBlockType(block acp.ContentBlock) string {
-	switch {
-	case block.Text != nil:
-		return firstNonEmpty(block.Text.Type, partTypeText)
-	case block.Image != nil:
-		return firstNonEmpty(block.Image.Type, mediaTypeImage)
-	case block.Audio != nil:
-		return firstNonEmpty(block.Audio.Type, contentTypeAudio)
-	case block.ResourceLink != nil:
-		return firstNonEmpty(block.ResourceLink.Type, "resource_link")
-	case block.Resource != nil:
-		return firstNonEmpty(block.Resource.Type, "resource")
-	default:
-		return blockTypeUnknown
-	}
 }
 
 func imageOpenCodePart(image *acp.ContentBlockImage) (map[string]any, error) {
@@ -1475,7 +1466,7 @@ func (s *session) emitUpdate(ctx context.Context, update acp.SessionUpdate) erro
 }
 
 func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event) error {
-	if !s.rawMessages.Enabled() {
+	if !s.rawMessages.Enabled() || len(event.Raw) == 0 {
 		return nil
 	}
 
@@ -1484,9 +1475,15 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 		return nil
 	}
 
+	// A payload that decodes to nothing is skipped without consuming a
+	// sequence number, so the per-session sequence stays contiguous over the
+	// notifications that are actually emitted.
 	var raw map[string]any
-	if len(event.Raw) > 0 {
-		_ = json.Unmarshal(event.Raw, &raw)
+
+	_ = json.Unmarshal(event.Raw, &raw)
+
+	if raw == nil {
+		return nil
 	}
 
 	payload := map[string]any{

@@ -300,6 +300,9 @@ func runConversation(
 	if err != nil {
 		return err
 	}
+	defer func() {
+		_, _ = conn.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	}()
 
 	resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(session.SessionId, prompt))
 	if err != nil {
@@ -307,8 +310,6 @@ func runConversation(
 	}
 
 	fmt.Fprintf(stdout, "\n\nstop reason: %s\n", resp.StopReason)
-
-	_, _ = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
 
 	return nil
 }

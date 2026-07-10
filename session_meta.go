@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/coder/acp-go-sdk"
@@ -55,7 +56,13 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 	}
 
 	options := opencodeMetaOptions{}
-	if model, _ := optionsMap[metaModelKey].(string); model != "" {
+
+	if rawModel, ok := optionsMap[metaModelKey]; ok {
+		model, ok := rawModel.(string)
+		if !ok {
+			return opencodeMetaOptions{}, unsupportedField("_meta.opencode.options." + metaModelKey)
+		}
+
 		options.Model = model
 	}
 
@@ -76,7 +83,12 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 		options.OutputSchema = cloneAny(schema)
 	}
 
-	if mode, _ := optionsMap[metaModeKey].(string); mode != "" {
+	if rawMode, ok := optionsMap[metaModeKey]; ok {
+		mode, ok := rawMode.(string)
+		if !ok {
+			return opencodeMetaOptions{}, unsupportedField("_meta.opencode.options." + metaModeKey)
+		}
+
 		options.Mode = mode
 	}
 
@@ -154,6 +166,19 @@ func unsupportedField(path string) error {
 		jsonFieldError: errValueUnsupported,
 		jsonFieldField: path,
 	})
+}
+
+// lifecycleMetaError normalizes lifecycle _meta validation failures to invalid
+// params (-32602): structured request errors pass through unchanged and plain
+// validation errors are wrapped so malformed _meta never surfaces as an
+// internal error.
+func lifecycleMetaError(err error) error {
+	var reqErr *acp.RequestError
+	if errors.As(err, &reqErr) {
+		return reqErr
+	}
+
+	return acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
 }
 
 func validateOpenCodePermission(permission string) error {

@@ -781,7 +781,10 @@ func (s *session) markPart(part opencode.NativePart) bool {
 	return true
 }
 
-func (s *session) Close(ctx context.Context) error {
+// Close shuts down the native OpenCode process under bounded background
+// contexts so a cancelled or expired caller context can never skip the
+// graceful abort/close ladder.
+func (s *session) Close(_ context.Context) error {
 	s.cancelTurn()
 	s.mu.Lock()
 	if s.closed {
@@ -803,7 +806,10 @@ func (s *session) Close(ctx context.Context) error {
 
 		cancel()
 
-		err = errors.Join(err, client.Close(ctx))
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+		err = errors.Join(err, client.Close(closeCtx))
+
+		closeCancel()
 	}
 
 	return err

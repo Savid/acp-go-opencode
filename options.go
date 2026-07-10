@@ -6,8 +6,6 @@ import (
 	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
-
-	"github.com/savid/acp-go-opencode/internal/defaults"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
@@ -61,7 +59,7 @@ func applyOptions(opts []Option) Options {
 		AgentTitle:              defaultAgentName,
 		AgentVersion:            "0.1.0",
 		SessionStoreLoadTimeout: 10 * time.Second,
-		HealthCheckTimeout:      defaults.HealthCheckTimeout,
+		HealthCheckTimeout:      opencode.HealthCheckTimeout,
 		MinimumVersion:          "1.17.13",
 		clientFactory:           opencode.StartServer,
 	}
@@ -146,6 +144,8 @@ func WithSessionStore(store SessionStore) Option {
 	}
 }
 
+// WithSessionStoreLoadTimeout bounds session store reads (load, list, and
+// subkey enumeration). Store writes use a separate fixed bound.
 func WithSessionStoreLoadTimeout(timeout time.Duration) Option {
 	return func(options *Options) {
 		options.SessionStoreLoadTimeout = timeout

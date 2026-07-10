@@ -27,6 +27,10 @@ import (
 
 const maxHydrateFileBytes int64 = 128 * 1024 * 1024
 
+// sessionStateReplaceTimeout bounds session store writes (the snapshot Replace
+// commit). Store reads are bounded separately by SessionStoreLoadTimeout.
+var sessionStateReplaceTimeout = 60 * time.Second
+
 const credentialTableAccount = "account"
 
 const archiveEncodingTarZstdBase64 = "tar+zstd+base64"
@@ -231,7 +235,7 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 		SessionStoreReplacement{Key: SessionKey{SessionID: string(s.id), Subpath: idmapSubpath}, Entries: []SessionStoreEntry{idmapEntry}},
 	)
 
-	storeCtx, cancel := s.agent.sessionStoreContext(ctx)
+	storeCtx, cancel := context.WithTimeout(ctx, sessionStateReplaceTimeout)
 	defer cancel()
 
 	return s.agent.sessionStore().Replace(storeCtx, mainKey, replacements)

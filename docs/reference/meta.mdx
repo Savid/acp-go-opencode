@@ -5,7 +5,10 @@ description: The _meta.opencode vocabulary on requests, responses, and error pay
 
 The adapter carries its non-standard surface under the `_meta.opencode`
 namespace. Unknown keys under `_meta.opencode` are rejected; foreign top-level
-namespaces are ignored.
+namespaces are ignored. Malformed `_meta` — a non-object `_meta.opencode`
+namespace, an unknown key, or a wrong-typed known option value — is rejected
+with an invalid-params error (`-32602`); unsupported keys and wrong-typed
+values carry the uniform `{"error": "unsupported", "field": "<path>"}` data.
 
 ## Request input
 

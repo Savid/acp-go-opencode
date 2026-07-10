@@ -296,6 +296,10 @@ func TestNativeMCPServerConfigConversion(t *testing.T) {
 		t.Fatalf("named unstable MCP servers rejected: %v", err)
 	}
 
+	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{{}}); err != nil {
+		t.Fatalf("empty unstable MCP server union rejected: %v", err)
+	}
+
 	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
 		{Http: &acp.UnstableMcpServerHttp{Name: "dup", Url: "http://127.0.0.1:9/mcp"}},
 		{Stdio: &acp.McpServerStdio{Name: "dup", Command: "server-files"}},
@@ -522,13 +526,18 @@ func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
 	if len(listResp.Sessions) != listSessionsPageSize || listResp.NextCursor == nil {
 		t.Fatalf("list resp len=%d next=%v", len(listResp.Sessions), listResp.NextCursor)
 	}
-	if _, err = listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("bad"))); err == nil {
+	if _, err = listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("!not-base64!"))); err == nil {
 		t.Fatal("bad cursor accepted")
 	}
-	cursor := "999"
-	empty, err := listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor(cursor)))
-	if err != nil || len(empty.Sessions) != 0 || empty.NextCursor != nil {
-		t.Fatalf("empty page = %#v err=%v", empty, err)
+	if _, err = listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("bad"))); err == nil {
+		t.Fatal("non-numeric cursor accepted")
+	}
+	rest, err := listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor(*listResp.NextCursor)))
+	if err != nil || len(rest.Sessions) != 2 || rest.NextCursor != nil {
+		t.Fatalf("second page = %#v err=%v", rest, err)
+	}
+	if _, err = listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor(encodeListCursor(999)))); err == nil {
+		t.Fatal("past-end cursor accepted")
 	}
 
 	parentClient := newFakeOpenCodeClient()

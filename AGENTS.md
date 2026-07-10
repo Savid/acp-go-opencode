@@ -15,17 +15,18 @@ REST/SSE event mapping, permission requests, config options, and
 
 Organized by domain. The public surface lives in the root package
 `opencodeacp`; the native OpenCode protocol glue lives under
-`internal/opencode`, and shared defaults under `internal/defaults`.
+`internal/opencode`.
 
 - **Entrypoint** (`cmd/acp-go-opencode`): process entrypoint (`main.go`), flag
   parsing, logger and signal setup, version reporting, OpenTelemetry wiring
   (`otel.go`), and the ACP stdio serve loop. `stdout` is reserved for ACP
   JSON-RPC; diagnostics go to `stderr`.
 - **ACP agent surface** (root package: `agent.go`, `agent_connection.go`,
-  `agent_session.go`, `ids.go`, `validation.go`): the `Agent` type, `NewAgent`,
-  `Serve`, `Initialize` capabilities and `_meta`, session lifecycle handlers
-  (new, load, resume, list, close, delete, fork), the extension-method handler,
-  concurrency limits, session ID generation, and start-path validation.
+  `agent_session.go`, `agent_goroutine.go`, `ids.go`, `session_validation.go`):
+  the `Agent` type, `NewAgent`, `Serve`, `Initialize` capabilities and `_meta`,
+  session lifecycle handlers (new, load, resume, list, close, delete, fork),
+  the extension-method handler, goroutine panic recovery, concurrency limits,
+  session ID generation, and start-path validation.
 - **Session orchestration** (`session.go`, `session_prompt.go`,
   `session_config.go`, `session_meta.go`): per-session turn state, prompt and
   cancel handling, native REST/SSE event mapping, permission and question
@@ -48,8 +49,6 @@ Organized by domain. The public surface lives in the root package
 - **Observability** (`internal/observer`): OpenTelemetry instrumentation
   helpers (trace/metric definitions, trace-context propagation) and the
   instrumentation name.
-- **Shared defaults** (`internal/defaults`): default constants such as the
-  server health-check timeout.
 - **Live tests** (`integration`, build tag `integration`): integration tests
   that launch the real local `opencode` CLI through `opencode serve`.
 - **Docs** (`docs/`, `docs.json`): Mintlify guide. Update alongside public API,
@@ -68,9 +67,11 @@ gate, vulnerability scan, modernization check, docs audit, and module tidy and
 verification. `make lint`, `make fmt`, and `make vuln` are available
 individually. Lint details live in `.golangci.yml`.
 
-`make docs-audit` checks that public docs and examples do not reintroduce
-removed public terms. Keep `stdout` reserved for ACP JSON-RPC in the CLI; logs
-and diagnostics belong on `stderr`.
+`make docs-audit` checks that the required docs files exist, that every CLI
+flag is registered in both `docs/reference/cli.mdx` and the command source,
+and that public docs and examples do not reintroduce removed public terms.
+Keep `stdout` reserved for ACP JSON-RPC in the CLI; logs and diagnostics
+belong on `stderr`.
 
 Run live integration tests only when a local OpenCode CLI is installed and
 authenticated:
@@ -95,8 +96,7 @@ Live tests always launch OpenCode under an isolated per-session XDG home.
 - Follow standard Go idioms: `ctx` first, no `ctx` in structs, and `%w` for
   wrapped errors.
 - Keep the public root package focused on the ACP surface; keep native REST/SSE
-  and process glue in `internal/opencode` and shared constants in
-  `internal/defaults`.
+  glue, process launch, and their shared constants in `internal/opencode`.
 - Prefer structured protocol types and JSON decoding over ad hoc string parsing;
   native OpenCode field spellings stay confined to `internal/opencode`.
 - Preserve ACP method names, request/response shapes, and validation behavior.

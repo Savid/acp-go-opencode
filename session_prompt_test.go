@@ -1023,43 +1023,6 @@ func TestPromptReconcileCancelledBeforeSend(t *testing.T) {
 	}
 }
 
-func TestTurnFenceHelperBranches(t *testing.T) {
-	session := testSession(NewAgent(), newFakeOpenCodeClient())
-	if !session.claimPermissionRequest("") || !session.claimQuestionRequest("") {
-		t.Fatal("empty request ids should not be fenced")
-	}
-	session.processedPermission = nil
-	session.processedQuestion = nil
-	if !session.claimPermissionRequest("perm") || !session.claimQuestionRequest("question") {
-		t.Fatal("nil processed request maps were not initialized")
-	}
-	session.markActiveMessageID("")
-	session.activeMessageIDs = nil
-	session.markActiveMessageID("message-1")
-	session.failedMessageIDs = nil
-	session.failedStreamEpochs = nil
-	session.markStreamFailed(9)
-	if !session.shouldSuppressEvent(opencode.Event{StreamEpoch: 9}) {
-		t.Fatal("failed stream epoch was not suppressed")
-	}
-	if !session.shouldSuppressEvent(opencode.Event{
-		Properties: json.RawMessage(`{"sessionID":"native-1","messageID":"message-1","type":"text","text":"late"}`),
-	}) {
-		t.Fatal("failed message id was not suppressed")
-	}
-	if session.shouldSuppressEvent(opencode.Event{
-		Properties: json.RawMessage(`{"sessionID":"native-1","messageID":"message-2","type":"text","text":"ok"}`),
-	}) {
-		t.Fatal("unfailed message id was suppressed")
-	}
-	if err := session.handleEvent(context.Background(), opencode.Event{
-		StreamEpoch: 9,
-		Properties:  json.RawMessage(`{"sessionID":"native-1","messageID":"message-1","type":"text","text":"late"}`),
-	}); err != nil {
-		t.Fatalf("suppressed handleEvent: %v", err)
-	}
-}
-
 func TestPermissionQuestionCancelledReplyBranches(t *testing.T) {
 	t.Run("permission without connection uses background when context cancelled", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
@@ -1848,25 +1811,23 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 				{Audio: &acp.ContentBlockAudio{Type: "audio", Data: "AA==", MimeType: "audio/wav"}},
 			},
 		})
-		if err == nil || !strings.Contains(err.Error(), "audio") {
-			t.Fatalf("unconvertible block error = %v", err)
-		}
+		requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "prompt"})
 	})
 
-	t.Run("command part conversion errors name block types", func(t *testing.T) {
+	t.Run("command part conversion errors use the uniform prompt shape", func(t *testing.T) {
 		if _, err := commandPromptParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image"}}}); err == nil {
 			t.Fatal("empty command image accepted")
 		}
-		if _, err := commandPromptParts([]acp.ContentBlock{acp.TextBlock("extra text")}); err == nil ||
-			!strings.Contains(err.Error(), "text") {
-			t.Fatalf("text command part error = %v", err)
-		}
-		if _, err := commandPromptParts([]acp.ContentBlock{{Resource: &acp.ContentBlockResource{Type: "resource"}}}); err == nil ||
-			!strings.Contains(err.Error(), "resource") {
-			t.Fatalf("resource command part error = %v", err)
-		}
-		if _, err := commandPromptParts([]acp.ContentBlock{{}}); err == nil || !strings.Contains(err.Error(), "unknown") {
-			t.Fatalf("unknown command part error = %v", err)
+		for _, block := range []acp.ContentBlock{
+			acp.TextBlock("extra text"),
+			{Resource: &acp.ContentBlockResource{Type: "resource"}},
+			{},
+		} {
+			_, err := commandPromptParts([]acp.ContentBlock{block})
+			if err == nil {
+				t.Fatalf("unconvertible command block accepted: %#v", block)
+			}
+			requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "prompt"})
 		}
 		if _, err := blobResourceOpenCodePart(&acp.BlobResourceContents{}); err == nil {
 			t.Fatal("empty blob resource accepted")
@@ -1874,12 +1835,6 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 		named := resourceLinkOpenCodePart(&acp.ContentBlockResourceLink{Name: "named.txt", Uri: "file:///tmp/ignored"})
 		if named["mime"] != "application/octet-stream" || named["filename"] != "named.txt" {
 			t.Fatalf("named resource link part = %#v", named)
-		}
-		if got := contentBlockType(acp.ContentBlock{Image: &acp.ContentBlockImage{}}); got != "image" {
-			t.Fatalf("image block type = %q", got)
-		}
-		if got := contentBlockType(acp.ContentBlock{ResourceLink: &acp.ContentBlockResourceLink{}}); got != "resource_link" {
-			t.Fatalf("resource link block type = %q", got)
 		}
 	})
 
@@ -2062,39 +2017,6 @@ func TestUsageUpdateSizeIsContextWindow(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestSessionContextWindow(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("caches lookups per model", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
-		session := testSession(NewAgent(), client)
-		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 1000 {
-			t.Fatalf("first lookup = %d, want 1000", got)
-		}
-		client.providersErr = errors.New("boom")
-		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 1000 {
-			t.Fatalf("cached lookup = %d, want 1000 (must not re-fetch)", got)
-		}
-	})
-
-	t.Run("provider error reports unknown", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
-		client.providersErr = errors.New("boom")
-		session := testSession(NewAgent(), client)
-		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 0 {
-			t.Fatalf("provider error lookup = %d, want 0", got)
-		}
-	})
-
-	t.Run("nil client reports unknown", func(t *testing.T) {
-		session := testSession(NewAgent(), newFakeOpenCodeClient())
-		session.client = nil
-		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 0 {
-			t.Fatalf("nil client lookup = %d, want 0", got)
-		}
-	})
 }
 
 func commandNames(commands []acp.AvailableCommand) []string {
@@ -3047,6 +2969,33 @@ func providerNativeError(detail string, status int, code string) *opencode.Nativ
 	e.Data.ResponseBody = `{"error":{"code":"` + code + `"}}`
 
 	return e
+}
+
+func TestTurnTimeoutWithoutAgent(t *testing.T) {
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	session.agent = nil
+	if session.turnTimeout() != 0 {
+		t.Fatal("nil agent turn timeout != 0")
+	}
+}
+
+// A panic in the native turn goroutine is recovered, logged, and surfaced as a
+// turn failure instead of crashing the agent or hanging the prompt.
+func TestPromptNativeTurnPanicIsRecovered(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.sendMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		panic("native turn exploded")
+	}
+	session := testSession(NewAgent(), client)
+
+	resp, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hi")}})
+	if err == nil {
+		t.Fatalf("panicking native turn returned no error: %#v", resp)
+	}
+	if !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("panic error = %v", err)
+	}
 }
 
 // T1 — a native provider error terminates the turn with the uniform

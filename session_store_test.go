@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -88,6 +89,24 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 	if err := store.Append(ctx, key, nil); err != nil {
 		t.Fatalf("append empty: %v", err)
 	}
+	if err := store.Append(ctx, SessionKey{Subpath: "sub"}, []SessionStoreEntry{json.RawMessage(`{}`)}); err == nil ||
+		!strings.Contains(err.Error(), "session id is required") {
+		t.Fatalf("empty session id append err = %v", err)
+	}
+	if err := store.Replace(ctx, SessionKey{}, []SessionStoreReplacement{{Key: SessionKey{}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}}}); err == nil ||
+		!strings.Contains(err.Error(), "session id is required") {
+		t.Fatalf("empty session id replace err = %v", err)
+	}
+	// Deleting an empty-SessionID key is a pure no-op: no error, no tombstone.
+	if err := store.Delete(ctx, SessionKey{}); err != nil {
+		t.Fatalf("empty session id delete: %v", err)
+	}
+	store.mu.Lock()
+	if len(store.tombstones) != 0 {
+		store.mu.Unlock()
+		t.Fatalf("empty session id delete left tombstones: %#v", store.tombstones)
+	}
+	store.mu.Unlock()
 	entry := SessionStoreEntry(`{
 			"capturedAtUnixMilli": 200,
 			"session": {"cwd": "/repo", "title": "Stored", "nativeSessionId": "native-1"}

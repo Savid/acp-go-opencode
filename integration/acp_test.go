@@ -34,9 +34,7 @@ func TestOpenCodeACPAgentBinarySessionLifecycle(t *testing.T) {
 	if initResp.AgentCapabilities.SessionCapabilities.Fork != nil {
 		t.Fatalf("stable fork advertised: %#v", initResp.AgentCapabilities.SessionCapabilities.Fork)
 	}
-	if _, err := conn.UnstableForkSession(ctx, acp.UnstableForkSessionRequest{}); err == nil {
-		t.Fatal("stable session/fork unexpectedly succeeded")
-	}
+	requireMethodNotFound(t, conn, ctx, "session/fork", map[string]any{"sessionId": "missing", "cwd": t.TempDir()})
 
 	cwd := t.TempDir()
 	session, err := conn.NewSession(ctx, opencodeacp.NewSessionRequest(cwd))
