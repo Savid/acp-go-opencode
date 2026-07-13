@@ -116,8 +116,13 @@ type Client interface {
 }
 
 type StartOptions struct {
-	ACPSessionID      ACPSessionID
-	Root              string
+	ACPSessionID ACPSessionID
+	Root         string
+	// ScratchParent is the already-resolved parent directory for ephemeral
+	// on-disk materialization. The root package resolves it (system temp
+	// directory when unset); this package never consults the system temp
+	// directory itself. It is used only as the fallback root when Root is empty.
+	ScratchParent     string
 	Cwd               string
 	ExecutablePath    string
 	DefaultModel      string
@@ -585,7 +590,7 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 
 	root := options.Root
 	if root == "" {
-		root = filepath.Join(os.TempDir(), "acp-go-opencode")
+		root = filepath.Join(options.ScratchParent, "acp-go-opencode")
 	}
 
 	if err := reapStaleLeases(root, options.Logger); err != nil {

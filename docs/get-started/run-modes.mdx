@@ -14,7 +14,7 @@ the streams directly.
 stdin/stdout. stdout carries ACP JSON-RPC only; diagnostics go to stderr.
 
 ```sh
-acp-go-opencode -path /usr/bin/opencode -home /tmp/acp-opencode
+acp-go-opencode -path /usr/bin/opencode -scratch-dir /tmp/acp-opencode
 ```
 
 ## Embedded
@@ -28,14 +28,14 @@ builds the same agent when you need to hold a reference before serving.
 ```go Serve
 err := opencodeacp.Serve(ctx, input, output,
 	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
-	opencodeacp.WithHome(home),
+	opencodeacp.WithScratchDir(scratchDir),
 )
 ```
 
 ```go NewAgent
 agent := opencodeacp.NewAgent(
 	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
-	opencodeacp.WithHome(home),
+	opencodeacp.WithScratchDir(scratchDir),
 )
 ```
 

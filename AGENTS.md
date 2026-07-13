@@ -33,7 +33,7 @@ Organized by domain. The public surface lives in the root package
   reconciliation, plan and message emission, config-option (model/mode)
   resolution, and session metadata parsing.
 - **Options and builders** (`options.go`, `request_builders.go`): agent
-  `Option` constructors (executable path, home root, default model, env,
+  `Option` constructors (executable path, scratch directory, default model, env,
   session store, telemetry providers, and OpenCode runtime toggles) and the
   exported request builders, `OpenCodeOptions`, MCP server builders, and fork
   call helper.

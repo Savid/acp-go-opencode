@@ -25,6 +25,7 @@ func TestApplyOptions(t *testing.T) {
 		WithAgentVersion("version"),
 		WithExecutablePath("opencode"),
 		WithHome("/tmp/home"),
+		WithScratchDir("/tmp/scratch"),
 		WithDefaultModel("openai/gpt"),
 		WithEnv(map[string]string{"A": "1"}),
 		WithTracerProvider(tracenoop.NewTracerProvider()),
@@ -43,6 +44,9 @@ func TestApplyOptions(t *testing.T) {
 	if opts.AgentName != "name" || opts.AgentTitle != "title" || opts.ExecutablePath != "opencode" ||
 		opts.Env["A"] != "1" || !opts.Pure || !opts.QuestionTool || opts.SessionStore != store {
 		t.Fatalf("options = %#v", opts)
+	}
+	if opts.Home != "/tmp/home" || opts.ScratchDir != "/tmp/scratch" {
+		t.Fatalf("home/scratch options = %q / %q", opts.Home, opts.ScratchDir)
 	}
 	if opts.SeedFiles["opencode.json"] != `{"provider":{}}` {
 		t.Fatalf("seed files = %#v", opts.SeedFiles)

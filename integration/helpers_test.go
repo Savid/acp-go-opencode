@@ -241,7 +241,7 @@ func startLiveAgent(t *testing.T, ctx context.Context, home string, extraArgs ..
 	t.Helper()
 	args := []string{
 		"-path", integrationOpenCodePath(t),
-		"-home", home,
+		"-scratch-dir", home,
 		"-opencode-pure",
 		"-opencode-health-timeout", "60s",
 	}

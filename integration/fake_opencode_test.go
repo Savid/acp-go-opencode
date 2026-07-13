@@ -154,7 +154,7 @@ func startAgentWithOpenCodePath(t *testing.T, ctx context.Context, opencodePath 
 	t.Helper()
 	cmd := agentCommand(ctx,
 		"-path", opencodePath,
-		"-home", home,
+		"-scratch-dir", home,
 		"-opencode-pure",
 		"-opencode-health-timeout", "5s",
 	)

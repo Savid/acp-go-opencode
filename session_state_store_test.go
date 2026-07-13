@@ -128,7 +128,7 @@ func TestStateStoreArchiveRoundTripAndHelpers(t *testing.T) {
 			t.Fatalf("write %s: %v", path, err)
 		}
 	}
-	archive, sha, err := encodeXDGArchive(root)
+	archive, sha, err := encodeXDGArchive(root, t.TempDir())
 	if err != nil {
 		t.Fatalf("encodeXDGArchive: %v", err)
 	}
@@ -289,10 +289,10 @@ func TestSnapshotToStoreNilClientAndFileSQLiteErrors(t *testing.T) {
 	if err := (&session{agent: NewAgent(), client: nil}).snapshotToStore(context.Background()); err != nil {
 		t.Fatalf("nil client snapshot: %v", err)
 	}
-	if _, _, err := encodeXDGArchive(filepath.Join(t.TempDir(), "missing")); err == nil {
+	if _, _, err := encodeXDGArchive(filepath.Join(t.TempDir(), "missing"), t.TempDir()); err == nil {
 		t.Fatal("encodeXDGArchive accepted missing root")
 	}
-	if _, ok, err := sqliteArchiveContent(filepath.Join(t.TempDir(), "missing.db")); err == nil || ok {
+	if _, ok, err := sqliteArchiveContent(filepath.Join(t.TempDir(), "missing.db"), t.TempDir()); err == nil || ok {
 		t.Fatalf("sqliteArchiveContent missing ok=%v err=%v", ok, err)
 	}
 	short := filepath.Join(t.TempDir(), "short.db")
@@ -366,6 +366,18 @@ func TestSnapshotToStoreMarshalAndArchiveFaults(t *testing.T) {
 		}
 		if err := snapshotFaultSession(t).snapshotToStore(ctx); err == nil {
 			t.Fatal("snapshot ignored archive error")
+		}
+	})
+
+	t.Run("scratch parent error", func(t *testing.T) {
+		session := snapshotFaultSession(t)
+		file := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		session.agent.options.ScratchDir = filepath.Join(file, "child")
+		if err := session.snapshotToStore(ctx); err == nil {
+			t.Fatal("snapshot ignored scratch parent error")
 		}
 	})
 
@@ -491,7 +503,7 @@ func TestEncodeXDGArchiveFaults(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "credential-dir", "secret.txt"), []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	archive, _, err := encodeXDGArchive(root)
+	archive, _, err := encodeXDGArchive(root, t.TempDir())
 	if err != nil {
 		t.Fatalf("encode credential dir: %v", err)
 	}
@@ -519,7 +531,7 @@ func TestEncodeXDGArchiveFaults(t *testing.T) {
 			stateFileInfoHeader = func(os.FileInfo, string) (*tar.Header, error) { return nil, errors.New("header failed") }
 		},
 		"sqlite content": func() {
-			stateSQLiteArchiveContent = func(string) ([]byte, bool, error) {
+			stateSQLiteArchiveContent = func(string, string) ([]byte, bool, error) {
 				return nil, false, errors.New("sqlite failed")
 			}
 		},
@@ -529,13 +541,13 @@ func TestEncodeXDGArchiveFaults(t *testing.T) {
 			}
 		},
 		"write scrubbed": func() {
-			stateSQLiteArchiveContent = func(string) ([]byte, bool, error) { return []byte("scrubbed"), true, nil }
+			stateSQLiteArchiveContent = func(string, string) ([]byte, bool, error) { return []byte("scrubbed"), true, nil }
 			stateNewTarWriter = func(io.Writer) archiveTarWriter {
 				return fakeTarWriter{writeErr: errors.New("write failed")}
 			}
 		},
 		"open": func() {
-			stateSQLiteArchiveContent = func(string) ([]byte, bool, error) { return nil, false, nil }
+			stateSQLiteArchiveContent = func(string, string) ([]byte, bool, error) { return nil, false, nil }
 			stateOpen = func(string) (io.ReadCloser, error) { return nil, errors.New("open failed") }
 		},
 		"copy": func() {
@@ -571,7 +583,7 @@ func TestEncodeXDGArchiveFaults(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			restoreStateStoreSeams(t)
 			setup()
-			if _, _, err := encodeXDGArchive(root); err == nil {
+			if _, _, err := encodeXDGArchive(root, t.TempDir()); err == nil {
 				t.Fatal("encodeXDGArchive ignored injected error")
 			}
 		})
@@ -719,7 +731,7 @@ func TestSQLiteArchiveAndCopyFaults(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "store.db")
 			seedSQLiteStore(t, dbPath)
 			setup(dbPath)
-			if _, ok, err := sqliteArchiveContent(dbPath); err == nil || ok {
+			if _, ok, err := sqliteArchiveContent(dbPath, t.TempDir()); err == nil || ok {
 				t.Fatal("sqliteArchiveContent ignored injected error")
 			}
 		})

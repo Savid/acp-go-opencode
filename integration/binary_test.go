@@ -18,7 +18,7 @@ func TestOpenCodeACPAgentBinaryClosedInput(t *testing.T) {
 
 	cmd := agentCommand(ctx,
 		"-path", integrationOpenCodePath(t),
-		"-home", t.TempDir(),
+		"-scratch-dir", t.TempDir(),
 		"-opencode-pure",
 		"-opencode-log-level", "INFO",
 	)

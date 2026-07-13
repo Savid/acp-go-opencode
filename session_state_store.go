@@ -181,6 +181,11 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 	replacements := []SessionStoreReplacement{}
 	mainKey := SessionKey{SessionID: string(s.id), Subpath: SessionStoreMainSubpath}
 
+	scratchDir, scratchErr := ensureScratchParent(s.agent.options.ScratchDir)
+	if scratchErr != nil {
+		return scratchErr
+	}
+
 	xdg := snapshot.client.XDGDirs()
 	for _, item := range []struct {
 		name string
@@ -191,7 +196,7 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 		{xdgCacheSubpath, xdg.Cache},
 		{xdgStateSubpath, xdg.State},
 	} {
-		archive, sha, err := encodeXDGArchive(item.dir)
+		archive, sha, err := encodeXDGArchive(item.dir, scratchDir)
 		if err != nil {
 			return err
 		}
@@ -335,7 +340,7 @@ func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID st
 	return idmap, snapshot, true, nil
 }
 
-func encodeXDGArchive(root string) ([]byte, string, error) {
+func encodeXDGArchive(root, scratchParent string) ([]byte, string, error) {
 	var files []string
 
 	if err := stateWalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -405,7 +410,7 @@ func encodeXDGArchive(root string) ([]byte, string, error) {
 		if info.Mode().IsRegular() {
 			var ok bool
 
-			scrubbed, ok, err = stateSQLiteArchiveContent(path)
+			scrubbed, ok, err = stateSQLiteArchiveContent(path, scratchParent)
 			if err != nil {
 				return nil, "", err
 			}
@@ -597,13 +602,13 @@ func shouldSkipSQLiteCompanion(rel string) bool {
 	return strings.HasSuffix(rel, ".db-wal") || strings.HasSuffix(rel, ".db-shm")
 }
 
-func sqliteArchiveContent(path string) ([]byte, bool, error) {
+func sqliteArchiveContent(path, scratchParent string) ([]byte, bool, error) {
 	ok, err := isSQLiteDatabase(path)
 	if err != nil || !ok {
 		return nil, ok, err
 	}
 
-	tempDir, err := stateMkdirTemp("", "acp-go-opencode-sqlite-*")
+	tempDir, err := stateMkdirTemp(scratchParent, "acp-go-opencode-sqlite-*")
 	if err != nil {
 		return nil, false, err
 	}

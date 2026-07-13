@@ -816,13 +816,16 @@ func TestOpenCodeServerReadinessHealthDocAndEventFailures(t *testing.T) {
 			case "/doc":
 				writeJSON(t, w, fullOpenCodeDoc())
 			case "/event":
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(500 * time.Millisecond)
 			default:
 				w.WriteHeader(http.StatusNotFound)
 			}
 		})
 		defer closeServer()
-		shortCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		// The deadline is generous enough that the health and /doc probes always
+		// complete first, so the deadline reliably fires while waiting on the
+		// readiness event rather than during an earlier probe.
+		shortCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
 		if err := client.waitReady(shortCtx, context.Background(), StartOptions{SkipVersionGate: true}); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("event wait error = %v", err)

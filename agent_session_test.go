@@ -13,6 +13,29 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
+func TestNonEmptyHomeRejectedOnEstablishingPaths(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	want := map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: optionFieldHome}
+
+	_, err := NewAgent(WithHome(t.TempDir())).NewSession(ctx, NewSessionRequest(cwd))
+	requireInvalidParamsData(t, err, want)
+
+	_, err = NewAgent(WithHome(t.TempDir())).LoadSession(ctx, LoadSessionRequest("s", cwd))
+	requireInvalidParamsData(t, err, want)
+
+	_, err = NewAgent(WithHome(t.TempDir())).ResumeSession(ctx, ResumeSessionRequest("s", cwd))
+	requireInvalidParamsData(t, err, want)
+
+	parentClient := newFakeOpenCodeClient()
+	parentClient.forkSession = testNativeSession("native-child")
+	parent := testSession(NewAgent(WithHome(t.TempDir())), parentClient)
+	parentAgent := parent.agent
+	parentAgent.sessions[parent.id] = parent
+	_, err = parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd)))
+	requireInvalidParamsData(t, err, want)
+}
+
 func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -30,7 +53,7 @@ func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
 	factoryCalls := 0
 	var permissions []string
 	agent := NewAgent(
-		WithHome(root),
+		WithScratchDir(root),
 		WithSessionStore(store),
 		func(options *Options) {
 			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
@@ -142,7 +165,7 @@ func assertCloseDeleteAndLineage(t *testing.T, ctx context.Context, agent *Agent
 	} else {
 		assertUnknownSessionError(t, err)
 	}
-	if parent.xdg.Root == "" || child.xdg.Root == "" || filepath.Dir(parent.xdg.Root) != root {
+	if parent.xdg.Root == "" || child.xdg.Root == "" || filepath.Dir(parent.xdg.Root) != filepath.Join(root, defaultAgentName) {
 		t.Fatalf("xdg roots parent=%#v child=%#v root=%q", parent.xdg, child.xdg, root)
 	}
 }
@@ -188,7 +211,7 @@ func TestNewSessionForwardsMCPServersToNativeLaunch(t *testing.T) {
 
 	var captured []opencode.MCPServerConfig
 
-	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+	agent := NewAgent(WithScratchDir(t.TempDir()), func(options *Options) {
 		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			captured = opts.MCPServers
 
@@ -320,7 +343,7 @@ func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceClient.xdg = sourceXDG
-	agent := NewAgent(WithHome(root), WithSessionStore(store))
+	agent := NewAgent(WithScratchDir(root), WithSessionStore(store))
 	session := testSession(agent, sourceClient)
 	session.cwd = root
 	if err = session.snapshotToStore(ctx); err != nil {
@@ -360,7 +383,7 @@ func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
 		ID:     "openai",
 		Models: map[string]opencode.ProviderModel{"other": {ID: "other"}},
 	}}}
-	invalidAgent := NewAgent(WithHome(root), WithSessionStore(store), func(options *Options) {
+	invalidAgent := NewAgent(WithScratchDir(root), WithSessionStore(store), func(options *Options) {
 		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			invalidClient.xdg = opts.ExistingXDG
 
@@ -465,7 +488,7 @@ func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceClient.xdg = sourceXDG
-	seedAgent := NewAgent(WithHome(root), WithSessionStore(store))
+	seedAgent := NewAgent(WithScratchDir(root), WithSessionStore(store))
 	seed := testSession(seedAgent, sourceClient)
 	seed.cwd = cwd
 	if err = seed.snapshotToStore(ctx); err != nil {
@@ -476,7 +499,7 @@ func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
 	loadedClient.getSession = testNativeSession("native-1")
 	loadedClient.providers = testProviders()
 	loadedClient.agents = []opencode.NativeAgent{{Name: "build"}}
-	loadAgent := NewAgent(WithHome(root), WithSessionStore(store), func(options *Options) {
+	loadAgent := NewAgent(WithScratchDir(root), WithSessionStore(store), func(options *Options) {
 		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			loadedClient.xdg = opts.ExistingXDG
 
@@ -492,7 +515,7 @@ func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
 
 	getErrClient := newFakeOpenCodeClient()
 	getErrClient.getErr = errors.New("get failed")
-	getErrAgent := NewAgent(WithHome(root), WithSessionStore(store), func(options *Options) {
+	getErrAgent := NewAgent(WithScratchDir(root), WithSessionStore(store), func(options *Options) {
 		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
 			getErrClient.xdg = opts.ExistingXDG
 
@@ -710,8 +733,8 @@ func assertNewLoadForkErrorBranches(t *testing.T, ctx context.Context, cwd strin
 	if _, err = closed.ResumeSession(ctx, ResumeSessionRequest("session-1", cwd)); err == nil {
 		t.Fatal("closed agent resumed session")
 	}
-	if _, err = NewAgent(WithHome(string([]byte{0}))).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
-		t.Fatal("invalid home root did not fail load")
+	if _, err = NewAgent(WithScratchDir(string([]byte{0}))).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
+		t.Fatal("invalid scratch root did not fail load")
 	}
 	if _, err = NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("load failed")})).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
 		t.Fatal("hydrate store error was ignored")
@@ -719,11 +742,11 @@ func assertNewLoadForkErrorBranches(t *testing.T, ctx context.Context, cwd strin
 
 	parentClient := newFakeOpenCodeClient()
 	parentClient.forkSession = testNativeSession("native-child")
-	parent := testSession(NewAgent(WithHome(string([]byte{0}))), parentClient)
+	parent := testSession(NewAgent(WithScratchDir(string([]byte{0}))), parentClient)
 	parentAgent := parent.agent
 	parentAgent.sessions[parent.id] = parent
 	if _, err = parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
-		t.Fatal("invalid fork home root did not fail")
+		t.Fatal("invalid fork scratch root did not fail")
 	}
 	if _, err = NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMCPServers(acp.McpServer{Sse: &acp.McpServerSseInline{Name: "sse"}})))); err == nil {
 		t.Fatal("unstable fork accepted SSE MCP")
@@ -740,7 +763,7 @@ func assertNewLoadForkErrorBranches(t *testing.T, ctx context.Context, cwd strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = copyXDGDirs(missingSource, validTarget); err == nil {
+	if err = copyXDGDirs(missingSource, validTarget, t.TempDir()); err == nil {
 		t.Fatal("copyXDGDirs accepted missing source")
 	}
 	restoreStateStoreSeams(t)
@@ -749,7 +772,7 @@ func assertNewLoadForkErrorBranches(t *testing.T, ctx context.Context, cwd strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = copyXDGDirs(validSource, validTarget); err == nil {
+	if err = copyXDGDirs(validSource, validTarget, t.TempDir()); err == nil {
 		t.Fatal("copyXDGDirs ignored decode error")
 	}
 }
@@ -878,7 +901,7 @@ func TestAgentRemainingLifecycleBranches(t *testing.T) {
 		root := t.TempDir()
 		for _, name := range []string{"list", "load", "resume", "delete"} {
 			t.Run(name, func(t *testing.T) {
-				agent := NewAgent(WithHome(root))
+				agent := NewAgent(WithScratchDir(root))
 				xdg, err := opencode.CreateXDGDirs(root, name)
 				if err != nil {
 					t.Fatal(err)
@@ -1049,14 +1072,14 @@ func testForkErrorBranches(t *testing.T, ctx context.Context, cwd string) {
 
 func testDeletedCleanupHelperBranches(t *testing.T, ctx context.Context, cwd string) {
 	t.Helper()
-	agent := NewAgent(WithHome(t.TempDir()))
+	agent := NewAgent(WithScratchDir(t.TempDir()))
 	agent.rememberDeleteCleanup(deleteCleanupRecord{})
 	if len(agent.deleteCleanup) != 0 {
 		t.Fatalf("empty cleanup record was remembered: %#v", agent.deleteCleanup)
 	}
 	agent.forgetDeleteCleanupIfDone("")
 
-	xdg, err := opencode.CreateXDGDirs(agent.options.Home, "keep")
+	xdg, err := opencode.CreateXDGDirs(agent.homeRoot(), "keep")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1078,8 +1101,8 @@ func testDeletedCleanupHelperBranches(t *testing.T, ctx context.Context, cwd str
 	}
 	for _, name := range []string{"list", "load", "delete"} {
 		t.Run("entrypoint retry error "+name, func(t *testing.T) {
-			entryAgent := NewAgent(WithHome(t.TempDir()))
-			entryXDG, err := opencode.CreateXDGDirs(entryAgent.options.Home, name)
+			entryAgent := NewAgent(WithScratchDir(t.TempDir()))
+			entryXDG, err := opencode.CreateXDGDirs(entryAgent.homeRoot(), name)
 			if err != nil {
 				t.Fatal(err)
 			}

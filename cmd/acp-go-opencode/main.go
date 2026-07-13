@@ -30,7 +30,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags.SetOutput(stderr)
 
 	opencodePath := flags.String("path", "", "path to opencode CLI")
-	opencodeHome := flags.String("home", "", "parent root for isolated OpenCode session state")
+	opencodeHome := flags.String("home", "", "unsupported: OpenCode has no native config or auth root; a non-empty value is rejected per session")
+	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
 	model := flags.String("model", "", "default OpenCode model as provider/model")
 	debug := flags.Bool("debug", false, "write debug logs to stderr")
 	printVersion := flags.Bool("version", false, "print adapter version and exit")
@@ -79,12 +80,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 
 	logger = telemetry.logger
 
-	opts := make([]opencodeacp.Option, 0, 9+len(telemetry.options))
+	opts := make([]opencodeacp.Option, 0, 10+len(telemetry.options))
 
 	opts = append(opts,
 		opencodeacp.WithAgentVersion(version),
 		opencodeacp.WithExecutablePath(*opencodePath),
 		opencodeacp.WithHome(*opencodeHome),
+		opencodeacp.WithScratchDir(*scratchDir),
 		opencodeacp.WithDefaultModel(*model),
 		opencodeacp.WithLogger(logger),
 		opencodeacp.WithOpenCodePure(*pure),

@@ -23,6 +23,10 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
+	if err := a.rejectHomeOption(); err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+
 	if err := validateSessionStartPaths(params.Cwd, params.AdditionalDirectories); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -155,6 +159,10 @@ func (a *Agent) loadOrResumeSession(
 	metaMap map[string]any,
 ) (*session, error) {
 	if err := a.ensureOpen(); err != nil {
+		return nil, err
+	}
+
+	if err := a.rejectHomeOption(); err != nil {
 		return nil, err
 	}
 
@@ -407,6 +415,10 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
 	ctx = a.observe.Extract(ctx, params.Meta)
+	if err := a.rejectHomeOption(); err != nil {
+		return acp.UnstableForkSessionResponse{}, err
+	}
+
 	if err := validateSessionStartPaths(params.Cwd, params.AdditionalDirectories); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -444,7 +456,9 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		return acp.UnstableForkSessionResponse{}, err
 	}
 
-	if copyErr := copyXDGDirs(parentSnapshot.client.XDGDirs(), xdg); copyErr != nil {
+	// CreateXDGDirs above already materialized the scratch parent (0700) as an
+	// ancestor of the new session home, so the resolver suffices here.
+	if copyErr := copyXDGDirs(parentSnapshot.client.XDGDirs(), xdg, scratchParent(a.options.ScratchDir)); copyErr != nil {
 		return acp.UnstableForkSessionResponse{}, copyErr
 	}
 
@@ -604,6 +618,7 @@ func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd str
 	return factory(ctx, opencode.StartOptions{
 		ACPSessionID:   opencode.ACPSessionID(id),
 		Root:           a.homeRoot(),
+		ScratchParent:  scratchParent(a.options.ScratchDir),
 		Cwd:            cwd,
 		ExecutablePath: a.options.ExecutablePath,
 		DefaultModel:   firstNonEmpty(meta.Model, a.options.DefaultModel),
@@ -714,12 +729,22 @@ func (a *Agent) cleanupDeletedSession(record deleteCleanupRecord) error {
 	return os.RemoveAll(record.XDGRoot)
 }
 
+// homeRoot returns the parent directory under which per-session XDG homes are
+// created. OpenCode has no native config or auth root, so this always resolves
+// under the ephemeral scratch parent, keeping the stable adapter-named subtree.
 func (a *Agent) homeRoot() string {
+	return filepath.Join(scratchParent(a.options.ScratchDir), defaultAgentName)
+}
+
+// rejectHomeOption enforces the isolation contract: OpenCode exposes no native
+// config or auth root, so a non-empty Home is rejected with the uniform
+// unsupported-option error at the top of every session-establishing path.
+func (a *Agent) rejectHomeOption() error {
 	if a.options.Home != "" {
-		return a.options.Home
+		return unsupportedField(optionFieldHome)
 	}
 
-	return filepath.Join(os.TempDir(), defaultAgentName)
+	return nil
 }
 
 func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
@@ -759,7 +784,7 @@ func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
 	return nil
 }
 
-func copyXDGDirs(source opencode.XDGDirs, target opencode.XDGDirs) error {
+func copyXDGDirs(source opencode.XDGDirs, target opencode.XDGDirs, scratchParent string) error {
 	for _, item := range []struct {
 		src string
 		dst string
@@ -769,7 +794,7 @@ func copyXDGDirs(source opencode.XDGDirs, target opencode.XDGDirs) error {
 		{source.Cache, target.Cache},
 		{source.State, target.State},
 	} {
-		data, _, err := encodeXDGArchive(item.src)
+		data, _, err := encodeXDGArchive(item.src, scratchParent)
 		if err != nil {
 			return err
 		}

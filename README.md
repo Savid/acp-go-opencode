@@ -83,16 +83,17 @@ func main() {
 ```
 
 See the [Go API reference](https://pkg.go.dev/github.com/savid/acp-go-opencode)
-for options such as the OpenCode executable path, the isolated home root,
-default model, environment overrides, session storage, and OpenTelemetry
-providers.
+for options such as the OpenCode executable path, the ephemeral scratch
+directory, default model, environment overrides, session storage, and
+OpenTelemetry providers.
 
 ## What It Provides
 
 - ACP session lifecycle: create, prompt, cancel, close, list, load, resume, and
   fork.
 - One isolated `opencode serve` process per session, with per-session XDG data,
-  config, cache, and state directories under a configurable home.
+  config, cache, and state directories under a configurable scratch directory
+  (`-scratch-dir` / `WithScratchDir`, defaulting to the system temp directory).
 - Native OpenCode REST calls and an SSE event stream mapped to ACP prompt
   streaming for messages, reasoning, plans, tool calls, usage, and session
   metadata.
@@ -141,7 +142,7 @@ local authenticated `opencode` CLI. `make test-integration-smoke` sets
 `make test-integration-live` additionally sets `ACP_GO_OPENCODE_RUN_LIVE_TOKENS=1`
 and may spend model tokens; `make test-integration-cover` runs the smoke suite
 against a coverage-instrumented binary. Live tests always launch OpenCode under
-an isolated per-session home.
+an isolated per-session scratch directory.
 
 ## License
 

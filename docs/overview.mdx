@@ -21,7 +21,7 @@ resolution, and `opencode-state-v1` session storage.
 
 Each session is fully isolated: its own `opencode serve` process bound to
 `127.0.0.1`, its own random basic-auth password, and its own XDG data, config,
-cache, and state directories under a configurable home root.
+cache, and state directories under a configurable scratch directory (`-scratch-dir` / `WithScratchDir`, defaulting to the system temp directory).
 
 ## What the adapter does not own
 

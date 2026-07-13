@@ -117,7 +117,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	cwd := flags.String("cwd", "", "session cwd; defaults to the JSONL cwd or current directory")
 	prompt := flags.String("prompt", defaultPrompt, "prompt to send after loading history")
 	opencodePath := flags.String("path", "", "path to opencode CLI")
-	opencodeHome := flags.String("home", "", "parent root for isolated OpenCode session state")
+	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
 
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -155,7 +155,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return err
 	}
 
-	return runLoaded(ctx, store, *sessionID, *cwd, *prompt, *opencodePath, *opencodeHome, stdout)
+	return runLoaded(ctx, store, *sessionID, *cwd, *prompt, *opencodePath, *scratchDir, stdout)
 }
 
 func runLoadedSession(
@@ -165,7 +165,7 @@ func runLoadedSession(
 	cwd string,
 	prompt string,
 	opencodePath string,
-	opencodeHome string,
+	scratchDir string,
 	stdout io.Writer,
 ) error {
 	clientInput, agentOutput := io.Pipe()
@@ -188,7 +188,7 @@ func runLoadedSession(
 			agentInput,
 			agentOutput,
 			opencodeacp.WithExecutablePath(opencodePath),
-			opencodeacp.WithHome(opencodeHome),
+			opencodeacp.WithScratchDir(scratchDir),
 			opencodeacp.WithSessionStore(store),
 			opencodeacp.WithLogger(slog.New(slog.DiscardHandler)),
 		)

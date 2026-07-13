@@ -54,6 +54,7 @@ func TestRunServeSuccessAndError(t *testing.T) {
 	if code := run(context.Background(), []string{
 		"-path", "opencode",
 		"-home", "/tmp/home",
+		"-scratch-dir", "/tmp/scratch",
 		"-model", "openai/gpt-test",
 		"-debug",
 		"-opencode-pure",

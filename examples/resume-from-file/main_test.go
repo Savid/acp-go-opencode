@@ -64,10 +64,10 @@ func TestRunUsesInferredValuesAndLoadedSession(t *testing.T) {
 	expectedCwd := cwd
 	expectedPrompt := "prompt"
 	expectedPath := "/bin/opencode"
-	expectedHome := "/home/opencode"
-	runLoaded = func(_ context.Context, store opencodeacp.SessionStore, sessionID string, gotCwd string, prompt string, opencodePath string, opencodeHome string, stdout io.Writer) error {
-		if sessionID != expectedSessionID || gotCwd != expectedCwd || prompt != expectedPrompt || opencodePath != expectedPath || opencodeHome != expectedHome {
-			t.Fatalf("runLoaded args sessionID=%q cwd=%q prompt=%q path=%q home=%q", sessionID, gotCwd, prompt, opencodePath, opencodeHome)
+	expectedScratch := "/tmp/opencode-scratch"
+	runLoaded = func(_ context.Context, store opencodeacp.SessionStore, sessionID string, gotCwd string, prompt string, opencodePath string, scratchDir string, stdout io.Writer) error {
+		if sessionID != expectedSessionID || gotCwd != expectedCwd || prompt != expectedPrompt || opencodePath != expectedPath || scratchDir != expectedScratch {
+			t.Fatalf("runLoaded args sessionID=%q cwd=%q prompt=%q path=%q scratch=%q", sessionID, gotCwd, prompt, opencodePath, scratchDir)
 		}
 		entries, err := store.Load(context.Background(), opencodeacp.SessionKey{SessionID: sessionID})
 		if err != nil || len(entries) != 2 {
@@ -80,7 +80,7 @@ func TestRunUsesInferredValuesAndLoadedSession(t *testing.T) {
 	t.Cleanup(func() { runLoaded = previousRunLoaded })
 
 	var stdout bytes.Buffer
-	if err := run(context.Background(), []string{"-file", path, "-prompt", "prompt", "-path", "/bin/opencode", "-home", "/home/opencode"}, &stdout, io.Discard); err != nil {
+	if err := run(context.Background(), []string{"-file", path, "-prompt", "prompt", "-path", "/bin/opencode", "-scratch-dir", "/tmp/opencode-scratch"}, &stdout, io.Discard); err != nil {
 		t.Fatalf("run returned error: %v", err)
 	}
 	if stdout.String() != "loaded" {
@@ -91,7 +91,7 @@ func TestRunUsesInferredValuesAndLoadedSession(t *testing.T) {
 	expectedSessionID = "explicit"
 	expectedPrompt = defaultPrompt
 	expectedPath = ""
-	expectedHome = ""
+	expectedScratch = ""
 	if err := run(context.Background(), []string{"-file", path, "-session", "explicit", "-cwd", cwd}, &stdout, io.Discard); err != nil {
 		t.Fatalf("run with explicit flags returned error: %v", err)
 	}

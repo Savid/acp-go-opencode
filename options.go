@@ -13,6 +13,10 @@ import (
 
 const defaultAgentName = "acp-go-opencode"
 
+// optionFieldHome names the rejected Home option in uniform unsupported-option
+// errors returned from session-establishing requests.
+const optionFieldHome = "home"
+
 // Option configures the OpenCode ACP agent.
 type Option func(*Options)
 
@@ -29,9 +33,16 @@ type Options struct {
 	AgentVersion string
 
 	ExecutablePath string
-	Home           string
-	DefaultModel   string
-	Env            map[string]string
+	// Home is unsupported: OpenCode has no native config or auth root, so a
+	// non-empty value is rejected on every session-establishing request. Use
+	// ScratchDir instead.
+	Home string
+	// ScratchDir is the sole parent for all ephemeral on-disk materialization
+	// (per-session isolated homes, sqlite temp directories, probe dirs). Empty
+	// means the system temporary directory.
+	ScratchDir   string
+	DefaultModel string
+	Env          map[string]string
 
 	Logger            *slog.Logger
 	TracerProvider    trace.TracerProvider
@@ -100,11 +111,24 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
-// WithHome sets the parent root under which isolated per-session OpenCode XDG
-// data, config, cache, and state directories are created.
+// WithHome is unsupported. OpenCode has no native config or auth root for the
+// adapter to point at, so a non-empty Home is rejected with the uniform
+// unsupported-option error on every session-establishing request. Use
+// WithScratchDir to control where ephemeral per-session state is materialized.
 func WithHome(path string) Option {
 	return func(options *Options) {
 		options.Home = path
+	}
+}
+
+// WithScratchDir sets the parent directory for all ephemeral on-disk
+// materialization: the isolated per-session OpenCode XDG homes, sqlite temp
+// directories used while snapshotting native state, and any probe directories.
+// An empty value (the default) uses the system temporary directory. The parent
+// is created with 0700 permissions when missing.
+func WithScratchDir(dir string) Option {
+	return func(options *Options) {
+		options.ScratchDir = dir
 	}
 }
 

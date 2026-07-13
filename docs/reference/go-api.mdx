@@ -23,7 +23,8 @@ agent when you need a reference first. Both take the same `Option` values.
 | Option | Purpose |
 |---|---|
 | `WithExecutablePath` | Path to the `opencode` binary. |
-| `WithHome` | Parent root for per-session XDG directories. |
+| `WithScratchDir` | Parent directory for all ephemeral per-session scratch (isolated XDG homes, sqlite temp dirs); empty uses the system temp directory. |
+| `WithHome` | Unsupported. OpenCode has no native config or auth root, so any non-empty value is rejected on every session-establishing request; use `WithScratchDir` instead. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
 | `WithEnv` | Environment overrides for the native process. |
 | `WithSeedFiles` | Files written into each session's config root before launch. |

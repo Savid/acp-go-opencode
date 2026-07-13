@@ -15,7 +15,8 @@ diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 | Flag | Meaning | Default |
 |---|---|---|
 | `-path` | Path to the `opencode` CLI. | resolved from `PATH` |
-| `-home` | Parent root for isolated per-session OpenCode state. | — |
+| `-scratch-dir` | Parent directory for ephemeral per-session scratch (isolated homes, sqlite temp dirs). | system temp directory |
+| `-home` | Unsupported. OpenCode has no native config or auth root, so any non-empty value is rejected on every session-establishing request; use `-scratch-dir` instead. | — |
 | `-model` | Default model as `provider/model`. | — |
 | `-debug` | Write debug logs to stderr. | off |
 | `-version` | Print the adapter version and exit. | — |

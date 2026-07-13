@@ -5,7 +5,7 @@ description: The mental model behind an ACP session, its isolated OpenCode proce
 
 An ACP session is the unit of isolation. Each session owns exactly one
 `opencode serve` process and its own set of four XDG directories — data, config,
-cache, and state — created under the configured home root. Two sessions never
+cache, and state — created under the configured scratch directory. Two sessions never
 share a process or a state directory, so their native histories, credentials at
 rest, and running work stay separate.
 
