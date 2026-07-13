@@ -21,6 +21,19 @@ Native part events map onto ACP update variants:
 | Todos | `plan` |
 | Token totals | `usage_update` |
 
+OpenCode text and reasoning part events carry the complete part plus, on live
+updates, an explicit appended `delta`. The adapter forwards that delta and
+reconciles the final REST response against what was already delivered, so a
+metadata-only part change never repeats text. A final non-append rewrite cannot
+be represented by ACP chunk updates; it is diagnosed without logging content
+and is not appended as corrupt duplicate text.
+
+Each native tool part produces exactly one `tool_call`. Later pending,
+in-progress, completed, or failed states for the same call produce
+`tool_call_update`; failed states preserve the native error in `rawOutput`.
+Identical message-level and step-level token snapshots produce one
+`usage_update`, while a changed snapshot still produces a later update.
+
 The native stream also echoes the just-posted user message back as part events.
 During a live turn those are suppressed — the client already owns that content,
 so only agent output streams back. The suppression is turn-local: user messages

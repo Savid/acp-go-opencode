@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,7 @@ const (
 
 	fieldPrompt        = "prompt"
 	partTypeText       = "text"
+	partTypeReasoning  = "reasoning"
 	partTypeFile       = "file"
 	partTypeTool       = "tool"
 	partTypeStepFinish = "step-finish"
@@ -58,6 +60,7 @@ const (
 	toolNameRead          = "read"
 	toolNameEdit          = "edit"
 	toolNameDelete        = "delete"
+	toolNameBash          = "bash"
 	priorityHigh          = "high"
 	priorityLow           = "low"
 )
@@ -758,31 +761,22 @@ func (s *session) emitMessage(ctx context.Context, message opencode.NativeMessag
 
 	for i := range message.Parts {
 		part := &message.Parts[i]
-		if !s.markPart(*part) {
-			continue
-		}
-
-		for _, update := range partUpdates(message.Info.Role, *part) {
-			if err := s.emitUpdate(ctx, update); err != nil {
-				return err
-			}
+		if err := s.emitPartUpdates(ctx, message.Info.Role, *part, ""); err != nil {
+			return err
 		}
 
 		if part.Type == partTypeStepFinish {
 			size := s.contextWindow(ctx, message.Info.ProviderID, message.Info.ModelID)
-			if update := usageUpdateFromTokens(part.MessageID, part.Tokens, size); update != nil {
-				if err := s.emitUpdate(ctx, *update); err != nil {
-					return err
-				}
+			if err := s.emitUsageUpdate(ctx, part.MessageID, part.Tokens, size); err != nil {
+				return err
 			}
 		}
 	}
 
 	if message.Info.Tokens.Total > 0 {
 		size := s.contextWindow(ctx, message.Info.ProviderID, message.Info.ModelID)
-		if update := usageUpdateFromTokens(message.Info.ID, message.Info.Tokens, size); update != nil {
-			return s.emitUpdate(ctx, *update)
-		}
+
+		return s.emitUsageUpdate(ctx, message.Info.ID, message.Info.Tokens, size)
 	}
 
 	return nil
@@ -810,69 +804,267 @@ func (s *session) validateNativeMessageSession(ctx context.Context, message open
 	return nil
 }
 
-func partUpdates(role string, part opencode.NativePart) []acp.SessionUpdate {
+type emittedToolState struct {
+	status    acp.ToolCallStatus
+	title     string
+	input     any
+	output    any
+	hasInput  bool
+	hasOutput bool
+}
+
+type emittedUsageState struct {
+	used int
+	size int
+}
+
+type nativeToolState struct {
+	status    acp.ToolCallStatus
+	title     string
+	input     any
+	output    any
+	hasInput  bool
+	hasOutput bool
+}
+
+func (s *session) emitPartUpdates(
+	ctx context.Context,
+	role string,
+	part opencode.NativePart,
+	nativeDelta string,
+) error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	updates, commit := s.partUpdates(role, part, nativeDelta)
+	for _, update := range updates {
+		if err := s.emitUpdate(ctx, update); err != nil {
+			return err
+		}
+	}
+
+	if commit != nil {
+		commit()
+	}
+
+	return nil
+}
+
+func (s *session) partUpdates(
+	role string,
+	part opencode.NativePart,
+	nativeDelta string,
+) ([]acp.SessionUpdate, func()) {
 	messageID := part.MessageID
 	switch part.Type {
 	case partTypeText:
-		if part.Text == "" {
-			return nil
+		text, commit := s.partTextDelta(part, nativeDelta)
+		if text == "" {
+			return nil, commit
 		}
 
 		if role == roleUser {
 			return []acp.SessionUpdate{{UserMessageChunk: &acp.SessionUpdateUserMessageChunk{
 				SessionUpdate: "user_message_chunk",
 				MessageId:     &messageID,
-				Content:       acp.TextBlock(part.Text),
-			}}}
+				Content:       acp.TextBlock(text),
+			}}}, commit
 		}
 
 		return []acp.SessionUpdate{{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
 			SessionUpdate: "agent_message_chunk",
 			MessageId:     &messageID,
-			Content:       acp.TextBlock(part.Text),
-		}}}
-	case "reasoning":
-		if part.Text == "" {
-			return nil
+			Content:       acp.TextBlock(text),
+		}}}, commit
+	case partTypeReasoning:
+		text, commit := s.partTextDelta(part, nativeDelta)
+		if text == "" {
+			return nil, commit
 		}
 
 		return []acp.SessionUpdate{{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
 			SessionUpdate: "agent_thought_chunk",
 			MessageId:     &messageID,
-			Content:       acp.TextBlock(part.Text),
-		}}}
+			Content:       acp.TextBlock(text),
+		}}}, commit
 	case partTypeTool:
-		return toolPartUpdates(part)
+		return s.toolPartUpdates(part)
 	default:
-		return nil
+		return nil, nil
 	}
 }
 
-func toolPartUpdates(part opencode.NativePart) []acp.SessionUpdate {
-	id := acp.ToolCallId(firstNonEmpty(part.CallID, part.ID, "opencode-tool"))
-	title := firstNonEmpty(part.Tool, string(id))
-	status := acp.ToolCallStatusInProgress
+func (s *session) partTextDelta(part opencode.NativePart, nativeDelta string) (string, func()) {
+	if part.ID == "" {
+		return firstNonEmpty(part.Text, nativeDelta), nil
+	}
 
-	if len(part.State) > 0 {
-		var state map[string]any
-
-		_ = json.Unmarshal(part.State, &state)
-		if stateStatus, _ := state["status"].(string); stateStatus != "" {
-			status = toolStatus(stateStatus)
+	previous := s.emittedPartText[part.ID]
+	if part.Text == "" {
+		if nativeDelta == "" {
+			return "", nil
 		}
 
-		if titleValue, _ := state[jsonFieldTitle].(string); titleValue != "" {
-			title = titleValue
+		next := previous + nativeDelta
+
+		return nativeDelta, func() { s.emittedPartText[part.ID] = next }
+	}
+
+	if part.Text == previous {
+		return "", nil
+	}
+
+	if previous == "" {
+		return part.Text, func() { s.emittedPartText[part.ID] = part.Text }
+	}
+
+	if strings.HasPrefix(part.Text, previous) {
+		return part.Text[len(previous):], func() { s.emittedPartText[part.ID] = part.Text }
+	}
+
+	if strings.HasPrefix(previous, part.Text) {
+		return "", nil
+	}
+
+	s.logNonAppendPartRewrite(part, len(previous))
+
+	return "", nil
+}
+
+func (s *session) logNonAppendPartRewrite(part opencode.NativePart, previousLength int) {
+	if s.agent == nil || s.agent.log == nil {
+		return
+	}
+
+	s.agent.log.Debug("ignored non-append OpenCode part rewrite",
+		slog.String("session_id", string(s.id)),
+		slog.String("part_id", part.ID),
+		slog.String("part_type", part.Type),
+		slog.Int("previous_length", previousLength),
+		slog.Int("current_length", len(part.Text)),
+	)
+}
+
+func (s *session) toolPartUpdates(part opencode.NativePart) ([]acp.SessionUpdate, func()) {
+	id := acp.ToolCallId(firstNonEmpty(part.CallID, part.ID, "opencode-tool"))
+	current := nativeToolPartState(part, id)
+
+	previous, seen := s.emittedTools[string(id)]
+	if !seen {
+		opts := []acp.ToolCallStartOpt{
+			acp.WithStartKind(toolKind(part.Tool)),
+			acp.WithStartStatus(current.status),
+		}
+		if current.hasInput {
+			opts = append(opts, acp.WithStartRawInput(current.input))
+		}
+
+		if current.hasOutput {
+			opts = append(opts, acp.WithStartRawOutput(current.output))
+		}
+
+		return []acp.SessionUpdate{acp.StartToolCall(id, current.title, opts...)}, func() {
+			s.emittedTools[string(id)] = emittedToolState(current)
 		}
 	}
 
-	return []acp.SessionUpdate{acp.StartToolCall(
-		id,
-		title,
-		acp.WithStartKind(toolKind(part.Tool)),
-		acp.WithStartStatus(status),
-		acp.WithStartRawInput(part.Raw),
-	)}
+	if current.status != previous.status && !toolStatusCanAdvance(previous.status, current.status) {
+		return nil, nil
+	}
+
+	next := previous
+	opts := make([]acp.ToolCallUpdateOpt, 0, 4)
+
+	if toolStatusCanAdvance(previous.status, current.status) && current.status != previous.status {
+		next.status = current.status
+		opts = append(opts, acp.WithUpdateStatus(current.status))
+	}
+
+	if current.title != previous.title {
+		next.title = current.title
+		opts = append(opts, acp.WithUpdateTitle(current.title))
+	}
+
+	if current.hasInput && (!previous.hasInput || !reflect.DeepEqual(current.input, previous.input)) {
+		next.input = current.input
+		next.hasInput = true
+
+		opts = append(opts, acp.WithUpdateRawInput(current.input))
+	}
+
+	if current.hasOutput && (!previous.hasOutput || !reflect.DeepEqual(current.output, previous.output)) {
+		next.output = current.output
+		next.hasOutput = true
+
+		opts = append(opts, acp.WithUpdateRawOutput(current.output))
+	}
+
+	if len(opts) == 0 {
+		return nil, nil
+	}
+
+	return []acp.SessionUpdate{acp.UpdateToolCall(id, opts...)}, func() {
+		s.emittedTools[string(id)] = next
+	}
+}
+
+func nativeToolPartState(part opencode.NativePart, id acp.ToolCallId) nativeToolState {
+	state := nativeToolState{
+		status: acp.ToolCallStatusInProgress,
+		title:  firstNonEmpty(part.Tool, string(id)),
+	}
+	if len(part.State) == 0 {
+		return state
+	}
+
+	var values map[string]any
+	if json.Unmarshal(part.State, &values) != nil {
+		return state
+	}
+
+	if value, _ := values["status"].(string); value != "" {
+		state.status = toolStatus(value)
+	}
+
+	if value, _ := values[jsonFieldTitle].(string); value != "" {
+		state.title = value
+	}
+
+	state.input, state.hasInput = values["input"]
+
+	state.output, state.hasOutput = values["output"]
+
+	if failure, ok := values[jsonFieldError]; ok && failure != nil {
+		state.output = map[string]any{jsonFieldError: failure}
+		state.hasOutput = true
+	}
+
+	return state
+}
+
+func toolStatusCanAdvance(previous, current acp.ToolCallStatus) bool {
+	if previous == current {
+		return false
+	}
+
+	if previous == acp.ToolCallStatusCompleted || previous == acp.ToolCallStatusFailed {
+		return false
+	}
+
+	return toolStatusRank(current) >= toolStatusRank(previous)
+}
+
+func toolStatusRank(status acp.ToolCallStatus) int {
+	switch status {
+	case acp.ToolCallStatusPending:
+		return 1
+	case acp.ToolCallStatusInProgress:
+		return 2
+	case acp.ToolCallStatusCompleted, acp.ToolCallStatusFailed:
+		return 3
+	default:
+		return 0
+	}
 }
 
 func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
@@ -918,8 +1110,8 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 			s.recordMessageRole(info)
 		}
 	case eventMessagePartUpdated, eventMessagePartCreated:
-		part, ok := eventPart(event.Properties)
-		if ok && part.SessionID == s.idmap.NativeSessionID && s.markPart(part) {
+		part, delta, ok := eventPartUpdate(event.Properties)
+		if ok && part.SessionID == s.idmap.NativeSessionID {
 			// The native stream echoes the just-posted user message parts; the
 			// ACP client already owns that content, so only non-user parts are
 			// forwarded. Roles arrive via message.updated before any part event.
@@ -929,11 +1121,7 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 
 			s.markActiveMessageID(part.MessageID)
 
-			for _, update := range partUpdates("assistant", part) {
-				if err := s.emitUpdate(ctx, update); err != nil {
-					return err
-				}
-			}
+			return s.emitPartUpdates(ctx, "assistant", part, delta)
 		}
 	case eventQuestionV2Asked, eventQuestionAsked:
 		req, ok := eventQuestion(event.Properties)
@@ -968,19 +1156,26 @@ func eventMessageInfo(data json.RawMessage) (opencode.NativeMessageInfo, bool) {
 }
 
 func eventPart(data json.RawMessage) (opencode.NativePart, bool) {
-	var part opencode.NativePart
-	if err := json.Unmarshal(data, &part); err == nil && part.Type != "" {
-		return part, true
-	}
+	part, _, ok := eventPartUpdate(data)
 
+	return part, ok
+}
+
+func eventPartUpdate(data json.RawMessage) (opencode.NativePart, string, bool) {
 	var wrapper struct {
-		Part opencode.NativePart `json:"part"`
+		Part  opencode.NativePart `json:"part"`
+		Delta string              `json:"delta"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err == nil && wrapper.Part.Type != "" {
-		return wrapper.Part, true
+		return wrapper.Part, wrapper.Delta, true
 	}
 
-	return opencode.NativePart{}, false
+	var part opencode.NativePart
+	if err := json.Unmarshal(data, &part); err == nil && part.Type != "" {
+		return part, "", true
+	}
+
+	return opencode.NativePart{}, "", false
 }
 
 func eventQuestion(data json.RawMessage) (opencode.QuestionRequest, bool) {
@@ -1496,6 +1691,38 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 	return conn.NotifyExtension(ctx, RawEventMethod, capRawEventPayload(payload))
 }
 
+func (s *session) emitUsageUpdate(
+	ctx context.Context,
+	messageID string,
+	tokens opencode.NativeTokens,
+	size int,
+) error {
+	update := usageUpdateFromTokens(messageID, tokens, size)
+	if update == nil || update.UsageUpdate == nil {
+		return nil
+	}
+
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	current := emittedUsageState{used: update.UsageUpdate.Used, size: update.UsageUpdate.Size}
+	if messageID != "" {
+		if previous, ok := s.emittedUsage[messageID]; ok && previous == current {
+			return nil
+		}
+	}
+
+	if err := s.emitUpdate(ctx, *update); err != nil {
+		return err
+	}
+
+	if messageID != "" {
+		s.emittedUsage[messageID] = current
+	}
+
+	return nil
+}
+
 func usageUpdateFromTokens(messageID string, tokens opencode.NativeTokens, size int) *acp.SessionUpdate {
 	used := int(tokens.Total)
 	if used <= 0 {
@@ -1578,7 +1805,7 @@ func toolKind(tool string) acp.ToolKind {
 		return acp.ToolKindMove
 	case "grep", "search", "find":
 		return acp.ToolKindSearch
-	case "bash", "shell", "run":
+	case toolNameBash, "shell", "run":
 		return acp.ToolKindExecute
 	case "fetch", "webfetch":
 		return acp.ToolKindFetch

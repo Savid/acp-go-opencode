@@ -308,7 +308,7 @@ func TestEventMappingMessagePartToolTodoUsageAndRaw(t *testing.T) {
 		t.Fatalf("tool event: %v", err)
 	}
 	if err := session.emitMessage(ctx, opencode.NativeMessage{
-		Info: opencode.NativeMessageInfo{ID: "message-1", SessionID: "native-1", Role: "assistant", Tokens: opencode.NativeTokens{Total: 9}},
+		Info: opencode.NativeMessageInfo{ID: "message-1", SessionID: "native-1", Role: "assistant", Tokens: opencode.NativeTokens{Total: 6}},
 		Parts: []opencode.NativePart{{
 			SessionID: "native-1",
 			MessageID: "message-1",
@@ -319,8 +319,8 @@ func TestEventMappingMessagePartToolTodoUsageAndRaw(t *testing.T) {
 		t.Fatalf("emitMessage: %v", err)
 	}
 
-	if conn.updateCount() != 6 {
-		t.Fatalf("updates = %d, want 6: %#v", conn.updateCount(), conn.updates)
+	if conn.updateCount() != 5 {
+		t.Fatalf("updates = %d, want 5: %#v", conn.updateCount(), conn.updates)
 	}
 	if conn.updates[0].Update.Plan == nil {
 		t.Fatalf("first update = %#v, want plan", conn.updates[0].Update)
@@ -334,12 +334,325 @@ func TestEventMappingMessagePartToolTodoUsageAndRaw(t *testing.T) {
 	if conn.updates[3].Update.ToolCall == nil {
 		t.Fatalf("fourth update = %#v, want tool", conn.updates[3].Update)
 	}
-	if conn.updates[4].Update.UsageUpdate == nil || conn.updates[5].Update.UsageUpdate == nil {
-		t.Fatalf("usage updates missing: %#v", conn.updates)
+	if conn.updates[4].Update.UsageUpdate == nil {
+		t.Fatalf("usage update missing: %#v", conn.updates)
 	}
 	if len(conn.extensions) == 0 || conn.extensions[0].method != RawEventMethod {
 		t.Fatalf("raw events = %#v", conn.extensions)
 	}
+}
+
+func TestPartUpdatesReconcileCumulativeTextAndMetadataEchoes(t *testing.T) {
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	part := opencode.NativePart{
+		ID:        "reasoning-1",
+		MessageID: "message-1",
+		Type:      "reasoning",
+		Text:      "The user",
+	}
+
+	updates := committedPartUpdates(session, "assistant", part, "")
+	if len(updates) != 1 || updates[0].AgentThoughtChunk == nil {
+		t.Fatalf("initial updates = %#v, want one thought chunk", updates)
+	}
+	if got := updates[0].AgentThoughtChunk.Content.Text.Text; got != "The user" {
+		t.Fatalf("initial thought = %q", got)
+	}
+
+	part.Raw = json.RawMessage(`{"id":"reasoning-1","metadata":{"changed":true}}`)
+	metadataUpdates := committedPartUpdates(session, "assistant", part, "")
+	if metadataUpdates != nil {
+		t.Fatalf("metadata-only echo updates = %#v, want nil", metadataUpdates)
+	}
+
+	part.Text = "The user wants"
+	updates = committedPartUpdates(session, "assistant", part, " WRONG")
+	if len(updates) != 1 || updates[0].AgentThoughtChunk == nil {
+		t.Fatalf("cumulative updates = %#v, want one thought chunk", updates)
+	}
+	if got := updates[0].AgentThoughtChunk.Content.Text.Text; got != " wants" {
+		t.Fatalf("cumulative delta = %q, want %q", got, " wants")
+	}
+
+	part.Text = "The user"
+	regressedUpdates := committedPartUpdates(session, "assistant", part, "")
+	if regressedUpdates != nil {
+		t.Fatalf("regressed snapshot updates = %#v, want nil", regressedUpdates)
+	}
+
+	part.Text = "The rewritten user wants"
+	rewrittenUpdates := committedPartUpdates(session, "assistant", part, " replacement")
+	if rewrittenUpdates != nil {
+		t.Fatalf("explicit rewrite delta updates = %#v, want nil", rewrittenUpdates)
+	}
+}
+
+func TestPartUpdatesSuppressRepeatedAndLateExplicitDeltas(t *testing.T) {
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	part := opencode.NativePart{
+		ID:        "reasoning-late",
+		MessageID: "message-late",
+		Type:      partTypeReasoning,
+		Text:      "First",
+	}
+
+	initial := committedPartUpdates(session, "assistant", part, "st")
+	if len(initial) != 1 || initial[0].AgentThoughtChunk == nil {
+		t.Fatalf("initial explicit delta updates = %#v", initial)
+	}
+	if got := initial[0].AgentThoughtChunk.Content.Text.Text; got != "First" {
+		t.Fatalf("initial explicit delta text = %q, want full snapshot", got)
+	}
+
+	part.Text = "First second"
+	live := committedPartUpdates(session, "assistant", part, " second")
+	if len(live) != 1 || live[0].AgentThoughtChunk == nil {
+		t.Fatalf("live explicit delta updates = %#v", live)
+	}
+	if got := live[0].AgentThoughtChunk.Content.Text.Text; got != " second" {
+		t.Fatalf("live explicit delta text = %q", got)
+	}
+
+	repeated := committedPartUpdates(session, "assistant", part, " second")
+	if repeated != nil {
+		t.Fatalf("repeated explicit delta updates = %#v, want nil", repeated)
+	}
+
+	finalPart := part
+	finalPart.Text = "First second final"
+	final := committedPartUpdates(session, "assistant", finalPart, "")
+	if len(final) != 1 || final[0].AgentThoughtChunk == nil {
+		t.Fatalf("final REST reconciliation updates = %#v", final)
+	}
+	if got := final[0].AgentThoughtChunk.Content.Text.Text; got != " final" {
+		t.Fatalf("final REST reconciliation text = %q", got)
+	}
+
+	late := committedPartUpdates(session, "assistant", part, " second")
+	if late != nil {
+		t.Fatalf("late buffered SSE updates = %#v, want nil", late)
+	}
+	if got := session.emittedPartText[part.ID]; got != finalPart.Text {
+		t.Fatalf("late buffered SSE regressed state to %q, want %q", got, finalPart.Text)
+	}
+}
+
+func TestToolPartUpdatesEmitOneStartThenMonotonicUpdates(t *testing.T) {
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	part := opencode.NativePart{
+		ID:        "part-1",
+		CallID:    "call-1",
+		MessageID: "message-1",
+		Type:      partTypeTool,
+		Tool:      "StructuredOutput",
+		State:     json.RawMessage(`{"status":"pending","input":{}}`),
+	}
+
+	updates := committedPartUpdates(session, "assistant", part, "")
+	if len(updates) != 1 || updates[0].ToolCall == nil {
+		t.Fatalf("pending updates = %#v, want one tool start", updates)
+	}
+	if updates[0].ToolCall.Status != acp.ToolCallStatusPending {
+		t.Fatalf("pending status = %q", updates[0].ToolCall.Status)
+	}
+
+	part.State = json.RawMessage(`{"status":"running","input":{"score":100}}`)
+	updates = committedPartUpdates(session, "assistant", part, "")
+	if len(updates) != 1 || updates[0].ToolCallUpdate == nil {
+		t.Fatalf("running updates = %#v, want one tool update", updates)
+	}
+	if updates[0].ToolCallUpdate.Status == nil || *updates[0].ToolCallUpdate.Status != acp.ToolCallStatusInProgress {
+		t.Fatalf("running status = %#v", updates[0].ToolCallUpdate.Status)
+	}
+
+	part.State = json.RawMessage(`{"status":"completed","title":"Structured Output","input":{"score":100},"output":"captured"}`)
+	updates = committedPartUpdates(session, "assistant", part, "")
+	if len(updates) != 1 || updates[0].ToolCallUpdate == nil {
+		t.Fatalf("completed updates = %#v, want one tool update", updates)
+	}
+	if updates[0].ToolCallUpdate.Status == nil || *updates[0].ToolCallUpdate.Status != acp.ToolCallStatusCompleted {
+		t.Fatalf("completed status = %#v", updates[0].ToolCallUpdate.Status)
+	}
+	if got := updates[0].ToolCallUpdate.RawOutput; got != "captured" {
+		t.Fatalf("completed raw output = %#v", got)
+	}
+
+	completedEcho := committedPartUpdates(session, "assistant", part, "")
+	if completedEcho != nil {
+		t.Fatalf("completed echo updates = %#v, want nil", completedEcho)
+	}
+	part.State = json.RawMessage(`{"status":"pending","input":{}}`)
+	regressedTool := committedPartUpdates(session, "assistant", part, "")
+	if regressedTool != nil {
+		t.Fatalf("regressed tool updates = %#v, want nil", regressedTool)
+	}
+}
+
+func TestToolPartUpdatesPreserveFailedErrorOutput(t *testing.T) {
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	part := opencode.NativePart{
+		ID:     "part-failed",
+		CallID: "call-failed",
+		Type:   partTypeTool,
+		Tool:   "bash",
+		State:  json.RawMessage(`{"status":"pending","input":{"command":"false"}}`),
+	}
+	start := committedPartUpdates(session, "assistant", part, "")
+	if len(start) != 1 || start[0].ToolCall == nil {
+		t.Fatalf("failed tool start = %#v", start)
+	}
+
+	part.State = json.RawMessage(`{"status":"running","input":{"command":"false"}}`)
+	running := committedPartUpdates(session, "assistant", part, "")
+	if len(running) != 1 || running[0].ToolCallUpdate == nil {
+		t.Fatalf("failed tool running = %#v", running)
+	}
+
+	part.State = json.RawMessage(`{"status":"error","input":{"command":"false"},"error":"exit status 1"}`)
+	failed := committedPartUpdates(session, "assistant", part, "")
+	if len(failed) != 1 || failed[0].ToolCallUpdate == nil {
+		t.Fatalf("failed tool terminal = %#v", failed)
+	}
+	update := failed[0].ToolCallUpdate
+	if update.Status == nil || *update.Status != acp.ToolCallStatusFailed {
+		t.Fatalf("failed tool status = %#v", update.Status)
+	}
+	if !reflect.DeepEqual(update.RawOutput, map[string]any{"error": "exit status 1"}) {
+		t.Fatalf("failed tool raw output = %#v", update.RawOutput)
+	}
+
+	replaySession := testSession(NewAgent(), newFakeOpenCodeClient())
+	replayed := committedPartUpdates(replaySession, "assistant", part, "")
+	if len(replayed) != 1 || replayed[0].ToolCall == nil {
+		t.Fatalf("replayed failed tool = %#v, want completed start", replayed)
+	}
+	if replayed[0].ToolCall.Status != acp.ToolCallStatusFailed {
+		t.Fatalf("replayed failed status = %q", replayed[0].ToolCall.Status)
+	}
+	if !reflect.DeepEqual(replayed[0].ToolCall.RawOutput, map[string]any{"error": "exit status 1"}) {
+		t.Fatalf("replayed failed raw output = %#v", replayed[0].ToolCall.RawOutput)
+	}
+}
+
+func TestUpdateReconciliationCommitsOnlyAfterDelivery(t *testing.T) {
+	ctx := context.Background()
+	conn := newRecordingAgentClient()
+	conn.updateErr = errors.New("delivery failed")
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	session := testSession(agent, newFakeOpenCodeClient())
+
+	textPart := opencode.NativePart{
+		ID:        "text-retry",
+		MessageID: "message-retry",
+		Type:      partTypeText,
+		Text:      "delivered once",
+	}
+	if err := session.emitPartUpdates(ctx, "assistant", textPart, ""); err == nil {
+		t.Fatal("text delivery unexpectedly succeeded")
+	}
+	if _, ok := session.emittedPartText[textPart.ID]; ok {
+		t.Fatal("failed text delivery committed reconciliation state")
+	}
+	conn.updateErr = nil
+	if err := session.emitPartUpdates(ctx, "assistant", textPart, ""); err != nil {
+		t.Fatalf("text retry: %v", err)
+	}
+	if session.emittedPartText[textPart.ID] != textPart.Text {
+		t.Fatal("successful text retry did not commit reconciliation state")
+	}
+
+	toolPart := opencode.NativePart{
+		ID:     "tool-retry",
+		CallID: "call-retry",
+		Type:   partTypeTool,
+		Tool:   "bash",
+		State:  json.RawMessage(`{"status":"pending","input":{"command":"true"}}`),
+	}
+	conn.updateErr = errors.New("delivery failed")
+	if err := session.emitPartUpdates(ctx, "assistant", toolPart, ""); err == nil {
+		t.Fatal("tool delivery unexpectedly succeeded")
+	}
+	if _, ok := session.emittedTools[toolPart.CallID]; ok {
+		t.Fatal("failed tool delivery committed reconciliation state")
+	}
+	conn.updateErr = nil
+	if err := session.emitPartUpdates(ctx, "assistant", toolPart, ""); err != nil {
+		t.Fatalf("tool retry: %v", err)
+	}
+	lastUpdate := conn.updates[len(conn.updates)-1].Update
+	if lastUpdate.ToolCall == nil || lastUpdate.ToolCallUpdate != nil {
+		t.Fatalf("tool retry = %#v, want tool start", lastUpdate)
+	}
+
+	usageTokens := opencode.NativeTokens{Total: 42}
+	conn.updateErr = errors.New("delivery failed")
+	if err := session.emitUsageUpdate(ctx, "usage-retry", usageTokens, 100); err == nil {
+		t.Fatal("usage delivery unexpectedly succeeded")
+	}
+	if _, ok := session.emittedUsage["usage-retry"]; ok {
+		t.Fatal("failed usage delivery committed reconciliation state")
+	}
+	conn.updateErr = nil
+	if err := session.emitUsageUpdate(ctx, "usage-retry", usageTokens, 100); err != nil {
+		t.Fatalf("usage retry: %v", err)
+	}
+	if _, ok := session.emittedUsage["usage-retry"]; !ok {
+		t.Fatal("successful usage retry did not commit reconciliation state")
+	}
+}
+
+func TestUpdateReconciliationEdgeBranches(t *testing.T) {
+	ctx := context.Background()
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	deltaOnly := opencode.NativePart{
+		ID:        "delta-only",
+		MessageID: "message-delta",
+		Type:      partTypeReasoning,
+	}
+	updates := committedPartUpdates(session, "assistant", deltaOnly, "tail")
+	if len(updates) != 1 || updates[0].AgentThoughtChunk == nil {
+		t.Fatalf("delta-only updates = %#v", updates)
+	}
+	if session.emittedPartText[deltaOnly.ID] != "tail" {
+		t.Fatalf("delta-only committed text = %q", session.emittedPartText[deltaOnly.ID])
+	}
+
+	session.agent = nil
+	session.emittedPartText["rewrite"] = "before"
+	rewrite := opencode.NativePart{ID: "rewrite", Type: partTypeText, Text: "after"}
+	if updates := committedPartUpdates(session, "assistant", rewrite, ""); updates != nil {
+		t.Fatalf("rewrite without logger updates = %#v", updates)
+	}
+
+	noState := nativeToolPartState(opencode.NativePart{Tool: "bash"}, "tool")
+	if noState.status != acp.ToolCallStatusInProgress {
+		t.Fatalf("tool without state status = %q", noState.status)
+	}
+	malformed := nativeToolPartState(opencode.NativePart{State: json.RawMessage(`{`)}, "tool")
+	if malformed.status != acp.ToolCallStatusInProgress {
+		t.Fatalf("malformed tool state status = %q", malformed.status)
+	}
+	if got := toolStatusRank(acp.ToolCallStatus("unknown")); got != 0 {
+		t.Fatalf("unknown tool status rank = %d", got)
+	}
+	if err := session.emitUsageUpdate(ctx, "empty", opencode.NativeTokens{}, 0); err != nil {
+		t.Fatalf("empty usage update: %v", err)
+	}
+}
+
+func committedPartUpdates(
+	session *session,
+	role string,
+	part opencode.NativePart,
+	nativeDelta string,
+) []acp.SessionUpdate {
+	updates, commit := session.partUpdates(role, part, nativeDelta)
+	if commit != nil {
+		commit()
+	}
+
+	return updates
 }
 
 func TestLiveUserMessagePartsAreNotEchoed(t *testing.T) {
@@ -2559,6 +2872,12 @@ func assertEventEdgeAndHelperBranches(t *testing.T, ctx context.Context, session
 	if _, ok := eventPart(json.RawMessage(`{`)); ok {
 		t.Fatal("malformed eventPart succeeded")
 	}
+	part, delta, ok := eventPartUpdate(json.RawMessage(
+		`{"part":{"id":"part-delta","type":"text","text":"hello"},"delta":"lo"}`,
+	))
+	if !ok || part.ID != "part-delta" || delta != "lo" {
+		t.Fatalf("eventPartUpdate = %#v delta=%q ok=%v", part, delta, ok)
+	}
 	for _, raw := range []json.RawMessage{
 		json.RawMessage(`{"question":{"id":"q1","sessionID":"s"}}`),
 		json.RawMessage(`{"data":{"id":"q2","sessionID":"s"}}`),
@@ -2581,10 +2900,10 @@ func assertEventEdgeAndHelperBranches(t *testing.T, ctx context.Context, session
 	if got := embeddedResourceText(emptyResource); got != "" {
 		t.Fatalf("empty embeddedResourceText = %q", got)
 	}
-	if updates := partUpdates("assistant", opencode.NativePart{Type: "text"}); updates != nil {
+	if updates := committedPartUpdates(rawSession, "assistant", opencode.NativePart{Type: "text"}, ""); updates != nil {
 		t.Fatalf("empty text updates = %#v", updates)
 	}
-	if updates := partUpdates("assistant", opencode.NativePart{Type: "reasoning"}); updates != nil {
+	if updates := committedPartUpdates(rawSession, "assistant", opencode.NativePart{Type: partTypeReasoning}, ""); updates != nil {
 		t.Fatalf("empty reasoning updates = %#v", updates)
 	}
 }

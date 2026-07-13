@@ -37,11 +37,14 @@ type session struct {
 
 	turn                chan struct{}
 	mu                  sync.Mutex
+	updateMu            sync.Mutex
 	cancel              context.CancelFunc
 	turnDone            <-chan struct{}
 	cancelled           bool
 	rawSeq              int64
-	seenParts           map[string]string
+	emittedPartText     map[string]string
+	emittedTools        map[string]emittedToolState
+	emittedUsage        map[string]emittedUsageState
 	pending             map[string]opencode.PermissionRequest
 	questions           map[string]opencode.QuestionRequest
 	processedPermission map[string]struct{}
@@ -127,7 +130,9 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		outputSchema:          cloneAnyMap(meta.OutputSchema),
 		rawMessages:           meta.RawMessages,
 		client:                client,
-		seenParts:             map[string]string{},
+		emittedPartText:       map[string]string{},
+		emittedTools:          map[string]emittedToolState{},
+		emittedUsage:          map[string]emittedUsageState{},
 		pending:               map[string]opencode.PermissionRequest{},
 		questions:             map[string]opencode.QuestionRequest{},
 		processedPermission:   map[string]struct{}{},
@@ -760,25 +765,6 @@ func (s *session) nextRawEventSequence() int64 {
 	s.rawSeq++
 
 	return s.rawSeq
-}
-
-func (s *session) markPart(part opencode.NativePart) bool {
-	if part.ID == "" {
-		return true
-	}
-
-	encoded := string(part.Raw)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.seenParts[part.ID] == encoded {
-		return false
-	}
-
-	s.seenParts[part.ID] = encoded
-
-	return true
 }
 
 // Close shuts down the native OpenCode process under bounded background
