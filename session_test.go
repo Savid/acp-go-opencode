@@ -152,6 +152,17 @@ func TestAbortWaitIdleEveryResult(t *testing.T) {
 	short, cancel := context.WithTimeout(ctx, time.Millisecond)
 	defer cancel()
 	require.ErrorIs(t, abortAndWaitIdle(short, client, "native"), context.DeadlineExceeded)
+
+	client.statuses = map[string]opencode.NativeSessionStatus{"native": {Type: "busy"}}
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		client.mu.Lock()
+		client.statuses["native"] = opencode.NativeSessionStatus{Type: "idle"}
+		client.mu.Unlock()
+	}()
+	settles, settleCancel := context.WithTimeout(ctx, time.Second)
+	defer settleCancel()
+	require.NoError(t, abortAndWaitIdle(settles, client, "native"))
 }
 
 func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
@@ -211,6 +222,25 @@ func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 	require.True(t, released)
 	require.NoError(t, current.Close(context.Background()))
 	current.detachRuntime(0, "ignored after close")
+}
+
+func TestSessionCloseReleasesDirectoryOnlyAfterNativeMCPDisconnect(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.closeErr = errors.New("disconnect failed")
+	current := testSession(NewAgent(), client)
+	releases := 0
+	current.directoryRelease = func() { releases++ }
+
+	require.ErrorContains(t, current.Close(context.Background()), "disconnect failed")
+	require.Zero(t, releases)
+	require.NotNil(t, current.directoryRelease)
+
+	client.closeErr = nil
+	require.NoError(t, current.Close(context.Background()))
+	require.Equal(t, 1, releases)
+	require.Nil(t, current.directoryRelease)
+	require.NoError(t, current.Close(context.Background()))
+	require.Equal(t, 1, releases)
 }
 
 func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {

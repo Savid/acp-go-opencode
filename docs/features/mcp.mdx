@@ -15,10 +15,13 @@ declare servers on the ACP lifecycle request (`WithSessionMCPServers`, or the
 |---|---|---|
 | stdio | Yes | `"type": "local"` |
 | streamable HTTP | Yes | `"type": "remote"` |
-| SSE | No — rejected at session start | — |
-| ACP-transport | No — rejected at session start | — |
+| SSE | No — rejected at lifecycle admission | — |
+| ACP-transport | No — rejected at lifecycle admission | — |
 
-A server without a name is also rejected at session start.
+A server with no transport is rejected with `no_transport` before its name is
+checked. SSE and ACP transports are likewise rejected before name validation;
+accepted stdio/HTTP entries then require a non-empty, unique name. The same
+ordering applies to new, load, resume, and `_opencode/session/fork`.
 
 ## How forwarding works
 
@@ -31,9 +34,20 @@ Accepted servers are registered through authenticated `POST /mcp?directory=...`:
   separate `arguments` key — the command and its args are one array.
 
 MCP state is removed when the session's directory scope closes and is never
-written into the shared config or portable store. Because registration is
-directory-scoped, one canonical directory admits only one live session
-principal; a second session or a different credential fingerprint is rejected.
+written by the adapter into the shared config or portable store. Directory
+ownership is released only after every native MCP deletion succeeds (a native
+not-found response also proves absence). A failed deletion makes close fail
+loudly, retains both the remaining registrations and directory principal, and
+can be retried; another session cannot enter that directory while disconnection
+is unproven. Because registration is directory-scoped, one canonical directory
+admits only one live session principal; a second session or a different
+credential fingerprint is rejected.
+
+If initial scope setup fails and its partial registration cannot be disproved,
+there is no live session handle through which cleanup could be retried. The
+adapter therefore retains the principal and quarantines that shared runtime;
+closing the Agent terminates the native process tree and supplies the final
+disconnect proof.
 
 <Note>
 The adapter forwards MCP servers into OpenCode's native config; it does not

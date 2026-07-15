@@ -231,6 +231,42 @@ func (a *Agent) runtimeGenerationIsCurrent(generation uint64) bool {
 	}
 }
 
+func (a *Agent) quarantineRuntimeConfiguration(generation uint64, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if !a.closed && a.runtime != nil && a.runtimeGeneration == generation && a.runtimeFatalErr == nil {
+		a.runtimeFatalErr = errors.Join(opencode.ErrMCPDisconnectUnproven, err)
+	}
+}
+
+func (a *Agent) closeDirectoryScope(client opencode.Client, releaseDirectory func(), generation uint64) error {
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+	closeErr := client.Close(closeCtx)
+
+	closeCancel()
+
+	current := a.runtimeGenerationIsCurrent(generation)
+	if closeErr == nil || !current {
+		releaseDirectory()
+
+		return closeErr
+	}
+
+	a.quarantineRuntimeConfiguration(generation, closeErr)
+
+	return closeErr
+}
+
+func (a *Agent) closeFailedSession(session *session) error {
+	closeErr := session.Close(context.Background())
+	if closeErr != nil {
+		a.quarantineRuntimeConfiguration(session.runtimeGeneration, closeErr)
+	}
+
+	return closeErr
+}
+
 func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, func(), func(), error) {
 	hooks := a.options.RuntimeResourceHooks
 	scratchRelease := func() {}
@@ -344,6 +380,10 @@ func (a *Agent) bindDirectory(id acp.SessionId, cwd string, servers []opencode.M
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if a.runtimeFatalErr != nil {
+		return nil, a.runtimeFatalErr
+	}
 
 	if existing, ok := a.directories[canonical]; ok {
 		if existing.MCPFingerprint != fingerprint {

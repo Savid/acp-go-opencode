@@ -1737,6 +1737,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 }
 
 func TestPromptHelpersAndAnswerMapping(t *testing.T) {
+	imageMime := "image/png"
 	parts, err := promptToOpenCodeParts([]acp.ContentBlock{
 		acp.TextBlock("hello"),
 		{ResourceLink: &acp.ContentBlockResourceLink{Name: "a", Type: "resource_link", Uri: "file:///tmp/a"}},
@@ -1746,14 +1747,18 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 		{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
 			BlobResourceContents: &acp.BlobResourceContents{Blob: "AA==", Uri: "file:///tmp/blob"},
 		}}},
+		{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
+			BlobResourceContents: &acp.BlobResourceContents{Blob: "AA==", Uri: "file:///tmp/image.png", MimeType: &imageMime},
+		}}},
 		{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}},
 	})
 	if err != nil {
 		t.Fatalf("promptToOpenCodeParts: %v", err)
 	}
-	if len(parts) != 5 || parts[0]["text"] != "hello" || parts[1]["text"] != "file:///tmp/a" ||
+	if len(parts) != 6 || parts[0]["text"] != "hello" || parts[1]["text"] != "file:///tmp/a" ||
 		parts[2]["text"] != "embedded" || parts[3]["text"] != "file:///tmp/blob" ||
-		parts[4]["type"] != "file" || parts[4]["mime"] != "image/png" || parts[4]["url"] != "data:image/png;base64,AA==" {
+		parts[4]["type"] != "file" || parts[4]["mime"] != "image/png" || parts[4]["url"] != "data:image/png;base64,AA==" ||
+		parts[5]["type"] != "file" || parts[5]["mime"] != "image/png" || parts[5]["url"] != "data:image/png;base64,AA==" {
 		t.Fatalf("parts = %#v", parts)
 	}
 	if _, err = promptToOpenCodeParts(nil); err == nil {
@@ -1764,6 +1769,11 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 	}
 	if _, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image"}}}); err == nil {
 		t.Fatal("empty image prompt accepted")
+	}
+	if _, err = promptToOpenCodeParts([]acp.ContentBlock{{Resource: &acp.ContentBlockResource{
+		Type: "resource", Resource: acp.EmbeddedResourceResource{TextResourceContents: &acp.TextResourceContents{}},
+	}}}); err == nil {
+		t.Fatal("empty embedded text resource accepted")
 	}
 	invalidURI := "%"
 	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Uri: &invalidURI}}})
@@ -2917,8 +2927,8 @@ func assertEventEdgeAndHelperBranches(t *testing.T, ctx context.Context, session
 		t.Fatal("empty tokens produced usage")
 	}
 	var emptyResource acp.EmbeddedResourceResource
-	if got := embeddedResourceText(emptyResource); got != "" {
-		t.Fatalf("empty embeddedResourceText = %q", got)
+	if _, err := embeddedResourceOpenCodePart(emptyResource); err == nil {
+		t.Fatal("empty embedded resource accepted")
 	}
 	if updates := committedPartUpdates(rawSession, "assistant", opencode.NativePart{Type: "text"}, ""); updates != nil {
 		t.Fatalf("empty text updates = %#v", updates)
@@ -3250,8 +3260,9 @@ func TestPromptMappingHelpers(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"uri":"file:///tmp/a","text":"body"}`), &resource); err != nil {
 		t.Fatal(err)
 	}
-	if got := embeddedResourceText(resource); got == "" {
-		t.Fatalf("embeddedResourceText = %q", got)
+	part, err := embeddedResourceOpenCodePart(resource)
+	if err != nil || part[partTypeText] != "body" {
+		t.Fatalf("embeddedResourceOpenCodePart = %#v, %v", part, err)
 	}
 	if update := usageUpdateFromTokens("m", opencode.NativeTokens{}, 0); update != nil {
 		t.Fatalf("empty usage update = %#v", update)

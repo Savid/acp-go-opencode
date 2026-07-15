@@ -32,16 +32,17 @@ const (
 	eventQuestionAsked      = "question.asked"
 	eventQuestionV2Asked    = "question.v2.asked"
 
-	fieldPrompt        = "prompt"
-	partTypeText       = "text"
-	partTypeReasoning  = "reasoning"
-	partTypeFile       = "file"
-	partTypeTool       = "tool"
-	partTypeStepFinish = "step-finish"
-	contentTypeAudio   = "audio"
-	mediaTypeImage     = "image"
-	roleUser           = "user"
-	defaultMimeType    = "application/octet-stream"
+	fieldPrompt         = "prompt"
+	fieldPromptResource = "prompt.resource"
+	partTypeText        = "text"
+	partTypeReasoning   = "reasoning"
+	partTypeFile        = "file"
+	partTypeTool        = "tool"
+	partTypeStepFinish  = "step-finish"
+	contentTypeAudio    = "audio"
+	mediaTypeImage      = "image"
+	roleUser            = "user"
+	defaultMimeType     = "application/octet-stream"
 
 	permissionReplyOnce   = "once"
 	permissionReplyAlways = "always"
@@ -55,7 +56,9 @@ const (
 
 	finishReasonLength    = "length"
 	nativeStatusPending   = "pending"
+	nativeStatusBusy      = "busy"
 	nativeStatusIdle      = "idle"
+	nativeStatusRetry     = "retry"
 	nativeStatusCompleted = "completed"
 	nativeStatusSuccess   = "success"
 	nativeStatusError     = "error"
@@ -619,10 +622,12 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock) ([]map[string]any, error) 
 		case block.ResourceLink != nil:
 			parts = append(parts, map[string]any{jsonFieldType: partTypeText, partTypeText: block.ResourceLink.Uri})
 		case block.Resource != nil:
-			text := embeddedResourceText(block.Resource.Resource)
-			if text != "" {
-				parts = append(parts, map[string]any{jsonFieldType: partTypeText, partTypeText: text})
+			part, err := embeddedResourceOpenCodePart(block.Resource.Resource)
+			if err != nil {
+				return nil, err
 			}
+
+			parts = append(parts, part)
 		case block.Image != nil:
 			part, err := imageOpenCodePart(block.Image)
 			if err != nil {
@@ -716,7 +721,7 @@ func blobResourceOpenCodePart(resource *acp.BlobResourceContents) (map[string]an
 	}
 
 	if nativeURL == "" {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldField: "prompt.resource", jsonFieldError: "missing resource data or uri"})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: "missing resource data or uri"})
 	}
 
 	part := map[string]any{
@@ -780,21 +785,32 @@ func filenameFromURI(uri string) string {
 	return name
 }
 
-func embeddedResourceText(resource acp.EmbeddedResourceResource) string {
-	data, _ := json.Marshal(resource)
+func embeddedResourceOpenCodePart(resource acp.EmbeddedResourceResource) (map[string]any, error) {
+	if text := resource.TextResourceContents; text != nil {
+		value := firstNonEmpty(text.Text, text.Uri)
+		if value == "" {
+			return nil, acp.NewInvalidParams(map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: "missing resource text or uri"})
+		}
 
-	var raw map[string]any
-
-	_ = json.Unmarshal(data, &raw)
-	if text, _ := raw[partTypeText].(string); text != "" {
-		return text
+		return map[string]any{jsonFieldType: partTypeText, partTypeText: value}, nil
 	}
 
-	if uri, _ := raw["uri"].(string); uri != "" {
-		return uri
+	if blob := resource.BlobResourceContents; blob != nil {
+		mimeType := ""
+		if blob.MimeType != nil {
+			mimeType = strings.ToLower(strings.TrimSpace(*blob.MimeType))
+		}
+
+		if strings.HasPrefix(mimeType, mediaTypeImage+"/") {
+			return blobResourceOpenCodePart(blob)
+		}
+
+		if blob.Uri != "" {
+			return map[string]any{jsonFieldType: partTypeText, partTypeText: blob.Uri}, nil
+		}
 	}
 
-	return ""
+	return nil, acp.NewInvalidParams(map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: "missing supported resource content"})
 }
 
 func (s *session) replayMessages(ctx context.Context) error {

@@ -103,6 +103,27 @@ func TestDirectoryWithoutExplicitMCPStillHasOneSessionPrincipal(t *testing.T) {
 	require.ErrorContains(t, err, "directory_mcp_principal")
 }
 
+func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T) {
+	agent := NewAgent()
+	client := newFakeOpenCodeClient()
+	current := testSession(agent, client)
+	releases := 0
+	current.directoryRelease = func() { releases++ }
+	agent.sessions[current.id] = current
+	client.closeErr = errors.New("MCP disconnect unproven")
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorContains(t, err, "MCP disconnect unproven")
+	require.Same(t, current, agent.sessions[current.id])
+	require.Zero(t, releases)
+
+	client.closeErr = nil
+	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.NoError(t, err)
+	require.NotContains(t, agent.sessions, current.id)
+	require.Equal(t, 1, releases)
+}
+
 func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
@@ -275,7 +296,7 @@ func TestRuntimeCrashFailsInflightTurnThenRecoversBeforeFollowingPrompt(t *testi
 	}()
 	<-started
 	close(first.runtimeExited)
-	require.ErrorContains(t, <-turnResult, "opencode_runtime_exited")
+	assertTurnFailed(t, <-turnResult, causeTransport, "shared OpenCode runtime exited")
 
 	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "following-turn", "continue"))
 	require.NoError(t, err)
@@ -652,7 +673,10 @@ func TestLifecycleMCPPaginationAndRequestBuilderHelpers(t *testing.T) {
 	require.NoError(t, validateUnstableMCPServers(unstable))
 	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Sse: &acp.UnstableMcpServerSse{Name: "sse"}}}))
 	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Acp: &acp.UnstableMcpServerAcpInline{Name: "acp"}}}))
-	require.NoError(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{}}))
+	requireInvalidParamsData(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{}}), map[string]any{
+		jsonFieldError: errValueNoTransport,
+		jsonFieldField: "mcpServers[0]",
+	})
 	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Http: &acp.UnstableMcpServerHttp{}}}))
 	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{
 		{Http: &acp.UnstableMcpServerHttp{Name: "same"}}, {Stdio: &acp.McpServerStdio{Name: "same"}},

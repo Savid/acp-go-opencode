@@ -23,6 +23,12 @@ Native part events map onto ACP update variants:
 | Todos | `plan` |
 | Token totals | `usage_update` |
 
+ACP text blocks and text embedded resources become native text parts. A blob
+embedded resource whose MIME type is `image/*` becomes a native file part using
+its base64 data (or URI); a non-image blob may be mentioned by URI, but opaque
+blob bytes without a supported image MIME type are rejected rather than
+silently dropped. Direct ACP image blocks use the same native file-part path.
+
 OpenCode text and reasoning part events carry the complete part plus, on live
 updates, an explicit appended `delta`. The adapter forwards that delta and
 reconciles the final REST response against what was already delivered, so a
@@ -33,6 +39,8 @@ and is not appended as corrupt duplicate text.
 Each native tool part produces exactly one `tool_call`. Later pending,
 in-progress, completed, or failed states for the same call produce
 `tool_call_update`; failed states preserve the native error in `rawOutput`.
+If the first observed state is already terminal, the initial `tool_call`
+carries that terminal status and no follow-up update is fabricated.
 Identical message-level and step-level token snapshots produce one
 `usage_update`, while a changed snapshot still produces a later update.
 
@@ -59,7 +67,7 @@ The failure payload's `cause` names the failure class:
 | `cause` | Meaning |
 |---|---|
 | `provider` | The model or provider raised an assistant error; carries the native `message`, plus `statusCode`/`providerCode` when reported. |
-| `transport` | The SSE stream or REST call failed; carries the real transport detail, never a bare `EOF`. |
+| `transport` | The SSE stream or REST call failed, or the shared `opencode serve` runtime exited; carries the real detail, never a bare `EOF`. |
 | `timeout` | The turn exceeded the deadline set by `WithTurnTimeout`. |
 
 By default there is no deadline. `WithTurnTimeout` bounds a single turn; when it
@@ -69,3 +77,8 @@ status, abort failure, or fence timeout poisons the session. See
 [Models and config](/docs/features/models-config) for the
 provider-error and structured-output details, and
 [Metadata](/docs/reference/meta) for the full error payload.
+
+A shared-runtime exit fails the in-flight turn with this same
+`opencode_turn_failed` transport shape. The logical session remains loaded; its
+next prompt starts a replacement runtime and restores the last committed event
+generation before routing any user content.

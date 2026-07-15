@@ -67,7 +67,7 @@ func validateMCPServers(servers []acp.McpServer) error {
 			})
 		default:
 			return acp.NewInvalidParams(map[string]any{
-				jsonFieldError: "no_transport",
+				jsonFieldError: errValueNoTransport,
 				jsonFieldField: fmt.Sprintf("mcpServers[%d]", index),
 			})
 		}

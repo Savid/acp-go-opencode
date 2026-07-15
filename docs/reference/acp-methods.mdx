@@ -34,3 +34,8 @@ extension. This page lists each method and its behavior.
 
 Unknown methods and foreign `_meta` namespaces are rejected or ignored per the
 ACP contract.
+
+After `Agent.Close`, the connection rejects every incoming request with
+invalid-request (`-32600`) before initialization gating, method lookup,
+extension dispatch, or parameter decoding. A malformed or unknown call cannot
+overtake the closed-agent fence.

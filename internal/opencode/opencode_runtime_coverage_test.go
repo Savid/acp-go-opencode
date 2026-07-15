@@ -116,8 +116,46 @@ func TestScopeAndMCPFailureShapes(t *testing.T) {
 		}))
 		t.Cleanup(server.Close)
 		client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL, mcpNames: []string{"one", "two"}}
-		require.Error(t, client.unregisterMCP(context.Background()))
+		err := client.unregisterMCP(context.Background())
+		require.ErrorIs(t, err, ErrMCPDisconnectUnproven)
+		require.Equal(t, []string{"one", "two"}, client.mcpNames)
+	})
+
+	t.Run("scope close retries disconnect before closing", func(t *testing.T) {
+		var attempts int
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodDelete {
+				attempts++
+				if attempts == 1 {
+					writer.WriteHeader(http.StatusInternalServerError)
+
+					return
+				}
+
+				writer.WriteHeader(http.StatusNotFound)
+
+				return
+			}
+
+			writer.WriteHeader(http.StatusNoContent)
+		}))
+		t.Cleanup(server.Close)
+
+		cancelled := false
+		client := &openCodeServer{
+			httpClient: server.Client(), baseURL: server.URL, closed: make(chan struct{}),
+			scopeCancel: func() { cancelled = true }, mcpNames: []string{"one"},
+		}
+		err := client.Close(context.Background())
+		require.ErrorIs(t, err, ErrMCPDisconnectUnproven)
+		require.False(t, cancelled)
+		require.Equal(t, []string{"one"}, client.mcpNames)
+
+		require.NoError(t, client.Close(context.Background()))
+		require.True(t, cancelled)
 		require.Empty(t, client.mcpNames)
+		require.NoError(t, client.Close(context.Background()))
+		require.Equal(t, 2, attempts)
 	})
 
 	t.Run("scope wrong first event", func(t *testing.T) {

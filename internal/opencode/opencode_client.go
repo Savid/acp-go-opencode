@@ -86,7 +86,10 @@ const (
 // openAPITypeArray is the OpenAPI schema "type" value for arrays.
 const openAPITypeArray = "array"
 
-var ErrSSEDisconnect = errors.New("opencode SSE disconnected")
+var (
+	ErrSSEDisconnect         = errors.New("opencode SSE disconnected")
+	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
+)
 
 type Client interface {
 	Close(context.Context) error
@@ -258,6 +261,8 @@ type openCodeServer struct {
 	runtimeClosed     chan struct{}
 	runtimeExited     chan struct{}
 	mcpNames          []string
+	scopeCloseMu      sync.Mutex
+	scopeClosed       bool
 	supervisorControl io.WriteCloser
 	supervisor        *supervisorProof
 	waitDone          chan error
@@ -933,15 +938,24 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 }
 
 func (s *openCodeServer) Close(ctx context.Context) error {
-	if s.scopeCancel != nil {
-		s.once.Do(func() {
-			close(s.closed)
-			s.scopeCancel()
-			_ = s.unregisterMCP(context.WithoutCancel(ctx))
-		})
-
+	if s.scopeCancel == nil {
 		return nil
 	}
+
+	s.scopeCloseMu.Lock()
+	defer s.scopeCloseMu.Unlock()
+
+	if s.scopeClosed {
+		return nil
+	}
+
+	if err := s.disconnectMCP(ctx); err != nil {
+		return err
+	}
+
+	close(s.closed)
+	s.scopeCancel()
+	s.scopeClosed = true
 
 	return nil
 }
@@ -1045,18 +1059,18 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 	select {
 	case event := <-scope.events:
 		if event.Type != eventTypeServerConnected {
-			_ = scope.Close(context.Background())
+			closeErr := scope.Close(context.Background())
 
-			return nil, fmt.Errorf("first directory-scoped event was %q", event.Type)
+			return nil, errors.Join(fmt.Errorf("first directory-scoped event was %q", event.Type), closeErr)
 		}
 	case err := <-scope.errs:
-		_ = scope.Close(context.Background())
+		closeErr := scope.Close(context.Background())
 
-		return nil, fmt.Errorf("opencode directory event stream failed: %w", err)
+		return nil, errors.Join(fmt.Errorf("opencode directory event stream failed: %w", err), closeErr)
 	case <-ctx.Done():
-		_ = scope.Close(context.Background())
+		closeErr := scope.Close(context.Background())
 
-		return nil, ctx.Err()
+		return nil, errors.Join(ctx.Err(), closeErr)
 	}
 
 	return scope, nil
@@ -1065,6 +1079,7 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 func (s *openCodeServer) registerMCP(ctx context.Context, servers []MCPServerConfig) error {
 	for _, server := range servers {
 		config := openCodeMCPConfigBlock([]MCPServerConfig{server})[server.Name]
+		s.mcpNames = append(s.mcpNames, server.Name)
 
 		var response map[string]struct {
 			Status string `json:"status"`
@@ -1073,33 +1088,54 @@ func (s *openCodeServer) registerMCP(ctx context.Context, servers []MCPServerCon
 			fieldName: server.Name,
 			"config":  config,
 		}, &response); err != nil {
-			_ = s.unregisterMCP(context.WithoutCancel(ctx))
+			cleanupErr := s.disconnectMCP(ctx)
 
-			return fmt.Errorf("register directory MCP %q: %w", server.Name, err)
+			return errors.Join(fmt.Errorf("register directory MCP %q: %w", server.Name, err), cleanupErr)
 		}
 
 		status, ok := response[server.Name]
 		if !ok || status.Status != "connected" {
-			_ = s.unregisterMCP(context.WithoutCancel(ctx))
+			cleanupErr := s.disconnectMCP(ctx)
 
-			return fmt.Errorf("directory MCP %q did not connect", server.Name)
+			return errors.Join(fmt.Errorf("directory MCP %q did not connect", server.Name), cleanupErr)
 		}
-
-		s.mcpNames = append(s.mcpNames, server.Name)
 	}
 
 	return nil
 }
 
 func (s *openCodeServer) unregisterMCP(ctx context.Context) error {
-	var result error
+	var (
+		result    error
+		remaining []string
+	)
+
 	for i := len(s.mcpNames) - 1; i >= 0; i-- {
-		result = errors.Join(result, s.doJSON(ctx, http.MethodDelete, "/mcp/"+url.PathEscape(s.mcpNames[i]), nil, nil, nil))
+		name := s.mcpNames[i]
+
+		err := s.doJSON(ctx, http.MethodDelete, "/mcp/"+url.PathEscape(name), nil, nil, nil)
+		if err != nil && !isHTTPStatus(err, http.StatusNotFound) {
+			result = errors.Join(result, err)
+
+			remaining = append(remaining, name)
+		}
 	}
 
-	s.mcpNames = nil
+	slices.Reverse(remaining)
+	s.mcpNames = remaining
 
-	return result
+	if result != nil {
+		return errors.Join(ErrMCPDisconnectUnproven, result)
+	}
+
+	return nil
+}
+
+func (s *openCodeServer) disconnectMCP(ctx context.Context) error {
+	disconnectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openCodeShutdownTimeout)
+	defer cancel()
+
+	return s.unregisterMCP(disconnectCtx)
 }
 
 func (s *openCodeServer) Events() <-chan Event {
@@ -1616,9 +1652,13 @@ func (e *HTTPError) Error() string {
 }
 
 func IsBadRequest(err error) bool {
+	return isHTTPStatus(err, http.StatusBadRequest)
+}
+
+func isHTTPStatus(err error, status int) bool {
 	var httpErr *HTTPError
 
-	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusBadRequest
+	return errors.As(err, &httpErr) && httpErr.StatusCode == status
 }
 
 func (s *openCodeServer) blockingHTTPClient() *http.Client {

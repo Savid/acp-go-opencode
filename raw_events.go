@@ -60,6 +60,7 @@ const (
 	validationDuplicate                = "duplicate"
 	errValueBackpressure               = "backpressure"
 	errValueUnsupported                = "unsupported"
+	errValueNoTransport                = "no_transport"
 	errValueSessionUnknown             = "unknown session"
 	elicitationModeForm                = "form"
 	elicitationModeURL                 = "url"

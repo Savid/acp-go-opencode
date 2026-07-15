@@ -509,7 +509,7 @@ func abortAndWaitIdle(ctx context.Context, client opencode.Client, nativeID stri
 			return nil
 		}
 
-		if status.Type != "busy" && status.Type != "retry" {
+		if status.Type != nativeStatusBusy && status.Type != nativeStatusRetry {
 			return fmt.Errorf("unknown native session status %q", status.Type)
 		}
 
@@ -990,26 +990,39 @@ func (s *session) nextRawEventSequence() int64 {
 // contexts so a cancelled or expired caller context can never skip the
 // graceful abort/close ladder.
 func (s *session) Close(_ context.Context) error {
-	epoch, cancelErr := s.beginCancellation("", false, true)
-	if cancelErr == nil && epoch != 0 {
-		cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		cancelErr = s.resolveCancellation(cancelCtx, epoch)
-
-		cancel()
-	}
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
 
 	s.mu.Lock()
-	if s.closed {
+
+	firstClose := !s.closed
+	if !firstClose && s.directoryRelease == nil {
 		s.mu.Unlock()
 
 		return nil
 	}
 
 	s.closed = true
+	s.mu.Unlock()
+
+	var cancelErr error
+
+	if firstClose {
+		epoch, err := s.beginCancellation("", false, true)
+
+		cancelErr = err
+		if cancelErr == nil && epoch != 0 {
+			cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+			cancelErr = s.resolveCancellation(cancelCtx, epoch)
+
+			cancel()
+		}
+	}
+
+	s.mu.Lock()
 	client := s.client
 	nativeID := s.idmap.NativeSessionID
 	release := s.directoryRelease
-	s.directoryRelease = nil
 	s.mu.Unlock()
 
 	var err = cancelErr
@@ -1021,8 +1034,12 @@ func (s *session) Close(_ context.Context) error {
 		closeCancel()
 	}
 
-	if release != nil {
+	if err == nil && release != nil {
 		release()
+
+		s.mu.Lock()
+		s.directoryRelease = nil
+		s.mu.Unlock()
 	}
 
 	return err
@@ -1121,24 +1138,20 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 			return err
 		}
 
-		releaseCandidate := func() {
-			closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-			_ = client.Close(closeCtx)
-
-			closeCancel()
-			releaseDirectory()
+		releaseCandidate := func() error {
+			return s.agent.closeDirectoryScope(client, releaseDirectory, generation)
 		}
 
 		if validateErr := validateModel(ctx, client, model, modelFieldSessionMeta); validateErr != nil {
 			current := s.agent.runtimeGenerationIsCurrent(generation)
 
-			releaseCandidate()
+			closeErr := releaseCandidate()
 
 			if !current {
 				continue
 			}
 
-			return validateErr
+			return errors.Join(validateErr, closeErr)
 		}
 
 		s.agent.restoreMu.Lock()
@@ -1148,19 +1161,22 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 		if err != nil {
 			current := s.agent.runtimeGenerationIsCurrent(generation)
 
-			releaseCandidate()
+			closeErr := releaseCandidate()
 
 			if !current {
 				continue
 			}
 
-			return fmt.Errorf("restore committed OpenCode recovery generation: %w", err)
+			return errors.Join(fmt.Errorf("restore committed OpenCode recovery generation: %w", err), closeErr)
 		}
 
 		if native.ID != idmap.NativeSessionID {
-			releaseCandidate()
+			closeErr := releaseCandidate()
 
-			return fmt.Errorf("restored OpenCode native session id drift: expected %q, got %q", idmap.NativeSessionID, native.ID)
+			return errors.Join(
+				fmt.Errorf("restored OpenCode native session id drift: expected %q, got %q", idmap.NativeSessionID, native.ID),
+				closeErr,
+			)
 		}
 
 		installed, closed := s.installRecoveredRuntime(client, releaseDirectory, idmap, generation)
@@ -1168,7 +1184,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 			return nil
 		}
 
-		releaseCandidate()
+		_ = releaseCandidate()
 
 		if closed {
 			return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueSessionUnknown})
@@ -1225,10 +1241,7 @@ func (s *session) runtimeFailure() error {
 		return nil
 	}
 
-	return acp.NewInternalError(map[string]any{
-		jsonFieldError: "opencode_runtime_exited",
-		jsonFieldCause: s.runtimeLostCause,
-	})
+	return acp.NewInternalError(turnFailedData(causeTransport, s.runtimeLostCause, 0, ""))
 }
 
 func (s *session) DeleteNativeAndClose(ctx context.Context) error {

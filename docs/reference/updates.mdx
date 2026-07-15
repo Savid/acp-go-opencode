@@ -21,6 +21,8 @@ table lists every variant and its native source.
 
 `usage_update` notifications may carry `_meta.opencode.messageId`; identical
 snapshots for the same message are suppressed. Tool failures carry the native
-error as structured `rawOutput`. See
+error as structured `rawOutput`. A tool first observed in a terminal state uses
+one terminal-status `tool_call` and does not fabricate a following
+`tool_call_update`. See
 [Prompt streaming](/docs/core/prompt-streaming) for how the message parts map
 during a live turn.

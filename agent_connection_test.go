@@ -67,6 +67,36 @@ func TestLocalConnectionRequiresInitializeAndStrictCancelRoute(t *testing.T) {
 	require.Contains(t, reqErr.Data, "reason")
 }
 
+func TestLocalConnectionRejectsClosedBeforeDispatchOrDecode(t *testing.T) {
+	agent := NewAgent()
+	require.NoError(t, agent.Close())
+
+	tests := []struct {
+		name        string
+		initialized bool
+		method      string
+		params      json.RawMessage
+	}{
+		{name: "before initialization gate", method: acp.AgentMethodSessionList},
+		{name: "initialize", method: acp.AgentMethodInitialize, params: json.RawMessage(`{bad`)},
+		{name: "unknown stable method", initialized: true, method: "unknown"},
+		{name: "unknown extension method", initialized: true, method: "_unknown"},
+		{name: "known malformed params", initialized: true, method: acp.AgentMethodAuthenticate, params: json.RawMessage(`{bad`)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &localAgentConnection{agent: agent}
+			conn.initialized.Store(tc.initialized)
+
+			_, reqErr := conn.handle(context.Background(), tc.method, tc.params)
+			require.NotNil(t, reqErr)
+			require.Equal(t, -32600, reqErr.Code)
+			require.Equal(t, map[string]any{jsonFieldError: errValueAgentClosed}, reqErr.Data)
+		})
+	}
+}
+
 type wireCoverageClient struct {
 	noopACPClient
 	mu           sync.Mutex

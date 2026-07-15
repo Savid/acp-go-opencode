@@ -302,7 +302,7 @@ func TestCrashGenerationCancellationAndPromptFailureBranches(t *testing.T) {
 	_, err := current.runPromptTurn(context.Background(), turnCtx, request, func(context.Context) (opencode.NativeMessage, error) {
 		return opencode.NativeMessage{}, nil
 	}, opencode.NativeCommand{}, false)
-	require.ErrorContains(t, err, "opencode_runtime_exited")
+	assertTurnFailed(t, err, causeTransport, "runtime exited")
 
 	current = testSession(NewAgent(), newFakeOpenCodeClient())
 	turnCtx = current.beginTurn(context.Background(), "turn")
@@ -310,7 +310,7 @@ func TestCrashGenerationCancellationAndPromptFailureBranches(t *testing.T) {
 	_, err = current.runPromptTurn(context.Background(), turnCtx, request, func(context.Context) (opencode.NativeMessage, error) {
 		return opencode.NativeMessage{}, nil
 	}, opencode.NativeCommand{}, false)
-	require.ErrorContains(t, err, "opencode_runtime_exited")
+	assertTurnFailed(t, err, causeTransport, "runtime exited")
 }
 
 func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {

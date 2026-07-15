@@ -54,11 +54,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	}
 
 	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		_ = client.Close(context.Background())
+		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		releaseDirectory()
-
-		return acp.NewSessionResponse{}, validateErr
+		return acp.NewSessionResponse{}, errors.Join(validateErr, closeErr)
 	}
 
 	sessionStarted := time.Now()
@@ -66,11 +64,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err)
 
 	if err != nil {
-		_ = client.Close(context.Background())
+		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		releaseDirectory()
-
-		return acp.NewSessionResponse{}, err
+		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
 	}
 
 	idmap := idmapRecord{
@@ -86,15 +82,15 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	session.runtimeGeneration = generation
 
 	if err := a.storeStartedSession(session); err != nil {
-		_ = session.Close(context.Background())
+		closeErr := a.closeFailedSession(session)
 
-		return acp.NewSessionResponse{}, err
+		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
 	}
 
 	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
-		_ = session.Close(context.Background())
+		closeErr := a.closeFailedSession(session)
 
-		return acp.NewSessionResponse{}, err
+		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
 	}
 
 	a.refreshLifecycleCommands(ctx, session)
@@ -216,11 +212,9 @@ func (a *Agent) loadOrResumeSession(
 	}
 
 	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		_ = client.Close(context.Background())
+		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		releaseDirectory()
-
-		return nil, validateErr
+		return nil, errors.Join(validateErr, closeErr)
 	}
 
 	a.restoreMu.Lock()
@@ -228,11 +222,9 @@ func (a *Agent) loadOrResumeSession(
 	a.restoreMu.Unlock()
 
 	if err != nil {
-		_ = client.Close(context.Background())
+		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		releaseDirectory()
-
-		return nil, err
+		return nil, errors.Join(err, closeErr)
 	}
 
 	session := newSession(a, id, cwd, additionalDirectories, native, client, meta, idmap)
@@ -242,9 +234,9 @@ func (a *Agent) loadOrResumeSession(
 	session.runtimeGeneration = generation
 
 	if err := a.storeStartedSession(session); err != nil {
-		_ = session.Close(context.Background())
+		closeErr := a.closeFailedSession(session)
 
-		return nil, err
+		return nil, errors.Join(err, closeErr)
 	}
 
 	return session, nil
@@ -342,7 +334,7 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 
 	closeCancel()
 
-	if a.removeSessionIf(params.SessionId, session) {
+	if closeErr == nil && a.removeSessionIf(params.SessionId, session) {
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
@@ -446,20 +438,16 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	}
 
 	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		_ = client.Close(context.Background())
+		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		releaseDirectory()
-
-		return acp.UnstableForkSessionResponse{}, validateErr
+		return acp.UnstableForkSessionResponse{}, errors.Join(validateErr, closeErr)
 	}
 
 	native, err := client.GetSession(ctx, nativeChild.ID)
 	if err != nil {
-		_ = client.Close(context.Background())
+		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		releaseDirectory()
-
-		return acp.UnstableForkSessionResponse{}, err
+		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
 	}
 
 	idmap := idmapRecord{
@@ -477,15 +465,15 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	session.runtimeGeneration = generation
 
 	if err := a.storeStartedSession(session); err != nil {
-		_ = session.Close(context.Background())
+		closeErr := a.closeFailedSession(session)
 
-		return acp.UnstableForkSessionResponse{}, err
+		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
 	}
 
 	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
-		_ = session.Close(context.Background())
+		closeErr := a.closeFailedSession(session)
 
-		return acp.UnstableForkSessionResponse{}, err
+		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
 	}
 
 	a.refreshLifecycleCommands(ctx, session)
@@ -601,9 +589,14 @@ func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd str
 			return client, releaseDirectory, generation, nil
 		}
 
-		releaseDirectory()
+		current := a.runtimeGenerationIsCurrent(generation)
+		if !current || !errors.Is(err, opencode.ErrMCPDisconnectUnproven) {
+			releaseDirectory()
+		} else {
+			a.quarantineRuntimeConfiguration(generation, err)
+		}
 
-		if a.runtimeGenerationIsCurrent(generation) {
+		if current {
 			return nil, nil, 0, err
 		}
 
@@ -682,7 +675,10 @@ func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
 		case server.Stdio != nil:
 			name = server.Stdio.Name
 		default:
-			continue
+			return acp.NewInvalidParams(map[string]any{
+				jsonFieldError: errValueNoTransport,
+				jsonFieldField: fmt.Sprintf("mcpServers[%d]", index),
+			})
 		}
 
 		if strings.TrimSpace(name) == "" {

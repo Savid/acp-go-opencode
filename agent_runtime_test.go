@@ -229,6 +229,60 @@ func TestDirectoryBindingRemainingOSHashAndReleaseBranches(t *testing.T) {
 	release()
 }
 
+func TestScopeCleanupFailureRetainsDirectoryPrincipal(t *testing.T) {
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.scopeErr = errors.Join(opencode.ErrMCPDisconnectUnproven, errors.New("delete failed"))
+	agent := NewAgent()
+	agent.runtime = client
+
+	scoped, release, generation, err := agent.newOpenCodeClient(context.Background(), "session", cwd, []opencode.MCPServerConfig{{Name: "tools"}})
+	require.ErrorIs(t, err, opencode.ErrMCPDisconnectUnproven)
+	require.Nil(t, scoped)
+	require.Nil(t, release)
+	require.Zero(t, generation)
+	require.Len(t, agent.directories, 1, "unproven native cleanup must retain directory ownership")
+	scoped, release, generation, err = agent.newOpenCodeClient(context.Background(), "session", cwd, []opencode.MCPServerConfig{{Name: "tools"}})
+	require.ErrorIs(t, err, opencode.ErrMCPDisconnectUnproven)
+	require.Nil(t, scoped)
+	require.Nil(t, release)
+	require.Zero(t, generation)
+	require.Len(t, agent.directories, 1, "quarantined runtime must not replace the retained principal")
+	require.NoError(t, agent.Close())
+}
+
+func TestDirectoryScopeCloseFailureQuarantinesWithoutRelease(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.closeErr = errors.New("disconnect failed")
+	agent := NewAgent()
+	agent.runtime = client
+	releases := 0
+
+	err := agent.closeDirectoryScope(client, func() { releases++ }, 0)
+	require.ErrorContains(t, err, "disconnect failed")
+	require.Zero(t, releases)
+	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrMCPDisconnectUnproven)
+
+	agent.runtimeFatalErr = nil
+	current := testSession(agent, client)
+	current.runtimeGeneration = 0
+	current.directoryRelease = func() { releases++ }
+	err = agent.closeFailedSession(current)
+	require.ErrorContains(t, err, "disconnect failed")
+	require.Zero(t, releases)
+	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrMCPDisconnectUnproven)
+
+	client.closeErr = nil
+	require.NoError(t, agent.Close())
+}
+
+func TestDirectoryBindingIncarnationSkipsZeroAfterWrap(t *testing.T) {
+	agent := NewAgent()
+	agent.directoryIncarnation = ^directoryBindingIncarnation(0)
+
+	require.Equal(t, directoryBindingIncarnation(1), agent.nextDirectoryBindingIncarnationLocked())
+}
+
 func TestRuntimeResourceCleanupProofAndDeletionGates(t *testing.T) {
 	originalRemoveAll := runtimeRemoveAll
 	t.Cleanup(func() { runtimeRemoveAll = originalRemoveAll })

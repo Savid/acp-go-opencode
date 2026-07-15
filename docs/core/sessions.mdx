@@ -33,12 +33,18 @@ turn route. Command refresh caused by a slash-command prompt is turn-scoped and
 carries that prompt's exact route envelope.
 
 If the shared native server exits, the adapter fails every in-flight turn on
-that server but retains the loaded logical sessions. A later prompt first
+that server with the uniform `opencode_turn_failed` transport error but retains
+the loaded logical sessions. A later prompt first
 starts a new runtime generation, reopens the session's directory/MCP scope,
 and verifies or completes replay of the last committed sync-event generation.
 Only a session fenced to that current runtime generation can publish its route
 and send the prompt; a replacement that crashes during reconstruction is
 discarded without routing the user prompt to it.
+
+Closing a session releases its canonical-directory principal only after the
+native directory scope confirms all MCP registrations are absent. If that
+proof fails, close returns an error and retains the logical session/principal so
+the host can retry; admission never races ahead of uncertain native cleanup.
 
 ## Load versus resume
 

@@ -41,8 +41,10 @@ Lifecycle requests accept:
 | `rawEvent.enabled` | Opt in to `_opencode/rawEvent` notifications. |
 
 `_meta.opencode.options.permission` becomes the native session's permission
-rule list at creation. `_meta.opencode.options.env` is rejected; native process
-environment is immutable and configured only with `WithEnv`.
+rule list at creation. Model selection is fixed by the logical session but is
+sent on each native message or command request, not in the native creation
+body. `_meta.opencode.options.env` is rejected; native process environment is
+immutable and configured only with `WithEnv`.
 
 `session/prompt` and an active `session/cancel` require a top-level
 `_meta["acp-go.dev/route"]` object containing exactly `version: 1` and a
@@ -81,7 +83,7 @@ A failed turn returns an ACP internal error whose `data` carries:
 | Field | Meaning |
 |---|---|
 | `error` | Always `opencode_turn_failed`. |
-| `cause` | `provider`, `transport`, or `timeout`. |
+| `cause` | `provider`, `transport`, or `timeout`; a shared-runtime exit is `transport`. |
 | `message` | The real native cause text. |
 | `statusCode` / `providerCode` | Included when the provider reports them. |
 | `structuredOutputRequested` | `true` when the turn sent a native output schema. |
