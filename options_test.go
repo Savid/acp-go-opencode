@@ -12,7 +12,9 @@ import (
 )
 
 func TestApplyOptions(t *testing.T) {
-	if options := applyOptions(nil); options.HealthCheckTimeout != opencode.HealthCheckTimeout {
+	if options := applyOptions(nil); options.NativeVersion != syncNativeVersion {
+		t.Fatalf("default native version = %q, want %q", options.NativeVersion, syncNativeVersion)
+	} else if options.HealthCheckTimeout != opencode.HealthCheckTimeout {
 		t.Fatalf("default health timeout = %s, want %s", options.HealthCheckTimeout, opencode.HealthCheckTimeout)
 	}
 

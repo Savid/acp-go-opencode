@@ -102,7 +102,7 @@ func applyOptions(opts []Option) Options {
 		AgentVersion:            "0.1.0",
 		SessionStoreLoadTimeout: 10 * time.Second,
 		HealthCheckTimeout:      opencode.HealthCheckTimeout,
-		NativeVersion:           "1.17.18",
+		NativeVersion:           syncNativeVersion,
 		clientFactory:           opencode.StartServer,
 	}
 	for _, opt := range opts {

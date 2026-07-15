@@ -465,7 +465,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		Pure:            true,
 		QuestionTool:    true,
 		LogLevel:        "DEBUG",
-		ExactVersion:    "1.17.18",
+		ExactVersion:    "1.18.1",
 		HealthTimeout:   5 * time.Second,
 		Logger:          logger,
 		SkipVersionGate: false,
@@ -1570,7 +1570,7 @@ func runFakeOpenCodeServerProcess() {
 		}
 		switch r.URL.Path {
 		case "/global/health":
-			writeJSONNoTest(w, map[string]any{"healthy": true, "version": "1.17.18"})
+			writeJSONNoTest(w, map[string]any{"healthy": true, "version": "1.18.1"})
 		case "/doc":
 			writeJSONNoTest(w, fullOpenCodeDoc())
 		case "/event":
@@ -1767,7 +1767,7 @@ func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
 						return nil, req.Context().Err()
 					}
 
-					return performanceJSONResponse(map[string]any{"healthy": true, "version": "1.17.18"}), nil
+					return performanceJSONResponse(map[string]any{"healthy": true, "version": "1.18.1"}), nil
 				case routeDoc:
 					return performanceJSONResponse(fullOpenCodeDoc()), nil
 				case routeEvent:
@@ -1795,7 +1795,7 @@ func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		err := client.waitReady(ctx, eventCtx, StartOptions{ExactVersion: "1.17.18"})
+		err := client.waitReady(ctx, eventCtx, StartOptions{ExactVersion: "1.18.1"})
 		cancel()
 		cancelEvents()
 		close(client.closed)
@@ -1820,7 +1820,7 @@ func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
 // through health, /doc validation, and the first server.connected event.
 // Fixture construction and shutdown are outside the interval. Each repetition
 // uses a fresh local XDG root and a fake HTTP/SSE process that implements the
-// exact pinned contract; this is not a physical OpenCode 1.17.18 p95 claim.
+// exact pinned contract; this is not a physical OpenCode 1.18.1 p95 claim.
 // With five samples, nearest-rank p95 is the slowest sample.
 func TestColdStartupReleaseGate(t *testing.T) {
 	executable := fakeOpenCodeExecutable(t)
@@ -1831,7 +1831,7 @@ func TestColdStartupReleaseGate(t *testing.T) {
 		client, err := StartServer(context.Background(), StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  executable,
-			ExactVersion:    "1.17.18",
+			ExactVersion:    "1.18.1",
 			HealthTimeout:   5 * time.Second,
 			SkipVersionGate: false,
 		})

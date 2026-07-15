@@ -185,7 +185,7 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/global/health":
-			writeFakeJSON(w, map[string]any{"healthy": true, "version": "1.17.18"})
+			writeFakeJSON(w, map[string]any{"healthy": true, "version": "1.18.1"})
 		case r.URL.Path == "/doc":
 			writeFakeJSON(w, fakeOpenCodeDoc(mode))
 		case r.URL.Path == "/event":
