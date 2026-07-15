@@ -157,15 +157,6 @@ func TestConnectionRemainingDispatchValidationAndBackpressureBranches(t *testing
 	_, requestErr := connection.handle(context.Background(), "_unknown", json.RawMessage(`{}`))
 	require.NotNil(t, requestErr)
 
-	called := make(chan struct{})
-	writer := newPostResponseWriter(io.Discard, func(acp.SessionId) func() {
-		return func() { close(called) }
-	})
-	writer.observeRequestLine([]byte(`{"id":1,"method":"session/new","params":{}}`))
-	_, err := writer.Write([]byte(`{"id":1,"result":{"sessionId":"session"}}`))
-	require.NoError(t, err)
-	<-called
-
 	notification := localNotification(func(*Agent, context.Context, acp.CancelNotification) error { return nil })
 	_, requestErr = notification(context.Background(), agent, json.RawMessage(`{`))
 	require.NotNil(t, requestErr)
@@ -181,7 +172,7 @@ func TestConnectionRemainingDispatchValidationAndBackpressureBranches(t *testing
 		agent.clientCalls <- struct{}{}
 	}
 	form := acp.NewUnstableCreateElicitationRequestForm(acp.UnstableElicitationSchema{})
-	_, err = connection.CreateElicitation(context.Background(), form, elicitationScope{SessionID: "session", TurnNonce: "nonce", ToolCallID: "tool"})
+	_, err := connection.CreateElicitation(context.Background(), form, elicitationScope{SessionID: "session", TurnNonce: "nonce", ToolCallID: "tool"})
 	require.Error(t, err)
 	_, err = connection.RequestPermission(context.Background(), acp.RequestPermissionRequest{})
 	require.Error(t, err)

@@ -66,7 +66,6 @@ type session struct {
 	activeToolCallIDs         map[string]struct{}
 	failedStreamEpochs        map[uint64]struct{}
 	failedMessageIDs          map[string]struct{}
-	suppressNextBacklog       bool
 	exclusiveTurn             bool
 	commandsByName            map[string]opencode.NativeCommand
 	availableCommands         []acp.AvailableCommand
@@ -678,7 +677,6 @@ func (s *session) markStreamFailed(epoch uint64) {
 		s.failedStreamEpochs[epoch] = struct{}{}
 	}
 
-	s.suppressNextBacklog = true
 	s.mu.Unlock()
 }
 
@@ -699,19 +697,6 @@ func (s *session) shouldSuppressEvent(event opencode.Event) bool {
 	}
 
 	return false
-}
-
-func (s *session) suppressBacklog() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.suppressNextBacklog
-}
-
-func (s *session) clearSuppressBacklog() {
-	s.mu.Lock()
-	s.suppressNextBacklog = false
-	s.mu.Unlock()
 }
 
 func (s *session) addPendingPermission(req opencode.PermissionRequest) {

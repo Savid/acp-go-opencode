@@ -1263,7 +1263,7 @@ func TestPromptBacklogPermissionWithoutCurrentToolFailsClosed(t *testing.T) {
 		Properties: json.RawMessage(`{"id":"perm","sessionID":"native-1"}`),
 	}
 	_, err := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
-	if err == nil || !strings.Contains(err.Error(), "active turn") {
+	if err == nil || !strings.Contains(err.Error(), "outside its originating turn") {
 		t.Fatalf("stale permission error=%v", err)
 	}
 }
@@ -1278,6 +1278,25 @@ func TestPromptBacklogErrorBeforeTurn(t *testing.T) {
 	if _, err := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}); err == nil {
 		t.Fatal("malformed backlog event was ignored")
 	}
+}
+
+func TestTurnBacklogForeignCallbacksAreDiscardedAndMalformedQuestionFails(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	session := testSession(NewAgent(), client)
+	client.events <- opencode.Event{
+		Type:       eventPermissionV2Asked,
+		Properties: json.RawMessage(`{"id":"permission","sessionID":"foreign"}`),
+	}
+	client.events <- opencode.Event{
+		Type:       eventQuestionAsked,
+		Properties: json.RawMessage(`{"id":"question","sessionID":"foreign"}`),
+	}
+	require.NoError(t, session.drainClientBacklog(context.Background()))
+	require.Zero(t, client.permissionReplyCount())
+	require.Zero(t, client.questionRejectCount())
+
+	client.events <- opencode.Event{Type: eventQuestionAsked, Properties: json.RawMessage(`{`)}
+	require.ErrorContains(t, session.drainClientBacklog(context.Background()), "invalid OpenCode question callback")
 }
 
 func TestPromptReconcileCancelledBeforeSend(t *testing.T) {
@@ -3625,23 +3644,23 @@ func TestPromptCancelAndLoadRejectRemainingRouteAndMCPBranches(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestPromptBacklogCancellationReturnsCancelledBeforeNativeTurn(t *testing.T) {
+func TestPromptBacklogQuestionFailsClosedBeforeNativeTurn(t *testing.T) {
 	agent := NewAgent()
 	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
 	connection := newRecordingAgentClient()
-	connection.elicitErr = errors.New("client stopped")
 	agent.setAgentClient(connection)
 	client := newFakeOpenCodeClient()
 	current := testSession(agent, client)
-	current.cancelled = true
 	client.events <- opencode.Event{
 		Type:       eventQuestionAsked,
 		Properties: json.RawMessage(`{"id":"question","sessionID":"native-1","questions":[{"question":"Continue?"}]}`),
 	}
 
 	response, err := current.promptWithRoute(context.Background(), promptCoverageParams(current.id), "nonce")
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+	require.ErrorContains(t, err, "question callback arrived outside its originating turn")
+	require.Empty(t, response.StopReason)
+	require.Equal(t, 1, client.questionRejectCount())
+	require.Empty(t, connection.elicitations)
 }
 
 func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {

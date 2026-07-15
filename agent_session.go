@@ -97,6 +97,8 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
+	a.refreshLifecycleCommands(ctx, session)
+
 	return acp.NewSessionResponse{
 		SessionId:     id,
 		Meta:          sessionResponseMeta(session.snapshot()),
@@ -116,6 +118,8 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 		return acp.LoadSessionResponse{}, err
 	}
 
+	a.refreshLifecycleCommands(ctx, session)
+
 	return acp.LoadSessionResponse{
 		Meta:          sessionResponseMeta(session.snapshot()),
 		ConfigOptions: session.configOptions(ctx),
@@ -133,29 +137,20 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 		return acp.ResumeSessionResponse{}, err
 	}
 
+	a.refreshLifecycleCommands(ctx, session)
+
 	return acp.ResumeSessionResponse{
 		Meta:          sessionResponseMeta(session.snapshot()),
 		ConfigOptions: session.configOptions(ctx),
 	}, nil
 }
 
-func (a *Agent) refreshCommandsAfterResponse(id acp.SessionId) func() {
-	return func() {
-		defer recoverAgentGoroutine(context.Background(), agentLogger(a), "OpenCode command refresh")
-
-		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		defer cancel()
-
-		session, err := a.session(id)
-		if err != nil {
-			a.log.DebugContext(ctx, "skip OpenCode command refresh for missing session", slog.String("session_id", string(id)), slog.String("error", err.Error()))
-
-			return
-		}
-
-		if err := session.refreshCommands(ctx); err != nil {
-			a.log.DebugContext(ctx, "refresh OpenCode commands failed", slog.String("session_id", string(id)), slog.String("error", err.Error()))
-		}
+func (a *Agent) refreshLifecycleCommands(ctx context.Context, session *session) {
+	if err := session.refreshCommands(ctx); err != nil {
+		a.log.DebugContext(ctx, "refresh OpenCode commands during session lifecycle failed",
+			slog.String("session_id", string(session.id)),
+			slog.String("error", err.Error()),
+		)
 	}
 }
 
@@ -492,6 +487,8 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 		return acp.UnstableForkSessionResponse{}, err
 	}
+
+	a.refreshLifecycleCommands(ctx, session)
 
 	return acp.UnstableForkSessionResponse{
 		SessionId:     id,

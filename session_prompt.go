@@ -25,6 +25,7 @@ var errPromptCancelled = errors.New("prompt cancelled")
 const (
 	eventServerConnected    = "server.connected"
 	eventPermissionV2Asked  = "permission.v2.asked"
+	eventPermissionAsked    = "permission.asked"
 	eventMessagePartCreated = "message.part.created"
 	eventMessagePartUpdated = "message.part.updated"
 	eventMessageUpdated     = "message.updated"
@@ -224,11 +225,14 @@ func (s *session) promptWithRoute(ctx context.Context, params acp.PromptRequest,
 	}
 	defer release()
 
-	if recoveryErr := s.ensureRuntime(ctx); recoveryErr != nil {
+	turnCtx := s.beginTurn(ctx, turnNonce)
+	defer s.finishTurn()
+
+	if recoveryErr := s.ensureRuntime(turnCtx); recoveryErr != nil {
 		return acp.PromptResponse{}, recoveryErr
 	}
 
-	invocation, command, matchedCommand, err := s.resolvePromptCommand(ctx, params)
+	invocation, command, matchedCommand, err := s.resolvePromptCommand(turnCtx, params)
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
@@ -236,25 +240,18 @@ func (s *session) promptWithRoute(ctx context.Context, params acp.PromptRequest,
 	var runNative func(context.Context) (opencode.NativeMessage, error)
 
 	if matchedCommand {
-		runNative, err = s.commandNativeRun(ctx, params, invocation, command)
+		runNative, err = s.commandNativeRun(turnCtx, params, invocation, command)
 	} else {
-		runNative, err = s.messageNativeRun(ctx, params)
+		runNative, err = s.messageNativeRun(turnCtx, params)
 	}
 
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
 
-	if err := s.drainClientBacklog(ctx); err != nil {
-		if errors.Is(err, errPromptCancelled) {
-			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
-		}
-
+	if err := s.drainClientBacklog(turnCtx); err != nil {
 		return acp.PromptResponse{}, err
 	}
-
-	turnCtx := s.beginTurn(ctx, turnNonce)
-	defer s.finishTurn()
 
 	return s.runPromptTurn(ctx, turnCtx, params, runNative, command, matchedCommand)
 }
@@ -1154,7 +1151,7 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 	}
 
 	switch event.Type {
-	case eventPermissionV2Asked, "permission.asked":
+	case eventPermissionV2Asked, eventPermissionAsked:
 		var req opencode.PermissionRequest
 		if err := json.Unmarshal(event.Properties, &req); err != nil {
 			return err
@@ -1551,18 +1548,42 @@ func (s *session) handleQuestion(ctx context.Context, req opencode.QuestionReque
 }
 
 func (s *session) drainClientBacklog(ctx context.Context) error {
-	suppress := s.suppressBacklog()
-	defer s.clearSuppressBacklog()
-
 	for {
 		select {
 		case event := <-s.client.Events():
-			if suppress || event.Type == eventServerConnected || s.shouldSuppressEvent(event) {
-				continue
-			}
+			switch event.Type {
+			case eventPermissionV2Asked, eventPermissionAsked:
+				var req opencode.PermissionRequest
+				if err := json.Unmarshal(event.Properties, &req); err != nil {
+					return err
+				}
 
-			if err := s.handleEvent(ctx, event); err != nil {
-				return err
+				if req.SessionID != s.idmap.NativeSessionID {
+					continue
+				}
+
+				replyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+				replyErr := s.client.ReplyPermission(replyCtx, req, permissionReplyReject, "stale callback from a completed turn")
+
+				cancel()
+
+				return errors.Join(invalidRoute("permission callback arrived outside its originating turn"), replyErr)
+			case eventQuestionV2Asked, eventQuestionAsked:
+				req, ok := eventQuestion(event.Properties)
+				if !ok {
+					return errors.New("invalid OpenCode question callback in turn backlog")
+				}
+
+				if req.SessionID != s.idmap.NativeSessionID {
+					continue
+				}
+
+				replyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+				replyErr := s.client.RejectQuestion(replyCtx, req)
+
+				cancel()
+
+				return errors.Join(invalidRoute("question callback arrived outside its originating turn"), replyErr)
 			}
 		case <-s.client.EventErrors():
 			continue

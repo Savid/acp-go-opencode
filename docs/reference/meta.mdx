@@ -68,10 +68,11 @@ The initialize response advertises adapter surfaces under
 path, result path, and schema mode). `AgentCapabilities.Meta` also advertises
 `"acp-go.dev/route": {"versions": [1]}`.
 
-Outbound permission and elicitation requests preserve native metadata and add
-the reserved route envelope with `version`, `sessionId`, `turnNonce`, and
-exactly one of `toolCallId` or `requestId`. A native metadata collision with
-that reserved key is rejected.
+Outbound elicitation requests preserve native metadata and add the reserved
+route envelope with `version`, `sessionId`, `turnNonce`, and exactly one of
+`toolCallId` or `requestId`. A native metadata collision with that reserved key
+is rejected. Permission requests instead use ACP's structural `sessionId` and
+`toolCallId`; the adapter accepts only tool calls published by the current turn.
 
 ## Turn-failure error data
 

@@ -3,18 +3,17 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
-
-	"errors"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
-
-	"sync"
-
-	"time"
 )
 
 func TestInitializeAdvertisesRouteEnvelopeV1(t *testing.T) {
@@ -121,7 +120,7 @@ func (client *wireCoverageClient) HandleExtensionMethod(_ context.Context, metho
 	return map[string]any{}, nil
 }
 
-func newWireCoverageConnection(t *testing.T) (*Agent, *localAgentConnection, *wireCoverageClient) {
+func newWireCoverageConnection(t *testing.T) (*Agent, *localAgentConnection, *wireCoverageClient, *acp.ClientSideConnection) {
 	t.Helper()
 	agent := NewAgent()
 	client := &wireCoverageClient{}
@@ -129,7 +128,7 @@ func newWireCoverageConnection(t *testing.T) (*Agent, *localAgentConnection, *wi
 	agentToClientReader, agentToClientWriter := io.Pipe()
 	local := newLocalAgentConnection(agent, agentToClientWriter, clientToAgentReader)
 	agent.setAgentClient(local)
-	_ = acp.NewClientSideConnection(client, clientToAgentWriter, agentToClientReader)
+	peer := acp.NewClientSideConnection(client, clientToAgentWriter, agentToClientReader)
 	t.Cleanup(func() {
 		_ = clientToAgentWriter.Close()
 		_ = clientToAgentReader.Close()
@@ -137,13 +136,13 @@ func newWireCoverageConnection(t *testing.T) (*Agent, *localAgentConnection, *wi
 		_ = agentToClientReader.Close()
 	})
 
-	return agent, local, client
+	return agent, local, client, peer
 }
 
 func TestLocalAgentConnectionOutboundClientMethods(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	agent, local, client := newWireCoverageConnection(t)
+	agent, local, client, _ := newWireCoverageConnection(t)
 
 	form := acp.NewUnstableCreateElicitationRequestForm(acp.UnstableElicitationSchema{})
 	_, err := local.UnstableCreateElicitation(ctx, form)
@@ -201,78 +200,122 @@ func TestLocalAgentConnectionOutboundClientMethods(t *testing.T) {
 	require.Error(t, err)
 }
 
-type failingWireWriter struct{}
+func TestLifecycleUpdatesFinishBeforeImmediatePromptAndTurnUpdatesCarryExactRoute(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-func (failingWireWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+	agent, _, wireClient, peer := newWireCoverageConnection(t)
+	nativeClient := newFakeOpenCodeClient()
+	nativeClient.createSession = testNativeSession("native-boundary")
+	nativeClient.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
+	agent.runtime = nativeClient
 
-func TestPostResponseWriterAllWireShapes(t *testing.T) {
-	var hooks []acp.SessionId
-	writer := newPostResponseWriter(io.Discard, func(id acp.SessionId) func() {
-		hooks = append(hooks, id)
-
-		return func() {}
-	})
-
-	for _, line := range [][]byte{
-		[]byte("not json"),
-		[]byte(`{"id":1}`),
-		[]byte(`{"id":1,"method":"unknown","params":{}}`),
-		[]byte(`{"id":2,"method":"session/load","params":{}}`),
-		[]byte(`{"id":3,"method":"session/new","params":{}}`),
-		[]byte(`{"id":"resume","method":"session/resume","params":{"sessionId":"existing"}}`),
-	} {
-		writer.observeRequestLine(line)
-	}
-
-	for _, line := range [][]byte{
-		[]byte("not json"),
-		[]byte(`{"id":3,"method":"notification"}`),
-		[]byte(`{"id":999,"result":{}}`),
-		[]byte(`{"id":3,"error":{"code":-1}}`),
-	} {
-		require.Empty(t, writer.hooksForResponseLine(line))
-	}
-
-	writer.observeRequestLine([]byte(`{"id":4,"method":"session/new","params":{}}`))
-	require.Empty(t, writer.hooksForResponseLine([]byte(`{"id":4,"result":"bad"}`)))
-	writer.observeRequestLine([]byte(`{"id":5,"method":"session/new","params":{}}`))
-	require.Empty(t, writer.hooksForResponseLine([]byte(`{"id":5,"result":{}}`)))
-	writer.observeRequestLine([]byte(`{"id":6,"method":"session/new","params":{}}`))
-	require.Len(t, writer.hooksForResponseLine([]byte(`{"id":6,"result":{"sessionId":"new"}}`)), 1)
-	require.Len(t, writer.hooksForResponseLine([]byte(`{"id":"resume","result":{}}`)), 1)
-	require.Equal(t, []acp.SessionId{"new", "existing"}, hooks)
-
-	withoutHook := newPostResponseWriter(io.Discard, nil)
-	require.Nil(t, withoutHook.hooksForResponseLine([]byte(`{"id":1,"result":{}}`)))
-
-	failing := newPostResponseWriter(failingWireWriter{}, nil)
-	_, err := failing.Write([]byte("payload"))
-	require.ErrorContains(t, err, "write failed")
-	_, err = writer.Write([]byte(`{"id":100,"result":{}}`))
+	_, err := peer.Initialize(ctx, acp.InitializeRequest{})
+	require.NoError(t, err)
+	created, err := peer.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
 
-	_, ok := jsonRPCIDKey(nil)
-	require.False(t, ok)
-	_, ok = jsonRPCIDKey(json.RawMessage(`{`))
-	require.False(t, ok)
-	key, ok := jsonRPCIDKey(json.RawMessage(` { "a" : 1 } `))
-	require.True(t, ok)
-	require.Equal(t, `{"a":1}`, key)
+	wireClient.mu.Lock()
+	require.Len(t, wireClient.updates, 1, "lifecycle command discovery must finish before session/new returns")
+	require.Nil(t, wireClient.updates[0].Meta)
+	require.NotNil(t, wireClient.updates[0].Update.AvailableCommandsUpdate)
+	wireClient.mu.Unlock()
+
+	turn := 0
+	nativeClient.sendMessage = func(ctx context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		turn++
+		messageID := fmt.Sprintf("assistant-%d", turn)
+		partID := fmt.Sprintf("part-%d", turn)
+		streamed := fmt.Sprintf("stream-%d", turn)
+		nativeClient.events <- opencode.Event{
+			Type:       eventMessageUpdated,
+			Properties: json.RawMessage(fmt.Sprintf(`{"info":{"id":%q,"sessionID":%q,"role":"assistant"}}`, messageID, id)),
+		}
+		nativeClient.events <- opencode.Event{
+			Type: eventMessagePartCreated,
+			Properties: json.RawMessage(fmt.Sprintf(
+				`{"id":%q,"sessionID":%q,"messageID":%q,"type":"text","text":%q}`,
+				partID, id, messageID, streamed,
+			)),
+		}
+
+		for {
+			wireClient.mu.Lock()
+			seen := false
+			for _, notification := range wireClient.updates {
+				chunk := notification.Update.AgentMessageChunk
+				if chunk != nil && chunk.MessageId != nil && *chunk.MessageId == messageID {
+					seen = true
+
+					break
+				}
+			}
+			wireClient.mu.Unlock()
+			if seen {
+				break
+			}
+
+			select {
+			case <-ctx.Done():
+				return opencode.NativeMessage{}, ctx.Err()
+			case <-time.After(time.Millisecond):
+			}
+		}
+
+		return opencode.NativeMessage{
+			Info: opencode.NativeMessageInfo{ID: messageID, SessionID: id, Role: "assistant", Finish: "stop"},
+			Parts: []opencode.NativePart{{
+				ID: partID, SessionID: id, MessageID: messageID, Type: partTypeText, Text: streamed + "-terminal",
+			}},
+		}, nil
+	}
+
+	for index, nonce := range []string{"route-turn-one", "route-turn-two"} {
+		wireClient.mu.Lock()
+		start := len(wireClient.updates)
+		wireClient.mu.Unlock()
+
+		response, promptErr := peer.Prompt(ctx, TextPromptRequest(created.SessionId, nonce, fmt.Sprintf("turn %d", index+1)))
+		require.NoError(t, promptErr)
+		require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+
+		wireClient.mu.Lock()
+		turnUpdates := append([]acp.SessionNotification(nil), wireClient.updates[start:]...)
+		wireClient.mu.Unlock()
+		require.NotEmpty(t, turnUpdates)
+		for _, notification := range turnUpdates {
+			require.Len(t, notification.Meta, 1)
+			route, ok := notification.Meta[routeEnvelopeKey].(map[string]any)
+			require.True(t, ok)
+			require.Len(t, route, 2)
+			require.EqualValues(t, routeEnvelopeVersion, route[routeFieldVersion])
+			require.Equal(t, nonce, route[routeFieldTurnNonce])
+			chunk := notification.Update.AgentMessageChunk
+			if chunk != nil {
+				require.NotNil(t, chunk.MessageId)
+				require.Equal(t, fmt.Sprintf("assistant-%d", index+1), *chunk.MessageId)
+			}
+		}
+	}
 }
 
-func TestPostResponseInputFramingAndGenericLifecycleHandlers(t *testing.T) {
-	var hookCalls []acp.SessionId
-	writer := newPostResponseWriter(io.Discard, func(id acp.SessionId) func() {
-		hookCalls = append(hookCalls, id)
+func TestConnectionInputGateAndGenericResponseHandlers(t *testing.T) {
+	gate := newConnectionInputGate(strings.NewReader("payload"))
+	readDone := make(chan string, 1)
+	go func() {
+		buffer := make([]byte, 7)
+		n, _ := gate.Read(buffer)
+		readDone <- string(buffer[:n])
+	}()
+	select {
+	case <-readDone:
+		t.Fatal("connection input gate read before open")
+	case <-time.After(10 * time.Millisecond):
+	}
+	gate.open()
+	require.Equal(t, "payload", <-readDone)
 
-		return func() {}
-	})
-	gate := newConnectionInputGate(strings.NewReader(""), writer)
-	gate.observeInput([]byte(`{"id":1,"method":"session/new","params":{}}`))
-	gate.observeInput([]byte("\n"))
-	require.Contains(t, writer.lifecycle, "1")
-
-	success := localLifecycleResponse(func(_ *Agent, _ context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	success := localResponse(func(_ *Agent, _ context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 		return acp.LoadSessionResponse{Meta: map[string]any{"id": request.SessionId}}, nil
 	})
 	result, reqErr := success(context.Background(), NewAgent(), json.RawMessage(`{"sessionId":"session","cwd":"/repo","mcpServers":[]}`))
@@ -281,7 +324,7 @@ func TestPostResponseInputFramingAndGenericLifecycleHandlers(t *testing.T) {
 	_, reqErr = success(context.Background(), NewAgent(), json.RawMessage(`{`))
 	require.NotNil(t, reqErr)
 
-	failure := localLifecycleResponse(func(*Agent, context.Context, acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	failure := localResponse(func(*Agent, context.Context, acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 		return acp.LoadSessionResponse{}, errors.New("failed")
 	})
 	_, reqErr = failure(context.Background(), NewAgent(), json.RawMessage(`{"sessionId":"session","cwd":"/repo","mcpServers":[]}`))

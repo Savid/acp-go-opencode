@@ -457,7 +457,6 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	loaded, err := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
 	require.NoError(t, err)
 	require.NotNil(t, loaded.Meta)
-	agent.refreshCommandsAfterResponse(created.SessionId)()
 	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
 	require.NoError(t, err)
 
@@ -513,7 +512,6 @@ func TestAgentLifecycleValidationAndStorageFailures(t *testing.T) {
 	_, err = agent.UnstableDeleteSession(ctx, acp.UnstableDeleteSessionRequest{})
 	require.Error(t, err)
 
-	agent.refreshCommandsAfterResponse("missing")()
 	require.NoError(t, agent.Close())
 	_, err = agent.NewSession(ctx, NewSessionRequest(cwd))
 	require.Error(t, err)
@@ -629,7 +627,7 @@ func TestHandleExtensionAndLocalConnectionHelperBranches(t *testing.T) {
 	_, err = scopedElicitationParams(acp.UnstableCreateElicitationRequest{}, elicitationScope{})
 	require.ErrorContains(t, err, "include form or url")
 
-	gate := newConnectionInputGate(strings.NewReader("{}\npartial"), nil)
+	gate := newConnectionInputGate(strings.NewReader("{}\npartial"))
 	gate.open()
 	all, err := io.ReadAll(gate)
 	require.NoError(t, err)
@@ -925,7 +923,7 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 	agent = NewAgent()
 	session := testSession(agent, client)
 	agent.sessions[session.id] = session
-	agent.refreshCommandsAfterResponse(session.id)()
+	agent.refreshLifecycleCommands(ctx, session)
 
 	closed := storedAgent(newFakeOpenCodeClient())
 	closed.closed = true
