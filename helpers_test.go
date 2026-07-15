@@ -52,6 +52,7 @@ type fakeOpenCodeClient struct {
 	sendMessage       func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
 	runCommand        func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
 	syncHistoryFunc   func(context.Context, map[string]int64) ([]opencode.SyncEvent, error)
+	refreshMCPFunc    func(context.Context, []opencode.MCPServerConfig) error
 
 	aborts         []string
 	deleted        []string
@@ -79,6 +80,7 @@ type fakeOpenCodeClient struct {
 	scopeErr       error
 	syncHistoryErr error
 	syncReplayErr  error
+	refreshMCPErr  error
 	syncEvents     []opencode.SyncEvent
 }
 
@@ -158,6 +160,14 @@ func (c *fakeOpenCodeClient) Shutdown(ctx context.Context) error { return c.Clos
 
 func (c *fakeOpenCodeClient) Scope(context.Context, opencode.ScopeOptions) (opencode.Client, error) {
 	return c, c.scopeErr
+}
+
+func (c *fakeOpenCodeClient) RefreshMCP(ctx context.Context, servers []opencode.MCPServerConfig) error {
+	if c.refreshMCPFunc != nil {
+		return c.refreshMCPFunc(ctx, servers)
+	}
+
+	return c.refreshMCPErr
 }
 
 func (c *fakeOpenCodeClient) CreateSession(ctx context.Context, title string) (opencode.NativeSession, error) {

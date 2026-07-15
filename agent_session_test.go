@@ -103,6 +103,116 @@ func TestDirectoryWithoutExplicitMCPStillHasOneSessionPrincipal(t *testing.T) {
 	require.ErrorContains(t, err, "directory_mcp_principal")
 }
 
+func TestLifecycleMCPRefreshesImmediatelyBeforeFirstNativePrompt(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-refresh")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	var (
+		orderMu sync.Mutex
+		order   []string
+	)
+
+	client.refreshMCPFunc = func(_ context.Context, servers []opencode.MCPServerConfig) error {
+		require.Equal(t, []opencode.MCPServerConfig{{
+			Name:    "wagie",
+			URL:     "http://127.0.0.1:9/mcp",
+			Headers: map[string]string{"Authorization": "Bearer session-grant"},
+		}}, servers)
+
+		orderMu.Lock()
+		order = append(order, "refresh")
+		orderMu.Unlock()
+
+		return nil
+	}
+	client.sendMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		orderMu.Lock()
+		order = append(order, "prompt")
+		orderMu.Unlock()
+
+		return opencode.NativeMessage{Info: opencode.NativeMessageInfo{
+			ID: "assistant-refresh", SessionID: id, Role: "assistant", Finish: "stop",
+		}}, nil
+	}
+
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(cwd,
+		WithSessionMCPServers(HTTPMCPServer(
+			"wagie",
+			"http://127.0.0.1:9/mcp",
+			map[string]string{"Authorization": "Bearer session-grant"},
+		)),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
+	))
+	require.NoError(t, err)
+	require.Empty(t, order, "lifecycle must not freeze the pre-arm catalog as prompt-ready")
+
+	_, err = agent.Prompt(ctx, TextPromptRequest(created.SessionId, "refresh-turn", "use the armed tool"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"refresh", "prompt"}, order)
+
+	_, err = agent.Prompt(ctx, TextPromptRequest(created.SessionId, "second-turn", "continue"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"refresh", "prompt", "prompt"}, order,
+		"one lifecycle must refresh exactly once")
+
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	require.Empty(t, agent.directories, "successful native MCP teardown must release the directory principal")
+}
+
+func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-refresh-failure")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	client.refreshMCPErr = errors.Join(opencode.ErrMCPDisconnectUnproven, errors.New("delete failed"))
+	client.sendMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		t.Fatal("native prompt ran with a stale MCP catalog")
+
+		return opencode.NativeMessage{}, nil
+	}
+
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+	mcp := HTTPMCPServer("wagie", "http://127.0.0.1:9/mcp", nil)
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(cwd,
+		WithSessionMCPServers(mcp),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
+	))
+	require.NoError(t, err)
+
+	_, err = agent.Prompt(ctx, TextPromptRequest(created.SessionId, "failed-refresh", "do not run"))
+	require.ErrorContains(t, err, "refresh OpenCode MCP catalog")
+
+	_, err = agent.NewSession(ctx, NewSessionRequest(cwd,
+		WithSessionMCPServers(mcp),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
+	))
+	require.ErrorContains(t, err, "directory_mcp_principal",
+		"failed refresh must retain the directory principal until native teardown is proven")
+
+	client.closeErr = nil
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	require.Empty(t, agent.directories)
+}
+
 func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()

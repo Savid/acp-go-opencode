@@ -98,6 +98,7 @@ type Client interface {
 	Close(context.Context) error
 	Shutdown(context.Context) error
 	Scope(context.Context, ScopeOptions) (Client, error)
+	RefreshMCP(context.Context, []MCPServerConfig) error
 	CreateSession(context.Context, string) (NativeSession, error)
 	CreateSessionWithPolicy(context.Context, string, []PermissionRule) (NativeSession, error)
 	GetSession(context.Context, string) (NativeSession, error)
@@ -1215,6 +1216,23 @@ func (s *openCodeServer) registerMCP(ctx context.Context, servers []MCPServerCon
 
 			return errors.Join(fmt.Errorf("directory MCP %q did not connect", server.Name), cleanupErr)
 		}
+	}
+
+	return nil
+}
+
+// RefreshMCP forces OpenCode to discard its cached tool catalog and reconnect
+// the directory-scoped MCP servers from their original session configuration.
+// A lifecycle request may register an endpoint before its host-side grant is
+// armed; reconnecting immediately before the first prompt makes the armed
+// catalog authoritative without weakening directory ownership or teardown.
+func (s *openCodeServer) RefreshMCP(ctx context.Context, servers []MCPServerConfig) error {
+	if err := s.unregisterMCP(ctx); err != nil {
+		return fmt.Errorf("disconnect directory MCP before refresh: %w", err)
+	}
+
+	if err := s.registerMCP(ctx, servers); err != nil {
+		return fmt.Errorf("reconnect directory MCP after refresh: %w", err)
 	}
 
 	return nil

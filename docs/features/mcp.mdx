@@ -33,6 +33,12 @@ Accepted servers are registered through authenticated `POST /mcp?directory=...`:
   executable followed by its arguments) and an `environment` map. There is no
   separate `arguments` key — the command and its args are one array.
 
+OpenCode caches each connected server's tool catalog. After a session lifecycle
+request succeeds, the adapter disconnects and re-registers the exact
+session-scoped MCP configuration immediately before that session's first native
+prompt. This makes host-side grants armed between lifecycle completion and the
+prompt visible to OpenCode instead of retaining the lifecycle-time catalog.
+
 MCP state is removed when the session's directory scope closes and is never
 written by the adapter into the shared config or portable store. Directory
 ownership is released only after every native MCP deletion succeeds (a native

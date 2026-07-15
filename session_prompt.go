@@ -356,6 +356,21 @@ func (s *session) runPromptTurn(
 	command opencode.NativeCommand,
 	matchedCommand bool,
 ) (acp.PromptResponse, error) {
+	if err := s.refreshLifecycleMCP(turnCtx); err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	return s.runPromptTurnWithRefreshedMCP(ctx, turnCtx, params, runNative, command, matchedCommand)
+}
+
+func (s *session) runPromptTurnWithRefreshedMCP(
+	ctx context.Context,
+	turnCtx context.Context,
+	params acp.PromptRequest,
+	runNative func(context.Context) (opencode.NativeMessage, error),
+	command opencode.NativeCommand,
+	matchedCommand bool,
+) (acp.PromptResponse, error) {
 	var fenceOnce sync.Once
 
 	var fenceErr error
@@ -491,6 +506,41 @@ func (s *session) runPromptTurn(
 			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
 		}
 	}
+}
+
+func (s *session) refreshLifecycleMCP(ctx context.Context) error {
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+
+	s.mu.Lock()
+	if !s.mcpRefreshPending {
+		s.mu.Unlock()
+
+		return nil
+	}
+
+	client := s.client
+	servers := cloneNativeMCPServerConfigs(s.mcpServers)
+	s.mu.Unlock()
+
+	if client == nil {
+		return acp.NewInternalError(turnFailedData(causeTransport, "OpenCode MCP refresh has no runtime client", 0, ""))
+	}
+
+	if err := client.RefreshMCP(ctx, servers); err != nil {
+		return acp.NewInternalError(turnFailedData(causeTransport, fmt.Sprintf("refresh OpenCode MCP catalog: %v", err), 0, ""))
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.client != client || s.runtimeLostCause != "" {
+		return acp.NewInternalError(turnFailedData(causeTransport, "OpenCode runtime changed during MCP refresh", 0, ""))
+	}
+
+	s.mcpRefreshPending = false
+
+	return nil
 }
 
 // turnTimeout returns the configured per-turn deadline, or 0 when no deadline

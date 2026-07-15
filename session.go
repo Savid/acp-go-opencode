@@ -36,10 +36,11 @@ type session struct {
 	outputSchema          map[string]any
 	rawMessages           rawMessageConfig
 
-	client           opencode.Client
-	directoryRelease func()
-	mcpServers       []opencode.MCPServerConfig
-	recoveryMu       sync.Mutex
+	client            opencode.Client
+	directoryRelease  func()
+	mcpServers        []opencode.MCPServerConfig
+	mcpRefreshPending bool
+	recoveryMu        sync.Mutex
 
 	turn                      chan struct{}
 	mu                        sync.Mutex

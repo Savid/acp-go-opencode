@@ -15,12 +15,16 @@ import (
 func TestScopedRuntimeMCPAndSyncMethods(t *testing.T) {
 	var mu sync.Mutex
 	var deleted []string
+	var registered []string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
 		case request.Method == http.MethodPost && request.URL.Path == "/mcp":
 			var body map[string]any
 			require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
 			name, _ := body["name"].(string)
+			mu.Lock()
+			registered = append(registered, name)
+			mu.Unlock()
 			writeJSON(t, writer, map[string]any{name: map[string]any{"status": "connected"}})
 		case request.Method == http.MethodDelete && request.URL.Path[:5] == "/mcp/":
 			mu.Lock()
@@ -50,18 +54,20 @@ func TestScopedRuntimeMCPAndSyncMethods(t *testing.T) {
 	require.NoError(t, client.Close(context.Background()), "root Close is intentionally a no-op")
 
 	servers := []MCPServerConfig{
-		{Name: "remote", URL: "https://mcp.test", Headers: map[string]string{"Authorization": "secret"}},
-		{Name: "local", Command: []string{"tool", "serve"}, Env: map[string]string{"TOKEN": "secret"}},
+		{Name: "remote-test", URL: "https://mcp.test", Headers: map[string]string{"Authorization": "secret"}},
+		{Name: "local-test", Command: []string{"tool", "serve"}, Env: map[string]string{"TOKEN": "secret"}},
 	}
 	scopedClient, err := client.Scope(context.Background(), ScopeOptions{Directory: "/repo", MCPServers: servers})
 	require.NoError(t, err)
 	scope, ok := scopedClient.(*openCodeServer)
 	require.True(t, ok)
 	require.Equal(t, "/repo", scope.directory)
+	require.NoError(t, scope.RefreshMCP(context.Background(), servers))
 	require.NoError(t, scope.Close(context.Background()))
 	require.NoError(t, scope.Close(context.Background()))
 	mu.Lock()
-	require.Equal(t, []string{"/mcp/local", "/mcp/remote"}, deleted)
+	require.Equal(t, []string{"remote-test", "local-test", "remote-test", "local-test"}, registered)
+	require.Equal(t, []string{"/mcp/local-test", "/mcp/remote-test", "/mcp/local-test", "/mcp/remote-test"}, deleted)
 	mu.Unlock()
 
 	events, err := client.SyncHistory(context.Background(), nil)
@@ -71,10 +77,10 @@ func TestScopedRuntimeMCPAndSyncMethods(t *testing.T) {
 	require.NoError(t, client.SyncReplay(context.Background(), "/repo", []SyncReplayEvent{{Type: "message.updated"}}))
 
 	block := openCodeMCPConfigBlock(servers)
-	remote, ok := block["remote"].(map[string]any)
+	remote, ok := block["remote-test"].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, "remote", remote["type"])
-	local, ok := block["local"].(map[string]any)
+	local, ok := block["local-test"].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, "local", local["type"])
 	require.Nil(t, openCodeMCPConfigBlock(nil))
@@ -119,6 +125,44 @@ func TestScopeAndMCPFailureShapes(t *testing.T) {
 		err := client.unregisterMCP(context.Background())
 		require.ErrorIs(t, err, ErrMCPDisconnectUnproven)
 		require.Equal(t, []string{"one", "two"}, client.mcpNames)
+	})
+
+	t.Run("refresh stops when disconnect is unproven", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			require.Equal(t, http.MethodDelete, request.Method)
+			writer.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(server.Close)
+
+		client := &openCodeServer{
+			httpClient: server.Client(), baseURL: server.URL,
+			mcpNames: []string{"one"},
+		}
+		err := client.RefreshMCP(context.Background(), []MCPServerConfig{{Name: "one", URL: "https://mcp.test"}})
+		require.ErrorIs(t, err, ErrMCPDisconnectUnproven)
+		require.ErrorContains(t, err, "disconnect directory MCP before refresh")
+		require.Equal(t, []string{"one"}, client.mcpNames)
+	})
+
+	t.Run("refresh reports reconnect failure after proven disconnect", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodDelete {
+				writer.WriteHeader(http.StatusNoContent)
+
+				return
+			}
+
+			writer.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(server.Close)
+
+		client := &openCodeServer{
+			httpClient: server.Client(), baseURL: server.URL,
+			mcpNames: []string{"one"},
+		}
+		err := client.RefreshMCP(context.Background(), []MCPServerConfig{{Name: "one", URL: "https://mcp.test"}})
+		require.ErrorContains(t, err, "reconnect directory MCP after refresh")
+		require.Empty(t, client.mcpNames, "failed reconnect cleanup proved the refreshed registration absent")
 	})
 
 	t.Run("scope close retries disconnect before closing", func(t *testing.T) {

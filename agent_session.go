@@ -79,6 +79,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	session.directoryRelease = releaseDirectory
 	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
+	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
 
 	if err := a.storeStartedSession(session); err != nil {
@@ -231,6 +232,7 @@ func (a *Agent) loadOrResumeSession(
 	session.directoryRelease = releaseDirectory
 	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
+	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
 
 	if err := a.storeStartedSession(session); err != nil {
@@ -462,6 +464,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	session.directoryRelease = releaseDirectory
 	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
+	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
 
 	if err := a.storeStartedSession(session); err != nil {

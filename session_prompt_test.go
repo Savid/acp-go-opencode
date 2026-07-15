@@ -3071,6 +3071,36 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 	})
 }
 
+func TestLifecycleMCPRefreshRemainingRuntimeBranches(t *testing.T) {
+	t.Run("missing client", func(t *testing.T) {
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		session.mcpRefreshPending = true
+		session.client = nil
+
+		err := session.refreshLifecycleMCP(context.Background())
+		require.ErrorContains(t, err, "no runtime client")
+		require.True(t, session.mcpRefreshPending)
+	})
+
+	t.Run("runtime changes during refresh", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		session := testSession(NewAgent(), client)
+		session.mcpRefreshPending = true
+		session.mcpServers = []opencode.MCPServerConfig{{Name: "wagie", URL: "https://mcp.test"}}
+		client.refreshMCPFunc = func(context.Context, []opencode.MCPServerConfig) error {
+			session.mu.Lock()
+			session.runtimeLostCause = "runtime exited"
+			session.mu.Unlock()
+
+			return nil
+		}
+
+		err := session.refreshLifecycleMCP(context.Background())
+		require.ErrorContains(t, err, "runtime changed during MCP refresh")
+		require.True(t, session.mcpRefreshPending)
+	})
+}
+
 func eventFromJSON(t *testing.T, raw string) opencode.Event {
 	t.Helper()
 	var event opencode.Event
