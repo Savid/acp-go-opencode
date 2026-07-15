@@ -207,6 +207,8 @@ func TestSendMessagePollingSkipsAndAssistantFailure(t *testing.T) {
 					"id": "new", "role": "assistant", "finish": "error", "error": map[string]any{"message": "provider failed"},
 				}}})
 			}
+		case request.Method == http.MethodGet && request.URL.Path == "/session/status":
+			writeJSON(t, writer, map[string]any{"s": map[string]any{"type": "idle"}})
 		default:
 			writer.WriteHeader(http.StatusNotFound)
 		}

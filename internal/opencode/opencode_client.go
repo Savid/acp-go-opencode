@@ -59,7 +59,8 @@ const (
 	routeAPIPermissionRequest = "/api/permission/request"
 	routeAPIQuestionRequest   = "/api/question/request"
 
-	roleAssistant = "assistant"
+	roleAssistant           = "assistant"
+	nativeSessionStatusIdle = "idle"
 )
 
 // Native OpenCode /doc path templates validated during readiness.
@@ -1386,6 +1387,8 @@ func (s *openCodeServer) SendMessage(ctx context.Context, id string, req Message
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
+	var candidate NativeMessage
+
 	for {
 		messages, err := s.messagesWithClient(ctx, client, id)
 		if err == nil {
@@ -1395,12 +1398,21 @@ func (s *openCodeServer) SendMessage(ctx context.Context, id string, req Message
 					continue
 				}
 
-				if err := AssistantMessageError(message); err != nil {
-					return NativeMessage{}, err
-				}
+				candidate = message
 
-				return message, nil
+				break
 			}
+		}
+
+		statuses, statusErr := s.sessionStatusWithClient(ctx, client)
+		status, active := statuses[id]
+
+		if candidate.Info.ID != "" && statusErr == nil && (!active || status.Type == nativeSessionStatusIdle) {
+			if err := AssistantMessageError(candidate); err != nil {
+				return NativeMessage{}, err
+			}
+
+			return candidate, nil
 		}
 
 		select {
@@ -1497,8 +1509,14 @@ func (s *openCodeServer) messagesWithClient(ctx context.Context, client *http.Cl
 }
 
 func (s *openCodeServer) SessionStatus(ctx context.Context) (map[string]NativeSessionStatus, error) {
+	return s.sessionStatusWithClient(ctx, s.httpClient)
+}
+
+func (s *openCodeServer) sessionStatusWithClient(
+	ctx context.Context, client *http.Client,
+) (map[string]NativeSessionStatus, error) {
 	out := map[string]NativeSessionStatus{}
-	err := s.getJSON(ctx, routeSessionStatus, nil, &out)
+	err := s.doJSONWithClient(ctx, client, http.MethodGet, routeSessionStatus, nil, nil, &out)
 
 	return out, err
 }

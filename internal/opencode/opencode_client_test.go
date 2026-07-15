@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -223,6 +224,8 @@ func TestOpenCodeSendMessageUsesNoDeadlineHTTPClient(t *testing.T) {
 				"role":      "assistant",
 				"finish":    "stop",
 			}}})
+		case "/session/status":
+			writeJSON(t, w, map[string]any{"s": map[string]any{"type": "idle"}})
 		case "/session/s":
 			writeJSON(t, w, map[string]any{"id": "s"})
 		default:
@@ -242,6 +245,59 @@ func TestOpenCodeSendMessageUsesNoDeadlineHTTPClient(t *testing.T) {
 	}
 	if _, err := client.GetSession(context.Background(), "s"); err == nil {
 		t.Fatal("regular REST call unexpectedly bypassed timeout")
+	}
+}
+
+func TestOpenCodeSendMessageWaitsForIdleAfterToolCallStep(t *testing.T) {
+	var prompted atomic.Bool
+	var messagePolls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/session/s/prompt_async":
+			prompted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		case "/session/s/message":
+			if !prompted.Load() {
+				writeJSON(t, w, []map[string]any{})
+
+				return
+			}
+			poll := messagePolls.Add(1)
+			message := map[string]any{"info": map[string]any{
+				"id": "assistant-tool-step", "sessionID": "s", "role": "assistant", "finish": "tool-calls",
+			}}
+			if poll > 1 {
+				message = map[string]any{"info": map[string]any{
+					"id": "assistant-final", "sessionID": "s", "role": "assistant", "finish": "stop",
+				}}
+			}
+			writeJSON(t, w, []map[string]any{message})
+		case "/session/status":
+			status := "busy"
+			if messagePolls.Load() > 1 {
+				status = "idle"
+			}
+			writeJSON(t, w, map[string]any{"s": map[string]any{"type": status}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &openCodeServer{
+		httpClient: server.Client(), baseURL: server.URL, username: "opencode", password: "secret",
+	}
+	message, err := client.SendMessage(t.Context(), "s", MessageRequest{
+		Parts: []map[string]any{{"type": "text", "text": "use a tool, then continue"}},
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if message.Info.ID != "assistant-final" {
+		t.Fatalf("SendMessage returned intermediate assistant %q", message.Info.ID)
+	}
+	if got := messagePolls.Load(); got < 2 {
+		t.Fatalf("message polls = %d, want at least 2", got)
 	}
 }
 
