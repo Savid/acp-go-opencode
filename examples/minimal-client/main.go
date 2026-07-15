@@ -42,6 +42,7 @@ var startAgent = startAgentProcess
 var getwd = os.Getwd
 var exit = os.Exit
 var commandContext = exec.CommandContext
+var newTurnNonce = opencodeacp.NewTurnNonce
 
 const agentPackage = "github.com/savid/acp-go-opencode/cmd/acp-go-opencode"
 
@@ -304,7 +305,12 @@ func runConversation(
 		_, _ = conn.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: session.SessionId})
 	}()
 
-	resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(session.SessionId, prompt))
+	turnNonce, err := newTurnNonce()
+	if err != nil {
+		return err
+	}
+
+	resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(session.SessionId, turnNonce, prompt))
 	if err != nil {
 		return err
 	}

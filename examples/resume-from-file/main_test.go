@@ -21,8 +21,8 @@ import (
 func TestReadTranscriptJSONL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	writeFile(t, path, "\n"+
-		`{"format":"opencode-state-v1","session":{"sessionId":"session-1","cwd":"/repo"}}`+"\n"+
-		`{"format":"opencode-state-v1"}`+"\n"+
+		`{"format":"opencode-sync-events-v1","session":{"sessionId":"session-1","cwd":"/repo"}}`+"\n"+
+		`{"format":"opencode-sync-events-v1"}`+"\n"+
 		`{"sessionId":"idmap-only"}`+"\n")
 
 	entries, sessionID, cwd, err := readTranscriptJSONL(path)
@@ -56,8 +56,8 @@ func TestRunUsesInferredValuesAndLoadedSession(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	cwd := t.TempDir()
 	writeFile(t, path,
-		fmt.Sprintf(`{"format":"opencode-state-v1","session":{"sessionId":"session-1","cwd":%q}}`+"\n", cwd)+
-			`{"sessionId":"session-1","format":"opencode-state-v1"}`+"\n")
+		fmt.Sprintf(`{"format":"opencode-sync-events-v1","session":{"sessionId":"session-1","cwd":%q}}`+"\n", cwd)+
+			`{"sessionId":"session-1","format":"opencode-sync-events-v1"}`+"\n")
 
 	previousRunLoaded := runLoaded
 	expectedSessionID := "session-1"
@@ -111,7 +111,7 @@ func TestRunErrors(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "session.jsonl")
-	writeFile(t, path, `{"format":"opencode-state-v1"}`+"\n")
+	writeFile(t, path, `{"format":"opencode-sync-events-v1"}`+"\n")
 	if err := run(context.Background(), []string{"-file", path}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "session id is required") {
 		t.Fatalf("expected session id error, got %v", err)
 	}
@@ -126,7 +126,7 @@ func TestRunErrors(t *testing.T) {
 		getwd = previousGetwd
 		runLoaded = previousRunLoaded
 	})
-	writeFile(t, path, `{"sessionId":"session-1","format":"opencode-state-v1"}`+"\n")
+	writeFile(t, path, `{"sessionId":"session-1","format":"opencode-sync-events-v1"}`+"\n")
 	if err := run(context.Background(), []string{"-file", path}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "getwd failed") {
 		t.Fatalf("expected getwd error, got %v", err)
 	}
@@ -165,7 +165,11 @@ func TestRunLoadedSessionWithFakeServe(t *testing.T) {
 
 func TestRunLoadedSessionErrors(t *testing.T) {
 	previousServe := serve
-	t.Cleanup(func() { serve = previousServe })
+	previousNewTurnNonce := newTurnNonce
+	t.Cleanup(func() {
+		serve = previousServe
+		newTurnNonce = previousNewTurnNonce
+	})
 
 	for name, method := range map[string]string{
 		"initialize": acp.AgentMethodInitialize,
@@ -178,6 +182,12 @@ func TestRunLoadedSessionErrors(t *testing.T) {
 				t.Fatalf("%s error path succeeded", name)
 			}
 		})
+	}
+
+	serve = fakeServe(t, "", nil)
+	newTurnNonce = func() (string, error) { return "", errors.New("entropy failed") }
+	if err := runLoadedSession(context.Background(), opencodeacp.NewInMemorySessionStore(), "session-1", t.TempDir(), "prompt", "", "", io.Discard); err == nil || !strings.Contains(err.Error(), "entropy failed") {
+		t.Fatalf("expected turn nonce error, got %v", err)
 	}
 }
 

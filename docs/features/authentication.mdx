@@ -1,6 +1,6 @@
 ---
 title: Authentication
-description: Why the adapter advertises no ACP auth methods and how it secures each per-session OpenCode process.
+description: Why the adapter advertises no ACP auth methods and how it secures the shared OpenCode runtime.
 ---
 
 Provider authentication belongs to OpenCode, not to the adapter. You sign in to
@@ -18,15 +18,15 @@ Because provider auth is native, the [models and config](/docs/features/models-c
 option catalog is populated only from providers OpenCode is already
 authenticated for.
 
-## Per-session server credentials
+## Runtime server credentials
 
-The adapter's own trust boundary is the loopback link to each
-`opencode serve` process. Every session's server binds to `127.0.0.1` and
-receives a random `OPENCODE_SERVER_PASSWORD`; all REST and SSE calls to it use
-HTTP basic auth with that password.
+The adapter's own trust boundary is the loopback link to its Agent-owned
+`opencode serve` process. The server binds to `127.0.0.1` and receives a random
+`OPENCODE_SERVER_PASSWORD`; all REST and SSE calls use HTTP basic auth with
+that password.
 
 <Note>
-Session snapshots deliberately exclude credential-bearing native files such as
-`auth.json`, so provider credentials are not written into the session store.
-Auth is re-injected from the host environment at hydrate time.
+Session snapshots contain only allowlisted native sync events. Native files,
+provider credentials, MCP credentials, and control secrets are never copied
+into the session store.
 </Note>

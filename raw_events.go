@@ -25,14 +25,11 @@ const (
 	modelFieldPrompt        = "model"
 	openCodePermissionAsk   = "ask"
 	openCodePermissionAllow = "allow"
-	idmapSubpath            = "idmap"
-	xdgDataSubpath          = "xdg/data"
-	xdgConfigSubpath        = "xdg/config"
-	xdgCacheSubpath         = "xdg/cache"
-	xdgStateSubpath         = "xdg/state"
+	openCodePermissionDeny  = "deny"
 	jsonFieldError          = "error"
 	jsonFieldMessage        = "message"
 	jsonFieldMethod         = "method"
+	jsonFieldRequest        = "request"
 	jsonFieldSessionID      = "sessionId"
 	jsonFieldCwd            = "cwd"
 	jsonFieldSequence       = "sequence"
@@ -47,6 +44,7 @@ const (
 	jsonFieldServer                    = "server"
 	jsonFieldCommand                   = "command"
 	jsonFieldMessageID                 = "messageId"
+	errValueAgentClosed                = "agent closed"
 	jsonFieldMode                      = "mode"
 	jsonFieldURL                       = "url"
 	jsonFieldMime                      = "mime"
@@ -55,6 +53,9 @@ const (
 	jsonFieldValue                     = "value"
 	jsonFieldLimit                     = "limit"
 	jsonFieldTitle                     = "title"
+	jsonFieldScope                     = "scope"
+	jsonFieldKey                       = "key"
+	jsonFieldPath                      = "path"
 	validationRequired                 = "required"
 	validationDuplicate                = "duplicate"
 	errValueBackpressure               = "backpressure"
@@ -115,10 +116,15 @@ func capRawEventPayload(payload map[string]any) map[string]any {
 		marker[rawMarkerSizeBytes] = len(encoded)
 	}
 
-	return map[string]any{
+	capped := map[string]any{
 		jsonFieldSessionID: payload[jsonFieldSessionID],
 		jsonFieldSequence:  payload[jsonFieldSequence],
 		jsonFieldSource:    payload[jsonFieldSource],
 		jsonFieldEvent:     marker,
 	}
+	if meta, ok := payload["_meta"]; ok {
+		capped["_meta"] = meta
+	}
+
+	return capped
 }

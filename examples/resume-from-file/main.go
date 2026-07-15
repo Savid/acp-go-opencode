@@ -32,11 +32,12 @@ type client struct {
 var _ acp.Client = (*client)(nil)
 
 var (
-	runMain   = run
-	runLoaded = runLoadedSession
-	getwd     = os.Getwd
-	exit      = os.Exit
-	serve     = opencodeacp.Serve
+	runMain      = run
+	runLoaded    = runLoadedSession
+	getwd        = os.Getwd
+	exit         = os.Exit
+	serve        = opencodeacp.Serve
+	newTurnNonce = opencodeacp.NewTurnNonce
 )
 
 func (*client) ReadTextFile(_ context.Context, params acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
@@ -117,7 +118,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	cwd := flags.String("cwd", "", "session cwd; defaults to the JSONL cwd or current directory")
 	prompt := flags.String("prompt", defaultPrompt, "prompt to send after loading history")
 	opencodePath := flags.String("path", "", "path to opencode CLI")
-	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
+	scratchDir := flags.String("scratch-dir", "", "parent directory for shared runtime scratch; empty means the system temp directory")
 
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -219,7 +220,12 @@ func runLoadedSession(
 
 	fmt.Fprintln(stdout, "== resume smoke test ==")
 
-	resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(id, prompt))
+	turnNonce, err := newTurnNonce()
+	if err != nil {
+		return err
+	}
+
+	resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(id, turnNonce, prompt))
 	if err != nil {
 		return err
 	}

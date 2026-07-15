@@ -250,6 +250,15 @@ func TestRunConversation(t *testing.T) {
 	require.Contains(t, output.String(), "stop reason: end_turn")
 }
 
+func TestRunConversationRejectsTurnNonceFailure(t *testing.T) {
+	original := newTurnNonce
+	newTurnNonce = func() (string, error) { return "", errors.New("entropy failed") }
+	t.Cleanup(func() { newTurnNonce = original })
+
+	err := runConversation(context.Background(), &fakeAgentConnection{}, "/repo", "hello", io.Discard)
+	require.ErrorContains(t, err, "entropy failed")
+}
+
 func TestRunConversationErrors(t *testing.T) {
 	t.Parallel()
 

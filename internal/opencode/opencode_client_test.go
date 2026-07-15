@@ -30,6 +30,10 @@ func fakeReadinessRoutesHandler(t *testing.T, seen *[]string) http.HandlerFunc {
 		case "/event":
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte(`data: {"type":"server.connected","properties":{}}` + "\n\n"))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
 		case "/api/question/request":
 			writeJSON(t, w, map[string]any{"data": []map[string]any{{"id": "q", "sessionID": "s"}}})
 		case "/question":
@@ -200,16 +204,25 @@ func TestOpenCodePendingSessionListErrors(t *testing.T) {
 }
 
 func TestOpenCodeSendMessageUsesNoDeadlineHTTPClient(t *testing.T) {
+	prompted := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(25 * time.Millisecond)
 		switch r.URL.Path {
+		case "/session/s/prompt_async":
+			prompted = true
+			w.WriteHeader(http.StatusNoContent)
 		case "/session/s/message":
-			writeJSON(t, w, map[string]any{"info": map[string]any{
+			if !prompted {
+				writeJSON(t, w, []map[string]any{})
+
+				return
+			}
+			writeJSON(t, w, []map[string]any{{"info": map[string]any{
 				"id":        "assistant",
 				"sessionID": "s",
 				"role":      "assistant",
 				"finish":    "stop",
-			}})
+			}}})
 		case "/session/s":
 			writeJSON(t, w, map[string]any{"id": "s"})
 		default:
@@ -570,14 +583,8 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 	if compareSemver("1.2.3", "1.2.4") >= 0 || compareSemver("1.3.0", "1.2.9") <= 0 || compareSemver("v1.2.3-beta", "1.2.3") != 0 {
 		t.Fatal("compareSemver returned unexpected ordering")
 	}
-	if SafePathName("../a:b") != "__a_b" || SafePathName("") != "session" {
-		t.Fatalf("SafePathName mismatch")
-	}
 	if got := envMapToSlice(map[string]string{"B": "2", "A": "1"}); !reflect.DeepEqual(got, []string{"A=1", "B=2"}) {
 		t.Fatalf("envMapToSlice = %#v", got)
-	}
-	if passwordHash("secret") == "" {
-		t.Fatal("empty password hash")
 	}
 	wrapped := errors.New("wrapped")
 	if !errors.Is(StreamError{Epoch: 1, Err: wrapped}, wrapped) {
@@ -663,6 +670,7 @@ func fullOpenCodeDoc() map[string]any {
 		"/session/{sessionID}",
 		"/session/{sessionID}/command",
 		"/session/{sessionID}/message",
+		"/session/{sessionID}/prompt_async",
 		"/session/{sessionID}/abort",
 		"/session/{sessionID}/fork",
 		"/session/{sessionID}/todo",
@@ -902,15 +910,22 @@ func TestOpenCodeBlockingPostRecoversPersistedCause(t *testing.T) {
 		{name: "message surfaces transport error when nothing persisted", transparent: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			postPath := "/session/s/message"
+			postPath := "/session/s/prompt_async"
 			if tt.command {
 				postPath = "/session/s/command"
 			}
+			messageReads := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodPost && r.URL.Path == postPath:
 					severMidBody(w)
 				case r.Method == http.MethodGet && r.URL.Path == "/session/s/message":
+					messageReads++
+					if !tt.command && messageReads == 1 {
+						writeJSON(t, w, []map[string]any{{"info": map[string]any{"id": "u", "sessionID": "s", "role": "user"}}})
+
+						return
+					}
 					if !tt.persist {
 						writeJSON(t, w, []map[string]any{{"info": map[string]any{"id": "u", "sessionID": "s", "role": "user"}}})
 
@@ -1003,11 +1018,18 @@ func TestOpenCodeBlockingPostDoubleFailureNamesBoth(t *testing.T) {
 		_ = conn.Close()
 	}
 
+	messageReads := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/session/s/message":
+		case r.Method == http.MethodPost && r.URL.Path == "/session/s/prompt_async":
 			severMidBody(w)
 		case r.Method == http.MethodGet && r.URL.Path == "/session/s/message":
+			messageReads++
+			if messageReads == 1 {
+				writeJSON(t, w, []map[string]any{{"info": map[string]any{"id": "u", "sessionID": "s", "role": "user"}}})
+
+				return
+			}
 			// The recovery re-fetch also fails: the server is effectively dead.
 			http.Error(w, "gateway is down", http.StatusBadGateway)
 		default:

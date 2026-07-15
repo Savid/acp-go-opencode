@@ -3,17 +3,12 @@
 package opencode
 
 import (
-	"errors"
 	"os/exec"
 	"syscall"
 )
 
 func configureOpenCodeProcess(cmd *exec.Cmd) {
-	// These platforms have no Pdeathsig equivalent; parent-death cleanup is
-	// best-effort via process-group signalling and stale-lease reaping.
+	// These platforms have no Pdeathsig equivalent. The supervisor pair owns
+	// process-tree cleanup and this process group is its containment boundary.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-}
-
-func inspectOpenCodeProcess(int) (processIdentity, error) {
-	return processIdentity{}, errors.ErrUnsupported
 }

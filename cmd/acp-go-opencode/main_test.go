@@ -60,7 +60,7 @@ func TestRunServeSuccessAndError(t *testing.T) {
 		"-opencode-pure",
 		"-opencode-question-tool",
 		"-opencode-log-level", "INFO",
-		"-opencode-minimum-version", "1.2.3",
+		"-opencode-version", "1.2.3",
 		"-opencode-health-timeout", "1s",
 		"-seed-file", "opencode.json=" + seedHost,
 	}, strings.NewReader(""), io.Discard, io.Discard); code != 0 {

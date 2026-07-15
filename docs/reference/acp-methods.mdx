@@ -13,12 +13,12 @@ extension. This page lists each method and its behavior.
 | `initialize` | Advertises capabilities, empty `authMethods`, and `_meta.opencode`. |
 | `authenticate` | Rejected with invalid-params echoing the requested `methodId`. |
 | `logout` | No-op; clears only adapter-owned session state. |
-| `session/new` | Create a session and launch its OpenCode process. |
+| `session/new` | Create a native session in the Agent-owned OpenCode runtime. |
 | `session/load` | Recreate a stored session and replay its history. |
 | `session/resume` | Restore a stored session without replay. |
 | `session/list` | Enumerate stored sessions. Pages carry an opaque base64 cursor; a cursor past the end is invalid params. |
-| `session/prompt` | Run a prompt turn against the native session. |
-| `session/cancel` | Cancel the running turn. |
+| `session/prompt` | Run a prompt turn; requires route version 1 and a fresh turn nonce. |
+| `session/cancel` | Cancel only the running turn whose nonce exactly matches. |
 | `session/close` | End the session and take a final snapshot. |
 | `session/delete` | Remove a stored session, leaving a tombstone. |
 | `session/set_config_option` | Change the `model` or `mode` option live. |

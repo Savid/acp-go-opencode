@@ -4,12 +4,12 @@ Shared instructions for automated coding agents working in this repository.
 
 ## Purpose
 
-This project is a Go implementation of an ACP agent for OpenCode. It runs one
-isolated `opencode serve` process per ACP session and builds directly on
+This project is a Go implementation of an ACP agent for OpenCode. Each Agent
+owns one shared `opencode serve` runtime and builds directly on
 `github.com/coder/acp-go-sdk`. OpenCode owns model execution and native state;
-this package owns ACP dispatch, process launch, per-session XDG isolation,
-REST/SSE event mapping, permission requests, config options, and
-`opencode-state-v1` session storage.
+this package owns ACP dispatch, supervised runtime/XDG ownership,
+directory/session/turn routing, REST/SSE event mapping, permission requests,
+config options, and `opencode-sync-events-v1` session storage.
 
 ## Project Map
 
@@ -37,15 +37,17 @@ Organized by domain. The public surface lives in the root package
   session store, telemetry providers, and OpenCode runtime toggles) and the
   exported request builders, `OpenCodeOptions`, MCP server builders, and fork
   call helper.
-- **Session storage** (`session_store.go`, `session_state_store.go`): the
+- **Session storage** (`session_store.go`, `session_state_store.go`,
+  `session_restore_ownership.go`): the
   `SessionStore` interface, `InMemorySessionStore`, the
-  `opencode-state-v1` format constant, and native-state snapshot capture.
+  `opencode-sync-events-v1` format constant, allowlisted native-event capture,
+  durable restore ownership, path rebasing, and online replay verification.
 - **Raw events** (`raw_events.go`): opt-in raw native event gating and the
   `_opencode/rawEvent` notification config.
-- **Native OpenCode client** (`internal/opencode`, package `opencode`:
-  `opencode_client.go`, `opencode_process_*.go`): launch and readiness of the
-  loopback `opencode serve` process, the native REST client and wire types, the
-  SSE event stream, and per-GOOS process-group termination.
+- **Native OpenCode client** (`internal/opencode`, package `opencode`): launch
+  and readiness of the loopback `opencode serve` process, native REST and
+  directory-scoped SSE, dynamic MCP scopes, portable home locking, and the
+  per-GOOS dual-supervisor process-tree fence.
 - **Observability** (`internal/observer`): OpenTelemetry instrumentation
   helpers (trace/metric definitions, trace-context propagation) and the
   instrumentation name.
@@ -89,7 +91,7 @@ binary named through `ACP_GO_OPENCODE_AGENT_BINARY` with `GOCOVERDIR`
 coverage. The live suite reads `ACP_GO_OPENCODE_MODEL`,
 `ACP_GO_OPENCODE_PERMISSION_PROMPT`, and `ACP_GO_OPENCODE_QUESTION_PROMPT` to
 tune the model and the prompts used to exercise permission and question flows.
-Live tests always launch OpenCode under an isolated per-session XDG home.
+Live tests always launch OpenCode under an exclusive test runtime XDG root.
 
 ## Coding Rules
 
@@ -126,8 +128,8 @@ Unless explicitly requested, ask before:
 
 - Changing the permission or question/elicitation flow shape.
 - Adding new ACP extension methods or `_meta` fields.
-- Changing the `opencode-state-v1` session-store contract.
-- Changing per-session XDG isolation or the native process launch and teardown
+- Changing the `opencode-sync-events-v1` session-store contract.
+- Changing shared XDG ownership or the native process launch and teardown
   behavior.
 
 ## Security And Boundaries
@@ -138,8 +140,13 @@ Unless explicitly requested, ask before:
   only clears adapter-owned session state.
 - Do not log auth material, user secrets, prompts, tool input, tool output, or
   raw native OpenCode event bodies by default.
-- Keep each session's native state isolated in its own XDG home; copy state
-  only through intentional session fork behavior.
+- Keep the shared XDG root single-writer and never open the live native
+  database directly. Portable state moves only through allowlisted online sync
+  events.
+- Route every prompt, active cancellation, session update, raw event, and
+  elicitation with the versioned turn envelope. Fence permissions structurally
+  by session id plus a tool-call id pending in the current turn; never infer an
+  ambiguous active session.
 - Reject unsupported ACP extension or provider mutation methods with explicit
   protocol errors unless this agent implements a namespaced extension.
 - Avoid broad filesystem or network behavior in tests unless the test is

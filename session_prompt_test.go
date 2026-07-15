@@ -14,6 +14,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
+	"github.com/stretchr/testify/require"
 )
 
 func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
@@ -138,7 +139,7 @@ func TestPromptRejectsInvalidCurrentModel(t *testing.T) {
 	}
 	session := testSession(NewAgent(), client)
 
-	_, err := session.Prompt(ctx, TextPromptRequest(session.id, "hello"))
+	_, err := session.Prompt(ctx, TextPromptRequest(session.id, "nonce", "hello"))
 	assertInvalidModelField(t, err, modelFieldPrompt)
 }
 
@@ -157,7 +158,7 @@ func TestCommandPromptRejectsInvalidCurrentModel(t *testing.T) {
 	}
 	session := testSession(NewAgent(), client)
 
-	_, err := session.Prompt(ctx, TextPromptRequest(session.id, "/review"))
+	_, err := session.Prompt(ctx, TextPromptRequest(session.id, "nonce", "/review"))
 	assertInvalidModelField(t, err, modelFieldPrompt)
 }
 
@@ -203,6 +204,12 @@ func TestPermissionV2AskReplyReconcileAndCancelled(t *testing.T) {
 	agent := NewAgent()
 	agent.setAgentClient(conn)
 	session := testSession(agent, client)
+	turnCtx := session.beginTurn(ctx)
+	session.markActiveToolCallID("tool-current")
+	defer func() {
+		session.finishTurn()
+		_ = turnCtx
+	}()
 
 	if err := session.handlePermission(ctx, opencode.PermissionRequest{
 		ID:        "perm-1",
@@ -210,6 +217,7 @@ func TestPermissionV2AskReplyReconcileAndCancelled(t *testing.T) {
 		Action:    "edit",
 		Resources: []string{"file.txt"},
 		Metadata:  map[string]any{"path": "file.txt"},
+		Tool:      opencode.PermissionTool{CallID: "tool-current"},
 	}); err != nil {
 		t.Fatalf("handlePermission: %v", err)
 	}
@@ -222,7 +230,7 @@ func TestPermissionV2AskReplyReconcileAndCancelled(t *testing.T) {
 	}
 
 	conn.permission = acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}
-	if err := session.handlePermission(ctx, opencode.PermissionRequest{ID: "perm-2", SessionID: "native-1"}); err != nil {
+	if err := session.handlePermission(ctx, opencode.PermissionRequest{ID: "perm-2", SessionID: "native-1", Tool: opencode.PermissionTool{CallID: "tool-current"}}); err != nil {
 		t.Fatalf("handlePermission cancelled: %v", err)
 	}
 	if got := client.permissionReply(1).reply; got != "reject" {
@@ -231,7 +239,7 @@ func TestPermissionV2AskReplyReconcileAndCancelled(t *testing.T) {
 
 	client.pendingPermissions = []opencode.PermissionRequest{
 		{ID: "foreign", SessionID: "other"},
-		{ID: "perm-3", SessionID: "native-1"},
+		{ID: "perm-3", SessionID: "native-1", Tool: opencode.PermissionTool{CallID: "tool-current"}},
 	}
 	if err := session.reconcilePermissions(ctx); err != nil {
 		t.Fatalf("reconcilePermissions: %v", err)
@@ -249,14 +257,17 @@ func TestPermissionQuestionDuplicateRequestIDsAreFenced(t *testing.T) {
 	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 	agent.setAgentClient(conn)
 	session := testSession(agent, client)
+	session.beginTurn(ctx)
+	session.markActiveToolCallID("tool-current")
+	defer session.finishTurn()
 
 	if err := session.handleEvent(ctx, opencode.Event{
 		Type:       "permission.v2.asked",
-		Properties: json.RawMessage(`{"id":"perm-dup","sessionID":"native-1","action":"edit"}`),
+		Properties: json.RawMessage(`{"id":"perm-dup","sessionID":"native-1","action":"edit","tool":{"callID":"tool-current"}}`),
 	}); err != nil {
 		t.Fatalf("permission event: %v", err)
 	}
-	client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm-dup", SessionID: "native-1", Action: "edit"}}
+	client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm-dup", SessionID: "native-1", Action: "edit", Tool: opencode.PermissionTool{CallID: "tool-current"}}}
 	if err := session.reconcilePermissions(ctx); err != nil {
 		t.Fatalf("permission reconcile: %v", err)
 	}
@@ -762,7 +773,7 @@ func TestPromptSSEDisconnectAbortsNativeTurn(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		_, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Meta: routeCarrier("nonce"), Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 		done <- err
 	}()
 	select {
@@ -937,7 +948,8 @@ func TestPromptServerReconnectReconcilesPendingPermissionAndQuestion(t *testing.
 	case <-ctx.Done():
 		t.Fatal("Prompt did not start")
 	}
-	client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit"}}
+	session.markActiveToolCallID("tool-current")
+	client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit", Tool: opencode.PermissionTool{CallID: "tool-current"}}}
 	client.pendingQuestions = []opencode.QuestionRequest{{
 		ID:        "question",
 		SessionID: "native-1",
@@ -985,7 +997,7 @@ func TestPromptServerReconnectReconcileFailures(t *testing.T) {
 				return nil
 			},
 			pending: func(client *fakeOpenCodeClient) {
-				client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit"}}
+				client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit", Tool: opencode.PermissionTool{CallID: "tool-current"}}}
 			},
 			wantErr: "permission failed",
 		},
@@ -998,7 +1010,7 @@ func TestPromptServerReconnectReconcileFailures(t *testing.T) {
 				return conn.permissionStarted
 			},
 			pending: func(client *fakeOpenCodeClient) {
-				client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit"}}
+				client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm", SessionID: "native-1", Action: "edit", Tool: opencode.PermissionTool{CallID: "tool-current"}}}
 			},
 			cancel:        true,
 			wantCancelled: true,
@@ -1081,6 +1093,7 @@ func TestPromptServerReconnectReconcileFailures(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal("Prompt did not start")
 			}
+			session.markActiveToolCallID("tool-current")
 			tt.pending(client)
 			client.events <- opencode.Event{Type: "server.connected"}
 			if startedHook != nil {
@@ -1124,7 +1137,7 @@ func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
 			sendEvent: func(client *fakeOpenCodeClient) {
 				client.events <- opencode.Event{
 					Type:       "permission.v2.asked",
-					Properties: json.RawMessage(`{"id":"perm","sessionID":"native-1","action":"edit"}`),
+					Properties: json.RawMessage(`{"id":"perm","sessionID":"native-1","action":"edit","tool":{"callID":"tool-current"}}`),
 				}
 			},
 			assertDone: func(t *testing.T, client *fakeOpenCodeClient, conn *recordingAgentClient) {
@@ -1195,7 +1208,7 @@ func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
 			defer cancel()
 			done := make(chan acp.PromptResponse, 1)
 			go func() {
-				resp, _ := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+				resp, _ := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Meta: routeCarrier("nonce"), Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 				done <- resp
 			}()
 			select {
@@ -1203,6 +1216,7 @@ func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal("Prompt did not start")
 			}
+			session.markActiveToolCallID("tool-current")
 			tt.sendEvent(client)
 			switch tt.name {
 			case "permission":
@@ -1218,7 +1232,7 @@ func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
 					t.Fatal("elicitation request did not start")
 				}
 			}
-			if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: session.id}); err != nil {
+			if err := agent.Cancel(ctx, CancelRequest(session.id, "nonce")); err != nil {
 				t.Fatalf("Cancel: %v", err)
 			}
 			select {
@@ -1234,7 +1248,7 @@ func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
 	}
 }
 
-func TestPromptBacklogCancelledBeforeTurn(t *testing.T) {
+func TestPromptBacklogPermissionWithoutCurrentToolFailsClosed(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	conn := newRecordingAgentClient()
 	conn.permErr = context.Canceled
@@ -1248,9 +1262,9 @@ func TestPromptBacklogCancelledBeforeTurn(t *testing.T) {
 		Type:       "permission.v2.asked",
 		Properties: json.RawMessage(`{"id":"perm","sessionID":"native-1"}`),
 	}
-	resp, err := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
-	if err != nil || resp.StopReason != acp.StopReasonCancelled {
-		t.Fatalf("resp=%#v err=%v", resp, err)
+	_, err := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+	if err == nil || !strings.Contains(err.Error(), "active turn") {
+		t.Fatalf("stale permission error=%v", err)
 	}
 }
 
@@ -1272,22 +1286,6 @@ func TestPromptReconcileCancelledBeforeSend(t *testing.T) {
 		setup     func(*fakeOpenCodeClient, *recordingAgentClient, *Agent)
 		waitStart func(context.Context, *testing.T, *recordingAgentClient)
 	}{
-		{
-			name: "permission",
-			setup: func(client *fakeOpenCodeClient, conn *recordingAgentClient, _ *Agent) {
-				client.pendingPermissions = []opencode.PermissionRequest{{ID: "perm", SessionID: "native-1"}}
-				conn.permissionStarted = make(chan struct{}, 1)
-				conn.permissionRelease = make(chan struct{})
-			},
-			waitStart: func(ctx context.Context, t *testing.T, conn *recordingAgentClient) {
-				t.Helper()
-				select {
-				case <-conn.permissionStarted:
-				case <-ctx.Done():
-					t.Fatal("permission request did not start")
-				}
-			},
-		},
 		{
 			name: "question",
 			setup: func(client *fakeOpenCodeClient, conn *recordingAgentClient, agent *Agent) {
@@ -2368,7 +2366,7 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 
 			return msg, nil
 		}
-		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, MessageId: &messageID, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Meta: routeCarrier("nonce"), MessageId: &messageID, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 		if err != nil {
 			t.Fatalf("Prompt: %v", err)
 		}
@@ -2471,10 +2469,10 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 
 	t.Run("unknown agent prompt and cancel", func(t *testing.T) {
 		agent := NewAgent()
-		if _, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: "missing"}); err == nil {
+		if _, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: "missing", Meta: routeCarrier("nonce")}); err == nil {
 			t.Fatal("unknown agent prompt succeeded")
 		}
-		if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: "missing"}); err == nil {
+		if err := agent.Cancel(ctx, CancelRequest("missing", "nonce")); err == nil {
 			t.Fatal("unknown agent cancel succeeded")
 		}
 	})
@@ -2583,7 +2581,7 @@ func TestPoisonedSessionRejectsFollowUpOperations(t *testing.T) {
 	if err := s.refreshCommands(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
 		t.Fatalf("refresh poisoned session error = %v", err)
 	}
-	if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: s.id}); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
+	if err := agent.Cancel(ctx, CancelRequest(s.id, "nonce")); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
 		t.Fatalf("cancel poisoned session error = %v", err)
 	}
 	if _, err := agent.SetSessionConfigOption(ctx, SetModelRequest(s.id, "openai/gpt-test")); err == nil ||
@@ -2819,6 +2817,9 @@ func TestReplayAndEventEdgeBranches(t *testing.T) {
 		t.Fatal("malformed permission event succeeded")
 	}
 	conn.permission = acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected("once")}
+	session.beginTurn(ctx)
+	session.markActiveToolCallID("c1")
+	defer session.finishTurn()
 	if err := session.handleEvent(ctx, opencode.Event{
 		Type: "permission.asked",
 		Properties: json.RawMessage(`{
@@ -3083,7 +3084,7 @@ func TestPromptStructuredOutput(t *testing.T) {
 
 			return msg, nil
 		}
-		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Meta: routeCarrier("nonce"), Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 		if err != nil {
 			t.Fatalf("Prompt: %v", err)
 		}
@@ -3113,7 +3114,7 @@ func TestPromptStructuredOutput(t *testing.T) {
 
 			return msg, nil
 		}
-		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Meta: routeCarrier("nonce"), Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 		if err != nil {
 			t.Fatalf("Prompt: %v", err)
 		}
@@ -3144,7 +3145,7 @@ func TestPromptStructuredOutput(t *testing.T) {
 
 			return msg, nil
 		}
-		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		resp, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Meta: routeCarrier("nonce"), Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 		if err != nil {
 			t.Fatalf("Prompt: %v", err)
 		}
@@ -3463,7 +3464,7 @@ func TestPromptCancelSuppressesNativeError(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("Prompt did not start")
 	}
-	if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: session.id}); err != nil {
+	if err := agent.Cancel(ctx, CancelRequest(session.id, "unit-test-turn")); err != nil {
 		t.Fatalf("Cancel: %v", err)
 	}
 	select {
@@ -3602,4 +3603,141 @@ func TestPromptDoubleTransportFailureNamesBoth(t *testing.T) {
 			t.Fatalf("data.message = %q, want substring %q (must name both failures)", message, want)
 		}
 	}
+}
+func promptCoverageParams(id acp.SessionId) acp.PromptRequest {
+	return acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}
+}
+
+func TestPromptCancelAndLoadRejectRemainingRouteAndMCPBranches(t *testing.T) {
+	agent := NewAgent()
+	_, err := agent.Prompt(context.Background(), acp.PromptRequest{})
+	require.Error(t, err)
+
+	client := newFakeOpenCodeClient()
+	current := testSession(agent, client)
+	agent.sessions[current.id] = current
+	require.Error(t, agent.Cancel(context.Background(), CancelRequest(current.id, "stale")))
+
+	_, err = agent.LoadSession(context.Background(), acp.LoadSessionRequest{
+		SessionId: "session", Cwd: t.TempDir(),
+		McpServers: []acp.McpServer{{Sse: &acp.McpServerSseInline{Name: "bad"}}},
+	})
+	require.Error(t, err)
+}
+
+func TestPromptBacklogCancellationReturnsCancelledBeforeNativeTurn(t *testing.T) {
+	agent := NewAgent()
+	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+	connection := newRecordingAgentClient()
+	connection.elicitErr = errors.New("client stopped")
+	agent.setAgentClient(connection)
+	client := newFakeOpenCodeClient()
+	current := testSession(agent, client)
+	current.cancelled = true
+	client.events <- opencode.Event{
+		Type:       eventQuestionAsked,
+		Properties: json.RawMessage(`{"id":"question","sessionID":"native-1","questions":[{"question":"Continue?"}]}`),
+	}
+
+	response, err := current.promptWithRoute(context.Background(), promptCoverageParams(current.id), "nonce")
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+}
+
+func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {
+	t.Run("cancelled reconciliation", func(t *testing.T) {
+		agent := NewAgent()
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		connection := newRecordingAgentClient()
+		connection.elicitErr = errors.New("client stopped")
+		agent.setAgentClient(connection)
+		client := newFakeOpenCodeClient()
+		client.abortErr = errors.New("abort failed")
+		client.pendingQuestions = []opencode.QuestionRequest{{ID: "question", SessionID: "native-1"}}
+		current := testSession(agent, client)
+		turnCtx := current.beginTurn(context.Background(), "nonce")
+		current.cancelled = true
+		_, err := current.runPromptTurn(context.Background(), turnCtx, promptCoverageParams(current.id), func(context.Context) (opencode.NativeMessage, error) {
+			return opencode.NativeMessage{}, nil
+		}, opencode.NativeCommand{}, false)
+		require.ErrorContains(t, err, "opencode_cancellation_fence_failed")
+	})
+
+	t.Run("ordinary reconciliation", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.permissionsErr = errors.New("permissions failed")
+		client.abortErr = errors.New("abort failed")
+		current := testSession(NewAgent(), client)
+		turnCtx := current.beginTurn(context.Background(), "nonce")
+		_, err := current.runPromptTurn(context.Background(), turnCtx, promptCoverageParams(current.id), func(context.Context) (opencode.NativeMessage, error) {
+			return opencode.NativeMessage{}, nil
+		}, opencode.NativeCommand{}, false)
+		require.ErrorContains(t, err, "permissions failed")
+		require.ErrorContains(t, err, "opencode_cancellation_fence_failed")
+	})
+
+	t.Run("stream error", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.abortErr = errors.New("abort failed")
+		client.errs <- errors.New("stream failed")
+		current := testSession(NewAgent(), client)
+		turnCtx := current.beginTurn(context.Background(), "nonce")
+		_, err := current.runPromptTurn(context.Background(), turnCtx, promptCoverageParams(current.id), func(ctx context.Context) (opencode.NativeMessage, error) {
+			<-ctx.Done()
+
+			return opencode.NativeMessage{}, ctx.Err()
+		}, opencode.NativeCommand{}, false)
+		require.ErrorContains(t, err, "opencode_cancellation_fence_failed")
+	})
+
+	t.Run("cancelled native result", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.abortErr = errors.New("abort failed")
+		current := testSession(NewAgent(), client)
+		turnCtx := current.beginTurn(context.Background(), "nonce")
+		current.cancelled = true
+		_, err := current.runPromptTurn(context.Background(), turnCtx, promptCoverageParams(current.id), func(context.Context) (opencode.NativeMessage, error) {
+			return opencode.NativeMessage{}, errors.New("native failed")
+		}, opencode.NativeCommand{}, false)
+		require.ErrorContains(t, err, "opencode_cancellation_fence_failed")
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.abortErr = errors.New("abort failed")
+		current := testSession(NewAgent(WithTurnTimeout(time.Millisecond)), client)
+		turnCtx := current.beginTurn(context.Background(), "nonce")
+		release := make(chan struct{})
+		_, err := current.runPromptTurn(context.Background(), turnCtx, promptCoverageParams(current.id), func(context.Context) (opencode.NativeMessage, error) {
+			<-release
+
+			return opencode.NativeMessage{}, nil
+		}, opencode.NativeCommand{}, false)
+		close(release)
+		require.ErrorContains(t, err, "opencode_cancellation_fence_failed")
+	})
+
+	t.Run("turn context", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.abortErr = errors.New("abort failed")
+		current := testSession(NewAgent(), client)
+		ctx, cancel := context.WithCancel(context.Background())
+		turnCtx := current.beginTurn(ctx, "nonce")
+		cancel()
+		release := make(chan struct{})
+		_, err := current.runPromptTurn(context.Background(), turnCtx, promptCoverageParams(current.id), func(context.Context) (opencode.NativeMessage, error) {
+			<-release
+
+			return opencode.NativeMessage{}, nil
+		}, opencode.NativeCommand{}, false)
+		close(release)
+		require.ErrorContains(t, err, "opencode_cancellation_fence_failed")
+	})
+}
+
+func TestPartTextDeltaEmptyNativeDeltaBranch(t *testing.T) {
+	current := testSession(NewAgent(), newFakeOpenCodeClient())
+	text, commit := current.partTextDelta(opencode.NativePart{ID: "part"}, "")
+	require.Empty(t, text)
+	require.Nil(t, commit)
 }

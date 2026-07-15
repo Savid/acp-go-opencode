@@ -45,24 +45,3 @@ func signalOpenCodeProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
 
 	return nil
 }
-
-func killProcessID(pid int) error {
-	if pid <= 0 {
-		return nil
-	}
-
-	pgid, err := openCodeSyscallGetpgid(pid)
-	if err == nil {
-		pid = -pgid
-	}
-
-	if err := openCodeSyscallKill(pid, syscall.SIGTERM); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-
-		return err
-	}
-
-	return nil
-}

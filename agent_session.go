@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -20,10 +19,6 @@ import (
 func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	ctx = a.observe.Extract(ctx, params.Meta)
 	if err := a.ensureOpen(); err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	if err := a.rejectHomeOption(); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
 
@@ -51,7 +46,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 	id := acp.SessionId(idValue)
 
-	client, err := a.newOpenCodeClient(ctx, id, params.Cwd, meta, opencode.XDGDirs{}, nativeMCPServerConfigs(params.McpServers))
+	mcpConfigs := nativeMCPServerConfigs(params.McpServers)
+
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -59,12 +56,19 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
 		_ = client.Close(context.Background())
 
+		releaseDirectory()
+
 		return acp.NewSessionResponse{}, validateErr
 	}
 
-	native, err := client.CreateSession(ctx, "")
+	sessionStarted := time.Now()
+	native, err := client.CreateSessionWithPolicy(ctx, "", nativePermissionPolicy(meta.Permission))
+	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err)
+
 	if err != nil {
 		_ = client.Close(context.Background())
+
+		releaseDirectory()
 
 		return acp.NewSessionResponse{}, err
 	}
@@ -76,6 +80,11 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	}
 
 	session := newSession(a, id, params.Cwd, params.AdditionalDirectories, native, client, meta, idmap)
+	session.directoryRelease = releaseDirectory
+	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
+	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
+	session.runtimeGeneration = generation
+
 	if err := a.storeStartedSession(session); err != nil {
 		_ = session.Close(context.Background())
 
@@ -162,22 +171,12 @@ func (a *Agent) loadOrResumeSession(
 		return nil, err
 	}
 
-	if err := a.rejectHomeOption(); err != nil {
-		return nil, err
-	}
-
 	if id == "" {
 		return nil, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
 
 	if a.isDeleted(id) {
-		_ = a.retryDeletedSessionCleanup(ctx)
-
 		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
-	}
-
-	if err := a.retryDeletedSessionCleanup(ctx); err != nil {
-		a.log.DebugContext(ctx, "retry deleted OpenCode session cleanup failed", slog.String("error", err.Error()))
 	}
 
 	if err := validateSessionStartPaths(cwd, additionalDirectories); err != nil {
@@ -193,13 +192,8 @@ func (a *Agent) loadOrResumeSession(
 		return nil, lifecycleMetaError(err)
 	}
 
-	xdg, err := opencode.CreateXDGDirs(a.homeRoot(), string(id))
-	if err != nil {
-		return nil, err
-	}
-
 	storeCtx, cancel := a.sessionStoreContext(ctx)
-	idmap, snapshot, ok, err := hydrateStateFromStore(storeCtx, a.sessionStore(), string(id), xdg)
+	idmap, snapshot, ok, err := hydrateStateFromStore(storeCtx, a.sessionStore(), string(id))
 
 	cancel()
 
@@ -211,10 +205,6 @@ func (a *Agent) loadOrResumeSession(
 		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
-	if snapshot.Session.Cwd != "" && snapshot.Session.Cwd != cwd {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: "cwd_mismatch", jsonFieldField: jsonFieldCwd})
-	}
-
 	if meta.Model == "" {
 		meta.Model = joinModelValue(snapshot.Session.Model.ProviderID, snapshot.Session.Model.ModelID)
 	}
@@ -223,7 +213,9 @@ func (a *Agent) loadOrResumeSession(
 		meta.Mode = snapshot.Session.Model.Agent
 	}
 
-	client, err := a.newOpenCodeClient(ctx, id, cwd, meta, xdg, nativeMCPServerConfigs(mcpServers))
+	mcpConfigs := nativeMCPServerConfigs(mcpServers)
+
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, cwd, mcpConfigs)
 	if err != nil {
 		return nil, err
 	}
@@ -231,17 +223,29 @@ func (a *Agent) loadOrResumeSession(
 	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
 		_ = client.Close(context.Background())
 
+		releaseDirectory()
+
 		return nil, validateErr
 	}
 
-	native, err := client.GetSession(ctx, idmap.NativeSessionID)
+	a.restoreMu.Lock()
+	native, err := restoreSyncState(ctx, client, snapshot, idmap.NativeSessionID, cwd)
+	a.restoreMu.Unlock()
+
 	if err != nil {
 		_ = client.Close(context.Background())
+
+		releaseDirectory()
 
 		return nil, err
 	}
 
 	session := newSession(a, id, cwd, additionalDirectories, native, client, meta, idmap)
+	session.directoryRelease = releaseDirectory
+	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
+	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
+	session.runtimeGeneration = generation
+
 	if err := a.storeStartedSession(session); err != nil {
 		_ = session.Close(context.Background())
 
@@ -254,10 +258,6 @@ func (a *Agent) loadOrResumeSession(
 func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
 	if err := a.ensureOpen(); err != nil {
 		return acp.ListSessionsResponse{}, err
-	}
-
-	if err := a.retryDeletedSessionCleanup(ctx); err != nil {
-		a.log.DebugContext(ctx, "retry deleted OpenCode session cleanup failed", slog.String("error", err.Error()))
 	}
 
 	if err := validateOptionalAbsolutePath(jsonFieldCwd, params.Cwd); err != nil {
@@ -316,16 +316,8 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 	}
 
 	slices.SortFunc(infos, func(left, right acp.SessionInfo) int {
-		l := ""
-		r := ""
-
-		if left.UpdatedAt != nil {
-			l = *left.UpdatedAt
-		}
-
-		if right.UpdatedAt != nil {
-			r = *right.UpdatedAt
-		}
+		l := *left.UpdatedAt
+		r := *right.UpdatedAt
 
 		if r != l {
 			return strings.Compare(r, l)
@@ -348,12 +340,12 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		return acp.CloseSessionResponse{}, err
 	}
 
+	snapshotErr := session.snapshotToStore(context.WithoutCancel(ctx))
+
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
 	closeErr := session.Close(closeCtx)
 
 	closeCancel()
-
-	snapshotErr := session.snapshotToStore(context.WithoutCancel(ctx))
 
 	if a.removeSessionIf(params.SessionId, session) {
 		a.observe.AddActiveSession(ctx, -1)
@@ -368,15 +360,10 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
 
-	if err := a.retryDeletedSessionCleanup(ctx); err != nil {
-		a.log.DebugContext(ctx, "retry deleted OpenCode session cleanup failed", slog.String("error", err.Error()))
-	}
-
 	a.mu.Lock()
 	session := a.sessions[params.SessionId]
 	a.mu.Unlock()
 
-	record := a.deleteCleanupRecord(params.SessionId, session)
 	storeCtx, cancel := a.sessionStoreContext(ctx)
 	err := a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
 
@@ -394,10 +381,6 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
 
-	if record.SessionID != "" {
-		a.rememberDeleteCleanup(record)
-	}
-
 	if session != nil {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
 		err = session.DeleteNativeAndClose(closeCtx)
@@ -407,18 +390,11 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
-	cleanupErr := a.cleanupDeletedSession(record)
-	a.forgetDeleteCleanupIfDone(record.SessionID)
-
-	return acp.UnstableDeleteSessionResponse{}, errors.Join(err, cleanupErr)
+	return acp.UnstableDeleteSessionResponse{}, err
 }
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
 	ctx = a.observe.Extract(ctx, params.Meta)
-	if err := a.rejectHomeOption(); err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-
 	if err := validateSessionStartPaths(params.Cwd, params.AdditionalDirectories); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -438,6 +414,14 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	}
 
 	parentSnapshot := parent.snapshot()
+	if meta.PermissionSet && normalizeOpenCodePermission(meta.Permission) != parentSnapshot.permission {
+		return acp.UnstableForkSessionResponse{}, acp.NewInvalidParams(map[string]any{
+			jsonFieldError: "child_permission_must_inherit",
+			jsonFieldField: "_meta.opencode.options.permission",
+		})
+	}
+
+	meta.Permission = parentSnapshot.permission
 
 	nativeChild, err := parentSnapshot.client.Fork(ctx, parentSnapshot.idmap.NativeSessionID, "")
 	if err != nil {
@@ -451,17 +435,6 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 	id := acp.SessionId(idValue)
 
-	xdg, err := opencode.CreateXDGDirs(a.homeRoot(), string(id))
-	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-
-	// CreateXDGDirs above already materialized the scratch parent (0700) as an
-	// ancestor of the new session home, so the resolver suffices here.
-	if copyErr := copyXDGDirs(parentSnapshot.client.XDGDirs(), xdg, scratchParent(a.options.ScratchDir)); copyErr != nil {
-		return acp.UnstableForkSessionResponse{}, copyErr
-	}
-
 	if meta.Model == "" {
 		meta.Model = joinModelValue(parentSnapshot.providerID, parentSnapshot.modelID)
 	}
@@ -470,7 +443,9 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		meta.Mode = parentSnapshot.mode
 	}
 
-	client, err := a.newOpenCodeClient(ctx, id, params.Cwd, meta, xdg, nativeMCPServerConfigsFromUnstable(params.McpServers))
+	mcpConfigs := nativeMCPServerConfigsFromUnstable(params.McpServers)
+
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs)
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -478,12 +453,16 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
 		_ = client.Close(context.Background())
 
+		releaseDirectory()
+
 		return acp.UnstableForkSessionResponse{}, validateErr
 	}
 
 	native, err := client.GetSession(ctx, nativeChild.ID)
 	if err != nil {
 		_ = client.Close(context.Background())
+
+		releaseDirectory()
 
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -497,6 +476,11 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	}
 
 	session := newSession(a, id, params.Cwd, params.AdditionalDirectories, native, client, meta, idmap)
+	session.directoryRelease = releaseDirectory
+	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
+	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
+	session.runtimeGeneration = generation
+
 	if err := a.storeStartedSession(session); err != nil {
 		_ = session.Close(context.Background())
 
@@ -598,153 +582,87 @@ func httpHeaderMap(headers []acp.HttpHeader) map[string]string {
 	return values
 }
 
-func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd string, meta sessionMeta, existing opencode.XDGDirs, mcpServers []opencode.MCPServerConfig) (opencode.Client, error) {
-	factory := a.options.clientFactory
-	if factory == nil {
-		factory = opencode.StartServer
-	}
-
-	env := cloneStringMap(a.options.Env)
-	if env == nil && len(meta.Env) > 0 {
-		env = map[string]string{}
-	}
-
-	for key, value := range meta.Env {
-		env[key] = value
-	}
-
-	a.observe.RecordOpenCodeProcessStart(ctx)
-
-	return factory(ctx, opencode.StartOptions{
-		ACPSessionID:   opencode.ACPSessionID(id),
-		Root:           a.homeRoot(),
-		ScratchParent:  scratchParent(a.options.ScratchDir),
-		Cwd:            cwd,
-		ExecutablePath: a.options.ExecutablePath,
-		DefaultModel:   firstNonEmpty(meta.Model, a.options.DefaultModel),
-		Env:            a.observe.InjectTraceEnv(ctx, env),
-		Pure:           a.options.Pure,
-		QuestionTool:   a.options.QuestionTool,
-		LogLevel:       a.options.LogLevel,
-		MinimumVersion: a.options.MinimumVersion,
-		HealthTimeout:  a.options.HealthCheckTimeout,
-		Logger:         a.log,
-		ExistingXDG:    existing,
-		Permission:     meta.Permission,
-		SeedFiles:      a.options.SeedFiles,
-		MCPServers:     mcpServers,
-	})
-}
-
-type deleteCleanupRecord struct {
-	SessionID acp.SessionId
-	NativeID  string
-	XDGRoot   string
-}
-
-func (a *Agent) deleteCleanupRecord(id acp.SessionId, session *session) deleteCleanupRecord {
-	record := deleteCleanupRecord{
-		SessionID: id,
-		XDGRoot:   filepath.Join(a.homeRoot(), opencode.SafePathName(string(id))),
-	}
-	if session == nil {
-		return record
-	}
-
-	snapshot := session.snapshot()
-
-	record.NativeID = snapshot.idmap.NativeSessionID
-	if snapshot.client != nil {
-		if xdg := snapshot.client.XDGDirs(); xdg.Root != "" {
-			record.XDGRoot = xdg.Root
-		}
-	}
-
-	return record
-}
-
-func (a *Agent) rememberDeleteCleanup(record deleteCleanupRecord) {
-	if record.SessionID == "" {
-		return
-	}
-
-	a.mu.Lock()
-	a.deleteCleanup[record.SessionID] = record
-	a.mu.Unlock()
-}
-
-func (a *Agent) forgetDeleteCleanupIfDone(id acp.SessionId) {
-	if id == "" {
-		return
-	}
-
-	record := a.deleteCleanupRecord(id, nil)
-	if _, err := os.Stat(record.XDGRoot); err == nil {
-		return
-	}
-
-	a.mu.Lock()
-	delete(a.deleteCleanup, id)
-	a.mu.Unlock()
-}
-
-func (a *Agent) retryDeletedSessionCleanup(ctx context.Context) error {
-	a.mu.Lock()
-
-	records := make([]deleteCleanupRecord, 0, len(a.deleteCleanup))
-	for _, record := range a.deleteCleanup {
-		records = append(records, record)
-	}
-	a.mu.Unlock()
-
-	var err error
-
-	for _, record := range records {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return errors.Join(err, ctxErr)
+func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd string, mcpServers []opencode.MCPServerConfig) (opencode.Client, func(), uint64, error) {
+	for {
+		releaseDirectory, err := a.bindDirectory(id, cwd, mcpServers)
+		if err != nil {
+			return nil, nil, 0, err
 		}
 
-		cleanupErr := a.cleanupDeletedSession(record)
-		if cleanupErr != nil {
-			err = errors.Join(err, cleanupErr)
+		runtime, generation, err := a.sharedRuntimeBinding(ctx)
+		if err != nil {
+			releaseDirectory()
 
-			continue
+			return nil, nil, 0, err
 		}
 
-		a.mu.Lock()
-		delete(a.deleteCleanup, record.SessionID)
-		a.mu.Unlock()
-	}
+		configurationStarted := time.Now()
+		client, err := runtime.Scope(ctx, opencode.ScopeOptions{Directory: cwd, MCPServers: mcpServers})
+		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, err)
 
-	return err
+		if err == nil {
+			return client, releaseDirectory, generation, nil
+		}
+
+		releaseDirectory()
+
+		if a.runtimeGenerationIsCurrent(generation) {
+			return nil, nil, 0, err
+		}
+
+		if err := ctx.Err(); err != nil {
+			return nil, nil, 0, err
+		}
+	}
 }
 
-func (a *Agent) cleanupDeletedSession(record deleteCleanupRecord) error {
-	if record.SessionID == "" || record.XDGRoot == "" {
+func cloneNativeMCPServerConfigs(configs []opencode.MCPServerConfig) []opencode.MCPServerConfig {
+	if configs == nil {
 		return nil
 	}
 
-	opencode.ReapLeaseFile(filepath.Join(record.XDGRoot, "state", opencode.LeaseFileName), a.log)
-
-	return os.RemoveAll(record.XDGRoot)
-}
-
-// homeRoot returns the parent directory under which per-session XDG homes are
-// created. OpenCode has no native config or auth root, so this always resolves
-// under the ephemeral scratch parent, keeping the stable adapter-named subtree.
-func (a *Agent) homeRoot() string {
-	return filepath.Join(scratchParent(a.options.ScratchDir), defaultAgentName)
-}
-
-// rejectHomeOption enforces the isolation contract: OpenCode exposes no native
-// config or auth root, so a non-empty Home is rejected with the uniform
-// unsupported-option error at the top of every session-establishing path.
-func (a *Agent) rejectHomeOption() error {
-	if a.options.Home != "" {
-		return unsupportedField(optionFieldHome)
+	cloned := make([]opencode.MCPServerConfig, len(configs))
+	for index := range configs {
+		cloned[index] = configs[index]
+		cloned[index].Headers = cloneStringMap(configs[index].Headers)
+		cloned[index].Command = append([]string(nil), configs[index].Command...)
+		cloned[index].Env = cloneStringMap(configs[index].Env)
 	}
 
-	return nil
+	return cloned
+}
+
+func nativePermissionPolicy(permission string) []opencode.PermissionRule {
+	return []opencode.PermissionRule{{Permission: "*", Pattern: "*", Action: normalizeOpenCodePermission(permission)}}
+}
+
+func mcpSecretNeedles(configs []opencode.MCPServerConfig) []string {
+	var needles []string
+
+	for _, config := range configs {
+		for _, value := range config.Headers {
+			if value != "" {
+				needles = append(needles, value)
+			}
+		}
+
+		for _, value := range config.Env {
+			if value != "" {
+				needles = append(needles, value)
+			}
+		}
+	}
+
+	return needles
+}
+
+// homeRoot returns the single shared runtime XDG root.
+func (a *Agent) homeRoot() string {
+	if a.options.Home != "" {
+		return a.options.Home
+	}
+
+	return filepath.Join(scratchParent(a.options.ScratchDir), defaultAgentName, "runtime")
 }
 
 func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
@@ -779,29 +697,6 @@ func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
 		}
 
 		seen[name] = struct{}{}
-	}
-
-	return nil
-}
-
-func copyXDGDirs(source opencode.XDGDirs, target opencode.XDGDirs, scratchParent string) error {
-	for _, item := range []struct {
-		src string
-		dst string
-	}{
-		{source.Data, target.Data},
-		{source.Config, target.Config},
-		{source.Cache, target.Cache},
-		{source.State, target.State},
-	} {
-		data, _, err := encodeXDGArchive(item.src, scratchParent)
-		if err != nil {
-			return err
-		}
-
-		if err := decodeXDGArchive(data, item.dst); err != nil {
-			return err
-		}
 	}
 
 	return nil

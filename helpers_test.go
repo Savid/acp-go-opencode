@@ -2,15 +2,29 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"maps"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"testing"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
+	"github.com/stretchr/testify/require"
 )
+
+func mustJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(value)
+	require.NoError(t, err)
+
+	return data
+}
 
 type fakeOpenCodeClient struct {
 	mu sync.Mutex
@@ -22,6 +36,7 @@ type fakeOpenCodeClient struct {
 	listSessions  []opencode.NativeSession
 	forkSession   opencode.NativeSession
 	messages      []opencode.NativeMessage
+	statuses      map[string]opencode.NativeSessionStatus
 	todos         []opencode.NativeTodo
 	providers     opencode.ProvidersResponse
 	agents        []opencode.NativeAgent
@@ -36,15 +51,18 @@ type fakeOpenCodeClient struct {
 	createSessionFunc func(context.Context, string) (opencode.NativeSession, error)
 	sendMessage       func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
 	runCommand        func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
+	syncHistoryFunc   func(context.Context, map[string]int64) ([]opencode.SyncEvent, error)
 
 	aborts         []string
 	deleted        []string
 	closed         bool
 	events         chan opencode.Event
 	errs           chan error
+	runtimeExited  chan struct{}
 	createErr      error
 	getErr         error
 	listErr        error
+	statusErr      error
 	deleteErr      error
 	messagesErr    error
 	commandsErr    error
@@ -58,6 +76,29 @@ type fakeOpenCodeClient struct {
 	questionsErr   error
 	replyErr       error
 	closeErr       error
+	scopeErr       error
+	syncHistoryErr error
+	syncReplayErr  error
+	syncEvents     []opencode.SyncEvent
+}
+
+type errorSessionStore struct{ err error }
+
+func (s *errorSessionStore) Append(context.Context, SessionKey, []SessionStoreEntry) error {
+	return s.err
+}
+func (s *errorSessionStore) Load(context.Context, SessionKey) ([]SessionStoreEntry, error) {
+	return nil, s.err
+}
+func (s *errorSessionStore) Replace(context.Context, SessionKey, []SessionStoreReplacement) error {
+	return s.err
+}
+func (s *errorSessionStore) Delete(context.Context, SessionKey) error { return s.err }
+func (s *errorSessionStore) ListSessions(context.Context) ([]SessionSummary, error) {
+	return nil, s.err
+}
+func (s *errorSessionStore) ListSubkeys(context.Context, SessionKey) ([]string, error) {
+	return nil, s.err
 }
 
 type fakePermissionReply struct {
@@ -82,11 +123,27 @@ type fakeQuestionReject struct {
 }
 
 func newFakeOpenCodeClient() *fakeOpenCodeClient {
-	return &fakeOpenCodeClient{
-		providers: testProviders(),
-		events:    make(chan opencode.Event, 16),
-		errs:      make(chan error, 16),
+	runtimeState, err := os.MkdirTemp("", "acp-go-opencode-test-state-")
+	if err != nil {
+		panic(err)
 	}
+
+	return &fakeOpenCodeClient{
+		xdg:           opencode.XDGDirs{Root: runtimeState, State: runtimeState},
+		providers:     testProviders(),
+		events:        make(chan opencode.Event, 16),
+		errs:          make(chan error, 16),
+		runtimeExited: make(chan struct{}),
+	}
+}
+
+func testProviders() opencode.ProvidersResponse {
+	return opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
+		ID: "openai", Name: "OpenAI", Models: map[string]opencode.ProviderModel{
+			"gpt-test":  {ID: "gpt-test", Name: "GPT Test", Limit: map[string]any{"context": float64(1000), "output": float64(200)}, Reasoning: true, ToolCall: true},
+			"gpt-other": {ID: "gpt-other", Name: "GPT Other"},
+		},
+	}}}
 }
 
 func (c *fakeOpenCodeClient) Close(context.Context) error {
@@ -97,12 +154,27 @@ func (c *fakeOpenCodeClient) Close(context.Context) error {
 	return c.closeErr
 }
 
+func (c *fakeOpenCodeClient) Shutdown(ctx context.Context) error { return c.Close(ctx) }
+
+func (c *fakeOpenCodeClient) Scope(context.Context, opencode.ScopeOptions) (opencode.Client, error) {
+	return c, c.scopeErr
+}
+
 func (c *fakeOpenCodeClient) CreateSession(ctx context.Context, title string) (opencode.NativeSession, error) {
 	if c.createSessionFunc != nil {
 		return c.createSessionFunc(ctx, title)
 	}
 
 	return c.createSession, c.createErr
+}
+
+func (c *fakeOpenCodeClient) CreateSessionWithPolicy(ctx context.Context, title string, _ []opencode.PermissionRule) (opencode.NativeSession, error) {
+	created, err := c.CreateSession(ctx, title)
+	if err == nil && created.ID != "" {
+		c.ensureSyncAggregate(created.ID)
+	}
+
+	return created, err
 }
 
 func (c *fakeOpenCodeClient) GetSession(context.Context, string) (opencode.NativeSession, error) {
@@ -143,6 +215,13 @@ func (c *fakeOpenCodeClient) SendMessage(ctx context.Context, id string, req ope
 
 func (c *fakeOpenCodeClient) Messages(context.Context, string) ([]opencode.NativeMessage, error) {
 	return append([]opencode.NativeMessage(nil), c.messages...), c.messagesErr
+}
+
+func (c *fakeOpenCodeClient) SessionStatus(context.Context) (map[string]opencode.NativeSessionStatus, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return maps.Clone(c.statuses), c.statusErr
 }
 
 func (c *fakeOpenCodeClient) Abort(_ context.Context, id string) error {
@@ -219,8 +298,72 @@ func (c *fakeOpenCodeClient) EventErrors() <-chan error {
 	return c.errs
 }
 
+func (c *fakeOpenCodeClient) RuntimeExited() <-chan struct{} {
+	return c.runtimeExited
+}
+
 func (c *fakeOpenCodeClient) XDGDirs() opencode.XDGDirs {
 	return c.xdg
+}
+
+func (c *fakeOpenCodeClient) SyncHistory(ctx context.Context, cursors map[string]int64) ([]opencode.SyncEvent, error) {
+	if c.syncHistoryFunc != nil {
+		return c.syncHistoryFunc(ctx, cursors)
+	}
+	if c.syncHistoryErr != nil {
+		return nil, c.syncHistoryErr
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []opencode.SyncEvent
+	for _, event := range c.syncEvents {
+		cursor, present := cursors[event.AggregateID]
+		if present && event.Sequence <= cursor {
+			continue
+		}
+		out = append(out, event)
+	}
+
+	return out, nil
+}
+
+func (c *fakeOpenCodeClient) SyncReplay(_ context.Context, _ string, events []opencode.SyncReplayEvent) error {
+	if c.syncReplayErr != nil {
+		return c.syncReplayErr
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, event := range events {
+		candidate := opencode.SyncEvent(event)
+		found := false
+		for _, existing := range c.syncEvents {
+			if existing.ID == candidate.ID {
+				found = true
+
+				break
+			}
+		}
+		if !found {
+			c.syncEvents = append(c.syncEvents, candidate)
+		}
+	}
+
+	return nil
+}
+
+func (c *fakeOpenCodeClient) ensureSyncAggregate(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, event := range c.syncEvents {
+		if event.AggregateID == id {
+			return
+		}
+	}
+	data := map[string]json.RawMessage{
+		"sessionID": json.RawMessage(strconv.Quote(id)),
+		"info":      json.RawMessage(`{"id":` + strconv.Quote(id) + `}`),
+	}
+	c.syncEvents = append(c.syncEvents, opencode.SyncEvent{ID: "evt-" + id, AggregateID: id, Type: "session.created.1", Data: data})
 }
 
 func (c *fakeOpenCodeClient) abortCount() int {
@@ -488,24 +631,6 @@ func assertTurnFailed(t testingT, err error, wantCause string, wantMessageSubstr
 	return data
 }
 
-func assertUnknownSessionError(t testingT, err error) {
-	t.Helper()
-	var reqErr *acp.RequestError
-	if !errors.As(err, &reqErr) {
-		t.Fatalf("error = %v, want RequestError", err)
-	}
-	if reqErr.Code != -32602 {
-		t.Fatalf("error code = %d, want -32602", reqErr.Code)
-	}
-	data, ok := reqErr.Data.(map[string]any)
-	if !ok {
-		t.Fatalf("error data = %#v, want map", reqErr.Data)
-	}
-	if data[jsonFieldError] != errValueSessionUnknown || data[jsonFieldField] != jsonFieldSessionID {
-		t.Fatalf("unknown session data = %#v, want {error:unknown session, field:sessionId}", data)
-	}
-}
-
 type testingT interface {
 	Helper()
 	Fatalf(string, ...any)
@@ -524,9 +649,10 @@ func testSession(agent *Agent, client *fakeOpenCodeClient) *session {
 	if client.xdg.Root == "" {
 		root, err := os.MkdirTemp("", "acp-go-opencode-test-*")
 		if err == nil {
-			client.xdg, _ = opencode.CreateXDGDirs(root, "session-1")
+			client.xdg, _ = opencode.CreateRuntimeXDGDirs(filepath.Join(root, "session-1"))
 		}
 	}
+	client.ensureSyncAggregate("native-1")
 
 	return newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
 		SessionID:       "session-1",
@@ -541,16 +667,4 @@ type errorReader struct {
 
 func (r errorReader) Read([]byte) (int, error) {
 	return 0, r.err
-}
-
-type errorReadCloser struct {
-	err error
-}
-
-func (r errorReadCloser) Read([]byte) (int, error) {
-	return 0, r.err
-}
-
-func (r errorReadCloser) Close() error {
-	return nil
 }

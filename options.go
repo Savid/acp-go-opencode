@@ -13,9 +13,41 @@ import (
 
 const defaultAgentName = "acp-go-opencode"
 
-// optionFieldHome names the rejected Home option in uniform unsupported-option
-// errors returned from session-establishing requests.
-const optionFieldHome = "home"
+type RuntimeResourceKind string
+
+const (
+	RuntimeResourceRuntime   RuntimeResourceKind = "runtime"
+	RuntimeResourceSession   RuntimeResourceKind = "session"
+	RuntimeResourcePrompt    RuntimeResourceKind = "prompt"
+	RuntimeResourceDiscovery RuntimeResourceKind = "discovery"
+)
+
+type RuntimeProcessKind string
+
+const (
+	RuntimeProcessHomeLockSupervisor RuntimeProcessKind = "home_lock_supervisor"
+	RuntimeProcessProviderDescendant RuntimeProcessKind = "provider_descendant"
+)
+
+type RuntimeStartupStage string
+
+const (
+	RuntimeStartupSpawn         RuntimeStartupStage = "spawn"
+	RuntimeStartupReadiness     RuntimeStartupStage = "readiness"
+	RuntimeStartupConfiguration RuntimeStartupStage = "configuration"
+	RuntimeStartupSession       RuntimeStartupStage = "session"
+)
+
+// RuntimeResourceHooks lets an embedding worker account for native roots and
+// adapter-created scratch roots in its worker-global permit pools. A nil hook
+// selects the standalone, unbounded controller.
+type RuntimeResourceHooks struct {
+	AcquireNativeRoot      func(context.Context, RuntimeResourceKind) (func(), error)
+	ReserveScratchRoot     func(context.Context, RuntimeResourceKind) (func(), error)
+	ObserveProcess         func(context.Context, RuntimeProcessKind, int64)
+	ObserveProcessSnapshot func(context.Context, RuntimeProcessKind, int)
+	ObserveStartupStage    func(context.Context, RuntimeResourceKind, RuntimeStartupStage, time.Duration, error)
+}
 
 // Option configures the OpenCode ACP agent.
 type Option func(*Options)
@@ -33,13 +65,11 @@ type Options struct {
 	AgentVersion string
 
 	ExecutablePath string
-	// Home is unsupported: OpenCode has no native config or auth root, so a
-	// non-empty value is rejected on every session-establishing request. Use
-	// ScratchDir instead.
+	// Home is the exclusive shared XDG root owned by this Agent runtime. Empty
+	// creates one beneath ScratchDir.
 	Home string
-	// ScratchDir is the sole parent for all ephemeral on-disk materialization
-	// (per-session isolated homes, sqlite temp directories, probe dirs). Empty
-	// means the system temporary directory.
+	// ScratchDir is the parent for a generated shared runtime root and transient
+	// adapter scratch material. It is never a per-session OpenCode home.
 	ScratchDir   string
 	DefaultModel string
 	Env          map[string]string
@@ -54,12 +84,13 @@ type Options struct {
 	ConcurrencyLimits       ConcurrencyLimits
 	SeedFiles               map[string]string
 
-	Pure               bool
-	QuestionTool       bool
-	LogLevel           string
-	MinimumVersion     string
-	HealthCheckTimeout time.Duration
-	TurnTimeout        time.Duration
+	Pure                 bool
+	QuestionTool         bool
+	LogLevel             string
+	NativeVersion        string
+	HealthCheckTimeout   time.Duration
+	TurnTimeout          time.Duration
+	RuntimeResourceHooks RuntimeResourceHooks
 
 	clientFactory func(context.Context, opencode.StartOptions) (opencode.Client, error)
 }
@@ -71,7 +102,7 @@ func applyOptions(opts []Option) Options {
 		AgentVersion:            "0.1.0",
 		SessionStoreLoadTimeout: 10 * time.Second,
 		HealthCheckTimeout:      opencode.HealthCheckTimeout,
-		MinimumVersion:          "1.17.13",
+		NativeVersion:           "1.17.18",
 		clientFactory:           opencode.StartServer,
 	}
 	for _, opt := range opts {
@@ -111,10 +142,7 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
-// WithHome is unsupported. OpenCode has no native config or auth root for the
-// adapter to point at, so a non-empty Home is rejected with the uniform
-// unsupported-option error on every session-establishing request. Use
-// WithScratchDir to control where ephemeral per-session state is materialized.
+// WithHome selects the exclusive shared OpenCode XDG root owned by the Agent.
 func WithHome(path string) Option {
 	return func(options *Options) {
 		options.Home = path
@@ -122,10 +150,8 @@ func WithHome(path string) Option {
 }
 
 // WithScratchDir sets the parent directory for all ephemeral on-disk
-// materialization: the isolated per-session OpenCode XDG homes, sqlite temp
-// directories used while snapshotting native state, and any probe directories.
-// An empty value (the default) uses the system temporary directory. The parent
-// is created with 0700 permissions when missing.
+// materialization, including a generated shared runtime root. An empty value
+// uses the system temporary directory.
 func WithScratchDir(dir string) Option {
 	return func(options *Options) {
 		options.ScratchDir = dir
@@ -182,15 +208,13 @@ func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
 	}
 }
 
-// WithSeedFiles writes files into each session's isolated OpenCode config root
-// before launching opencode serve, so the native server reads them as its own
-// config. Keys are paths relative to the per-session
+// WithSeedFiles writes immutable bootstrap files into the shared OpenCode
+// runtime config root before launching opencode serve. Keys are paths relative to
 // <XDG_CONFIG_HOME>/opencode/ directory mapped to file contents; absolute
-// paths, parent-directory escapes, and empty keys are rejected with the uniform
-// unsupported error. The seeded opencode.json is deep-merged with the wrapper's
-// managed $schema and permission keys (the wrapper wins for those keys, the
-// seed supplies the rest, e.g. a custom provider block); every other seeded
-// file is written verbatim. The map is cloned like WithEnv.
+// paths, parent-directory escapes, and empty keys are rejected. A seeded
+// opencode.json must not contain permission or MCP policy because those values
+// are bound to native sessions and directory scopes respectively. The map is
+// cloned like WithEnv.
 func WithSeedFiles(files map[string]string) Option {
 	return func(options *Options) {
 		options.SeedFiles = cloneStringMap(files)
@@ -215,9 +239,17 @@ func WithOpenCodeLogLevel(level string) Option {
 	}
 }
 
-func WithOpenCodeMinimumVersion(version string) Option {
+// WithVersion selects the exact native version required by the sync
+// event store. Version ranges and minimum-version fallbacks are unsupported.
+func WithVersion(version string) Option {
 	return func(options *Options) {
-		options.MinimumVersion = version
+		options.NativeVersion = version
+	}
+}
+
+func WithRuntimeResourceHooks(hooks RuntimeResourceHooks) Option {
+	return func(options *Options) {
+		options.RuntimeResourceHooks = hooks
 	}
 }
 

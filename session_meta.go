@@ -9,12 +9,12 @@ import (
 )
 
 type sessionMeta struct {
-	Model        string
-	Env          map[string]string
-	OutputSchema map[string]any
-	Mode         string
-	Permission   string
-	RawMessages  rawMessageConfig
+	Model         string
+	OutputSchema  map[string]any
+	Mode          string
+	Permission    string
+	PermissionSet bool
+	RawMessages   rawMessageConfig
 }
 
 func sessionMetaFromLifecycle(meta map[string]any) (sessionMeta, error) {
@@ -30,21 +30,21 @@ func sessionMetaFromLifecycle(meta map[string]any) (sessionMeta, error) {
 	outputSchema, _ := options.OutputSchema.(map[string]any)
 
 	return sessionMeta{
-		Model:        options.Model,
-		Env:          options.Env,
-		OutputSchema: outputSchema,
-		Mode:         options.Mode,
-		Permission:   normalizeOpenCodePermission(options.Permission),
-		RawMessages:  rawMessageConfigFromMeta(meta),
+		Model:         options.Model,
+		OutputSchema:  outputSchema,
+		Mode:          options.Mode,
+		Permission:    normalizeOpenCodePermission(options.Permission),
+		PermissionSet: options.PermissionSet,
+		RawMessages:   rawMessageConfigFromMeta(meta),
 	}, nil
 }
 
 type opencodeMetaOptions struct {
-	Model        string
-	Env          map[string]string
-	OutputSchema any
-	Mode         string
-	Permission   string
+	Model         string
+	OutputSchema  any
+	Mode          string
+	Permission    string
+	PermissionSet bool
 }
 
 func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
@@ -57,6 +57,10 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 
 	options := opencodeMetaOptions{}
 
+	if _, removed := optionsMap[metaEnvKey]; removed {
+		return opencodeMetaOptions{}, unsupportedField("_meta.opencode.options." + metaEnvKey)
+	}
+
 	if rawModel, ok := optionsMap[metaModelKey]; ok {
 		model, ok := rawModel.(string)
 		if !ok {
@@ -64,15 +68,6 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 		}
 
 		options.Model = model
-	}
-
-	if rawEnv, ok := optionsMap[metaEnvKey]; ok {
-		env, err := stringMapFromMeta(rawEnv)
-		if err != nil {
-			return opencodeMetaOptions{}, err
-		}
-
-		options.Env = env
 	}
 
 	if schema, ok := optionsMap[metaOutputSchemaKey]; ok {
@@ -103,6 +98,7 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 		}
 
 		options.Permission = normalizeOpenCodePermission(permission)
+		options.PermissionSet = true
 	}
 
 	return options, nil
@@ -132,7 +128,7 @@ func validateLifecycleMeta(meta map[string]any) error {
 
 			for optionKey := range optionsMap {
 				switch optionKey {
-				case configModel, "env", "outputSchema", configMode, metaPermissionKey:
+				case configModel, "outputSchema", configMode, metaPermissionKey:
 				default:
 					return unsupportedField("_meta.opencode.options." + optionKey)
 				}
@@ -183,7 +179,7 @@ func lifecycleMetaError(err error) error {
 
 func validateOpenCodePermission(permission string) error {
 	switch permission {
-	case "", openCodePermissionAsk, openCodePermissionAllow:
+	case "", openCodePermissionAsk, openCodePermissionAllow, openCodePermissionDeny:
 		return nil
 	default:
 		return unsupportedField("_meta.opencode.options.permission")
@@ -209,27 +205,6 @@ func validateSchemaObject(schema any) error {
 	}
 
 	return nil
-}
-
-func stringMapFromMeta(value any) (map[string]string, error) {
-	switch typed := value.(type) {
-	case map[string]string:
-		return cloneStringMap(typed), nil
-	case map[string]any:
-		out := make(map[string]string, len(typed))
-		for key, raw := range typed {
-			str, ok := raw.(string)
-			if !ok {
-				return nil, fmt.Errorf("_meta.opencode.options.env.%s must be a string", key)
-			}
-
-			out[key] = str
-		}
-
-		return out, nil
-	default:
-		return nil, fmt.Errorf("_meta.opencode.options.env must be an object")
-	}
 }
 
 func cloneAnyMap(values map[string]any) map[string]any {

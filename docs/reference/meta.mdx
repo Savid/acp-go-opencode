@@ -20,7 +20,6 @@ Lifecycle requests accept:
     "opencode": {
       "options": {
         "model": "provider/model",
-        "env": {},
         "mode": "build",
         "permission": "ask",
         "outputSchema": {}
@@ -36,15 +35,23 @@ Lifecycle requests accept:
 | Key | Values |
 |---|---|
 | `options.model` | `provider/model` string. |
-| `options.env` | Environment overrides for the native process. |
 | `options.mode` | An enumerable OpenCode agent name. |
-| `options.permission` | `ask` or `allow`; empty is treated as `ask`. |
+| `options.permission` | `ask`, `allow`, or `deny`; empty is treated as `ask`. |
 | `options.outputSchema` | JSON Schema object for native structured output. |
 | `rawEvent.enabled` | Opt in to `_opencode/rawEvent` notifications. |
 
-`_meta.opencode.options.permission` is written into the isolated per-session
-OpenCode config as `permission: {"*": "<value>"}` before `opencode serve`
-starts.
+`_meta.opencode.options.permission` becomes the native session's permission
+rule list at creation. `_meta.opencode.options.env` is rejected; native process
+environment is immutable and configured only with `WithEnv`.
+
+`session/prompt` and an active `session/cancel` require a top-level
+`_meta["acp-go.dev/route"]` object containing exactly `version: 1` and a
+non-empty `turnNonce`. The cancel nonce must equal the active prompt nonce.
+
+Every live-turn `session/update` and `_opencode/rawEvent` notification carries
+that same exact `{version, turnNonce}` object in its notification `_meta`;
+raw-event payloads also carry their structural `sessionId`. Lifecycle and
+load-history updates remain outside a turn epoch and omit the envelope.
 
 ## Response output
 
@@ -58,7 +65,13 @@ starts.
 The initialize response advertises adapter surfaces under
 `_meta.opencode`: `fork`, `elicitation`, `rawEvent` (method, enable path, and
 `maxBytes`), `sessionStore` (format and key), and `structuredOutput` (config
-path, result path, and schema mode).
+path, result path, and schema mode). `AgentCapabilities.Meta` also advertises
+`"acp-go.dev/route": {"versions": [1]}`.
+
+Outbound permission and elicitation requests preserve native metadata and add
+the reserved route envelope with `version`, `sessionId`, `turnNonce`, and
+exactly one of `toolCallId` or `requestId`. A native metadata collision with
+that reserved key is rejected.
 
 ## Turn-failure error data
 

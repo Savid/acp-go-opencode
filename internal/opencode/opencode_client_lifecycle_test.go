@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,11 +14,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/savid/acp-go-opencode/internal/homelock"
+	"github.com/stretchr/testify/require"
 )
+
+const releaseGateRepetitions = 5
 
 type openCodeMethodsRecorder struct {
 	seen        []string
@@ -25,6 +32,7 @@ type openCodeMethodsRecorder struct {
 	commandBody CommandRequest
 	forkBody    map[string]any
 	createBody  map[string]any
+	promptAsync bool
 }
 
 func openCodeMethodsRoutes(t *testing.T, rec *openCodeMethodsRecorder) map[string]http.HandlerFunc {
@@ -60,10 +68,22 @@ func openCodeMethodsRoutes(t *testing.T, rec *openCodeMethodsRecorder) map[strin
 			})
 		},
 		"GET /session/s%2F1/message": func(w http.ResponseWriter, _ *http.Request) {
+			if rec.promptAsync {
+				writeJSON(t, w, []map[string]any{{"info": map[string]any{"id": "assistant", "sessionID": "s/1", "role": "assistant", "finish": "stop"}, "parts": []map[string]any{{"id": "part-1", "sessionID": "s/1", "messageID": "assistant", "type": "text", "text": "ok"}}}})
+
+				return
+			}
 			writeJSON(t, w, []map[string]any{{
 				"info":  map[string]any{"id": "history", "sessionID": "s/1", "role": "assistant"},
 				"parts": []map[string]any{{"id": "history-part", "sessionID": "s/1", "messageID": "history", "type": "text", "text": "ok"}},
 			}})
+		},
+		"POST /session/s%2F1/prompt_async": func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&rec.messageBody); err != nil {
+				t.Errorf("decode async body: %v", err)
+			}
+			rec.promptAsync = true
+			w.WriteHeader(http.StatusNoContent)
 		},
 		"GET /command": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{
@@ -199,7 +219,7 @@ func TestOpenCodeServerMessageAndCommandMethods(t *testing.T) {
 		t.Fatalf("SendMessage = %#v body=%#v err=%v", message, rec.messageBody, err)
 	}
 	messages, err := client.Messages(ctx, "s/1")
-	if err != nil || len(messages) != 1 || messages[0].Info.ID != "history" {
+	if err != nil || len(messages) != 1 || messages[0].Info.ID != "assistant" {
 		t.Fatalf("Messages = %#v err=%v", messages, err)
 	}
 	commands, err := client.Commands(ctx)
@@ -439,22 +459,16 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	root := t.TempDir()
 	logger := slog.New(slog.DiscardHandler)
 	client, err := StartServer(context.Background(), StartOptions{
-		ACPSessionID:     "session/one",
-		Root:             root,
-		Cwd:              t.TempDir(),
-		ExecutablePath:   helper,
-		DefaultModel:     "openai/gpt-test",
-		Env:              map[string]string{"BASE_ENV": "base"},
-		AdditionalEnv:    map[string]string{"EXTRA_ENV": "extra"},
-		Pure:             true,
-		QuestionTool:     true,
-		LogLevel:         "DEBUG",
-		Permission:       "allow",
-		MinimumVersion:   "1.0.0",
-		HealthTimeout:    5 * time.Second,
-		Logger:           logger,
-		SkipVersionGate:  false,
-		ExpectedNativeID: "native",
+		Root:            root,
+		ExecutablePath:  helper,
+		Env:             map[string]string{"BASE_ENV": "base"},
+		Pure:            true,
+		QuestionTool:    true,
+		LogLevel:        "DEBUG",
+		ExactVersion:    "1.17.18",
+		HealthTimeout:   5 * time.Second,
+		Logger:          logger,
+		SkipVersionGate: false,
 	})
 	if err != nil {
 		t.Fatalf("StartServer: %v", err)
@@ -463,30 +477,34 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	if !ok {
 		t.Fatalf("client type = %T, want *openCodeServer", client)
 	}
-	if server.xdg.Root == "" || !strings.Contains(filepath.Base(server.xdg.Root), "session_one") {
+	if server.xdg.Root != root {
 		t.Fatalf("xdg dirs = %#v", server.xdg)
 	}
-	if _, statErr := os.Stat(filepath.Join(server.xdg.State, LeaseFileName)); statErr != nil {
-		t.Fatalf("lease was not written: %v", statErr)
+	for _, name := range []string{homelock.ClaimFileName, homelock.LivenessFileName} {
+		if _, statErr := os.Stat(filepath.Join(server.xdg.Root, name)); statErr != nil {
+			t.Fatalf("runtime lock %s was not retained: %v", name, statErr)
+		}
 	}
 	configData, err := os.ReadFile(filepath.Join(server.xdg.Config, "opencode", "opencode.json"))
 	if err != nil {
 		t.Fatalf("permission config was not written: %v", err)
 	}
-	if !strings.Contains(string(configData), `"*": "allow"`) {
-		t.Fatalf("permission config = %s", string(configData))
+	if strings.Contains(string(configData), `"permission"`) {
+		t.Fatalf("runtime config contains session permission = %s", string(configData))
 	}
 	if server.Events() == nil || server.EventErrors() == nil || server.XDGDirs().Root == "" {
 		t.Fatalf("server channels/dirs not initialized: %#v", server)
 	}
-	if err := server.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
 	if err := server.Close(context.Background()); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(server.xdg.State, LeaseFileName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("lease after close err = %v", err)
+	for _, name := range []string{homelock.ClaimFileName, homelock.LivenessFileName} {
+		if _, err := os.Stat(filepath.Join(server.xdg.Root, name)); err != nil {
+			t.Fatalf("runtime lock file %s was unlinked: %v", name, err)
+		}
 	}
 }
 
@@ -502,7 +520,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 			return exec.CommandContext(ctx, filepath.Join(t.TempDir(), "missing-opencode"))
 		}
-		_, err := StartServer(ctx, StartOptions{ExistingXDG: xdg})
+		_, err := StartServer(ctx, StartOptions{ExistingXDG: xdg, SkipSupervisor: true})
 		if err == nil {
 			t.Fatal("missing executable unexpectedly started")
 		}
@@ -511,16 +529,9 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		}
 	})
 
-	t.Run("reap failure", func(t *testing.T) {
-		if _, err := StartServer(ctx, StartOptions{Root: "["}); err == nil {
-			t.Fatal("invalid reap glob unexpectedly succeeded")
-		}
-	})
-
 	t.Run("create xdg failure", func(t *testing.T) {
 		_, err := StartServer(ctx, StartOptions{
-			Root:         t.TempDir(),
-			ACPSessionID: ACPSessionID(string([]byte{0})),
+			Root: filepath.Join(t.TempDir(), string([]byte{0})),
 		})
 		if err == nil {
 			t.Fatal("invalid session xdg path unexpectedly succeeded")
@@ -536,10 +547,10 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		}
 	})
 
-	t.Run("permission config failure", func(t *testing.T) {
+	t.Run("runtime config failure", func(t *testing.T) {
 		_, err := StartServer(ctx, StartOptions{
 			ExistingXDG: testXDGDirs(t),
-			Permission:  "deny",
+			SeedFiles:   map[string]string{"../escape": "bad"},
 		})
 		if err == nil {
 			t.Fatal("invalid permission unexpectedly started")
@@ -590,58 +601,17 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		}
 	})
 
-	t.Run("lease write failure", func(t *testing.T) {
-		restoreOpenCodeClientSeams(t)
-		openCodeWriteLease = func(string, serverLease) error {
-			return errors.New("lease failed")
-		}
-		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
-			t.Fatal("lease error was ignored")
-		}
-	})
-
-	t.Run("post-start lease write failure kills process", func(t *testing.T) {
-		restoreOpenCodeClientSeams(t)
-		helper := fakeOpenCodeExecutable(t)
-		writeCount := 0
-		killed := false
-		openCodeWriteLease = func(string, serverLease) error {
-			writeCount++
-			if writeCount == 2 {
-				return errors.New("post-start lease failed")
-			}
-
-			return nil
-		}
-		openCodeKillProcess = func(*exec.Cmd) error {
-			killed = true
-
-			return nil
-		}
-		_, err := StartServer(ctx, StartOptions{
-			Root:           t.TempDir(),
-			ExecutablePath: helper,
-			HealthTimeout:  5 * time.Second,
-		})
-		if err == nil || !strings.Contains(err.Error(), "post-start lease failed") {
-			t.Fatalf("post-start lease err = %v", err)
-		}
-		if !killed {
-			t.Fatal("post-start lease failure did not kill process")
-		}
-	})
-
 	t.Run("readiness failure closes process", func(t *testing.T) {
 		helper := fakeOpenCodeExecutable(t)
 		_, err := StartServer(ctx, StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  helper,
-			MinimumVersion:  "99.0.0",
+			ExactVersion:    "99.0.0",
 			HealthTimeout:   2 * time.Second,
 			SkipVersionGate: false,
 			Logger:          slog.New(slog.DiscardHandler),
 		})
-		if err == nil || !strings.Contains(err.Error(), "below minimum") {
+		if err == nil || !strings.Contains(err.Error(), "does not match required") {
 			t.Fatalf("readiness error = %v", err)
 		}
 	})
@@ -665,7 +635,7 @@ func TestOpenCodeServerReadinessGateAndStreamFailures(t *testing.T) {
 			}
 		})
 		defer closeServer()
-		if err := client.waitReady(ctx, ctx, StartOptions{MinimumVersion: "9.0.0"}); err == nil {
+		if err := client.waitReady(ctx, ctx, StartOptions{ExactVersion: "9.0.0"}); err == nil {
 			t.Fatal("old version unexpectedly passed readiness")
 		}
 	})
@@ -1040,28 +1010,28 @@ func TestOpenCodeServerCloseTimeoutAndContext(t *testing.T) {
 			} else {
 				openCodeShutdownTimeout = time.Millisecond
 			}
-			if err := server.Close(ctx); err == nil {
-				t.Fatal("Close unexpectedly succeeded")
+			if err := server.Shutdown(ctx); err == nil {
+				t.Fatal("Shutdown unexpectedly succeeded")
 			}
 		})
 	}
 }
 
-func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
+func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	root := t.TempDir()
-	xdg, err := CreateXDGDirs(root, "")
+	xdg, err := CreateRuntimeXDGDirs(root)
 	if err != nil {
-		t.Fatalf("CreateXDGDirs: %v", err)
+		t.Fatalf("CreateRuntimeXDGDirs: %v", err)
 	}
-	if filepath.Base(xdg.Root) != "session" {
+	if xdg.Root != root {
 		t.Fatalf("default xdg root = %#v", xdg)
 	}
 	if ensureErr := ensureXDGDirs(XDGDirs{Root: "", Data: "x", Config: "x", Cache: "x", State: "x"}); ensureErr == nil {
 		t.Fatal("ensureXDGDirs accepted empty root")
 	}
-	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, "", nil, nil)
-	if err != nil || !strings.Contains(permissionConfig, `"*": "ask"`) {
-		t.Fatalf("default permission config = %q err=%v", permissionConfig, err)
+	permissionConfig, err := materializeOpenCodeRuntimeConfig(xdg, nil)
+	if err != nil || strings.Contains(permissionConfig, `"permission"`) {
+		t.Fatalf("runtime config = %q err=%v", permissionConfig, err)
 	}
 	permissionFile := filepath.Join(xdg.Config, "opencode", "opencode.json")
 	info, err := os.Stat(permissionFile)
@@ -1070,9 +1040,6 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("permission config file mode = %v", info.Mode().Perm())
-	}
-	if _, denyErr := materializeOpenCodePermissionConfig(xdg, "deny", nil, nil); denyErr == nil {
-		t.Fatal("unsupported permission config accepted")
 	}
 	configRootFile := filepath.Join(t.TempDir(), "config-file")
 	if writeErr := os.WriteFile(configRootFile, []byte("file"), 0o600); writeErr != nil {
@@ -1096,25 +1063,6 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	if err != nil || password == "" {
 		t.Fatalf("randomPassword = %q err=%v", password, err)
 	}
-	if err := writeLease(xdg.State, serverLease{PID: 0, Port: port, PasswordHash: passwordHash(password)}); err != nil {
-		t.Fatalf("writeLease: %v", err)
-	}
-	badRoot := string([]byte{0})
-	if err := writeLease(badRoot, serverLease{}); err == nil {
-		t.Fatal("writeLease accepted invalid path")
-	}
-	if err := os.MkdirAll(filepath.Join(root, "bad", "state"), 0o700); err != nil {
-		t.Fatalf("mkdir bad lease: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "bad", "state", LeaseFileName), []byte("{"), 0o600); err != nil {
-		t.Fatalf("write bad lease: %v", err)
-	}
-	if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
-		t.Fatalf("reapStaleLeases: %v", err)
-	}
-	if err := reapStaleLeases("", nil); err != nil {
-		t.Fatalf("empty reapStaleLeases: %v", err)
-	}
 	env := mergeProcessEnv(map[string]string{"": "skip", "A": "1"}, map[string]string{"A": "2", "B": "3"})
 	if env["A"] != "2" || env["B"] != "3" {
 		t.Fatalf("merged env = %#v", env)
@@ -1130,84 +1078,12 @@ func TestXDGLeaseEnvAndPipeHelpers(t *testing.T) {
 	}
 }
 
-func TestMaterializeOpenCodeConfigMCPServers(t *testing.T) {
-	if block := openCodeMCPConfigBlock(nil); block != nil {
-		t.Fatalf("empty MCP server list produced block %#v", block)
-	}
-
-	xdg := testXDGDirs(t)
-	seed := map[string]string{"opencode.json": `{
-  "mcp": {
-    "seeded": {"type": "remote", "url": "http://seed.example/mcp"},
-    "gateway": {"type": "local", "command": ["stale-binary", "--flag"]}
-  }
-}`}
-	servers := []MCPServerConfig{
-		{Name: "gateway", URL: "http://127.0.0.1:9/mcp", Headers: map[string]string{"Authorization": "Bearer t"}},
-		{Name: "files", Command: []string{"server-files", "--root", "/tmp"}, Env: map[string]string{"DEBUG": "1"}},
-	}
-
-	config, err := materializeOpenCodePermissionConfig(xdg, "ask", seed, servers)
-	if err != nil {
-		t.Fatalf("materializeOpenCodePermissionConfig: %v", err)
-	}
-
-	var merged map[string]any
-	if unmarshalErr := json.Unmarshal([]byte(config), &merged); unmarshalErr != nil {
-		t.Fatalf("returned config is not JSON: %v", unmarshalErr)
-	}
-
-	mcp, ok := merged["mcp"].(map[string]any)
-	if !ok {
-		t.Fatalf("merged config missing mcp block: %#v", merged)
-	}
-
-	seeded, ok := mcp["seeded"].(map[string]any)
-	if !ok || seeded["url"] != "http://seed.example/mcp" {
-		t.Fatalf("seeded MCP server dropped: %#v", mcp["seeded"])
-	}
-
-	remote, ok := mcp["gateway"].(map[string]any)
-	if !ok || remote["type"] != "remote" || remote["url"] != "http://127.0.0.1:9/mcp" || remote["enabled"] != true {
-		t.Fatalf("wrapper remote MCP server did not win the merge: %#v", mcp["gateway"])
-	}
-	// The forwarded remote server must REPLACE the same-named seeded local server
-	// wholesale: no stale "command" from the seed may survive into the hybrid.
-	if _, stale := remote["command"]; stale {
-		t.Fatalf("seeded local command bled into forwarded remote server: %#v", remote)
-	}
-	headers, ok := remote["headers"].(map[string]any)
-	if !ok || headers["Authorization"] != "Bearer t" {
-		t.Fatalf("remote MCP headers = %#v", remote["headers"])
-	}
-
-	local, ok := mcp["files"].(map[string]any)
-	if !ok || local["type"] != "local" || local["enabled"] != true {
-		t.Fatalf("local MCP server = %#v", mcp["files"])
-	}
-	command, ok := local["command"].([]any)
-	if !ok || len(command) != 3 || command[0] != "server-files" || command[1] != "--root" || command[2] != "/tmp" {
-		t.Fatalf("local MCP command = %#v", local["command"])
-	}
-	environment, ok := local["environment"].(map[string]any)
-	if !ok || environment["DEBUG"] != "1" {
-		t.Fatalf("local MCP environment = %#v", local["environment"])
-	}
-
-	// No session MCP servers → no managed mcp key.
-	plain, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", nil, nil)
-	if err != nil {
-		t.Fatalf("materializeOpenCodePermissionConfig without MCP: %v", err)
-	}
-
-	var plainConfig map[string]any
-	if unmarshalErr := json.Unmarshal([]byte(plain), &plainConfig); unmarshalErr != nil {
-		t.Fatalf("plain config is not JSON: %v", unmarshalErr)
-	}
-
-	if _, exists := plainConfig["mcp"]; exists {
-		t.Fatalf("mcp key emitted without session MCP servers: %#v", plainConfig)
-	}
+// Seed-guard tests below exercise the shared runtime seed writer. Their old
+// helper shape is retained only inside this test file to keep fault tables
+// focused on filesystem behavior; permission/MCP assertions have dedicated
+// multiplexing tests.
+func materializeOpenCodePermissionConfig(dirs XDGDirs, _ string, seeds map[string]string, _ []MCPServerConfig) (string, error) {
+	return materializeOpenCodeRuntimeConfig(dirs, seeds)
 }
 
 func TestOpenCodeSeedFilesMergeAndConfinement(t *testing.T) {
@@ -1219,8 +1095,7 @@ func TestOpenCodeSeedFilesMergeAndConfinement(t *testing.T) {
       "npm": "@ai-sdk/openai-compatible",
       "options": {"baseURL": "https://proxy.example/v1"}
     }
-  },
-  "permission": {"*": "allow"}
+  }
 }`,
 		"themes/custom.json":        `{"name":"custom"}`,
 		"agents/subdir/reviewer.md": "seeded agent",
@@ -1240,9 +1115,8 @@ func TestOpenCodeSeedFilesMergeAndConfinement(t *testing.T) {
 	if merged["$schema"] != "https://opencode.ai/config.json" {
 		t.Fatalf("merged config missing wrapper $schema: %#v", merged)
 	}
-	permission, ok := merged["permission"].(map[string]any)
-	if !ok || permission["*"] != "ask" {
-		t.Fatalf("wrapper permission did not win the merge: %#v", merged["permission"])
+	if _, ok := merged["permission"]; ok {
+		t.Fatalf("shared runtime config contains permission: %#v", merged)
 	}
 	provider, ok := merged["provider"].(map[string]any)
 	if !ok || provider["litellm"] == nil {
@@ -1400,9 +1274,9 @@ func TestOpenCodeSeedGuardManifestAndBackups(t *testing.T) {
 		if err != nil {
 			t.Fatalf("first seed: %v", err)
 		}
-		// A different permission changes the merged bytes, so the guard must back
-		// up the prior merged opencode.json.
-		if _, seedErr := materializeOpenCodePermissionConfig(xdg, "allow", nil, nil); seedErr != nil {
+		// A different immutable seed changes the merged bytes, so the guard must
+		// back up the prior merged opencode.json.
+		if _, seedErr := materializeOpenCodePermissionConfig(xdg, "allow", map[string]string{"opencode.json": `{"provider":{"x":{}}}`}, nil); seedErr != nil {
 			t.Fatalf("second seed: %v", seedErr)
 		}
 		backup, err := os.ReadFile(filepath.Join(configDir, openCodeConfigFileName+openCodeSeedBackupSuffix))
@@ -1597,7 +1471,7 @@ func TestOpenCodeSeedGuardWriteFaults(t *testing.T) {
 	})
 }
 
-func TestPortPasswordLeaseAndReaperFaultInjection(t *testing.T) {
+func TestPortPasswordAndConfigFaultInjection(t *testing.T) {
 	restoreOpenCodeClientSeams(t)
 
 	openCodeListen = func(string, string) (net.Listener, error) {
@@ -1621,225 +1495,9 @@ func TestPortPasswordLeaseAndReaperFaultInjection(t *testing.T) {
 	openCodeMarshalIndent = func(any, string, string) ([]byte, error) {
 		return nil, errors.New("marshal failed")
 	}
-	if err := writeLease(t.TempDir(), serverLease{}); err == nil {
-		t.Fatal("writeLease ignored marshal error")
-	}
 	if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", nil, nil); err == nil {
 		t.Fatal("permission config ignored marshal error")
 	}
-
-	if err := reapStaleLeases("[", slog.New(slog.DiscardHandler)); err == nil {
-		t.Fatal("reapStaleLeases accepted malformed glob")
-	}
-	root := t.TempDir()
-	stateDir := filepath.Join(root, "session", "state")
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("missing", filepath.Join(stateDir, LeaseFileName)); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-	if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
-		t.Fatalf("reap stale read error: %v", err)
-	}
-}
-
-func TestLeaseReaperVerifiesProcessIdentity(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("process identity is platform-specific")
-	}
-	t.Run("unrelated process survives", func(t *testing.T) {
-		root := t.TempDir()
-		xdg, err := CreateXDGDirs(root, "unrelated")
-		if err != nil {
-			t.Fatal(err)
-		}
-		cmd := exec.Command("sleep", "30")
-		cmd.Env = append(os.Environ(),
-			"XDG_STATE_HOME="+xdg.State,
-			"OPENCODE_SERVER_PASSWORD=secret",
-		)
-		if startErr := cmd.Start(); startErr != nil {
-			t.Fatalf("start sleep: %v", startErr)
-		}
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-		waited := false
-		t.Cleanup(func() {
-			if waited {
-				return
-			}
-			select {
-			case <-done:
-			default:
-				_ = cmd.Process.Kill()
-				<-done
-			}
-		})
-		identity, err := openCodeInspectProcess(cmd.Process.Pid)
-		if err != nil {
-			t.Skipf("process identity unavailable: %v", err)
-		}
-		if err := writeLease(xdg.State, serverLease{
-			PID:              cmd.Process.Pid,
-			PasswordHash:     passwordHash("secret"),
-			XDGRoot:          xdg.Root,
-			ProcessStartTime: identity.StartTime,
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
-			t.Fatalf("reapStaleLeases: %v", err)
-		}
-		select {
-		case err := <-done:
-			waited = true
-			t.Fatalf("unrelated process was killed: %v", err)
-		default:
-		}
-		if _, err := os.Stat(filepath.Join(xdg.State, LeaseFileName)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("lease after unrelated reap = %v", err)
-		}
-	})
-
-	t.Run("verified fake opencode is reaped", func(t *testing.T) {
-		root := t.TempDir()
-		xdg, err := CreateXDGDirs(root, "orphan")
-		if err != nil {
-			t.Fatal(err)
-		}
-		cmd := exec.Command(os.Args[0], "-test.run=TestFakeOpenCodeServerProcessHelper", "--", "serve", "--port", "0")
-		configureOpenCodeProcess(cmd)
-		cmd.Env = append(os.Environ(),
-			"ACP_GO_OPENCODE_FAKE_SERVER_HELPER=1",
-			"XDG_STATE_HOME="+xdg.State,
-			"OPENCODE_SERVER_USERNAME=opencode",
-			"OPENCODE_SERVER_PASSWORD=secret",
-		)
-		if startErr := cmd.Start(); startErr != nil {
-			t.Fatalf("start fake opencode: %v", startErr)
-		}
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-		waited := false
-		t.Cleanup(func() {
-			if waited {
-				return
-			}
-			select {
-			case <-done:
-			default:
-				_ = cmd.Process.Kill()
-				<-done
-			}
-		})
-		var identity processIdentity
-		for i := 0; i < 50; i++ {
-			identity, err = openCodeInspectProcess(cmd.Process.Pid)
-			if err == nil {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		if err != nil {
-			t.Skipf("process identity unavailable: %v", err)
-		}
-		if err := writeLease(xdg.State, serverLease{
-			PID:              cmd.Process.Pid,
-			PasswordHash:     passwordHash("secret"),
-			XDGRoot:          xdg.Root,
-			ProcessStartTime: identity.StartTime,
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if err := reapStaleLeases(root, slog.New(slog.DiscardHandler)); err != nil {
-			t.Fatalf("reapStaleLeases: %v", err)
-		}
-		select {
-		case <-done:
-			waited = true
-		case <-time.After(2 * time.Second):
-			t.Fatal("verified fake opencode was not reaped")
-		}
-		if _, err := os.Stat(filepath.Join(xdg.State, LeaseFileName)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("lease after verified reap = %v", err)
-		}
-	})
-}
-
-func TestLeaseIdentityBranchCoverage(t *testing.T) {
-	root := t.TempDir()
-	xdg, err := CreateXDGDirs(root, "lease")
-	if err != nil {
-		t.Fatal(err)
-	}
-	leasePath := filepath.Join(xdg.State, LeaseFileName)
-	baseIdentity := processIdentity{
-		StartTime: "start",
-		Cmdline:   []string{"/usr/bin/opencode", "serve"},
-		Env: map[string]string{
-			"XDG_STATE_HOME":           xdg.State,
-			"OPENCODE_SERVER_PASSWORD": "secret",
-		},
-	}
-	baseLease := serverLease{
-		PID:              999999,
-		PasswordHash:     passwordHash("secret"),
-		XDGRoot:          xdg.Root,
-		ProcessStartTime: "start",
-	}
-
-	restoreOpenCodeClientSeams(t)
-	openCodeInspectProcess = func(int) (processIdentity, error) {
-		return baseIdentity, nil
-	}
-	if !leaseMatchesProcess(leasePath, baseLease) {
-		t.Fatal("matching lease did not match")
-	}
-	if cmdlineLooksLikeOpenCodeServe([]string{"/tmp/opencode"}) != true || cmdlineLooksLikeOpenCodeServe([]string{"node"}) {
-		t.Fatal("cmdline OpenCode detection mismatch")
-	}
-	if leaseMatchesProcess(leasePath, serverLease{PID: 0, ProcessStartTime: "start"}) {
-		t.Fatal("zero pid lease matched")
-	}
-	if leaseMatchesProcess(leasePath, serverLease{PID: 1}) {
-		t.Fatal("missing start time lease matched")
-	}
-
-	for _, tt := range []struct {
-		name     string
-		identity processIdentity
-		lease    serverLease
-		err      error
-	}{
-		{name: "inspect error", identity: baseIdentity, lease: baseLease, err: errors.New("inspect failed")},
-		{name: "start mismatch", identity: processIdentity{StartTime: "other", Cmdline: baseIdentity.Cmdline, Env: baseIdentity.Env}, lease: baseLease},
-		{name: "state mismatch", identity: processIdentity{StartTime: "start", Cmdline: baseIdentity.Cmdline, Env: map[string]string{"XDG_STATE_HOME": t.TempDir(), "OPENCODE_SERVER_PASSWORD": "secret"}}, lease: baseLease},
-		{name: "password mismatch", identity: processIdentity{StartTime: "start", Cmdline: baseIdentity.Cmdline, Env: map[string]string{"XDG_STATE_HOME": xdg.State, "OPENCODE_SERVER_PASSWORD": "wrong"}}, lease: baseLease},
-		{name: "root mismatch", identity: baseIdentity, lease: serverLease{PID: baseLease.PID, PasswordHash: baseLease.PasswordHash, XDGRoot: t.TempDir(), ProcessStartTime: baseLease.ProcessStartTime}},
-		{name: "cmdline mismatch", identity: processIdentity{StartTime: "start", Cmdline: []string{"node"}, Env: baseIdentity.Env}, lease: baseLease},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			openCodeInspectProcess = func(int) (processIdentity, error) {
-				return tt.identity, tt.err
-			}
-			if leaseMatchesProcess(leasePath, tt.lease) {
-				t.Fatal("mismatched lease matched")
-			}
-		})
-	}
-
-	openCodeInspectProcess = func(int) (processIdentity, error) {
-		return baseIdentity, nil
-	}
-	if err := writeLease(xdg.State, baseLease); err != nil {
-		t.Fatal(err)
-	}
-	ReapLeaseFile(leasePath, slog.New(slog.DiscardHandler))
-	if _, err := os.Stat(leasePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("lease after reap = %v", err)
-	}
-	ReapLeaseFile(t.TempDir(), nil)
 }
 
 func TestNativeUnmarshalErrors(t *testing.T) {
@@ -1912,7 +1570,7 @@ func runFakeOpenCodeServerProcess() {
 		}
 		switch r.URL.Path {
 		case "/global/health":
-			writeJSONNoTest(w, map[string]any{"healthy": true, "version": "9.9.9"})
+			writeJSONNoTest(w, map[string]any{"healthy": true, "version": "1.17.18"})
 		case "/doc":
 			writeJSONNoTest(w, fullOpenCodeDoc())
 		case "/event":
@@ -1938,11 +1596,8 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	listen := openCodeListen
 	randReader := openCodeRandReader
 	marshalIndent := openCodeMarshalIndent
-	leaseWriter := openCodeWriteLease
 	terminateProcess := openCodeTerminateProcess
 	killProcess := openCodeKillProcess
-	inspectProcess := openCodeInspectProcess
-	procReader := procReadFile
 	waitCommand := openCodeWaitCommand
 	after := openCodeAfter
 	readyPoll := openCodeReadyPollInterval
@@ -1953,11 +1608,8 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodeListen = listen
 		openCodeRandReader = randReader
 		openCodeMarshalIndent = marshalIndent
-		openCodeWriteLease = leaseWriter
 		openCodeTerminateProcess = terminateProcess
 		openCodeKillProcess = killProcess
-		openCodeInspectProcess = inspectProcess
-		procReadFile = procReader
 		openCodeWaitCommand = waitCommand
 		openCodeAfter = after
 		openCodeReadyPollInterval = readyPoll
@@ -2086,4 +1738,124 @@ func slicesIndex(values []string, want string) int {
 	}
 
 	return -1
+}
+
+// TestHealthAttemptDeadlineReleaseGate proves the readiness loop cannot inherit
+// the shared HTTP client's 30-second timeout. The timed interval starts when a
+// deliberately blocked /global/health RoundTrip begins and stops when its
+// request context cancels. The local in-memory transport performs no network or
+// provider work. With five samples, nearest-rank p95 is the slowest sample.
+func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
+	budgets := make([]time.Duration, 0, releaseGateRepetitions)
+	elapsed := make([]time.Duration, 0, releaseGateRepetitions)
+
+	for range releaseGateRepetitions {
+		var healthCalls atomic.Int32
+		eventCtx, cancelEvents := context.WithCancel(context.Background())
+		client := &openCodeServer{
+			httpClient: &http.Client{Timeout: 30 * time.Second, Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case routeGlobalHealth:
+					if healthCalls.Add(1) == 1 {
+						deadline, ok := req.Context().Deadline()
+						require.True(t, ok, "health attempt must carry its own deadline")
+						started := time.Now()
+						budgets = append(budgets, time.Until(deadline))
+						<-req.Context().Done()
+						elapsed = append(elapsed, time.Since(started))
+
+						return nil, req.Context().Err()
+					}
+
+					return performanceJSONResponse(map[string]any{"healthy": true, "version": "1.17.18"}), nil
+				case routeDoc:
+					return performanceJSONResponse(fullOpenCodeDoc()), nil
+				case routeEvent:
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Status:     "200 OK",
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body: io.NopCloser(strings.NewReader(
+							"data: {\"type\":\"server.connected\",\"properties\":{}}\n\n",
+						)),
+					}, nil
+				default:
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Status:     "404 Not Found",
+						Header:     make(http.Header),
+						Body:       http.NoBody,
+					}, nil
+				}
+			})},
+			baseURL: "http://opencode.release-gate",
+			events:  make(chan Event, 8),
+			errs:    make(chan error, 8),
+			closed:  make(chan struct{}),
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := client.waitReady(ctx, eventCtx, StartOptions{ExactVersion: "1.17.18"})
+		cancel()
+		cancelEvents()
+		close(client.closed)
+		require.NoError(t, err)
+		require.EqualValues(t, 2, healthCalls.Load())
+	}
+
+	require.Len(t, budgets, releaseGateRepetitions)
+	require.Len(t, elapsed, releaseGateRepetitions)
+	slices.Sort(budgets)
+	slices.Sort(elapsed)
+	p95Budget := budgets[len(budgets)-1]
+	p95Elapsed := elapsed[len(elapsed)-1]
+	t.Logf("health-attempt release gate: repetitions=%d p95_budget=%s p95_elapsed=%s", releaseGateRepetitions, p95Budget, p95Elapsed)
+	require.LessOrEqual(t, p95Budget, 500*time.Millisecond)
+	require.Greater(t, p95Budget, 400*time.Millisecond)
+	require.Less(t, p95Elapsed, time.Second, "health-attempt p95 must reject the fixed 30-second penalty")
+}
+
+// TestColdStartupReleaseGate is the deterministic provider-free adapter gate.
+// It times StartServer from immediately before synthetic local process launch
+// through health, /doc validation, and the first server.connected event.
+// Fixture construction and shutdown are outside the interval. Each repetition
+// uses a fresh local XDG root and a fake HTTP/SSE process that implements the
+// exact pinned contract; this is not a physical OpenCode 1.17.18 p95 claim.
+// With five samples, nearest-rank p95 is the slowest sample.
+func TestColdStartupReleaseGate(t *testing.T) {
+	executable := fakeOpenCodeExecutable(t)
+	durations := make([]time.Duration, 0, releaseGateRepetitions)
+
+	for range releaseGateRepetitions {
+		started := time.Now()
+		client, err := StartServer(context.Background(), StartOptions{
+			Root:            t.TempDir(),
+			ExecutablePath:  executable,
+			ExactVersion:    "1.17.18",
+			HealthTimeout:   5 * time.Second,
+			SkipVersionGate: false,
+		})
+		durations = append(durations, time.Since(started))
+		require.NoError(t, err)
+		require.NoError(t, client.Shutdown(context.Background()))
+	}
+
+	slices.Sort(durations)
+	p95 := durations[len(durations)-1]
+	t.Logf("deterministic-adapter cold-start gate: repetitions=%d p95=%s", releaseGateRepetitions, p95)
+	require.Less(t, p95, 5*time.Second)
+}
+
+func performanceJSONResponse(value any) *http.Response {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewReader(data)),
+	}
 }

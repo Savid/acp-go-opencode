@@ -93,6 +93,7 @@ var startAgent = startAgentProcess
 var getwd = os.Getwd
 var exit = os.Exit
 var commandContext = exec.CommandContext
+var newTurnNonce = opencodeacp.NewTurnNonce
 var isTerminal = term.IsTerminal
 var getTerminalSize = term.GetSize
 var makeTerminalRaw = term.MakeRaw
@@ -1402,6 +1403,7 @@ func runInteractiveLoop(
 	queue := make([]string, 0, 1)
 	inputDone := false
 	running := false
+	activeTurnNonce := ""
 
 	var done <-chan promptResult
 
@@ -1437,13 +1439,20 @@ func runInteractiveLoop(
 			queue = queue[1:]
 			running = true
 
+			turnNonce, err := newTurnNonce()
+			if err != nil {
+				return err
+			}
+
+			activeTurnNonce = turnNonce
+
 			result := make(chan promptResult, 1)
 			done = result
 
 			ticks.start()
 
 			go func() {
-				result <- promptResult{err: runPrompt(ctx, conn, ui, sessionID, prompt)}
+				result <- promptResult{err: runPromptWithNonce(ctx, conn, ui, sessionID, turnNonce, prompt)}
 			}()
 
 			continue
@@ -1462,7 +1471,7 @@ func runInteractiveLoop(
 				continue
 			}
 
-			control := handleInputEvent(ctx, conn, ui, sessionID, event, running, enqueue)
+			control := handleInputEventWithNonce(ctx, conn, ui, sessionID, activeTurnNonce, event, running, enqueue)
 			if control.err != nil {
 				return control.err
 			}
@@ -1477,6 +1486,7 @@ func runInteractiveLoop(
 			}
 		case result := <-done:
 			running = false
+			activeTurnNonce = ""
 			done = nil
 
 			ticks.stop()
@@ -1496,7 +1506,7 @@ func runInteractiveLoop(
 			ui.tick()
 		case <-ctx.Done():
 			if running {
-				_ = conn.Cancel(context.Background(), acp.CancelNotification{SessionId: sessionID})
+				_ = conn.Cancel(context.Background(), opencodeacp.CancelRequest(sessionID, activeTurnNonce))
 			}
 
 			return nil
@@ -1513,12 +1523,25 @@ func handleInputEvent(
 	running bool,
 	enqueue func(string, bool),
 ) inputControl {
+	return handleInputEventWithNonce(ctx, conn, ui, sessionID, "unit-test-turn", event, running, enqueue)
+}
+
+func handleInputEventWithNonce(
+	ctx context.Context,
+	conn agentConnection,
+	ui *chatUI,
+	sessionID acp.SessionId,
+	turnNonce string,
+	event inputEvent,
+	running bool,
+	enqueue func(string, bool),
+) inputControl {
 	switch event.kind {
 	case inputPrompt:
 		prompt := strings.TrimSpace(event.text)
 		if quitCommand(prompt) {
 			if running {
-				_ = conn.Cancel(context.Background(), acp.CancelNotification{SessionId: sessionID})
+				_ = conn.Cancel(context.Background(), opencodeacp.CancelRequest(sessionID, turnNonce))
 			}
 
 			return inputControl{exit: true}
@@ -1532,14 +1555,14 @@ func handleInputEvent(
 			return inputControl{}
 		}
 
-		if err := conn.Cancel(ctx, acp.CancelNotification{SessionId: sessionID}); err != nil {
+		if err := conn.Cancel(ctx, opencodeacp.CancelRequest(sessionID, turnNonce)); err != nil {
 			return inputControl{err: err}
 		}
 
 		ui.writeNotice("interrupt", "requested")
 	case inputExit:
 		if running {
-			_ = conn.Cancel(context.Background(), acp.CancelNotification{SessionId: sessionID})
+			_ = conn.Cancel(context.Background(), opencodeacp.CancelRequest(sessionID, turnNonce))
 		}
 
 		return inputControl{exit: true}
@@ -1727,9 +1750,25 @@ func runPrompt(
 	sessionID acp.SessionId,
 	prompt string,
 ) error {
+	turnNonce, err := newTurnNonce()
+	if err != nil {
+		return err
+	}
+
+	return runPromptWithNonce(ctx, conn, ui, sessionID, turnNonce, prompt)
+}
+
+func runPromptWithNonce(
+	ctx context.Context,
+	conn agentConnection,
+	ui *chatUI,
+	sessionID acp.SessionId,
+	turnNonce string,
+	prompt string,
+) error {
 	ui.beginAgentTurn(prompt)
 
-	resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(sessionID, prompt))
+	resp, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(sessionID, turnNonce, prompt))
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			ui.endAgentTurn(acp.StopReasonCancelled)

@@ -1,14 +1,6 @@
 package opencode
 
-import (
-	"fmt"
-	"strings"
-)
-
-const (
-	permissionAsk   = "ask"
-	permissionAllow = "allow"
-)
+import "strings"
 
 // firstNonEmpty returns the first non-empty string from values.
 func firstNonEmpty(values ...string) string {
@@ -19,25 +11,6 @@ func firstNonEmpty(values ...string) string {
 	}
 
 	return ""
-}
-
-// validateOpenCodePermission rejects permission values the native config cannot express.
-func validateOpenCodePermission(permission string) error {
-	switch permission {
-	case "", permissionAsk, permissionAllow:
-		return nil
-	default:
-		return fmt.Errorf("unsupported opencode permission %q", permission)
-	}
-}
-
-// normalizeOpenCodePermission maps the empty permission to the native default.
-func normalizeOpenCodePermission(permission string) string {
-	if permission == "" {
-		return permissionAsk
-	}
-
-	return permission
 }
 
 // HasModel reports whether the provider catalog contains the "provider/model" value.

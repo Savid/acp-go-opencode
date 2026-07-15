@@ -3,20 +3,28 @@ title: Security
 description: The adapter's trust boundaries, stdout discipline, and how credentials stay out of the store.
 ---
 
-The adapter's security posture rests on isolating each session and keeping
-provider credentials out of anything it persists or streams. This page is the
-operator's view of those boundaries.
+The adapter's security posture rests on exclusive runtime ownership, exact
+session/turn routing, and keeping credentials out of anything it persists or
+streams. This page is the operator's view of those boundaries.
 
 ## Trust boundaries
 
-Every session runs its own `opencode serve` process, and that process is the
-adapter's only trusted peer:
+Each Agent owns one `opencode serve` process, and that process is the adapter's
+only trusted peer:
 
 - Each server binds to `127.0.0.1` and is reachable only over loopback.
-- Each server receives a per-session random basic-auth password; all REST and
+- The server receives a random basic-auth password; all REST and
   SSE calls authenticate with it.
-- Each session has its own XDG data, config, cache, and state directories, so
-  one session cannot read another's native state.
+- The Agent exclusively owns the shared XDG root. Never-unlinked claim and
+  liveness locks plus the native supervisor prevent a second writer and retain
+  the resource permit until the whole process tree is gone.
+- The writable home must have approved local lock semantics. Linux admits
+  ext4, XFS, Btrfs, F2FS, and tmpfs; macOS/FreeBSD/OpenBSD admit their explicit
+  local-filesystem allowlists; Windows admits fixed or RAM drives formatted as
+  NTFS or ReFS. Network mounts, overlay filesystems, and unrecognized backends
+  fail before native startup.
+- Native session IDs, canonical directory scopes, and turn nonces bind every
+  prompt, abort, permission, question, and event route.
 
 ## stdout is protocol-only
 
@@ -27,10 +35,10 @@ corrupts the session.
 
 ## Credentials and snapshots
 
-Session snapshots exclude credential-bearing native files such as `auth.json`
-and other credential-named files. Provider auth is native to OpenCode and is
-re-injected from the host environment at hydrate time rather than persisted in
-the store.
+Session snapshots contain only allowlisted native sync events, never XDG files
+or the SQLite database. Unknown event kinds or fields fail closed. Before an
+atomic store replacement, the adapter scans the complete graph bundle for MCP
+headers/environment values and sensitive process-environment values.
 
 <Warning>
 The runtime permission flow is load-bearing for user trust: the adapter never

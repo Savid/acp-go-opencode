@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -65,7 +66,16 @@ func normalRawEvent(marker string) opencode.Event {
 func TestRawEventOversizeEmitsFixedMarker(t *testing.T) {
 	conn := newRecordingAgentClient()
 	sess := rawEventSession(t, "session-1", conn)
-	if err := sess.emitRawOpenCodeEvent(context.Background(), oversizeRawEvent()); err != nil {
+	ctx := withTurnRoute(context.Background(), "turn-raw")
+	if err := sess.emitUpdate(ctx, acp.UpdateAgentMessageText("late")); err != nil {
+		t.Fatalf("emit update: %v", err)
+	}
+	conn.mu.Lock()
+	if !reflect.DeepEqual(conn.updates[0].Meta, routeCarrier("turn-raw")) {
+		t.Fatalf("session/update route envelope = %#v", conn.updates[0].Meta)
+	}
+	conn.mu.Unlock()
+	if err := sess.emitRawOpenCodeEvent(ctx, oversizeRawEvent()); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
 	events := rawEventNotifications(conn, "session-1")
@@ -73,6 +83,9 @@ func TestRawEventOversizeEmitsFixedMarker(t *testing.T) {
 		t.Fatalf("emitted %d notifications, want 1", len(events))
 	}
 	payload := events[0]
+	if !reflect.DeepEqual(payload["_meta"], routeCarrier("turn-raw")) {
+		t.Fatalf("route envelope = %#v", payload["_meta"])
+	}
 	if payload[jsonFieldSequence] != int64(1) || payload[jsonFieldSource] != rawEventSource {
 		t.Fatalf("envelope not intact: %#v", payload)
 	}

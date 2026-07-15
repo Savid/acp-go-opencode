@@ -19,11 +19,10 @@ const (
 // OpenCodeOptions is the stable OpenCode-specific subset accepted at
 // _meta.opencode.options.
 type OpenCodeOptions struct {
-	Model        string            `json:"model,omitempty"`
-	Env          map[string]string `json:"env,omitempty"`
-	OutputSchema map[string]any    `json:"outputSchema,omitempty"`
-	Mode         string            `json:"mode,omitempty"`
-	Permission   string            `json:"permission,omitempty"`
+	Model        string         `json:"model,omitempty"`
+	OutputSchema map[string]any `json:"outputSchema,omitempty"`
+	Mode         string         `json:"mode,omitempty"`
+	Permission   string         `json:"permission,omitempty"`
 }
 
 // Meta returns an ACP _meta object for the supported OpenCode-specific options.
@@ -31,10 +30,6 @@ func (options OpenCodeOptions) Meta() map[string]any {
 	values := map[string]any{}
 	if options.Model != "" {
 		values[metaModelKey] = options.Model
-	}
-
-	if len(options.Env) > 0 {
-		values[metaEnvKey] = cloneStringMap(options.Env)
 	}
 
 	if options.OutputSchema != nil {
@@ -194,15 +189,20 @@ func HTTPMCPServer(name string, url string, headers map[string]string) acp.McpSe
 	}}
 }
 
-func PromptRequest(sessionID acp.SessionId, blocks ...acp.ContentBlock) acp.PromptRequest {
+func PromptRequest(sessionID acp.SessionId, turnNonce string, blocks ...acp.ContentBlock) acp.PromptRequest {
 	return acp.PromptRequest{
 		SessionId: sessionID,
 		Prompt:    append([]acp.ContentBlock{}, blocks...),
+		Meta:      routeCarrier(turnNonce),
 	}
 }
 
-func TextPromptRequest(sessionID acp.SessionId, text string) acp.PromptRequest {
-	return PromptRequest(sessionID, acp.TextBlock(text))
+func TextPromptRequest(sessionID acp.SessionId, turnNonce, text string) acp.PromptRequest {
+	return PromptRequest(sessionID, turnNonce, acp.TextBlock(text))
+}
+
+func CancelRequest(sessionID acp.SessionId, turnNonce string) acp.CancelNotification {
+	return acp.CancelNotification{SessionId: sessionID, Meta: routeCarrier(turnNonce)}
 }
 
 func SetConfigOptionRequest(sessionID acp.SessionId, configID acp.SessionConfigId, value acp.SessionConfigValueId) acp.SetSessionConfigOptionRequest {
@@ -283,14 +283,6 @@ func WithOpenCodeModel(model string) OpenCodeOption {
 	}
 }
 
-func WithOpenCodeEnv(env map[string]string) OpenCodeOption {
-	cloned := cloneStringMap(env)
-
-	return func(options *OpenCodeOptions) {
-		options.Env = cloneStringMap(cloned)
-	}
-}
-
 func WithOpenCodeOutputSchema(schema map[string]any) OpenCodeOption {
 	cloned := cloneAnyMap(schema)
 
@@ -335,7 +327,6 @@ func (config sessionRequestConfig) additionalDirectoriesClone() []string {
 func cloneOpenCodeOptions(options OpenCodeOptions) OpenCodeOptions {
 	return OpenCodeOptions{
 		Model:        options.Model,
-		Env:          cloneStringMap(options.Env),
 		OutputSchema: cloneAnyMap(options.OutputSchema),
 		Mode:         options.Mode,
 		Permission:   options.Permission,

@@ -13,7 +13,7 @@ the process.
 
 Pass an implementation with `WithSessionStore`. The package ships
 `NewInMemorySessionStore` as the default and as a reference implementation of the
-`SessionStore` interface. Stored rows use the `opencode-state-v1` format
+`SessionStore` interface. Stored rows use the `opencode-sync-events-v1` format
 (`SessionStoreFormat`), keyed by `{SessionID, Subpath}`.
 
 ```go
@@ -33,26 +33,34 @@ empty session id fail, and `Delete` of an empty-id key is a pure no-op.
 
 ## Snapshot contents
 
-A snapshot is taken after a completed turn and on lifecycle boundaries
-(new, load, fork, close), so an unexpected exit still leaves a recent snapshot.
-Each snapshot writes these subpath entries:
+A snapshot is taken after a completed turn and on lifecycle boundaries. The
+`main` subpath contains one atomic bundle with:
 
-| Subpath | Contents |
-|---|---|
-| main | The session snapshot record. |
-| `idmap` | The ACP-to-native id mapping, consulted on every REST, SSE, permission, and delete path. |
-| `xdg/data` | Native data directory archive. |
-| `xdg/config` | Native config directory archive. |
-| `xdg/cache` | Native cache directory archive. |
-| `xdg/state` | Native state directory archive. |
+- adapter, exact native (`1.17.18`), and event-schema versions;
+- a restore generation and the selected ACP/native session identity;
+- the adopted parent/child graph in parent-first order, including source cwd
+  and per-session permission policy; and
+- exact event arrays for each allowlisted aggregate.
 
-The four `xdg/*` archives are deterministic `tar+zstd+base64` blobs and are
-restored into fresh per-session directories on hydration. Credential-bearing
-files such as `auth.json` are excluded from the archive; provider auth is
-re-injected from the environment at hydrate time.
+The adapter exports through `POST /sync/history`; it never opens or copies the
+live SQLite database. Only known event kinds and known fields are accepted.
+Unknown event data fails closed, and the finished bundle is scanned for MCP and
+process-environment secrets before the store replacement is published.
+
+Restore durably claims each source-to-destination aggregate mapping before the
+first `POST /sync/replay`, replays one complete aggregate per call in
+parent-before-child order, and rechecks ownership plus exact event equality
+after every call. Allowed absolute path fields must be inside the captured cwd
+and are rebased to the destination cwd; an escaping path is rejected.
+
+The same committed bundle is the recovery boundary for a loaded session after
+an unexpected shared-server exit. Recovery is graph-complete and exact before
+the next prompt is submitted; native state that does not match the committed
+event generation fails closed instead of accepting a prompt on ambiguous
+state.
 
 <Note>
-A snapshot is blocked while any input, permission, or message generation is
+A snapshot is blocked while any input, permission, elicitation, or generation is
 pending, so a snapshot never captures a half-finished turn. `session/delete`
 removes a stored session and leaves a tombstone so the id is not silently
 reused.

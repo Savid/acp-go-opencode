@@ -26,15 +26,3 @@ func killOpenCodeProcess(cmd *exec.Cmd) error {
 	}
 	return nil
 }
-
-func killProcessID(pid int) error {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	return proc.Kill()
-}
-
-func inspectOpenCodeProcess(int) (processIdentity, error) {
-	return processIdentity{}, os.ErrNotExist
-}

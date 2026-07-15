@@ -3,11 +3,13 @@ title: Prompt Streaming
 description: How OpenCode's native REST and SSE output becomes ACP session updates, and how a turn ends.
 ---
 
-A prompt turn posts the user message to OpenCode's REST API and then consumes
-the session's SSE event stream, translating native events into ACP
+A prompt turn submits the user message through
+`POST /session/{id}/prompt_async` and then consumes the canonical
+directory-scoped SSE stream, translating native events into ACP
 `session/update` notifications as they arrive. The turn ends when the native
 message completes, when the stream fails, when a deadline elapses, or when the
-host cancels.
+host cancels. Every prompt carries a fresh route-envelope turn nonce; an active
+cancel must carry that same nonce.
 
 ## Stream mapping
 
@@ -49,7 +51,8 @@ any concurrent failure:
 - **Cancelled** — the host cancelled, or a coinciding deadline resolves as
   cancelled rather than timeout; the prompt returns `cancelled`.
 - **Failure** — the turn returns one terminal ACP internal error carrying a
-  uniform `opencode_turn_failed` payload. The session stays usable.
+  uniform `opencode_turn_failed` payload. Transport/provider failures leave the
+  session usable.
 
 The failure payload's `cause` names the failure class:
 
@@ -60,7 +63,9 @@ The failure payload's `cause` names the failure class:
 | `timeout` | The turn exceeded the deadline set by `WithTurnTimeout`. |
 
 By default there is no deadline. `WithTurnTimeout` bounds a single turn; when it
-elapses the adapter aborts the native turn and fails the prompt with
-`cause: "timeout"`. See [Models and config](/docs/features/models-config) for the
+elapses the adapter aborts the native turn, polls native session status until
+the session is absent or idle, and only then reopens turn admission. Unknown
+status, abort failure, or fence timeout poisons the session. See
+[Models and config](/docs/features/models-config) for the
 provider-error and structured-output details, and
 [Metadata](/docs/reference/meta) for the full error payload.

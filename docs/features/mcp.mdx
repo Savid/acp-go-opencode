@@ -3,8 +3,9 @@ title: MCP
 description: Forward stdio and streamable HTTP MCP servers from an ACP session into OpenCode's native config.
 ---
 
-Attach MCP servers to a session and the adapter wires them into that session's
-native OpenCode config, so OpenCode's own MCP client connects to them. You
+Attach MCP servers to a session and the adapter registers them dynamically for
+that session's canonical working directory, so OpenCode's own MCP client
+connects to them. You
 declare servers on the ACP lifecycle request (`WithSessionMCPServers`, or the
 `mcpServers` field); the adapter translates and forwards them.
 
@@ -21,8 +22,7 @@ A server without a name is also rejected at session start.
 
 ## How forwarding works
 
-Accepted servers are written into the generated per-session `opencode.json`
-under the wrapper-managed `mcp` key:
+Accepted servers are registered through authenticated `POST /mcp?directory=...`:
 
 - **HTTP servers** become `"type": "remote"` entries carrying their `url` and
   any request `headers`.
@@ -30,9 +30,10 @@ under the wrapper-managed `mcp` key:
   executable followed by its arguments) and an `environment` map. There is no
   separate `arguments` key — the command and its args are one array.
 
-The `mcp` key is deep-merged on top of any seeded `opencode.json`, so a seeded
-server with the same name is overridden while other seeded servers are
-preserved.
+MCP state is removed when the session's directory scope closes and is never
+written into the shared config or portable store. Because registration is
+directory-scoped, one canonical directory admits only one live session
+principal; a second session or a different credential fingerprint is rejected.
 
 <Note>
 The adapter forwards MCP servers into OpenCode's native config; it does not

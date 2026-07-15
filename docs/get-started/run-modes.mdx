@@ -17,6 +17,11 @@ stdin/stdout. stdout carries ACP JSON-RPC only; diagnostics go to stderr.
 acp-go-opencode -path /usr/bin/opencode -scratch-dir /tmp/acp-opencode
 ```
 
+Use `-home` when the host assigns an exact exclusive runtime XDG root. Use
+`-scratch-dir` as the parent for adapter materialization when no exact home is
+assigned. Either location must resolve to an approved local filesystem; remote,
+overlay, and unrecognized filesystems are rejected before native startup.
+
 ## Embedded
 
 `Serve` runs the agent against reader/writer streams you supply, so your host

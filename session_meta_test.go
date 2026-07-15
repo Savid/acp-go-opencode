@@ -10,12 +10,6 @@ import (
 )
 
 func TestSessionMetaLifecycleBranches(t *testing.T) {
-	if _, err := stringMapFromMeta(map[string]any{"A": 1}); err == nil {
-		t.Fatal("non-string env accepted")
-	}
-	if env, err := stringMapFromMeta(map[string]string{"A": "1"}); err != nil || env["A"] != "1" {
-		t.Fatalf("stringMapFromMeta map[string]string = %#v err=%v", env, err)
-	}
 	if err := validateLifecycleMeta(map[string]any{opencodeMetaKey: "bad"}); err == nil {
 		t.Fatal("bad opencode meta accepted")
 	}
@@ -41,11 +35,10 @@ func assertSessionMetaAndSchemaHelpers(t *testing.T) {
 	t.Helper()
 	meta, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{
 		metaModelKey:      "p/m",
-		metaEnvKey:        map[string]any{"A": "1"},
 		metaModeKey:       "plan",
 		metaPermissionKey: "ask",
 	}}})
-	if err != nil || meta.Model != "p/m" || meta.Env["A"] != "1" || meta.Mode != "plan" || meta.Permission != "ask" {
+	if err != nil || meta.Model != "p/m" || meta.Mode != "plan" || meta.Permission != "ask" {
 		t.Fatalf("session meta = %#v err=%v", meta, err)
 	}
 	meta, err = sessionMetaFromLifecycle(map[string]any{})
@@ -53,12 +46,12 @@ func assertSessionMetaAndSchemaHelpers(t *testing.T) {
 		t.Fatalf("default permission meta = %#v err=%v", meta, err)
 	}
 	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: "bad"}}}); err == nil {
-		t.Fatal("bad env meta accepted")
+		t.Fatal("removed per-session env meta accepted")
 	}
 	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: 1}}}); err == nil {
 		t.Fatal("non-string permission meta accepted")
 	}
-	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "deny"}}}); err == nil {
+	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "maybe"}}}); err == nil {
 		t.Fatal("unsupported permission meta accepted")
 	}
 	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: "bad"}}}); err == nil {

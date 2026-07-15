@@ -18,23 +18,39 @@ err := opencodeacp.Serve(ctx, input, output, opts...)
 `Serve` runs the agent against the supplied streams; `NewAgent` builds the same
 agent when you need a reference first. Both take the same `Option` values.
 
+`Serve` closes the agent before it returns. If shutdown fails, that close error
+takes precedence over EOF or context cancellation. In particular,
+`errors.Is(err, opencodeacp.ErrProcessTreeUnproven)` means the adapter could not
+prove every native OpenCode descendant exited; an embedding host must keep that
+runtime and its resources quarantined.
+
 ## Agent options
 
 | Option | Purpose |
 |---|---|
 | `WithExecutablePath` | Path to the `opencode` binary. |
-| `WithScratchDir` | Parent directory for all ephemeral per-session scratch (isolated XDG homes, sqlite temp dirs); empty uses the system temp directory. |
-| `WithHome` | Unsupported. OpenCode has no native config or auth root, so any non-empty value is rejected on every session-establishing request; use `WithScratchDir` instead. |
+| `WithScratchDir` | Parent for a materialized shared runtime root and transient adapter scratch; empty uses the system temp directory. |
+| `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
-| `WithEnv` | Environment overrides for the native process. |
-| `WithSeedFiles` | Files written into each session's config root before launch. |
+| `WithEnv` | Immutable environment overrides for the shared native process. |
+| `WithSeedFiles` | Immutable files written into the shared config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
 | `WithConcurrencyLimits` | Cap concurrent client calls and active sessions. |
 | `WithTurnTimeout` | Per-turn deadline; `0` (default) disables it. |
+| `WithRuntimeResourceHooks` | Worker-global native-root and scratch-root permit hooks; a non-nil hook must return a non-nil release function. |
 | `WithAgentName` / `WithAgentTitle` / `WithAgentVersion` | Identity in the initialize response. |
 | `WithLogger` | `*slog.Logger` for adapter diagnostics. |
 | `WithTracerProvider` / `WithMeterProvider` / `WithTextMapPropagator` | OpenTelemetry wiring. |
+
+`RuntimeResourceHooks` also carries `ObserveProcess`,
+`ObserveProcessSnapshot`, and `ObserveStartupStage`. OpenCode reports its two
+actual home-lock supervisors only after native readiness and removes them when
+the supervisor waiter proves exit; it never derives that count from root
+permits. Absolute provider-descendant snapshots are emitted only when the
+containment backend can prove them. Startup observations distinguish
+`spawn`, `readiness`, `configuration`, and native `session` creation and carry
+the stage error.
 
 ### OpenCode process options
 
@@ -43,16 +59,15 @@ agent when you need a reference first. Both take the same `Option` values.
 | `WithOpenCodePure` | Start OpenCode without external plugins. | off |
 | `WithOpenCodeQuestionTool` | Enable native question-tool elicitation. | off |
 | `WithOpenCodeLogLevel` | Native server log level. | native default |
-| `WithOpenCodeMinimumVersion` | Minimum accepted OpenCode version. | `1.17.13` |
+| `WithVersion` | Exact native version required by the event store. | `1.17.18` |
 | `WithOpenCodeHealthCheckTimeout` | Server readiness timeout. | `60s` |
 
-`WithSeedFiles` maps relative paths to file contents written into each session's
-isolated OpenCode config root (`<XDG_CONFIG_HOME>/opencode/`) before the server
-starts. The seeded `opencode.json` is deep-merged with the wrapper's managed
-`$schema` and `permission` keys (the wrapper wins for those, the seed supplies
-the rest, e.g. a custom `provider` block); every other seeded file is written
-verbatim. Absolute paths, `..` escapes, and empty keys are rejected with the
-uniform unsupported-field error. See
+`WithSeedFiles` maps relative paths to file contents written into the shared
+OpenCode config root (`<XDG_CONFIG_HOME>/opencode/`) before the server starts.
+A seeded `opencode.json` must not contain `permission` or `mcp`; those values
+belong to native sessions and directory scopes. Every other seeded file is
+written verbatim. Absolute paths, `..` escapes, and empty keys are rejected.
+See
 [Models and config](/docs/features/models-config) for a seeded `provider`
 example.
 
@@ -67,7 +82,9 @@ vocabulary already populated:
 | `LoadSessionRequest` / `ResumeSessionRequest` | `session/load` / `session/resume`. |
 | `ForkSessionRequest` / `CallForkSession` | `_opencode/session/fork` request and call helper. |
 | `ListSessionsRequest` (with `WithListSessionsCwd` / `-Cursor` / `-Meta`) | `session/list`. |
-| `PromptRequest` / `TextPromptRequest` | `session/prompt`. |
+| `NewTurnNonce` | Generate a cryptographically random turn identity. |
+| `PromptRequest` / `TextPromptRequest` | `session/prompt` with a required turn nonce. |
+| `CancelRequest` | `session/cancel` for the same required turn nonce. |
 | `SetConfigOptionRequest` / `SetModelRequest` | `session/set_config_option`. |
 | `StdioMCPServer` / `HTTPMCPServer` | MCP server definitions. |
 
@@ -76,12 +93,13 @@ Session-scoped request options include `WithSessionMCPServers`,
 `WithSessionRawEvents`, and `WithSessionOpenCodeOptions`.
 
 `OpenCodeOptions` (built with `NewOpenCodeOptions` and `WithOpenCodeModel`,
-`WithOpenCodeEnv`, `WithOpenCodeOutputSchema`, `WithOpenCodeMode`,
+`WithOpenCodeOutputSchema`, `WithOpenCodeMode`,
 `WithOpenCodePermission`) render into `_meta.opencode.options` via its `Meta`
 method.
 
 ## Session store
 
 `SessionStore` is the persistence interface; `NewInMemorySessionStore` is the
-default implementation. Rows use the `SessionStoreFormat` (`opencode-state-v1`)
+default implementation. Rows use `SessionStoreFormat`
+(`opencode-sync-events-v1`)
 constant. See [Session store](/docs/features/session-store).

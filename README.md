@@ -6,8 +6,8 @@ Go ACP agent that exposes the local OpenCode CLI as an [Agent Client Protocol](h
 [![CI](https://github.com/savid/acp-go-opencode/actions/workflows/go-test.yml/badge.svg)](https://github.com/savid/acp-go-opencode/actions/workflows/go-test.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-It runs one isolated `opencode serve` process per session, speaks ACP over
-JSON-RPC streams, and builds on
+It runs one authenticated `opencode serve` runtime for all sessions owned by an
+agent instance, speaks ACP over JSON-RPC streams, and builds on
 [`github.com/coder/acp-go-sdk`](https://github.com/coder/acp-go-sdk).
 
 Use it as either:
@@ -83,17 +83,25 @@ func main() {
 ```
 
 See the [Go API reference](https://pkg.go.dev/github.com/savid/acp-go-opencode)
-for options such as the OpenCode executable path, the ephemeral scratch
-directory, default model, environment overrides, session storage, and
+for options such as the OpenCode executable path, the exclusive runtime home,
+scratch parent, default model, process environment, session storage, and
 OpenTelemetry providers.
 
 ## What It Provides
 
 - ACP session lifecycle: create, prompt, cancel, close, list, load, resume, and
   fork.
-- One isolated `opencode serve` process per session, with per-session XDG data,
-  config, cache, and state directories under a configurable scratch directory
-  (`-scratch-dir` / `WithScratchDir`, defaulting to the system temp directory).
+- One Agent-owned `opencode serve` process and shared XDG root. `-home` /
+  `WithHome` selects that exclusive root; `-scratch-dir` / `WithScratchDir`
+  selects the parent used when the adapter materializes one. The root must be
+  on an approved local filesystem; network, overlay, and unknown filesystem
+  semantics fail closed before the native process starts.
+- Native sessions remain independently routed inside the shared runtime.
+  Directory-scoped MCP is bound to one live session principal per canonical
+  working directory.
+- A native-server crash fails the active turn, retains loaded logical
+  sessions, and reconstructs a session from its last committed sync-event
+  generation before a following prompt can reach the replacement runtime.
 - Native OpenCode REST calls and an SSE event stream mapped to ACP prompt
   streaming for messages, reasoning, plans, tool calls, usage, and session
   metadata.
@@ -103,8 +111,13 @@ OpenTelemetry providers.
   requests.
 - Model and mode selection through ACP session config options and
   `_meta.opencode.options`.
-- Durable mirroring through a host-provided `SessionStore`; stored rows use the
-  `opencode-state-v1` format keyed by `{SessionID, Subpath}`.
+- Durable, credential-free native event snapshots through a host-provided
+  `SessionStore`; stored rows use `opencode-sync-events-v1`, keyed by
+  `{SessionID, Subpath}` and pinned to OpenCode `1.17.18`.
+- Versioned `acp-go.dev/route` envelopes bind each prompt, cancellation,
+  session update, raw event, and elicitation to one turn nonce. Permission
+  requests are fenced structurally by session id plus a tool-call id already
+  pending in that turn.
 - Optional raw native event notifications through `_opencode/rawEvent`.
 - OpenTelemetry adapter telemetry without recording prompt or tool secrets by
   default.
@@ -137,12 +150,12 @@ make test-integration-cover
 
 `make audit` runs the full local gate: format, lint, build, unit tests,
 coverage, cross-compile, vuln, and docs checks. Live integration tests require a
-local authenticated `opencode` CLI. `make test-integration-smoke` sets
+local authenticated OpenCode `1.17.18` CLI. `make test-integration-smoke` sets
 `ACP_GO_OPENCODE_RUN_INTEGRATION=1` and avoids model spend;
 `make test-integration-live` additionally sets `ACP_GO_OPENCODE_RUN_LIVE_TOKENS=1`
 and may spend model tokens; `make test-integration-cover` runs the smoke suite
 against a coverage-instrumented binary. Live tests always launch OpenCode under
-an isolated per-session scratch directory.
+an isolated runtime scratch directory.
 
 ## License
 

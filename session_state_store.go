@@ -1,79 +1,33 @@
-//nolint:tagliatelle // Store metadata preserves OpenCode native modelID/providerID spellings.
+//nolint:tagliatelle // Native sync events use aggregate_id; replay uses aggregateID.
 package opencodeacp
 
 import (
-	"archive/tar"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"database/sql"
-	"encoding/base64"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
-
-	"github.com/klauspost/compress/zstd"
-	_ "modernc.org/sqlite"
 )
 
-const maxHydrateFileBytes int64 = 128 * 1024 * 1024
+const (
+	syncEventSchemaVersion  = "1"
+	syncNativeVersion       = "1.17.18"
+	snapshotBlockGeneration = "generation"
+	syncTypeSessionCreated  = "session.created.1"
+	syncFieldPart           = "part"
+	syncFieldDirectory      = "directory"
+)
 
-// sessionStateReplaceTimeout bounds session store writes (the snapshot Replace
-// commit). Store reads are bounded separately by SessionStoreLoadTimeout.
 var sessionStateReplaceTimeout = 60 * time.Second
-
-const credentialTableAccount = "account"
-
-const archiveEncodingTarZstdBase64 = "tar+zstd+base64"
-
-type archiveTarWriter interface {
-	io.Writer
-	WriteHeader(*tar.Header) error
-	Close() error
-}
-
-type archiveZstdWriter interface {
-	io.Writer
-	Close() error
-}
-
-var (
-	stateJSONMarshal    = json.Marshal
-	stateWalkDir        = filepath.WalkDir
-	stateRel            = filepath.Rel
-	stateLstat          = os.Lstat
-	stateFileInfoHeader = tar.FileInfoHeader
-	stateNewTarWriter   = func(w io.Writer) archiveTarWriter { return tar.NewWriter(w) }
-	stateOpen           = func(name string) (io.ReadCloser, error) { return os.Open(name) }
-	stateCopy           = io.Copy
-	stateNewZstdWriter  = func(w io.Writer) (archiveZstdWriter, error) {
-		return zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
-	}
-	stateNewZstdReader = func(r io.Reader) (*zstd.Decoder, error) { return zstd.NewReader(r) }
-	stateRemoveAll     = os.RemoveAll
-	stateMkdirAll      = os.MkdirAll
-	stateAbs           = filepath.Abs
-	stateOpenFile      = func(name string, flag int, perm os.FileMode) (io.WriteCloser, error) {
-		return os.OpenFile(name, flag, perm)
-	}
-	stateCopyN                       = io.CopyN
-	stateMkdirTemp                   = os.MkdirTemp
-	stateStat                        = os.Stat
-	stateReadFile                    = os.ReadFile
-	stateCopyFile                    = copyFile
-	stateSQLiteArchiveContent        = sqliteArchiveContent
-	stateScrubSQLiteCredentialTables = scrubSQLiteCredentialTables
-	stateSQLOpen                     = sql.Open
-)
+var restoreRandRead = rand.Read
 
 type idmapRecord struct {
 	SessionID             string `json:"sessionId"`
@@ -86,11 +40,15 @@ type idmapRecord struct {
 }
 
 type stateSnapshot struct {
-	Format              string                 `json:"format"`
-	CapturedAtUnixMilli int64                  `json:"capturedAtUnixMilli"`
-	Session             stateSnapshotSession   `json:"session"`
-	Archives            map[string]archiveInfo `json:"archives"`
-	Wrapper             stateSnapshotWrapper   `json:"wrapper"`
+	Format              string                          `json:"format"`
+	AdapterVersion      string                          `json:"adapterVersion"`
+	NativeVersion       string                          `json:"nativeVersion"`
+	EventSchemaVersion  string                          `json:"eventSchemaVersion"`
+	CapturedAtUnixMilli int64                           `json:"capturedAtUnixMilli"`
+	RestoreGeneration   string                          `json:"restoreGeneration"`
+	Session             stateSnapshotSession            `json:"session"`
+	Graph               []stateSnapshotNode             `json:"graph"`
+	Events              map[string][]opencode.SyncEvent `json:"events"`
 }
 
 type stateSnapshotSession struct {
@@ -109,25 +67,13 @@ type stateSnapshotModel struct {
 	Agent      string `json:"agent,omitempty"`
 }
 
-type archiveInfo struct {
-	Subpath string `json:"subpath"`
-	SHA256  string `json:"sha256"`
-	Bytes   int    `json:"bytes"`
-}
-
-type stateSnapshotWrapper struct {
-	Todos              []opencode.NativeTodo `json:"todos"`
-	PermissionsHistory []any                 `json:"permissionsHistory"`
-	PendingInput       bool                  `json:"pendingInput"`
-}
-
-type archiveEntry struct {
-	Format   string `json:"format"`
-	Encoding string `json:"encoding"`
-	Sequence int    `json:"sequence"`
-	Final    bool   `json:"final"`
-	SHA256   string `json:"sha256"`
-	Data     string `json:"data"`
+type stateSnapshotNode struct {
+	SessionID       string `json:"sessionId"`
+	NativeSessionID string `json:"nativeSessionId"`
+	ParentSessionID string `json:"parentSessionId,omitempty"`
+	NativeParentID  string `json:"nativeParentId,omitempty"`
+	SourceCwd       string `json:"sourceCwd"`
+	Permission      string `json:"permission"`
 }
 
 func (s *session) snapshotToStore(ctx context.Context) error {
@@ -135,115 +81,103 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 		return err
 	}
 
-	if reason := s.snapshotBlockedReason(); reason != "" {
-		return fmt.Errorf("cannot snapshot OpenCode session while %s pending", reason)
+	graph := s.agent.adoptedGraph(s)
+	for _, member := range graph {
+		if reason := member.snapshotBlockedReason(); reason != "" {
+			return fmt.Errorf("cannot snapshot OpenCode graph while %s pending", reason)
+		}
 	}
 
-	snapshot := s.snapshot()
-	if snapshot.client == nil {
-		return nil
+	first, err := s.client.SyncHistory(ctx, map[string]int64{})
+	if err != nil {
+		return fmt.Errorf("capture OpenCode sync history: %w", err)
 	}
 
-	idmap := snapshot.idmap
+	allow := make(map[string]stateSnapshotNode, len(graph))
+	nodes := make([]stateSnapshotNode, 0, len(graph))
+
+	for _, member := range graph {
+		snapshot := member.snapshot()
+		node := stateSnapshotNode{
+			SessionID: string(snapshot.id), NativeSessionID: snapshot.idmap.NativeSessionID,
+			ParentSessionID: snapshot.idmap.ParentSessionID,
+			NativeParentID:  snapshot.idmap.NativeParentSessionID,
+			SourceCwd:       snapshot.cwd, Permission: snapshot.permission,
+		}
+		allow[node.NativeSessionID] = node
+		nodes = append(nodes, node)
+	}
+
+	events, cursors, err := allowlistedSyncEvents(first, allow)
+	if err != nil {
+		return err
+	}
+
+	second, err := s.client.SyncHistory(ctx, cursors)
+	if err != nil {
+		return fmt.Errorf("verify OpenCode sync watermark: %w", err)
+	}
+
+	for _, event := range second {
+		if _, ok := allow[event.AggregateID]; ok {
+			return fmt.Errorf("OpenCode graph changed during export")
+		}
+	}
+
+	generation, err := newRestoreGeneration()
+	if err != nil {
+		return err
+	}
+
 	now := time.Now().UnixMilli()
+	replacements := make([]SessionStoreReplacement, 0, len(graph))
 
-	idmap.UpdatedAtUnixMilli = now
-	if idmap.CreatedAtUnixMilli == 0 {
-		idmap.CreatedAtUnixMilli = now
-	}
-
-	idmap.Format = SessionStoreFormat
-
-	todos, _ := snapshot.client.Todos(ctx, idmap.NativeSessionID)
-	main := stateSnapshot{
-		Format:              SessionStoreFormat,
-		CapturedAtUnixMilli: now,
-		Session: stateSnapshotSession{
-			SessionID:             idmap.SessionID,
-			NativeSessionID:       idmap.NativeSessionID,
-			ParentSessionID:       idmap.ParentSessionID,
-			NativeParentSessionID: idmap.NativeParentSessionID,
-			Cwd:                   snapshot.cwd,
-			Title:                 snapshot.title,
-			Model: stateSnapshotModel{
-				ProviderID: snapshot.providerID,
-				ModelID:    snapshot.modelID,
-				Agent:      snapshot.mode,
+	for _, member := range graph {
+		memberSnapshot := member.snapshot()
+		bundle := stateSnapshot{
+			Format: SessionStoreFormat, AdapterVersion: s.agent.options.AgentVersion,
+			NativeVersion: syncNativeVersion, EventSchemaVersion: syncEventSchemaVersion,
+			CapturedAtUnixMilli: now, RestoreGeneration: generation,
+			Session: stateSnapshotSession{
+				SessionID: string(memberSnapshot.id), NativeSessionID: memberSnapshot.idmap.NativeSessionID,
+				ParentSessionID:       memberSnapshot.idmap.ParentSessionID,
+				NativeParentSessionID: memberSnapshot.idmap.NativeParentSessionID,
+				Cwd:                   memberSnapshot.cwd, Title: memberSnapshot.title,
+				Model: stateSnapshotModel{ProviderID: memberSnapshot.providerID, ModelID: memberSnapshot.modelID, Agent: memberSnapshot.mode},
 			},
-		},
-		Archives: map[string]archiveInfo{},
-		Wrapper: stateSnapshotWrapper{
-			Todos:        todos,
-			PendingInput: false,
-		},
-	}
-
-	replacements := []SessionStoreReplacement{}
-	mainKey := SessionKey{SessionID: string(s.id), Subpath: SessionStoreMainSubpath}
-
-	scratchDir, scratchErr := ensureScratchParent(s.agent.options.ScratchDir)
-	if scratchErr != nil {
-		return scratchErr
-	}
-
-	xdg := snapshot.client.XDGDirs()
-	for _, item := range []struct {
-		name string
-		dir  string
-	}{
-		{xdgDataSubpath, xdg.Data},
-		{xdgConfigSubpath, xdg.Config},
-		{xdgCacheSubpath, xdg.Cache},
-		{xdgStateSubpath, xdg.State},
-	} {
-		archive, sha, err := encodeXDGArchive(item.dir, scratchDir)
-		if err != nil {
-			return err
+			Graph: nodes, Events: events,
 		}
 
-		main.Archives[strings.TrimPrefix(item.name, "xdg/")] = archiveInfo{
-			Subpath: item.name,
-			SHA256:  sha,
-			Bytes:   len(archive),
+		entry, marshalErr := json.Marshal(bundle)
+		if marshalErr != nil {
+			return marshalErr
 		}
 
-		entry, err := stateJSONMarshal(archiveEntry{
-			Format:   SessionStoreFormat,
-			Encoding: archiveEncodingTarZstdBase64,
-			Sequence: 0,
-			Final:    true,
-			SHA256:   sha,
-			Data:     base64.StdEncoding.EncodeToString(archive),
-		})
-		if err != nil {
+		if err := scanSyncBundle(entry, s.agent.graphSecretNeedles(graph)); err != nil {
 			return err
 		}
 
 		replacements = append(replacements, SessionStoreReplacement{
-			Key:     SessionKey{SessionID: string(s.id), Subpath: item.name},
+			Key:     SessionKey{SessionID: string(memberSnapshot.id), Subpath: SessionStoreMainSubpath},
 			Entries: []SessionStoreEntry{entry},
 		})
 	}
 
-	mainEntry, err := stateJSONMarshal(main)
-	if err != nil {
-		return err
-	}
-
-	idmapEntry, err := stateJSONMarshal(idmap)
-	if err != nil {
-		return err
-	}
-
-	replacements = append(replacements,
-		SessionStoreReplacement{Key: mainKey, Entries: []SessionStoreEntry{mainEntry}},
-		SessionStoreReplacement{Key: SessionKey{SessionID: string(s.id), Subpath: idmapSubpath}, Entries: []SessionStoreEntry{idmapEntry}},
-	)
-
 	storeCtx, cancel := context.WithTimeout(ctx, sessionStateReplaceTimeout)
 	defer cancel()
 
-	return s.agent.sessionStore().Replace(storeCtx, mainKey, replacements)
+	s.agent.restoreMu.Lock()
+	ownershipErr := recordSnapshotOwnership(s.client, stateSnapshot{
+		RestoreGeneration: generation,
+		Graph:             nodes,
+	})
+	s.agent.restoreMu.Unlock()
+
+	if ownershipErr != nil {
+		return ownershipErr
+	}
+
+	return s.agent.sessionStore().Replace(storeCtx, SessionKey{SessionID: string(s.id)}, replacements)
 }
 
 func (s *session) snapshotBlockedReason() string {
@@ -256,570 +190,467 @@ func (s *session) snapshotBlockedReason() string {
 	case len(s.questions) > 0:
 		return "elicitation"
 	case len(s.activeMessageIDs) > 0:
-		return "generation"
+		return snapshotBlockGeneration
 	default:
 		return ""
 	}
 }
 
-func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID string, xdg opencode.XDGDirs) (idmapRecord, stateSnapshot, bool, error) {
-	idEntries, err := store.Load(ctx, SessionKey{SessionID: sessionID, Subpath: idmapSubpath})
-	if err != nil {
-		return idmapRecord{}, stateSnapshot{}, false, err
+func (a *Agent) adoptedGraph(selected *session) []*session {
+	a.mu.Lock()
+
+	all := make(map[acp.SessionId]*session, len(a.sessions))
+	for id, member := range a.sessions {
+		all[id] = member
+	}
+	a.mu.Unlock()
+
+	root := selected
+	for root != nil {
+		parentID := acp.SessionId(root.snapshot().idmap.ParentSessionID)
+
+		parent := all[parentID]
+		if parent == nil {
+			break
+		}
+
+		root = parent
 	}
 
-	mainEntries, err := store.Load(ctx, SessionKey{SessionID: sessionID, Subpath: SessionStoreMainSubpath})
-	if err != nil {
-		return idmapRecord{}, stateSnapshot{}, false, err
+	children := make(map[acp.SessionId][]*session)
+
+	for _, member := range all {
+		parent := acp.SessionId(member.snapshot().idmap.ParentSessionID)
+		children[parent] = append(children[parent], member)
 	}
 
-	if len(idEntries) == 0 || len(mainEntries) == 0 {
-		return idmapRecord{}, stateSnapshot{}, false, nil
+	for parent := range children {
+		slices.SortFunc(children[parent], func(left, right *session) int {
+			return strings.Compare(string(left.id), string(right.id))
+		})
 	}
 
-	var idmap idmapRecord
-	if err := json.Unmarshal(idEntries[len(idEntries)-1], &idmap); err != nil {
+	var graph []*session
+
+	var visit func(*session)
+
+	visit = func(member *session) {
+		graph = append(graph, member)
+		for _, child := range children[member.id] {
+			visit(child)
+		}
+	}
+	visit(root)
+
+	return graph
+}
+
+func (a *Agent) graphSecretNeedles(graph []*session) []string {
+	var needles []string
+
+	for _, member := range graph {
+		member.mu.Lock()
+		needles = append(needles, member.secretNeedles...)
+		member.mu.Unlock()
+	}
+
+	for key, value := range a.options.Env {
+		upper := strings.ToUpper(key)
+		if strings.Contains(upper, "TOKEN") || strings.Contains(upper, "KEY") || strings.Contains(upper, "SECRET") ||
+			strings.Contains(upper, "PASSWORD") || strings.Contains(upper, "AUTH") || strings.Contains(upper, "COOKIE") {
+			needles = append(needles, value)
+		}
+	}
+
+	return needles
+}
+
+func allowlistedSyncEvents(history []opencode.SyncEvent, allow map[string]stateSnapshotNode) (map[string][]opencode.SyncEvent, map[string]int64, error) {
+	grouped := make(map[string][]opencode.SyncEvent, len(allow))
+	for _, event := range history {
+		node, ok := allow[event.AggregateID]
+		if !ok {
+			continue
+		}
+
+		if err := validateSyncEvent(event, node); err != nil {
+			return nil, nil, err
+		}
+
+		grouped[event.AggregateID] = append(grouped[event.AggregateID], cloneSyncEvent(event))
+	}
+
+	cursors := make(map[string]int64, len(allow))
+	for aggregateID := range allow {
+		events := grouped[aggregateID]
+		if len(events) == 0 {
+			return nil, nil, fmt.Errorf("sync history missing aggregate %q", aggregateID)
+		}
+
+		slices.SortFunc(events, func(left, right opencode.SyncEvent) int {
+			if left.Sequence < right.Sequence {
+				return -1
+			}
+
+			if left.Sequence > right.Sequence {
+				return 1
+			}
+
+			return strings.Compare(left.ID, right.ID)
+		})
+
+		for index, event := range events {
+			if event.Sequence != int64(index) {
+				return nil, nil, fmt.Errorf("aggregate %q has non-contiguous sequence", aggregateID)
+			}
+		}
+
+		grouped[aggregateID] = events
+		cursors[aggregateID] = events[len(events)-1].Sequence
+	}
+
+	return grouped, cursors, nil
+}
+
+var syncDataFields = map[string]map[string]struct{}{
+	syncTypeSessionCreated:   {syncFieldSessionID: {}, syncFieldInfo: {}},
+	"session.updated.1":      {syncFieldSessionID: {}, syncFieldInfo: {}},
+	"message.updated.1":      {syncFieldSessionID: {}, syncFieldInfo: {}},
+	"message.part.updated.1": {syncFieldSessionID: {}, syncFieldPart: {}, "time": {}},
+}
+
+const (
+	syncFieldInfo      = "info"
+	syncFieldSessionID = "sessionID"
+)
+
+func validateSyncEvent(event opencode.SyncEvent, node stateSnapshotNode) error {
+	if event.ID == "" || event.AggregateID != node.NativeSessionID || event.Sequence < 0 {
+		return fmt.Errorf("invalid sync event identity")
+	}
+
+	allowed, ok := syncDataFields[event.Type]
+	if !ok {
+		return fmt.Errorf("unsupported sync event type %q", event.Type)
+	}
+
+	for field := range event.Data {
+		if _, ok := allowed[field]; !ok {
+			return fmt.Errorf("unsupported field %q on sync event type %q", field, event.Type)
+		}
+	}
+
+	var sessionID string
+	if err := json.Unmarshal(event.Data[syncFieldSessionID], &sessionID); err != nil || sessionID != node.NativeSessionID {
+		return fmt.Errorf("sync event %q session identity mismatch", event.ID)
+	}
+
+	return nil
+}
+
+func cloneSyncEvent(event opencode.SyncEvent) opencode.SyncEvent {
+	cloned := event
+
+	cloned.Data = make(map[string]json.RawMessage, len(event.Data))
+	for key, value := range event.Data {
+		cloned.Data[key] = append(json.RawMessage(nil), value...)
+	}
+
+	return cloned
+}
+
+func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID string) (idmapRecord, stateSnapshot, bool, error) {
+	entries, err := store.Load(ctx, SessionKey{SessionID: sessionID, Subpath: SessionStoreMainSubpath})
+	if err != nil || len(entries) == 0 {
 		return idmapRecord{}, stateSnapshot{}, false, err
 	}
 
 	var snapshot stateSnapshot
-	if err := json.Unmarshal(mainEntries[len(mainEntries)-1], &snapshot); err != nil {
+	if err := json.Unmarshal(entries[len(entries)-1], &snapshot); err != nil {
 		return idmapRecord{}, stateSnapshot{}, false, err
 	}
 
-	if idmap.Format != SessionStoreFormat || snapshot.Format != SessionStoreFormat {
-		return idmapRecord{}, stateSnapshot{}, false, fmt.Errorf("unsupported opencode store format")
-	}
-
-	if err := validateHydratedStateAgreement(sessionID, idmap, snapshot); err != nil {
+	if err := validateSyncSnapshot(sessionID, snapshot); err != nil {
 		return idmapRecord{}, stateSnapshot{}, false, err
 	}
 
-	for _, item := range []struct {
-		subpath string
-		target  string
-	}{
-		{xdgDataSubpath, xdg.Data},
-		{xdgConfigSubpath, xdg.Config},
-		{xdgCacheSubpath, xdg.Cache},
-		{xdgStateSubpath, xdg.State},
-	} {
-		entries, err := store.Load(ctx, SessionKey{SessionID: sessionID, Subpath: item.subpath})
-		if err != nil {
-			return idmapRecord{}, stateSnapshot{}, false, err
-		}
-
-		if len(entries) == 0 {
-			return idmapRecord{}, stateSnapshot{}, false, fmt.Errorf("store missing archive %s", item.subpath)
-		}
-
-		var archive archiveEntry
-		if unmarshalErr := json.Unmarshal(entries[len(entries)-1], &archive); unmarshalErr != nil {
-			return idmapRecord{}, stateSnapshot{}, false, unmarshalErr
-		}
-
-		if archive.Format != SessionStoreFormat || archive.Encoding != archiveEncodingTarZstdBase64 || !archive.Final {
-			return idmapRecord{}, stateSnapshot{}, false, fmt.Errorf("invalid archive entry %s", item.subpath)
-		}
-
-		data, err := base64.StdEncoding.DecodeString(archive.Data)
-		if err != nil {
-			return idmapRecord{}, stateSnapshot{}, false, err
-		}
-
-		sum := sha256.Sum256(data)
-		if archive.SHA256 != "" && archive.SHA256 != hex.EncodeToString(sum[:]) {
-			return idmapRecord{}, stateSnapshot{}, false, fmt.Errorf("archive %s checksum mismatch", item.subpath)
-		}
-
-		if err := decodeXDGArchive(data, item.target); err != nil {
-			return idmapRecord{}, stateSnapshot{}, false, err
-		}
+	idmap := idmapRecord{
+		SessionID: snapshot.Session.SessionID, NativeSessionID: snapshot.Session.NativeSessionID,
+		ParentSessionID:       snapshot.Session.ParentSessionID,
+		NativeParentSessionID: snapshot.Session.NativeParentSessionID,
+		Format:                snapshot.Format, UpdatedAtUnixMilli: snapshot.CapturedAtUnixMilli,
 	}
 
 	return idmap, snapshot, true, nil
 }
 
-func encodeXDGArchive(root, scratchParent string) ([]byte, string, error) {
-	var files []string
-
-	if err := stateWalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if path == root {
-			return nil
-		}
-
-		rel, err := stateRel(root, path)
-		if err != nil {
-			return err
-		}
-
-		if shouldExcludeStatePath(rel) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-
-			return nil
-		}
-
-		if !d.IsDir() && shouldSkipSQLiteCompanion(rel) {
-			return nil
-		}
-
-		files = append(files, filepath.ToSlash(rel))
-
-		return nil
-	}); err != nil {
-		return nil, "", err
+func validateSyncSnapshot(sessionID string, snapshot stateSnapshot) error {
+	if snapshot.Format != SessionStoreFormat || snapshot.NativeVersion != syncNativeVersion || snapshot.EventSchemaVersion != syncEventSchemaVersion {
+		return fmt.Errorf("unsupported opencode store format or native event schema")
 	}
 
-	slices.Sort(files)
-
-	var tarbuf bytes.Buffer
-
-	tw := stateNewTarWriter(&tarbuf)
-
-	for _, relSlash := range files {
-		rel := filepath.FromSlash(relSlash)
-		path := filepath.Join(root, rel)
-
-		info, err := stateLstat(path)
-		if err != nil {
-			return nil, "", err
-		}
-
-		header, err := stateFileInfoHeader(info, "")
-		if err != nil {
-			return nil, "", err
-		}
-
-		header.Name = relSlash
-		header.Uid = 0
-		header.Gid = 0
-		header.Uname = ""
-		header.Gname = ""
-		header.ModTime = time.Unix(0, 0)
-		header.AccessTime = time.Unix(0, 0)
-		header.ChangeTime = time.Unix(0, 0)
-
-		var scrubbed []byte
-
-		if info.Mode().IsRegular() {
-			var ok bool
-
-			scrubbed, ok, err = stateSQLiteArchiveContent(path, scratchParent)
-			if err != nil {
-				return nil, "", err
-			}
-
-			if ok {
-				header.Size = int64(len(scrubbed))
-			}
-		}
-
-		if err := tw.WriteHeader(header); err != nil {
-			return nil, "", err
-		}
-
-		if info.Mode().IsRegular() {
-			if scrubbed != nil {
-				if _, err := tw.Write(scrubbed); err != nil {
-					return nil, "", err
-				}
-			} else {
-				file, err := stateOpen(path)
-				if err != nil {
-					return nil, "", err
-				}
-
-				_, copyErr := stateCopy(tw, file)
-				closeErr := file.Close()
-
-				if copyErr != nil {
-					return nil, "", copyErr
-				}
-
-				if closeErr != nil {
-					return nil, "", closeErr
-				}
-			}
-		}
+	if snapshot.Session.SessionID != sessionID || snapshot.Session.NativeSessionID == "" || snapshot.RestoreGeneration == "" {
+		return fmt.Errorf("opencode sync manifest identity mismatch")
 	}
 
-	if err := tw.Close(); err != nil {
-		return nil, "", err
-	}
-
-	var zbuf bytes.Buffer
-
-	zw, err := stateNewZstdWriter(&zbuf)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if _, err := zw.Write(tarbuf.Bytes()); err != nil {
-		zw.Close()
-
-		return nil, "", err
-	}
-
-	if err := zw.Close(); err != nil {
-		return nil, "", err
-	}
-
-	sum := sha256.Sum256(zbuf.Bytes())
-
-	return zbuf.Bytes(), hex.EncodeToString(sum[:]), nil
-}
-
-func decodeXDGArchive(data []byte, target string) error {
-	if err := stateRemoveAll(target); err != nil {
-		return err
-	}
-
-	if err := stateMkdirAll(target, 0o700); err != nil {
-		return err
-	}
-
-	zr, err := stateNewZstdReader(bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	defer zr.Close()
-
-	tr := tar.NewReader(zr)
-
-	cleanTarget, err := stateAbs(target)
-	if err != nil {
-		return err
-	}
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			return nil
+	seen := make(map[string]stateSnapshotNode, len(snapshot.Graph))
+	for _, node := range snapshot.Graph {
+		if node.SessionID == "" || node.NativeSessionID == "" || node.SourceCwd == "" {
+			return fmt.Errorf("invalid opencode sync graph node")
 		}
 
-		if err != nil {
-			return err
+		if _, exists := seen[node.NativeSessionID]; exists {
+			return fmt.Errorf("duplicate opencode sync aggregate")
 		}
 
-		if header.Name == "" || filepath.IsAbs(header.Name) || strings.Contains(header.Name, "..") {
-			return fmt.Errorf("archive path rejected: %s", header.Name)
+		seen[node.NativeSessionID] = node
+	}
+
+	if _, ok := seen[snapshot.Session.NativeSessionID]; !ok {
+		return fmt.Errorf("selected aggregate is absent from opencode sync graph")
+	}
+
+	for aggregateID, events := range snapshot.Events {
+		node, ok := seen[aggregateID]
+		if !ok || len(events) == 0 {
+			return fmt.Errorf("opencode sync event aggregate is not allowlisted")
 		}
 
-		path := filepath.Join(cleanTarget, filepath.FromSlash(header.Name))
-
-		cleanPath, err := stateAbs(path)
-		if err != nil {
-			return err
-		}
-
-		if cleanPath != cleanTarget && !strings.HasPrefix(cleanPath, cleanTarget+string(os.PathSeparator)) {
-			return fmt.Errorf("archive path escapes target: %s", header.Name)
-		}
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := stateMkdirAll(cleanPath, 0o700); err != nil {
+		for _, event := range events {
+			if err := validateSyncEvent(event, node); err != nil {
 				return err
 			}
-		case tar.TypeReg:
-			if header.Size < 0 || header.Size > maxHydrateFileBytes {
-				return fmt.Errorf("archive file %s has unsupported size %d", header.Name, header.Size)
-			}
-
-			if err := stateMkdirAll(filepath.Dir(cleanPath), 0o700); err != nil {
-				return err
-			}
-
-			mode := header.FileInfo().Mode().Perm() & 0o700
-
-			file, err := stateOpenFile(cleanPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-			if err != nil {
-				return err
-			}
-
-			written, copyErr := stateCopyN(file, tr, header.Size)
-			closeErr := file.Close()
-
-			if copyErr != nil {
-				return copyErr
-			}
-
-			if written != header.Size {
-				return fmt.Errorf("archive file %s restored %d bytes, want %d", header.Name, written, header.Size)
-			}
-
-			if closeErr != nil {
-				return closeErr
-			}
 		}
 	}
-}
 
-func shouldExcludeStatePath(rel string) bool {
-	rel = filepath.ToSlash(strings.ToLower(rel))
-
-	base := pathBase(rel)
-	if base == "auth.json" || base == opencode.LeaseFileName || strings.Contains(base, "credential") || strings.Contains(rel, "/credential") {
-		return true
-	}
-
-	return false
-}
-
-func validateHydratedStateAgreement(sessionID string, idmap idmapRecord, snapshot stateSnapshot) error {
-	if idmap.SessionID != sessionID {
-		return fmt.Errorf("opencode store idmap session mismatch: %q != %q", idmap.SessionID, sessionID)
-	}
-
-	if snapshot.Session.SessionID != sessionID {
-		return fmt.Errorf("opencode store snapshot session mismatch: %q != %q", snapshot.Session.SessionID, sessionID)
-	}
-
-	if snapshot.Session.NativeSessionID != idmap.NativeSessionID {
-		return fmt.Errorf("opencode store idmap/main native session mismatch")
-	}
-
-	if snapshot.Session.ParentSessionID != idmap.ParentSessionID {
-		return fmt.Errorf("opencode store idmap/main parent session mismatch")
-	}
-
-	if snapshot.Session.NativeParentSessionID != idmap.NativeParentSessionID {
-		return fmt.Errorf("opencode store idmap/main native parent session mismatch")
+	if len(snapshot.Events) != len(seen) {
+		return fmt.Errorf("opencode sync graph is incomplete")
 	}
 
 	return nil
 }
 
-func shouldSkipSQLiteCompanion(rel string) bool {
-	rel = strings.ToLower(filepath.ToSlash(rel))
-
-	return strings.HasSuffix(rel, ".db-wal") || strings.HasSuffix(rel, ".db-shm")
-}
-
-func sqliteArchiveContent(path, scratchParent string) ([]byte, bool, error) {
-	ok, err := isSQLiteDatabase(path)
-	if err != nil || !ok {
-		return nil, ok, err
+func restoreSyncState(ctx context.Context, client opencode.Client, snapshot stateSnapshot, nativeID, targetCwd string) (opencode.NativeSession, error) {
+	if err := validateSyncSnapshot(snapshot.Session.SessionID, snapshot); err != nil {
+		return opencode.NativeSession{}, err
 	}
 
-	tempDir, err := stateMkdirTemp(scratchParent, "acp-go-opencode-sqlite-*")
+	history, err := client.SyncHistory(ctx, map[string]int64{})
 	if err != nil {
-		return nil, false, err
+		return opencode.NativeSession{}, err
 	}
 
-	defer func() { _ = stateRemoveAll(tempDir) }()
-
-	copyPath := filepath.Join(tempDir, "archive.db")
-	if copyErr := stateCopyFile(path, copyPath, 0o600); copyErr != nil {
-		return nil, false, copyErr
+	existing := make(map[string][]opencode.SyncEvent)
+	for _, event := range history {
+		existing[event.AggregateID] = append(existing[event.AggregateID], event)
 	}
 
-	for _, suffix := range []string{"-wal", "-shm"} {
-		if _, statErr := stateStat(path + suffix); statErr == nil {
-			if copyErr := stateCopyFile(path+suffix, copyPath+suffix, 0o600); copyErr != nil {
-				return nil, false, copyErr
+	if err := claimRestoreOwnership(client, snapshot, existing); err != nil {
+		return opencode.NativeSession{}, err
+	}
+
+	for _, node := range snapshot.Graph {
+		expected, err := rebaseSyncEvents(snapshot.Events[node.NativeSessionID], node.SourceCwd, targetCwd)
+		if err != nil {
+			return opencode.NativeSession{}, err
+		}
+
+		if current := existing[node.NativeSessionID]; len(current) > 0 && !syncEventPrefix(current, expected) {
+			return opencode.NativeSession{}, fmt.Errorf("destination aggregate %q is owned by another restore", node.NativeSessionID)
+		}
+
+		if len(existing[node.NativeSessionID]) < len(expected) {
+			replay := make([]opencode.SyncReplayEvent, len(expected))
+			for index, event := range expected {
+				replay[index] = opencode.SyncReplayEvent(event)
+			}
+
+			replayErr := client.SyncReplay(ctx, targetCwd, replay)
+			if replayErr != nil {
+				return opencode.NativeSession{}, fmt.Errorf("replay aggregate %q: %w", node.NativeSessionID, replayErr)
 			}
 		}
-	}
 
-	if scrubErr := stateScrubSQLiteCredentialTables(copyPath); scrubErr != nil {
-		return nil, false, scrubErr
-	}
+		verified, err := client.SyncHistory(ctx, map[string]int64{})
+		if err != nil {
+			return opencode.NativeSession{}, err
+		}
 
-	data, err := stateReadFile(copyPath)
-	if err != nil {
-		return nil, false, err
-	}
+		var actual []opencode.SyncEvent
 
-	return data, true, nil
-}
+		for _, event := range verified {
+			if event.AggregateID == node.NativeSessionID {
+				actual = append(actual, event)
+			}
+		}
 
-func isSQLiteDatabase(path string) (bool, error) {
-	file, err := stateOpen(path)
-	if err != nil {
-		return false, err
-	}
-	defer file.Close()
+		if !syncEventsEqual(actual, expected) {
+			return opencode.NativeSession{}, fmt.Errorf("aggregate %q failed exact replay verification", node.NativeSessionID)
+		}
 
-	header := make([]byte, 16)
-
-	n, err := io.ReadFull(file, header)
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return false, nil
-	}
-
-	if err != nil {
-		return false, err
-	}
-
-	return n == len(header) && string(header) == "SQLite format 3\x00", nil
-}
-
-func copyFile(source string, target string, mode os.FileMode) error {
-	in, err := stateOpen(source)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := stateOpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-
-	_, copyErr := stateCopy(out, in)
-	closeErr := out.Close()
-
-	if copyErr != nil {
-		return copyErr
-	}
-
-	return closeErr
-}
-
-func scrubSQLiteCredentialTables(path string) error {
-	db, err := stateSQLOpen("sqlite", path)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	for _, statement := range []string{
-		"PRAGMA foreign_keys=OFF",
-		"PRAGMA secure_delete=ON",
-		"PRAGMA wal_checkpoint(TRUNCATE)",
-		"PRAGMA journal_mode=DELETE",
-	} {
-		if _, execErr := db.ExecContext(ctx, statement); execErr != nil {
-			return execErr
+		if err := verifyRestoreOwnership(client, snapshot, node); err != nil {
+			return opencode.NativeSession{}, err
 		}
 	}
 
-	tables, err := sqliteCredentialTables(ctx, db)
-	if err != nil {
-		return err
+	return client.GetSession(ctx, nativeID)
+}
+
+func rebaseSyncEvents(events []opencode.SyncEvent, sourceCwd, targetCwd string) ([]opencode.SyncEvent, error) {
+	if filepath.Clean(sourceCwd) == filepath.Clean(targetCwd) {
+		out := make([]opencode.SyncEvent, len(events))
+		for index, event := range events {
+			out[index] = cloneSyncEvent(event)
+		}
+
+		return out, nil
 	}
 
-	for _, table := range tables {
-		statement := "DELETE FROM " + quoteSQLiteIdent(table) // #nosec G202 -- table names come from sqlite_master and are identifier-quoted.
-		if _, err := db.ExecContext(ctx, statement); err != nil {
-			return err
+	out := make([]opencode.SyncEvent, len(events))
+	for index, event := range events {
+		out[index] = cloneSyncEvent(event)
+		for field, raw := range out[index].Data {
+			var value any
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return nil, err
+			}
+
+			value, err := rebasePathValues(value, "", sourceCwd, targetCwd)
+			if err != nil {
+				return nil, fmt.Errorf("validate sync event %q field %q paths: %w", event.ID, field, err)
+			}
+
+			// value came from json.Unmarshal above, so it is always JSON-encodable.
+			encoded, _ := json.Marshal(value)
+
+			out[index].Data[field] = encoded
 		}
 	}
 
-	if len(tables) > 0 {
-		if _, err := db.ExecContext(ctx, "VACUUM"); err != nil {
-			return err
+	return out, nil
+}
+
+func rebasePathValues(value any, field, sourceCwd, targetCwd string) (any, error) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			rebased, err := rebasePathValues(child, key, sourceCwd, targetCwd)
+			if err != nil {
+				return nil, err
+			}
+
+			typed[key] = rebased
+		}
+
+		return typed, nil
+	case []any:
+		for index, child := range typed {
+			rebased, err := rebasePathValues(child, field, sourceCwd, targetCwd)
+			if err != nil {
+				return nil, err
+			}
+
+			typed[index] = rebased
+		}
+
+		return typed, nil
+	case string:
+		if field != syncFieldDirectory && field != "cwd" && field != "root" && field != jsonFieldPath {
+			return typed, nil
+		}
+
+		if typed == "" || !filepath.IsAbs(typed) {
+			return typed, nil
+		}
+
+		relative, err := filepath.Rel(sourceCwd, typed)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+			return nil, fmt.Errorf("absolute %s %q escapes source cwd %q", field, typed, sourceCwd)
+		}
+
+		if relative == "." {
+			return targetCwd, nil
+		}
+
+		return filepath.Join(targetCwd, relative), nil
+	default:
+		return value, nil
+	}
+}
+
+func syncEventPrefix(current, expected []opencode.SyncEvent) bool {
+	if len(current) > len(expected) {
+		return false
+	}
+
+	return syncEventsEqual(current, expected[:len(current)])
+}
+
+func syncEventsEqual(left, right []opencode.SyncEvent) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	left = append([]opencode.SyncEvent(nil), left...)
+	right = append([]opencode.SyncEvent(nil), right...)
+
+	slices.SortFunc(left, func(a, b opencode.SyncEvent) int {
+		if a.Sequence < b.Sequence {
+			return -1
+		}
+
+		if a.Sequence > b.Sequence {
+			return 1
+		}
+
+		return 0
+	})
+	slices.SortFunc(right, func(a, b opencode.SyncEvent) int {
+		if a.Sequence < b.Sequence {
+			return -1
+		}
+
+		if a.Sequence > b.Sequence {
+			return 1
+		}
+
+		return 0
+	})
+
+	for index := range left {
+		a, _ := json.Marshal(left[index])
+
+		b, _ := json.Marshal(right[index])
+		if !bytes.Equal(a, b) {
+			return false
 		}
 	}
 
-	if _, err := db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		return err
+	return true
+}
+
+func scanSyncBundle(bundle []byte, needles []string) error {
+	lower := bytes.ToLower(bundle)
+	for _, forbidden := range []string{`"access_token"`, `"refresh_token"`, `"authorization"`, `"cookie"`, `"api_key"`, `"share"`} {
+		if bytes.Contains(lower, []byte(forbidden)) {
+			return fmt.Errorf("sync bundle contains forbidden credential/account field %q", forbidden)
+		}
+	}
+
+	for _, needle := range needles {
+		if needle != "" && bytes.Contains(bundle, []byte(needle)) {
+			return fmt.Errorf("sync bundle contains an MCP credential")
+		}
 	}
 
 	return nil
 }
 
-func sqliteCredentialTables(ctx context.Context, db *sql.DB) ([]string, error) {
-	rows, err := db.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var tables []string
-
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-
-		sensitive, err := sqliteTableIsCredentialBearing(ctx, db, name)
-		if err != nil {
-			return nil, err
-		}
-
-		if sensitive {
-			tables = append(tables, name)
-		}
+func newRestoreGeneration() (string, error) {
+	var value [16]byte
+	if _, err := restoreRandRead(value[:]); err != nil {
+		return "", err
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return tables, nil
-}
-
-func sqliteTableIsCredentialBearing(ctx context.Context, db *sql.DB, table string) (bool, error) {
-	switch strings.ToLower(table) {
-	case credentialTableAccount, "control_account", "credential", "session_share":
-		return true, nil
-	}
-
-	if sensitiveSQLiteName(table) {
-		return true, nil
-	}
-
-	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+quoteSQLiteIdent(table)+")")
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			cid          int
-			name         string
-			columnType   string
-			notNull      int
-			defaultValue sql.NullString
-			primaryKey   int
-		)
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			return false, err
-		}
-
-		if sensitiveSQLiteName(name) {
-			return true, nil
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-
-	return false, nil
-}
-
-func sensitiveSQLiteName(value string) bool {
-	value = strings.ToLower(value)
-	for _, marker := range []string{"credential", "secret", "access_token", "refresh_token", "api_key", "apikey", "private_key", "password"} {
-		if strings.Contains(value, marker) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func quoteSQLiteIdent(value string) string {
-	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
-}
-
-func pathBase(path string) string {
-	index := strings.LastIndex(path, "/")
-	if index == -1 {
-		return path
-	}
-
-	return path[index+1:]
+	return hex.EncodeToString(value[:]), nil
 }

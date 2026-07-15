@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,45 +48,13 @@ func TestOpenCodeACPAgentFakeExecutableStdoutNoise(t *testing.T) {
 	}
 }
 
-func TestOpenCodeACPAgentFakeExecutableLeaseReaper(t *testing.T) {
+func TestOpenCodeACPAgentFakeExecutableSharedRuntimeLayout(t *testing.T) {
 	requireRunIntegration(t)
-	if runtime.GOOS == "windows" {
-		t.Skip("lease reaper signal semantics are platform-specific")
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	home := t.TempDir()
-	orphan := exec.CommandContext(ctx, "sleep", "30")
-	if err := orphan.Start(); err != nil {
-		t.Fatalf("start orphan process: %v", err)
-	}
-	waitOrphan := make(chan error, 1)
-	go func() { waitOrphan <- orphan.Wait() }()
-	t.Cleanup(func() {
-		select {
-		case <-waitOrphan:
-			// orphan already exited; Wait has returned
-		default:
-			_ = orphan.Process.Kill()
-			<-waitOrphan
-		}
-	})
-
-	leaseDir := filepath.Join(home, "orphan", "state")
-	if err := os.MkdirAll(leaseDir, 0o700); err != nil {
-		t.Fatalf("mkdir lease dir: %v", err)
-	}
-	lease := map[string]any{"pid": orphan.Process.Pid, "port": 0, "startedAtUnixMilli": time.Now().UnixMilli(), "passwordHash": "test"}
-	data, err := json.Marshal(lease)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(leaseDir, "server.lease"), data, 0o600); err != nil {
-		t.Fatalf("write lease: %v", err)
-	}
-
 	agent := startAgentWithOpenCodePath(t, ctx, fakeOpenCodeExecutable(t, fakeModeOK), home)
 	defer agent.close()
 
@@ -94,29 +62,29 @@ func TestOpenCodeACPAgentFakeExecutableLeaseReaper(t *testing.T) {
 	if _, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}); err != nil {
 		t.Fatalf("initialize: %v\nstderr:\n%s", err, agent.stderrString())
 	}
-	if _, err := conn.NewSession(ctx, opencodeacp.NewSessionRequest(t.TempDir())); err != nil {
-		t.Fatalf("new session: %v\nstderr:\n%s", err, agent.stderrString())
+	first, err := conn.NewSession(ctx, opencodeacp.NewSessionRequest(t.TempDir()))
+	if err != nil {
+		t.Fatalf("new first session: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	second, err := conn.NewSession(ctx, opencodeacp.NewSessionRequest(t.TempDir()))
+	if err != nil {
+		t.Fatalf("new second session: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	if first.SessionId == second.SessionId {
+		t.Fatalf("logical session ids were reused: %q", first.SessionId)
 	}
 
-	leasePath := filepath.Join(leaseDir, "server.lease")
-	deadline := time.After(5 * time.Second)
-	for {
-		if _, err := os.Stat(leasePath); os.IsNotExist(err) {
-			break
-		}
-		select {
-		case err := <-waitOrphan:
-			t.Fatalf("unrelated stale-lease process was killed: %v", err)
-		case <-deadline:
-			t.Fatalf("stale lease file still present")
-		default:
-			time.Sleep(10 * time.Millisecond)
+	runtimeRoot := filepath.Join(home, "acp-go-opencode", "runtime")
+	for _, name := range []string{"data", "config", "cache", "state"} {
+		info, statErr := os.Stat(filepath.Join(runtimeRoot, name))
+		if statErr != nil || !info.IsDir() {
+			t.Fatalf("shared runtime %s dir: info=%v err=%v", name, info, statErr)
 		}
 	}
-	select {
-	case err := <-waitOrphan:
-		t.Fatalf("unrelated stale-lease process exited: %v", err)
-	default:
+	for _, sessionID := range []acp.SessionId{first.SessionId, second.SessionId} {
+		if _, statErr := os.Stat(filepath.Join(home, string(sessionID))); !os.IsNotExist(statErr) {
+			t.Fatalf("per-session native XDG root exists for %q: %v", sessionID, statErr)
+		}
 	}
 }
 
@@ -211,10 +179,13 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 	}
 
 	_, _ = fmt.Fprintln(os.Stdout, "native stdout noise before HTTP readiness")
+	var stateMu sync.Mutex
+	var nextSession int
+	sessionDirectories := map[string]string{}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/global/health":
-			writeFakeJSON(w, map[string]any{"healthy": true, "version": "9.0.0"})
+			writeFakeJSON(w, map[string]any{"healthy": true, "version": "1.17.18"})
 		case r.URL.Path == "/doc":
 			writeFakeJSON(w, fakeOpenCodeDoc(mode))
 		case r.URL.Path == "/event":
@@ -225,12 +196,55 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 			}
 			<-r.Context().Done()
 		case r.URL.Path == "/session" && r.Method == http.MethodPost:
-			writeFakeJSON(w, fakeNativeSession("native-fake"))
-		case r.URL.Path == "/session/native-fake" && r.Method == http.MethodGet:
-			writeFakeJSON(w, fakeNativeSession("native-fake"))
-		case r.URL.Path == "/session/native-fake/todo" && r.Method == http.MethodGet:
+			stateMu.Lock()
+			nextSession++
+			nativeID := "native-fake-" + strconv.Itoa(nextSession)
+			directory := r.URL.Query().Get("directory")
+			sessionDirectories[nativeID] = directory
+			stateMu.Unlock()
+			writeFakeJSON(w, fakeNativeSession(nativeID, directory))
+		case r.URL.Path == "/sync/history" && r.Method == http.MethodPost:
+			var cursors map[string]int64
+			if err := json.NewDecoder(r.Body).Decode(&cursors); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+
+				return
+			}
+			if len(cursors) != 0 {
+				writeFakeJSON(w, []any{})
+
+				return
+			}
+			stateMu.Lock()
+			events := make([]any, 0, len(sessionDirectories))
+			for nativeID, directory := range sessionDirectories {
+				events = append(events, map[string]any{
+					"id":           "event-" + nativeID + "-created",
+					"aggregate_id": nativeID,
+					"seq":          0,
+					"type":         "session.created.1",
+					"data": map[string]any{
+						"sessionID": nativeID,
+						"info":      map[string]any{"id": nativeID, "directory": directory},
+					},
+				})
+			}
+			stateMu.Unlock()
+			writeFakeJSON(w, events)
+		case strings.HasPrefix(r.URL.Path, "/session/") && r.Method == http.MethodGet && !strings.HasSuffix(r.URL.Path, "/todo"):
+			nativeID := strings.TrimPrefix(r.URL.Path, "/session/")
+			stateMu.Lock()
+			directory, found := sessionDirectories[nativeID]
+			stateMu.Unlock()
+			if !found {
+				http.NotFound(w, r)
+
+				return
+			}
+			writeFakeJSON(w, fakeNativeSession(nativeID, directory))
+		case strings.HasPrefix(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/todo") && r.Method == http.MethodGet:
 			writeFakeJSON(w, []any{})
-		case r.URL.Path == "/session/native-fake/abort" && r.Method == http.MethodPost:
+		case strings.HasPrefix(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/abort") && r.Method == http.MethodPost:
 			writeFakeJSON(w, map[string]any{"ok": true})
 		case r.URL.Path == "/config/providers":
 			writeFakeJSON(w, map[string]any{"providers": []map[string]any{{
@@ -270,6 +284,7 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 		"/session/{sessionID}",
 		"/session/{sessionID}/command",
 		"/session/{sessionID}/message",
+		"/session/{sessionID}/prompt_async",
 		"/session/{sessionID}/abort",
 		"/session/{sessionID}/fork",
 		"/session/{sessionID}/todo",
@@ -460,11 +475,12 @@ func fakePendingArrayPath(itemRef string) map[string]any {
 	}
 }
 
-func fakeNativeSession(id string) map[string]any {
+func fakeNativeSession(id string, directory string) map[string]any {
 	return map[string]any{
-		"id":    id,
-		"title": "Fake",
-		"agent": "build",
+		"id":        id,
+		"title":     "Fake",
+		"directory": directory,
+		"agent":     "build",
 		"model": map[string]any{
 			"providerID": "openai",
 			"modelID":    "gpt-test",

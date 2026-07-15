@@ -1,1331 +1,585 @@
 package opencodeacp
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"database/sql"
-	"database/sql/driver"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
-	"github.com/savid/acp-go-opencode/internal/opencode"
+	"errors"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/savid/acp-go-opencode/internal/opencode"
+	"github.com/stretchr/testify/require"
 )
 
-func TestSnapshotHydrateScrubsSQLiteCredentialTables(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	xdg, err := opencode.CreateXDGDirs(root, "session-1")
-	if err != nil {
-		t.Fatalf("opencode.CreateXDGDirs: %v", err)
+func syncTestEvent(aggregate string, sequence int64, kind string, extra map[string]json.RawMessage) opencode.SyncEvent {
+	data := map[string]json.RawMessage{
+		"sessionID": json.RawMessage(`"` + aggregate + `"`),
+		"info":      json.RawMessage(`{"id":"` + aggregate + `","directory":"/source"}`),
 	}
-	dbPath := filepath.Join(xdg.Data, "opencode", "opencode.db")
-	if err = os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
-		t.Fatal(err)
+	for key, value := range extra {
+		data[key] = value
 	}
-	seedSQLiteStore(t, dbPath)
 
+	return opencode.SyncEvent{ID: aggregate + "-evt", AggregateID: aggregate, Sequence: sequence, Type: kind, Data: data}
+}
+
+func TestAllowlistedSyncEventsRejectsCrossAggregateAndUnknownSchema(t *testing.T) {
+	allow := map[string]stateSnapshotNode{"a": {NativeSessionID: "a", SourceCwd: "/source"}}
+	history := []opencode.SyncEvent{
+		syncTestEvent("a", 0, "session.created.1", nil),
+		syncTestEvent("other", 0, "session.created.1", nil),
+	}
+	events, cursors, err := allowlistedSyncEvents(history, allow)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	require.Len(t, events["a"], 1)
+	require.EqualValues(t, 0, cursors["a"])
+
+	bad := syncTestEvent("a", 0, "session.created.1", map[string]json.RawMessage{"credential": json.RawMessage(`"secret"`)})
+	_, _, err = allowlistedSyncEvents([]opencode.SyncEvent{bad}, allow)
+	require.ErrorContains(t, err, "unsupported field")
+	bad.Type = "future.2"
+	delete(bad.Data, "credential")
+	_, _, err = allowlistedSyncEvents([]opencode.SyncEvent{bad}, allow)
+	require.ErrorContains(t, err, "unsupported sync event type")
+}
+
+func TestSyncSnapshotHardRejectsOldAndIncompleteFormats(t *testing.T) {
 	store := NewInMemorySessionStore()
+	require.NoError(t, store.Append(context.Background(), SessionKey{SessionID: "s"}, []SessionStoreEntry{
+		json.RawMessage(`{"format":"removed-format"}`),
+	}))
+	idmap, hydrated, found, err := hydrateStateFromStore(context.Background(), store, "s")
+	require.Empty(t, idmap)
+	require.Empty(t, hydrated)
+	require.False(t, found)
+	require.ErrorContains(t, err, "unsupported opencode store format")
+
+	snapshot := validSyncSnapshot("s", "native", "/source")
+	delete(snapshot.Events, "native")
+	require.ErrorContains(t, validateSyncSnapshot("s", snapshot), "incomplete")
+}
+
+func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	client.xdg = xdg
-	client.todos = []opencode.NativeTodo{{ID: "todo-1", Content: "Remember", Status: "pending", Priority: "medium"}}
-	agent := NewAgent(WithSessionStore(store))
-	session := testSession(agent, client)
-	if err = session.snapshotToStore(ctx); err != nil {
-		t.Fatalf("snapshotToStore: %v", err)
-	}
+	client.getSession = testNativeSession("native")
+	snapshot := validSyncSnapshot("s", "native", "/source")
+	native, err := restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	require.NoError(t, err)
+	require.Equal(t, "native", native.ID)
+	require.Len(t, client.syncEvents, 1)
+	var info map[string]any
+	require.NoError(t, json.Unmarshal(client.syncEvents[0].Data["info"], &info))
+	require.Equal(t, "/target", info["directory"])
+	_, err = os.Stat(filepath.Join(client.xdg.State, restoreOwnershipFileName))
+	require.NoError(t, err)
 
-	if countSQLiteRows(t, dbPath, "account") != 1 || countSQLiteRows(t, dbPath, "credential") != 1 {
-		t.Fatal("snapshot modified live credential tables")
-	}
+	// A complete retry is idempotent and verifies rather than duplicating.
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	require.NoError(t, err)
+	require.Len(t, client.syncEvents, 1)
 
-	if err = os.RemoveAll(xdg.Root); err != nil {
-		t.Fatalf("remove original xdg: %v", err)
-	}
-	restored, err := opencode.CreateXDGDirs(root, "session-1-restored")
-	if err != nil {
-		t.Fatalf("create restored xdg: %v", err)
-	}
-	idmap, snapshot, ok, err := hydrateStateFromStore(ctx, store, "session-1", restored)
-	if err != nil {
-		t.Fatalf("hydrateStateFromStore: %v", err)
-	}
-	if !ok || idmap.NativeSessionID != "native-1" || snapshot.Format != SessionStoreFormat {
-		t.Fatalf("hydrate result idmap=%#v snapshot=%#v ok=%v", idmap, snapshot, ok)
-	}
-	restoredDB := filepath.Join(restored.Data, "opencode", "opencode.db")
-	if countSQLiteRows(t, restoredDB, "account") != 0 {
-		t.Fatal("account credentials round-tripped through store")
-	}
-	if countSQLiteRows(t, restoredDB, "credential") != 0 {
-		t.Fatal("credential table rows round-tripped through store")
-	}
-	if countSQLiteRows(t, restoredDB, "message") != 1 {
-		t.Fatal("non-credential table did not round-trip")
-	}
+	client.syncEvents[0].Data["info"] = json.RawMessage(`{"id":"foreign","directory":"/target"}`)
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	require.ErrorContains(t, err, "owned by another restore")
 }
 
-func TestDecodeXDGArchiveRejectsTraversalAndBadChecksum(t *testing.T) {
-	ctx := context.Background()
-	store := NewInMemorySessionStore()
-	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
-	idmapData, _ := json.Marshal(idmapRecord{SessionID: "s", NativeSessionID: "n", Format: SessionStoreFormat})
-	mainData, _ := json.Marshal(validHydrateSnapshot())
-	badArchive, _ := json.Marshal(archiveEntry{Format: SessionStoreFormat, Encoding: archiveEncodingTarZstdBase64, Final: true, SHA256: "bad", Data: base64.StdEncoding.EncodeToString([]byte("not zstd"))})
-	if err := store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{mainData}},
-		{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{idmapData}},
-		{Key: SessionKey{SessionID: "s", Subpath: xdgDataSubpath}, Entries: []SessionStoreEntry{badArchive}},
-		{Key: SessionKey{SessionID: "s", Subpath: xdgConfigSubpath}, Entries: []SessionStoreEntry{badArchive}},
-		{Key: SessionKey{SessionID: "s", Subpath: xdgCacheSubpath}, Entries: []SessionStoreEntry{badArchive}},
-		{Key: SessionKey{SessionID: "s", Subpath: xdgStateSubpath}, Entries: []SessionStoreEntry{badArchive}},
-	}); err != nil {
-		t.Fatalf("Replace: %v", err)
-	}
-	_, _, ok, err := hydrateStateFromStore(ctx, store, "s", opencode.XDGDirs{
-		Data:   filepath.Join(t.TempDir(), "data"),
-		Config: filepath.Join(t.TempDir(), "config"),
-		Cache:  filepath.Join(t.TempDir(), "cache"),
-		State:  filepath.Join(t.TempDir(), "state"),
-	})
-	if err == nil || ok {
-		t.Fatal("bad archive checksum accepted")
-	}
-
-	if !shouldExcludeStatePath("nested/auth.json") || !shouldExcludeStatePath("x/credential-store.json") || !shouldExcludeStatePath("server.lease") {
-		t.Fatal("credential state path exclusion failed")
-	}
-	if !shouldSkipSQLiteCompanion("opencode.db-wal") || shouldSkipSQLiteCompanion("opencode.db") {
-		t.Fatal("SQLite companion detection failed")
-	}
-	if !sensitiveSQLiteName("access_token") || quoteSQLiteIdent(`a"b`) != `"a""b"` || pathBase("a/b/c") != "c" {
-		t.Fatal("SQLite helper checks failed")
-	}
-}
-
-func TestStateStoreArchiveRoundTripAndHelpers(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "nested"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for path, body := range map[string]string{
-		filepath.Join(root, "nested", "file.txt"): "body",
-		filepath.Join(root, "auth.json"):          "secret",
-		filepath.Join(root, "cache.db-wal"):       "wal",
-	} {
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatalf("write %s: %v", path, err)
-		}
-	}
-	archive, sha, err := encodeXDGArchive(root, t.TempDir())
-	if err != nil {
-		t.Fatalf("encodeXDGArchive: %v", err)
-	}
-	sum := sha256.Sum256(archive)
-	if sha != hex.EncodeToString(sum[:]) {
-		t.Fatalf("sha = %q", sha)
-	}
-	target := t.TempDir()
-	if err = decodeXDGArchive(archive, target); err != nil {
-		t.Fatalf("decodeXDGArchive: %v", err)
-	}
-	data, err := os.ReadFile(filepath.Join(target, "nested", "file.txt"))
-	if err != nil || string(data) != "body" {
-		t.Fatalf("decoded file = %q err=%v", data, err)
-	}
-	if _, err := os.Stat(filepath.Join(target, "auth.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("auth.json restored err=%v", err)
-	}
-	if _, err := os.Stat(filepath.Join(target, "cache.db-wal")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("wal restored err=%v", err)
-	}
-
-	if err := decodeXDGArchive([]byte("not zstd"), t.TempDir()); err == nil {
-		t.Fatal("decode accepted invalid zstd")
-	}
-	if err := decodeXDGArchive(testTarZstd(t, []tar.Header{{Name: "../escape", Typeflag: tar.TypeReg, Size: 0}}, nil), t.TempDir()); err == nil {
-		t.Fatal("decode accepted traversal")
-	}
-	if err := decodeXDGArchive(testTarZstd(t, []tar.Header{{Name: "/abs", Typeflag: tar.TypeReg, Size: 0}}, nil), t.TempDir()); err == nil {
-		t.Fatal("decode accepted absolute path")
-	}
-}
-
-func TestHydrateStateFromStoreErrors(t *testing.T) {
-	ctx := context.Background()
-	xdg, err := opencode.CreateXDGDirs(t.TempDir(), "hydrate")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, ok, err := hydrateStateFromStore(ctx, NewInMemorySessionStore(), "missing", xdg); err != nil || ok {
-		t.Fatalf("missing hydrate ok=%v err=%v", ok, err)
-	}
-	errStore := &errorSessionStore{err: errors.New("load failed")}
-	if _, _, _, err := hydrateStateFromStore(ctx, errStore, "s", xdg); err == nil {
-		t.Fatal("hydrate ignored load error")
-	}
-
-	store := NewInMemorySessionStore()
-	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
-	if err := store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"format":"bad"}`)}},
-		{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{json.RawMessage(`{"format":"bad"}`)}},
-	}); err != nil {
-		t.Fatalf("replace bad format: %v", err)
-	}
-	if _, _, _, err := hydrateStateFromStore(ctx, store, "s", xdg); err == nil {
-		t.Fatal("hydrate accepted bad format")
-	}
-
-	store = NewInMemorySessionStore()
-	idmapData, _ := json.Marshal(idmapRecord{SessionID: "s", NativeSessionID: "n", Format: SessionStoreFormat})
-	mainData, _ := json.Marshal(validHydrateSnapshot())
-	if err := store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{mainData}},
-		{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{idmapData}},
-	}); err != nil {
-		t.Fatalf("replace missing archive: %v", err)
-	}
-	if _, _, _, err := hydrateStateFromStore(ctx, store, "s", xdg); err == nil {
-		t.Fatal("hydrate accepted missing archive")
-	}
-}
-
-func TestHydrateStateAgreementRejectsMismatches(t *testing.T) {
-	ctx := context.Background()
-	xdg, err := opencode.CreateXDGDirs(t.TempDir(), "hydrate")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tests := []struct {
-		name   string
-		mutate func(*idmapRecord, *stateSnapshot)
-		want   string
-	}{
-		{
-			name: "requested ACP id disagrees with idmap",
-			mutate: func(idmap *idmapRecord, _ *stateSnapshot) {
-				idmap.SessionID = "other"
-			},
-			want: "idmap session mismatch",
-		},
-		{
-			name: "requested ACP id disagrees with snapshot",
-			mutate: func(_ *idmapRecord, snapshot *stateSnapshot) {
-				snapshot.Session.SessionID = "other"
-			},
-			want: "snapshot session mismatch",
-		},
-		{
-			name: "native id disagrees",
-			mutate: func(_ *idmapRecord, snapshot *stateSnapshot) {
-				snapshot.Session.NativeSessionID = "other-native"
-			},
-			want: "native session mismatch",
-		},
-		{
-			name: "parent ACP id disagrees",
-			mutate: func(idmap *idmapRecord, snapshot *stateSnapshot) {
-				idmap.ParentSessionID = "parent"
-				snapshot.Session.ParentSessionID = "other-parent"
-			},
-			want: "parent session mismatch",
-		},
-		{
-			name: "parent native id disagrees",
-			mutate: func(idmap *idmapRecord, snapshot *stateSnapshot) {
-				idmap.NativeParentSessionID = "native-parent"
-				snapshot.Session.NativeParentSessionID = "other-native-parent"
-			},
-			want: "native parent session mismatch",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			store := validHydrateStore(t, ctx)
-			idmap := validHydrateIDMap()
-			snapshot := validHydrateSnapshot()
-			tt.mutate(&idmap, &snapshot)
-			replaceHydrateRecords(t, ctx, store, idmap, snapshot)
-			if _, _, _, err := hydrateStateFromStore(ctx, store, "s", xdg); err == nil || !strings.Contains(err.Error(), tt.want) {
-				t.Fatalf("hydrate mismatch err = %v, want %q", err, tt.want)
-			}
-		})
-	}
-}
-
-func TestSnapshotToStoreBlockedWhilePending(t *testing.T) {
-	ctx := context.Background()
-	agent := NewAgent()
-
-	permission := &session{agent: agent, pending: map[string]opencode.PermissionRequest{"p": {}}}
-	if err := permission.snapshotToStore(ctx); err == nil || !strings.Contains(err.Error(), "permission") {
-		t.Fatalf("pending permission snapshot err = %v", err)
-	}
-
-	question := &session{agent: agent, questions: map[string]opencode.QuestionRequest{"q": {}}}
-	if err := question.snapshotToStore(ctx); err == nil || !strings.Contains(err.Error(), "elicitation") {
-		t.Fatalf("pending question snapshot err = %v", err)
-	}
-
-	generation := &session{agent: agent, activeMessageIDs: map[string]struct{}{"m": {}}}
-	if err := generation.snapshotToStore(ctx); err == nil || !strings.Contains(err.Error(), "generation") {
-		t.Fatalf("active generation snapshot err = %v", err)
-	}
-}
-
-func TestSnapshotToStoreNilClientAndFileSQLiteErrors(t *testing.T) {
-	if err := (&session{agent: NewAgent(), client: nil}).snapshotToStore(context.Background()); err != nil {
-		t.Fatalf("nil client snapshot: %v", err)
-	}
-	if _, _, err := encodeXDGArchive(filepath.Join(t.TempDir(), "missing"), t.TempDir()); err == nil {
-		t.Fatal("encodeXDGArchive accepted missing root")
-	}
-	if _, ok, err := sqliteArchiveContent(filepath.Join(t.TempDir(), "missing.db"), t.TempDir()); err == nil || ok {
-		t.Fatalf("sqliteArchiveContent missing ok=%v err=%v", ok, err)
-	}
-	short := filepath.Join(t.TempDir(), "short.db")
-	if err := os.WriteFile(short, []byte("short"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := isSQLiteDatabase(short); err != nil || ok {
-		t.Fatalf("short sqlite ok=%v err=%v", ok, err)
-	}
-	if err := copyFile(filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "out"), 0o600); err == nil {
-		t.Fatal("copyFile accepted missing source")
-	}
-	source := filepath.Join(t.TempDir(), "source")
-	if err := os.WriteFile(source, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := copyFile(source, string([]byte{0}), 0o600); err == nil {
-		t.Fatal("copyFile accepted invalid target")
-	}
-	if err := scrubSQLiteCredentialTables(short); err == nil {
-		t.Fatal("scrubSQLiteCredentialTables accepted non-sqlite")
-	}
-	dbPath := filepath.Join(t.TempDir(), "clean.db")
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = db.Exec(`CREATE TABLE regular (id TEXT PRIMARY KEY, body TEXT)`); err != nil {
-		t.Fatal(err)
-	}
-	if err = db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err = sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	sensitive, err := sqliteTableIsCredentialBearing(context.Background(), db, "regular")
-	if err != nil || sensitive {
-		t.Fatalf("regular table sensitive=%v err=%v", sensitive, err)
-	}
-}
-
-func TestSnapshotToStoreMarshalAndArchiveFaults(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("created at is initialized", func(t *testing.T) {
-		session := snapshotFaultSession(t)
-		session.idmap.CreatedAtUnixMilli = 0
-		if err := session.snapshotToStore(ctx); err != nil {
-			t.Fatalf("snapshotToStore: %v", err)
-		}
-		entries, err := session.agent.sessionStore().Load(ctx, SessionKey{SessionID: string(session.id), Subpath: idmapSubpath})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var idmap idmapRecord
-		if err := json.Unmarshal(entries[len(entries)-1], &idmap); err != nil {
-			t.Fatal(err)
-		}
-		if idmap.CreatedAtUnixMilli == 0 {
-			t.Fatal("CreatedAtUnixMilli was not initialized")
-		}
-	})
-
-	t.Run("archive encode error", func(t *testing.T) {
-		restoreStateStoreSeams(t)
-		stateWalkDir = func(string, fs.WalkDirFunc) error {
-			return errors.New("walk failed")
-		}
-		if err := snapshotFaultSession(t).snapshotToStore(ctx); err == nil {
-			t.Fatal("snapshot ignored archive error")
-		}
-	})
-
-	t.Run("scratch parent error", func(t *testing.T) {
-		session := snapshotFaultSession(t)
-		file := filepath.Join(t.TempDir(), "not-a-dir")
-		if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		session.agent.options.ScratchDir = filepath.Join(file, "child")
-		if err := session.snapshotToStore(ctx); err == nil {
-			t.Fatal("snapshot ignored scratch parent error")
-		}
-	})
-
-	for name, failAt := range map[string]int{
-		"archive entry": 1,
-		"main entry":    5,
-		"idmap entry":   6,
-	} {
-		t.Run("marshal "+name, func(t *testing.T) {
-			restoreStateStoreSeams(t)
-			calls := 0
-			stateJSONMarshal = func(value any) ([]byte, error) {
-				calls++
-				if calls == failAt {
-					return nil, errors.New("marshal failed")
-				}
-
-				return json.Marshal(value)
-			}
-			if err := snapshotFaultSession(t).snapshotToStore(ctx); err == nil {
-				t.Fatalf("snapshot ignored %s marshal error", name)
-			}
-		})
-	}
-}
-
-func TestHydrateStateFromStoreFaults(t *testing.T) {
-	ctx := context.Background()
-	xdg, err := opencode.CreateXDGDirs(t.TempDir(), "hydrate")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("main load error", func(t *testing.T) {
-		store := validHydrateStore(t, ctx)
-		errStore := selectiveLoadErrorStore{SessionStore: store, key: SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}, err: errors.New("main load failed")}
-		if _, _, _, err := hydrateStateFromStore(ctx, errStore, "s", xdg); err == nil {
-			t.Fatal("hydrate ignored main load error")
-		}
-	})
-
-	t.Run("invalid idmap and main json", func(t *testing.T) {
-		for name, replacements := range map[string][]SessionStoreReplacement{
-			"idmap": {
-				{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{json.RawMessage(`{`)}},
-				{Key: SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateSnapshot())}},
-			},
-			"main": {
-				{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateIDMap())}},
-				{Key: SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{json.RawMessage(`{`)}},
-			},
-		} {
-			t.Run(name, func(t *testing.T) {
-				store := NewInMemorySessionStore()
-				main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
-				if err := store.Replace(ctx, main, replacements); err != nil {
-					t.Fatal(err)
-				}
-				if _, _, _, err := hydrateStateFromStore(ctx, store, "s", xdg); err == nil {
-					t.Fatal("hydrate accepted invalid json")
-				}
-			})
-		}
-	})
-
-	t.Run("archive load and decode errors", func(t *testing.T) {
-		for name, mutate := range map[string]func(*InMemorySessionStore){
-			"load": func(store *InMemorySessionStore) {
-				*store = *validHydrateStore(t, ctx)
-			},
-			"json": func(store *InMemorySessionStore) {
-				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, json.RawMessage(`{`))
-			},
-			"base64": func(store *InMemorySessionStore) {
-				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, mustStateJSON(t, archiveEntry{Format: SessionStoreFormat, Encoding: archiveEncodingTarZstdBase64, Final: true, Data: "not base64"}))
-			},
-			"invalid": func(store *InMemorySessionStore) {
-				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, mustStateJSON(t, archiveEntry{Format: SessionStoreFormat, Encoding: "gzip", Final: true, Data: ""}))
-			},
-			"decode": func(store *InMemorySessionStore) {
-				data := []byte("not zstd")
-				sum := sha256.Sum256(data)
-				replaceArchiveEntry(t, ctx, store, xdgDataSubpath, mustStateJSON(t, archiveEntry{
-					Format:   SessionStoreFormat,
-					Encoding: archiveEncodingTarZstdBase64,
-					Final:    true,
-					SHA256:   hex.EncodeToString(sum[:]),
-					Data:     base64.StdEncoding.EncodeToString(data),
-				}))
-			},
-		} {
-			t.Run(name, func(t *testing.T) {
-				store := validHydrateStore(t, ctx)
-				if name == "load" {
-					errStore := selectiveLoadErrorStore{
-						SessionStore: store,
-						key:          SessionKey{SessionID: "s", Subpath: xdgDataSubpath},
-						err:          errors.New("archive load failed"),
-					}
-					if _, _, _, err := hydrateStateFromStore(ctx, errStore, "s", xdg); err == nil {
-						t.Fatal("hydrate ignored archive load error")
-					}
-
-					return
-				}
-				mutate(store)
-				if _, _, _, err := hydrateStateFromStore(ctx, store, "s", xdg); err == nil {
-					t.Fatal("hydrate accepted bad archive")
-				}
-			})
-		}
-	})
-}
-
-func TestEncodeXDGArchiveFaults(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("body"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(root, "credential-dir"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "credential-dir", "secret.txt"), []byte("secret"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	archive, _, err := encodeXDGArchive(root, t.TempDir())
-	if err != nil {
-		t.Fatalf("encode credential dir: %v", err)
-	}
-	target := t.TempDir()
-	if err := decodeXDGArchive(archive, target); err != nil {
-		t.Fatalf("decode credential dir archive: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(target, "credential-dir")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("credential dir restored err = %v", err)
-	}
-
-	tests := map[string]func(){
-		"walk entry": func() {
-			stateWalkDir = func(root string, fn fs.WalkDirFunc) error {
-				return fn(filepath.Join(root, "bad"), nil, errors.New("walk entry failed"))
-			}
-		},
-		"rel": func() {
-			stateRel = func(string, string) (string, error) { return "", errors.New("rel failed") }
-		},
-		"lstat": func() {
-			stateLstat = func(string) (os.FileInfo, error) { return nil, errors.New("lstat failed") }
-		},
-		"header": func() {
-			stateFileInfoHeader = func(os.FileInfo, string) (*tar.Header, error) { return nil, errors.New("header failed") }
-		},
-		"sqlite content": func() {
-			stateSQLiteArchiveContent = func(string, string) ([]byte, bool, error) {
-				return nil, false, errors.New("sqlite failed")
-			}
-		},
-		"write header": func() {
-			stateNewTarWriter = func(io.Writer) archiveTarWriter {
-				return fakeTarWriter{writeHeaderErr: errors.New("write header failed")}
-			}
-		},
-		"write scrubbed": func() {
-			stateSQLiteArchiveContent = func(string, string) ([]byte, bool, error) { return []byte("scrubbed"), true, nil }
-			stateNewTarWriter = func(io.Writer) archiveTarWriter {
-				return fakeTarWriter{writeErr: errors.New("write failed")}
-			}
-		},
-		"open": func() {
-			stateSQLiteArchiveContent = func(string, string) ([]byte, bool, error) { return nil, false, nil }
-			stateOpen = func(string) (io.ReadCloser, error) { return nil, errors.New("open failed") }
-		},
-		"copy": func() {
-			stateCopy = func(io.Writer, io.Reader) (int64, error) { return 0, errors.New("copy failed") }
-		},
-		"file close": func() {
-			stateOpen = func(string) (io.ReadCloser, error) {
-				return fakeReadCloser{Reader: strings.NewReader("body"), closeErr: errors.New("close failed")}, nil
-			}
-		},
-		"tar close": func() {
-			stateNewTarWriter = func(io.Writer) archiveTarWriter {
-				return fakeTarWriter{closeErr: errors.New("tar close failed")}
-			}
-		},
-		"zstd new": func() {
-			stateNewZstdWriter = func(io.Writer) (archiveZstdWriter, error) {
-				return nil, errors.New("zstd new failed")
-			}
-		},
-		"zstd write": func() {
-			stateNewZstdWriter = func(io.Writer) (archiveZstdWriter, error) {
-				return fakeZstdWriter{writeErr: errors.New("zstd write failed")}, nil
-			}
-		},
-		"zstd close": func() {
-			stateNewZstdWriter = func(io.Writer) (archiveZstdWriter, error) {
-				return fakeZstdWriter{closeErr: errors.New("zstd close failed")}, nil
-			}
-		},
-	}
-	for name, setup := range tests {
-		t.Run(name, func(t *testing.T) {
-			restoreStateStoreSeams(t)
-			setup()
-			if _, _, err := encodeXDGArchive(root, t.TempDir()); err == nil {
-				t.Fatal("encodeXDGArchive ignored injected error")
-			}
-		})
-	}
-}
-
-func TestDecodeXDGArchiveFaults(t *testing.T) {
-	regularArchive := testTarZstd(t, []tar.Header{{Name: "dir/file.txt", Typeflag: tar.TypeReg, Mode: 0o600, Size: 4}}, map[string]string{"dir/file.txt": "body"})
-	dirArchive := testTarZstd(t, []tar.Header{{Name: "dir", Typeflag: tar.TypeDir, Mode: 0o700}}, nil)
-	bigArchive := testTarZstdPartial(t, tar.Header{Name: "big", Typeflag: tar.TypeReg, Mode: 0o600, Size: maxHydrateFileBytes + 1})
-	badTarArchive := testZstdBytes(t, []byte("not a tar stream"))
-
-	tests := map[string]struct {
-		data  []byte
-		setup func()
-	}{
-		"remove": {data: regularArchive, setup: func() {
-			stateRemoveAll = func(string) error { return errors.New("remove failed") }
-		}},
-		"mkdir root": {data: regularArchive, setup: func() {
-			stateMkdirAll = func(string, os.FileMode) error { return errors.New("mkdir failed") }
-		}},
-		"zstd": {data: []byte("not zstd"), setup: func() {
-			stateNewZstdReader = func(io.Reader) (*zstd.Decoder, error) { return nil, errors.New("zstd failed") }
-		}},
-		"abs target": {data: regularArchive, setup: func() {
-			stateAbs = func(string) (string, error) { return "", errors.New("abs failed") }
-		}},
-		"tar next": {data: badTarArchive},
-		"abs child": {data: regularArchive, setup: func() {
-			calls := 0
-			stateAbs = func(path string) (string, error) {
-				calls++
-				if calls == 2 {
-					return "", errors.New("child abs failed")
-				}
-
-				return filepath.Clean(path), nil
-			}
-		}},
-		"escape": {data: regularArchive, setup: func() {
-			calls := 0
-			stateAbs = func(path string) (string, error) {
-				calls++
-				if calls == 2 {
-					return filepath.Join(string(os.PathSeparator), "elsewhere"), nil
-				}
-
-				return filepath.Clean(path), nil
-			}
-		}},
-		"dir mkdir": {data: dirArchive, setup: func() {
-			calls := 0
-			stateMkdirAll = func(string, os.FileMode) error {
-				calls++
-				if calls == 2 {
-					return errors.New("dir mkdir failed")
-				}
-
-				return nil
-			}
-		}},
-		"big file": {data: bigArchive},
-		"parent mkdir": {data: regularArchive, setup: func() {
-			calls := 0
-			stateMkdirAll = func(string, os.FileMode) error {
-				calls++
-				if calls == 2 {
-					return errors.New("parent mkdir failed")
-				}
-
-				return nil
-			}
-		}},
-		"open file": {data: regularArchive, setup: func() {
-			stateOpenFile = func(string, int, os.FileMode) (io.WriteCloser, error) {
-				return nil, errors.New("open file failed")
-			}
-		}},
-		"copy": {data: regularArchive, setup: func() {
-			stateOpenFile = func(string, int, os.FileMode) (io.WriteCloser, error) {
-				return fakeWriteCloser{}, nil
-			}
-			stateCopyN = func(io.Writer, io.Reader, int64) (int64, error) {
-				return 0, errors.New("copy failed")
-			}
-		}},
-		"short write": {data: regularArchive, setup: func() {
-			stateOpenFile = func(string, int, os.FileMode) (io.WriteCloser, error) {
-				return fakeWriteCloser{}, nil
-			}
-			stateCopyN = func(io.Writer, io.Reader, int64) (int64, error) { return 0, nil }
-		}},
-		"close": {data: regularArchive, setup: func() {
-			stateOpenFile = func(string, int, os.FileMode) (io.WriteCloser, error) {
-				return fakeWriteCloser{closeErr: errors.New("close failed")}, nil
-			}
-		}},
-	}
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			restoreStateStoreSeams(t)
-			if tc.setup != nil {
-				tc.setup()
-			}
-			if err := decodeXDGArchive(tc.data, t.TempDir()); err == nil {
-				t.Fatal("decodeXDGArchive ignored injected error")
-			}
-		})
-	}
-}
-
-func TestSQLiteArchiveAndCopyFaults(t *testing.T) {
-	tests := map[string]func(string){
-		"mkdir temp": func(string) {
-			stateMkdirTemp = func(string, string) (string, error) { return "", errors.New("mkdir temp failed") }
-		},
-		"copy db": func(string) {
-			stateCopyFile = func(string, string, os.FileMode) error { return errors.New("copy failed") }
-		},
-		"copy companion": func(dbPath string) {
-			if err := os.WriteFile(dbPath+"-wal", []byte("wal"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			calls := 0
-			stateCopyFile = func(source string, target string, mode os.FileMode) error {
-				calls++
-				if calls > 1 {
-					return errors.New("copy companion failed")
-				}
-
-				return copyFile(source, target, mode)
-			}
-		},
-		"scrub": func(string) {
-			stateScrubSQLiteCredentialTables = func(string) error { return errors.New("scrub failed") }
-		},
-		"read": func(string) {
-			stateReadFile = func(string) ([]byte, error) { return nil, errors.New("read failed") }
-		},
-	}
-	for name, setup := range tests {
-		t.Run(name, func(t *testing.T) {
-			restoreStateStoreSeams(t)
-			dbPath := filepath.Join(t.TempDir(), "store.db")
-			seedSQLiteStore(t, dbPath)
-			setup(dbPath)
-			if _, ok, err := sqliteArchiveContent(dbPath, t.TempDir()); err == nil || ok {
-				t.Fatal("sqliteArchiveContent ignored injected error")
-			}
-		})
-	}
-
-	source := filepath.Join(t.TempDir(), "source")
-	if err := os.WriteFile(source, []byte("body"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Run("sqlite read", func(t *testing.T) {
-		restoreStateStoreSeams(t)
-		stateOpen = func(string) (io.ReadCloser, error) {
-			return errorReadCloser{err: errors.New("read failed")}, nil
-		}
-		if ok, err := isSQLiteDatabase("ignored"); err == nil || ok {
-			t.Fatalf("isSQLiteDatabase read error ok=%v err=%v", ok, err)
-		}
-	})
-	t.Run("copy", func(t *testing.T) {
-		restoreStateStoreSeams(t)
-		stateCopy = func(io.Writer, io.Reader) (int64, error) { return 0, errors.New("copy failed") }
-		if err := copyFile(source, filepath.Join(t.TempDir(), "target"), 0o600); err == nil {
-			t.Fatal("copyFile ignored copy error")
-		}
-	})
-	t.Run("copy close", func(t *testing.T) {
-		restoreStateStoreSeams(t)
-		stateOpenFile = func(string, int, os.FileMode) (io.WriteCloser, error) {
-			return fakeWriteCloser{closeErr: errors.New("close failed")}, nil
-		}
-		if err := copyFile(source, filepath.Join(t.TempDir(), "target"), 0o600); err == nil {
-			t.Fatal("copyFile ignored close error")
-		}
-	})
-}
-
-func TestSQLiteScrubFaults(t *testing.T) {
-	t.Run("open", func(t *testing.T) {
-		restoreStateStoreSeams(t)
-		stateSQLOpen = func(string, string) (*sql.DB, error) { return nil, errors.New("open failed") }
-		if err := scrubSQLiteCredentialTables("ignored"); err == nil {
-			t.Fatal("scrub ignored open error")
-		}
-	})
-
-	for _, scenario := range []string{
-		"scrub-exec-error",
-		"credential-query-error",
-		"scrub-delete-error",
-		"scrub-vacuum-error",
-		"scrub-final-checkpoint-error",
-	} {
-		t.Run(scenario, func(t *testing.T) {
-			restoreStateStoreSeams(t)
-			stateSQLOpen = func(string, string) (*sql.DB, error) { return openFaultSQL(t, scenario), nil }
-			if err := scrubSQLiteCredentialTables("ignored"); err == nil {
-				t.Fatal("scrub ignored injected SQL error")
-			}
-		})
-	}
-
-	for _, scenario := range []string{"credential-scan-error", "credential-rows-error", "table-query-error"} {
-		t.Run(scenario, func(t *testing.T) {
-			db := openFaultSQL(t, scenario)
-			defer db.Close()
-			if _, err := sqliteCredentialTables(context.Background(), db); err == nil {
-				t.Fatal("sqliteCredentialTables ignored injected error")
-			}
-		})
-	}
-
-	for _, scenario := range []string{"table-scan-error", "table-rows-error"} {
-		t.Run(scenario, func(t *testing.T) {
-			db := openFaultSQL(t, scenario)
-			defer db.Close()
-			if _, err := sqliteTableIsCredentialBearing(context.Background(), db, "regular"); err == nil {
-				t.Fatal("sqliteTableIsCredentialBearing ignored injected error")
-			}
-		})
-	}
-	db := openFaultSQL(t, "table-sensitive-column")
-	defer db.Close()
-	sensitive, err := sqliteTableIsCredentialBearing(context.Background(), db, "regular")
-	if err != nil || !sensitive {
-		t.Fatalf("sensitive column result = %v err=%v", sensitive, err)
-	}
-	db = openFaultSQL(t, "unused")
-	defer db.Close()
-	sensitive, err = sqliteTableIsCredentialBearing(context.Background(), db, "api_key_store")
-	if err != nil || !sensitive {
-		t.Fatalf("sensitive table name result = %v err=%v", sensitive, err)
-	}
-}
-
-func restoreStateStoreSeams(t *testing.T) {
-	t.Helper()
-	jsonMarshal := stateJSONMarshal
-	walkDir := stateWalkDir
-	rel := stateRel
-	lstat := stateLstat
-	fileInfoHeader := stateFileInfoHeader
-	newTarWriter := stateNewTarWriter
-	open := stateOpen
-	copyFn := stateCopy
-	newZstdWriter := stateNewZstdWriter
-	newZstdReader := stateNewZstdReader
-	removeAll := stateRemoveAll
-	mkdirAll := stateMkdirAll
-	abs := stateAbs
-	openFile := stateOpenFile
-	copyN := stateCopyN
-	mkdirTemp := stateMkdirTemp
-	stat := stateStat
-	readFile := stateReadFile
-	copyFileFn := stateCopyFile
-	sqliteArchiveContentFn := stateSQLiteArchiveContent
-	scrubSQLiteCredentialTablesFn := stateScrubSQLiteCredentialTables
-	sqlOpen := stateSQLOpen
-	t.Cleanup(func() {
-		stateJSONMarshal = jsonMarshal
-		stateWalkDir = walkDir
-		stateRel = rel
-		stateLstat = lstat
-		stateFileInfoHeader = fileInfoHeader
-		stateNewTarWriter = newTarWriter
-		stateOpen = open
-		stateCopy = copyFn
-		stateNewZstdWriter = newZstdWriter
-		stateNewZstdReader = newZstdReader
-		stateRemoveAll = removeAll
-		stateMkdirAll = mkdirAll
-		stateAbs = abs
-		stateOpenFile = openFile
-		stateCopyN = copyN
-		stateMkdirTemp = mkdirTemp
-		stateStat = stat
-		stateReadFile = readFile
-		stateCopyFile = copyFileFn
-		stateSQLiteArchiveContent = sqliteArchiveContentFn
-		stateScrubSQLiteCredentialTables = scrubSQLiteCredentialTablesFn
-		stateSQLOpen = sqlOpen
-	})
-}
-
-func snapshotFaultSession(t *testing.T) *session {
-	t.Helper()
-	root := t.TempDir()
-	xdg, err := opencode.CreateXDGDirs(root, "session-1")
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestRestoreRejectsExistingAggregateWithoutDurableOwner(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	client.xdg = xdg
-	agent := NewAgent(WithSessionStore(NewInMemorySessionStore()))
+	client.syncEvents = []opencode.SyncEvent{syncTestEvent("native", 0, "session.created.1", nil)}
+	snapshot := validSyncSnapshot("s", "native", "/source")
 
-	return testSession(agent, client)
+	_, err := restoreSyncState(context.Background(), client, snapshot, "native", "/source")
+	require.ErrorContains(t, err, "no durable restore owner")
 }
 
-func validHydrateStore(t *testing.T, ctx context.Context) *InMemorySessionStore {
-	t.Helper()
-	store := NewInMemorySessionStore()
-	data := testTarZstd(t, nil, nil)
-	sum := sha256.Sum256(data)
-	archive := mustStateJSON(t, archiveEntry{
-		Format:   SessionStoreFormat,
-		Encoding: archiveEncodingTarZstdBase64,
-		Final:    true,
-		SHA256:   hex.EncodeToString(sum[:]),
-		Data:     base64.StdEncoding.EncodeToString(data),
-	})
-	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
-	replacements := make([]SessionStoreReplacement, 0, 6)
-	replacements = append(replacements,
-		SessionStoreReplacement{Key: main, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateSnapshot())}},
-		SessionStoreReplacement{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateIDMap())}},
-	)
-	for _, subpath := range []string{xdgDataSubpath, xdgConfigSubpath, xdgCacheSubpath, xdgStateSubpath} {
-		replacements = append(replacements, SessionStoreReplacement{
-			Key:     SessionKey{SessionID: "s", Subpath: subpath},
-			Entries: []SessionStoreEntry{archive},
-		})
-	}
-	if err := store.Replace(ctx, main, replacements); err != nil {
-		t.Fatal(err)
-	}
+func TestRestoreRejectsPathOutsideCapturedCWD(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	snapshot := validSyncSnapshot("s", "native", "/source")
+	snapshot.Events["native"][0].Data["info"] = json.RawMessage(`{"id":"native","directory":"/other"}`)
 
-	return store
+	_, err := restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	require.ErrorContains(t, err, "escapes source cwd")
+	require.Empty(t, client.syncEvents)
 }
 
-func validHydrateIDMap() idmapRecord {
-	return idmapRecord{
-		SessionID:       "s",
-		NativeSessionID: "n",
-		Format:          SessionStoreFormat,
-	}
+func TestBundleCredentialScan(t *testing.T) {
+	require.NoError(t, scanSyncBundle([]byte(`{"text":"ordinary"}`), nil))
+	require.ErrorContains(t, scanSyncBundle([]byte(`{"authorization":"Bearer secret"}`), nil), "forbidden")
+	require.ErrorContains(t, scanSyncBundle([]byte(`{"text":"Bearer exact"}`), []string{"Bearer exact"}), "MCP credential")
 }
 
-func validHydrateSnapshot() stateSnapshot {
+func validSyncSnapshot(sessionID, nativeID, cwd string) stateSnapshot {
+	event := syncTestEvent(nativeID, 0, "session.created.1", nil)
+
 	return stateSnapshot{
-		Format: SessionStoreFormat,
-		Session: stateSnapshotSession{
-			SessionID:       "s",
-			NativeSessionID: "n",
+		Format: SessionStoreFormat, AdapterVersion: "test", NativeVersion: syncNativeVersion,
+		EventSchemaVersion: syncEventSchemaVersion, RestoreGeneration: "generation",
+		Session: stateSnapshotSession{SessionID: sessionID, NativeSessionID: nativeID, Cwd: cwd},
+		Graph:   []stateSnapshotNode{{SessionID: sessionID, NativeSessionID: nativeID, SourceCwd: cwd, Permission: "ask"}},
+		Events:  map[string][]opencode.SyncEvent{nativeID: {event}},
+	}
+}
+func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
+	base := validSyncSnapshot("session", "native", "/source")
+	require.NoError(t, validateSyncSnapshot("session", base))
+
+	tests := map[string]func(*stateSnapshot){
+		"format":              func(value *stateSnapshot) { value.Format = "old" },
+		"native version":      func(value *stateSnapshot) { value.NativeVersion = "old" },
+		"event schema":        func(value *stateSnapshot) { value.EventSchemaVersion = "old" },
+		"session identity":    func(value *stateSnapshot) { value.Session.SessionID = "other" },
+		"native identity":     func(value *stateSnapshot) { value.Session.NativeSessionID = "" },
+		"generation":          func(value *stateSnapshot) { value.RestoreGeneration = "" },
+		"invalid node":        func(value *stateSnapshot) { value.Graph[0].SourceCwd = "" },
+		"duplicate aggregate": func(value *stateSnapshot) { value.Graph = append(value.Graph, value.Graph[0]) },
+		"selected absent": func(value *stateSnapshot) {
+			value.Graph[0].NativeSessionID = "other"
+			value.Events = map[string][]opencode.SyncEvent{"other": value.Events["native"]}
 		},
+		"unknown event aggregate": func(value *stateSnapshot) { value.Events["other"] = value.Events["native"] },
+		"empty event aggregate":   func(value *stateSnapshot) { value.Events["native"] = nil },
+		"invalid event": func(value *stateSnapshot) {
+			value.Events["native"][0].Type = "unknown"
+		},
+		"incomplete graph": func(value *stateSnapshot) { value.Events = map[string][]opencode.SyncEvent{} },
 	}
-}
-
-func replaceHydrateRecords(t *testing.T, ctx context.Context, store *InMemorySessionStore, idmap idmapRecord, snapshot stateSnapshot) {
-	t.Helper()
-	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
-	replacements := make([]SessionStoreReplacement, 0, 6)
-	replacements = append(replacements,
-		SessionStoreReplacement{Key: main, Entries: []SessionStoreEntry{mustStateJSON(t, snapshot)}},
-		SessionStoreReplacement{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, idmap)}},
-	)
-	for _, candidate := range []string{xdgDataSubpath, xdgConfigSubpath, xdgCacheSubpath, xdgStateSubpath} {
-		entries, err := store.Load(ctx, SessionKey{SessionID: "s", Subpath: candidate})
-		if err != nil {
-			t.Fatal(err)
-		}
-		replacements = append(replacements, SessionStoreReplacement{
-			Key:     SessionKey{SessionID: "s", Subpath: candidate},
-			Entries: entries,
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			value := cloneStateSnapshot(t, base)
+			mutate(&value)
+			require.Error(t, validateSyncSnapshot("session", value))
 		})
 	}
-	if err := store.Replace(ctx, main, replacements); err != nil {
-		t.Fatal(err)
+}
+
+func TestSyncEventAllowlistAndIdentityBranches(t *testing.T) {
+	node := stateSnapshotNode{SessionID: "session", NativeSessionID: "native", SourceCwd: "/source"}
+	event := opencode.SyncEvent{
+		ID: "event", AggregateID: "native", Sequence: 0, Type: "session.created.1",
+		Data: map[string]json.RawMessage{"sessionID": json.RawMessage(`"native"`), "info": json.RawMessage(`{"id":"native"}`)},
 	}
-}
+	require.NoError(t, validateSyncEvent(event, node))
 
-func replaceArchiveEntry(t *testing.T, ctx context.Context, store *InMemorySessionStore, subpath string, entry SessionStoreEntry) {
-	t.Helper()
-	main := SessionKey{SessionID: "s", Subpath: SessionStoreMainSubpath}
-	replacements := make([]SessionStoreReplacement, 0, 6)
-	replacements = append(replacements,
-		SessionStoreReplacement{Key: main, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateSnapshot())}},
-		SessionStoreReplacement{Key: SessionKey{SessionID: "s", Subpath: idmapSubpath}, Entries: []SessionStoreEntry{mustStateJSON(t, validHydrateIDMap())}},
-	)
-	for _, candidate := range []string{xdgDataSubpath, xdgConfigSubpath, xdgCacheSubpath, xdgStateSubpath} {
-		entries, err := store.Load(ctx, SessionKey{SessionID: "s", Subpath: candidate})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if candidate == subpath {
-			entries = []SessionStoreEntry{entry}
-		}
-		replacements = append(replacements, SessionStoreReplacement{
-			Key:     SessionKey{SessionID: "s", Subpath: candidate},
-			Entries: entries,
-		})
-	}
-	if err := store.Replace(ctx, main, replacements); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func mustStateJSON(t *testing.T, value any) SessionStoreEntry {
-	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return SessionStoreEntry(data)
-}
-
-type selectiveLoadErrorStore struct {
-	SessionStore
-	key SessionKey
-	err error
-}
-
-func (s selectiveLoadErrorStore) Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error) {
-	if key == s.key {
-		return nil, s.err
-	}
-
-	return s.SessionStore.Load(ctx, key)
-}
-
-type fakeTarWriter struct {
-	writeHeaderErr error
-	writeErr       error
-	closeErr       error
-}
-
-func (w fakeTarWriter) WriteHeader(*tar.Header) error {
-	return w.writeHeaderErr
-}
-
-func (w fakeTarWriter) Write(p []byte) (int, error) {
-	if w.writeErr != nil {
-		return 0, w.writeErr
-	}
-
-	return len(p), nil
-}
-
-func (w fakeTarWriter) Close() error {
-	return w.closeErr
-}
-
-type fakeZstdWriter struct {
-	writeErr error
-	closeErr error
-}
-
-func (w fakeZstdWriter) Write(p []byte) (int, error) {
-	if w.writeErr != nil {
-		return 0, w.writeErr
-	}
-
-	return len(p), nil
-}
-
-func (w fakeZstdWriter) Close() error {
-	return w.closeErr
-}
-
-type fakeReadCloser struct {
-	io.Reader
-	closeErr error
-}
-
-func (r fakeReadCloser) Close() error {
-	return r.closeErr
-}
-
-type fakeWriteCloser struct {
-	closeErr error
-}
-
-func (w fakeWriteCloser) Write(p []byte) (int, error) {
-	return len(p), nil
-}
-
-func (w fakeWriteCloser) Close() error {
-	return w.closeErr
-}
-
-func testZstdBytes(t *testing.T, data []byte) []byte {
-	t.Helper()
-	var zbuf bytes.Buffer
-	zw, err := zstd.NewWriter(&zbuf)
-	if err != nil {
-		t.Fatalf("zstd writer: %v", err)
-	}
-	if _, err := zw.Write(data); err != nil {
-		t.Fatalf("zstd write: %v", err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatalf("zstd close: %v", err)
-	}
-
-	return zbuf.Bytes()
-}
-
-func testTarZstdPartial(t *testing.T, header tar.Header) []byte {
-	t.Helper()
-	var tarbuf bytes.Buffer
-	tw := tar.NewWriter(&tarbuf)
-	if err := tw.WriteHeader(&header); err != nil {
-		t.Fatalf("write partial header: %v", err)
-	}
-
-	return testZstdBytes(t, tarbuf.Bytes())
-}
-
-const faultSQLDriverName = "opencode_state_store_fault"
-
-func init() {
-	sql.Register(faultSQLDriverName, faultSQLDriver{})
-}
-
-func openFaultSQL(t *testing.T, scenario string) *sql.DB {
-	t.Helper()
-	db, err := sql.Open(faultSQLDriverName, scenario)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return db
-}
-
-type faultSQLDriver struct{}
-
-func (faultSQLDriver) Open(name string) (driver.Conn, error) {
-	return &faultSQLConn{scenario: name}, nil
-}
-
-type faultSQLConn struct {
-	scenario string
-	exec     int
-}
-
-func (c *faultSQLConn) Prepare(string) (driver.Stmt, error) {
-	return nil, errors.New("prepare unsupported")
-}
-
-func (c *faultSQLConn) Close() error {
-	return nil
-}
-
-func (c *faultSQLConn) Begin() (driver.Tx, error) {
-	return nil, errors.New("transactions unsupported")
-}
-
-func (c *faultSQLConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
-	c.exec++
-	switch {
-	case c.scenario == "scrub-exec-error":
-		return nil, errors.New("exec failed")
-	case c.scenario == "scrub-delete-error" && strings.HasPrefix(query, "DELETE FROM"):
-		return nil, errors.New("delete failed")
-	case c.scenario == "scrub-vacuum-error" && query == "VACUUM":
-		return nil, errors.New("vacuum failed")
-	case c.scenario == "scrub-final-checkpoint-error" && query == "PRAGMA wal_checkpoint(TRUNCATE)" && c.exec > 4:
-		return nil, errors.New("final checkpoint failed")
-	default:
-		return driver.RowsAffected(0), nil
-	}
-}
-
-func (c *faultSQLConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	switch {
-	case strings.HasPrefix(query, "SELECT name"):
-		switch c.scenario {
-		case "credential-query-error":
-			return nil, errors.New("credential query failed")
-		case "credential-scan-error":
-			return &faultRows{columns: []string{"name", "extra"}, rows: [][]driver.Value{{"account", "x"}}}, nil
-		case "credential-rows-error":
-			return &faultRows{columns: []string{"name"}, nextErr: errors.New("credential rows failed")}, nil
-		case "table-query-error":
-			return &faultRows{columns: []string{"name"}, rows: [][]driver.Value{{"regular"}}}, nil
-		case "scrub-delete-error", "scrub-vacuum-error":
-			return &faultRows{columns: []string{"name"}, rows: [][]driver.Value{{"account"}}}, nil
-		default:
-			return &faultRows{columns: []string{"name"}}, nil
-		}
-	case strings.HasPrefix(query, "PRAGMA table_info"):
-		switch c.scenario {
-		case "table-query-error":
-			return nil, errors.New("table query failed")
-		case "table-scan-error":
-			return &faultRows{
-				columns: []string{"cid", "name", "type", "notnull", "dflt_value", "pk", "extra"},
-				rows:    [][]driver.Value{{int64(0), "body", "TEXT", int64(0), nil, int64(0), "x"}},
-			}, nil
-		case "table-rows-error":
-			return &faultRows{columns: sqliteTableInfoColumns(), nextErr: errors.New("table rows failed")}, nil
-		case "table-sensitive-column":
-			return &faultRows{
-				columns: sqliteTableInfoColumns(),
-				rows:    [][]driver.Value{{int64(0), "access_token", "TEXT", int64(0), nil, int64(0)}},
-			}, nil
-		default:
-			return &faultRows{
-				columns: sqliteTableInfoColumns(),
-				rows:    [][]driver.Value{{int64(0), "body", "TEXT", int64(0), nil, int64(0)}},
-			}, nil
-		}
-	default:
-		return &faultRows{columns: []string{"ignored"}}, nil
-	}
-}
-
-type faultRows struct {
-	columns []string
-	rows    [][]driver.Value
-	nextErr error
-	index   int
-}
-
-func (r *faultRows) Columns() []string {
-	return r.columns
-}
-
-func (r *faultRows) Close() error {
-	return nil
-}
-
-func (r *faultRows) Next(dest []driver.Value) error {
-	if r.nextErr != nil {
-		err := r.nextErr
-		r.nextErr = nil
-
-		return err
-	}
-	if r.index >= len(r.rows) {
-		return io.EOF
-	}
-	copy(dest, r.rows[r.index])
-	r.index++
-
-	return nil
-}
-
-func sqliteTableInfoColumns() []string {
-	return []string{"cid", "name", "type", "notnull", "dflt_value", "pk"}
-}
-
-func seedSQLiteStore(t *testing.T, path string) {
-	t.Helper()
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	for _, stmt := range []string{
-		`CREATE TABLE account (id TEXT PRIMARY KEY, access_token TEXT, refresh_token TEXT)`,
-		`CREATE TABLE credential (id TEXT PRIMARY KEY, value TEXT)`,
-		`CREATE TABLE message (id TEXT PRIMARY KEY, body TEXT)`,
-		`INSERT INTO account (id, access_token, refresh_token) VALUES ('acct', 'token', 'refresh')`,
-		`INSERT INTO credential (id, value) VALUES ('cred', 'secret')`,
-		`INSERT INTO message (id, body) VALUES ('msg', 'kept')`,
+	for name, mutate := range map[string]func(*opencode.SyncEvent){
+		"empty id":        func(value *opencode.SyncEvent) { value.ID = "" },
+		"wrong aggregate": func(value *opencode.SyncEvent) { value.AggregateID = "other" },
+		"negative":        func(value *opencode.SyncEvent) { value.Sequence = -1 },
+		"unknown type":    func(value *opencode.SyncEvent) { value.Type = "unknown" },
+		"unknown field":   func(value *opencode.SyncEvent) { value.Data["secret"] = json.RawMessage(`true`) },
+		"invalid session": func(value *opencode.SyncEvent) { value.Data["sessionID"] = json.RawMessage(`{`) },
+		"wrong session":   func(value *opencode.SyncEvent) { value.Data["sessionID"] = json.RawMessage(`"other"`) },
 	} {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("exec %q: %v", stmt, err)
-		}
+		t.Run(name, func(t *testing.T) {
+			candidate := cloneSyncEvent(event)
+			mutate(&candidate)
+			require.Error(t, validateSyncEvent(candidate, node))
+		})
 	}
+
+	allow := map[string]stateSnapshotNode{"native": node}
+	grouped, cursors, err := allowlistedSyncEvents([]opencode.SyncEvent{
+		{ID: "ignored", AggregateID: "other"}, event,
+	}, allow)
+	require.NoError(t, err)
+	require.Len(t, grouped["native"], 1)
+	require.EqualValues(t, 0, cursors["native"])
+
+	_, _, err = allowlistedSyncEvents(nil, allow)
+	require.ErrorContains(t, err, "missing aggregate")
+	noncontiguous := cloneSyncEvent(event)
+	noncontiguous.Sequence = 1
+	_, _, err = allowlistedSyncEvents([]opencode.SyncEvent{noncontiguous}, allow)
+	require.ErrorContains(t, err, "non-contiguous")
+	invalid := cloneSyncEvent(event)
+	invalid.Type = "unknown"
+	_, _, err = allowlistedSyncEvents([]opencode.SyncEvent{invalid}, allow)
+	require.Error(t, err)
+
+	sequenceOne := cloneSyncEvent(event)
+	sequenceOne.ID = "event-one"
+	sequenceOne.Sequence = 1
+	_, _, err = allowlistedSyncEvents([]opencode.SyncEvent{sequenceOne, event}, allow)
+	require.NoError(t, err)
+	_, _, err = allowlistedSyncEvents([]opencode.SyncEvent{event, sequenceOne}, allow)
+	require.NoError(t, err)
+	equalSequence := cloneSyncEvent(event)
+	equalSequence.ID = "event-other"
+	_, _, err = allowlistedSyncEvents([]opencode.SyncEvent{event, equalSequence}, allow)
+	require.ErrorContains(t, err, "non-contiguous")
 }
 
-func countSQLiteRows(t *testing.T, path string, table string) int {
+func TestHydrateRebaseAndSyncComparisonBranches(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemorySessionStore()
+	_, _, ok, err := hydrateStateFromStore(ctx, store, "missing")
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "bad"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "bad", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{json.RawMessage(`{`)},
+	}}))
+	badIDMap, badSnapshot, badFound, err := hydrateStateFromStore(ctx, store, "bad")
+	require.Error(t, err)
+	require.Empty(t, badIDMap)
+	require.Empty(t, badSnapshot)
+	require.False(t, badFound)
+
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{encoded},
+	}}))
+	idmap, loaded, ok, err := hydrateStateFromStore(ctx, store, "session")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "native", idmap.NativeSessionID)
+	require.Equal(t, snapshot.RestoreGeneration, loaded.RestoreGeneration)
+
+	value := map[string]any{
+		"directory": "/source", "cwd": "/source/sub", "root": "relative", "other": "/source/ignored",
+		"nested": []any{map[string]any{"path": "/source/file"}, true},
+	}
+	rebased, err := rebasePathValues(value, "", "/source", "/target")
+	require.NoError(t, err)
+	result, ok := rebased.(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "/target", result["directory"])
+	require.Equal(t, filepath.Join("/target", "sub"), result["cwd"])
+	require.Equal(t, "relative", result["root"])
+	require.Equal(t, "/source/ignored", result["other"])
+	_, err = rebasePathValues("/outside", "path", "/source", "/target")
+	require.ErrorContains(t, err, "escapes source cwd")
+
+	badEvent := cloneSyncEvent(snapshot.Events["native"][0])
+	badEvent.Data["info"] = json.RawMessage(`{`)
+	_, err = rebaseSyncEvents([]opencode.SyncEvent{badEvent}, "/source", "/target")
+	require.Error(t, err)
+	samePathEvent := cloneSyncEvent(snapshot.Events["native"][0])
+	samePathEvent.Data["info"] = json.RawMessage(`{ "directory": "/source", "id": "native" }`)
+	samePath, err := rebaseSyncEvents([]opencode.SyncEvent{samePathEvent}, "/source/.", "/source")
+	require.NoError(t, err)
+	require.Equal(t, samePathEvent.Data["info"], samePath[0].Data["info"], "same-path restore must preserve native JSON bytes")
+
+	event := snapshot.Events["native"][0]
+	require.True(t, syncEventPrefix(nil, []opencode.SyncEvent{event}))
+	require.False(t, syncEventPrefix([]opencode.SyncEvent{event, event}, []opencode.SyncEvent{event}))
+	require.False(t, syncEventsEqual(nil, []opencode.SyncEvent{event}))
+	changed := cloneSyncEvent(event)
+	changed.ID = "changed"
+	require.False(t, syncEventsEqual([]opencode.SyncEvent{event}, []opencode.SyncEvent{changed}))
+	sequenceOne := cloneSyncEvent(event)
+	sequenceOne.Sequence = 1
+	require.True(t, syncEventsEqual([]opencode.SyncEvent{sequenceOne, event}, []opencode.SyncEvent{event, sequenceOne}))
+}
+
+func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
+	agent := NewAgent(WithEnv(map[string]string{
+		"API_TOKEN": "token", "PASSWORD": "password", "COOKIE": "cookie", "NORMAL": "ignored",
+	}))
+	client := newFakeOpenCodeClient()
+	current := testSession(agent, client)
+	agent.sessions[current.id] = current
+
+	current.pending["permission"] = opencode.PermissionRequest{}
+	require.Equal(t, metaPermissionKey, current.snapshotBlockedReason())
+	delete(current.pending, "permission")
+	current.questions["question"] = opencode.QuestionRequest{}
+	require.Equal(t, "elicitation", current.snapshotBlockedReason())
+	delete(current.questions, "question")
+	current.activeMessageIDs["message"] = struct{}{}
+	require.Equal(t, "generation", current.snapshotBlockedReason())
+	delete(current.activeMessageIDs, "message")
+	require.Empty(t, current.snapshotBlockedReason())
+
+	current.secretNeedles = []string{"mcp-secret"}
+	needles := agent.graphSecretNeedles([]*session{current})
+	require.ElementsMatch(t, []string{"mcp-secret", "token", "password", "cookie"}, needles)
+
+	oldRead := restoreRandRead
+	restoreRandRead = func([]byte) (int, error) { return 0, errors.New("entropy failed") }
+	t.Cleanup(func() { restoreRandRead = oldRead })
+	_, err := newRestoreGeneration()
+	require.ErrorContains(t, err, "entropy failed")
+	restoreRandRead = oldRead
+	generation, err := newRestoreGeneration()
+	require.NoError(t, err)
+	require.Len(t, generation, 32)
+}
+
+func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
+	newSnapshotSession := func() (*session, *fakeOpenCodeClient) {
+		agent := NewAgent()
+		client := newFakeOpenCodeClient()
+		current := testSession(agent, client)
+		agent.sessions[current.id] = current
+
+		return current, client
+	}
+
+	current, _ := newSnapshotSession()
+	current.pending["permission"] = opencode.PermissionRequest{}
+	require.ErrorContains(t, current.snapshotToStore(context.Background()), "permission")
+
+	current, client := newSnapshotSession()
+	client.syncEvents[0].Type = "unknown"
+	require.Error(t, current.snapshotToStore(context.Background()))
+
+	current, client = newSnapshotSession()
+	historyCalls := 0
+	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
+		historyCalls++
+		if historyCalls == 2 {
+			return nil, errors.New("watermark failed")
+		}
+
+		return append([]opencode.SyncEvent(nil), client.syncEvents...), nil
+	}
+	require.ErrorContains(t, current.snapshotToStore(context.Background()), "watermark failed")
+
+	current, client = newSnapshotSession()
+	historyCalls = 0
+	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
+		historyCalls++
+		if historyCalls == 2 {
+			return []opencode.SyncEvent{syncTestEvent("native-1", 1, "session.updated.1", nil)}, nil
+		}
+
+		return append([]opencode.SyncEvent(nil), client.syncEvents...), nil
+	}
+	require.ErrorContains(t, current.snapshotToStore(context.Background()), "changed during export")
+
+	current, _ = newSnapshotSession()
+	originalRead := restoreRandRead
+	restoreRandRead = func([]byte) (int, error) { return 0, errors.New("generation failed") }
+	require.ErrorContains(t, current.snapshotToStore(context.Background()), "generation failed")
+	restoreRandRead = originalRead
+	t.Cleanup(func() { restoreRandRead = originalRead })
+
+	current, client = newSnapshotSession()
+	client.syncEvents[0].Data["info"] = json.RawMessage(`{`)
+	require.Error(t, current.snapshotToStore(context.Background()))
+
+	current, client = newSnapshotSession()
+	current.secretNeedles = []string{"credential-value"}
+	client.syncEvents[0].Data["info"] = json.RawMessage(`{"id":"native-1","note":"credential-value"}`)
+	require.ErrorContains(t, current.snapshotToStore(context.Background()), "MCP credential")
+
+	current, client = newSnapshotSession()
+	client.xdg.State = ""
+	require.ErrorContains(t, current.snapshotToStore(context.Background()), "state directory is empty")
+}
+
+func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranches(t *testing.T) {
+	invalid := validSyncSnapshot("session", "native", "/source")
+	invalid.Format = "wrong"
+	_, err := restoreSyncState(context.Background(), newFakeOpenCodeClient(), invalid, "native", "/target")
+	require.Error(t, err)
+
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	client := newFakeOpenCodeClient()
+	client.syncReplayErr = errors.New("replay failed")
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	require.ErrorContains(t, err, "replay failed")
+
+	client = newFakeOpenCodeClient()
+	historyCalls := 0
+	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
+		historyCalls++
+		if historyCalls == 2 {
+			return nil, errors.New("verify history failed")
+		}
+
+		return nil, nil
+	}
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	require.ErrorContains(t, err, "verify history failed")
+
+	client = newFakeOpenCodeClient()
+	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) { return nil, nil }
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	require.ErrorContains(t, err, "failed exact replay verification")
+
+	client = newFakeOpenCodeClient()
+	historyCalls = 0
+	expected, err := rebaseSyncEvents(snapshot.Events["native"], "/source", "/target")
+	require.NoError(t, err)
+	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
+		historyCalls++
+		if historyCalls == 1 {
+			return nil, nil
+		}
+		wrong := restoreOwnershipFile{Format: "opencode-restore-ownership-v1", Aggregates: map[string]restoreOwnership{}}
+		encoded, marshalErr := json.Marshal(wrong)
+		require.NoError(t, marshalErr)
+		require.NoError(t, os.WriteFile(filepath.Join(client.xdg.State, restoreOwnershipFileName), encoded, 0o600))
+
+		return expected, nil
+	}
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	require.ErrorContains(t, err, "lost durable restore ownership")
+}
+
+func TestRebaseArrayErrorAndSyncSortComparatorBranches(t *testing.T) {
+	_, err := rebasePathValues([]any{"/outside"}, "path", "/source", "/target")
+	require.ErrorContains(t, err, "escapes source cwd")
+
+	zero := syncTestEvent("native", 0, "session.created.1", nil)
+	one := syncTestEvent("native", 1, "session.updated.1", nil)
+	require.True(t, syncEventsEqual([]opencode.SyncEvent{zero, one}, []opencode.SyncEvent{one, zero}))
+	require.True(t, syncEventsEqual([]opencode.SyncEvent{zero, zero}, []opencode.SyncEvent{zero, zero}))
+}
+
+func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.xdg.State = ""
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	node := snapshot.Graph[0]
+	require.Error(t, recordSnapshotOwnership(client, snapshot))
+	require.Error(t, claimRestoreOwnership(client, snapshot, nil))
+	require.Error(t, verifyRestoreOwnership(client, snapshot, node))
+
+	state := t.TempDir()
+	client.xdg.State = state
+	registry, err := readRestoreOwnership(client)
+	require.NoError(t, err)
+	require.Empty(t, registry.Aggregates)
+	require.NoError(t, recordSnapshotOwnership(client, snapshot))
+	require.NoError(t, claimRestoreOwnership(client, snapshot, nil))
+	require.NoError(t, verifyRestoreOwnership(client, snapshot, node))
+
+	path := filepath.Join(state, restoreOwnershipFileName)
+	require.NoError(t, os.WriteFile(path, []byte(`{`), 0o600))
+	_, err = readRestoreOwnership(client)
+	require.ErrorContains(t, err, "decode restore ownership")
+	require.NoError(t, os.WriteFile(path, []byte(`{"format":"wrong","aggregates":{}}`), 0o600))
+	_, err = readRestoreOwnership(client)
+	require.ErrorContains(t, err, "invalid restore ownership")
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Mkdir(path, 0o700))
+	_, err = readRestoreOwnership(client)
+	require.ErrorContains(t, err, "read restore ownership")
+
+	client.xdg.State = filepath.Join(t.TempDir(), "state-file")
+	require.NoError(t, os.WriteFile(client.xdg.State, []byte("x"), 0o600))
+	err = writeRestoreOwnership(client, restoreOwnershipFile{})
+	require.ErrorContains(t, err, "create restore ownership directory")
+}
+
+func preserveRestoreOwnershipSeams(t *testing.T) {
 	t.Helper()
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var count int
-	if err := db.QueryRow("SELECT count(*) FROM " + quoteSQLiteIdent(table)).Scan(&count); err != nil {
-		t.Fatalf("count %s: %v", table, err)
-	}
-
-	return count
+	readFile := restoreReadFile
+	mkdirAll := restoreMkdirAll
+	marshal := restoreJSONMarshal
+	createTemp := restoreCreateTemp
+	chmod := restoreChmod
+	write := restoreWrite
+	syncFile := restoreSync
+	closeFile := restoreClose
+	rename := restoreRename
+	open := restoreOpen
+	t.Cleanup(func() {
+		restoreReadFile = readFile
+		restoreMkdirAll = mkdirAll
+		restoreJSONMarshal = marshal
+		restoreCreateTemp = createTemp
+		restoreChmod = chmod
+		restoreWrite = write
+		restoreSync = syncFile
+		restoreClose = closeFile
+		restoreRename = rename
+		restoreOpen = open
+	})
 }
 
-type errorSessionStore struct {
-	err error
+func TestRestoreOwnershipRemainingPropagationConflictAndLossBranches(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	node := snapshot.Graph[0]
+	path := filepath.Join(client.xdg.State, restoreOwnershipFileName)
+	require.NoError(t, os.WriteFile(path, []byte(`{`), 0o600))
+	require.Error(t, recordSnapshotOwnership(client, snapshot))
+	require.Error(t, claimRestoreOwnership(client, snapshot, nil))
+	require.Error(t, verifyRestoreOwnership(client, snapshot, node))
+
+	require.NoError(t, os.WriteFile(path, []byte(`{"format":"opencode-restore-ownership-v1","aggregates":{"native":{"sessionId":"other","restoreGeneration":"other","sourceAggregateId":"native","destinationAggregateId":"native"}}}`), 0o600))
+	require.ErrorContains(t, claimRestoreOwnership(client, snapshot, nil), "owned by another restore")
+	require.ErrorContains(t, verifyRestoreOwnership(client, snapshot, node), "lost durable restore ownership")
 }
 
-func (s *errorSessionStore) Append(context.Context, SessionKey, []SessionStoreEntry) error {
-	return s.err
+func TestWriteRestoreOwnershipEveryInjectedFilesystemFailure(t *testing.T) {
+	registry := restoreOwnershipFile{Format: "opencode-restore-ownership-v1", Aggregates: map[string]restoreOwnership{}}
+
+	t.Run("mkdir", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		restoreMkdirAll = func(string, os.FileMode) error { return errors.New("mkdir failed") }
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "mkdir failed")
+	})
+	t.Run("marshal", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		restoreJSONMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal failed") }
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "marshal failed")
+	})
+	t.Run("create temp", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		restoreCreateTemp = func(string, string) (*os.File, error) { return nil, errors.New("create failed") }
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "create failed")
+	})
+	t.Run("chmod", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		restoreChmod = func(*os.File, os.FileMode) error { return errors.New("chmod failed") }
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "chmod failed")
+	})
+	t.Run("write", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		restoreWrite = func(*os.File, []byte) (int, error) { return 0, errors.New("write failed") }
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "write failed")
+	})
+	t.Run("sync", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		restoreSync = func(*os.File) error { return errors.New("sync failed") }
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "sync failed")
+	})
+	t.Run("close", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		originalClose := restoreClose
+		restoreClose = func(file *os.File) error {
+			_ = originalClose(file)
+
+			return errors.New("close failed")
+		}
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "close failed")
+	})
+	t.Run("rename", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		restoreRename = func(string, string) error { return errors.New("rename failed") }
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "rename failed")
+	})
+	t.Run("open directory", func(t *testing.T) {
+		preserveRestoreOwnershipSeams(t)
+		client := newFakeOpenCodeClient()
+		restoreOpen = func(string) (*os.File, error) { return nil, errors.New("open failed") }
+		require.ErrorContains(t, writeRestoreOwnership(client, registry), "open failed")
+	})
 }
 
-func (s *errorSessionStore) Load(context.Context, SessionKey) ([]SessionStoreEntry, error) {
-	return nil, s.err
-}
-
-func (s *errorSessionStore) Replace(context.Context, SessionKey, []SessionStoreReplacement) error {
-	return s.err
-}
-
-func (s *errorSessionStore) Delete(context.Context, SessionKey) error {
-	return s.err
-}
-
-func (s *errorSessionStore) ListSessions(context.Context) ([]SessionSummary, error) {
-	return nil, s.err
-}
-
-func (s *errorSessionStore) ListSubkeys(context.Context, SessionKey) ([]string, error) {
-	return nil, s.err
-}
-
-func testTarZstd(t *testing.T, headers []tar.Header, bodies map[string]string) []byte {
+func cloneStateSnapshot(t *testing.T, value stateSnapshot) stateSnapshot {
 	t.Helper()
-	var tarbuf bytes.Buffer
-	tw := tar.NewWriter(&tarbuf)
-	for _, header := range headers {
-		if err := tw.WriteHeader(&header); err != nil {
-			t.Fatalf("write header: %v", err)
-		}
-		if body := bodies[header.Name]; body != "" {
-			if _, err := io.WriteString(tw, body); err != nil {
-				t.Fatalf("write body: %v", err)
-			}
-		}
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatalf("close tar: %v", err)
-	}
-	var zbuf bytes.Buffer
-	zw, err := zstd.NewWriter(&zbuf)
-	if err != nil {
-		t.Fatalf("zstd writer: %v", err)
-	}
-	if _, err := zw.Write(tarbuf.Bytes()); err != nil {
-		t.Fatalf("zstd write: %v", err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatalf("zstd close: %v", err)
-	}
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+	var cloned stateSnapshot
+	require.NoError(t, json.Unmarshal(encoded, &cloned))
 
-	return zbuf.Bytes()
+	return cloned
 }

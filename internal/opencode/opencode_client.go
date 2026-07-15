@@ -6,14 +6,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -30,18 +29,13 @@ import (
 
 const (
 	opencodeDefaultUsername = "opencode"
-	LeaseFileName           = "server.lease"
 
 	// opencodeExecutableName is the OpenCode program name: the default
-	// executable, the per-XDG config directory, and the process cmdline
-	// marker used by the lease reaper.
+	// executable and the per-XDG config directory.
 	opencodeExecutableName = "opencode"
 	// opencodeServeCommand is the OpenCode CLI subcommand that starts the
 	// loopback HTTP server.
 	opencodeServeCommand = "serve"
-	// defaultSessionPathName is the fallback directory name used when no ACP
-	// session ID is available for a per-session XDG home.
-	defaultSessionPathName = "session"
 	// eventTypeServerConnected is the first SSE event type emitted by a
 	// healthy opencode serve process.
 	eventTypeServerConnected = "server.connected"
@@ -51,6 +45,9 @@ const (
 // contract validation.
 const (
 	routeConfigProviders      = "/config/providers"
+	routeDoc                  = "/doc"
+	routeGlobalHealth         = "/global/health"
+	fieldName                 = "name"
 	routeCommand              = "/command"
 	routeEvent                = "/event"
 	routeSession              = "/session"
@@ -65,10 +62,11 @@ const (
 
 // Native OpenCode /doc path templates validated during readiness.
 const (
-	docPathSessionCommand = "/session/{sessionID}/command"
-	docPathSessionMessage = "/session/{sessionID}/message"
-	docPathQuestionReply  = "/question/{requestID}/reply"
-	docPathQuestionReject = "/question/{requestID}/reject"
+	docPathSessionCommand     = "/session/{sessionID}/command"
+	docPathSessionMessage     = "/session/{sessionID}/message"
+	docPathSessionPromptAsync = "/session/{sessionID}/prompt_async"
+	docPathQuestionReply      = "/question/{requestID}/reply"
+	docPathQuestionReject     = "/question/{requestID}/reject"
 )
 
 // Native OpenCode wire-field spellings shared between request bodies and the
@@ -92,7 +90,10 @@ var ErrSSEDisconnect = errors.New("opencode SSE disconnected")
 
 type Client interface {
 	Close(context.Context) error
+	Shutdown(context.Context) error
+	Scope(context.Context, ScopeOptions) (Client, error)
 	CreateSession(context.Context, string) (NativeSession, error)
+	CreateSessionWithPolicy(context.Context, string, []PermissionRule) (NativeSession, error)
 	GetSession(context.Context, string) (NativeSession, error)
 	ListSessions(context.Context, string) ([]NativeSession, error)
 	DeleteSession(context.Context, string) error
@@ -100,6 +101,7 @@ type Client interface {
 	RunCommand(context.Context, string, CommandRequest) (NativeMessage, error)
 	SendMessage(context.Context, string, MessageRequest) (NativeMessage, error)
 	Messages(context.Context, string) ([]NativeMessage, error)
+	SessionStatus(context.Context) (map[string]NativeSessionStatus, error)
 	Abort(context.Context, string) error
 	Fork(context.Context, string, string) (NativeSession, error)
 	Todos(context.Context, string) ([]NativeTodo, error)
@@ -112,35 +114,107 @@ type Client interface {
 	RejectQuestion(context.Context, QuestionRequest) error
 	Events() <-chan Event
 	EventErrors() <-chan error
+	RuntimeExited() <-chan struct{}
 	XDGDirs() XDGDirs
+	SyncHistory(context.Context, map[string]int64) ([]SyncEvent, error)
+	SyncReplay(context.Context, string, []SyncReplayEvent) error
+}
+
+type ScopeOptions struct {
+	Directory  string
+	MCPServers []MCPServerConfig
+}
+
+type PermissionRule struct {
+	Permission string `json:"permission"`
+	Pattern    string `json:"pattern"`
+	Action     string `json:"action"`
+}
+
+type SyncEvent struct {
+	ID          string                     `json:"id"`
+	AggregateID string                     `json:"aggregate_id"`
+	Sequence    int64                      `json:"seq"`
+	Type        string                     `json:"type"`
+	Data        map[string]json.RawMessage `json:"data"`
+}
+
+type SyncReplayEvent struct {
+	ID          string                     `json:"id"`
+	AggregateID string                     `json:"aggregateID"`
+	Sequence    int64                      `json:"seq"`
+	Type        string                     `json:"type"`
+	Data        map[string]json.RawMessage `json:"data"`
 }
 
 type StartOptions struct {
-	ACPSessionID ACPSessionID
-	Root         string
+	Root string
 	// ScratchParent is the already-resolved parent directory for ephemeral
 	// on-disk materialization. The root package resolves it (system temp
 	// directory when unset); this package never consults the system temp
 	// directory itself. It is used only as the fallback root when Root is empty.
-	ScratchParent     string
-	Cwd               string
-	ExecutablePath    string
-	DefaultModel      string
-	Env               map[string]string
-	Pure              bool
-	QuestionTool      bool
-	LogLevel          string
-	MinimumVersion    string
-	HealthTimeout     time.Duration
-	Logger            *slog.Logger
-	ExistingXDG       XDGDirs
-	SkipVersionGate   bool
-	AdditionalEnv     map[string]string
-	ExpectedNativeID  string
-	PermissionSurface bool
-	Permission        string
-	SeedFiles         map[string]string
-	MCPServers        []MCPServerConfig
+	ScratchParent       string
+	ExecutablePath      string
+	Env                 map[string]string
+	Pure                bool
+	QuestionTool        bool
+	LogLevel            string
+	ExactVersion        string
+	HealthTimeout       time.Duration
+	Logger              *slog.Logger
+	ExistingXDG         XDGDirs
+	SkipVersionGate     bool
+	SeedFiles           map[string]string
+	SkipSupervisor      bool
+	ObserveProcess      func(context.Context, string, int64)
+	ObserveStartupStage func(context.Context, string, string, time.Duration, error)
+}
+
+type runtimeProcessObservation struct {
+	mu                  sync.Mutex
+	exited              bool
+	supervisorsObserved bool
+	observe             func(context.Context, string, int64)
+}
+
+func (o *runtimeProcessObservation) markSupervisorsReady(ctx context.Context) {
+	if o == nil || o.observe == nil {
+		return
+	}
+
+	o.mu.Lock()
+	if o.exited || o.supervisorsObserved {
+		o.mu.Unlock()
+
+		return
+	}
+
+	o.supervisorsObserved = true
+	o.mu.Unlock()
+	o.observe(ctx, "home_lock_supervisor", 2)
+}
+
+func (o *runtimeProcessObservation) markExited() {
+	if o == nil {
+		return
+	}
+
+	o.mu.Lock()
+	o.exited = true
+	observed := o.supervisorsObserved
+	o.supervisorsObserved = false
+	observe := o.observe
+	o.mu.Unlock()
+
+	if observed && observe != nil {
+		observe(context.Background(), "home_lock_supervisor", -2)
+	}
+}
+
+func observeOpenCodeStartupStage(ctx context.Context, options StartOptions, lifecycle, stage string, started time.Time, err error) {
+	if options.ObserveStartupStage != nil {
+		options.ObserveStartupStage(ctx, lifecycle, stage, time.Since(started), err)
+	}
 }
 
 // MCPServerConfig describes one MCP server exposed to the native OpenCode
@@ -153,8 +227,6 @@ type MCPServerConfig struct {
 	Command []string
 	Env     map[string]string
 }
-
-type ACPSessionID string
 
 type XDGDirs struct {
 	Root   string
@@ -176,10 +248,19 @@ type openCodeServer struct {
 	sessionPermissionListSupport bool
 	sessionQuestionListSupport   bool
 
-	events chan Event
-	errs   chan error
-	closed chan struct{}
-	once   sync.Once
+	events            chan Event
+	errs              chan error
+	closed            chan struct{}
+	once              sync.Once
+	directory         string
+	scopeCancel       context.CancelFunc
+	runtimeOnce       *sync.Once
+	runtimeClosed     chan struct{}
+	runtimeExited     chan struct{}
+	mcpNames          []string
+	supervisorControl io.WriteCloser
+	supervisor        *supervisorProof
+	waitDone          chan error
 
 	streamMu    sync.Mutex
 	streamEpoch uint64
@@ -553,22 +634,13 @@ type ProviderModelModalities struct {
 	Input []string `json:"input"`
 }
 
-type processIdentity struct {
-	StartTime string
-	Cmdline   []string
-	Env       map[string]string
-}
-
 var (
 	openCodeCommandContext                = exec.CommandContext
 	openCodeListen                        = net.Listen
 	openCodeRandReader          io.Reader = rand.Reader
 	openCodeMarshalIndent                 = json.MarshalIndent
-	openCodeWriteLease                    = writeLease
 	openCodeTerminateProcess              = terminateOpenCodeProcess
 	openCodeKillProcess                   = killOpenCodeProcess
-	openCodeInspectProcess                = inspectOpenCodeProcess
-	procReadFile                          = os.ReadFile
 	openCodeWaitCommand                   = func(cmd *exec.Cmd) error { return cmd.Wait() }
 	openCodeAfter                         = time.After
 	openCodeReadyPollInterval             = 100 * time.Millisecond
@@ -588,20 +660,20 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		options.HealthTimeout = HealthCheckTimeout
 	}
 
-	root := options.Root
-	if root == "" {
-		root = filepath.Join(options.ScratchParent, "acp-go-opencode")
-	}
-
-	if err := reapStaleLeases(root, options.Logger); err != nil {
-		return nil, err
-	}
-
 	xdg := options.ExistingXDG
 	if xdg.Root == "" {
+		root := options.Root
+		if root == "" {
+			if options.ScratchParent == "" {
+				return nil, fmt.Errorf("OpenCode runtime root is required")
+			}
+
+			root = filepath.Join(options.ScratchParent, "acp-go-opencode")
+		}
+
 		var err error
 
-		xdg, err = CreateXDGDirs(root, string(options.ACPSessionID))
+		xdg, err = CreateRuntimeXDGDirs(root)
 		if err != nil {
 			return nil, err
 		}
@@ -611,7 +683,10 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		return nil, err
 	}
 
-	permissionConfig, err := materializeOpenCodePermissionConfig(xdg, options.Permission, options.SeedFiles, options.MCPServers)
+	configurationStarted := time.Now()
+	runtimeConfig, err := materializeOpenCodeRuntimeConfig(xdg, options.SeedFiles)
+	observeOpenCodeStartupStage(ctx, options, "runtime", "configuration", configurationStarted, err)
+
 	if err != nil {
 		return nil, err
 	}
@@ -642,17 +717,7 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		args = append(args, "--log-level", options.LogLevel)
 	}
 
-	processCtx, cancel := context.WithCancel(context.Background())
-
-	cmd := openCodeCommandContext(processCtx, executable, args...)
-	if options.Cwd != "" {
-		cmd.Dir = options.Cwd
-	}
-
 	env := mergeProcessEnv(options.Env)
-	for key, value := range options.AdditionalEnv {
-		env[key] = value
-	}
 
 	env["XDG_DATA_HOME"] = xdg.Data
 	env["XDG_CONFIG_HOME"] = xdg.Config
@@ -661,13 +726,49 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 	env["OPENCODE_SERVER_USERNAME"] = username
 	env["OPENCODE_SERVER_PASSWORD"] = password
 
-	env["OPENCODE_CONFIG_CONTENT"] = permissionConfig
+	env["OPENCODE_CONFIG_CONTENT"] = runtimeConfig
 	if options.QuestionTool {
 		env["OPENCODE_ENABLE_QUESTION_TOOL"] = "1"
 	}
 
-	cmd.Env = envMapToSlice(env)
-	configureOpenCodeProcess(cmd)
+	nativeEnv := envMapToSlice(env)
+	processCtx, cancel := context.WithCancel(context.Background())
+
+	var cmd *exec.Cmd
+
+	var supervisor *supervisorProof
+
+	if options.SkipSupervisor {
+		cmd = openCodeCommandContext(processCtx, executable, args...)
+		cmd.Env = nativeEnv
+		configureOpenCodeProcess(cmd)
+	} else {
+		cmd, supervisor, err = supervisorCommand(processCtx, supervisorConfig{
+			NativePath: executable,
+			NativeArgs: args,
+			NativeEnv:  nativeEnv,
+			NativeDir:  "",
+			Home:       xdg.Root,
+			Scratch:    filepath.Join(xdg.State, "runtime-supervisor"),
+		})
+		if err != nil {
+			cancel()
+
+			return nil, err
+		}
+
+		configureOpenCodeProcess(cmd)
+	}
+
+	var supervisorControl io.WriteCloser
+	if supervisor != nil {
+		supervisorControl, err = cmd.StdinPipe()
+		if err != nil {
+			cancel()
+
+			return nil, err
+		}
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -683,79 +784,97 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		return nil, err
 	}
 
-	if err := openCodeWriteLease(xdg.State, serverLease{
-		PID:          0,
-		Port:         port,
-		StartedAt:    time.Now().UnixMilli(),
-		PasswordHash: passwordHash(password),
-		XDGRoot:      xdg.Root,
-	}); err != nil {
-		cancel()
-
-		return nil, err
-	}
+	spawnStarted := time.Now()
 
 	if err := cmd.Start(); err != nil {
+		observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, err)
+
+		if supervisorControl != nil {
+			_ = supervisorControl.Close()
+		}
+
 		cancel()
 
 		return nil, err
 	}
 
-	lease := serverLease{
-		PID:          cmd.Process.Pid,
-		Port:         port,
-		StartedAt:    time.Now().UnixMilli(),
-		PasswordHash: passwordHash(password),
-		XDGRoot:      xdg.Root,
-	}
-	if identity, err := openCodeInspectProcess(cmd.Process.Pid); err == nil {
-		lease.ProcessStartTime = identity.StartTime
+	observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, nil)
+
+	if options.Logger != nil {
+		options.Logger.DebugContext(ctx, "opencode startup stage complete", slog.String("stage", "spawn"), slog.Duration("elapsed", time.Since(spawnStarted)))
 	}
 
-	if err := openCodeWriteLease(xdg.State, lease); err != nil {
-		cancel()
+	waitDone := make(chan error, 1)
+	runtimeExited := make(chan struct{})
+	waitCommand := openCodeWaitCommand
+	processObservation := &runtimeProcessObservation{observe: options.ObserveProcess}
 
-		_ = openCodeKillProcess(cmd)
+	go func() {
+		defer processObservation.markExited()
 
-		return nil, err
-	}
+		waitDone <- waitCommand(cmd)
+
+		close(runtimeExited)
+	}()
 
 	go drainProcessPipe(options.Logger, "opencode stdout", stdout)
 	go drainProcessPipe(options.Logger, "opencode stderr", stderr)
 
 	server := &openCodeServer{
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		baseURL:    "http://127.0.0.1:" + strconv.Itoa(port),
-		username:   username,
-		password:   password,
-		cmd:        cmd,
-		cancel:     cancel,
-		xdg:        xdg,
-		log:        options.Logger,
-		events:     make(chan Event, 256),
-		errs:       make(chan error, 8),
-		closed:     make(chan struct{}),
+		httpClient:        &http.Client{Timeout: 30 * time.Second},
+		baseURL:           "http://127.0.0.1:" + strconv.Itoa(port),
+		username:          username,
+		password:          password,
+		cmd:               cmd,
+		cancel:            cancel,
+		xdg:               xdg,
+		log:               options.Logger,
+		events:            make(chan Event, 256),
+		errs:              make(chan error, 8),
+		closed:            make(chan struct{}),
+		runtimeOnce:       &sync.Once{},
+		runtimeClosed:     make(chan struct{}),
+		runtimeExited:     runtimeExited,
+		supervisorControl: supervisorControl,
+		supervisor:        supervisor,
+		waitDone:          waitDone,
 	}
 
 	readyCtx, readyCancel := context.WithTimeout(ctx, options.HealthTimeout)
 	defer readyCancel()
 
+	readinessStarted := time.Now()
 	if err := server.waitReady(readyCtx, processCtx, options); err != nil {
-		_ = server.Close(context.Background())
+		observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, err)
 
-		return nil, err
+		shutdownErr := server.Shutdown(readyCtx)
+
+		return nil, errors.Join(err, shutdownErr)
+	}
+
+	observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, nil)
+
+	if supervisor != nil {
+		processObservation.markSupervisorsReady(ctx)
 	}
 
 	return server, nil
 }
 
 func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context, options StartOptions) error {
+	started := time.Now()
+
 	var health struct {
 		Healthy bool   `json:"healthy"`
 		Version string `json:"version"`
 	}
+
 	for {
-		err := s.getJSON(ctx, "/global/health", nil, &health)
+		attemptCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		err := s.getJSON(attemptCtx, routeGlobalHealth, nil, &health)
+
+		cancel()
+
 		if err == nil && health.Healthy {
 			break
 		}
@@ -771,13 +890,21 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 		}
 	}
 
-	if !options.SkipVersionGate && options.MinimumVersion != "" && compareSemver(health.Version, options.MinimumVersion) < 0 {
-		return fmt.Errorf("opencode %s is below minimum %s", health.Version, options.MinimumVersion)
+	if !options.SkipVersionGate && options.ExactVersion != "" && health.Version != options.ExactVersion {
+		return fmt.Errorf("opencode version %s does not match required sync-store version %s", health.Version, options.ExactVersion)
+	}
+
+	if s.log != nil {
+		s.log.DebugContext(ctx, "opencode startup stage complete", slog.String("stage", "health"), slog.Duration("elapsed", time.Since(started)))
 	}
 
 	var doc map[string]any
-	if err := s.getJSON(ctx, "/doc", nil, &doc); err != nil {
+	if err := s.getJSON(ctx, routeDoc, nil, &doc); err != nil {
 		return fmt.Errorf("load opencode /doc: %w", err)
+	}
+
+	if s.log != nil {
+		s.log.DebugContext(ctx, "opencode startup stage complete", slog.String("stage", "openapi"), slog.Duration("elapsed", time.Since(started)))
 	}
 
 	docCapabilities, err := inspectOpenCodeDoc(doc)
@@ -806,26 +933,50 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 }
 
 func (s *openCodeServer) Close(ctx context.Context) error {
+	if s.scopeCancel != nil {
+		s.once.Do(func() {
+			close(s.closed)
+			s.scopeCancel()
+			_ = s.unregisterMCP(context.WithoutCancel(ctx))
+		})
+
+		return nil
+	}
+
+	return nil
+}
+
+func (s *openCodeServer) Shutdown(ctx context.Context) error {
 	var err error
 
-	s.once.Do(func() {
+	once := s.runtimeOnce
+	if once == nil {
+		once = &s.once
+	}
+
+	once.Do(func() {
 		terminateProcess := openCodeTerminateProcess
 		killProcess := openCodeKillProcess
 		waitCommand := openCodeWaitCommand
 		after := openCodeAfter
 		shutdownTimeout := openCodeShutdownTimeout
 
-		close(s.closed)
-
-		if s.cancel != nil {
-			s.cancel()
+		if s.runtimeClosed != nil {
+			close(s.runtimeClosed)
 		}
 
 		if s.cmd != nil && s.cmd.Process != nil {
-			_ = terminateProcess(s.cmd)
+			if s.supervisorControl != nil {
+				_ = s.supervisorControl.Close()
+			} else {
+				_ = terminateProcess(s.cmd)
+			}
 
-			done := make(chan error, 1)
-			go func() { done <- waitCommand(s.cmd) }()
+			done := s.waitDone
+			if done == nil {
+				done = make(chan error, 1)
+				go func() { done <- waitCommand(s.cmd) }()
+			}
 
 			select {
 			case waitErr := <-done:
@@ -835,16 +986,120 @@ func (s *openCodeServer) Close(ctx context.Context) error {
 			case <-ctx.Done():
 				_ = killProcess(s.cmd)
 				err = ctx.Err()
+
+				if s.supervisor != nil {
+					<-done
+				}
 			case <-after(shutdownTimeout):
 				_ = killProcess(s.cmd)
 				err = errors.New("opencode process did not exit after shutdown")
+
+				if s.supervisor != nil {
+					<-done
+				}
+			}
+
+			if s.supervisor != nil {
+				err = errors.Join(err, s.supervisor.awaitCompletion(ctx))
 			}
 		}
 
-		_ = os.Remove(filepath.Join(s.xdg.State, LeaseFileName))
+		if s.cancel != nil {
+			s.cancel()
+		}
 	})
 
 	return err
+}
+
+func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Client, error) {
+	if options.Directory == "" {
+		return nil, fmt.Errorf("opencode scope directory is required")
+	}
+
+	scopeCtx, cancel := context.WithCancel(context.Background())
+	scope := &openCodeServer{
+		httpClient: s.httpClient, baseURL: s.baseURL, username: s.username,
+		password: s.password, cmd: s.cmd, cancel: s.cancel, xdg: s.xdg,
+		log: s.log, sessionPermissionListSupport: s.sessionPermissionListSupport,
+		sessionQuestionListSupport: s.sessionQuestionListSupport,
+		events:                     make(chan Event, 256), errs: make(chan error, 8),
+		closed: make(chan struct{}), directory: options.Directory,
+		scopeCancel: cancel, runtimeOnce: s.runtimeOnce, runtimeClosed: s.runtimeClosed,
+		runtimeExited: s.runtimeExited,
+	}
+
+	if err := scope.registerMCP(ctx, options.MCPServers); err != nil {
+		cancel()
+
+		return nil, err
+	}
+
+	// Capture package-level reconnect seams before the goroutine starts. Tests
+	// may restore those seams as soon as Scope returns.
+	after := openCodeAfter
+
+	reconnectDelay := openCodeEventReconnectDelay
+	go scope.readEventsWithTiming(scopeCtx, after, reconnectDelay)
+
+	select {
+	case event := <-scope.events:
+		if event.Type != eventTypeServerConnected {
+			_ = scope.Close(context.Background())
+
+			return nil, fmt.Errorf("first directory-scoped event was %q", event.Type)
+		}
+	case err := <-scope.errs:
+		_ = scope.Close(context.Background())
+
+		return nil, fmt.Errorf("opencode directory event stream failed: %w", err)
+	case <-ctx.Done():
+		_ = scope.Close(context.Background())
+
+		return nil, ctx.Err()
+	}
+
+	return scope, nil
+}
+
+func (s *openCodeServer) registerMCP(ctx context.Context, servers []MCPServerConfig) error {
+	for _, server := range servers {
+		config := openCodeMCPConfigBlock([]MCPServerConfig{server})[server.Name]
+
+		var response map[string]struct {
+			Status string `json:"status"`
+		}
+		if err := s.doJSON(ctx, http.MethodPost, "/mcp", nil, map[string]any{
+			fieldName: server.Name,
+			"config":  config,
+		}, &response); err != nil {
+			_ = s.unregisterMCP(context.WithoutCancel(ctx))
+
+			return fmt.Errorf("register directory MCP %q: %w", server.Name, err)
+		}
+
+		status, ok := response[server.Name]
+		if !ok || status.Status != "connected" {
+			_ = s.unregisterMCP(context.WithoutCancel(ctx))
+
+			return fmt.Errorf("directory MCP %q did not connect", server.Name)
+		}
+
+		s.mcpNames = append(s.mcpNames, server.Name)
+	}
+
+	return nil
+}
+
+func (s *openCodeServer) unregisterMCP(ctx context.Context) error {
+	var result error
+	for i := len(s.mcpNames) - 1; i >= 0; i-- {
+		result = errors.Join(result, s.doJSON(ctx, http.MethodDelete, "/mcp/"+url.PathEscape(s.mcpNames[i]), nil, nil, nil))
+	}
+
+	s.mcpNames = nil
+
+	return result
 }
 
 func (s *openCodeServer) Events() <-chan Event {
@@ -855,14 +1110,26 @@ func (s *openCodeServer) EventErrors() <-chan error {
 	return s.errs
 }
 
+func (s *openCodeServer) RuntimeExited() <-chan struct{} {
+	return s.runtimeExited
+}
+
 func (s *openCodeServer) XDGDirs() XDGDirs {
 	return s.xdg
 }
 
 func (s *openCodeServer) CreateSession(ctx context.Context, title string) (NativeSession, error) {
+	return s.CreateSessionWithPolicy(ctx, title, nil)
+}
+
+func (s *openCodeServer) CreateSessionWithPolicy(ctx context.Context, title string, permission []PermissionRule) (NativeSession, error) {
 	body := map[string]any{}
 	if title != "" {
 		body["title"] = title
+	}
+
+	if len(permission) > 0 {
+		body[fieldPermission] = permission
 	}
 
 	var out NativeSession
@@ -870,6 +1137,29 @@ func (s *openCodeServer) CreateSession(ctx context.Context, title string) (Nativ
 	err := s.doJSON(ctx, http.MethodPost, routeSession, nil, body, &out)
 
 	return out, err
+}
+
+func (s *openCodeServer) SyncHistory(ctx context.Context, cursors map[string]int64) ([]SyncEvent, error) {
+	if cursors == nil {
+		cursors = map[string]int64{}
+	}
+
+	var out []SyncEvent
+
+	err := s.doJSON(ctx, http.MethodPost, "/sync/history", nil, cursors, &out)
+
+	return out, err
+}
+
+func (s *openCodeServer) SyncReplay(ctx context.Context, directory string, events []SyncReplayEvent) error {
+	if directory == "" || len(events) == 0 {
+		return fmt.Errorf("sync replay requires a directory and events")
+	}
+
+	return s.doJSON(ctx, http.MethodPost, "/sync/replay", nil, map[string]any{
+		"directory": directory,
+		"events":    events,
+	}, nil)
 }
 
 func (s *openCodeServer) GetSession(ctx context.Context, id string) (NativeSession, error) {
@@ -921,16 +1211,53 @@ func (s *openCodeServer) RunCommand(ctx context.Context, id string, req CommandR
 }
 
 func (s *openCodeServer) SendMessage(ctx context.Context, id string, req MessageRequest) (NativeMessage, error) {
-	var out NativeMessage
-	if err := s.doJSONWithClient(ctx, s.blockingHTTPClient(), http.MethodPost, "/session/"+url.PathEscape(id)+"/message", nil, req, &out); err != nil {
+	client := s.blockingHTTPClient()
+
+	before, err := s.messagesWithClient(ctx, client, id)
+	if err != nil {
+		return NativeMessage{}, fmt.Errorf("load opencode messages before prompt: %w", err)
+	}
+
+	beforeAssistant := ""
+
+	for index := len(before) - 1; index >= 0; index-- {
+		if before[index].Info.Role == roleAssistant {
+			beforeAssistant = before[index].Info.ID
+
+			break
+		}
+	}
+
+	if err := s.doJSONWithClient(ctx, client, http.MethodPost, "/session/"+url.PathEscape(id)+"/prompt_async", nil, req, nil); err != nil {
 		return s.recoverBlockingTurnFailure(ctx, id, err)
 	}
 
-	if err := AssistantMessageError(out); err != nil {
-		return NativeMessage{}, err
-	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 
-	return out, nil
+	for {
+		messages, err := s.messagesWithClient(ctx, client, id)
+		if err == nil {
+			for index := len(messages) - 1; index >= 0; index-- {
+				message := messages[index]
+				if message.Info.Role != roleAssistant || message.Info.ID == beforeAssistant || message.Info.Finish == "" {
+					continue
+				}
+
+				if err := AssistantMessageError(message); err != nil {
+					return NativeMessage{}, err
+				}
+
+				return message, nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return NativeMessage{}, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // recoverBlockingTurnFailure resolves the real cause of a transport failure on
@@ -1007,9 +1334,13 @@ func AssistantMessageError(message NativeMessage) error {
 }
 
 func (s *openCodeServer) Messages(ctx context.Context, id string) ([]NativeMessage, error) {
+	return s.messagesWithClient(ctx, s.httpClient, id)
+}
+
+func (s *openCodeServer) messagesWithClient(ctx context.Context, client *http.Client, id string) ([]NativeMessage, error) {
 	var out []NativeMessage
 
-	err := s.getJSON(ctx, "/session/"+url.PathEscape(id)+"/message", nil, &out)
+	err := s.doJSONWithClient(ctx, client, http.MethodGet, "/session/"+url.PathEscape(id)+"/message", nil, nil, &out)
 
 	return out, err
 }
@@ -1205,6 +1536,18 @@ func (s *openCodeServer) doJSONWithClient(
 		reader = bytes.NewReader(data)
 	}
 
+	if s.directory != "" && path != routeGlobalHealth && path != routeDoc && path != "/sync/history" && path != "/sync/replay" {
+		if query == nil {
+			query = url.Values{}
+		} else {
+			query = maps.Clone(query)
+		}
+
+		if query.Get("directory") == "" {
+			query.Set("directory", s.directory)
+		}
+	}
+
 	reqURL := s.baseURL + path
 	if len(query) > 0 {
 		reqURL += "?" + query.Encode()
@@ -1290,12 +1633,10 @@ func (s *openCodeServer) blockingHTTPClient() *http.Client {
 }
 
 func (s *openCodeServer) readEvents(ctx context.Context) {
-	// Capture the reconnect-timing seams once, at entry, so this long-lived
-	// goroutine never reads the package-level test seams again — a running
-	// reader would otherwise race tests that restore those globals in cleanup.
-	after := openCodeAfter
-	reconnectDelay := openCodeEventReconnectDelay
+	s.readEventsWithTiming(ctx, openCodeAfter, openCodeEventReconnectDelay)
+}
 
+func (s *openCodeServer) readEventsWithTiming(ctx context.Context, after func(time.Duration) <-chan time.Time, reconnectDelay time.Duration) {
 	for {
 		epoch := s.nextStreamEpoch()
 		if err := s.readEventStream(ctx, epoch); err != nil {
@@ -1350,7 +1691,12 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 		epoch = epochs[0]
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+routeEvent, http.NoBody)
+	eventURL := s.baseURL + routeEvent
+	if s.directory != "" {
+		eventURL += "?" + url.Values{"directory": []string{s.directory}}.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, eventURL, http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -1460,6 +1806,7 @@ func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 		"/session/{sessionID}",
 		docPathSessionCommand,
 		docPathSessionMessage,
+		docPathSessionPromptAsync,
 		"/session/{sessionID}/abort",
 		"/session/{sessionID}/fork",
 		"/session/{sessionID}/todo",
@@ -1920,18 +2267,15 @@ func openAPIComponentSchema(doc map[string]any, ref string) (map[string]any, boo
 	return schema, schema != nil
 }
 
-func CreateXDGDirs(root string, sessionID string) (XDGDirs, error) {
-	if sessionID == "" {
-		sessionID = defaultSessionPathName
-	}
-
-	base := filepath.Join(root, SafePathName(sessionID))
+// CreateRuntimeXDGDirs materializes one shared runtime XDG root without a
+// session-derived path component.
+func CreateRuntimeXDGDirs(root string) (XDGDirs, error) {
 	dirs := XDGDirs{
-		Root:   base,
-		Data:   filepath.Join(base, "data"),
-		Config: filepath.Join(base, "config"),
-		Cache:  filepath.Join(base, "cache"),
-		State:  filepath.Join(base, "state"),
+		Root:   root,
+		Data:   filepath.Join(root, "data"),
+		Config: filepath.Join(root, "config"),
+		Cache:  filepath.Join(root, "cache"),
+		State:  filepath.Join(root, "state"),
 	}
 
 	return dirs, ensureXDGDirs(dirs)
@@ -1958,25 +2302,10 @@ const (
 	openCodeSeedManifestField = "seedFiles"
 )
 
-// materializeOpenCodePermissionConfig writes the per-session opencode.json into
-// the isolated OpenCode config root and returns its contents so the caller can
-// export them via OPENCODE_CONFIG_CONTENT. The wrapper's managed keys ($schema,
-// permission, and mcp when session MCP servers are present) are deep-merged on
-// top of any seeded opencode.json — the wrapper wins for those keys, the seed
-// supplies the rest (e.g. a provider block). Every other seeded file is written
-// verbatim under the same config root. All writes — including the merged
-// opencode.json — are routed through the provenance guard so a seed pass can
-// never clobber an operator-authored file.
-func materializeOpenCodePermissionConfig(
-	dirs XDGDirs,
-	permission string,
-	seedFiles map[string]string,
-	mcpServers []MCPServerConfig,
-) (string, error) {
-	if err := validateOpenCodePermission(permission); err != nil {
-		return "", err
-	}
-
+// materializeOpenCodeRuntimeConfig writes only immutable process-level seed
+// configuration. Permission and MCP state are session/directory scoped and
+// must never enter OPENCODE_CONFIG_CONTENT on a multiplexed runtime.
+func materializeOpenCodeRuntimeConfig(dirs XDGDirs, seedFiles map[string]string) (string, error) {
 	configDir := filepath.Join(dirs.Config, opencodeExecutableName)
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return "", err
@@ -1987,23 +2316,15 @@ func materializeOpenCodePermissionConfig(
 		return "", err
 	}
 
-	managed := map[string]any{
-		"$schema": "https://opencode.ai/config.json",
-		fieldPermission: map[string]any{
-			"*": normalizeOpenCodePermission(permission),
-		},
+	for _, forbidden := range []string{fieldPermission, fieldMCP} {
+		if _, exists := seededConfig[forbidden]; exists {
+			return "", fmt.Errorf("shared runtime seed must not contain session-scoped %q", forbidden)
+		}
 	}
+
+	managed := map[string]any{"$schema": "https://opencode.ai/config.json"}
 
 	config := deepMergeJSON(seededConfig, managed)
-
-	// The mcp block is overlaid separately from the generic deep-merge: a
-	// forwarded server must REPLACE any same-named seeded server wholesale, never
-	// recurse into it. Deep-merging server objects would let a seeded local
-	// server's stale "command" bleed into a forwarded remote server and hand
-	// OpenCode a hybrid entry.
-	if mcpBlock := openCodeMCPConfigBlock(mcpServers); len(mcpBlock) > 0 {
-		config[fieldMCP] = overlayManagedMCPBlock(config[fieldMCP], mcpBlock)
-	}
 
 	data, err := openCodeMarshalIndent(config, "", "  ")
 	if err != nil {
@@ -2240,26 +2561,6 @@ func unsupportedField(path string) error {
 	return fmt.Errorf("unsupported field %s", path)
 }
 
-// overlayManagedMCPBlock overlays the wrapper-managed mcp servers onto any
-// seeded mcp block. Same-named entries are REPLACED WHOLESALE — never
-// deep-merged — so a seeded local server and a forwarded remote server sharing a
-// name can never combine into a hybrid entry (e.g. a "remote" block carrying a
-// stale "command"). Seeded servers with other names are preserved verbatim.
-func overlayManagedMCPBlock(seeded any, managed map[string]any) map[string]any {
-	existing, _ := seeded.(map[string]any)
-	merged := make(map[string]any, len(existing)+len(managed))
-
-	for name, entry := range existing {
-		merged[name] = entry
-	}
-
-	for name, entry := range managed {
-		merged[name] = entry
-	}
-
-	return merged
-}
-
 // deepMergeJSON returns base with override applied on top: nested maps are
 // merged recursively, and override wins for every conflicting key.
 func deepMergeJSON(base, override map[string]any) map[string]any {
@@ -2305,123 +2606,6 @@ func randomPassword() (string, error) {
 	}
 
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
-}
-
-func passwordHash(password string) string {
-	sum := sha256.Sum256([]byte(password))
-
-	return hex.EncodeToString(sum[:])
-}
-
-type serverLease struct {
-	PID              int    `json:"pid"`
-	Port             int    `json:"port"`
-	StartedAt        int64  `json:"startedAtUnixMilli"`
-	PasswordHash     string `json:"passwordHash"`
-	XDGRoot          string `json:"xdgRoot,omitempty"`
-	ProcessStartTime string `json:"processStartTime,omitempty"`
-}
-
-func writeLease(stateDir string, lease serverLease) error {
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return err
-	}
-
-	data, err := openCodeMarshalIndent(lease, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(filepath.Join(stateDir, LeaseFileName), data, 0o600)
-}
-
-func reapStaleLeases(root string, log *slog.Logger) error {
-	if root == "" {
-		return nil
-	}
-
-	matches, err := filepath.Glob(filepath.Join(root, "*", "state", LeaseFileName))
-	if err != nil {
-		return err
-	}
-
-	for _, match := range matches {
-		ReapLeaseFile(match, log)
-	}
-
-	return nil
-}
-
-func ReapLeaseFile(path string, log *slog.Logger) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return
-		}
-
-		return
-	}
-
-	var lease serverLease
-	if err := json.Unmarshal(data, &lease); err != nil {
-		_ = os.Remove(path)
-
-		return
-	}
-
-	if lease.PID > 0 && leaseMatchesProcess(path, lease) {
-		if err := killProcessID(lease.PID); err != nil && log != nil {
-			log.Debug("reap stale opencode lease failed", slog.Int("pid", lease.PID), slog.String("error", err.Error()))
-		}
-	}
-
-	_ = os.Remove(path)
-}
-
-func leaseMatchesProcess(path string, lease serverLease) bool {
-	if lease.PID <= 0 || lease.ProcessStartTime == "" {
-		return false
-	}
-
-	identity, err := openCodeInspectProcess(lease.PID)
-	if err != nil {
-		return false
-	}
-
-	if identity.StartTime != lease.ProcessStartTime {
-		return false
-	}
-
-	stateDir := filepath.Dir(path)
-	if identity.Env["XDG_STATE_HOME"] != stateDir {
-		return false
-	}
-
-	if passwordHash(identity.Env["OPENCODE_SERVER_PASSWORD"]) != lease.PasswordHash {
-		return false
-	}
-
-	if lease.XDGRoot != "" && filepath.Clean(lease.XDGRoot) != filepath.Clean(filepath.Dir(stateDir)) {
-		return false
-	}
-
-	return cmdlineLooksLikeOpenCodeServe(identity.Cmdline)
-}
-
-func cmdlineLooksLikeOpenCodeServe(args []string) bool {
-	for _, arg := range args {
-		if arg == opencodeServeCommand {
-			return true
-		}
-	}
-
-	for _, arg := range args {
-		if strings.Contains(filepath.Base(arg), opencodeExecutableName) {
-			return true
-		}
-	}
-
-	return false
 }
 
 func mergeProcessEnv(overlays ...map[string]string) map[string]string {
@@ -2509,17 +2693,6 @@ func parseSemver(value string) [3]int {
 	}
 
 	return out
-}
-
-func SafePathName(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return defaultSessionPathName
-	}
-
-	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "..", "_")
-
-	return replacer.Replace(value)
 }
 
 func IntFromNumber(value any) (int, bool) {

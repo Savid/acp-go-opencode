@@ -1,20 +1,24 @@
 ---
 title: Sessions
-description: The mental model behind an ACP session, its isolated OpenCode process, and how load differs from resume.
+description: The mental model behind ACP sessions in one shared OpenCode runtime, and how load differs from resume.
 ---
 
-An ACP session is the unit of isolation. Each session owns exactly one
-`opencode serve` process and its own set of four XDG directories — data, config,
-cache, and state — created under the configured scratch directory. Two sessions never
-share a process or a state directory, so their native histories, credentials at
-rest, and running work stay separate.
+An Agent owns exactly one `opencode serve` process and one exclusive XDG root.
+ACP sessions are native sessions inside that runtime. REST requests, aborts,
+callbacks, and SSE subscriptions carry the native session identity; event
+subscriptions also carry the canonical working directory.
+
+OpenCode registers MCP dynamically at directory scope. The adapter therefore
+admits only one live session principal for a canonical working directory. A
+second live session in that directory is rejected, and a changed MCP
+fingerprint is rejected as a principal conflict.
 
 ## Lifecycle
 
 The adapter implements the full ACP session lifecycle plus one namespaced
 extension for fork:
 
-- `session/new` — create a session and launch its OpenCode process.
+- `session/new` — create a native session in the Agent runtime.
 - `session/load` — recreate a stored session and replay its history.
 - `session/resume` — restore a stored session without replaying history.
 - `session/list` — enumerate stored sessions.
@@ -22,23 +26,31 @@ extension for fork:
 - `session/delete` — remove a stored session, leaving a tombstone.
 - `_opencode/session/fork` — branch a session's native state into a new session.
 
+If the shared native server exits, the adapter fails every in-flight turn on
+that server but retains the loaded logical sessions. A later prompt first
+starts a new runtime generation, reopens the session's directory/MCP scope,
+and verifies or completes replay of the last committed sync-event generation.
+Only a session fenced to that current runtime generation can publish its route
+and send the prompt; a replacement that crashes during reconstruction is
+discarded without routing the user prompt to it.
+
 ## Load versus resume
 
-Both `session/load` and `session/resume` hydrate a stored session's native state
-into fresh per-session directories. They differ in what the host sees:
+Both `session/load` and `session/resume` replay the stored native event graph
+through the running server. They differ in what the host sees:
 
 - **`session/load`** replays the stored conversation back to the client as
   `session/update` notifications (user and agent message chunks) so the host can
   rebuild its transcript view.
 - **`session/resume`** restores the same native state but returns without
   replaying, for hosts that already hold the transcript and only need the
-  session live again.
+session live again.
 
 ## Storage and hydration
 
 Session persistence is optional and host-provided through a `SessionStore`. When
 one is wired, the adapter snapshots native state after completed turns and on
-lifecycle boundaries, then restores it into clean directories on load, resume,
-or fork. See [Session store](/docs/features/session-store) for the snapshot
-contents and wiring, and [Sessions storage format](/docs/reference/meta) for the
-`opencode-state-v1` advertisement.
+lifecycle boundaries, then restores it through OpenCode's online sync API on
+load, resume, or fork. See [Session store](/docs/features/session-store) for the
+snapshot contents and wiring, and [Metadata](/docs/reference/meta) for the
+`opencode-sync-events-v1` advertisement.

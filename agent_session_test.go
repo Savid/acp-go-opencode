@@ -2,1210 +2,1017 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
+	"github.com/stretchr/testify/require"
 )
 
-func TestNonEmptyHomeRejectedOnEstablishingPaths(t *testing.T) {
+func TestAgentOwnsOneSharedRuntimeForManyDirectories(t *testing.T) {
 	ctx := context.Background()
-	cwd := t.TempDir()
-	want := map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: optionFieldHome}
-
-	_, err := NewAgent(WithHome(t.TempDir())).NewSession(ctx, NewSessionRequest(cwd))
-	requireInvalidParamsData(t, err, want)
-
-	_, err = NewAgent(WithHome(t.TempDir())).LoadSession(ctx, LoadSessionRequest("s", cwd))
-	requireInvalidParamsData(t, err, want)
-
-	_, err = NewAgent(WithHome(t.TempDir())).ResumeSession(ctx, ResumeSessionRequest("s", cwd))
-	requireInvalidParamsData(t, err, want)
-
-	parentClient := newFakeOpenCodeClient()
-	parentClient.forkSession = testNativeSession("native-child")
-	parent := testSession(NewAgent(WithHome(t.TempDir())), parentClient)
-	parentAgent := parent.agent
-	parentAgent.sessions[parent.id] = parent
-	_, err = parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd)))
-	requireInvalidParamsData(t, err, want)
-}
-
-func TestAgentSessionLifecycleConfigDeleteAndForkLineage(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	parent := newFakeOpenCodeClient()
-	parent.createSession = testNativeSession("native-parent")
-	parent.getSession = parent.createSession
-	parent.forkSession = testNativeSession("native-child")
-	parent.providers = testProviders()
-	parent.agents = []opencode.NativeAgent{{Name: "build", Description: "Build"}, {Name: "plan", Description: "Plan"}}
-	child := newFakeOpenCodeClient()
-	child.getSession = testNativeSession("native-child")
-	child.providers = parent.providers
-	child.agents = parent.agents
-	store := NewInMemorySessionStore()
-	factoryCalls := 0
-	var permissions []string
+	client := newFakeOpenCodeClient()
+	var created atomic.Int64
+	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
+		return testNativeSession(fmt.Sprintf("native-%d", created.Add(1))), nil
+	}
+	client.getSession = testNativeSession("native-1")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	var factoryCalls atomic.Int64
 	agent := NewAgent(
-		WithScratchDir(root),
-		WithSessionStore(store),
+		WithHome(t.TempDir()),
 		func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-				factoryCalls++
-				permissions = append(permissions, opts.Permission)
-				client := parent
-				if factoryCalls > 1 {
-					client = child
-				}
-				xdg := opts.ExistingXDG
-				if xdg.Root == "" {
-					var err error
-					xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
-					if err != nil {
-						return nil, err
-					}
-				}
-				client.xdg = xdg
+			options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+				factoryCalls.Add(1)
 
 				return client, nil
 			}
 		},
 	)
-	conn := newRecordingAgentClient()
-	agent.setAgentClient(conn)
-	cwd := t.TempDir()
+	agent.setAgentClient(newRecordingAgentClient())
 
-	newResp, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeModel("openai/gpt-test"),
-		WithOpenCodeMode("build"),
-		WithOpenCodePermission("allow"),
-	))))
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	if newResp.SessionId == "" || len(newResp.ConfigOptions) != 2 {
-		t.Fatalf("new response = %#v", newResp)
-	}
-	if len(permissions) != 1 || permissions[0] != "allow" {
-		t.Fatalf("start permissions = %#v", permissions)
-	}
-	if _, err = agent.SetSessionConfigOption(ctx, SetModelRequest(newResp.SessionId, "openai/gpt-other")); err != nil {
-		t.Fatalf("SetModel: %v", err)
-	}
-	if _, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(newResp.SessionId, configMode, "plan")); err != nil {
-		t.Fatalf("SetMode: %v", err)
-	}
-	if _, err = agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
-		Boolean: &acp.SetSessionConfigOptionBoolean{SessionId: newResp.SessionId, ConfigId: configMode, Type: "boolean", Value: true},
-	}); err == nil {
-		t.Fatal("boolean config option unexpectedly accepted")
-	}
-	listResp, err := agent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
-	if err != nil {
-		t.Fatalf("ListSessions: %v", err)
-	}
-	if len(listResp.Sessions) != 1 {
-		t.Fatalf("list sessions = %#v", listResp.Sessions)
-	}
+	first, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(
+		NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"), WithOpenCodePermission("deny")),
+	)))
+	require.NoError(t, err)
+	second, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(
+		NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"), WithOpenCodePermission("allow")),
+	)))
+	require.NoError(t, err)
+	require.NotEqual(t, first.SessionId, second.SessionId)
+	require.EqualValues(t, 1, factoryCalls.Load())
+	require.Len(t, agent.sessions, 2)
 
-	rawFork, err := json.Marshal(ForkSessionRequest(newResp.SessionId, cwd))
-	if err != nil {
-		t.Fatal(err)
-	}
-	forkAny, err := agent.HandleExtensionMethod(ctx, ForkSessionMethod, rawFork)
-	if err != nil {
-		t.Fatalf("fork extension: %v", err)
-	}
-	forkResp, ok := forkAny.(acp.UnstableForkSessionResponse)
-	if !ok || forkResp.SessionId == "" || forkResp.SessionId == newResp.SessionId {
-		t.Fatalf("fork response = %#v", forkResp)
-	}
-	idEntries, err := store.Load(ctx, SessionKey{SessionID: string(forkResp.SessionId), Subpath: idmapSubpath})
-	if err != nil {
-		t.Fatalf("load child idmap: %v", err)
-	}
-	var idmap idmapRecord
-	if err := json.Unmarshal(idEntries[len(idEntries)-1], &idmap); err != nil {
-		t.Fatal(err)
-	}
-	if idmap.ParentSessionID != string(newResp.SessionId) || idmap.NativeParentSessionID != "native-parent" {
-		t.Fatalf("child idmap lineage = %#v", idmap)
-	}
-
-	assertCloseDeleteAndLineage(t, ctx, agent, newResp, forkResp, cwd, root, parent, child)
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: first.SessionId})
+	require.NoError(t, err)
+	require.Len(t, agent.sessions, 1)
+	require.NotNil(t, agent.runtime, "session close must not close the shared runtime")
+	require.NoError(t, agent.Close())
 }
 
-func assertCloseDeleteAndLineage(t *testing.T, ctx context.Context, agent *Agent, newResp acp.NewSessionResponse, forkResp acp.UnstableForkSessionResponse, cwd, root string, parent, child *fakeOpenCodeClient) {
-	t.Helper()
-	if _, err := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: newResp.SessionId}); err != nil {
-		t.Fatalf("CloseSession: %v", err)
-	}
-	if _, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(forkResp.SessionId)); err != nil {
-		t.Fatalf("DeleteSession: %v", err)
-	}
-	if len(child.deleted) != 1 || child.deleted[0] != "native-child" {
-		t.Fatalf("native delete calls = %#v", child.deleted)
-	}
-	if _, err := os.Stat(child.xdg.Root); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("deleted child XDG root still exists: %v", err)
-	}
-	if _, err := agent.LoadSession(ctx, LoadSessionRequest(forkResp.SessionId, cwd)); err == nil {
-		t.Fatal("deleted session loaded")
-	} else {
-		assertUnknownSessionError(t, err)
-	}
-	if _, err := agent.ResumeSession(ctx, ResumeSessionRequest(forkResp.SessionId, cwd)); err == nil {
-		t.Fatal("deleted session resumed")
-	} else {
-		assertUnknownSessionError(t, err)
-	}
-	if parent.xdg.Root == "" || child.xdg.Root == "" || filepath.Dir(parent.xdg.Root) != filepath.Join(root, defaultAgentName) {
-		t.Fatalf("xdg roots parent=%#v child=%#v root=%q", parent.xdg, child.xdg, root)
-	}
-}
-
-func TestNewSessionRejectsInvalidRequestedModel(t *testing.T) {
+func TestDirectoryMCPPrincipalFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
 	client := newFakeOpenCodeClient()
 	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
-		t.Fatal("CreateSession called after invalid model")
-
-		return opencode.NativeSession{}, nil
+		return testNativeSession(fmt.Sprintf("native-%d", len(client.syncEvents)+1)), nil
 	}
-	agent := NewAgent(func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			var err error
-			client.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
-			if err != nil {
-				return nil, err
-			}
-
-			return client, nil
-		}
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) { return client, nil }
 	})
 
-	_, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeModel("missing/model"),
-	))))
-	assertInvalidModelField(t, err, modelFieldSessionMeta)
-	if !client.closed {
-		t.Fatal("client was not closed after invalid model")
-	}
+	mcp := HTTPMCPServer("gateway", "http://127.0.0.1:9/mcp", map[string]string{"Authorization": "Bearer one"})
+	_, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionMCPServers(mcp),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test")))))
+	require.NoError(t, err)
+	_, err = agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionMCPServers(mcp),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test")))))
+	require.ErrorContains(t, err, "directory_mcp_principal")
+
+	other := HTTPMCPServer("gateway", "http://127.0.0.1:9/mcp", map[string]string{"Authorization": "Bearer two"})
+	_, err = agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionMCPServers(other),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test")))))
+	require.ErrorContains(t, err, "mcp_principal_conflict")
 }
 
-func TestNewSessionForwardsMCPServersToNativeLaunch(t *testing.T) {
+func TestDirectoryWithoutExplicitMCPStillHasOneSessionPrincipal(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
 	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-one")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) { return client, nil }
+	})
+
+	_, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+	_, err = agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.ErrorContains(t, err, "directory_mcp_principal")
+}
+
+func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
 	client.createSession = testNativeSession("native-1")
-	client.getSession = client.createSession
-	client.providers = testProviders()
-	client.agents = []opencode.NativeAgent{{Name: "build", Description: "Build"}}
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	var nativeAcquire, scratchAcquire, nativeRelease, scratchRelease atomic.Int64
+	hooks := RuntimeResourceHooks{
+		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+			nativeAcquire.Add(1)
 
-	var captured []opencode.MCPServerConfig
+			return func() { nativeRelease.Add(1) }, nil
+		},
+		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+			scratchAcquire.Add(1)
 
-	agent := NewAgent(WithScratchDir(t.TempDir()), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			captured = opts.MCPServers
+			return func() { scratchRelease.Add(1) }, nil
+		},
+	}
+	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(hooks), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) { return client, nil }
+	})
+	_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test")))))
+	require.NoError(t, err)
+	require.EqualValues(t, 1, nativeAcquire.Load())
+	require.EqualValues(t, 1, scratchAcquire.Load())
+	require.NoError(t, agent.Close())
+	require.EqualValues(t, 1, nativeRelease.Load())
+	require.EqualValues(t, 1, scratchRelease.Load())
 
-			var err error
-			client.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
-			if err != nil {
-				return nil, err
+	rejected := NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
+		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) { return nil, errors.New("pool full") },
+	}))
+	_, err = rejected.sharedRuntime(ctx)
+	require.ErrorContains(t, err, "pool full")
+}
+
+func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *testing.T) {
+	ctx := context.Background()
+	first := newFakeOpenCodeClient()
+	first.createSession = testNativeSession("native-first")
+	first.agents = []opencode.NativeAgent{{Name: "build"}}
+	second := newFakeOpenCodeClient()
+	second.xdg = first.xdg
+	second.getSession = testNativeSession("native-first")
+	second.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	var factoryCalls, nativeReleases, scratchReleases atomic.Int64
+	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
+		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+			return func() { nativeReleases.Add(1) }, nil
+		},
+		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+			return func() { scratchReleases.Add(1) }, nil
+		},
+	}), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			if factoryCalls.Add(1) == 1 {
+				return first, nil
 			}
 
-			return client, nil
+			return second, nil
+		}
+	})
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	close(first.runtimeExited)
+	require.Eventually(t, func() bool {
+		agent.mu.Lock()
+		retained := agent.runtime == nil && len(agent.sessions) == 1
+		agent.mu.Unlock()
+
+		return retained && nativeReleases.Load() == 1 && scratchReleases.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+	require.EqualValues(t, 1, nativeReleases.Load())
+	require.EqualValues(t, 1, scratchReleases.Load())
+
+	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "recovery-turn", "continue after restart"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	require.EqualValues(t, 2, factoryCalls.Load())
+	require.Len(t, agent.sessions, 1)
+	require.NoError(t, agent.sessions[created.SessionId].runtimeFailure())
+	require.NoError(t, agent.Close())
+	require.EqualValues(t, 2, nativeReleases.Load())
+	require.EqualValues(t, 2, scratchReleases.Load())
+}
+
+func TestRecoverySkipsCrashedReplacementGenerationBeforePrompt(t *testing.T) {
+	ctx := context.Background()
+	first := newFakeOpenCodeClient()
+	first.createSession = testNativeSession("native-first")
+	first.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	second := newFakeOpenCodeClient()
+	second.xdg = first.xdg
+	second.getSession = testNativeSession("native-first")
+	second.agents = []opencode.NativeAgent{{Name: "build"}}
+	close(second.runtimeExited)
+
+	third := newFakeOpenCodeClient()
+	third.xdg = first.xdg
+	third.getSession = testNativeSession("native-first")
+	third.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	runtimes := []opencode.Client{first, second, third}
+	var factoryCalls atomic.Int64
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			index := int(factoryCalls.Add(1)) - 1
+
+			return runtimes[index], nil
+		}
+	})
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	close(first.runtimeExited)
+	require.Eventually(t, func() bool {
+		agent.mu.Lock()
+		defer agent.mu.Unlock()
+
+		return agent.runtime == nil
+	}, time.Second, 10*time.Millisecond)
+
+	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "fenced-recovery", "continue"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	require.EqualValues(t, 3, factoryCalls.Load())
+	require.EqualValues(t, 3, agent.sessions[created.SessionId].runtimeGeneration)
+	require.NoError(t, agent.Close())
+}
+
+func TestRuntimeCrashFailsInflightTurnThenRecoversBeforeFollowingPrompt(t *testing.T) {
+	ctx := context.Background()
+	first := newFakeOpenCodeClient()
+	first.createSession = testNativeSession("native-first")
+	first.agents = []opencode.NativeAgent{{Name: "build"}}
+	started := make(chan struct{})
+	first.sendMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		close(started)
+		<-ctx.Done()
+
+		return opencode.NativeMessage{}, ctx.Err()
+	}
+
+	second := newFakeOpenCodeClient()
+	second.xdg = first.xdg
+	second.getSession = testNativeSession("native-first")
+	second.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	var factoryCalls atomic.Int64
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			if factoryCalls.Add(1) == 1 {
+				return first, nil
+			}
+
+			return second, nil
+		}
+	})
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	turnResult := make(chan error, 1)
+	go func() {
+		_, promptErr := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "crashed-turn", "block"))
+		turnResult <- promptErr
+	}()
+	<-started
+	close(first.runtimeExited)
+	require.ErrorContains(t, <-turnResult, "opencode_runtime_exited")
+
+	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "following-turn", "continue"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	require.EqualValues(t, 2, factoryCalls.Load())
+	require.NoError(t, agent.Close())
+}
+
+type fanoutRuntime struct {
+	*fakeOpenCodeClient
+	next atomic.Int64
+}
+
+func (r *fanoutRuntime) Scope(_ context.Context, options opencode.ScopeOptions) (opencode.Client, error) {
+	id := fmt.Sprintf("native-%d", r.next.Add(1))
+
+	return &fanoutScope{
+		Client: r.fakeOpenCodeClient, root: r.fakeOpenCodeClient,
+		directory: options.Directory, nativeID: id,
+		events: make(chan opencode.Event), errs: make(chan error),
+	}, nil
+}
+
+type fanoutScope struct {
+	opencode.Client
+	root      *fakeOpenCodeClient
+	directory string
+	nativeID  string
+	events    chan opencode.Event
+	errs      chan error
+}
+
+func (s *fanoutScope) Close(context.Context) error { return nil }
+
+func (s *fanoutScope) CreateSessionWithPolicy(context.Context, string, []opencode.PermissionRule) (opencode.NativeSession, error) {
+	native := testNativeSession(s.nativeID)
+	native.Directory = s.directory
+	s.root.ensureSyncAggregate(s.nativeID)
+
+	return native, nil
+}
+
+func (s *fanoutScope) SendMessage(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+	if id != s.nativeID {
+		return opencode.NativeMessage{}, fmt.Errorf("scope %q received native session %q", s.nativeID, id)
+	}
+
+	text, _ := request.Parts[0][partTypeText].(string)
+	if err := os.WriteFile(filepath.Join(s.directory, "native-cwd-proof.txt"), []byte(text), 0o600); err != nil {
+		return opencode.NativeMessage{}, err
+	}
+
+	return opencode.NativeMessage{Info: opencode.NativeMessageInfo{
+		ID: "assistant-" + id, SessionID: id, Role: "assistant", Finish: "stop",
+	}}, nil
+}
+
+func (s *fanoutScope) Events() <-chan opencode.Event      { return s.events }
+func (s *fanoutScope) EventErrors() <-chan error          { return s.errs }
+func (s *fanoutScope) XDGDirs() opencode.XDGDirs          { return s.root.XDGDirs() }
+func (s *fanoutScope) RuntimeExited() <-chan struct{}     { return s.root.RuntimeExited() }
+func (s *fanoutScope) Shutdown(ctx context.Context) error { return s.root.Shutdown(ctx) }
+
+func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
+	const sessionCount = 8
+
+	ctx := context.Background()
+	runtime := &fanoutRuntime{fakeOpenCodeClient: newFakeOpenCodeClient()}
+	runtime.agents = []opencode.NativeAgent{{Name: "build"}}
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return runtime, nil
 		}
 	})
 	agent.setAgentClient(newRecordingAgentClient())
 
-	_, err := agent.NewSession(ctx, NewSessionRequest(cwd,
-		WithSessionMCPServers(
-			HTTPMCPServer("gateway", "http://127.0.0.1:9/mcp", map[string]string{"Authorization": "Bearer t"}),
-			StdioMCPServer("files", "server-files", []string{"--root", "/tmp"}, map[string]string{"DEBUG": "1"}),
-		),
-		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
-	))
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
+	type sessionCase struct {
+		id     acp.SessionId
+		cwd    string
+		marker string
+	}
+	cases := make([]sessionCase, sessionCount)
+
+	var createGroup sync.WaitGroup
+	createErrors := make(chan error, sessionCount)
+	for index := range cases {
+		cases[index].cwd = t.TempDir()
+		cases[index].marker = fmt.Sprintf("cwd-marker-%d", index)
+		createGroup.Add(1)
+
+		go func() {
+			defer createGroup.Done()
+
+			created, err := agent.NewSession(ctx, NewSessionRequest(cases[index].cwd))
+			if err == nil {
+				cases[index].id = created.SessionId
+			}
+			createErrors <- err
+		}()
+	}
+	createGroup.Wait()
+	close(createErrors)
+	for err := range createErrors {
+		require.NoError(t, err)
+	}
+	require.Len(t, agent.sessions, sessionCount)
+	require.EqualValues(t, 1, agent.runtimeGeneration)
+
+	var promptGroup sync.WaitGroup
+	promptErrors := make(chan error, sessionCount)
+	for index := range cases {
+		promptGroup.Add(1)
+
+		go func() {
+			defer promptGroup.Done()
+
+			response, err := agent.Prompt(ctx, TextPromptRequest(cases[index].id, fmt.Sprintf("turn-%d", index), cases[index].marker))
+			if err == nil && response.StopReason != acp.StopReasonEndTurn {
+				err = fmt.Errorf("stop reason = %q", response.StopReason)
+			}
+			promptErrors <- err
+		}()
+	}
+	promptGroup.Wait()
+	close(promptErrors)
+	for err := range promptErrors {
+		require.NoError(t, err)
 	}
 
-	if len(captured) != 2 {
-		t.Fatalf("MCP servers forwarded = %#v", captured)
-	}
-	remote := captured[0]
-	if remote.Name != "gateway" || remote.URL != "http://127.0.0.1:9/mcp" ||
-		remote.Headers["Authorization"] != "Bearer t" || len(remote.Command) != 0 {
-		t.Fatalf("remote MCP config = %#v", remote)
-	}
-	local := captured[1]
-	if local.Name != "files" || local.URL != "" || len(local.Command) != 3 ||
-		local.Command[0] != "server-files" || local.Command[1] != "--root" || local.Command[2] != "/tmp" ||
-		local.Env["DEBUG"] != "1" {
-		t.Fatalf("local MCP config = %#v", local)
+	for index := range cases {
+		data, err := os.ReadFile(filepath.Join(cases[index].cwd, "native-cwd-proof.txt"))
+		require.NoError(t, err)
+		require.Equal(t, cases[index].marker, string(data))
 	}
 
-	if _, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionMCPServers(
-		HTTPMCPServer("", "http://127.0.0.1:9/mcp", nil),
-	))); err == nil {
-		t.Fatal("unnamed HTTP MCP server accepted")
-	}
-
-	if _, err := agent.NewSession(ctx, NewSessionRequest(cwd, WithSessionMCPServers(
-		StdioMCPServer("", "server-files", nil, nil),
-	))); err == nil {
-		t.Fatal("unnamed stdio MCP server accepted")
-	}
+	require.NoError(t, agent.Close())
 }
 
-func TestNativeMCPServerConfigConversion(t *testing.T) {
-	if nativeMCPServerConfigs(nil) != nil || nativeMCPServerConfigsFromUnstable(nil) != nil {
-		t.Fatal("empty conversions returned non-nil")
-	}
-
-	unstable := []acp.UnstableMcpServer{
-		{Http: &acp.UnstableMcpServerHttp{Name: "gateway", Url: "http://127.0.0.1:9/mcp"}},
-		{Stdio: &acp.McpServerStdio{
-			Name:    "files",
-			Command: "server-files",
-			Args:    []string{"--root"},
-			Env:     []acp.EnvVariable{{Name: "DEBUG", Value: "1"}},
-		}},
-		{Sse: &acp.UnstableMcpServerSse{Name: "sse"}},
-	}
-	configs := nativeMCPServerConfigsFromUnstable(unstable)
-	if len(configs) != 2 || configs[0].Name != "gateway" || configs[0].URL != "http://127.0.0.1:9/mcp" ||
-		configs[0].Headers != nil || len(configs[1].Command) != 2 ||
-		configs[1].Command[0] != "server-files" || configs[1].Env["DEBUG"] != "1" {
-		t.Fatalf("unstable MCP conversion = %#v", configs)
-	}
-
-	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
-		{Http: &acp.UnstableMcpServerHttp{Name: "", Url: "http://127.0.0.1:9/mcp"}},
-	}); err == nil {
-		t.Fatal("unnamed unstable HTTP MCP server accepted")
-	}
-
-	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
-		{Stdio: &acp.McpServerStdio{Name: "", Command: "server-files"}},
-	}); err == nil {
-		t.Fatal("unnamed unstable stdio MCP server accepted")
-	}
-
-	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
-		{Http: &acp.UnstableMcpServerHttp{Name: "   ", Url: "http://127.0.0.1:9/mcp"}},
-	}); err == nil {
-		t.Fatal("whitespace-only-name unstable HTTP MCP server accepted")
-	} else {
-		requireInvalidParamsData(t, err, map[string]any{"mcpServers[0].name": "required"})
-	}
-
-	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
-		{Stdio: &acp.McpServerStdio{Name: "   ", Command: "server-files"}},
-	}); err == nil {
-		t.Fatal("whitespace-only-name unstable stdio MCP server accepted")
-	} else {
-		requireInvalidParamsData(t, err, map[string]any{"mcpServers[0].name": "required"})
-	}
-
-	if err := validateUnstableMCPServers(unstable[:2]); err != nil {
-		t.Fatalf("named unstable MCP servers rejected: %v", err)
-	}
-
-	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{{}}); err != nil {
-		t.Fatalf("empty unstable MCP server union rejected: %v", err)
-	}
-
-	if err := validateUnstableMCPServers([]acp.UnstableMcpServer{
-		{Http: &acp.UnstableMcpServerHttp{Name: "dup", Url: "http://127.0.0.1:9/mcp"}},
-		{Stdio: &acp.McpServerStdio{Name: "dup", Command: "server-files"}},
-	}); err == nil {
-		t.Fatal("duplicate-name unstable MCP servers accepted")
-	} else {
-		requireInvalidParamsData(t, err, map[string]any{"mcpServers[1].name": "duplicate"})
-	}
+func TestForkPermissionMustInherit(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	agent := NewAgent()
+	parent := testSession(agent, client)
+	parent.permission = openCodePermissionDeny
+	agent.sessions[parent.id] = parent
+	_, err := agent.forkSession(context.Background(), ForkSessionRequest(parent.id, t.TempDir(),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodePermission("allow")))))
+	require.ErrorContains(t, err, "child_permission_must_inherit")
 }
-
-func TestLoadSessionHydratesStoredSnapshot(t *testing.T) {
+func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
-	store := NewInMemorySessionStore()
-	sourceClient := newFakeOpenCodeClient()
-	sourceXDG, err := opencode.CreateXDGDirs(root, "source")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sourceClient.xdg = sourceXDG
-	agent := NewAgent(WithScratchDir(root), WithSessionStore(store))
-	session := testSession(agent, sourceClient)
-	session.cwd = root
-	if err = session.snapshotToStore(ctx); err != nil {
-		t.Fatalf("snapshotToStore: %v", err)
-	}
-
-	loadedClient := newFakeOpenCodeClient()
-	loadedClient.getSession = testNativeSession("native-1")
-	loadedClient.providers = testProviders()
-	loadedClient.agents = []opencode.NativeAgent{{Name: "build"}}
-	var replayPart opencode.NativePart
-	if err = json.Unmarshal([]byte(`{"id":"part-1","sessionID":"native-1","messageID":"user-1","type":"text","text":"hello"}`), &replayPart); err != nil {
-		t.Fatal(err)
-	}
-	loadedClient.messages = []opencode.NativeMessage{{
-		Info:  opencode.NativeMessageInfo{ID: "user-1", SessionID: "native-1", Role: "user"},
-		Parts: []opencode.NativePart{replayPart},
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-lifecycle")
+	client.getSession = testNativeSession("native-lifecycle")
+	client.messages = []opencode.NativeMessage{{
+		Info:  opencode.NativeMessageInfo{ID: "assistant", SessionID: "native-lifecycle", Role: "assistant"},
+		Parts: []opencode.NativePart{{ID: "part", SessionID: "native-lifecycle", MessageID: "assistant", Type: "text", Text: "history"}},
 	}}
-	agent.options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-		loadedClient.xdg = opts.ExistingXDG
+	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review"}}
 
-		return loadedClient, nil
-	}
-	conn := newRecordingAgentClient()
-	agent.setAgentClient(conn)
-	resp, err := agent.LoadSession(ctx, LoadSessionRequest("session-1", root))
-	if err != nil {
-		t.Fatalf("LoadSession: %v", err)
-	}
-	if resp.Meta[opencodeMetaKey] == nil || conn.updateCount() != 1 {
-		t.Fatalf("load resp=%#v updates=%#v", resp, conn.updates)
-	}
+	agent := NewAgent()
+	agent.runtime = client
+	agent.setAgentClient(newRecordingAgentClient())
 
-	invalidClient := newFakeOpenCodeClient()
-	invalidClient.getSession = testNativeSession("native-1")
-	invalidClient.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
-		ID:     "openai",
-		Models: map[string]opencode.ProviderModel{"other": {ID: "other"}},
-	}}}
-	invalidAgent := NewAgent(WithScratchDir(root), WithSessionStore(store), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			invalidClient.xdg = opts.ExistingXDG
+	created, err := agent.NewSession(ctx, NewSessionRequest(cwd,
+		WithSessionMCPServers(HTTPMCPServer("remote", "https://mcp.test", map[string]string{"Authorization": "secret"})),
+		WithSessionOpenCodeOptions(OpenCodeOptions{Model: "openai/gpt-test", Mode: "build", Permission: "allow"}),
+	))
+	require.NoError(t, err)
+	require.NotEmpty(t, created.SessionId)
 
-			return invalidClient, nil
-		}
-	})
-	_, err = invalidAgent.LoadSession(ctx, LoadSessionRequest("session-1", root))
-	assertInvalidModelField(t, err, modelFieldSessionMeta)
-	if !invalidClient.closed {
-		t.Fatal("invalid load did not close client")
-	}
+	listed, err := agent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
+	require.NoError(t, err)
+	require.Len(t, listed.Sessions, 1)
+
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+
+	loaded, err := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
+	require.NoError(t, err)
+	require.NotNil(t, loaded.Meta)
+	agent.refreshCommandsAfterResponse(created.SessionId)()
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+
+	resumed, err := agent.ResumeSession(ctx, ResumeSessionRequest(created.SessionId, cwd))
+	require.NoError(t, err)
+	require.NotNil(t, resumed.Meta)
+
+	_, err = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
+	require.NoError(t, err)
+	_, err = agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
+	require.Error(t, err)
+
+	listed, err = agent.ListSessions(ctx, ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, listed.Sessions)
+	require.NoError(t, agent.Close())
 }
 
-func TestAgentSessionLifecycleErrorBranches(t *testing.T) {
+func TestAgentLifecycleValidationAndStorageFailures(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
+	agent := NewAgent()
+	client := newFakeOpenCodeClient()
+	agent.runtime = client
 
-	t.Run("new session validation and native errors", func(t *testing.T) {
-		closed := NewAgent()
-		if err := closed.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := closed.NewSession(ctx, NewSessionRequest(cwd)); err == nil {
-			t.Fatal("closed agent accepted new session")
-		}
-		if _, err := NewAgent().NewSession(ctx, NewSessionRequest("relative")); err == nil {
-			t.Fatal("relative cwd accepted")
-		}
-		if _, err := NewAgent().NewSession(ctx, NewSessionRequest(cwd, WithSessionMCPServers(acp.McpServer{Sse: &acp.McpServerSseInline{Name: "sse", Url: "http://example.test"}}))); err == nil {
-			t.Fatal("SSE MCP accepted")
-		}
-		if _, err := NewAgent().NewSession(ctx, NewSessionRequest(cwd, WithSessionMeta(map[string]any{opencodeMetaKey: map[string]any{"unknown": true}}))); err == nil {
-			t.Fatal("bad meta accepted")
-		}
-		factoryErr := NewAgent(func(options *Options) {
-			options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-				return nil, errors.New("factory failed")
-			}
-		})
-		if _, err := factoryErr.NewSession(ctx, NewSessionRequest(cwd)); err == nil {
-			t.Fatal("factory error ignored")
-		}
-		createErrClient := newFakeOpenCodeClient()
-		createErrClient.createErr = errors.New("create failed")
-		agent := NewAgent(func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-				createErrClient.xdg, _ = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
+	_, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: "relative"})
+	require.Error(t, err)
+	_, err = agent.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{{Sse: &acp.McpServerSseInline{Name: "bad", Url: "https://bad"}}}})
+	require.Error(t, err)
+	_, err = agent.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, Meta: map[string]any{opencodeMetaKey: "bad"}})
+	require.Error(t, err)
 
-				return createErrClient, nil
-			}
-		})
-		if _, err := agent.NewSession(ctx, NewSessionRequest(cwd)); err == nil {
-			t.Fatal("create error ignored")
-		}
-		if !createErrClient.closed {
-			t.Fatal("create error did not close client")
-		}
-	})
+	_, err = agent.LoadSession(ctx, acp.LoadSessionRequest{})
+	require.Error(t, err)
+	_, err = agent.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: "missing", Cwd: cwd})
+	require.Error(t, err)
 
-	t.Run("load resume and close errors", func(t *testing.T) {
-		agent := NewAgent()
-		if _, err := agent.LoadSession(ctx, LoadSessionRequest("", cwd)); err == nil {
-			t.Fatal("empty load id accepted")
-		}
-		if _, err := agent.ResumeSession(ctx, ResumeSessionRequest("s", cwd, WithSessionMCPServers(acp.McpServer{Sse: &acp.McpServerSseInline{Name: "sse", Url: "http://example.test"}}))); err == nil {
-			t.Fatal("resume accepted unsupported MCP")
-		}
-		if _, err := agent.LoadSession(ctx, LoadSessionRequest("missing", cwd)); err == nil {
-			t.Fatal("unknown load succeeded")
-		} else {
-			assertUnknownSessionError(t, err)
-		}
-		if _, err := agent.ResumeSession(ctx, ResumeSessionRequest("missing", cwd)); err == nil {
-			t.Fatal("unknown resume succeeded")
-		} else {
-			assertUnknownSessionError(t, err)
-		}
-		if _, err := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: "missing"}); err == nil {
-			t.Fatal("unknown close succeeded")
-		}
-		if _, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest("")); err == nil {
-			t.Fatal("empty delete accepted")
-		}
-		errStoreAgent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("store failed")}))
-		if _, err := errStoreAgent.ListSessions(ctx, ListSessionsRequest()); err == nil {
-			t.Fatal("list ignored store error")
-		}
-		if _, err := errStoreAgent.UnstableDeleteSession(ctx, DeleteSessionRequest("s")); err == nil {
-			t.Fatal("delete ignored store error")
-		}
-	})
+	badStoreAgent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("store failed")}))
+	badStoreAgent.runtime = client
+	_, err = badStoreAgent.LoadSession(ctx, LoadSessionRequest("missing", cwd))
+	require.ErrorContains(t, err, "store failed")
+	_, err = badStoreAgent.ListSessions(ctx, ListSessionsRequest())
+	require.ErrorContains(t, err, "store failed")
+	_, err = badStoreAgent.UnstableDeleteSession(ctx, DeleteSessionRequest("missing"))
+	require.ErrorContains(t, err, "store failed")
+
+	_, err = agent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd("relative")))
+	require.Error(t, err)
+	badCursor := "not-base64!"
+	_, err = agent.ListSessions(ctx, acp.ListSessionsRequest{Cursor: &badCursor})
+	require.Error(t, err)
+
+	_, err = agent.UnstableDeleteSession(ctx, acp.UnstableDeleteSessionRequest{})
+	require.Error(t, err)
+
+	agent.refreshCommandsAfterResponse("missing")()
+	require.NoError(t, agent.Close())
+	_, err = agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.Error(t, err)
+	_, err = agent.ListSessions(ctx, ListSessionsRequest())
+	require.Error(t, err)
+	_, err = agent.HandleExtensionMethod(ctx, "_unknown", nil)
+	require.Error(t, err)
 }
 
-func TestAgentLoadResumeListPaginationAndForkErrors(t *testing.T) {
+func TestAgentHelperFailureAndCapacityBranches(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
-	cwd := t.TempDir()
-	store := NewInMemorySessionStore()
-	sourceClient := newFakeOpenCodeClient()
-	sourceXDG, err := opencode.CreateXDGDirs(root, "source")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sourceClient.xdg = sourceXDG
-	seedAgent := NewAgent(WithScratchDir(root), WithSessionStore(store))
-	seed := testSession(seedAgent, sourceClient)
-	seed.cwd = cwd
-	if err = seed.snapshotToStore(ctx); err != nil {
-		t.Fatalf("snapshotToStore: %v", err)
-	}
-
-	loadedClient := newFakeOpenCodeClient()
-	loadedClient.getSession = testNativeSession("native-1")
-	loadedClient.providers = testProviders()
-	loadedClient.agents = []opencode.NativeAgent{{Name: "build"}}
-	loadAgent := NewAgent(WithScratchDir(root), WithSessionStore(store), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			loadedClient.xdg = opts.ExistingXDG
-
-			return loadedClient, nil
-		}
-	})
-	if _, err = loadAgent.ResumeSession(ctx, ResumeSessionRequest("session-1", cwd)); err != nil {
-		t.Fatalf("ResumeSession: %v", err)
-	}
-	if _, err = loadAgent.LoadSession(ctx, LoadSessionRequest("session-1", t.TempDir())); err == nil {
-		t.Fatal("cwd mismatch load succeeded")
-	}
-
-	getErrClient := newFakeOpenCodeClient()
-	getErrClient.getErr = errors.New("get failed")
-	getErrAgent := NewAgent(WithScratchDir(root), WithSessionStore(store), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			getErrClient.xdg = opts.ExistingXDG
-
-			return getErrClient, nil
-		}
-	})
-	if _, err = getErrAgent.LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
-		t.Fatal("get error load succeeded")
-	}
-	if !getErrClient.closed {
-		t.Fatal("get error did not close client")
-	}
-
-	listStore := NewInMemorySessionStore()
-	for i := 0; i < listSessionsPageSize+2; i++ {
-		id := fmt.Sprintf("stored-%02d", i)
-		entry, _ := json.Marshal(stateSnapshot{
-			Format:              SessionStoreFormat,
-			CapturedAtUnixMilli: int64(10_000 - i),
-			Session:             stateSnapshotSession{SessionID: id, Cwd: cwd, Title: id},
-		})
-		if err = listStore.Replace(ctx, SessionKey{SessionID: id}, []SessionStoreReplacement{{Key: SessionKey{SessionID: id}, Entries: []SessionStoreEntry{entry}}}); err != nil {
-			t.Fatalf("replace list store: %v", err)
-		}
-	}
-	listAgent := NewAgent(WithSessionStore(listStore))
-	listResp, err := listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
-	if err != nil {
-		t.Fatalf("ListSessions: %v", err)
-	}
-	if len(listResp.Sessions) != listSessionsPageSize || listResp.NextCursor == nil {
-		t.Fatalf("list resp len=%d next=%v", len(listResp.Sessions), listResp.NextCursor)
-	}
-	if _, err = listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("!not-base64!"))); err == nil {
-		t.Fatal("bad cursor accepted")
-	}
-	if _, err = listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("bad"))); err == nil {
-		t.Fatal("non-numeric cursor accepted")
-	}
-	rest, err := listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor(*listResp.NextCursor)))
-	if err != nil || len(rest.Sessions) != 2 || rest.NextCursor != nil {
-		t.Fatalf("second page = %#v err=%v", rest, err)
-	}
-	if _, err = listAgent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor(encodeListCursor(999)))); err == nil {
-		t.Fatal("past-end cursor accepted")
-	}
-
-	parentClient := newFakeOpenCodeClient()
-	parentClient.forkErr = errors.New("fork failed")
-	parent := testSession(NewAgent(), parentClient)
-	parentAgent := parent.agent
-	parentAgent.mu.Lock()
-	parentAgent.sessions[parent.id] = parent
-	parentAgent.mu.Unlock()
-	if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
-		t.Fatal("fork error ignored")
-	}
-	if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest("missing", cwd))); err == nil {
-		t.Fatal("missing parent fork succeeded")
-	}
-	if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, "relative"))); err == nil {
-		t.Fatal("relative fork cwd accepted")
-	}
-}
-
-func TestAgentHelperAndLifecycleBranchCoverage(t *testing.T) {
-	ctx := context.Background()
-	cwd := t.TempDir()
-
-	invalidOptions := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: -1}))
-	if _, err := invalidOptions.Initialize(ctx, acp.InitializeRequest{}); err == nil {
-		t.Fatal("invalid construction options were not reported during initialize")
-	}
-	invalidOptions.options.SessionStore = nil
-	if invalidOptions.sessionStore() == nil {
-		t.Fatal("nil session store did not fall back")
-	}
-	storeCtx, cancel := invalidOptions.sessionStoreContext(ctx)
-	cancel()
+	agent := NewAgent(WithSessionStoreLoadTimeout(time.Nanosecond))
+	storeCtx, cancel := agent.sessionStoreContext(ctx)
+	defer cancel()
 	select {
 	case <-storeCtx.Done():
-	default:
-		t.Fatal("store context was not cancellable")
+	case <-time.After(time.Second):
+		t.Fatal("session store context did not expire")
 	}
-	invalidOptions.options.SessionStoreLoadTimeout = 0
-	defaultStoreCtx, defaultCancel := invalidOptions.sessionStoreContext(ctx)
+
+	defaultAgent := NewAgent()
+	defaultAgent.options.SessionStoreLoadTimeout = 0
+	_, defaultCancel := defaultAgent.sessionStoreContext(ctx)
 	defaultCancel()
-	select {
-	case <-defaultStoreCtx.Done():
-	default:
-		t.Fatal("default store context was not cancellable")
+	require.NotNil(t, defaultAgent.sessionStore())
+
+	release, err := agent.acquireClientCall(ctx)
+	require.NoError(t, err)
+	for i := 1; i < cap(agent.clientCalls); i++ {
+		agent.clientCalls <- struct{}{}
 	}
+	_, err = agent.acquireClientCall(ctx)
+	require.Error(t, err)
+	cancelled, stop := context.WithCancel(ctx)
+	stop()
+	_, err = agent.acquireClientCall(cancelled)
+	require.ErrorIs(t, err, context.Canceled)
+	release()
+	for len(agent.clientCalls) > 0 {
+		<-agent.clientCalls
+	}
+
+	require.Equal(t, acp.PositionEncodingKindUtf8, selectPositionEncoding([]acp.PositionEncodingKind{acp.PositionEncodingKindUtf16, acp.PositionEncodingKindUtf8}))
+	require.Equal(t, acp.PositionEncodingKindUtf16, selectPositionEncoding([]acp.PositionEncodingKind{acp.PositionEncodingKindUtf16}))
 
 	closed := NewAgent()
-	if err := closed.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := closed.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest("s", cwd))); err == nil {
-		t.Fatal("closed agent accepted extension method")
-	}
-
-	limitAgent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
-	first := testSession(limitAgent, newFakeOpenCodeClient())
-	if err := limitAgent.storeStartedSession(first); err != nil {
-		t.Fatalf("store first session: %v", err)
-	}
-	second := testSession(limitAgent, newFakeOpenCodeClient())
-	second.id = "second"
-	if err := limitAgent.storeStartedSession(second); err == nil {
-		t.Fatal("active-session backpressure was not enforced")
-	}
-	if limitAgent.removeSessionIf(second.id, second) {
-		t.Fatal("removeSessionIf removed a non-current session")
-	}
-	if _, err := limitAgent.session("deleted"); err == nil {
-		t.Fatal("unknown deleted session unexpectedly resolved before deletion mark")
-	} else {
-		assertUnknownSessionError(t, err)
-	}
-	limitAgent.deleted["deleted"] = struct{}{}
-	if _, err := limitAgent.session("deleted"); err == nil {
-		t.Fatal("deleted session unexpectedly resolved")
-	} else {
-		assertUnknownSessionError(t, err)
-	}
-	limitAgent.closed = true
-	if err := limitAgent.storeStartedSession(second); err == nil {
-		t.Fatal("closed agent stored session")
-	}
-
-	client := newFakeOpenCodeClient()
-	defaultSession := newSession(NewAgent(), "wrapper", cwd, nil, opencode.NativeSession{ID: "native"}, client, sessionMeta{}, idmapRecord{})
-	if defaultSession.title != "OpenCode session" || defaultSession.idmap.SessionID != "wrapper" ||
-		defaultSession.idmap.NativeSessionID != "native" || defaultSession.idmap.Format != SessionStoreFormat {
-		t.Fatalf("default session fields = %#v", defaultSession)
-	}
-	if selector, ok, err := defaultSession.validatedModelSelector(ctx, modelFieldPrompt); err != nil || ok {
-		t.Fatalf("empty model selector = %#v ok=%v err=%v", selector, ok, err)
-	}
-	defaultSession.Close(ctx)
-	if err := defaultSession.Close(ctx); err != nil {
-		t.Fatalf("second session close: %v", err)
-	}
-
-	queued := defaultSession.turnQueue()
-	queued <- struct{}{}
-	cancelled, cancelAcquire := context.WithCancel(ctx)
-	cancelAcquire()
-	if _, err := defaultSession.acquireTurn(cancelled); !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled acquireTurn error = %v", err)
-	}
-	if _, err := defaultSession.acquireTurn(ctx); err == nil {
-		t.Fatal("prompt backpressure was not enforced")
-	}
-	<-queued
-	if provider, model := splitModelValue("", "provider", "model"); provider != "provider" || model != "model" {
-		t.Fatalf("empty split fallback = %q/%q", provider, model)
-	}
-
-	assertNewLoadForkErrorBranches(t, ctx, cwd, closed)
+	require.NoError(t, closed.Close())
+	require.Error(t, closed.ensureOpen())
+	_, err = closed.HandleExtensionMethod(ctx, ForkSessionMethod, json.RawMessage(`{`))
+	require.Error(t, err)
 }
 
-func assertNewLoadForkErrorBranches(t *testing.T, ctx context.Context, cwd string, closed *Agent) {
+func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
+	oldRead := agentRandRead
+	agentRandRead = func([]byte) (int, error) { return 0, errors.New("fingerprint entropy failed") }
+	failedEntropy := NewAgent()
+	agentRandRead = oldRead
+	t.Cleanup(func() { agentRandRead = oldRead })
+	_, err := failedEntropy.Initialize(context.Background(), acp.InitializeRequest{})
+	require.ErrorContains(t, err, "fingerprint entropy failed")
+
+	for name, option := range map[string]Option{
+		"native version": WithVersion("wrong"),
+		"health":         WithOpenCodeHealthCheckTimeout(0),
+		"turn timeout":   WithTurnTimeout(-time.Second),
+		"limits":         WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: -1}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewAgent(option).Initialize(context.Background(), acp.InitializeRequest{})
+			require.Error(t, err)
+		})
+	}
+
+	agent := NewAgent()
+	agent.options.SessionStore = nil
+	require.NotNil(t, agent.sessionStore())
+	current := testSession(agent, newFakeOpenCodeClient())
+	require.Error(t, agent.storeStartedSession(current), "missing runtime must reject publication")
+	agent.runtime = newFakeOpenCodeClient()
+	require.NoError(t, agent.storeStartedSession(current))
+	require.False(t, agent.removeSessionIf(current.id, &session{}))
+	require.True(t, agent.removeSessionIf(current.id, current))
+	require.False(t, agent.removeSessionIf(current.id, current))
+	agent.closed = true
+	require.Error(t, agent.storeStartedSession(current))
+}
+
+func TestHandleExtensionAndLocalConnectionHelperBranches(t *testing.T) {
+	ctx := context.Background()
+	agent := NewAgent()
+	_, err := agent.HandleExtensionMethod(ctx, "_unknown", nil)
+	require.Error(t, err)
+	_, err = agent.HandleExtensionMethod(ctx, ForkSessionMethod, json.RawMessage(`{`))
+	require.Error(t, err)
+	_, err = agent.HandleExtensionMethod(ctx, ForkSessionMethod, json.RawMessage(`{}`))
+	require.Error(t, err)
+
+	conn := &localAgentConnection{agent: agent}
+	conn.initialized.Store(true)
+	_, reqErr := conn.handle(ctx, "unknown", nil)
+	require.NotNil(t, reqErr)
+	_, reqErr = conn.handle(ctx, acp.AgentMethodSessionList, json.RawMessage(`{`))
+	require.NotNil(t, reqErr)
+	_, reqErr = conn.handle(ctx, acp.AgentMethodSessionList, json.RawMessage(`{"cwd":"relative"}`))
+	require.NotNil(t, reqErr)
+
+	require.Nil(t, requestError(nil))
+	require.Equal(t, -32800, requestError(context.Canceled).Code)
+	require.Equal(t, -32603, requestError(errors.New("boom")).Code)
+	reqError := acp.NewInvalidParams(nil)
+	require.Same(t, reqError, requestError(reqError))
+
+	_, err = scopedElicitationParams(acp.UnstableCreateElicitationRequest{}, elicitationScope{})
+	require.ErrorContains(t, err, "include form or url")
+
+	gate := newConnectionInputGate(strings.NewReader("{}\npartial"), nil)
+	gate.open()
+	all, err := io.ReadAll(gate)
+	require.NoError(t, err)
+	require.Equal(t, "{}\npartial", string(all))
+}
+
+func TestLifecycleMCPPaginationAndRequestBuilderHelpers(t *testing.T) {
+	stdio := &acp.McpServerStdio{Name: "stdio", Command: "tool", Args: []string{"serve"}, Env: []acp.EnvVariable{{Name: "TOKEN", Value: "secret"}}}
+	unstable := []acp.UnstableMcpServer{
+		{Http: &acp.UnstableMcpServerHttp{Name: "http", Url: "https://mcp.test", Headers: []acp.HttpHeader{{Name: "X", Value: "Y"}}}},
+		{Stdio: stdio},
+	}
+	configs := nativeMCPServerConfigsFromUnstable(unstable)
+	require.Len(t, configs, 2)
+	require.Equal(t, []string{"tool", "serve"}, configs[1].Command)
+	require.Equal(t, "secret", configs[1].Env["TOKEN"])
+	require.Nil(t, nativeMCPServerConfigsFromUnstable(nil))
+	require.Nil(t, httpHeaderMap(nil))
+	require.Empty(t, nativeStdioMCPServerConfig(&acp.McpServerStdio{Name: "empty"}).Env)
+	require.ElementsMatch(t, []string{"Y", "secret"}, mcpSecretNeedles(configs))
+
+	require.NoError(t, validateUnstableMCPServers(unstable))
+	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Sse: &acp.UnstableMcpServerSse{Name: "sse"}}}))
+	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Acp: &acp.UnstableMcpServerAcpInline{Name: "acp"}}}))
+	require.NoError(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{}}))
+	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Http: &acp.UnstableMcpServerHttp{}}}))
+	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{
+		{Http: &acp.UnstableMcpServerHttp{Name: "same"}}, {Stdio: &acp.McpServerStdio{Name: "same"}},
+	}))
+
+	infos := make([]acp.SessionInfo, listSessionsPageSize+1)
+	for index := range infos {
+		infos[index].SessionId = acp.SessionId(fmt.Sprintf("session-%d", index))
+	}
+	page, next, err := paginateSessionInfos(infos, nil)
+	require.NoError(t, err)
+	require.Len(t, page, listSessionsPageSize)
+	require.NotNil(t, next)
+	page, next, err = paginateSessionInfos(infos, next)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	require.Nil(t, next)
+
+	negative := base64.RawURLEncoding.EncodeToString([]byte("-1"))
+	_, err = decodeListCursor(&negative)
+	require.Error(t, err)
+	nonnumeric := base64.RawURLEncoding.EncodeToString([]byte("x"))
+	_, err = decodeListCursor(&nonnumeric)
+	require.Error(t, err)
+	past := encodeListCursor(len(infos) + 1)
+	_, _, err = paginateSessionInfos(infos, &past)
+	require.Error(t, err)
+
+	require.Equal(t, acp.SessionId("delete"), DeleteSessionRequest("delete").SessionId)
+	list := ListSessionsRequest(WithListSessionsCwd("/repo"))
+	require.Equal(t, "/repo", *list.Cwd)
+}
+
+func TestDirectoryBindingFingerprintAndResourceBranches(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	require.NoError(t, os.Mkdir(realDir, 0o700))
+	link := filepath.Join(root, "link")
+	require.NoError(t, os.Symlink(realDir, link))
+	agent := NewAgent()
+	servers := []opencode.MCPServerConfig{{Name: "b", URL: "https://b"}, {Name: "a", URL: "https://a"}}
+	fingerprint, err := agent.directoryMCPFingerprint(servers)
+	require.NoError(t, err)
+	require.NotEmpty(t, fingerprint)
+	require.Empty(t, mustDirectoryFingerprint(t, agent, nil))
+
+	release, err := agent.bindDirectory("one", link, servers)
+	require.NoError(t, err)
+	_, err = agent.bindDirectory("two", realDir, servers)
+	require.Error(t, err)
+	_, err = agent.bindDirectory("one", realDir, []opencode.MCPServerConfig{{Name: "other", URL: "https://other"}})
+	require.Error(t, err)
+	release()
+	_, err = agent.bindDirectory("one", filepath.Join(root, "missing"), nil)
+	require.ErrorContains(t, err, "canonicalize cwd")
+
+	released := false
+	releaseResource, err := acquireRuntimeResource(context.Background(), func(context.Context, RuntimeResourceKind) (func(), error) {
+		return func() { released = true }, nil
+	}, "kind")
+	require.NoError(t, err)
+	releaseResource()
+	require.True(t, released)
+	standaloneRelease, err := acquireRuntimeResource(context.Background(), nil, RuntimeResourceRuntime)
+	require.NoError(t, err)
+	standaloneRelease()
+	_, err = acquireRuntimeResource(context.Background(), func(context.Context, RuntimeResourceKind) (func(), error) {
+		return nil, errors.New("denied")
+	}, "kind")
+	require.ErrorContains(t, err, "denied")
+	_, err = acquireRuntimeResource(context.Background(), func(context.Context, RuntimeResourceKind) (func(), error) {
+		//nolint:nilnil // The test exercises rejection of a nil release without an acquisition error.
+		return nil, nil
+	}, "kind")
+	require.ErrorContains(t, err, "nil release")
+}
+
+func mustDirectoryFingerprint(t *testing.T, agent *Agent, configs []opencode.MCPServerConfig) string {
 	t.Helper()
-	createClient := newFakeOpenCodeClient()
-	createClient.createSession = testNativeSession("native-created")
-	snapshotErrAgent := NewAgent(
-		WithSessionStore(&errorSessionStore{err: errors.New("replace failed")}),
-		func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-				var err error
-				createClient.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
-				if err != nil {
-					return nil, err
-				}
+	value, err := agent.directoryMCPFingerprint(configs)
+	require.NoError(t, err)
 
-				return createClient, nil
-			}
-		},
-	)
-	if _, err := snapshotErrAgent.NewSession(ctx, NewSessionRequest(cwd)); err == nil {
-		t.Fatal("snapshot store error during new session was ignored")
-	}
-	if !createClient.closed {
-		t.Fatal("snapshot failure did not close new session client")
-	}
-
-	store := NewInMemorySessionStore()
-	sourceClient := newFakeOpenCodeClient()
-	sourceXDG, err := opencode.CreateXDGDirs(t.TempDir(), "source")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sourceClient.xdg = sourceXDG
-	seedAgent := NewAgent(WithSessionStore(store))
-	seed := testSession(seedAgent, sourceClient)
-	seed.cwd = cwd
-	if err = seed.snapshotToStore(ctx); err != nil {
-		t.Fatalf("seed snapshot: %v", err)
-	}
-	replayErrClient := newFakeOpenCodeClient()
-	replayErrClient.getSession = testNativeSession("native-1")
-	replayErrClient.messagesErr = errors.New("messages failed")
-	replayErrAgent := NewAgent(WithSessionStore(store), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			replayErrClient.xdg = opts.ExistingXDG
-
-			return replayErrClient, nil
-		}
-	})
-	if _, err = replayErrAgent.LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
-		t.Fatal("load replay error was ignored")
-	}
-
-	if _, err = closed.ResumeSession(ctx, ResumeSessionRequest("session-1", cwd)); err == nil {
-		t.Fatal("closed agent resumed session")
-	}
-	if _, err = NewAgent(WithScratchDir(string([]byte{0}))).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
-		t.Fatal("invalid scratch root did not fail load")
-	}
-	if _, err = NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("load failed")})).LoadSession(ctx, LoadSessionRequest("session-1", cwd)); err == nil {
-		t.Fatal("hydrate store error was ignored")
-	}
-
-	parentClient := newFakeOpenCodeClient()
-	parentClient.forkSession = testNativeSession("native-child")
-	parent := testSession(NewAgent(WithScratchDir(string([]byte{0}))), parentClient)
-	parentAgent := parent.agent
-	parentAgent.sessions[parent.id] = parent
-	if _, err = parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
-		t.Fatal("invalid fork scratch root did not fail")
-	}
-	if _, err = NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMCPServers(acp.McpServer{Sse: &acp.McpServerSseInline{Name: "sse"}})))); err == nil {
-		t.Fatal("unstable fork accepted SSE MCP")
-	}
-	if _, err = NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMCPServers(acp.McpServer{Acp: &acp.McpServerAcpInline{Name: "acp"}})))); err == nil {
-		t.Fatal("unstable fork accepted ACP MCP")
-	}
-	if _, err = NewAgent().HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd, WithSessionMeta(map[string]any{opencodeMetaKey: map[string]any{"bad": true}})))); err == nil {
-		t.Fatal("unstable fork accepted invalid meta")
-	}
-
-	missingSource := opencode.XDGDirs{Data: filepath.Join(t.TempDir(), "missing"), Config: t.TempDir(), Cache: t.TempDir(), State: t.TempDir()}
-	validTarget, err := opencode.CreateXDGDirs(t.TempDir(), "target")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = copyXDGDirs(missingSource, validTarget, t.TempDir()); err == nil {
-		t.Fatal("copyXDGDirs accepted missing source")
-	}
-	restoreStateStoreSeams(t)
-	stateRemoveAll = func(string) error { return errors.New("remove failed") }
-	validSource, err := opencode.CreateXDGDirs(t.TempDir(), "source")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = copyXDGDirs(validSource, validTarget, t.TempDir()); err == nil {
-		t.Fatal("copyXDGDirs ignored decode error")
-	}
+	return value
 }
 
-func TestAgentRemainingLifecycleBranches(t *testing.T) {
+func TestNewSessionRemainingFailureStages(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
 
-	t.Run("new session id and store errors", func(t *testing.T) {
-		testNewSessionIDAndStoreErrors(t, ctx, cwd)
-	})
-
-	t.Run("load validation and startup errors", func(t *testing.T) {
-		agent := NewAgent()
-		if _, err := agent.LoadSession(ctx, LoadSessionRequest("s", "relative")); err == nil {
-			t.Fatal("LoadSession accepted relative cwd")
-		}
-		if _, err := agent.LoadSession(ctx, LoadSessionRequest("s", cwd, WithSessionMCPServers(acp.McpServer{Sse: &acp.McpServerSseInline{Name: "sse"}}))); err == nil {
-			t.Fatal("LoadSession accepted SSE MCP")
-		}
-		if _, err := agent.LoadSession(ctx, LoadSessionRequest("s", cwd, WithSessionMeta(map[string]any{opencodeMetaKey: map[string]any{"bad": true}}))); err == nil {
-			t.Fatal("LoadSession accepted invalid meta")
-		}
-
-		store := validHydrateStore(t, ctx)
-		factoryErrAgent := NewAgent(WithSessionStore(store), func(options *Options) {
-			options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-				return nil, errors.New("factory failed")
-			}
-		})
-		if _, err := factoryErrAgent.LoadSession(ctx, LoadSessionRequest("s", cwd)); err == nil {
-			t.Fatal("LoadSession ignored client factory error")
-		}
-
-		loadedClient := newFakeOpenCodeClient()
-		loadedClient.getSession = testNativeSession("n")
-		limitAgent := NewAgent(WithSessionStore(store), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-				loadedClient.xdg = opts.ExistingXDG
-
-				return loadedClient, nil
-			}
-		})
-		limitAgent.sessions["existing"] = testSession(limitAgent, newFakeOpenCodeClient())
-		if _, err := limitAgent.LoadSession(ctx, LoadSessionRequest("s", cwd)); err == nil {
-			t.Fatal("LoadSession ignored storeStartedSession error")
-		}
-	})
-
-	t.Run("list filters and errors", func(t *testing.T) {
-		closed := NewAgent()
-		if err := closed.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := closed.ListSessions(ctx, ListSessionsRequest()); err == nil {
-			t.Fatal("closed agent listed sessions")
-		}
-		relative := "relative"
-		if _, err := NewAgent().ListSessions(ctx, acp.ListSessionsRequest{Cwd: &relative}); err == nil {
-			t.Fatal("ListSessions accepted relative cwd")
-		}
-
-		store := NewInMemorySessionStore()
-		for _, item := range []struct {
-			id  string
-			cwd string
-		}{
-			{"active", cwd},
-			{"deleted", cwd},
-			{"other-cwd", t.TempDir()},
-		} {
-			entry, _ := json.Marshal(stateSnapshot{
-				Format:              SessionStoreFormat,
-				CapturedAtUnixMilli: 100,
-				Session:             stateSnapshotSession{SessionID: item.id, Cwd: item.cwd, Title: item.id},
-			})
-			if err := store.Replace(ctx, SessionKey{SessionID: item.id}, []SessionStoreReplacement{{Key: SessionKey{SessionID: item.id}, Entries: []SessionStoreEntry{entry}}}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		agent := NewAgent(WithSessionStore(store))
-		active := testSession(agent, newFakeOpenCodeClient())
-		active.id = "active"
-		active.cwd = cwd
-		agent.sessions[active.id] = active
-		otherActive := testSession(agent, newFakeOpenCodeClient())
-		otherActive.id = "other-active"
-		otherActive.cwd = t.TempDir()
-		agent.sessions[otherActive.id] = otherActive
-		agent.deleted["deleted"] = struct{}{}
-		resp, err := agent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
-		if err != nil {
-			t.Fatalf("ListSessions: %v", err)
-		}
-		if len(resp.Sessions) != 1 || resp.Sessions[0].SessionId != "active" {
-			t.Fatalf("filtered list = %#v", resp.Sessions)
-		}
-	})
-
-	t.Run("delete active close error", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
-		client.closeErr = errors.New("close failed")
-		agent := NewAgent()
-		session := testSession(agent, client)
-		agent.sessions[session.id] = session
-		if _, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(session.id)); err == nil {
-			t.Fatal("delete ignored active close error")
-		}
-	})
-
-	t.Run("delete active ignores native delete error after tombstone", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
-		client.deleteErr = errors.New("native delete failed")
-		agent := NewAgent()
-		session := testSession(agent, client)
-		agent.sessions[session.id] = session
-		if _, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(session.id)); err != nil {
-			t.Fatalf("delete returned native delete error: %v", err)
-		}
-		if len(client.deleted) != 1 || client.deleted[0] != "native-1" {
-			t.Fatalf("native delete attempts = %#v", client.deleted)
-		}
-	})
-
-	t.Run("deleted cleanup retry entrypoints", func(t *testing.T) {
-		root := t.TempDir()
-		for _, name := range []string{"list", "load", "resume", "delete"} {
-			t.Run(name, func(t *testing.T) {
-				agent := NewAgent(WithScratchDir(root))
-				xdg, err := opencode.CreateXDGDirs(root, name)
-				if err != nil {
-					t.Fatal(err)
-				}
-				agent.deleteCleanup[acp.SessionId(name)] = deleteCleanupRecord{
-					SessionID: acp.SessionId(name),
-					XDGRoot:   xdg.Root,
-				}
-				switch name {
-				case "list":
-					_, _ = agent.ListSessions(ctx, ListSessionsRequest())
-				case "load":
-					agent.deleted[acp.SessionId(name)] = struct{}{}
-					_, _ = agent.LoadSession(ctx, LoadSessionRequest(acp.SessionId(name), cwd))
-				case "resume":
-					agent.deleted[acp.SessionId(name)] = struct{}{}
-					_, _ = agent.ResumeSession(ctx, ResumeSessionRequest(acp.SessionId(name), cwd))
-				case "delete":
-					_, _ = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(acp.SessionId(name)))
-				}
-				if _, err := os.Stat(xdg.Root); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("%s cleanup did not remove XDG root: %v", name, err)
-				}
-				if _, ok := agent.deleteCleanup[acp.SessionId(name)]; ok {
-					t.Fatalf("%s cleanup metadata was not cleared", name)
-				}
-			})
-		}
-	})
-
-	t.Run("deleted cleanup helper branches", func(t *testing.T) {
-		testDeletedCleanupHelperBranches(t, ctx, cwd)
-	})
-
-	t.Run("fork errors", func(t *testing.T) {
-		testForkErrorBranches(t, ctx, cwd)
-	})
-
-	t.Run("client factory defaults and env merge", func(t *testing.T) {
-		defaultAgent := NewAgent()
-		defaultAgent.options.clientFactory = nil
-		if _, err := defaultAgent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{}, opencode.XDGDirs{Root: filepath.Join(t.TempDir(), "root")}, nil); err == nil {
-			t.Fatal("default client factory unexpectedly succeeded with incomplete XDG")
-		}
-		var captured opencode.StartOptions
-		agent := NewAgent(func(options *Options) {
-			options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-				captured = opts
-
-				return newFakeOpenCodeClient(), nil
-			}
-		})
-		if _, err := agent.newOpenCodeClient(ctx, "s", cwd, sessionMeta{Env: map[string]string{"A": "1"}}, opencode.XDGDirs{}, nil); err != nil {
-			t.Fatalf("newOpenCodeClient env: %v", err)
-		}
-		if captured.Env["A"] != "1" {
-			t.Fatalf("captured env = %#v", captured.Env)
-		}
-	})
-}
-
-func testForkErrorBranches(t *testing.T, ctx context.Context, cwd string) {
-	t.Helper()
 	oldReader := sessionIDRandReader
+	sessionIDRandReader = errorReader{err: errors.New("id entropy failed")}
+	_, err := NewAgent().NewSession(ctx, NewSessionRequest(cwd))
+	require.ErrorContains(t, err, "id entropy failed")
+	sessionIDRandReader = oldReader
 	t.Cleanup(func() { sessionIDRandReader = oldReader })
 
-	parentClient := newFakeOpenCodeClient()
-	parentClient.forkSession = testNativeSession("native-child")
-	parentClient.xdg, _ = opencode.CreateXDGDirs(t.TempDir(), "parent")
-	parentAgent := NewAgent()
-	parent := testSession(parentAgent, parentClient)
-	parentAgent.sessions[parent.id] = parent
-
-	sessionIDRandReader = errorReader{err: errors.New("id failed")}
-	if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
-		t.Fatal("fork ignored session id error")
-	}
-	sessionIDRandReader = oldReader
-
-	parentClient.xdg = opencode.XDGDirs{}
-	if _, err := parentAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(parent.id, cwd))); err == nil {
-		t.Fatal("fork ignored XDG copy error")
-	}
-	parentClient.xdg, _ = opencode.CreateXDGDirs(t.TempDir(), "parent")
-
-	factoryErrAgent := NewAgent(func(options *Options) {
+	factoryFailure := NewAgent(WithHome(t.TempDir()), func(options *Options) {
 		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-			return nil, errors.New("child factory failed")
+			return nil, errors.New("runtime start failed")
 		}
 	})
-	factoryParent := testSession(factoryErrAgent, parentClient)
-	factoryErrAgent.sessions[factoryParent.id] = factoryParent
-	if _, err := factoryErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(factoryParent.id, cwd))); err == nil {
-		t.Fatal("fork ignored child factory error")
-	}
+	_, err = factoryFailure.NewSession(ctx, NewSessionRequest(cwd))
+	require.ErrorContains(t, err, "runtime start failed")
 
-	invalidChild := newFakeOpenCodeClient()
-	invalidChild.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
-		ID:     "openai",
-		Models: map[string]opencode.ProviderModel{"other": {ID: "other"}},
-	}}}
-	invalidAgent := NewAgent(func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			invalidChild.xdg = opts.ExistingXDG
-
-			return invalidChild, nil
-		}
-	})
-	invalidParent := testSession(invalidAgent, parentClient)
-	invalidAgent.sessions[invalidParent.id] = invalidParent
-	_, err := invalidAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(invalidParent.id, cwd)))
-	assertInvalidModelField(t, err, modelFieldSessionMeta)
-	if !invalidChild.closed {
-		t.Fatal("invalid fork did not close child")
-	}
-
-	getErrClient := newFakeOpenCodeClient()
-	getErrClient.getErr = errors.New("get failed")
-	getErrAgent := NewAgent(func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			getErrClient.xdg = opts.ExistingXDG
-
-			return getErrClient, nil
-		}
-	})
-	getParent := testSession(getErrAgent, parentClient)
-	getErrAgent.sessions[getParent.id] = getParent
-	if _, err := getErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(getParent.id, cwd))); err == nil {
-		t.Fatal("fork ignored child get error")
-	}
-	if !getErrClient.closed {
-		t.Fatal("child get error did not close client")
-	}
-
-	limitChild := newFakeOpenCodeClient()
-	limitChild.getSession = testNativeSession("native-child")
-	limitAgent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			limitChild.xdg = opts.ExistingXDG
-
-			return limitChild, nil
-		}
-	})
-	limitParent := testSession(limitAgent, parentClient)
-	limitAgent.sessions[limitParent.id] = limitParent
-	if _, err := limitAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(limitParent.id, cwd))); err == nil {
-		t.Fatal("fork ignored active-session limit")
-	}
-
-	snapshotErrChild := newFakeOpenCodeClient()
-	snapshotErrChild.getSession = testNativeSession("native-child")
-	snapshotErrAgent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("replace failed")}), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			snapshotErrChild.xdg = opts.ExistingXDG
-
-			return snapshotErrChild, nil
-		}
-	})
-	snapshotParent := testSession(snapshotErrAgent, parentClient)
-	snapshotErrAgent.sessions[snapshotParent.id] = snapshotParent
-	if _, err := snapshotErrAgent.HandleExtensionMethod(ctx, ForkSessionMethod, mustJSON(t, ForkSessionRequest(snapshotParent.id, cwd))); err == nil {
-		t.Fatal("fork ignored snapshot error")
-	}
-	if !snapshotErrChild.closed {
-		t.Fatal("fork snapshot error did not close child")
-	}
-}
-
-func testDeletedCleanupHelperBranches(t *testing.T, ctx context.Context, cwd string) {
-	t.Helper()
-	agent := NewAgent(WithScratchDir(t.TempDir()))
-	agent.rememberDeleteCleanup(deleteCleanupRecord{})
-	if len(agent.deleteCleanup) != 0 {
-		t.Fatalf("empty cleanup record was remembered: %#v", agent.deleteCleanup)
-	}
-	agent.forgetDeleteCleanupIfDone("")
-
-	xdg, err := opencode.CreateXDGDirs(agent.homeRoot(), "keep")
-	if err != nil {
-		t.Fatal(err)
-	}
-	agent.deleteCleanup["keep"] = deleteCleanupRecord{SessionID: "keep", XDGRoot: xdg.Root}
-	agent.forgetDeleteCleanupIfDone("keep")
-	if _, ok := agent.deleteCleanup["keep"]; !ok {
-		t.Fatal("cleanup metadata was forgotten while XDG root still existed")
-	}
-
-	cancelled, cancel := context.WithCancel(ctx)
-	cancel()
-	if err := agent.retryDeletedSessionCleanup(cancelled); err == nil {
-		t.Fatal("cancelled cleanup retry returned nil")
-	}
-	errorAgent := NewAgent()
-	errorAgent.deleteCleanup["bad"] = deleteCleanupRecord{SessionID: "bad", XDGRoot: string([]byte{0})}
-	if err := errorAgent.retryDeletedSessionCleanup(ctx); err == nil {
-		t.Fatal("cleanup error retry returned nil")
-	}
-	for _, name := range []string{"list", "load", "delete"} {
-		t.Run("entrypoint retry error "+name, func(t *testing.T) {
-			entryAgent := NewAgent(WithScratchDir(t.TempDir()))
-			entryXDG, err := opencode.CreateXDGDirs(entryAgent.homeRoot(), name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			entryAgent.deleteCleanup[acp.SessionId(name)] = deleteCleanupRecord{
-				SessionID: acp.SessionId(name),
-				XDGRoot:   entryXDG.Root,
-			}
-			switch name {
-			case "list":
-				_, _ = entryAgent.ListSessions(cancelled, ListSessionsRequest())
-			case "load":
-				_, _ = entryAgent.LoadSession(cancelled, LoadSessionRequest(acp.SessionId(name), cwd))
-			case "delete":
-				_, _ = entryAgent.UnstableDeleteSession(cancelled, DeleteSessionRequest(acp.SessionId(name)))
-			}
+	for name, configure := range map[string]func(*fakeOpenCodeClient, *Agent){
+		"scope":  func(client *fakeOpenCodeClient, _ *Agent) { client.scopeErr = errors.New("scope failed") },
+		"model":  func(client *fakeOpenCodeClient, _ *Agent) { client.providersErr = errors.New("providers failed") },
+		"create": func(client *fakeOpenCodeClient, _ *Agent) { client.createErr = errors.New("create failed") },
+		"snapshot history": func(client *fakeOpenCodeClient, _ *Agent) {
+			client.syncHistoryErr = errors.New("history failed")
+		},
+		"store": func(_ *fakeOpenCodeClient, agent *Agent) {
+			agent.options.SessionStore = &errorSessionStore{err: errors.New("replace failed")}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := newFakeOpenCodeClient()
+			client.createSession = testNativeSession("native")
+			agent := NewAgent()
+			agent.runtime = client
+			configure(client, agent)
+			_, testErr := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(OpenCodeOptions{Model: "openai/gpt-test"})))
+			require.Error(t, testErr)
 		})
 	}
 
-	if err := agent.cleanupDeletedSession(deleteCleanupRecord{}); err != nil {
-		t.Fatalf("empty cleanup err = %v", err)
-	}
-	if err := agent.cleanupDeletedSession(deleteCleanupRecord{SessionID: "bad", XDGRoot: string([]byte{0})}); err == nil {
-		t.Fatal("invalid cleanup root returned nil")
-	}
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native")
+	limited := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
+	limited.runtime = client
+	limited.sessions["existing"] = testSession(limited, client)
+	_, err = limited.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.ErrorContains(t, err, "backpressure")
 }
 
-func testNewSessionIDAndStoreErrors(t *testing.T, ctx context.Context, cwd string) {
-	t.Helper()
-	defaultClient := newFakeOpenCodeClient()
-	defaultClient.createSession = opencode.NativeSession{ID: "native-default", Title: "Default"}
-	defaultClient.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
-		ID:     "openai",
-		Models: map[string]opencode.ProviderModel{"gpt-default": {ID: "gpt-default"}},
-	}}}
-	var defaultModel string
-	defaultAgent := NewAgent(WithDefaultModel("openai/gpt-default"), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			defaultModel = opts.DefaultModel
-			var err error
-			defaultClient.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
-			if err != nil {
-				return nil, err
-			}
+func TestLoadResumeRemainingFailureStages(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	snapshot := validSyncSnapshot("session", "native", cwd)
+	snapshot.Session.Model = stateSnapshotModel{ProviderID: "openai", ModelID: "gpt-test"}
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
 
-			return defaultClient, nil
-		}
-	})
-	defaultResp, err := defaultAgent.NewSession(ctx, NewSessionRequest(cwd))
-	if err != nil {
-		t.Fatalf("NewSession with default model: %v", err)
-	}
-	if defaultModel != "openai/gpt-default" {
-		t.Fatalf("start default model = %q", defaultModel)
-	}
-	defaultMeta, _ := defaultResp.Meta[opencodeMetaKey].(map[string]any)
-	if defaultMeta["modelId"] != "openai/gpt-default" {
-		t.Fatalf("default model meta = %#v", defaultMeta)
+	newStoredAgent := func(client *fakeOpenCodeClient) *Agent {
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+			Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{encoded},
+		}}))
+		agent := NewAgent(WithSessionStore(store))
+		agent.runtime = client
+
+		return agent
 	}
 
+	for name, configure := range map[string]func(*fakeOpenCodeClient){
+		"scope":       func(client *fakeOpenCodeClient) { client.scopeErr = errors.New("scope failed") },
+		"model":       func(client *fakeOpenCodeClient) { client.providersErr = errors.New("providers failed") },
+		"history":     func(client *fakeOpenCodeClient) { client.syncHistoryErr = errors.New("history failed") },
+		"replay":      func(client *fakeOpenCodeClient) { client.syncReplayErr = errors.New("replay failed") },
+		"get session": func(client *fakeOpenCodeClient) { client.getErr = errors.New("get failed") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := newFakeOpenCodeClient()
+			client.getSession = testNativeSession("native")
+			configure(client)
+			agent := newStoredAgent(client)
+			_, testErr := agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
+			require.Error(t, testErr)
+		})
+	}
+
+	agent := newStoredAgent(newFakeOpenCodeClient())
+	agent.deleted["session"] = struct{}{}
+	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
+	require.Error(t, err)
+	_, err = agent.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: "session", Cwd: cwd, McpServers: []acp.McpServer{{Sse: &acp.McpServerSseInline{Name: "bad"}}}})
+	require.Error(t, err)
+}
+
+func TestForkSessionSuccessAndFailureStages(t *testing.T) {
+	ctx := context.Background()
+	newForkAgent := func() (*Agent, *fakeOpenCodeClient, *session) {
+		client := newFakeOpenCodeClient()
+		client.forkSession = testNativeSession("native-child")
+		client.getSession = testNativeSession("native-child")
+		client.ensureSyncAggregate("native-child")
+		agent := NewAgent()
+		agent.runtime = client
+		parent := testSession(agent, client)
+		agent.sessions[parent.id] = parent
+
+		return agent, client, parent
+	}
+
+	agent, _, parent := newForkAgent()
+	response, err := agent.forkSession(ctx, ForkSessionRequest(parent.id, t.TempDir()))
+	require.NoError(t, err)
+	require.NotEmpty(t, response.SessionId)
+
+	for name, configure := range map[string]func(*Agent, *fakeOpenCodeClient){
+		"native fork": func(_ *Agent, client *fakeOpenCodeClient) { client.forkErr = errors.New("fork failed") },
+		"scope":       func(_ *Agent, client *fakeOpenCodeClient) { client.scopeErr = errors.New("scope failed") },
+		"model":       func(_ *Agent, client *fakeOpenCodeClient) { client.providersErr = errors.New("providers failed") },
+		"get":         func(_ *Agent, client *fakeOpenCodeClient) { client.getErr = errors.New("get failed") },
+		"snapshot": func(_ *Agent, client *fakeOpenCodeClient) {
+			client.syncHistoryErr = errors.New("snapshot failed")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testAgent, client, testParent := newForkAgent()
+			configure(testAgent, client)
+			_, testErr := testAgent.forkSession(ctx, ForkSessionRequest(testParent.id, t.TempDir()))
+			require.Error(t, testErr)
+		})
+	}
+
+	agent, _, parent = newForkAgent()
 	oldReader := sessionIDRandReader
-	sessionIDRandReader = errorReader{err: errors.New("id failed")}
-	if _, err := NewAgent().NewSession(ctx, NewSessionRequest(cwd)); err == nil {
-		t.Fatal("NewSession ignored session id error")
-	}
+	sessionIDRandReader = errorReader{err: errors.New("entropy failed")}
+	_, err = agent.forkSession(ctx, ForkSessionRequest(parent.id, t.TempDir()))
+	require.ErrorContains(t, err, "entropy failed")
 	sessionIDRandReader = oldReader
 
-	client := newFakeOpenCodeClient()
-	client.createSession = testNativeSession("native-created")
-	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), func(options *Options) {
-		options.clientFactory = func(_ context.Context, opts opencode.StartOptions) (opencode.Client, error) {
-			var err error
-			client.xdg, err = opencode.CreateXDGDirs(opts.Root, string(opts.ACPSessionID))
-			if err != nil {
-				return nil, err
-			}
-
-			return client, nil
-		}
-	})
-	agent.sessions["existing"] = testSession(agent, newFakeOpenCodeClient())
-	if _, err := agent.NewSession(ctx, NewSessionRequest(cwd)); err == nil {
-		t.Fatal("NewSession ignored storeStartedSession error")
-	}
-	if !client.closed {
-		t.Fatal("storeStartedSession error did not close client")
-	}
+	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: parent.id, Cwd: "relative"})
+	require.Error(t, err)
+	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: parent.id, Cwd: t.TempDir(), Meta: map[string]any{opencodeMetaKey: "bad"}})
+	require.Error(t, err)
+	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: "missing", Cwd: t.TempDir()})
+	require.Error(t, err)
 }
-func testProviders() opencode.ProvidersResponse {
-	return opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
-		ID:   "openai",
-		Name: "OpenAI",
-		Models: map[string]opencode.ProviderModel{
-			"gpt-test": {
-				ID:   "gpt-test",
-				Name: "GPT Test",
-				Limit: map[string]any{
-					"context": float64(1000),
-					"output":  float64(200),
-				},
-				Reasoning: true,
-				ToolCall:  true,
-			},
-			"gpt-other": {ID: "gpt-other", Name: "GPT Other"},
-		},
-	}}}
+
+type summaryCoverageStore struct {
+	*InMemorySessionStore
+	summaries []SessionSummary
+}
+
+func (store *summaryCoverageStore) ListSessions(context.Context) ([]SessionSummary, error) {
+	return append([]SessionSummary(nil), store.summaries...), nil
+}
+
+func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	storedAgent := func(client *fakeOpenCodeClient) *Agent {
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+			Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{encoded},
+		}}))
+		agent := NewAgent(WithSessionStore(store))
+		agent.runtime = client
+
+		return agent
+	}
+
+	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	client.messagesErr = errors.New("messages failed")
+	agent := storedAgent(client)
+	_, err = agent.LoadSession(ctx, LoadSessionRequest("session", cwd))
+	require.ErrorContains(t, err, "messages failed")
+
+	client = newFakeOpenCodeClient()
+	client.commandsErr = errors.New("commands failed")
+	agent = NewAgent()
+	session := testSession(agent, client)
+	agent.sessions[session.id] = session
+	agent.refreshCommandsAfterResponse(session.id)()
+
+	closed := storedAgent(newFakeOpenCodeClient())
+	closed.closed = true
+	_, err = closed.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
+	require.Error(t, err)
+
+	for _, request := range []acp.ResumeSessionRequest{
+		{SessionId: "session", Cwd: "relative"},
+		{SessionId: "session", Cwd: cwd, McpServers: []acp.McpServer{{Sse: &acp.McpServerSseInline{Name: "bad"}}}},
+		{SessionId: "session", Cwd: cwd, Meta: map[string]any{opencodeMetaKey: "bad"}},
+	} {
+		_, err = storedAgent(newFakeOpenCodeClient()).ResumeSession(ctx, request)
+		require.Error(t, err)
+	}
+
+	client = newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	agent = storedAgent(client)
+	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("missing/model")))))
+	require.Error(t, err)
+
+	client = newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	agent = storedAgent(client)
+	agent.options.ConcurrencyLimits.MaxActiveSessions = 1
+	agent.sessions["occupied"] = testSession(agent, client)
+	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
+	require.ErrorContains(t, err, "backpressure")
+}
+
+func TestListSessionsRemainingFilteringSortingAndCloseBranches(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	otherCwd := t.TempDir()
+	store := &summaryCoverageStore{InMemorySessionStore: NewInMemorySessionStore(), summaries: []SessionSummary{
+		{SessionID: "seen", Cwd: cwd, Title: "seen", UpdatedAtUnixMilli: 10},
+		{SessionID: "deleted", Cwd: cwd, Title: "deleted", UpdatedAtUnixMilli: 10},
+		{SessionID: "other-cwd", Cwd: otherCwd, Title: "other", UpdatedAtUnixMilli: 20},
+		{SessionID: "stored-z", Cwd: cwd, Title: "z", UpdatedAtUnixMilli: 30},
+		{SessionID: "stored-a", Cwd: cwd, Title: "a", UpdatedAtUnixMilli: 30},
+	}}
+	agent := NewAgent(WithSessionStore(store))
+	client := newFakeOpenCodeClient()
+	active := testSession(agent, client)
+	active.id = "seen"
+	active.cwd = cwd
+	filtered := testSession(agent, client)
+	filtered.id = "filtered-active"
+	filtered.cwd = otherCwd
+	agent.sessions[active.id] = active
+	agent.sessions[filtered.id] = filtered
+	agent.deleted["deleted"] = struct{}{}
+
+	response, err := agent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
+	require.NoError(t, err)
+	require.Equal(t, []acp.SessionId{"seen", "stored-a", "stored-z"}, []acp.SessionId{
+		response.Sessions[0].SessionId, response.Sessions[1].SessionId, response.Sessions[2].SessionId,
+	})
+
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: "missing"})
+	require.Error(t, err)
+}
+
+func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.forkSession = testNativeSession("native-child")
+	client.getSession = testNativeSession("native-child")
+	client.ensureSyncAggregate("native-child")
+	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
+	agent.runtime = client
+	parent := testSession(agent, client)
+	agent.sessions[parent.id] = parent
+
+	_, err := agent.forkSession(context.Background(), acp.UnstableForkSessionRequest{
+		SessionId:  parent.id,
+		Cwd:        t.TempDir(),
+		McpServers: []acp.UnstableMcpServer{{Sse: &acp.UnstableMcpServerSse{Name: "bad"}}},
+	})
+	require.Error(t, err)
+
+	_, err = agent.forkSession(context.Background(), ForkSessionRequest(parent.id, t.TempDir()))
+	require.ErrorContains(t, err, "backpressure")
+
+	configs := nativeMCPServerConfigs([]acp.McpServer{
+		{Stdio: &acp.McpServerStdio{Name: "stdio", Command: "tool"}},
+		{},
+	})
+	require.Len(t, configs, 1)
 }

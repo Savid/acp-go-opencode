@@ -13,14 +13,14 @@ func TestInMemoryStoreReplaceTombstonesUnlistedSubpaths(t *testing.T) {
 	store := NewInMemorySessionStore()
 	main := SessionKey{SessionID: "s1", Subpath: SessionStoreMainSubpath}
 	if err := store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"format":"opencode-state-v1"}`)}},
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"format":"opencode-sync-events-v1"}`)}},
 		{Key: SessionKey{SessionID: "s1", Subpath: "idmap"}, Entries: []SessionStoreEntry{json.RawMessage(`{"sessionId":"s1"}`)}},
 		{Key: SessionKey{SessionID: "s1", Subpath: "old"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
 	}); err != nil {
 		t.Fatalf("first replace: %v", err)
 	}
 	if err := store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"format":"opencode-state-v1"}`)}},
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"format":"opencode-sync-events-v1"}`)}},
 		{Key: SessionKey{SessionID: "s1", Subpath: "idmap"}, Entries: []SessionStoreEntry{json.RawMessage(`{"sessionId":"s1"}`)}},
 	}); err != nil {
 		t.Fatalf("second replace: %v", err)

@@ -24,7 +24,6 @@ func TestRequestBuilders(t *testing.T) {
 		WithSessionOutputSchema(map[string]any{"type": "object"}),
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(
 			WithOpenCodeModel("openai/gpt"),
-			WithOpenCodeEnv(map[string]string{"K": "V"}),
 			WithOpenCodeMode("plan"),
 			WithOpenCodePermission("allow"),
 		)),
@@ -49,8 +48,11 @@ func TestRequestBuilders(t *testing.T) {
 	if ResumeSessionRequest("s", "/tmp/project", WithSessionMCPServers(httpServer)).SessionId != "s" {
 		t.Fatal("ResumeSessionRequest did not set session id")
 	}
-	if prompt := TextPromptRequest("s", "hello"); prompt.SessionId != "s" || len(prompt.Prompt) != 1 {
+	if prompt := TextPromptRequest("s", "nonce", "hello"); prompt.SessionId != "s" || len(prompt.Prompt) != 1 {
 		t.Fatalf("TextPromptRequest = %#v", prompt)
+	}
+	if cancel := CancelRequest("s", "nonce"); cancel.SessionId != "s" || cancel.Meta[routeEnvelopeKey] == nil {
+		t.Fatalf("CancelRequest = %#v", cancel)
 	}
 	list := ListSessionsRequest(WithListSessionsCursor("next"), WithListSessionsMeta(map[string]any{"a": "b"}))
 	if list.Cursor == nil || *list.Cursor != "next" || list.Meta["a"] != "b" {

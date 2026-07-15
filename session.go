@@ -18,6 +18,8 @@ import (
 
 const sessionUpdateAvailableCommands = "available_commands_update"
 
+var observeCancellationWait = func() {}
+
 type session struct {
 	agent                 *Agent
 	id                    acp.SessionId
@@ -29,38 +31,51 @@ type session struct {
 	providerID            string
 	modelID               string
 	mode                  string
-	env                   map[string]string
+	permission            string
+	secretNeedles         []string
 	outputSchema          map[string]any
 	rawMessages           rawMessageConfig
 
-	client opencode.Client
+	client           opencode.Client
+	directoryRelease func()
+	mcpServers       []opencode.MCPServerConfig
+	recoveryMu       sync.Mutex
 
-	turn                chan struct{}
-	mu                  sync.Mutex
-	updateMu            sync.Mutex
-	cancel              context.CancelFunc
-	turnDone            <-chan struct{}
-	cancelled           bool
-	rawSeq              int64
-	emittedPartText     map[string]string
-	emittedTools        map[string]emittedToolState
-	emittedUsage        map[string]emittedUsageState
-	pending             map[string]opencode.PermissionRequest
-	questions           map[string]opencode.QuestionRequest
-	processedPermission map[string]struct{}
-	processedQuestion   map[string]struct{}
-	turnEpoch           uint64
-	activeMessageIDs    map[string]struct{}
-	failedStreamEpochs  map[uint64]struct{}
-	failedMessageIDs    map[string]struct{}
-	suppressNextBacklog bool
-	exclusiveTurn       bool
-	commandsByName      map[string]opencode.NativeCommand
-	availableCommands   []acp.AvailableCommand
-	contextWindows      map[string]int
-	messageRoles        map[string]string
-	poisonCause         string
-	closed              bool
+	turn                      chan struct{}
+	mu                        sync.Mutex
+	updateMu                  sync.Mutex
+	cancel                    context.CancelFunc
+	turnDone                  <-chan struct{}
+	cancelled                 bool
+	cancelling                bool
+	cancellationEpoch         uint64
+	cancellationResolvedEpoch uint64
+	cancellationDone          chan struct{}
+	cancellationErr           error
+	rawSeq                    int64
+	emittedPartText           map[string]string
+	emittedTools              map[string]emittedToolState
+	emittedUsage              map[string]emittedUsageState
+	pending                   map[string]opencode.PermissionRequest
+	questions                 map[string]opencode.QuestionRequest
+	processedPermission       map[string]struct{}
+	processedQuestion         map[string]struct{}
+	turnEpoch                 uint64
+	turnNonce                 string
+	activeMessageIDs          map[string]struct{}
+	activeToolCallIDs         map[string]struct{}
+	failedStreamEpochs        map[uint64]struct{}
+	failedMessageIDs          map[string]struct{}
+	suppressNextBacklog       bool
+	exclusiveTurn             bool
+	commandsByName            map[string]opencode.NativeCommand
+	availableCommands         []acp.AvailableCommand
+	contextWindows            map[string]int
+	messageRoles              map[string]string
+	poisonCause               string
+	runtimeLostCause          string
+	runtimeGeneration         uint64
+	closed                    bool
 }
 
 type sessionSnapshot struct {
@@ -73,7 +88,7 @@ type sessionSnapshot struct {
 	providerID            string
 	modelID               string
 	mode                  string
-	env                   map[string]string
+	permission            string
 	rawMessages           rawMessageConfig
 	client                opencode.Client
 }
@@ -126,7 +141,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		providerID:            providerID,
 		modelID:               modelID,
 		mode:                  firstNonEmpty(meta.Mode, native.Agent, "build"),
-		env:                   cloneStringMap(meta.Env),
+		permission:            normalizeOpenCodePermission(meta.Permission),
 		outputSchema:          cloneAnyMap(meta.OutputSchema),
 		rawMessages:           meta.RawMessages,
 		client:                client,
@@ -164,6 +179,10 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 
 	if err := s.poisonedErrorLocked(); err != nil {
 		return nil, err
+	}
+
+	if s.cancelling {
+		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: "session_cancelling"})
 	}
 
 	if exclusive {
@@ -249,16 +268,24 @@ func (s *session) turnQueue() chan struct{} {
 	return s.turn
 }
 
-func (s *session) beginTurn(ctx context.Context) context.Context {
+func (s *session) beginTurn(ctx context.Context, turnNonces ...string) context.Context {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	turnNonce := "unit-test-turn"
+	if len(turnNonces) > 0 {
+		turnNonce = turnNonces[0]
+	}
+
 	turnCtx, cancel := context.WithCancel(ctx)
+	turnCtx = withTurnRoute(turnCtx, turnNonce)
 	s.cancel = cancel
 	s.turnDone = turnCtx.Done()
 	s.cancelled = false
 	s.turnEpoch++
+	s.turnNonce = turnNonce
 	s.activeMessageIDs = map[string]struct{}{}
+	s.activeToolCallIDs = map[string]struct{}{}
 
 	return turnCtx
 }
@@ -267,12 +294,18 @@ func (s *session) finishTurn() {
 	s.mu.Lock()
 	cancel := s.cancel
 	s.cancel = nil
+
 	s.turnDone = nil
-	s.cancelled = false
+	if !s.cancelling {
+		s.cancelled = false
+	}
+
+	s.turnNonce = ""
 	s.updatedAt = time.Now().UTC().Format(time.RFC3339)
 	s.pending = map[string]opencode.PermissionRequest{}
 	s.questions = map[string]opencode.QuestionRequest{}
 	s.activeMessageIDs = map[string]struct{}{}
+	s.activeToolCallIDs = map[string]struct{}{}
 	s.mu.Unlock()
 
 	if cancel != nil {
@@ -280,11 +313,22 @@ func (s *session) finishTurn() {
 	}
 }
 
+func (s *session) currentTurnNonce() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.turnNonce
+}
+
 func (s *session) cancelTurn() {
+	s.signalTurnCancellation(true)
+}
+
+func (s *session) signalTurnCancellation(markCancelled bool) {
 	s.mu.Lock()
 
 	cancel := s.cancel
-	if cancel != nil {
+	if cancel != nil && markCancelled {
 		s.cancelled = true
 	}
 
@@ -316,6 +360,165 @@ func (s *session) cancelTurn() {
 
 	for _, req := range questions {
 		_ = s.client.RejectQuestion(ctx, req)
+	}
+}
+
+// beginCancellation closes turn admission before cancelling the active turn.
+// The returned epoch is the native cancellation fence that must resolve before
+// another turn may start on this session.
+func (s *session) beginCancellation(turnNonce string, requireMatch bool, markCancelled bool) (uint64, error) {
+	s.mu.Lock()
+	if requireMatch && (s.cancel == nil || turnNonce == "" || s.turnNonce != turnNonce) {
+		s.mu.Unlock()
+
+		return 0, invalidRoute("cancel route is missing, stale, or does not target the active turn")
+	}
+
+	if s.cancel == nil {
+		s.mu.Unlock()
+
+		return 0, nil
+	}
+
+	if s.cancellationResolvedEpoch == s.turnEpoch {
+		s.cancelled = s.cancelled || markCancelled
+		epoch := s.turnEpoch
+		cancel := s.cancel
+		s.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+
+		return epoch, nil
+	}
+
+	if s.cancelling {
+		s.cancelled = s.cancelled || markCancelled
+		epoch := s.cancellationEpoch
+		s.mu.Unlock()
+
+		return epoch, nil
+	}
+
+	s.cancelling = true
+	s.cancelled = s.cancelled || markCancelled
+	s.cancellationEpoch = s.turnEpoch
+	s.cancellationErr = nil
+	epoch := s.cancellationEpoch
+	s.mu.Unlock()
+
+	s.signalTurnCancellation(markCancelled)
+
+	return epoch, nil
+}
+
+func (s *session) resolveCancellation(ctx context.Context, epoch uint64) error {
+	if epoch == 0 {
+		return nil
+	}
+
+	for {
+		s.mu.Lock()
+		if !s.cancelling || s.cancellationEpoch != epoch {
+			err := s.cancellationErr
+			s.mu.Unlock()
+
+			return err
+		}
+
+		if done := s.cancellationDone; done != nil {
+			s.mu.Unlock()
+			observeCancellationWait()
+
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		done := make(chan struct{})
+		s.cancellationDone = done
+		client := s.client
+		nativeID := s.idmap.NativeSessionID
+		generation := s.runtimeGeneration
+		runtimeLost := s.runtimeLostCause != ""
+		s.mu.Unlock()
+
+		var err error
+		if !runtimeLost {
+			err = abortAndWaitIdle(ctx, client, nativeID)
+		}
+
+		s.mu.Lock()
+		if s.runtimeGeneration != generation || s.runtimeLostCause != "" {
+			err = nil
+		}
+
+		if s.cancellationEpoch == epoch {
+			s.cancellationErr = err
+			s.cancelling = false
+
+			s.cancellationDone = nil
+			if s.cancel == nil {
+				s.cancelled = false
+			}
+
+			if err != nil && s.poisonCause == "" {
+				s.poisonCause = fmt.Sprintf("native cancellation fence failed: %v", err)
+			} else if err == nil {
+				s.cancellationResolvedEpoch = epoch
+			}
+		}
+
+		close(done)
+		s.mu.Unlock()
+
+		if err != nil {
+			return acp.NewInternalError(map[string]any{
+				jsonFieldError: "opencode_cancellation_fence_failed",
+				jsonFieldCause: err.Error(),
+			})
+		}
+
+		return nil
+	}
+}
+
+func abortAndWaitIdle(ctx context.Context, client opencode.Client, nativeID string) error {
+	if client == nil || nativeID == "" {
+		return errors.New("native session is unavailable")
+	}
+
+	if err := client.Abort(ctx, nativeID); err != nil {
+		return fmt.Errorf("abort native session: %w", err)
+	}
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		statuses, err := client.SessionStatus(ctx)
+		if err != nil {
+			return fmt.Errorf("read native session status: %w", err)
+		}
+
+		status, active := statuses[nativeID]
+		if !active || status.Type == nativeStatusIdle {
+			return nil
+		}
+
+		if status.Type != "busy" && status.Type != "retry" {
+			return fmt.Errorf("unknown native session status %q", status.Type)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -400,6 +603,37 @@ func (s *session) markActiveMessageID(messageID string) {
 
 	s.activeMessageIDs[messageID] = struct{}{}
 	s.mu.Unlock()
+}
+
+func (s *session) markActiveToolCallID(toolCallID string) {
+	if toolCallID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	if s.activeToolCallIDs == nil {
+		s.activeToolCallIDs = map[string]struct{}{}
+	}
+
+	s.activeToolCallIDs[toolCallID] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *session) ownsCurrentToolCall(toolCallID string) bool {
+	if toolCallID == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.cancel == nil || s.cancelling {
+		return false
+	}
+
+	_, ok := s.activeToolCallIDs[toolCallID]
+
+	return ok
 }
 
 // recordMessageRole remembers the native role declared for a message so live
@@ -580,7 +814,7 @@ func (s *session) snapshot() sessionSnapshot {
 		providerID:            s.providerID,
 		modelID:               s.modelID,
 		mode:                  s.mode,
-		env:                   cloneStringMap(s.env),
+		permission:            s.permission,
 		rawMessages:           s.rawMessages,
 		client:                s.client,
 	}
@@ -771,7 +1005,14 @@ func (s *session) nextRawEventSequence() int64 {
 // contexts so a cancelled or expired caller context can never skip the
 // graceful abort/close ladder.
 func (s *session) Close(_ context.Context) error {
-	s.cancelTurn()
+	epoch, cancelErr := s.beginCancellation("", false, true)
+	if cancelErr == nil && epoch != 0 {
+		cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		cancelErr = s.resolveCancellation(cancelCtx, epoch)
+
+		cancel()
+	}
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -782,33 +1023,242 @@ func (s *session) Close(_ context.Context) error {
 	s.closed = true
 	client := s.client
 	nativeID := s.idmap.NativeSessionID
+	release := s.directoryRelease
+	s.directoryRelease = nil
 	s.mu.Unlock()
 
-	var err error
+	var err = cancelErr
 
 	if client != nil && nativeID != "" {
-		abortCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		_ = client.Abort(abortCtx, nativeID)
-
-		cancel()
-
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
 		err = errors.Join(err, client.Close(closeCtx))
 
 		closeCancel()
 	}
 
+	if release != nil {
+		release()
+	}
+
 	return err
 }
 
+func (s *session) detachRuntime(generation uint64, cause string) {
+	s.mu.Lock()
+	if s.closed || s.runtimeGeneration != generation {
+		s.mu.Unlock()
+
+		return
+	}
+
+	s.runtimeGeneration = 0
+	s.runtimeLostCause = cause
+
+	cancel := s.cancel
+	s.cancel = nil
+	s.turnDone = nil
+	s.pending = make(map[string]opencode.PermissionRequest)
+	s.questions = make(map[string]opencode.QuestionRequest)
+	release := s.directoryRelease
+	s.directoryRelease = nil
+	client := s.client
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	if client != nil {
+		ctx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+		_ = client.Close(ctx)
+
+		closeCancel()
+	}
+
+	if release != nil {
+		release()
+	}
+}
+
+func (s *session) ensureRuntime(ctx context.Context) error {
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueSessionUnknown})
+	}
+
+	if s.runtimeLostCause == "" {
+		generation := s.runtimeGeneration
+		s.mu.Unlock()
+
+		if generation == 0 || s.agent.runtimeGenerationIsCurrent(generation) {
+			return nil
+		}
+
+		// The runtime-exit watcher clears the Agent generation before it
+		// detaches each session. A prompt entering in that narrow interval
+		// performs the same idempotent detach itself rather than touching the
+		// already-fenced client.
+		s.detachRuntime(generation, "shared OpenCode runtime exited")
+		s.mu.Lock()
+	}
+
+	id := s.id
+	cwd := s.cwd
+	model := joinModelValue(s.providerID, s.modelID)
+	mcpServers := cloneNativeMCPServerConfigs(s.mcpServers)
+	s.mu.Unlock()
+
+	storeCtx, cancel := s.agent.sessionStoreContext(ctx)
+	idmap, snapshot, ok, err := hydrateStateFromStore(storeCtx, s.agent.sessionStore(), string(id))
+
+	cancel()
+
+	if err != nil {
+		return fmt.Errorf("load committed OpenCode recovery generation: %w", err)
+	}
+
+	if !ok {
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "opencode_recovery_generation_missing"})
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		client, releaseDirectory, generation, err := s.agent.newOpenCodeClient(ctx, id, cwd, mcpServers)
+		if err != nil {
+			return err
+		}
+
+		releaseCandidate := func() {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+			_ = client.Close(closeCtx)
+
+			closeCancel()
+			releaseDirectory()
+		}
+
+		if validateErr := validateModel(ctx, client, model, modelFieldSessionMeta); validateErr != nil {
+			current := s.agent.runtimeGenerationIsCurrent(generation)
+
+			releaseCandidate()
+
+			if !current {
+				continue
+			}
+
+			return validateErr
+		}
+
+		s.agent.restoreMu.Lock()
+		native, err := restoreSyncState(ctx, client, snapshot, idmap.NativeSessionID, cwd)
+		s.agent.restoreMu.Unlock()
+
+		if err != nil {
+			current := s.agent.runtimeGenerationIsCurrent(generation)
+
+			releaseCandidate()
+
+			if !current {
+				continue
+			}
+
+			return fmt.Errorf("restore committed OpenCode recovery generation: %w", err)
+		}
+
+		if native.ID != idmap.NativeSessionID {
+			releaseCandidate()
+
+			return fmt.Errorf("restored OpenCode native session id drift: expected %q, got %q", idmap.NativeSessionID, native.ID)
+		}
+
+		installed, closed := s.installRecoveredRuntime(client, releaseDirectory, idmap, generation)
+		if installed {
+			return nil
+		}
+
+		releaseCandidate()
+
+		if closed {
+			return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueSessionUnknown})
+		}
+	}
+}
+
+func (s *session) installRecoveredRuntime(client opencode.Client, releaseDirectory func(), idmap idmapRecord, generation uint64) (bool, bool) {
+	s.agent.mu.Lock()
+	defer s.agent.mu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed || s.agent.closed {
+		return false, true
+	}
+
+	if s.agent.runtime == nil || s.agent.runtimeGeneration != generation {
+		return false, false
+	}
+
+	if exited := s.agent.runtime.RuntimeExited(); exited != nil {
+		select {
+		case <-exited:
+			return false, false
+		default:
+		}
+	}
+
+	s.client = client
+	s.directoryRelease = releaseDirectory
+	s.idmap = idmap
+	s.runtimeGeneration = generation
+	s.runtimeLostCause = ""
+	s.commandsByName = nil
+	s.availableCommands = nil
+	s.contextWindows = nil
+	s.messageRoles = nil
+	s.processedPermission = map[string]struct{}{}
+	s.processedQuestion = map[string]struct{}{}
+	s.cancelling = false
+	s.cancellationErr = nil
+	s.cancellationDone = nil
+
+	return true, false
+}
+
+func (s *session) runtimeFailure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.runtimeLostCause == "" {
+		return nil
+	}
+
+	return acp.NewInternalError(map[string]any{
+		jsonFieldError: "opencode_runtime_exited",
+		jsonFieldCause: s.runtimeLostCause,
+	})
+}
+
 func (s *session) DeleteNativeAndClose(ctx context.Context) error {
-	s.cancelTurn()
+	epoch, err := s.beginCancellation("", false, true)
+	if err == nil && epoch != 0 {
+		cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		err = s.resolveCancellation(cancelCtx, epoch)
+
+		cancel()
+	}
+
 	s.mu.Lock()
 	client := s.client
 	nativeID := s.idmap.NativeSessionID
 	s.mu.Unlock()
-
-	var err error
 
 	if client != nil && nativeID != "" {
 		deleteCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)

@@ -25,6 +25,7 @@ type agentClient interface {
 
 type elicitationScope struct {
 	SessionID  acp.SessionId
+	TurnNonce  string
 	ToolCallID acp.ToolCallId
 	RequestID  *acp.RequestId
 }
@@ -487,17 +488,22 @@ func scopedElicitationParams(
 		return nil, errors.New("elicitation request must include form or url")
 	}
 
-	if scope.SessionID != "" {
-		payload[jsonFieldSessionID] = scope.SessionID
+	meta, _ := payload["_meta"].(map[string]any)
+	if meta == nil {
+		meta = map[string]any{}
 	}
 
-	if scope.ToolCallID != "" {
-		payload["toolCallId"] = scope.ToolCallID
+	if _, exists := meta[routeEnvelopeKey]; exists {
+		return nil, fmt.Errorf("native elicitation metadata used reserved key %q", routeEnvelopeKey)
 	}
 
-	if scope.RequestID != nil {
-		payload["requestId"] = scope.RequestID
+	route, err := outboundRoute(scope)
+	if err != nil {
+		return nil, err
 	}
+
+	meta[routeEnvelopeKey] = route
+	payload["_meta"] = meta
 
 	return json.Marshal(payload)
 }

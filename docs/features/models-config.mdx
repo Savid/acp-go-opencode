@@ -30,7 +30,7 @@ Structured output is native. Supplying a JSON Schema object at
 `_meta.opencode.options.outputSchema` (or via `WithOpenCodeOutputSchema` /
 `WithSessionOutputSchema`) makes every non-command prompt request the native
 `format: {"type": "json_schema", "schema": ...}` output mode on
-`POST /session/{id}/message`. The validated result is returned on the prompt
+`POST /session/{id}/prompt_async`. The validated result is returned on the prompt
 response at `_meta.opencode.structuredOutput`. If OpenCode fails to produce
 valid structured output after its native retries, the turn fails with the
 uniform `opencode_turn_failed` provider error described below. Slash-command
@@ -49,14 +49,14 @@ trigger; slash-command turns always report `false`.
 
 ## Seeding a custom provider
 
-The wrapper authors each session's `opencode.json` (it owns `$schema` and
-`permission`). To add native config the wrapper does not manage — such as a
-custom `provider` — seed an `opencode.json` with `WithSeedFiles` (Go) or
+The wrapper authors the shared runtime's `opencode.json` and owns `$schema`.
+To add immutable process config such as a custom `provider`, seed an
+`opencode.json` with `WithSeedFiles` (Go) or
 `-seed-file opencode.json=<hostpath>` (CLI). For the `opencode.json` filename
-the seed is deep-merged: your keys are kept and the wrapper's `$schema` and
-`permission` keys are merged on top, so the injected `permission` block still
-wins. Keep secrets in the environment (`WithEnv`) and reference them from the
-seed with OpenCode's `{env:...}` indirection.
+the seed is deep-merged with the wrapper's `$schema`. The seed must not contain
+`permission` or `mcp`; permission rides the native session and MCP rides the
+directory scope. Keep secrets in the process environment (`WithEnv`) and
+reference them from the seed with OpenCode's `{env:...}` indirection.
 
 The example below registers an OpenAI-style provider served by a self-hosted
 LiteLLM gateway. `options.baseURL` ends in `/v1`, and `apiKey` reads
@@ -80,7 +80,6 @@ LiteLLM gateway. `options.baseURL` ends in `/v1`, and `apiKey` reads
 }
 ```
 
-The wrapper still injects its `permission` block via the merge, so seeded models
-respect the session's permission policy. Models seeded this way appear as
+Models seeded this way appear as
 `litellm/<model>` in the `model` config option, populated from authenticated
 `GET /config/providers` like every other provider.

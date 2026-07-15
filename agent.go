@@ -2,8 +2,10 @@ package opencodeacp
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -26,6 +28,7 @@ var (
 	agentJSONMarshal   = json.Marshal
 	agentJSONUnmarshal = json.Unmarshal
 	newAgentForServe   = NewAgent
+	agentRandRead      = rand.Read
 )
 
 // Agent exposes OpenCode through ACP.
@@ -35,15 +38,31 @@ type Agent struct {
 	observe    *observer.Observer
 	optionsErr error
 
-	mu                 sync.Mutex
-	closed             bool
-	conn               agentClient
-	sessions           map[acp.SessionId]*session
-	deleted            map[acp.SessionId]struct{}
-	deleteCleanup      map[acp.SessionId]deleteCleanupRecord
-	clientCalls        chan struct{}
-	clientCapabilities acp.ClientCapabilities
-	positionEncoding   acp.PositionEncodingKind
+	mu                    sync.Mutex
+	closed                bool
+	conn                  agentClient
+	sessions              map[acp.SessionId]*session
+	deleted               map[acp.SessionId]struct{}
+	clientCalls           chan struct{}
+	clientCapabilities    acp.ClientCapabilities
+	positionEncoding      acp.PositionEncodingKind
+	runtime               opencode.Client
+	runtimeGeneration     uint64
+	runtimeStarting       chan struct{}
+	runtimeStartErr       error
+	runtimeFatalErr       error
+	runtimeNativeRelease  func()
+	runtimeScratchRelease func()
+	directories           map[string]directoryBinding
+	directoryIncarnation  directoryBindingIncarnation
+	fingerprintKey        [32]byte
+	restoreMu             sync.Mutex
+}
+
+type directoryBinding struct {
+	SessionID      acp.SessionId
+	MCPFingerprint string
+	Incarnation    directoryBindingIncarnation
 }
 
 var (
@@ -55,7 +74,20 @@ var (
 func NewAgent(opts ...Option) *Agent {
 	options := applyOptions(opts)
 	limits, optionsErr := normalizeConcurrencyLimits(options.ConcurrencyLimits)
+
 	options.ConcurrencyLimits = limits
+
+	if options.NativeVersion != syncNativeVersion {
+		optionsErr = errors.Join(optionsErr, fmt.Errorf("OpenCode version must be exactly %s for %s", syncNativeVersion, SessionStoreFormat))
+	}
+
+	if options.HealthCheckTimeout <= 0 {
+		optionsErr = errors.Join(optionsErr, errors.New("OpenCode health check timeout must be positive"))
+	}
+
+	if options.TurnTimeout < 0 {
+		optionsErr = errors.Join(optionsErr, errors.New("OpenCode turn timeout cannot be negative"))
+	}
 
 	log := options.Logger
 	if log == nil {
@@ -66,32 +98,41 @@ func NewAgent(opts ...Option) *Agent {
 		options.SessionStore = NewInMemorySessionStore()
 	}
 
-	return &Agent{
-		options:    options,
-		log:        log,
-		optionsErr: optionsErr,
-		observe: observer.New(observer.Config{
-			MeterProvider:  options.MeterProvider,
-			Propagator:     options.TextMapPropagator,
-			TracerProvider: options.TracerProvider,
-			Version:        options.AgentVersion,
-		}),
-		sessions:      make(map[acp.SessionId]*session),
-		deleted:       make(map[acp.SessionId]struct{}),
-		deleteCleanup: make(map[acp.SessionId]deleteCleanupRecord),
-		clientCalls:   make(chan struct{}, limits.MaxConcurrentClientCalls),
+	observe := observer.New(observer.Config{
+		MeterProvider:  options.MeterProvider,
+		Propagator:     options.TextMapPropagator,
+		TracerProvider: options.TracerProvider,
+		Version:        options.AgentVersion,
+	})
+	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe)
+
+	agent := &Agent{
+		options:     options,
+		log:         log,
+		optionsErr:  optionsErr,
+		observe:     observe,
+		sessions:    make(map[acp.SessionId]*session),
+		deleted:     make(map[acp.SessionId]struct{}),
+		directories: make(map[string]directoryBinding),
+		clientCalls: make(chan struct{}, limits.MaxConcurrentClientCalls),
 	}
+	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
+		agent.optionsErr = errors.Join(agent.optionsErr, fmt.Errorf("create runtime fingerprint key: %w", err))
+	}
+
+	return agent
 }
 
-func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) error {
+func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) (serveErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	agent := newAgentForServe(opts...)
 	defer func() {
-		if err := agent.Close(); err != nil {
-			agent.log.DebugContext(context.Background(), "close OpenCode ACP agent failed", slog.String("error", err.Error()))
+		if closeErr := agent.Close(); closeErr != nil {
+			agent.log.DebugContext(context.Background(), "close OpenCode ACP agent failed", slog.String("error", closeErr.Error()))
+			serveErr = closeErr
 		}
 	}()
 
@@ -129,6 +170,12 @@ func (a *Agent) Close() error {
 	}
 
 	a.sessions = make(map[acp.SessionId]*session)
+	runtime := a.runtime
+	a.runtime = nil
+	nativeRelease := a.runtimeNativeRelease
+	a.runtimeNativeRelease = nil
+	scratchRelease := a.runtimeScratchRelease
+	a.runtimeScratchRelease = nil
 	a.closed = true
 	a.conn = nil
 	a.mu.Unlock()
@@ -140,6 +187,19 @@ func (a *Agent) Close() error {
 		err = errors.Join(err, session.Close(ctx))
 
 		cancel()
+	}
+
+	var shutdownErr error
+
+	if runtime != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		shutdownErr = runtime.Shutdown(ctx)
+
+		cancel()
+	}
+
+	if runtime != nil || nativeRelease != nil || scratchRelease != nil {
+		err = errors.Join(err, a.cleanupRuntimeResources(shutdownErr, nativeRelease, scratchRelease))
 	}
 
 	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
@@ -162,15 +222,15 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 
 	opencodeMeta := map[string]any{
 		"fork": map[string]any{
-			"unstable": true,
-			"method":   ForkSessionMethod,
-			"request":  "acp.UnstableForkSessionRequest JSON payload only",
-			"response": "acp.UnstableForkSessionResponse JSON payload only",
+			"unstable":       true,
+			"method":         ForkSessionMethod,
+			jsonFieldRequest: "acp.UnstableForkSessionRequest JSON payload only",
+			"response":       "acp.UnstableForkSessionResponse JSON payload only",
 		},
 		"elicitation": map[string]any{
-			"unstable": true,
-			"scope":    "session",
-			"tracks":   "in-progress ACP elicitation RFD",
+			"unstable":     true,
+			jsonFieldScope: string(RuntimeResourceSession),
+			"tracks":       "in-progress ACP elicitation RFD",
 		},
 		rawEventCapabilityKey: map[string]any{
 			"method":         RawEventMethod,
@@ -179,8 +239,8 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 			"defaultEnabled": false,
 		},
 		"sessionStore": map[string]any{
-			"format": SessionStoreFormat,
-			"key":    []string{jsonFieldSessionID, "subpath"},
+			"format":     SessionStoreFormat,
+			jsonFieldKey: []string{jsonFieldSessionID, "subpath"},
 		},
 		structuredOutputMetaKey: map[string]any{
 			"config": outputSchemaOptionPath,
@@ -198,7 +258,10 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		},
 		AuthMethods: []acp.AuthMethod{},
 		AgentCapabilities: acp.AgentCapabilities{
-			Meta:        map[string]any{opencodeMetaKey: opencodeMeta},
+			Meta: map[string]any{
+				opencodeMetaKey:  opencodeMeta,
+				routeEnvelopeKey: map[string]any{"versions": []int{routeEnvelopeVersion}},
+			},
 			LoadSession: true,
 			McpCapabilities: acp.McpCapabilities{
 				Http: true,
@@ -258,7 +321,7 @@ func (a *Agent) ensureOpen() error {
 	defer a.mu.Unlock()
 
 	if a.closed {
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "agent closed"})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
 	}
 
 	return nil
@@ -313,7 +376,15 @@ func (a *Agent) storeStartedSession(session *session) error {
 	defer a.mu.Unlock()
 
 	if a.closed {
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "agent closed"})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+	}
+
+	if a.runtime == nil {
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "shared OpenCode runtime exited"})
+	}
+
+	if session.runtimeGeneration != a.runtimeGeneration {
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "shared OpenCode runtime generation changed"})
 	}
 
 	if len(a.sessions) >= a.options.ConcurrencyLimits.MaxActiveSessions {
@@ -379,12 +450,6 @@ func (a *Agent) clientSupportsFormElicitation() bool {
 	}
 
 	return caps.Form != nil || caps.Url == nil
-}
-
-func (a *Agent) clientSupportsURLElicitation() bool {
-	caps := a.clientElicitationCapabilities()
-
-	return caps != nil && caps.Url != nil
 }
 
 func selectPositionEncoding(values []acp.PositionEncodingKind) acp.PositionEncodingKind {

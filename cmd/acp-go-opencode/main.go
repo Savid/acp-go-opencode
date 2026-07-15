@@ -30,20 +30,20 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags.SetOutput(stderr)
 
 	opencodePath := flags.String("path", "", "path to opencode CLI")
-	opencodeHome := flags.String("home", "", "unsupported: OpenCode has no native config or auth root; a non-empty value is rejected per session")
-	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
+	opencodeHome := flags.String("home", "", "exclusive shared OpenCode XDG runtime root")
+	scratchDir := flags.String("scratch-dir", "", "parent for a generated runtime root and transient scratch")
 	model := flags.String("model", "", "default OpenCode model as provider/model")
 	debug := flags.Bool("debug", false, "write debug logs to stderr")
 	printVersion := flags.Bool("version", false, "print adapter version and exit")
 	pure := flags.Bool("opencode-pure", false, "start OpenCode without external plugins")
 	questionTool := flags.Bool("opencode-question-tool", false, "enable OpenCode native question tool mapping")
 	logLevel := flags.String("opencode-log-level", "", "OpenCode native server log level")
-	minimumVersion := flags.String("opencode-minimum-version", "", "minimum accepted OpenCode version")
+	nativeVersion := flags.String("opencode-version", "1.17.18", "exact OpenCode version required by the sync-event store")
 	healthTimeout := flags.Duration("opencode-health-timeout", opencode.HealthCheckTimeout, "OpenCode server readiness timeout")
 
 	var seedFiles seedFileFlag
 
-	flags.Var(&seedFiles, "seed-file", "seed a file into the session config root as <relpath>=<hostpath> (repeatable)")
+	flags.Var(&seedFiles, "seed-file", "seed a file into the shared runtime config root as <relpath>=<hostpath> (repeatable)")
 
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -95,8 +95,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		opencodeacp.WithOpenCodeHealthCheckTimeout(*healthTimeout),
 	)
 
-	if *minimumVersion != "" {
-		opts = append(opts, opencodeacp.WithOpenCodeMinimumVersion(*minimumVersion))
+	if *nativeVersion != "" {
+		opts = append(opts, opencodeacp.WithVersion(*nativeVersion))
 	}
 
 	if len(seedFiles.files) > 0 {

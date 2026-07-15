@@ -4,9 +4,9 @@ description: How acp-go-opencode turns a local OpenCode install into an embeddab
 ---
 
 `acp-go-opencode` exposes [OpenCode](https://opencode.ai) as an
-[Agent Client Protocol](https://agentclientprotocol.com/) agent. It runs one
-authenticated loopback `opencode serve` process per ACP session and maps that
-process's native REST and SSE state onto ACP methods and notifications, so an
+[Agent Client Protocol](https://agentclientprotocol.com/) agent. Each Agent
+owns one authenticated loopback `opencode serve` runtime and maps its
+directory-scoped REST and SSE state onto ACP methods and notifications, so an
 ACP host can drive OpenCode without speaking OpenCode's native protocol.
 
 Use it two ways: as a standalone subprocess an editor or host launches
@@ -15,13 +15,15 @@ Use it two ways: as a standalone subprocess an editor or host launches
 ## What the adapter owns
 
 The adapter is a thin translation layer. Its responsibilities stop at the ACP
-boundary: ACP dispatch, per-session process launch, per-session XDG isolation,
+boundary: ACP dispatch, shared-runtime ownership, directory/session routing,
 REST/SSE event mapping, permission and question bridging, config-option
-resolution, and `opencode-state-v1` session storage.
+resolution, and `opencode-sync-events-v1` session storage.
 
-Each session is fully isolated: its own `opencode serve` process bound to
-`127.0.0.1`, its own random basic-auth password, and its own XDG data, config,
-cache, and state directories under a configurable scratch directory (`-scratch-dir` / `WithScratchDir`, defaulting to the system temp directory).
+The runtime binds to `127.0.0.1`, uses a random basic-auth password, and owns
+one exclusive XDG data/config/cache/state root. Native session IDs and
+directory-scoped event streams keep session traffic separate. One canonical
+working directory can have only one live session principal, because OpenCode's
+dynamic MCP registration is directory-scoped.
 
 ## What the adapter does not own
 

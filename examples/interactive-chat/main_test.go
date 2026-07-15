@@ -1137,6 +1137,17 @@ func TestRunPrompt(t *testing.T) {
 	require.Contains(t, output.String(), "stop> cancelled")
 }
 
+func TestPromptEntryPointsRejectTurnNonceFailure(t *testing.T) {
+	original := newTurnNonce
+	newTurnNonce = func() (string, error) { return "", errors.New("entropy failed") }
+	t.Cleanup(func() { newTurnNonce = original })
+
+	conn := &fakeAgentConnection{}
+	ui := newChatUI(io.Discard)
+	require.ErrorContains(t, runPrompt(context.Background(), conn, ui, "session-1", "hello"), "entropy failed")
+	require.ErrorContains(t, runInteractiveLoop(context.Background(), conn, ui, strings.NewReader(""), "session-1", "hello"), "entropy failed")
+}
+
 func TestRun(t *testing.T) {
 	originalStartAgent := startAgent
 	originalGetwd := getwd

@@ -7,7 +7,12 @@ import (
 	"strings"
 	"testing"
 
+	"encoding/json"
+
 	"github.com/coder/acp-go-sdk"
+
+	"github.com/savid/acp-go-opencode/internal/opencode"
+	"github.com/stretchr/testify/require"
 )
 
 func TestOutputSchemaAccepted(t *testing.T) {
@@ -37,7 +42,7 @@ func TestOutputSchemaInvalidRejected(t *testing.T) {
 func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.closeErr = errors.New("close failed")
+	client.closeErr = errors.Join(errors.New("close failed"), opencode.ErrProcessTreeUnproven)
 	agent := NewAgent()
 	session := testSession(agent, client)
 	agent.sessions[session.id] = session
@@ -45,9 +50,9 @@ func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	oldNewAgent := newAgentForServe
 	newAgentForServe = func(...Option) *Agent { return agent }
 	t.Cleanup(func() { newAgentForServe = oldNewAgent })
-	if err := Serve(ctx, strings.NewReader(""), io.Discard); err != nil {
-		t.Fatalf("Serve: %v", err)
-	}
+	err := Serve(ctx, strings.NewReader(""), io.Discard)
+	require.ErrorIs(t, err, ErrProcessTreeUnproven)
+	require.ErrorIs(t, ErrProcessTreeUnproven, opencode.ErrProcessTreeUnproven)
 
 	oldMarshal := agentJSONMarshal
 	oldUnmarshal := agentJSONUnmarshal
@@ -90,7 +95,8 @@ func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	if _, err := agent.SetSessionMode(ctx, acp.SetSessionModeRequest{}); err == nil {
 		t.Fatal("SetSessionMode accepted")
 	}
-	if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: session.id}); err != nil {
+	session.beginTurn(ctx, "nonce")
+	if err := agent.Cancel(ctx, CancelRequest(session.id, "nonce")); err != nil {
 		t.Fatalf("Cancel: %v", err)
 	}
 	if !session.wasCancelled() && client.abortCount() == 0 {
@@ -114,4 +120,105 @@ func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	if _, err := io.Copy(io.Discard, strings.NewReader("")); err != nil {
 		t.Fatal(err)
 	}
+}
+func TestAgentAndRouteRemainingPublicBranches(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, Serve(cancelled, strings.NewReader(""), io.Discard), context.Canceled)
+
+	agent := NewAgent()
+	agent.deleted["deleted"] = struct{}{}
+	_, err := agent.session("deleted")
+	require.Error(t, err)
+
+	_, err = parseInboundTurnRoute(map[string]any{routeEnvelopeKey: map[string]any{
+		routeFieldVersion: 999,
+		"turnNonce":       "nonce",
+	}})
+	require.Error(t, err)
+
+	client := newFakeOpenCodeClient()
+	client.forkSession = testNativeSession("native-child")
+	client.getSession = testNativeSession("native-child")
+	client.ensureSyncAggregate("native-child")
+	agent.runtime = client
+	parent := testSession(agent, client)
+	agent.sessions[parent.id] = parent
+	request := ForkSessionRequest(parent.id, t.TempDir())
+	value, err := agent.HandleExtensionMethod(context.Background(), ForkSessionMethod, mustJSON(t, request))
+	require.NoError(t, err)
+	require.NotNil(t, value)
+}
+
+func TestConnectionRemainingDispatchValidationAndBackpressureBranches(t *testing.T) {
+	agent := NewAgent()
+	connection := &localAgentConnection{agent: agent}
+	connection.initialized.Store(true)
+	_, requestErr := connection.handle(context.Background(), "_unknown", json.RawMessage(`{}`))
+	require.NotNil(t, requestErr)
+
+	called := make(chan struct{})
+	writer := newPostResponseWriter(io.Discard, func(acp.SessionId) func() {
+		return func() { close(called) }
+	})
+	writer.observeRequestLine([]byte(`{"id":1,"method":"session/new","params":{}}`))
+	_, err := writer.Write([]byte(`{"id":1,"result":{"sessionId":"session"}}`))
+	require.NoError(t, err)
+	<-called
+
+	notification := localNotification(func(*Agent, context.Context, acp.CancelNotification) error { return nil })
+	_, requestErr = notification(context.Background(), agent, json.RawMessage(`{`))
+	require.NotNil(t, requestErr)
+	_, requestErr = notification(context.Background(), agent, mustJSON(t, CancelRequest("session", "nonce")))
+	require.Nil(t, requestErr)
+
+	_, requestErr = localResponse(func(*Agent, context.Context, acp.PromptRequest) (acp.PromptResponse, error) {
+		return acp.PromptResponse{}, nil
+	})(context.Background(), agent, json.RawMessage(`{}`))
+	require.NotNil(t, requestErr)
+
+	for len(agent.clientCalls) < cap(agent.clientCalls) {
+		agent.clientCalls <- struct{}{}
+	}
+	form := acp.NewUnstableCreateElicitationRequestForm(acp.UnstableElicitationSchema{})
+	_, err = connection.CreateElicitation(context.Background(), form, elicitationScope{SessionID: "session", TurnNonce: "nonce", ToolCallID: "tool"})
+	require.Error(t, err)
+	_, err = connection.RequestPermission(context.Background(), acp.RequestPermissionRequest{})
+	require.Error(t, err)
+	require.Error(t, connection.SessionUpdate(context.Background(), acp.SessionNotification{}))
+	require.Error(t, connection.NotifyExtension(context.Background(), "_extension", nil))
+}
+
+func TestScopedElicitationRemainingURLMetadataAndEncodingBranches(t *testing.T) {
+	request := acp.NewUnstableCreateElicitationRequestUrl("id", "https://example.test")
+	request.Url.Message = "message"
+	request.Url.Meta = map[string]any{"native": true}
+	raw, err := scopedElicitationParams(request, elicitationScope{SessionID: "session", TurnNonce: "nonce", ToolCallID: "tool"})
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "native")
+
+	request.Url.Meta = map[string]any{routeEnvelopeKey: map[string]any{}}
+	_, err = scopedElicitationParams(request, elicitationScope{SessionID: "session", TurnNonce: "nonce", ToolCallID: "tool"})
+	require.Error(t, err)
+
+	form := acp.NewUnstableCreateElicitationRequestForm(acp.UnstableElicitationSchema{})
+	form.Form.Meta = map[string]any{"cannotEncode": func() {}}
+	_, err = scopedElicitationParams(form, elicitationScope{SessionID: "session", TurnNonce: "nonce", ToolCallID: "tool"})
+	require.Error(t, err)
+}
+
+func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
+	agent := NewAgent()
+	client := newFakeOpenCodeClient()
+	client.agents = []opencode.NativeAgent{{Name: "build"}, {Name: "plan"}}
+	session := testSession(agent, client)
+	agent.sessions[session.id] = session
+
+	boolean := true
+	_, err := agent.SetSessionConfigOption(context.Background(), acp.SetSessionConfigOptionRequest{Boolean: &acp.SetSessionConfigOptionBoolean{SessionId: session.id, ConfigId: configMode, Value: boolean}})
+	require.Error(t, err)
+	_, err = agent.SetSessionConfigOption(context.Background(), SetConfigOptionRequest(session.id, configMode, "plan"))
+	require.NoError(t, err)
+
+	require.Equal(t, map[string]string{"key": "value"}, cloneAny(map[string]string{"key": "value"}))
 }

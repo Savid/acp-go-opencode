@@ -13,7 +13,7 @@ import (
 
 const (
 	SessionStoreMainSubpath = ""
-	SessionStoreFormat      = "opencode-state-v1"
+	SessionStoreFormat      = "opencode-sync-events-v1"
 )
 
 type SessionStoreEntry = json.RawMessage
@@ -139,25 +139,37 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 	}
 
 	mainCount := 0
+	mainIncluded := false
+	seenReplacement := make(map[SessionKey]struct{}, len(replacements))
 
 	for _, replacement := range replacements {
-		if replacement.Key.SessionID != main.SessionID {
-			return fmt.Errorf("replacement key does not match main session")
+		if _, duplicate := seenReplacement[replacement.Key]; duplicate {
+			return fmt.Errorf("duplicate replacement key")
 		}
 
+		seenReplacement[replacement.Key] = struct{}{}
 		if replacement.Key.Subpath == SessionStoreMainSubpath {
 			mainCount++
+
+			if replacement.Key.SessionID == main.SessionID {
+				mainIncluded = true
+			}
 		}
 	}
 
-	if mainCount != 1 {
-		return fmt.Errorf("replacements must include the main key exactly once")
+	if mainCount == 0 || !mainIncluded {
+		return fmt.Errorf("replacements must include at least one main key")
 	}
 
 	now := time.Now().UnixMilli()
 
+	replacedSessions := make(map[string]struct{}, len(replacements))
+	for _, replacement := range replacements {
+		replacedSessions[replacement.Key.SessionID] = struct{}{}
+	}
+
 	for candidate := range s.entries {
-		if candidate.SessionID == main.SessionID {
+		if _, replacing := replacedSessions[candidate.SessionID]; replacing {
 			delete(s.entries, candidate)
 			delete(s.updatedAt, candidate)
 			s.tombstones[candidate] = now

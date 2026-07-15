@@ -2,24 +2,22 @@
 // Protocol agent.
 //
 // Most hosts run the agent over a pair of JSON-RPC streams using [Serve].
-// Serve launches one isolated loopback `opencode serve` process per ACP
-// session, maps ACP requests into OpenCode REST calls, streams native SSE
-// events back to the client as ACP session updates, and tears the process
-// down when the session closes. Hosts must complete ACP initialization before
-// issuing session or other agent methods.
+// Serve launches one authenticated loopback `opencode serve` process owned by
+// the Agent, maps ACP requests into directory-scoped OpenCode REST/SSE calls,
+// and keeps that runtime alive across session close. Hosts must complete ACP
+// initialization before issuing session or other agent methods.
 //
 // Hosts should use [Serve] for the JSON-RPC transport; hosts that embed the
 // agent directly construct one with [NewAgent] and the same [Option] values.
 // OpenCode authentication and provider credentials remain owned by the local
-// OpenCode installation. Each session runs under its own XDG home created
-// beneath the ephemeral scratch directory ([WithScratchDir]), so native state
-// never leaks between sessions.
+// OpenCode installation. [WithHome] selects the Agent's exclusive shared XDG
+// root. When it is empty, the adapter materializes the root beneath the parent
+// selected by [WithScratchDir].
 //
 // Hosts that need durable remote resume can provide [WithSessionStore]. A
-// session store receives `opencode-state-v1` snapshots keyed by the
-// ACP-visible session ID and subpath, can back session/list, and can hydrate
-// a snapshot into a fresh per-session XDG home for session/load or
-// session/resume when the local native state is absent.
+// session store receives `opencode-sync-events-v1` native event bundles keyed
+// by the ACP-visible session ID and subpath, can back session/list, and can
+// replay an adopted parent/child graph through OpenCode's online sync API.
 //
 // Hosts that need structured output can attach [OpenCodeOptions] with
 // [WithSessionOpenCodeOptions] or use [WithSessionOutputSchema]. Parsed

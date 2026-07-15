@@ -38,7 +38,7 @@ func TestApplyOptions(t *testing.T) {
 		WithOpenCodePure(true),
 		WithOpenCodeQuestionTool(true),
 		WithOpenCodeLogLevel("INFO"),
-		WithOpenCodeMinimumVersion("1.2.3"),
+		WithVersion("1.2.3"),
 		WithOpenCodeHealthCheckTimeout(time.Second),
 	})
 	if opts.AgentName != "name" || opts.AgentTitle != "title" || opts.ExecutablePath != "opencode" ||
