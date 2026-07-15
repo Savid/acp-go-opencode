@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -198,6 +199,36 @@ func activeJobProcesses(job windows.Handle) (uint32, error) {
 		return 0, fmt.Errorf("query Windows Job Object process count: %w", err)
 	}
 	return info.ActiveProcesses, nil
+}
+
+func querySupervisorProcessSnapshot(identityPath string) (int, bool) {
+	raw, err := os.ReadFile(identityPath)
+	if err != nil {
+		return 0, false
+	}
+
+	name := strings.TrimSpace(string(raw))
+	namePtr, err := windows.UTF16PtrFromString(name)
+	if err != nil || name == "" {
+		return 0, false
+	}
+
+	job, openErr := windows.CreateJobObject(nil, namePtr)
+	if job == 0 || !errors.Is(openErr, windows.ERROR_ALREADY_EXISTS) {
+		if job != 0 {
+			_ = windows.CloseHandle(job)
+		}
+
+		return 0, false
+	}
+	defer windows.CloseHandle(job) //nolint:errcheck // The queried count remains valid after best-effort handle cleanup.
+
+	active, err := activeJobProcesses(job)
+	if err != nil {
+		return 0, false
+	}
+
+	return int(active), true
 }
 
 func configureIndependentSupervisor(cmd *exec.Cmd) {

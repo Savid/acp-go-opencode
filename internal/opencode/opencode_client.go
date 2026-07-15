@@ -28,7 +28,9 @@ import (
 )
 
 const (
-	opencodeDefaultUsername = "opencode"
+	opencodeDefaultUsername          = "opencode"
+	runtimeProcessHomeLockSupervisor = "home_lock_supervisor"
+	runtimeProcessProviderDescendant = "provider_descendant"
 
 	// opencodeExecutableName is the OpenCode program name: the default
 	// executable and the per-XDG config directory.
@@ -156,28 +158,34 @@ type StartOptions struct {
 	// on-disk materialization. The root package resolves it (system temp
 	// directory when unset); this package never consults the system temp
 	// directory itself. It is used only as the fallback root when Root is empty.
-	ScratchParent       string
-	ExecutablePath      string
-	Env                 map[string]string
-	Pure                bool
-	QuestionTool        bool
-	LogLevel            string
-	ExactVersion        string
-	HealthTimeout       time.Duration
-	Logger              *slog.Logger
-	ExistingXDG         XDGDirs
-	SkipVersionGate     bool
-	SeedFiles           map[string]string
-	SkipSupervisor      bool
-	ObserveProcess      func(context.Context, string, int64)
-	ObserveStartupStage func(context.Context, string, string, time.Duration, error)
+	ScratchParent          string
+	ExecutablePath         string
+	Env                    map[string]string
+	Pure                   bool
+	QuestionTool           bool
+	LogLevel               string
+	ExactVersion           string
+	HealthTimeout          time.Duration
+	Logger                 *slog.Logger
+	ExistingXDG            XDGDirs
+	SkipVersionGate        bool
+	SeedFiles              map[string]string
+	SkipSupervisor         bool
+	ObserveProcess         func(context.Context, string, int64)
+	ObserveProcessSnapshot func(context.Context, string, int)
+	ObserveStartupStage    func(context.Context, string, string, time.Duration, error)
 }
 
 type runtimeProcessObservation struct {
 	mu                  sync.Mutex
 	exited              bool
 	supervisorsObserved bool
+	descendantsObserved bool
+	descendantsQuiesced bool
 	observe             func(context.Context, string, int64)
+	observeSnapshot     func(context.Context, string, int)
+	publishing          bool
+	pending             []func()
 }
 
 func (o *runtimeProcessObservation) markSupervisorsReady(ctx context.Context) {
@@ -193,8 +201,68 @@ func (o *runtimeProcessObservation) markSupervisorsReady(ctx context.Context) {
 	}
 
 	o.supervisorsObserved = true
+	startPublishing := o.enqueueLocked(func() {
+		o.observe(ctx, runtimeProcessHomeLockSupervisor, 2)
+	})
 	o.mu.Unlock()
-	o.observe(ctx, "home_lock_supervisor", 2)
+
+	if startPublishing {
+		o.publish()
+	}
+}
+
+func (o *runtimeProcessObservation) markDescendantsReady(ctx context.Context, inventory func() (int, bool)) {
+	if o == nil || o.observeSnapshot == nil || inventory == nil {
+		return
+	}
+
+	o.mu.Lock()
+	if o.exited || o.descendantsObserved || o.descendantsQuiesced {
+		o.mu.Unlock()
+
+		return
+	}
+
+	count, available := inventory()
+	if !available || count < 0 {
+		o.mu.Unlock()
+
+		return
+	}
+
+	o.descendantsObserved = true
+	startPublishing := o.enqueueLocked(func() {
+		o.observeSnapshot(ctx, runtimeProcessProviderDescendant, count)
+	})
+	o.mu.Unlock()
+
+	if startPublishing {
+		o.publish()
+	}
+}
+
+func (o *runtimeProcessObservation) markDescendantsQuiesced(ctx context.Context) {
+	if o == nil || o.observeSnapshot == nil {
+		return
+	}
+
+	o.mu.Lock()
+
+	if o.descendantsQuiesced {
+		o.mu.Unlock()
+
+		return
+	}
+
+	o.descendantsQuiesced = true
+	startPublishing := o.enqueueLocked(func() {
+		o.observeSnapshot(ctx, runtimeProcessProviderDescendant, 0)
+	})
+	o.mu.Unlock()
+
+	if startPublishing {
+		o.publish()
+	}
 }
 
 func (o *runtimeProcessObservation) markExited() {
@@ -206,11 +274,47 @@ func (o *runtimeProcessObservation) markExited() {
 	o.exited = true
 	observed := o.supervisorsObserved
 	o.supervisorsObserved = false
-	observe := o.observe
+
+	startPublishing := false
+	if observed && o.observe != nil {
+		startPublishing = o.enqueueLocked(func() {
+			o.observe(context.Background(), runtimeProcessHomeLockSupervisor, -2)
+		})
+	}
 	o.mu.Unlock()
 
-	if observed && observe != nil {
-		observe(context.Background(), "home_lock_supervisor", -2)
+	if startPublishing {
+		o.publish()
+	}
+}
+
+func (o *runtimeProcessObservation) enqueueLocked(event func()) bool {
+	o.pending = append(o.pending, event)
+	if o.publishing {
+		return false
+	}
+
+	o.publishing = true
+
+	return true
+}
+
+func (o *runtimeProcessObservation) publish() {
+	for {
+		o.mu.Lock()
+		if len(o.pending) == 0 {
+			o.publishing = false
+			o.mu.Unlock()
+
+			return
+		}
+
+		event := o.pending[0]
+		o.pending[0] = nil
+		o.pending = o.pending[1:]
+		o.mu.Unlock()
+
+		event()
 	}
 }
 
@@ -251,21 +355,22 @@ type openCodeServer struct {
 	sessionPermissionListSupport bool
 	sessionQuestionListSupport   bool
 
-	events            chan Event
-	errs              chan error
-	closed            chan struct{}
-	once              sync.Once
-	directory         string
-	scopeCancel       context.CancelFunc
-	runtimeOnce       *sync.Once
-	runtimeClosed     chan struct{}
-	runtimeExited     chan struct{}
-	mcpNames          []string
-	scopeCloseMu      sync.Mutex
-	scopeClosed       bool
-	supervisorControl io.WriteCloser
-	supervisor        *supervisorProof
-	waitDone          chan error
+	events             chan Event
+	errs               chan error
+	closed             chan struct{}
+	once               sync.Once
+	directory          string
+	scopeCancel        context.CancelFunc
+	runtimeOnce        *sync.Once
+	runtimeClosed      chan struct{}
+	runtimeExited      chan struct{}
+	mcpNames           []string
+	scopeCloseMu       sync.Mutex
+	scopeClosed        bool
+	supervisorControl  io.WriteCloser
+	supervisor         *supervisorProof
+	processObservation *runtimeProcessObservation
+	waitDone           chan error
 
 	streamMu    sync.Mutex
 	streamEpoch uint64
@@ -812,7 +917,10 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 	waitDone := make(chan error, 1)
 	runtimeExited := make(chan struct{})
 	waitCommand := openCodeWaitCommand
-	processObservation := &runtimeProcessObservation{observe: options.ObserveProcess}
+	processObservation := &runtimeProcessObservation{
+		observe:         options.ObserveProcess,
+		observeSnapshot: options.ObserveProcessSnapshot,
+	}
 
 	go func() {
 		defer processObservation.markExited()
@@ -826,23 +934,24 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 	go drainProcessPipe(options.Logger, "opencode stderr", stderr)
 
 	server := &openCodeServer{
-		httpClient:        &http.Client{Timeout: 30 * time.Second},
-		baseURL:           "http://127.0.0.1:" + strconv.Itoa(port),
-		username:          username,
-		password:          password,
-		cmd:               cmd,
-		cancel:            cancel,
-		xdg:               xdg,
-		log:               options.Logger,
-		events:            make(chan Event, 256),
-		errs:              make(chan error, 8),
-		closed:            make(chan struct{}),
-		runtimeOnce:       &sync.Once{},
-		runtimeClosed:     make(chan struct{}),
-		runtimeExited:     runtimeExited,
-		supervisorControl: supervisorControl,
-		supervisor:        supervisor,
-		waitDone:          waitDone,
+		httpClient:         &http.Client{Timeout: 30 * time.Second},
+		baseURL:            "http://127.0.0.1:" + strconv.Itoa(port),
+		username:           username,
+		password:           password,
+		cmd:                cmd,
+		cancel:             cancel,
+		xdg:                xdg,
+		log:                options.Logger,
+		events:             make(chan Event, 256),
+		errs:               make(chan error, 8),
+		closed:             make(chan struct{}),
+		runtimeOnce:        &sync.Once{},
+		runtimeClosed:      make(chan struct{}),
+		runtimeExited:      runtimeExited,
+		supervisorControl:  supervisorControl,
+		supervisor:         supervisor,
+		processObservation: processObservation,
+		waitDone:           waitDone,
 	}
 
 	readyCtx, readyCancel := context.WithTimeout(ctx, options.HealthTimeout)
@@ -861,6 +970,7 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 
 	if supervisor != nil {
 		processObservation.markSupervisorsReady(ctx)
+		processObservation.markDescendantsReady(ctx, supervisor.processSnapshot)
 	}
 
 	return server, nil
@@ -1014,7 +1124,12 @@ func (s *openCodeServer) Shutdown(ctx context.Context) error {
 			}
 
 			if s.supervisor != nil {
-				err = errors.Join(err, s.supervisor.awaitCompletion(ctx))
+				proofErr := s.supervisor.awaitCompletion(ctx)
+				if proofErr == nil {
+					s.processObservation.markDescendantsQuiesced(context.Background())
+				}
+
+				err = errors.Join(err, proofErr)
 			}
 		}
 

@@ -34,3 +34,4 @@ func configureIndependentSupervisor(*exec.Cmd) {}
 func terminateIndependentSupervisor(*exec.Cmd) error {
 	return unsupportedContainment()
 }
+func querySupervisorProcessSnapshot(string) (int, bool) { return 0, false }

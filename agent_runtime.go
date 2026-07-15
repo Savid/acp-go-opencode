@@ -312,6 +312,9 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, func()
 		ObserveProcess: func(processCtx context.Context, kind string, delta int64) {
 			observeRuntimeProcess(processCtx, hooks, RuntimeProcessKind(kind), delta)
 		},
+		ObserveProcessSnapshot: func(processCtx context.Context, kind string, count int) {
+			observeRuntimeProcessSnapshot(processCtx, hooks, RuntimeProcessKind(kind), count)
+		},
 		ObserveStartupStage: func(stageCtx context.Context, lifecycle, stage string, elapsed time.Duration, stageErr error) {
 			observe := hooks.ObserveStartupStage
 			if observe != nil {

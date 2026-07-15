@@ -100,6 +100,56 @@ func TestShutdownSupervisorWaitAndLoggingBranches(t *testing.T) {
 	}
 }
 
+func TestShutdownEmitsZeroOnlyForProvenDescendantQuiescence(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		completion bool
+		wantZero   bool
+	}{
+		{name: "proven", completion: true, wantZero: true},
+		{name: "unproven", wantZero: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restoreOpenCodeClientSeams(t)
+			root := t.TempDir()
+			started := filepath.Join(root, "started")
+			completion := filepath.Join(root, "complete")
+			require.NoError(t, writeSupervisorMarker(started))
+			if tc.completion {
+				require.NoError(t, writeSupervisorMarker(completion))
+			}
+
+			var snapshots []int
+			observation := &runtimeProcessObservation{observeSnapshot: func(_ context.Context, _ string, count int) {
+				snapshots = append(snapshots, count)
+			}}
+			observation.markDescendantsReady(t.Context(), func() (int, bool) { return 3, true })
+			waitDone := make(chan error, 1)
+			waitDone <- nil
+			server := &openCodeServer{
+				cmd: &exec.Cmd{Process: &os.Process{Pid: 123}}, supervisorControl: nopWriteCloser{},
+				supervisor:         &supervisorProof{started: started, completion: completion},
+				processObservation: observation, waitDone: waitDone,
+			}
+
+			ctx := context.Background()
+			if !tc.completion {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			err := server.Shutdown(ctx)
+			if tc.wantZero {
+				require.NoError(t, err)
+				require.Equal(t, []int{3, 0}, snapshots)
+			} else {
+				require.ErrorIs(t, err, ErrProcessTreeUnproven)
+				require.Equal(t, []int{3}, snapshots)
+			}
+		})
+	}
+}
+
 type nopWriteCloser struct{}
 
 func (nopWriteCloser) Write(value []byte) (int, error) { return len(value), nil }

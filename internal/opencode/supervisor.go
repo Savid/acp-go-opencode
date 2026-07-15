@@ -34,16 +34,17 @@ const (
 var ErrProcessTreeUnproven = errors.New("OpenCode process tree exit is unproven")
 
 type supervisorConfig struct {
-	NativePath    string   `json:"nativePath"`
-	NativeArgs    []string `json:"nativeArgs"`
-	NativeEnv     []string `json:"nativeEnv"`
-	NativeDir     string   `json:"nativeDir,omitempty"`
-	Home          string   `json:"home"`
-	Scratch       string   `json:"scratch"`
-	JobName       string   `json:"jobName,omitempty"`
-	Started       string   `json:"started"`
-	Completion    string   `json:"completion"`
-	NativePIDFile string   `json:"nativePidFile"`
+	NativePath        string   `json:"nativePath"`
+	NativeArgs        []string `json:"nativeArgs"`
+	NativeEnv         []string `json:"nativeEnv"`
+	NativeDir         string   `json:"nativeDir,omitempty"`
+	Home              string   `json:"home"`
+	Scratch           string   `json:"scratch"`
+	JobName           string   `json:"jobName,omitempty"`
+	Started           string   `json:"started"`
+	Completion        string   `json:"completion"`
+	NativePIDFile     string   `json:"nativePidFile"`
+	InventoryIdentity string   `json:"inventoryIdentity"`
 }
 
 type supervisorReady struct {
@@ -64,10 +65,12 @@ var supervisorInput io.Reader = os.Stdin
 var supervisorOutput io.Writer = os.Stdout
 var supervisorError io.Writer = os.Stderr
 var supervisorExit = os.Exit
+var supervisorProcessSnapshot = querySupervisorProcessSnapshot
 
 type supervisorProof struct {
-	started    string
-	completion string
+	started           string
+	completion        string
+	inventoryIdentity string
 }
 
 // init turns the embedding command itself into either member of the
@@ -181,6 +184,7 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 	config.Started = filepath.Join(config.Scratch, "supervisor-started-"+markerNonce)
 	config.Completion = filepath.Join(config.Scratch, "supervisor-complete-"+markerNonce)
 	config.NativePIDFile = filepath.Join(config.Scratch, "supervisor-native-pid-"+markerNonce)
+	config.InventoryIdentity = filepath.Join(config.Scratch, "supervisor-inventory-"+markerNonce)
 
 	path, err := writeSupervisorConfig(config.Scratch, config)
 	if err != nil {
@@ -197,7 +201,9 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 	cmd := openCodeCommandContext(ctx, executable)
 	cmd.Env = supervisorEnv(supervisorModeGuardian, path)
 
-	return cmd, &supervisorProof{started: config.Started, completion: config.Completion}, nil
+	return cmd, &supervisorProof{
+		started: config.Started, completion: config.Completion, inventoryIdentity: config.InventoryIdentity,
+	}, nil
 }
 
 func supervisorNonce() (string, error) {
@@ -259,6 +265,14 @@ func (p *supervisorProof) awaitCompletion(ctx context.Context) error {
 	}
 }
 
+func (p *supervisorProof) processSnapshot() (int, bool) {
+	if p == nil {
+		return 0, false
+	}
+
+	return supervisorProcessSnapshot(p.inventoryIdentity)
+}
+
 func supervisorEnv(mode string, configPath string) []string {
 	env := make([]string, 0, len(os.Environ())+2)
 	for _, entry := range os.Environ() {
@@ -290,6 +304,7 @@ func runGuardian(config supervisorConfig) error {
 	defer containment.Close()
 
 	config.JobName = containment.Name()
+	_ = writeSupervisorInventoryIdentity(config.InventoryIdentity, config.JobName)
 
 	livenessConfig, err := writeSupervisorConfig(config.Scratch, config)
 	if err != nil {
@@ -556,6 +571,26 @@ func writeNativePID(path string, pid int) error {
 
 	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", pid)), 0o600); err != nil {
 		return fmt.Errorf("write private native PID proof: %w", err)
+	}
+
+	return nil
+}
+
+func writeSupervisorInventoryIdentity(path string, identity string) error {
+	if path == "" || identity == "" {
+		return errors.New("private supervisor inventory identity is invalid")
+	}
+
+	file, err := supervisorOpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create private supervisor inventory identity: %w", err)
+	}
+
+	_, writeErr := fmt.Fprintln(file, identity)
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		_ = os.Remove(path)
+
+		return fmt.Errorf("write private supervisor inventory identity: %w", err)
 	}
 
 	return nil

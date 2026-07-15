@@ -48,6 +48,7 @@ func preserveSupervisorGlobals(t *testing.T) {
 	oldOutput := supervisorOutput
 	oldError := supervisorError
 	oldExit := supervisorExit
+	oldProcessSnapshot := supervisorProcessSnapshot
 	t.Cleanup(func() {
 		supervisorExecutable = oldExecutable
 		supervisorExecCommand = oldCommand
@@ -61,6 +62,7 @@ func preserveSupervisorGlobals(t *testing.T) {
 		supervisorOutput = oldOutput
 		supervisorError = oldError
 		supervisorExit = oldExit
+		supervisorProcessSnapshot = oldProcessSnapshot
 	})
 }
 
@@ -117,6 +119,7 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, cmd)
 	require.NotNil(t, proof)
+	require.NotEmpty(t, proof.inventoryIdentity)
 	require.Contains(t, strings.Join(cmd.Env, "\n"), supervisorModeEnv+"="+supervisorModeGuardian)
 
 	nonce, err := supervisorNonce()
@@ -143,9 +146,22 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 		_ = writeSupervisorMarker(completed)
 	}()
 	require.NoError(t, (&supervisorProof{started: started, completion: completed}).awaitCompletion(context.Background()))
+
+	count, available := (*supervisorProof)(nil).processSnapshot()
+	require.Zero(t, count)
+	require.False(t, available)
+	supervisorProcessSnapshot = func(path string) (int, bool) {
+		require.Equal(t, proof.inventoryIdentity, path)
+
+		return 3, true
+	}
+	count, available = proof.processSnapshot()
+	require.Equal(t, 3, count)
+	require.True(t, available)
 }
 
 func TestSupervisorMarkerPIDReadyAndCopyUtilities(t *testing.T) {
+	preserveSupervisorGlobals(t)
 	root := t.TempDir()
 	require.Error(t, writeSupervisorMarker(""))
 	marker := filepath.Join(root, "marker")
@@ -165,6 +181,24 @@ func TestSupervisorMarkerPIDReadyAndCopyUtilities(t *testing.T) {
 	require.NoError(t, os.WriteFile(pidPath, []byte("bad"), 0o600))
 	_, err = readNativePID(pidPath)
 	require.ErrorContains(t, err, "invalid")
+
+	require.Error(t, writeSupervisorInventoryIdentity("", "job"))
+	require.Error(t, writeSupervisorInventoryIdentity(filepath.Join(root, "identity"), ""))
+	identityPath := filepath.Join(root, "identity")
+	require.NoError(t, writeSupervisorInventoryIdentity(identityPath, "job-name"))
+	identity, err := os.ReadFile(identityPath)
+	require.NoError(t, err)
+	require.Equal(t, "job-name\n", string(identity))
+	require.Error(t, writeSupervisorInventoryIdentity(identityPath, "job-name"))
+	require.Error(t, writeSupervisorInventoryIdentity(filepath.Join(identityPath, "child"), "job-name"))
+	supervisorOpenFile = func(string, int, os.FileMode) (*os.File, error) {
+		return os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	}
+	require.ErrorContains(t, writeSupervisorInventoryIdentity(filepath.Join(root, "full"), "job-name"), "write private")
+
+	count, available := querySupervisorProcessSnapshot(identityPath)
+	require.Zero(t, count)
+	require.False(t, available)
 
 	_, err = parseSupervisorReady("bad")
 	require.ErrorContains(t, err, "invalid readiness")

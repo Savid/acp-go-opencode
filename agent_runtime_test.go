@@ -101,6 +101,7 @@ func TestWatchSharedRuntimeRemainingBranches(t *testing.T) {
 func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	var observedProcess RuntimeProcessKind
 	var observedDelta int64
+	var observedSnapshot int
 	var observedLifecycle RuntimeResourceKind
 	var observedStage RuntimeStartupStage
 	observedClient := newFakeOpenCodeClient()
@@ -109,6 +110,10 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 			observedProcess = kind
 			observedDelta = delta
 		},
+		ObserveProcessSnapshot: func(_ context.Context, kind RuntimeProcessKind, count int) {
+			require.Equal(t, RuntimeProcessProviderDescendant, kind)
+			observedSnapshot = count
+		},
 		ObserveStartupStage: func(_ context.Context, lifecycle RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
 			observedLifecycle = lifecycle
 			observedStage = stage
@@ -116,6 +121,7 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	}))
 	observed.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
 		options.ObserveProcess(ctx, string(RuntimeProcessHomeLockSupervisor), 2)
+		options.ObserveProcessSnapshot(ctx, string(RuntimeProcessProviderDescendant), 3)
 		options.ObserveStartupStage(ctx, string(RuntimeResourceRuntime), string(RuntimeStartupReadiness), time.Second, nil)
 
 		return observedClient, nil
@@ -127,6 +133,7 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	require.NotNil(t, scratchRelease)
 	require.Equal(t, RuntimeProcessHomeLockSupervisor, observedProcess)
 	require.EqualValues(t, 2, observedDelta)
+	require.Equal(t, 3, observedSnapshot)
 	require.Equal(t, RuntimeResourceRuntime, observedLifecycle)
 	require.Equal(t, RuntimeStartupReadiness, observedStage)
 	nativeRelease()

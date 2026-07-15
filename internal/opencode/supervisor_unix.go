@@ -50,6 +50,8 @@ func terminateIndependentSupervisor(cmd *exec.Cmd) error {
 	return signalOpenCodeProcessGroup(cmd, syscall.SIGKILL)
 }
 
+func querySupervisorProcessSnapshot(string) (int, bool) { return 0, false }
+
 func quiesceProcessGroup(nativePID int, timeout time.Duration) error {
 	if nativePID <= 0 {
 		return errors.New("native process group ID is required")
