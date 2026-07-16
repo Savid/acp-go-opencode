@@ -290,6 +290,81 @@ func TestPermissionQuestionDuplicateRequestIDsAreFenced(t *testing.T) {
 	}
 }
 
+func TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	agent, _, wireClient, peer := newWireCoverageConnection(t)
+	_, err := peer.Initialize(ctx, acp.InitializeRequest{ClientCapabilities: acp.ClientCapabilities{
+		Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
+	}})
+	require.NoError(t, err)
+
+	native := newFakeOpenCodeClient()
+	session := testSession(agent, native)
+	turnCtx := session.beginTurn(ctx, "wire-turn")
+	defer session.finishTurn()
+
+	emitToolStart := func(id string) {
+		t.Helper()
+		properties := mustJSON(t, opencode.NativePart{
+			ID:        "part-" + id,
+			SessionID: "native-1",
+			MessageID: "message-1",
+			Type:      partTypeTool,
+			Tool:      "edit",
+			CallID:    id,
+			State:     json.RawMessage(`{"status":"pending"}`),
+		})
+		require.NoError(t, session.handleEvent(turnCtx, opencode.Event{
+			Type: eventMessagePartCreated, Properties: properties,
+		}))
+	}
+
+	emitToolStart("permission-tool")
+	require.NoError(t, session.handleEvent(turnCtx, opencode.Event{
+		Type: eventPermissionV2Asked,
+		Properties: json.RawMessage(
+			`{"id":"permission-1","sessionID":"native-1","action":"edit","tool":{"callID":"permission-tool"}}`,
+		),
+	}))
+
+	emitToolStart("question-tool")
+	require.NoError(t, session.handleEvent(turnCtx, opencode.Event{
+		Type: eventQuestionV2Asked,
+		Properties: json.RawMessage(
+			`{"id":"question-1","sessionID":"native-1","tool":{"callID":"question-tool"},"questions":[{"question":"Proceed?"}]}`,
+		),
+	}))
+
+	require.Eventually(t, func() bool {
+		wireClient.mu.Lock()
+		defer wireClient.mu.Unlock()
+
+		return len(wireClient.order) == 4
+	}, time.Second, time.Millisecond)
+	wireClient.mu.Lock()
+	require.Equal(t, []string{
+		"tool_call:permission-tool",
+		"permission:permission-tool",
+		"tool_call:question-tool",
+		"elicitation:question-tool",
+	}, wireClient.order)
+	wireClient.mu.Unlock()
+
+	err = session.handleEvent(turnCtx, opencode.Event{
+		Type: eventQuestionV2Asked,
+		Properties: json.RawMessage(
+			`{"id":"question-stale","sessionID":"native-1","tool":{"callID":"not-published"},"questions":[{"question":"Proceed?"}]}`,
+		),
+	})
+	require.ErrorContains(t, err, "does not target a tool call published in the active turn")
+	require.Equal(t, 2, native.questionRejectCount())
+	wireClient.mu.Lock()
+	require.Len(t, wireClient.elicitations, 1)
+	wireClient.mu.Unlock()
+}
+
 func TestEventMappingMessagePartToolTodoUsageAndRaw(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()

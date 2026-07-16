@@ -104,11 +104,13 @@ type wireCoverageClient struct {
 	permissions  []acp.RequestPermissionRequest
 	elicitations []acp.UnstableCreateElicitationRequest
 	extensions   []string
+	order        []string
 }
 
 func (client *wireCoverageClient) RequestPermission(_ context.Context, request acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 	client.mu.Lock()
 	client.permissions = append(client.permissions, request)
+	client.order = append(client.order, "permission:"+string(request.ToolCall.ToolCallId))
 	client.mu.Unlock()
 
 	return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
@@ -117,6 +119,13 @@ func (client *wireCoverageClient) RequestPermission(_ context.Context, request a
 func (client *wireCoverageClient) SessionUpdate(_ context.Context, update acp.SessionNotification) error {
 	client.mu.Lock()
 	client.updates = append(client.updates, update)
+	if update.Update.ToolCall != nil {
+		client.order = append(client.order, "tool_call:"+string(update.Update.ToolCall.ToolCallId))
+	} else if update.Update.ToolCallUpdate != nil {
+		client.order = append(client.order, "tool_call_update:"+string(update.Update.ToolCallUpdate.ToolCallId))
+	} else {
+		client.order = append(client.order, "session_update")
+	}
 	client.mu.Unlock()
 
 	return nil
@@ -125,6 +134,17 @@ func (client *wireCoverageClient) SessionUpdate(_ context.Context, update acp.Se
 func (client *wireCoverageClient) UnstableCreateElicitation(_ context.Context, request acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
 	client.mu.Lock()
 	client.elicitations = append(client.elicitations, request)
+	var meta map[string]any
+	if request.Form != nil {
+		meta = request.Form.Meta
+	} else if request.Url != nil {
+		meta = request.Url.Meta
+	}
+	if route, ok := meta[routeEnvelopeKey].(map[string]any); ok {
+		if toolCallID, ok := route["toolCallId"].(string); ok {
+			client.order = append(client.order, "elicitation:"+toolCallID)
+		}
+	}
 	client.mu.Unlock()
 
 	return acp.NewUnstableCreateElicitationResponseDecline(), nil

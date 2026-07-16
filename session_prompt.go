@@ -1267,7 +1267,7 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 				req.ReplyRoute = opencode.QuestionRouteSession
 			}
 
-			return s.handleQuestion(ctx, req)
+			return s.dispatchQuestion(ctx, req)
 		}
 	}
 
@@ -1377,13 +1377,29 @@ func (s *session) reconcileQuestions(ctx context.Context) error {
 
 	for _, req := range requests {
 		if req.SessionID == s.idmap.NativeSessionID {
-			if err := s.handleQuestion(ctx, req); err != nil {
+			if err := s.dispatchQuestion(ctx, req); err != nil {
 				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+func (s *session) dispatchQuestion(ctx context.Context, req opencode.QuestionRequest) error {
+	if req.Tool.CallID == "" || s.ownsCurrentToolCall(req.Tool.CallID) {
+		return s.handleQuestion(ctx, req)
+	}
+
+	rejectCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	rejectErr := s.client.RejectQuestion(rejectCtx, req)
+
+	cancel()
+
+	return errors.Join(
+		invalidRoute("question request does not target a tool call published in the active turn"),
+		rejectErr,
+	)
 }
 
 func (s *session) handlePermission(ctx context.Context, req opencode.PermissionRequest) error {
