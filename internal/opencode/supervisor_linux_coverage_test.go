@@ -21,6 +21,7 @@ func preservePlatformSupervisorGlobals(t *testing.T) {
 	oldPIDFDSendSignal := supervisorLinuxPIDFDSendSignal
 	oldPoll := supervisorLinuxPoll
 	oldWait4 := supervisorLinuxWait4
+	oldWaitid := supervisorLinuxWaitid
 	oldReadDir := supervisorLinuxReadDir
 	oldReadFile := supervisorLinuxReadFile
 	oldClose := supervisorLinuxClose
@@ -30,6 +31,7 @@ func preservePlatformSupervisorGlobals(t *testing.T) {
 		supervisorLinuxPIDFDSendSignal = oldPIDFDSendSignal
 		supervisorLinuxPoll = oldPoll
 		supervisorLinuxWait4 = oldWait4
+		supervisorLinuxWaitid = oldWaitid
 		supervisorLinuxReadDir = oldReadDir
 		supervisorLinuxReadFile = oldReadFile
 		supervisorLinuxClose = oldClose
@@ -39,6 +41,9 @@ func preservePlatformSupervisorGlobals(t *testing.T) {
 	// host. Real supervisor integration tests execute fresh helper subprocesses
 	// and therefore retain the production PR_SET_CHILD_SUBREAPER call.
 	supervisorLinuxPrctl = func(int, uintptr, uintptr, uintptr, uintptr) error { return nil }
+	supervisorLinuxWaitid = func(int, int, *unix.Siginfo, int, *unix.Rusage) error {
+		return unix.ECHILD
+	}
 }
 
 func TestLinuxContainmentCapabilityFailures(t *testing.T) {
@@ -87,6 +92,20 @@ func TestLinuxReaperQuiescenceBranches(t *testing.T) {
 		require.ErrorContains(t, quiesceLinuxReaper(123, 0, time.Second), "term inventory failed")
 	})
 
+	t.Run("term kernel fence failure", func(t *testing.T) {
+		preservePlatformSupervisorGlobals(t)
+		oldKill := openCodeSyscallKill
+		t.Cleanup(func() { openCodeSyscallKill = oldKill })
+		openCodeSyscallKill = func(int, syscall.Signal) error { return nil }
+		configureLinuxChildrenFixture(t, "")
+		supervisorLinuxWaitid = func(int, int, *unix.Siginfo, int, *unix.Rusage) error {
+			return errors.New("term waitid failed")
+		}
+		err := quiesceLinuxReaper(123, 0, time.Second)
+		require.ErrorIs(t, err, ErrProcessTreeUnproven)
+		require.ErrorContains(t, err, "term waitid failed")
+	})
+
 	t.Run("kill reaches quiet", func(t *testing.T) {
 		preservePlatformSupervisorGlobals(t)
 		oldKill := openCodeSyscallKill
@@ -108,6 +127,13 @@ func TestLinuxReaperQuiescenceBranches(t *testing.T) {
 
 			return 1, nil
 		}
+		supervisorLinuxWaitid = func(int, int, *unix.Siginfo, int, *unix.Rusage) error {
+			if lastSignal == unix.SIGKILL {
+				return unix.ECHILD
+			}
+
+			return nil
+		}
 		supervisorLinuxWait4 = func(int, *unix.WaitStatus, int, *unix.Rusage) (int, error) { return 123, nil }
 		require.NoError(t, quiesceLinuxReaper(123, 0, 750*time.Millisecond))
 	})
@@ -128,7 +154,31 @@ func TestLinuxReaperQuiescenceBranches(t *testing.T) {
 			return nil
 		}
 		supervisorLinuxPoll = func([]unix.PollFd, int) (int, error) { return 0, nil }
+		supervisorLinuxWaitid = func(int, int, *unix.Siginfo, int, *unix.Rusage) error { return nil }
 		require.ErrorContains(t, quiesceLinuxReaper(123, 0, time.Second), "kill signal failed")
+	})
+
+	t.Run("kill kernel fence failure", func(t *testing.T) {
+		preservePlatformSupervisorGlobals(t)
+		oldKill := openCodeSyscallKill
+		t.Cleanup(func() { openCodeSyscallKill = oldKill })
+		lastGroupSignal := syscall.Signal(0)
+		openCodeSyscallKill = func(_ int, signal syscall.Signal) error {
+			lastGroupSignal = signal
+
+			return nil
+		}
+		configureLinuxChildrenFixture(t, "")
+		supervisorLinuxWaitid = func(int, int, *unix.Siginfo, int, *unix.Rusage) error {
+			if lastGroupSignal == syscall.SIGKILL {
+				return errors.New("kill waitid failed")
+			}
+
+			return nil
+		}
+		err := quiesceLinuxReaper(123, 0, 750*time.Millisecond)
+		require.ErrorIs(t, err, ErrProcessTreeUnproven)
+		require.ErrorContains(t, err, "kill waitid failed")
 	})
 
 	t.Run("deadline", func(t *testing.T) {
@@ -141,8 +191,41 @@ func TestLinuxReaperQuiescenceBranches(t *testing.T) {
 		supervisorLinuxClose = func(int) error { return nil }
 		supervisorLinuxPIDFDSendSignal = func(int, unix.Signal, *unix.Siginfo, int) error { return nil }
 		supervisorLinuxPoll = func([]unix.PollFd, int) (int, error) { return 0, nil }
+		supervisorLinuxWaitid = func(int, int, *unix.Siginfo, int, *unix.Rusage) error { return nil }
 		require.ErrorContains(t, quiesceLinuxReaper(123, 0, 520*time.Millisecond), "did not become quiescent")
 	})
+}
+
+func TestLinuxReaperNoChildrenBranches(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		waitErr   error
+		quiescent bool
+		wantErr   bool
+	}{
+		{name: "kernel empty", waitErr: unix.ECHILD, quiescent: true},
+		{name: "live or waitable"},
+		{name: "interrupted", waitErr: unix.EINTR},
+		{name: "failure", waitErr: errors.New("waitid failed"), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			preservePlatformSupervisorGlobals(t)
+			supervisorLinuxWaitid = func(idType int, id int, _ *unix.Siginfo, options int, _ *unix.Rusage) error {
+				require.Equal(t, unix.P_ALL, idType)
+				require.Zero(t, id)
+				require.Equal(t, unix.WEXITED|unix.WNOHANG|unix.WNOWAIT, options)
+
+				return test.waitErr
+			}
+			quiescent, err := linuxReaperNoChildren()
+			require.Equal(t, test.quiescent, quiescent)
+			if test.wantErr {
+				require.ErrorIs(t, err, ErrProcessTreeUnproven)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestSignalLinuxReaperChildrenBranches(t *testing.T) {

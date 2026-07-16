@@ -20,10 +20,12 @@ only trusted peer:
   the resource permit until the whole process tree is gone.
 - On Linux, each supervisor helper is its own child subreaper and uses pidfds
   plus `/proc` child inventory to terminate and reap descendants that escape
-  the native process group with `setsid` or `setpgid`. The embedding host is
-  never made a subreaper. Windows uses a kill-on-close Job Object. Platforms
-  without one of these proof-capable containment backends fail closed before
-  native startup.
+  the native process group with `setsid` or `setpgid`. It accepts only the
+  kernel's non-reaping `waitid(P_ALL, WNOWAIT)` `ECHILD` result as the final
+  empty-tree proof; quiet `/proc` snapshots cannot close a fork/reparent race.
+  The embedding host is never made a subreaper. Windows uses a kill-on-close
+  Job Object. Platforms without one of these proof-capable containment backends
+  fail closed before native startup.
 - The writable home must have approved local lock semantics. Linux admits
   ext4, XFS, Btrfs, F2FS, and tmpfs; macOS/FreeBSD/OpenBSD admit their explicit
   local-filesystem allowlists; Windows admits fixed or RAM drives formatted as

@@ -29,6 +29,7 @@ var (
 	supervisorLinuxPIDFDSendSignal = unix.PidfdSendSignal
 	supervisorLinuxPoll            = unix.Poll
 	supervisorLinuxWait4           = unix.Wait4
+	supervisorLinuxWaitid          = unix.Waitid
 	supervisorLinuxReadDir         = os.ReadDir
 	supervisorLinuxReadFile        = os.ReadFile
 	supervisorLinuxClose           = unix.Close
@@ -116,50 +117,69 @@ func quiesceLinuxReaper(nativePID int, waitOwnedPID int, timeout time.Duration) 
 	}
 
 	_ = signalProcessGroup(nativePID, syscall.SIGTERM)
-	quiet := false
-
 	for time.Now().Before(termDeadline) {
-		active, err := signalLinuxReaperChildren(waitOwnedPID, unix.SIGTERM)
+		_, err := signalLinuxReaperChildren(waitOwnedPID, unix.SIGTERM)
 		if err != nil {
 			return err
 		}
 
-		if active == 0 {
-			if quiet {
-				return nil
-			}
+		quiescent, err := linuxReaperNoChildren()
+		if err != nil {
+			return err
+		}
 
-			quiet = true
-		} else {
-			quiet = false
+		if quiescent {
+			return nil
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	_ = signalProcessGroup(nativePID, syscall.SIGKILL)
-	quiet = false
 
 	for time.Now().Before(deadline) {
-		active, err := signalLinuxReaperChildren(waitOwnedPID, unix.SIGKILL)
+		_, err := signalLinuxReaperChildren(waitOwnedPID, unix.SIGKILL)
 		if err != nil {
 			return err
 		}
 
-		if active == 0 {
-			if quiet {
-				return nil
-			}
+		quiescent, err := linuxReaperNoChildren()
+		if err != nil {
+			return err
+		}
 
-			quiet = true
-		} else {
-			quiet = false
+		if quiescent {
+			return nil
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	return fmt.Errorf("native process tree rooted at %d did not become quiescent", nativePID)
+}
+
+// linuxReaperNoChildren uses WNOWAIT so it never steals the direct native root
+// from cmd.Wait. ECHILD is the only authoritative success result: a nil result
+// means at least one live or waitable child still exists, even when a concurrent
+// /proc children snapshot happened to be empty.
+func linuxReaperNoChildren() (bool, error) {
+	var info unix.Siginfo
+
+	err := supervisorLinuxWaitid(
+		unix.P_ALL,
+		0,
+		&info,
+		unix.WEXITED|unix.WNOHANG|unix.WNOWAIT,
+		nil,
+	)
+	switch {
+	case errors.Is(err, unix.ECHILD):
+		return true, nil
+	case err == nil, errors.Is(err, unix.EINTR):
+		return false, nil
+	default:
+		return false, errors.Join(ErrProcessTreeUnproven, fmt.Errorf("fence Linux child subreaper: %w", err))
+	}
 }
 
 func signalLinuxReaperChildren(waitOwnedPID int, signal unix.Signal) (int, error) {
