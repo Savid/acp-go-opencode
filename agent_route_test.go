@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -40,6 +41,12 @@ func TestRouteEnvelopeRemainingShapes(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	require.Equal(t, inboundTurnRoute{Version: routeEnvelopeVersion, TurnNonce: "nonce"}, parsed)
+	boundaryNonce := strings.Repeat("n", routeTurnNonceMaxBytes)
+	parsed, err = parseInboundTurnRoute(routeCarrier(boundaryNonce))
+	require.NoError(t, err)
+	require.Equal(t, boundaryNonce, parsed.TurnNonce)
+	_, err = parseInboundTurnRoute(routeCarrier(strings.Repeat("n", routeTurnNonceMaxBytes+1)))
+	require.ErrorContains(t, err, "maximum size")
 
 	_, err = outboundRoute(elicitationScope{})
 	require.ErrorContains(t, err, "incomplete")

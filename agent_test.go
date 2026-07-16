@@ -108,12 +108,15 @@ func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	if !client.closed {
 		t.Fatal("client not closed")
 	}
-	payload := capRawEventPayload(map[string]any{
+	payload, err := capRawEventPayload(map[string]any{
 		"sessionId": "s",
 		"sequence":  int64(1),
 		"source":    "test",
 		"event":     strings.Repeat("x", rawEventMaxBytes),
 	})
+	if err != nil {
+		t.Fatalf("cap raw event: %v", err)
+	}
 	if event, _ := payload["event"].(map[string]any); event["truncated"] != true {
 		t.Fatalf("raw event was not capped: %#v", payload)
 	}

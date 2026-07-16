@@ -1879,9 +1879,14 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 		return nil
 	}
 
+	s.rawEventMu.Lock()
+	defer s.rawEventMu.Unlock()
+
+	sequence := s.rawSeq + 1
+
 	payload := map[string]any{
 		jsonFieldSessionID: s.id,
-		jsonFieldSequence:  s.nextRawEventSequence(),
+		jsonFieldSequence:  sequence,
 		jsonFieldSource:    rawEventSource,
 		jsonFieldEvent:     raw,
 	}
@@ -1889,7 +1894,18 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 		payload["_meta"] = meta
 	}
 
-	return conn.NotifyExtension(ctx, RawEventMethod, capRawEventPayload(payload))
+	capped, err := capRawEventPayload(payload)
+	if err != nil {
+		return err
+	}
+
+	if err := conn.NotifyExtension(ctx, RawEventMethod, capped); err != nil {
+		return err
+	}
+
+	s.rawSeq = sequence
+
+	return nil
 }
 
 func (s *session) emitUsageUpdate(

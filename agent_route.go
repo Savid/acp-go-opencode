@@ -21,11 +21,12 @@ func NewTurnNonce() (string, error) {
 }
 
 const (
-	routeEnvelopeKey     = "acp-go.dev/route"
-	routeEnvelopeVersion = 1
-	routeFieldVersion    = "version"
-	routeFieldTurnNonce  = "turnNonce"
-	routeFieldRequestID  = "requestId"
+	routeEnvelopeKey       = "acp-go.dev/route"
+	routeEnvelopeVersion   = 1
+	routeTurnNonceMaxBytes = 4 * 1024
+	routeFieldVersion      = "version"
+	routeFieldTurnNonce    = "turnNonce"
+	routeFieldRequestID    = "requestId"
 )
 
 type inboundTurnRoute struct {
@@ -77,6 +78,10 @@ func parseInboundTurnRoute(meta map[string]any) (inboundTurnRoute, error) {
 	nonce, nonceOK := obj[routeFieldTurnNonce].(string)
 	if !ok || version != routeEnvelopeVersion || !nonceOK || nonce == "" {
 		return inboundTurnRoute{}, invalidRoute("unknown route version or empty turnNonce")
+	}
+
+	if len(nonce) > routeTurnNonceMaxBytes {
+		return inboundTurnRoute{}, invalidRoute("route turnNonce exceeds the maximum size")
 	}
 
 	return inboundTurnRoute{Version: routeEnvelopeVersion, TurnNonce: nonce}, nil

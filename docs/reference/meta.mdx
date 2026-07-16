@@ -48,7 +48,8 @@ immutable and configured only with `WithEnv`.
 
 `session/prompt` and an active `session/cancel` require a top-level
 `_meta["acp-go.dev/route"]` object containing exactly `version: 1` and a
-non-empty `turnNonce`. The cancel nonce must equal the active prompt nonce.
+non-empty `turnNonce` of at most 4096 bytes. The cancel nonce must equal the
+active prompt nonce.
 
 Every live-turn `session/update` and `_opencode/rawEvent` notification carries
 that same exact `{version, turnNonce}` object in its notification `_meta`;

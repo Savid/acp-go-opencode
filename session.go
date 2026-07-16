@@ -45,6 +45,7 @@ type session struct {
 	turn                      chan struct{}
 	mu                        sync.Mutex
 	updateMu                  sync.Mutex
+	rawEventMu                sync.Mutex
 	cancel                    context.CancelFunc
 	turnDone                  <-chan struct{}
 	cancelled                 bool
@@ -976,15 +977,6 @@ func validSlashCommandName(name string) bool {
 	}
 
 	return true
-}
-
-func (s *session) nextRawEventSequence() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.rawSeq++
-
-	return s.rawSeq
 }
 
 // Close shuts down the native OpenCode process under bounded background

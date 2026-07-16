@@ -12,6 +12,23 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
+const rawBoundaryField = "rawBoundaryData"
+
+type failThenRecordRawClient struct {
+	*recordingAgentClient
+	failures int
+}
+
+func (c *failThenRecordRawClient) NotifyExtension(ctx context.Context, method string, params any) error {
+	if c.failures > 0 {
+		c.failures--
+
+		return errors.New("client notify failed")
+	}
+
+	return c.recordingAgentClient.NotifyExtension(ctx, method, params)
+}
+
 // rawEventNotifications returns the event payloads (envelope maps) emitted for
 // the given ACP session id, in order.
 func rawEventNotifications(conn *recordingAgentClient, sessionID acp.SessionId) []map[string]any {
@@ -33,7 +50,7 @@ func rawEventNotifications(conn *recordingAgentClient, sessionID acp.SessionId) 
 	return out
 }
 
-func rawEventSession(t *testing.T, id acp.SessionId, conn *recordingAgentClient) *session {
+func rawEventSession(t *testing.T, id acp.SessionId, conn agentClient) *session {
 	t.Helper()
 	agent := NewAgent()
 	agent.setAgentClient(conn)
@@ -208,12 +225,15 @@ func TestRawEventValidJSONInvariant(t *testing.T) {
 		}
 	}
 
-	marked := capRawEventPayload(map[string]any{
+	marked, err := capRawEventPayload(map[string]any{
 		jsonFieldSessionID: "session-1",
 		jsonFieldSequence:  int64(9),
 		jsonFieldSource:    rawEventSource,
 		jsonFieldEvent:     map[string]any{"bad": make(chan int)},
 	})
+	if err != nil {
+		t.Fatalf("cap unserializable payload: %v", err)
+	}
 	marker, ok := marked[jsonFieldEvent].(map[string]any)
 	if !ok || marker[rawMarkerReason] != rawReasonUnserializable {
 		t.Fatalf("unserializable marker = %#v", marked[jsonFieldEvent])
@@ -226,14 +246,108 @@ func TestRawEventValidJSONInvariant(t *testing.T) {
 	}
 }
 
+func TestRawEventFinalPayloadBoundaryIncludesRouteMeta(t *testing.T) {
+	payload := map[string]any{
+		jsonFieldSessionID: "session-1",
+		jsonFieldSequence:  int64(1),
+		jsonFieldSource:    rawEventSource,
+		jsonFieldEvent:     map[string]any{rawBoundaryField: ""},
+		"_meta":            routeCarrier(strings.Repeat("n", routeTurnNonceMaxBytes)),
+	}
+	empty, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal empty payload: %v", err)
+	}
+	padding := rawEventMaxBytes - len(empty)
+	if padding <= 0 {
+		t.Fatalf("empty routed payload is %d bytes", len(empty))
+	}
+	payload[jsonFieldEvent] = map[string]any{rawBoundaryField: strings.Repeat("x", padding)}
+
+	capped, err := capRawEventPayload(payload)
+	if err != nil {
+		t.Fatalf("cap boundary payload: %v", err)
+	}
+	encoded, err := json.Marshal(capped)
+	if err != nil {
+		t.Fatalf("marshal boundary payload: %v", err)
+	}
+	if len(encoded) != rawEventMaxBytes {
+		t.Fatalf("boundary payload = %d bytes, want %d", len(encoded), rawEventMaxBytes)
+	}
+	if event, ok := capped[jsonFieldEvent].(map[string]any); !ok || event[rawMarkerTruncated] == true {
+		t.Fatalf("exact-boundary event was replaced: %#v", capped[jsonFieldEvent])
+	}
+
+	payload[jsonFieldEvent] = map[string]any{rawBoundaryField: strings.Repeat("x", padding+1)}
+	capped, err = capRawEventPayload(payload)
+	if err != nil {
+		t.Fatalf("cap over-boundary payload: %v", err)
+	}
+	encoded, err = json.Marshal(capped)
+	if err != nil {
+		t.Fatalf("marshal capped payload: %v", err)
+	}
+	if len(encoded) > rawEventMaxBytes {
+		t.Fatalf("capped payload = %d bytes, exceeds %d", len(encoded), rawEventMaxBytes)
+	}
+	marker, ok := capped[jsonFieldEvent].(map[string]any)
+	if !ok {
+		t.Fatalf("over-boundary event is not a marker: %#v", capped[jsonFieldEvent])
+	}
+	if marker[rawMarkerReason] != rawReasonOversize || marker[rawMarkerSizeBytes] != rawEventMaxBytes+1 {
+		t.Fatalf("over-boundary marker = %#v", marker)
+	}
+}
+
+func TestRawEventFinalPayloadRejectsUnboundedInternalRoute(t *testing.T) {
+	hugeNonce := strings.Repeat("n", rawEventMaxBytes)
+	payload := map[string]any{
+		jsonFieldSessionID: "session-1",
+		jsonFieldSequence:  int64(1),
+		jsonFieldSource:    rawEventSource,
+		jsonFieldEvent:     map[string]any{"type": "event"},
+		"_meta":            routeCarrier(hugeNonce),
+	}
+
+	if _, err := capRawEventPayload(payload); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("unbounded route error = %v", err)
+	}
+
+	conn := newRecordingAgentClient()
+	sess := rawEventSession(t, "session-1", conn)
+	if err := sess.emitRawOpenCodeEvent(withTurnRoute(context.Background(), hugeNonce), normalRawEvent("event")); err == nil ||
+		!strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("emit with unbounded internal route error = %v", err)
+	}
+	if sess.rawSeq != 0 || len(rawEventNotifications(conn, "session-1")) != 0 {
+		t.Fatalf("failed cap changed sequence or emitted: sequence=%d events=%#v", sess.rawSeq, rawEventNotifications(conn, "session-1"))
+	}
+
+	payload["_meta"] = map[string]any{"bad": make(chan int)}
+	if _, err := capRawEventPayload(payload); err == nil || !strings.Contains(err.Error(), "marshal capped") {
+		t.Fatalf("unserializable final payload error = %v", err)
+	}
+}
+
 // Case 5 — a NotifyExtension failure is recorded internally and does NOT abort
 // the prompt turn.
 func TestRawEventEmitFailureDoesNotFailTurn(t *testing.T) {
 	conn := newRecordingAgentClient()
-	conn.notifyErr = errors.New("client notify failed")
-	sess := rawEventSession(t, "session-1", conn)
+	failing := &failThenRecordRawClient{recordingAgentClient: conn, failures: 1}
+	sess := rawEventSession(t, "session-1", failing)
 	if err := sess.handleEvent(context.Background(), normalRawEvent("boom")); err != nil {
 		t.Fatalf("raw emit failure aborted the turn: %v", err)
+	}
+	if sess.rawSeq != 0 {
+		t.Fatalf("failed delivery consumed sequence %d", sess.rawSeq)
+	}
+	if err := sess.emitRawOpenCodeEvent(context.Background(), normalRawEvent("ok")); err != nil {
+		t.Fatalf("successful emit after failure: %v", err)
+	}
+	events := rawEventNotifications(conn, "session-1")
+	if len(events) != 1 || events[0][jsonFieldSequence] != int64(1) {
+		t.Fatalf("successful events after failure = %#v", events)
 	}
 }
 
