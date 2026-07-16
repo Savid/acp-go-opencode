@@ -103,3 +103,9 @@ method.
 default implementation. Rows use `SessionStoreFormat`
 (`opencode-sync-events-v1`)
 constant. See [Session store](/docs/features/session-store).
+
+`InspectSessionStoreTerminalState` validates the committed
+`SessionStoreEntry` set for a logical ACP session and returns
+`SessionStoreTerminalState`, whose `MessageID` is the snapshot's latest
+finished assistant message. This is the durable terminal identity for
+host-side turn checkpoint reconciliation.

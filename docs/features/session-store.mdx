@@ -59,6 +59,16 @@ the next prompt is submitted; native state that does not match the committed
 event generation fails closed instead of accepting a prompt on ambiguous
 state.
 
+Hosts that reconcile their own turn checkpoints can call
+`InspectSessionStoreTerminalState` with the logical ACP session id and the
+committed main entries loaded from the store. The helper requires exactly one
+current snapshot entry, derives its private native aggregate, and returns the
+latest finished assistant message identity. The inspection is semantic rather
+than positional because OpenCode can append a repeated user-message event after
+the terminal assistant. Malformed, unsupported, or non-contiguous snapshots
+fail closed; a valid snapshot without a terminal assistant returns an empty
+`MessageID`.
+
 <Note>
 A snapshot is blocked while any input, permission, elicitation, or generation is
 pending, so a snapshot never captures a half-finished turn. `session/delete`
