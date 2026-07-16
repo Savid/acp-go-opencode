@@ -40,6 +40,18 @@ func routeCarrier(turnNonce string) map[string]any {
 	return map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: routeEnvelopeVersion, routeFieldTurnNonce: turnNonce}}
 }
 
+func requestRouteCarrier(turnNonce string) map[string]any {
+	if !validRouteTurnNonce(turnNonce) {
+		return nil
+	}
+
+	return routeCarrier(turnNonce)
+}
+
+func validRouteTurnNonce(turnNonce string) bool {
+	return turnNonce != "" && len(turnNonce) <= routeTurnNonceMaxBytes
+}
+
 func withTurnRoute(ctx context.Context, turnNonce string) context.Context {
 	return context.WithValue(ctx, turnRouteContextKey{}, turnNonce)
 }
@@ -94,6 +106,10 @@ func invalidRoute(reason string) error {
 func outboundRoute(scope elicitationScope) (map[string]any, error) {
 	if scope.SessionID == "" || scope.TurnNonce == "" {
 		return nil, fmt.Errorf("turn-scoped elicitation route is incomplete")
+	}
+
+	if len(scope.TurnNonce) > routeTurnNonceMaxBytes {
+		return nil, fmt.Errorf("turn-scoped elicitation route turnNonce exceeds the maximum size")
 	}
 
 	envelope := map[string]any{routeFieldVersion: routeEnvelopeVersion, jsonFieldSessionID: scope.SessionID, routeFieldTurnNonce: scope.TurnNonce}

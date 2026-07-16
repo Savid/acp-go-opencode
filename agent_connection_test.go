@@ -31,7 +31,8 @@ func TestScopedElicitationStampsExactRouteAndRejectsCollision(t *testing.T) {
 		Message: "choose", RequestedSchema: acp.UnstableElicitationSchema{},
 		Meta: map[string]any{"native": "preserved"},
 	}}
-	raw, err := scopedElicitationParams(form, elicitationScope{SessionID: "s", TurnNonce: "nonce", RequestID: &requestID})
+	boundaryNonce := strings.Repeat("n", routeTurnNonceMaxBytes)
+	raw, err := scopedElicitationParams(form, elicitationScope{SessionID: "s", TurnNonce: boundaryNonce, RequestID: &requestID})
 	require.NoError(t, err)
 	var payload map[string]any
 	require.NoError(t, json.Unmarshal(raw, &payload))
@@ -42,9 +43,15 @@ func TestScopedElicitationStampsExactRouteAndRejectsCollision(t *testing.T) {
 	require.True(t, ok)
 	require.EqualValues(t, 1, route["version"])
 	require.Equal(t, "s", route["sessionId"])
-	require.Equal(t, "nonce", route["turnNonce"])
+	require.Equal(t, boundaryNonce, route["turnNonce"])
 	require.Equal(t, "question-1", route["requestId"])
 	require.NotContains(t, route, "toolCallId")
+
+	oversizeForm := acp.NewUnstableCreateElicitationRequestForm(acp.UnstableElicitationSchema{})
+	_, err = scopedElicitationParams(oversizeForm, elicitationScope{
+		SessionID: "s", TurnNonce: strings.Repeat("n", routeTurnNonceMaxBytes+1), RequestID: &requestID,
+	})
+	require.ErrorContains(t, err, "maximum size")
 
 	form.Form.Meta[routeEnvelopeKey] = map[string]any{"version": 99}
 	_, err = scopedElicitationParams(form, elicitationScope{SessionID: "s", TurnNonce: "nonce", RequestID: &requestID})

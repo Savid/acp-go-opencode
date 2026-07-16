@@ -45,6 +45,9 @@ func TestRouteEnvelopeRemainingShapes(t *testing.T) {
 	parsed, err = parseInboundTurnRoute(routeCarrier(boundaryNonce))
 	require.NoError(t, err)
 	require.Equal(t, boundaryNonce, parsed.TurnNonce)
+	require.NotNil(t, requestRouteCarrier(boundaryNonce))
+	require.Nil(t, requestRouteCarrier(""))
+	require.Nil(t, requestRouteCarrier(strings.Repeat("n", routeTurnNonceMaxBytes+1)))
 	_, err = parseInboundTurnRoute(routeCarrier(strings.Repeat("n", routeTurnNonceMaxBytes+1)))
 	require.ErrorContains(t, err, "maximum size")
 
@@ -52,6 +55,8 @@ func TestRouteEnvelopeRemainingShapes(t *testing.T) {
 	require.ErrorContains(t, err, "incomplete")
 	_, err = outboundRoute(elicitationScope{SessionID: "session", TurnNonce: "nonce"})
 	require.ErrorContains(t, err, "exactly one")
+	_, err = outboundRoute(elicitationScope{SessionID: "session", TurnNonce: strings.Repeat("n", routeTurnNonceMaxBytes+1)})
+	require.ErrorContains(t, err, "maximum size")
 
 	requestID := acp.RequestId{Number: requestIDNumberPointer(7)}
 	_, err = outboundRoute(elicitationScope{SessionID: "session", TurnNonce: "nonce", RequestID: &requestID})

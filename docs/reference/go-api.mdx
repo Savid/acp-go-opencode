@@ -88,6 +88,11 @@ vocabulary already populated:
 | `SetConfigOptionRequest` / `SetModelRequest` | `session/set_config_option`. |
 | `StdioMCPServer` / `HTTPMCPServer` | MCP server definitions. |
 
+`PromptRequest`, `TextPromptRequest`, and `CancelRequest` stamp route metadata
+only for a non-empty `turnNonce` of at most 4096 bytes. An invalid nonce leaves
+the request without a route envelope, so the adapter rejects it rather than
+sending an invalid or unbounded route.
+
 Session-scoped request options include `WithSessionMCPServers`,
 `WithSessionAdditionalDirectories`, `WithSessionMeta`, `WithSessionOutputSchema`,
 `WithSessionRawEvents`, and `WithSessionOpenCodeOptions`.

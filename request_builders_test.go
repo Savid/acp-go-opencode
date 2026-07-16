@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -61,6 +62,31 @@ func TestRequestBuilders(t *testing.T) {
 	unstable := unstableMCPServersFromStable(req.McpServers)
 	if len(unstable) != 4 || unstable[0].Http == nil || unstable[1].Stdio == nil || unstable[2].Sse == nil || unstable[3].Acp == nil {
 		t.Fatalf("unstable MCP servers = %#v", unstable)
+	}
+}
+
+func TestTurnRequestBuildersFailClosedOnInvalidNonce(t *testing.T) {
+	tests := []struct {
+		name      string
+		turnNonce string
+		wantRoute bool
+	}{
+		{name: "empty", turnNonce: ""},
+		{name: "maximum bytes", turnNonce: strings.Repeat("n", routeTurnNonceMaxBytes), wantRoute: true},
+		{name: "over maximum bytes", turnNonce: strings.Repeat("n", routeTurnNonceMaxBytes+1)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prompt := PromptRequest("s", tc.turnNonce)
+			cancel := CancelRequest("s", tc.turnNonce)
+			if (prompt.Meta != nil) != tc.wantRoute {
+				t.Fatalf("PromptRequest route presence = %t, want %t", prompt.Meta != nil, tc.wantRoute)
+			}
+			if (cancel.Meta != nil) != tc.wantRoute {
+				t.Fatalf("CancelRequest route presence = %t, want %t", cancel.Meta != nil, tc.wantRoute)
+			}
+		})
 	}
 }
 

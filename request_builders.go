@@ -193,7 +193,7 @@ func PromptRequest(sessionID acp.SessionId, turnNonce string, blocks ...acp.Cont
 	return acp.PromptRequest{
 		SessionId: sessionID,
 		Prompt:    append([]acp.ContentBlock{}, blocks...),
-		Meta:      routeCarrier(turnNonce),
+		Meta:      requestRouteCarrier(turnNonce),
 	}
 }
 
@@ -202,7 +202,7 @@ func TextPromptRequest(sessionID acp.SessionId, turnNonce, text string) acp.Prom
 }
 
 func CancelRequest(sessionID acp.SessionId, turnNonce string) acp.CancelNotification {
-	return acp.CancelNotification{SessionId: sessionID, Meta: routeCarrier(turnNonce)}
+	return acp.CancelNotification{SessionId: sessionID, Meta: requestRouteCarrier(turnNonce)}
 }
 
 func SetConfigOptionRequest(sessionID acp.SessionId, configID acp.SessionConfigId, value acp.SessionConfigValueId) acp.SetSessionConfigOptionRequest {
