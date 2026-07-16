@@ -720,6 +720,7 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 	agent.options.SessionStore = nil
 	require.NotNil(t, agent.sessionStore())
 	current := testSession(agent, newFakeOpenCodeClient())
+	agent.runtime = nil
 	require.Error(t, agent.storeStartedSession(current), "missing runtime must reject publication")
 	agent.runtime = newFakeOpenCodeClient()
 	require.NoError(t, agent.storeStartedSession(current))

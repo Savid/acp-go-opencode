@@ -36,6 +36,7 @@ func (buffer *supervisorCloseBuffer) Close() error {
 
 func preserveSupervisorGlobals(t *testing.T) {
 	t.Helper()
+	preservePlatformSupervisorGlobals(t)
 	oldExecutable := supervisorExecutable
 	oldCommand := supervisorExecCommand
 	oldRandRead := supervisorRandRead
@@ -377,8 +378,7 @@ func TestSupervisorEntropyAndProofStatFailures(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	err = (&supervisorProof{started: filepath.Join(root, "absent-start"), completion: filepath.Join(root, "absent-complete")}).awaitCompletion(cancelled)
-	require.ErrorIs(t, err, ErrProcessTreeUnproven)
-	require.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, err)
 
 	started := filepath.Join(root, "started")
 	require.NoError(t, writeSupervisorMarker(started))

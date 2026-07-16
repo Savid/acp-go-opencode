@@ -111,6 +111,7 @@ func TestShutdownEmitsZeroOnlyForProvenDescendantQuiescence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			restoreOpenCodeClientSeams(t)
+			openCodeContainmentTimeout = 10 * time.Millisecond
 			root := t.TempDir()
 			started := filepath.Join(root, "started")
 			completion := filepath.Join(root, "complete")

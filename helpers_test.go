@@ -663,12 +663,24 @@ func testSession(agent *Agent, client *fakeOpenCodeClient) *session {
 		}
 	}
 	client.ensureSyncAggregate("native-1")
+	agent.mu.Lock()
+	if agent.runtime == nil {
+		agent.runtime = client
+	}
+	if agent.runtimeGeneration == 0 {
+		agent.runtimeGeneration = 1
+	}
+	generation := agent.runtimeGeneration
+	agent.mu.Unlock()
 
-	return newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
+	session := newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
 		SessionID:       "session-1",
 		NativeSessionID: "native-1",
 		Format:          SessionStoreFormat,
 	})
+	session.runtimeGeneration = generation
+
+	return session
 }
 
 type errorReader struct {

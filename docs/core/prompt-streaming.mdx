@@ -71,14 +71,25 @@ The failure payload's `cause` names the failure class:
 | `timeout` | The turn exceeded the deadline set by `WithTurnTimeout`. |
 
 By default there is no deadline. `WithTurnTimeout` bounds a single turn; when it
-elapses the adapter aborts the native turn, polls native session status until
-the session is absent or idle, and only then reopens turn admission. Unknown
-status, abort failure, or fence timeout poisons the session. See
+elapses the adapter sends native abort as a best-effort hint, retires that
+turn's exact shared-runtime generation, and waits for the one memoized
+whole-process-tree containment result before reopening turn admission. Native
+`idle` status is never accepted as process containment. Failure to prove the
+tree empty poisons the affected session and quarantines the runtime resources.
+The same fence is used for host cancellation and stream/control failures that
+can leave native work running. See
 [Models and config](/docs/features/models-config) for the
 provider-error and structured-output details, and
 [Metadata](/docs/reference/meta) for the full error payload.
 
+Because cancellation containment retires a shared runtime, an Agent admits at
+most one native prompt turn at a time across all of its logical sessions.
+Queued prompts remain context-cancellable. Lifecycle calls and bounded REST
+calls retain their separate concurrency limit.
+
 A shared-runtime exit fails the in-flight turn with this same
-`opencode_turn_failed` transport shape. The logical session remains loaded; its
-next prompt starts a replacement runtime and restores the last committed event
-generation before routing any user content.
+`opencode_turn_failed` transport shape; an overlapping cancel still resolves
+as cancelled, while containment failure is never erased by the runtime-loss
+race. Logical sessions remain loaded. A later prompt starts a replacement
+runtime and restores the last committed event generation before routing any
+user content.

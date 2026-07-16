@@ -1,4 +1,4 @@
-//go:build linux || darwin || freebsd || openbsd
+//go:build darwin || freebsd || openbsd
 
 package opencode
 
@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"syscall"
 	"time"
 )
@@ -15,7 +16,7 @@ type guardianContainment struct{}
 type livenessContainment struct{}
 
 func newGuardianContainment() (*guardianContainment, error) {
-	return &guardianContainment{}, nil
+	return nil, errors.Join(ErrProcessTreeUnproven, fmt.Errorf("proof-capable OpenCode runtime containment is unavailable on %s", runtime.GOOS))
 }
 
 func (*guardianContainment) Name() string { return "" }
@@ -27,7 +28,7 @@ func (*guardianContainment) Quiesce(nativePID int, timeout time.Duration) error 
 }
 
 func openLivenessContainment(string) (*livenessContainment, error) {
-	return &livenessContainment{}, nil
+	return nil, errors.Join(ErrProcessTreeUnproven, fmt.Errorf("proof-capable OpenCode runtime containment is unavailable on %s", runtime.GOOS))
 }
 
 func (*livenessContainment) Start(cmd *exec.Cmd) error {

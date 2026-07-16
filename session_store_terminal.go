@@ -49,13 +49,7 @@ func InspectSessionStoreTerminalState(
 
 	nativeSessionID := snapshot.Session.NativeSessionID
 
-	events, ok := snapshot.Events[nativeSessionID]
-	if !ok {
-		return SessionStoreTerminalState{}, fmt.Errorf(
-			"native session %q is absent from the OpenCode session-store snapshot",
-			nativeSessionID,
-		)
-	}
+	events := snapshot.Events[nativeSessionID]
 
 	var terminal SessionStoreTerminalState
 

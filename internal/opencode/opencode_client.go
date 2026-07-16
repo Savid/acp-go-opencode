@@ -92,6 +92,7 @@ const openAPITypeArray = "array"
 var (
 	ErrSSEDisconnect         = errors.New("opencode SSE disconnected")
 	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
+	ErrScopeRuntimeShutdown  = errors.New("directory-scoped OpenCode client cannot shut down the shared runtime")
 )
 
 type Client interface {
@@ -360,10 +361,9 @@ type openCodeServer struct {
 	events             chan Event
 	errs               chan error
 	closed             chan struct{}
-	once               sync.Once
 	directory          string
 	scopeCancel        context.CancelFunc
-	runtimeOnce        *sync.Once
+	runtimeShutdown    *runtimeShutdownState
 	runtimeClosed      chan struct{}
 	runtimeExited      chan struct{}
 	mcpNames           []string
@@ -376,6 +376,17 @@ type openCodeServer struct {
 
 	streamMu    sync.Mutex
 	streamEpoch uint64
+}
+
+type runtimeShutdownState struct {
+	once sync.Once
+	done chan struct{}
+	mu   sync.Mutex
+	err  error
+}
+
+func newRuntimeShutdownState() *runtimeShutdownState {
+	return &runtimeShutdownState{done: make(chan struct{})}
 }
 
 type NativeSession struct {
@@ -758,6 +769,7 @@ var (
 	openCodeReadyPollInterval             = 100 * time.Millisecond
 	openCodeEventReconnectDelay           = 250 * time.Millisecond
 	openCodeShutdownTimeout               = 5 * time.Second
+	openCodeContainmentTimeout            = 15 * time.Second
 )
 
 // HealthCheckTimeout is the default bound on OpenCode server readiness checks.
@@ -947,7 +959,7 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		events:             make(chan Event, 256),
 		errs:               make(chan error, 8),
 		closed:             make(chan struct{}),
-		runtimeOnce:        &sync.Once{},
+		runtimeShutdown:    newRuntimeShutdownState(),
 		runtimeClosed:      make(chan struct{}),
 		runtimeExited:      runtimeExited,
 		supervisorControl:  supervisorControl,
@@ -1072,73 +1084,105 @@ func (s *openCodeServer) Close(ctx context.Context) error {
 	return nil
 }
 
-func (s *openCodeServer) Shutdown(ctx context.Context) error {
-	var err error
-
-	once := s.runtimeOnce
-	if once == nil {
-		once = &s.once
+func (s *openCodeServer) Shutdown(context.Context) error {
+	if s.scopeCancel != nil {
+		return ErrScopeRuntimeShutdown
 	}
 
-	once.Do(func() {
-		terminateProcess := openCodeTerminateProcess
-		killProcess := openCodeKillProcess
-		waitCommand := openCodeWaitCommand
-		after := openCodeAfter
-		shutdownTimeout := openCodeShutdownTimeout
+	state := s.runtimeShutdown
+	if state == nil {
+		state = newRuntimeShutdownState()
+		s.runtimeShutdown = state
+	}
 
-		if s.runtimeClosed != nil {
-			close(s.runtimeClosed)
-		}
+	state.once.Do(func() {
+		go func() {
+			err := s.shutdownRuntime()
 
-		if s.cmd != nil && s.cmd.Process != nil {
-			if s.supervisorControl != nil {
-				_ = s.supervisorControl.Close()
-			} else {
-				_ = terminateProcess(s.cmd)
-			}
-
-			done := s.waitDone
-			if done == nil {
-				done = make(chan error, 1)
-				go func() { done <- waitCommand(s.cmd) }()
-			}
-
-			select {
-			case waitErr := <-done:
-				if waitErr != nil && s.log != nil {
-					s.log.DebugContext(ctx, "opencode exited during shutdown", slog.Any("error", waitErr))
-				}
-			case <-ctx.Done():
-				_ = killProcess(s.cmd)
-				err = ctx.Err()
-
-				if s.supervisor != nil {
-					<-done
-				}
-			case <-after(shutdownTimeout):
-				_ = killProcess(s.cmd)
-				err = errors.New("opencode process did not exit after shutdown")
-
-				if s.supervisor != nil {
-					<-done
-				}
-			}
-
-			if s.supervisor != nil {
-				proofErr := s.supervisor.awaitCompletion(ctx)
-				if proofErr == nil {
-					s.processObservation.markDescendantsQuiesced(context.Background())
-				}
-
-				err = errors.Join(err, proofErr)
-			}
-		}
-
-		if s.cancel != nil {
-			s.cancel()
-		}
+			state.mu.Lock()
+			state.err = err
+			state.mu.Unlock()
+			close(state.done)
+		}()
 	})
+
+	<-state.done
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	return state.err
+}
+
+func (s *openCodeServer) shutdownRuntime() error {
+	terminateProcess := openCodeTerminateProcess
+	killProcess := openCodeKillProcess
+	waitCommand := openCodeWaitCommand
+	after := openCodeAfter
+	shutdownTimeout := openCodeShutdownTimeout
+
+	proofCtx, proofCancel := context.WithTimeout(context.Background(), openCodeContainmentTimeout)
+	defer proofCancel()
+
+	if s.runtimeClosed != nil {
+		close(s.runtimeClosed)
+	}
+
+	var err error
+
+	if s.cmd != nil && s.cmd.Process != nil {
+		if s.supervisorControl != nil {
+			_ = s.supervisorControl.Close()
+		} else {
+			_ = terminateProcess(s.cmd)
+		}
+
+		done := s.waitDone
+		if done == nil {
+			done = make(chan error, 1)
+			go func() { done <- waitCommand(s.cmd) }()
+		}
+
+		waited := false
+
+		select {
+		case waitErr := <-done:
+			waited = true
+
+			if waitErr != nil && s.log != nil {
+				s.log.DebugContext(proofCtx, "opencode exited during shutdown", slog.Any("error", waitErr))
+			}
+		case <-after(shutdownTimeout):
+			_ = killProcess(s.cmd)
+			err = errors.New("opencode process did not exit after shutdown")
+		case <-proofCtx.Done():
+			_ = killProcess(s.cmd)
+			err = errors.Join(ErrProcessTreeUnproven, proofCtx.Err())
+		}
+
+		if !waited {
+			select {
+			case <-done:
+				waited = true
+			case <-proofCtx.Done():
+				err = errors.Join(err, ErrProcessTreeUnproven, proofCtx.Err())
+			}
+		}
+
+		if s.supervisor != nil {
+			proofErr := s.supervisor.awaitCompletion(proofCtx)
+			if proofErr == nil && waited {
+				s.processObservation.markDescendantsQuiesced(context.Background())
+			}
+
+			err = errors.Join(err, proofErr)
+		} else if !waited {
+			err = errors.Join(err, ErrProcessTreeUnproven)
+		}
+	}
+
+	if s.cancel != nil {
+		s.cancel()
+	}
 
 	return err
 }
@@ -1156,7 +1200,7 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		sessionQuestionListSupport: s.sessionQuestionListSupport,
 		events:                     make(chan Event, 256), errs: make(chan error, 8),
 		closed: make(chan struct{}), directory: options.Directory,
-		scopeCancel: cancel, runtimeOnce: s.runtimeOnce, runtimeClosed: s.runtimeClosed,
+		scopeCancel: cancel, runtimeShutdown: s.runtimeShutdown, runtimeClosed: s.runtimeClosed,
 		runtimeExited: s.runtimeExited,
 	}
 

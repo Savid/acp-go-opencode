@@ -216,38 +216,23 @@ func supervisorNonce() (string, error) {
 }
 
 // awaitCompletion closes the guardian-SIGKILL gap for a still-running adapter.
-// A liveness supervisor publishes completion only after it has proved its
-// native tree empty. If no liveness process ever started, the guardian could
-// not have launched a native root and the short startup observation expires.
+// Shutdown calls it only after the guardian has exited. A missing start marker
+// is therefore an explicit no-native-started outcome, never a timing guess.
 func (p *supervisorProof) awaitCompletion(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
 
-	startupDeadline := time.Now().Add(time.Second)
+	if _, err := os.Stat(p.completion); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return errors.Join(ErrProcessTreeUnproven, fmt.Errorf("stat liveness completion proof: %w", err))
+	}
 
-	for {
-		if _, err := os.Stat(p.completion); err == nil {
-			return nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return errors.Join(ErrProcessTreeUnproven, fmt.Errorf("stat liveness completion proof: %w", err))
-		}
-
-		if _, err := os.Stat(p.started); err == nil {
-			break
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return errors.Join(ErrProcessTreeUnproven, fmt.Errorf("stat liveness start proof: %w", err))
-		}
-
-		if time.Now().After(startupDeadline) {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return errors.Join(ErrProcessTreeUnproven, ctx.Err())
-		case <-time.After(10 * time.Millisecond):
-		}
+	if _, err := os.Stat(p.started); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return errors.Join(ErrProcessTreeUnproven, fmt.Errorf("stat liveness start proof: %w", err))
 	}
 
 	for {

@@ -48,7 +48,7 @@ func TestScopedRuntimeMCPAndSyncMethods(t *testing.T) {
 	runtimeExited := make(chan struct{})
 	client := &openCodeServer{
 		httpClient: server.Client(), baseURL: server.URL, events: make(chan Event, 1), errs: make(chan error, 1),
-		closed: make(chan struct{}), runtimeOnce: &sync.Once{}, runtimeClosed: make(chan struct{}), runtimeExited: runtimeExited,
+		closed: make(chan struct{}), runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}), runtimeExited: runtimeExited,
 	}
 	require.Equal(t, (<-chan struct{})(runtimeExited), client.RuntimeExited())
 	require.NoError(t, client.Close(context.Background()), "root Close is intentionally a no-op")
@@ -213,7 +213,7 @@ func TestScopeAndMCPFailureShapes(t *testing.T) {
 			writer.WriteHeader(http.StatusNoContent)
 		}))
 		t.Cleanup(server.Close)
-		client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL, runtimeOnce: &sync.Once{}, runtimeClosed: make(chan struct{})}
+		client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL, runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{})}
 		_, err := client.Scope(context.Background(), ScopeOptions{Directory: "/repo"})
 		require.ErrorContains(t, err, "first directory-scoped event")
 	})
@@ -223,7 +223,7 @@ func TestScopeAndMCPFailureShapes(t *testing.T) {
 			httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 				return nil, errors.New("dial failed")
 			})},
-			baseURL: "http://opencode.test", runtimeOnce: &sync.Once{}, runtimeClosed: make(chan struct{}),
+			baseURL: "http://opencode.test", runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
 		}
 		_, err := client.Scope(context.Background(), ScopeOptions{Directory: "/repo"})
 		require.ErrorContains(t, err, "directory event stream failed")
@@ -238,7 +238,7 @@ func TestScopeAndMCPFailureShapes(t *testing.T) {
 
 				return nil, request.Context().Err()
 			})},
-			baseURL: "http://opencode.test", runtimeOnce: &sync.Once{}, runtimeClosed: make(chan struct{}),
+			baseURL: "http://opencode.test", runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
 		}
 		_, err := client.Scope(ctx, ScopeOptions{Directory: "/repo"})
 		require.ErrorIs(t, err, context.Canceled)

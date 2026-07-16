@@ -98,7 +98,13 @@ OpenTelemetry providers.
   semantics fail closed before the native process starts.
 - Native sessions remain independently routed inside the shared runtime.
   Directory-scoped MCP is bound to one live session principal per canonical
-  working directory.
+  working directory. Native prompt turns are serialized across the Agent so
+  cancel or timeout can retire the shared generation without killing unrelated
+  concurrent work.
+- Cancel and timeout send native abort only as an advisory hint, then await one
+  memoized whole-runtime containment result for the exact generation. Fenced
+  stream/control failures use the same path. Linux helper-owned subreapers catch `setsid` escapees;
+  Windows uses a Job Object; unsupported containment backends fail closed.
 - A native-server crash fails the active turn, retains loaded logical
   sessions, and reconstructs a session from its last committed sync-event
   generation before a following prompt can reach the replacement runtime.

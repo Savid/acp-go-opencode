@@ -28,6 +28,7 @@ type supervisedNative struct {
 	rootPID     int
 	descPID     int
 	livenessPID int
+	proof       *supervisorProof
 	stderr      *supervisorTestBuffer
 	cancel      context.CancelFunc
 }
@@ -96,6 +97,20 @@ func TestSupervisorLivenessSIGKILLLeavesClaimLockedUntilTreeExit(t *testing.T) {
 	assertHomeReacquires(t, runtime.home)
 }
 
+func TestCancelledShutdownContainsStubbornSetsidDescendant(t *testing.T) {
+	runtime := startSupervisedNative(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	shutdownSupervisedRuntime(t, runtime, ctx)
+}
+
+func TestTurnTimeoutShutdownContainsStubbornSetsidDescendant(t *testing.T) {
+	runtime := startSupervisedNative(t)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	shutdownSupervisedRuntime(t, runtime, ctx)
+}
+
 func startSupervisedNative(t *testing.T) *supervisedNative {
 	t.Helper()
 	root := t.TempDir()
@@ -107,18 +122,18 @@ func startSupervisedNative(t *testing.T) *supervisedNative {
 	script := filepath.Join(root, "native.sh")
 	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
 if [ "$1" = "descendant" ]; then
+  echo "$$" > "$DESC_PID_FILE"
   trap '' TERM
   while :; do sleep 1; done
 fi
-"$0" descendant &
-echo "$!" > "$DESC_PID_FILE"
+setsid "$0" descendant &
 echo "$$" > "$ROOT_PID_FILE"
 trap '' TERM
 while IFS= read -r line; do printf '%s\n' "$line"; done
 `), 0o700))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	cmd, _, err := supervisorCommand(ctx, supervisorConfig{
+	cmd, proof, err := supervisorCommand(ctx, supervisorConfig{
 		NativePath: script,
 		NativeArgs: []string{"root"},
 		NativeEnv: append(os.Environ(),
@@ -143,12 +158,16 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 		home:   home,
 		stderr: stderr,
 		cancel: cancel,
+		proof:  proof,
 	}
 	t.Cleanup(func() {
 		cancel()
 		_ = stdin.Close()
 		if runtime.rootPID > 0 {
 			_ = syscall.Kill(-runtime.rootPID, syscall.SIGKILL)
+		}
+		if runtime.descPID > 0 {
+			_ = syscall.Kill(runtime.descPID, syscall.SIGKILL)
 		}
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
@@ -157,10 +176,45 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 
 	runtime.rootPID = waitPIDFile(t, rootPIDPath)
 	runtime.descPID = waitPIDFile(t, descPIDPath)
+	descendantSession, descendantGroup := processSessionAndGroup(t, runtime.descPID)
+	require.Equal(t, runtime.descPID, descendantSession, "descendant must escape into a new session")
+	require.Equal(t, runtime.descPID, descendantGroup, "descendant must escape into a new process group")
+	require.NotEqual(t, runtime.rootPID, descendantGroup)
 	runtime.livenessPID = parentPID(t, runtime.rootPID)
 	require.Positive(t, runtime.livenessPID)
 
 	return runtime
+}
+
+func shutdownSupervisedRuntime(t *testing.T, runtime *supervisedNative, ctx context.Context) {
+	t.Helper()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- runtime.cmd.Wait() }()
+	server := &openCodeServer{
+		cmd: runtime.cmd, supervisorControl: runtime.stdin, supervisor: runtime.proof,
+		waitDone: waitDone, runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
+	}
+	require.NoError(t, server.Shutdown(ctx))
+	runtime.cancel()
+	assertProcessGone(t, runtime.rootPID)
+	assertProcessGone(t, runtime.descPID)
+	assertHomeReacquires(t, runtime.home)
+}
+
+func processSessionAndGroup(t *testing.T, pid int) (int, int) {
+	t.Helper()
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	require.NoError(t, err)
+	closeParen := strings.LastIndexByte(string(raw), ')')
+	require.Greater(t, closeParen, 0)
+	fields := strings.Fields(string(raw[closeParen+1:]))
+	require.GreaterOrEqual(t, len(fields), 4)
+	group, err := strconv.Atoi(fields[2])
+	require.NoError(t, err)
+	session, err := strconv.Atoi(fields[3])
+	require.NoError(t, err)
+
+	return session, group
 }
 
 func waitPIDFile(t *testing.T, path string) int {

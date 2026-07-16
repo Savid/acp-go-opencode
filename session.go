@@ -375,12 +375,6 @@ func (s *session) beginCancellation(turnNonce string, requireMatch bool, markCan
 		return 0, invalidRoute("cancel route is missing, stale, or does not target the active turn")
 	}
 
-	if s.cancel == nil {
-		s.mu.Unlock()
-
-		return 0, nil
-	}
-
 	if s.cancellationResolvedEpoch == s.turnEpoch {
 		s.cancelled = s.cancelled || markCancelled
 		epoch := s.turnEpoch
@@ -400,6 +394,12 @@ func (s *session) beginCancellation(turnNonce string, requireMatch bool, markCan
 		s.mu.Unlock()
 
 		return epoch, nil
+	}
+
+	if s.cancel == nil {
+		s.mu.Unlock()
+
+		return 0, nil
 	}
 
 	s.cancelling = true
@@ -445,27 +445,28 @@ func (s *session) resolveCancellation(ctx context.Context, epoch uint64) error {
 		client := s.client
 		nativeID := s.idmap.NativeSessionID
 		generation := s.runtimeGeneration
-		runtimeLost := s.runtimeLostCause != ""
+		agent := s.agent
 		s.mu.Unlock()
 
+		if client != nil && nativeID != "" {
+			// Native abort is advisory. The exact-generation runtime retirement
+			// below is the containment certificate and supersedes an abort error.
+			_ = client.Abort(ctx, nativeID)
+		}
+
 		var err error
-		if !runtimeLost {
-			err = abortAndWaitIdle(ctx, client, nativeID)
+		if agent == nil {
+			err = errors.Join(opencode.ErrProcessTreeUnproven, errors.New("native runtime owner is unavailable"))
+		} else {
+			err = agent.retireSharedRuntime(generation, "shared OpenCode runtime retired after turn cancellation", s)
 		}
 
 		s.mu.Lock()
-		if s.runtimeGeneration != generation || s.runtimeLostCause != "" {
-			err = nil
-		}
-
 		if s.cancellationEpoch == epoch {
 			s.cancellationErr = err
 			s.cancelling = false
 
 			s.cancellationDone = nil
-			if s.cancel == nil {
-				s.cancelled = false
-			}
 
 			if err != nil && s.poisonCause == "" {
 				s.poisonCause = fmt.Sprintf("native cancellation fence failed: %v", err)
@@ -485,41 +486,6 @@ func (s *session) resolveCancellation(ctx context.Context, epoch uint64) error {
 		}
 
 		return nil
-	}
-}
-
-func abortAndWaitIdle(ctx context.Context, client opencode.Client, nativeID string) error {
-	if client == nil || nativeID == "" {
-		return errors.New("native session is unavailable")
-	}
-
-	if err := client.Abort(ctx, nativeID); err != nil {
-		return fmt.Errorf("abort native session: %w", err)
-	}
-
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		statuses, err := client.SessionStatus(ctx)
-		if err != nil {
-			return fmt.Errorf("read native session status: %w", err)
-		}
-
-		status, active := statuses[nativeID]
-		if !active || status.Type == nativeStatusIdle {
-			return nil
-		}
-
-		if status.Type != nativeStatusBusy && status.Type != nativeStatusRetry {
-			return fmt.Errorf("unknown native session status %q", status.Type)
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
 	}
 }
 
@@ -1005,7 +971,7 @@ func (s *session) Close(_ context.Context) error {
 
 		cancelErr = err
 		if cancelErr == nil && epoch != 0 {
-			cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+			cancelCtx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
 			cancelErr = s.resolveCancellation(cancelCtx, epoch)
 
 			cancel()
@@ -1240,7 +1206,7 @@ func (s *session) runtimeFailure() error {
 func (s *session) DeleteNativeAndClose(ctx context.Context) error {
 	epoch, err := s.beginCancellation("", false, true)
 	if err == nil && epoch != 0 {
-		cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		cancelCtx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
 		err = s.resolveCancellation(cancelCtx, epoch)
 
 		cancel()

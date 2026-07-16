@@ -41,10 +41,20 @@ Only a session fenced to that current runtime generation can publish its route
 and send the prompt; a replacement that crashes during reconstruction is
 discarded without routing the user prompt to it.
 
+Cancel and turn timeout retire the exact runtime generation used by that turn;
+stream/control failures use the same fence when native work may remain. All
+concurrent observers join one
+memoized base-runtime shutdown result. Retirement detaches every directory
+scope on that generation, proves the complete native process tree empty, and
+only then permits a replacement generation. Session snapshots and lazy restore
+remain available after successful containment.
+
 Closing a session releases its canonical-directory principal only after the
 native directory scope confirms all MCP registrations are absent. If that
 proof fails, close returns an error and retains the logical session/principal so
 the host can retry; admission never races ahead of uncertain native cleanup.
+Directory-scoped clients cannot own or initiate shutdown of the shared base
+runtime.
 
 ## Load versus resume
 

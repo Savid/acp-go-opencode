@@ -897,10 +897,16 @@ func TestPromptIdleSSEDisconnectDoesNotPoisonNextTurn(t *testing.T) {
 
 func TestPromptSuppressesLateFailedEpochEvents(t *testing.T) {
 	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native-1")
 	conn := newRecordingAgentClient()
 	agent := NewAgent()
 	agent.setAgentClient(conn)
 	session := testSession(agent, client)
+	session.cwd = t.TempDir()
+	require.NoError(t, session.snapshotToStore(context.Background()))
+	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+		return client, nil
+	}
 	started := make(chan struct{})
 	client.sendMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(started)
@@ -957,6 +963,104 @@ func TestPromptSuppressesLateFailedEpochEvents(t *testing.T) {
 	if conn.updateCount() != 1 {
 		t.Fatalf("late failed-epoch update was emitted: %#v", conn.updates)
 	}
+}
+
+func TestPromptNativeTurnQueueHonorsContext(t *testing.T) {
+	agent := NewAgent()
+	client := newFakeOpenCodeClient()
+	session := testSession(agent, client)
+	release, err := agent.acquireNativeTurn(context.Background())
+	require.NoError(t, err)
+	defer release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("queued")}})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestPromptCancelledStreamErrorRetiresRuntime(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		closeErr error
+	}{
+		{name: "contained"},
+		{name: "containment failure", closeErr: errors.New("containment failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newFakeOpenCodeClient()
+			client.closeErr = tc.closeErr
+			agent := NewAgent()
+			session := testSession(agent, client)
+			turnCtx := session.beginTurn(context.Background(), "nonce")
+			session.cancelled = true
+			client.errs <- errors.New("stream failed while cancellation won")
+
+			response, err := session.runPromptTurnWithRefreshedMCP(
+				context.Background(), turnCtx,
+				acp.PromptRequest{SessionId: session.id},
+				func(ctx context.Context) (opencode.NativeMessage, error) {
+					<-ctx.Done()
+
+					return opencode.NativeMessage{}, ctx.Err()
+				},
+				opencode.NativeCommand{}, false,
+			)
+			if tc.closeErr != nil {
+				require.ErrorContains(t, err, tc.closeErr.Error())
+
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+		})
+	}
+}
+
+func TestPromptUnexpectedTurnContextEndIsTransportFailure(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	session := testSession(NewAgent(), client)
+	turnCtx := session.beginTurn(context.Background(), "nonce")
+	session.mu.Lock()
+	cancel := session.cancel
+	session.mu.Unlock()
+	cancel()
+	release := make(chan struct{})
+	defer close(release)
+
+	_, err := session.runPromptTurnWithRefreshedMCP(
+		context.Background(), turnCtx, acp.PromptRequest{SessionId: session.id},
+		func(context.Context) (opencode.NativeMessage, error) {
+			<-release
+
+			return opencode.NativeMessage{}, nil
+		},
+		opencode.NativeCommand{}, false,
+	)
+	assertTurnFailed(t, err, causeTransport, "without a cancellation route")
+}
+
+func TestFinishPromptTurnCancellationBranches(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	response, err := session.finishPromptTurn(
+		ctx, context.Background(), acp.PromptRequest{},
+		promptTurnResult{err: errors.New("native failed")}, opencode.NativeCommand{}, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+
+	session = testSession(NewAgent(), newFakeOpenCodeClient())
+	response, err = session.finishPromptTurn(
+		ctx, context.Background(), acp.PromptRequest{},
+		promptTurnResult{message: opencode.NativeMessage{Info: opencode.NativeMessageInfo{
+			ID: "assistant", SessionID: "native-1", Role: "assistant", Finish: "stop",
+		}}},
+		opencode.NativeCommand{}, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
 }
 
 func TestPromptCleanEOFSentinelDisconnectAbortsTurn(t *testing.T) {
@@ -3613,10 +3717,13 @@ func TestPromptCancelSuppressesNativeError(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("Prompt did not return after cancel")
 	}
+	if !client.closed {
+		t.Fatal("cancel did not retire the shared runtime")
+	}
 }
 
 // T6 — with WithTurnTimeout set, a hanging native turn fails with cause
-// "timeout" (not cancelled) and the native turn is aborted.
+// "timeout" (not cancelled) after the exact shared runtime is retired.
 func TestPromptTurnTimeoutFailsWithTimeoutCause(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.sendMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
@@ -3636,6 +3743,9 @@ func TestPromptTurnTimeoutFailsWithTimeoutCause(t *testing.T) {
 	assertTurnFailed(t, err, causeTimeout, "deadline")
 	if client.abortCount() != 1 {
 		t.Fatalf("abort count = %d, want 1 (timeout aborts the native turn)", client.abortCount())
+	}
+	if !client.closed {
+		t.Fatal("timeout did not retire the shared runtime")
 	}
 }
 
@@ -3787,7 +3897,7 @@ func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {
 		connection.elicitErr = errors.New("client stopped")
 		agent.setAgentClient(connection)
 		client := newFakeOpenCodeClient()
-		client.abortErr = errors.New("abort failed")
+		client.closeErr = errors.New("containment failed")
 		client.pendingQuestions = []opencode.QuestionRequest{{ID: "question", SessionID: "native-1"}}
 		current := testSession(agent, client)
 		turnCtx := current.beginTurn(context.Background(), "nonce")
@@ -3801,7 +3911,7 @@ func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {
 	t.Run("ordinary reconciliation", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.permissionsErr = errors.New("permissions failed")
-		client.abortErr = errors.New("abort failed")
+		client.closeErr = errors.New("containment failed")
 		current := testSession(NewAgent(), client)
 		turnCtx := current.beginTurn(context.Background(), "nonce")
 		_, err := current.runPromptTurn(context.Background(), turnCtx, promptCoverageParams(current.id), func(context.Context) (opencode.NativeMessage, error) {
@@ -3813,7 +3923,7 @@ func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {
 
 	t.Run("stream error", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
-		client.abortErr = errors.New("abort failed")
+		client.closeErr = errors.New("containment failed")
 		client.errs <- errors.New("stream failed")
 		current := testSession(NewAgent(), client)
 		turnCtx := current.beginTurn(context.Background(), "nonce")
@@ -3827,7 +3937,7 @@ func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {
 
 	t.Run("cancelled native result", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
-		client.abortErr = errors.New("abort failed")
+		client.closeErr = errors.New("containment failed")
 		current := testSession(NewAgent(), client)
 		turnCtx := current.beginTurn(context.Background(), "nonce")
 		current.cancelled = true
@@ -3839,7 +3949,7 @@ func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {
 
 	t.Run("timeout", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
-		client.abortErr = errors.New("abort failed")
+		client.closeErr = errors.New("containment failed")
 		current := testSession(NewAgent(WithTurnTimeout(time.Millisecond)), client)
 		turnCtx := current.beginTurn(context.Background(), "nonce")
 		release := make(chan struct{})
@@ -3854,13 +3964,13 @@ func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {
 
 	t.Run("turn context", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
-		client.abortErr = errors.New("abort failed")
+		client.closeErr = errors.New("containment failed")
 		current := testSession(NewAgent(), client)
 		ctx, cancel := context.WithCancel(context.Background())
 		turnCtx := current.beginTurn(ctx, "nonce")
 		cancel()
 		release := make(chan struct{})
-		_, err := current.runPromptTurn(context.Background(), turnCtx, promptCoverageParams(current.id), func(context.Context) (opencode.NativeMessage, error) {
+		_, err := current.runPromptTurn(ctx, turnCtx, promptCoverageParams(current.id), func(context.Context) (opencode.NativeMessage, error) {
 			<-release
 
 			return opencode.NativeMessage{}, nil

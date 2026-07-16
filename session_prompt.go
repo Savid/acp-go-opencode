@@ -56,9 +56,6 @@ const (
 
 	finishReasonLength    = "length"
 	nativeStatusPending   = "pending"
-	nativeStatusBusy      = "busy"
-	nativeStatusIdle      = "idle"
-	nativeStatusRetry     = "retry"
 	nativeStatusCompleted = "completed"
 	nativeStatusSuccess   = "success"
 	nativeStatusError     = "error"
@@ -193,7 +190,7 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 		return err
 	}
 
-	cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	cancelCtx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
 	defer cancel()
 
 	return session.resolveCancellation(cancelCtx, epoch)
@@ -214,6 +211,12 @@ func (s *session) promptWithRoute(ctx context.Context, params acp.PromptRequest,
 	if err := s.ensureNotPoisoned(); err != nil {
 		return acp.PromptResponse{}, err
 	}
+
+	releaseNativeTurn, err := s.agent.acquireNativeTurn(ctx)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+	defer releaseNativeTurn()
 
 	acquire := s.acquireTurn
 
@@ -379,7 +382,7 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 		fenceOnce.Do(func() {
 			epoch, _ := s.beginCancellation("", false, markCancelled)
 
-			fenceCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+			fenceCtx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
 			fenceErr = s.resolveCancellation(fenceCtx, epoch)
 
 			cancel()
@@ -389,23 +392,7 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 	}
 
 	failTurn := func(err error) (acp.PromptResponse, error) {
-		if runtimeErr := s.runtimeFailure(); runtimeErr != nil {
-			return acp.PromptResponse{}, runtimeErr
-		}
-
-		if errors.Is(err, errPromptCancelled) {
-			if fenceErr := fenceTurn(true); fenceErr != nil {
-				return acp.PromptResponse{}, fenceErr
-			}
-
-			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
-		}
-
-		if fenceErr := fenceTurn(false); fenceErr != nil {
-			return acp.PromptResponse{}, errors.Join(err, fenceErr)
-		}
-
-		return acp.PromptResponse{}, err
+		return s.settlePromptFailure(err, fenceTurn, params)
 	}
 	if err := s.reconcilePermissions(turnCtx); err != nil {
 		return failTurn(err)
@@ -462,20 +449,22 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 		case err := <-s.client.EventErrors():
 			s.markStreamFailed(opencode.StreamErrorEpoch(err))
 
+			if response, cancelErr, cancelled := s.settlePromptCancellation(ctx, fenceTurn, params); cancelled {
+				return response, cancelErr
+			}
+
 			if fenceErr := fenceTurn(false); fenceErr != nil {
 				return acp.PromptResponse{}, errors.Join(acp.NewInternalError(turnFailedData(causeTransport, err.Error(), 0, "")), fenceErr)
 			}
 
 			return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(causeTransport, err.Error(), 0, ""))
 		case result := <-done:
-			if runtimeErr := s.runtimeFailure(); runtimeErr != nil {
-				return acp.PromptResponse{}, runtimeErr
+			if response, cancelErr, cancelled := s.settlePromptCancellation(ctx, fenceTurn, params); cancelled {
+				return response, cancelErr
 			}
 
-			if result.err != nil && (s.wasCancelled() || turnCtx.Err() != nil) {
-				if fenceErr := fenceTurn(true); fenceErr != nil {
-					return acp.PromptResponse{}, fenceErr
-				}
+			if runtimeErr := s.runtimeFailure(); runtimeErr != nil {
+				return acp.PromptResponse{}, runtimeErr
 			}
 
 			return s.finishPromptTurn(ctx, turnCtx, params, result, command, matchedCommand)
@@ -483,7 +472,7 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 			// The cancel guard runs before all failure mapping: when a user
 			// cancel and the turn deadline coincide, the turn resolves
 			// deterministically to cancelled, never cause "timeout".
-			cancelWon := s.wasCancelled() || turnCtx.Err() != nil
+			cancelWon := s.wasCancelled() || ctx.Err() != nil
 
 			if fenceErr := fenceTurn(false); fenceErr != nil {
 				return acp.PromptResponse{}, fenceErr
@@ -495,17 +484,57 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 
 			return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(causeTimeout, fmt.Sprintf("turn exceeded %s deadline", timeout), 0, ""))
 		case <-turnCtx.Done():
+			if response, cancelErr, cancelled := s.settlePromptCancellation(ctx, fenceTurn, params); cancelled {
+				return response, cancelErr
+			}
+
 			if runtimeErr := s.runtimeFailure(); runtimeErr != nil {
 				return acp.PromptResponse{}, runtimeErr
 			}
 
-			if fenceErr := fenceTurn(true); fenceErr != nil {
-				return acp.PromptResponse{}, fenceErr
-			}
-
-			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
+			return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(causeTransport, "OpenCode turn context ended without a cancellation route", 0, ""))
 		}
 	}
+}
+
+func (s *session) settlePromptFailure(
+	err error,
+	fenceTurn func(bool) error,
+	params acp.PromptRequest,
+) (acp.PromptResponse, error) {
+	if errors.Is(err, errPromptCancelled) {
+		if fenceErr := fenceTurn(true); fenceErr != nil {
+			return acp.PromptResponse{}, fenceErr
+		}
+
+		return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
+	}
+
+	if runtimeErr := s.runtimeFailure(); runtimeErr != nil {
+		return acp.PromptResponse{}, runtimeErr
+	}
+
+	if fenceErr := fenceTurn(false); fenceErr != nil {
+		return acp.PromptResponse{}, errors.Join(err, fenceErr)
+	}
+
+	return acp.PromptResponse{}, err
+}
+
+func (s *session) settlePromptCancellation(
+	ctx context.Context,
+	fenceTurn func(bool) error,
+	params acp.PromptRequest,
+) (acp.PromptResponse, error, bool) {
+	if !s.wasCancelled() && ctx.Err() == nil {
+		return acp.PromptResponse{}, nil, false
+	}
+
+	if fenceErr := fenceTurn(true); fenceErr != nil {
+		return acp.PromptResponse{}, fenceErr, true
+	}
+
+	return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil, true
 }
 
 func (s *session) refreshLifecycleMCP(ctx context.Context) error {
@@ -562,7 +591,7 @@ func (s *session) finishPromptTurn(
 	matchedCommand bool,
 ) (acp.PromptResponse, error) {
 	if result.err != nil {
-		if s.wasCancelled() || turnCtx.Err() != nil {
+		if s.wasCancelled() || ctx.Err() != nil {
 			//nolint:nilerr // The native error is intentionally suppressed for caller cancellation.
 			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
 		}
@@ -607,7 +636,7 @@ func (s *session) finishPromptTurn(
 	usage := usageFromTokens(final.Info.Tokens)
 
 	stopReason := stopReasonFromOpenCode(final.Info.Finish)
-	if s.wasCancelled() || turnCtx.Err() != nil {
+	if s.wasCancelled() || ctx.Err() != nil {
 		stopReason = acp.StopReasonCancelled
 	}
 

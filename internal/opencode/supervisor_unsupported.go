@@ -3,6 +3,7 @@
 package opencode
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -13,7 +14,7 @@ type guardianContainment struct{}
 type livenessContainment struct{}
 
 func unsupportedContainment() error {
-	return fmt.Errorf("OpenCode runtime containment is unsupported on %s", runtime.GOOS)
+	return errors.Join(ErrProcessTreeUnproven, fmt.Errorf("OpenCode runtime containment is unsupported on %s", runtime.GOOS))
 }
 
 func newGuardianContainment() (*guardianContainment, error) { return nil, unsupportedContainment() }

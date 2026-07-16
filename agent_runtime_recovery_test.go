@@ -153,6 +153,12 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		installed, closed := current.installRecoveredRuntime(exited, func() {}, current.idmap, 1)
 		require.False(t, installed)
 		require.False(t, closed)
+
+		agent.runtime = newFakeOpenCodeClient()
+		agent.runtimeGeneration = 2
+		installed, closed = current.installRecoveredRuntime(exited, func() {}, current.idmap, 1)
+		require.False(t, installed)
+		require.False(t, closed)
 	})
 
 	t.Run("scope crash observes caller cancellation", func(t *testing.T) {
@@ -302,7 +308,7 @@ func TestCrashGenerationCancellationAndPromptFailureBranches(t *testing.T) {
 	_, err := current.runPromptTurn(context.Background(), turnCtx, request, func(context.Context) (opencode.NativeMessage, error) {
 		return opencode.NativeMessage{}, nil
 	}, opencode.NativeCommand{}, false)
-	assertTurnFailed(t, err, causeTransport, "runtime exited")
+	assertTurnFailed(t, err, causeTransport, "runtime retired after turn cancellation")
 
 	current = testSession(NewAgent(), newFakeOpenCodeClient())
 	turnCtx = current.beginTurn(context.Background(), "turn")

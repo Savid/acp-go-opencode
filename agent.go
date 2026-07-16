@@ -22,6 +22,7 @@ const (
 	defaultMaxConcurrentClientCalls = 16
 	sessionTurnCapacity             = 1
 	closeTimeout                    = 5 * time.Second
+	settlementTimeout               = 20 * time.Second
 )
 
 var (
@@ -41,9 +42,12 @@ type Agent struct {
 	mu                    sync.Mutex
 	closed                bool
 	conn                  agentClient
+	closeDone             chan struct{}
+	closeErr              error
 	sessions              map[acp.SessionId]*session
 	deleted               map[acp.SessionId]struct{}
 	clientCalls           chan struct{}
+	nativeTurns           chan struct{}
 	clientCapabilities    acp.ClientCapabilities
 	positionEncoding      acp.PositionEncodingKind
 	runtime               opencode.Client
@@ -53,6 +57,7 @@ type Agent struct {
 	runtimeFatalErr       error
 	runtimeNativeRelease  func()
 	runtimeScratchRelease func()
+	runtimeRetirements    map[uint64]*runtimeRetirement
 	directories           map[string]directoryBinding
 	directoryIncarnation  directoryBindingIncarnation
 	fingerprintKey        [32]byte
@@ -107,14 +112,16 @@ func NewAgent(opts ...Option) *Agent {
 	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe)
 
 	agent := &Agent{
-		options:     options,
-		log:         log,
-		optionsErr:  optionsErr,
-		observe:     observe,
-		sessions:    make(map[acp.SessionId]*session),
-		deleted:     make(map[acp.SessionId]struct{}),
-		directories: make(map[string]directoryBinding),
-		clientCalls: make(chan struct{}, limits.MaxConcurrentClientCalls),
+		options:            options,
+		log:                log,
+		optionsErr:         optionsErr,
+		observe:            observe,
+		sessions:           make(map[acp.SessionId]*session),
+		deleted:            make(map[acp.SessionId]struct{}),
+		directories:        make(map[string]directoryBinding),
+		runtimeRetirements: make(map[uint64]*runtimeRetirement),
+		clientCalls:        make(chan struct{}, limits.MaxConcurrentClientCalls),
+		nativeTurns:        make(chan struct{}, 1),
 	}
 	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
 		agent.optionsErr = errors.Join(agent.optionsErr, fmt.Errorf("create runtime fingerprint key: %w", err))
@@ -163,46 +170,62 @@ func (a *Agent) connection() agentClient {
 
 func (a *Agent) Close() error {
 	a.mu.Lock()
+	if a.closeDone != nil {
+		done := a.closeDone
+		a.mu.Unlock()
+		<-done
+		a.mu.Lock()
+		err := a.closeErr
+		a.mu.Unlock()
+
+		return err
+	}
+
+	closeDone := make(chan struct{})
+	a.closeDone = closeDone
 
 	sessions := make([]*session, 0, len(a.sessions))
 	for _, session := range a.sessions {
 		sessions = append(sessions, session)
 	}
 
-	a.sessions = make(map[acp.SessionId]*session)
 	runtime := a.runtime
-	a.runtime = nil
-	nativeRelease := a.runtimeNativeRelease
-	a.runtimeNativeRelease = nil
-	scratchRelease := a.runtimeScratchRelease
-	a.runtimeScratchRelease = nil
+	generation := a.runtimeGeneration
+	waiting := a.runtimeStarting
 	a.closed = true
 	a.conn = nil
 	a.mu.Unlock()
 
 	var err error
+	if runtime != nil {
+		err = errors.Join(err, a.retireSharedRuntime(generation, "shared OpenCode runtime retired while closing agent"))
+	} else if waiting != nil {
+		<-waiting
+		a.mu.Lock()
+		retirement := a.runtimeRetirements[generation]
+		a.mu.Unlock()
+
+		if retirement != nil {
+			<-retirement.done
+			err = errors.Join(err, retirement.err)
+		}
+	}
 
 	for _, session := range sessions {
-		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
 		err = errors.Join(err, session.Close(ctx))
 
 		cancel()
 	}
 
-	var shutdownErr error
-
-	if runtime != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		shutdownErr = runtime.Shutdown(ctx)
-
-		cancel()
-	}
-
-	if runtime != nil || nativeRelease != nil || scratchRelease != nil {
-		err = errors.Join(err, a.cleanupRuntimeResources(shutdownErr, nativeRelease, scratchRelease))
-	}
-
 	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
+
+	a.mu.Lock()
+	a.sessions = make(map[acp.SessionId]*session)
+	a.closeErr = err
+
+	close(closeDone)
+	a.mu.Unlock()
 
 	return err
 }
@@ -352,6 +375,18 @@ func (a *Agent) acquireClientCall(ctx context.Context) (func(), error) {
 		return nil, ctx.Err()
 	default:
 		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "client_calls"})
+	}
+}
+
+// acquireNativeTurn serializes prompts across every logical session sharing
+// this Agent's native runtime. Cancellation retires that whole runtime, so a
+// second active native turn could otherwise be killed as collateral work.
+func (a *Agent) acquireNativeTurn(ctx context.Context) (func(), error) {
+	select {
+	case a.nativeTurns <- struct{}{}:
+		return func() { <-a.nativeTurns }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

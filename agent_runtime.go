@@ -12,11 +12,18 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
+
+type runtimeRetirement struct {
+	generation uint64
+	done       chan struct{}
+	err        error
+}
 
 var (
 	runtimeEvalSymlinks      = filepath.EvalSymlinks
@@ -157,32 +164,92 @@ func (a *Agent) watchSharedRuntime(runtime opencode.Client, generation uint64) {
 
 func (a *Agent) handleSharedRuntimeExit(runtime opencode.Client, generation uint64) {
 	a.mu.Lock()
-	if a.closed || a.runtime != runtime || a.runtimeGeneration != generation {
-		a.mu.Unlock()
+	current := !a.closed && a.runtime == runtime && a.runtimeGeneration == generation
+	a.mu.Unlock()
 
+	if !current {
 		return
 	}
 
-	sessions := make([]*session, 0, len(a.sessions))
-	for _, current := range a.sessions {
-		sessions = append(sessions, current)
+	if err := a.retireSharedRuntime(generation, "shared OpenCode runtime exited"); err != nil && a.log != nil {
+		a.log.ErrorContext(context.Background(), "clean up exited shared OpenCode runtime", slog.Any("error", err))
+	}
+}
+
+// retireSharedRuntime is the sole exact-generation process-containment fence.
+// Every caller for one generation observes the same shutdown/proof result, and
+// no replacement runtime can start until that result has been published.
+func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...*session) error {
+	a.mu.Lock()
+	if retirement := a.runtimeRetirements[generation]; retirement != nil {
+		done := retirement.done
+		a.mu.Unlock()
+		<-done
+
+		return retirement.err
 	}
 
+	if a.runtime == nil || a.runtimeGeneration != generation {
+		err := a.runtimeFatalErr
+		a.mu.Unlock()
+
+		if err != nil {
+			return err
+		}
+
+		return errors.Join(
+			opencode.ErrProcessTreeUnproven,
+			fmt.Errorf("OpenCode runtime generation %d has no containment result", generation),
+		)
+	}
+
+	runtime := a.runtime
+	sessions := make([]*session, 0, len(a.sessions))
+
+	seenSessions := make(map[*session]struct{}, len(a.sessions)+len(targets))
+	for _, current := range a.sessions {
+		sessions = append(sessions, current)
+		seenSessions[current] = struct{}{}
+	}
+
+	for _, target := range targets {
+		if target == nil {
+			continue
+		}
+
+		if _, exists := seenSessions[target]; exists {
+			continue
+		}
+
+		sessions = append(sessions, target)
+		seenSessions[target] = struct{}{}
+	}
+
+	retirement := &runtimeRetirement{generation: generation, done: make(chan struct{})}
+	a.runtimeRetirements[generation] = retirement
 	a.directories = make(map[string]directoryBinding)
 	a.runtime = nil
-	cleanupDone := make(chan struct{})
-	a.runtimeStarting = cleanupDone
+	a.runtimeStarting = retirement.done
 	nativeRelease := a.runtimeNativeRelease
 	a.runtimeNativeRelease = nil
 	scratchRelease := a.runtimeScratchRelease
 	a.runtimeScratchRelease = nil
 	a.mu.Unlock()
 
+	var detachGroup sync.WaitGroup
+	detachGroup.Add(len(sessions))
+
 	for _, current := range sessions {
-		current.detachRuntime(generation, "shared OpenCode runtime exited")
+		go func() {
+			defer detachGroup.Done()
+
+			current.detachRuntime(generation, cause)
+		}()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	detachGroup.Wait()
+
+	ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
 	shutdownErr := runtime.Shutdown(ctx)
 
 	cancel()
@@ -190,20 +257,20 @@ func (a *Agent) handleSharedRuntimeExit(runtime opencode.Client, generation uint
 	cleanupErr := a.cleanupRuntimeResources(shutdownErr, nativeRelease, scratchRelease)
 
 	a.mu.Lock()
+	retirement.err = cleanupErr
+
 	if fatalRuntimeCleanup(cleanupErr) {
 		a.runtimeFatalErr = cleanupErr
 	}
 
-	if a.runtimeStarting == cleanupDone {
+	if a.runtimeStarting == retirement.done {
 		a.runtimeStarting = nil
 	}
 
-	close(cleanupDone)
+	close(retirement.done)
 	a.mu.Unlock()
 
-	if cleanupErr != nil && a.log != nil {
-		a.log.ErrorContext(context.Background(), "clean up exited shared OpenCode runtime", slog.Any("error", cleanupErr))
-	}
+	return cleanupErr
 }
 
 func (a *Agent) runtimeGenerationIsCurrent(generation uint64) bool {

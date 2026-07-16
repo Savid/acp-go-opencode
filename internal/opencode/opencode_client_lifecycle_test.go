@@ -508,6 +508,56 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	}
 }
 
+func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneContainmentResult(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+	openCodeTerminateProcess = func(*exec.Cmd) error { return nil }
+	openCodeAfter = func(time.Duration) <-chan time.Time {
+		ready := make(chan time.Time, 1)
+		ready <- time.Now()
+
+		return ready
+	}
+
+	var kills atomic.Int32
+	killed := make(chan struct{})
+	openCodeKillProcess = func(*exec.Cmd) error {
+		if kills.Add(1) == 1 {
+			close(killed)
+		}
+
+		return nil
+	}
+
+	root := t.TempDir()
+	completion := filepath.Join(root, "complete")
+	require.NoError(t, writeSupervisorMarker(completion))
+	state := newRuntimeShutdownState()
+	base := &openCodeServer{
+		cmd: &exec.Cmd{Process: &os.Process{Pid: 123}}, supervisorControl: nopWriteCloser{},
+		supervisor: &supervisorProof{completion: completion}, waitDone: make(chan error, 1),
+		runtimeShutdown: state, runtimeClosed: make(chan struct{}),
+	}
+	scope := &openCodeServer{scopeCancel: func() {}, runtimeShutdown: state}
+	require.ErrorIs(t, scope.Shutdown(context.Background()), ErrScopeRuntimeShutdown)
+	require.Zero(t, kills.Load())
+
+	results := make(chan error, 2)
+	go func() { results <- base.Shutdown(context.Background()) }()
+	go func() {
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		results <- base.Shutdown(cancelled)
+	}()
+	<-killed
+	base.waitDone <- nil
+	first := <-results
+	second := <-results
+	require.ErrorContains(t, first, "did not exit after shutdown")
+	require.True(t, first == second, "all shutdown callers must receive the exact memoized error")
+	require.EqualValues(t, 1, kills.Load())
+	require.True(t, first == base.Shutdown(context.Background()))
+}
+
 func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	ctx := context.Background()
 
@@ -987,6 +1037,7 @@ func TestOpenCodeServerCloseTimeoutAndContext(t *testing.T) {
 	for name, cancelled := range map[string]bool{"timeout": false, "context": true} {
 		t.Run(name, func(t *testing.T) {
 			restoreOpenCodeClientSeams(t)
+			openCodeContainmentTimeout = 10 * time.Millisecond
 			cmd := &exec.Cmd{Process: &os.Process{Pid: 1234}}
 			openCodeTerminateProcess = func(*exec.Cmd) error { return nil }
 			openCodeKillProcess = func(*exec.Cmd) error { return nil }
@@ -1603,6 +1654,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	readyPoll := openCodeReadyPollInterval
 	reconnectDelay := openCodeEventReconnectDelay
 	shutdownTimeout := openCodeShutdownTimeout
+	containmentTimeout := openCodeContainmentTimeout
 	t.Cleanup(func() {
 		openCodeCommandContext = commandContext
 		openCodeListen = listen
@@ -1615,6 +1667,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodeReadyPollInterval = readyPoll
 		openCodeEventReconnectDelay = reconnectDelay
 		openCodeShutdownTimeout = shutdownTimeout
+		openCodeContainmentTimeout = containmentTimeout
 	})
 }
 

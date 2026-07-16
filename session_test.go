@@ -10,8 +10,6 @@ import (
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
 
-	"time"
-
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/stretchr/testify/require"
@@ -129,42 +127,6 @@ func TestSessionTurnAdmissionAndCancellationFailureShapes(t *testing.T) {
 	release()
 }
 
-func TestAbortWaitIdleEveryResult(t *testing.T) {
-	ctx := context.Background()
-	require.Error(t, abortAndWaitIdle(ctx, nil, "native"))
-	client := newFakeOpenCodeClient()
-	require.Error(t, abortAndWaitIdle(ctx, client, ""))
-
-	client.abortErr = errors.New("abort failed")
-	require.ErrorContains(t, abortAndWaitIdle(ctx, client, "native"), "abort native session")
-	client.abortErr = nil
-	client.statusErr = errors.New("status failed")
-	require.ErrorContains(t, abortAndWaitIdle(ctx, client, "native"), "read native session status")
-	client.statusErr = nil
-	client.statuses = map[string]opencode.NativeSessionStatus{"native": {Type: "mystery"}}
-	require.ErrorContains(t, abortAndWaitIdle(ctx, client, "native"), "unknown native session status")
-	client.statuses = map[string]opencode.NativeSessionStatus{"native": {Type: "idle"}}
-	require.NoError(t, abortAndWaitIdle(ctx, client, "native"))
-	client.statuses = map[string]opencode.NativeSessionStatus{}
-	require.NoError(t, abortAndWaitIdle(ctx, client, "native"))
-
-	client.statuses = map[string]opencode.NativeSessionStatus{"native": {Type: "busy"}}
-	short, cancel := context.WithTimeout(ctx, time.Millisecond)
-	defer cancel()
-	require.ErrorIs(t, abortAndWaitIdle(short, client, "native"), context.DeadlineExceeded)
-
-	client.statuses = map[string]opencode.NativeSessionStatus{"native": {Type: "busy"}}
-	go func() {
-		time.Sleep(75 * time.Millisecond)
-		client.mu.Lock()
-		client.statuses["native"] = opencode.NativeSessionStatus{Type: "idle"}
-		client.mu.Unlock()
-	}()
-	settles, settleCancel := context.WithTimeout(ctx, time.Second)
-	defer settleCancel()
-	require.NoError(t, abortAndWaitIdle(settles, client, "native"))
-}
-
 func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
@@ -250,7 +212,7 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 	released := false
 	current.directoryRelease = func() { released = true }
 	current.beginTurn(context.Background(), "nonce")
-	current.detachRuntime(0, "runtime exited")
+	current.detachRuntime(current.runtimeGeneration, "runtime exited")
 	require.True(t, released)
 	require.NoError(t, current.ensureNotPoisoned())
 	require.ErrorContains(t, current.runtimeFailure(), "runtime exited")
@@ -281,6 +243,14 @@ func TestSessionCancellationEpochCoordinationRemainingBranches(t *testing.T) {
 	require.Error(t, err)
 	require.NoError(t, current.resolveCancellation(context.Background(), 0))
 
+	resolved := testSession(NewAgent(), newFakeOpenCodeClient())
+	turnCtx := resolved.beginTurn(context.Background(), "resolved")
+	resolved.cancellationResolvedEpoch = resolved.turnEpoch
+	epoch, err := resolved.beginCancellation("", false, true)
+	require.NoError(t, err)
+	require.Equal(t, resolved.turnEpoch, epoch)
+	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+
 	done := make(chan struct{})
 	current.cancelling = true
 	current.cancellationEpoch = 7
@@ -293,24 +263,24 @@ func TestSessionCancellationEpochCoordinationRemainingBranches(t *testing.T) {
 	var observeOnce sync.Once
 	observeCancellationWait = func() { observeOnce.Do(func() { waiting <- struct{}{} }) }
 	t.Cleanup(func() { observeCancellationWait = originalObserve })
-	resolved := make(chan error, 1)
-	go func() { resolved <- current.resolveCancellation(context.Background(), 7) }()
+	resolvedResult := make(chan error, 1)
+	go func() { resolvedResult <- current.resolveCancellation(context.Background(), 7) }()
 	<-waiting
 	current.mu.Lock()
 	current.cancelling = false
 	current.mu.Unlock()
 	close(done)
-	require.NoError(t, <-resolved)
+	require.NoError(t, <-resolvedResult)
 
 	current = testSession(agent, client)
 	current.beginTurn(context.Background(), "nonce")
 	client.statuses = map[string]opencode.NativeSessionStatus{"native-1": {Type: "idle"}}
-	epoch, err := current.beginCancellation("nonce", true, true)
+	epoch, err = current.beginCancellation("nonce", true, true)
 	require.NoError(t, err)
 	require.NoError(t, current.resolveCancellation(context.Background(), epoch))
 	epoch, err = current.beginCancellation("nonce", true, true)
-	require.NoError(t, err)
-	require.EqualValues(t, current.turnEpoch, epoch)
+	require.Error(t, err)
+	require.Zero(t, epoch)
 
 	current = testSession(agent, newFakeOpenCodeClient())
 	current.beginTurn(context.Background(), "nonce")
@@ -321,8 +291,9 @@ func TestSessionCancellationEpochCoordinationRemainingBranches(t *testing.T) {
 	require.EqualValues(t, current.turnEpoch, epoch)
 
 	errorClient := newFakeOpenCodeClient()
-	errorClient.abortErr = errors.New("abort failed")
-	current = testSession(agent, errorClient)
+	errorClient.closeErr = errors.New("containment failed")
+	errorAgent := NewAgent()
+	current = testSession(errorAgent, errorClient)
 	current.beginTurn(context.Background(), "nonce")
 	epoch, err = current.beginCancellation("", false, false)
 	require.NoError(t, err)
@@ -331,6 +302,13 @@ func TestSessionCancellationEpochCoordinationRemainingBranches(t *testing.T) {
 	current.mu.Unlock()
 	require.Error(t, current.resolveCancellation(context.Background(), epoch))
 	require.Error(t, current.ensureNotPoisoned())
+
+	orphan := testSession(NewAgent(), newFakeOpenCodeClient())
+	orphan.beginTurn(context.Background(), "nonce")
+	epoch, err = orphan.beginCancellation("", false, false)
+	require.NoError(t, err)
+	orphan.agent = nil
+	require.ErrorContains(t, orphan.resolveCancellation(context.Background(), epoch), opencode.ErrProcessTreeUnproven.Error())
 }
 
 func TestDeleteNativeAndCloseFencesActiveTurn(t *testing.T) {

@@ -36,7 +36,7 @@ runtime and its resources quarantined.
 | `WithSeedFiles` | Immutable files written into the shared config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
-| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions. |
+| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions; native prompt turns are additionally serialized Agent-wide because cancellation retires their shared runtime. |
 | `WithTurnTimeout` | Per-turn deadline; `0` (default) disables it. |
 | `WithRuntimeResourceHooks` | Worker-global native-root and scratch-root permit hooks; a non-nil hook must return a non-nil release function. |
 | `WithAgentName` / `WithAgentTitle` / `WithAgentVersion` | Identity in the initialize response. |
@@ -51,6 +51,11 @@ permits. Absolute provider-descendant snapshots are emitted only when the
 containment backend can prove them. Startup observations distinguish
 `spawn`, `readiness`, `configuration`, and native `session` creation and carry
 the stage error.
+
+Cancellation, timeout, and turn-failure settlement use a 20-second adapter
+budget around a base-runtime shutdown whose internal containment proof is
+bounded to 15 seconds. Every waiter for a runtime generation receives the same
+memoized result; a scope client cannot shut down the base runtime.
 
 ### OpenCode process options
 

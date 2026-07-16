@@ -21,13 +21,93 @@ type proofFailureRuntimeClient struct {
 	entered chan struct{}
 	resume  chan struct{}
 	err     error
+	calls   atomic.Int32
 }
 
 func (client *proofFailureRuntimeClient) Shutdown(context.Context) error {
-	close(client.entered)
+	if client.calls.Add(1) == 1 {
+		close(client.entered)
+	}
 	<-client.resume
 
 	return client.err
+}
+
+func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
+	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessTreeUnproven)
+	client := &proofFailureRuntimeClient{
+		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		entered:            make(chan struct{}),
+		resume:             make(chan struct{}),
+		err:                containmentErr,
+	}
+	agent := NewAgent(WithHome(t.TempDir()))
+	agent.runtime = client
+	agent.runtimeGeneration = 1
+
+	results := make(chan error, 2)
+	go func() { results <- agent.retireSharedRuntime(1, "cancel") }()
+	go func() { results <- agent.retireSharedRuntime(1, "timeout") }()
+	<-client.entered
+	close(client.resume)
+	first := <-results
+	second := <-results
+	require.True(t, first == second, "concurrent callers must receive one exact memoized result")
+	require.ErrorIs(t, first, containmentErr)
+	require.EqualValues(t, 1, client.calls.Load())
+
+	secondClient := newFakeOpenCodeClient()
+	agent.mu.Lock()
+	agent.runtime = secondClient
+	agent.runtimeGeneration = 2
+	agent.runtimeFatalErr = nil
+	agent.mu.Unlock()
+	require.NoError(t, agent.retireSharedRuntime(2, "next generation"))
+	require.True(t, first == agent.retireSharedRuntime(1, "late first-generation waiter"))
+
+	missing := NewAgent()
+	require.ErrorIs(t, missing.retireSharedRuntime(9, "missing"), opencode.ErrProcessTreeUnproven)
+	missing.runtimeFatalErr = containmentErr
+	require.ErrorIs(t, missing.retireSharedRuntime(9, "fatal"), containmentErr)
+
+	nilTarget := NewAgent(WithHome(t.TempDir()))
+	nilTarget.runtime = newFakeOpenCodeClient()
+	nilTarget.runtimeGeneration = 1
+	require.NoError(t, nilTarget.retireSharedRuntime(1, "nil target", nil))
+}
+
+func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.T) {
+	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessTreeUnproven)
+	client := &proofFailureRuntimeClient{
+		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		entered:            make(chan struct{}),
+		resume:             make(chan struct{}),
+		err:                containmentErr,
+	}
+	agent := NewAgent(WithHome(t.TempDir()))
+	agent.runtime = client
+	agent.runtimeGeneration = 1
+
+	results := make(chan error, 2)
+	go func() { results <- agent.Close() }()
+	<-client.entered
+	go func() { results <- agent.Close() }()
+	close(client.resume)
+	first := <-results
+	second := <-results
+	require.True(t, first == second)
+	require.ErrorIs(t, first, containmentErr)
+	require.EqualValues(t, 1, client.calls.Load())
+
+	waiting := NewAgent()
+	retirement := &runtimeRetirement{generation: 1, done: make(chan struct{}), err: containmentErr}
+	waiting.runtimeGeneration = 1
+	waiting.runtimeStarting = retirement.done
+	waiting.runtimeRetirements[1] = retirement
+	done := make(chan error, 1)
+	go func() { done <- waiting.Close() }()
+	close(retirement.done)
+	require.ErrorIs(t, <-done, containmentErr)
 }
 
 func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
@@ -272,7 +352,6 @@ func TestDirectoryScopeCloseFailureQuarantinesWithoutRelease(t *testing.T) {
 
 	agent.runtimeFatalErr = nil
 	current := testSession(agent, client)
-	current.runtimeGeneration = 0
 	current.directoryRelease = func() { releases++ }
 	err = agent.closeFailedSession(current)
 	require.ErrorContains(t, err, "disconnect failed")
