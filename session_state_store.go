@@ -76,9 +76,31 @@ type stateSnapshotNode struct {
 	Permission      string `json:"permission"`
 }
 
+type capturedStateSnapshot struct {
+	replacements []SessionStoreReplacement
+}
+
 func (s *session) snapshotToStore(ctx context.Context) error {
-	if err := s.ensureNotPoisoned(); err != nil {
+	captured, err := s.captureStateSnapshot(ctx, false)
+	if err != nil || len(captured.replacements) == 0 {
 		return err
+	}
+
+	return s.commitStateSnapshot(ctx, captured)
+}
+
+// captureStateSnapshot reads one stable native sync generation without
+// publishing it. Cancellation uses the split capture/commit path so it can
+// collect the just-aborted turn while the loopback API is still online, prove
+// the complete native process tree is gone, and only then perform remote store
+// I/O. allowInterruptedGeneration is valid only after the native abort request
+// has settled; pending permissions and elicitations remain hard blockers.
+func (s *session) captureStateSnapshot(
+	ctx context.Context,
+	allowInterruptedGeneration bool,
+) (capturedStateSnapshot, error) {
+	if err := s.ensureNotPoisoned(); err != nil {
+		return capturedStateSnapshot{}, err
 	}
 
 	// Cancellation retires and proves the complete shared native process tree
@@ -93,19 +115,21 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 	s.mu.Unlock()
 
 	if runtimeLost {
-		return nil
+		return capturedStateSnapshot{}, nil
 	}
 
 	graph := s.agent.adoptedGraph(s)
 	for _, member := range graph {
 		if reason := member.snapshotBlockedReason(); reason != "" {
-			return fmt.Errorf("cannot snapshot OpenCode graph while %s pending", reason)
+			if !allowInterruptedGeneration || member != s || reason != snapshotBlockGeneration {
+				return capturedStateSnapshot{}, fmt.Errorf("cannot snapshot OpenCode graph while %s pending", reason)
+			}
 		}
 	}
 
 	first, err := s.client.SyncHistory(ctx, map[string]int64{})
 	if err != nil {
-		return fmt.Errorf("capture OpenCode sync history: %w", err)
+		return capturedStateSnapshot{}, fmt.Errorf("capture OpenCode sync history: %w", err)
 	}
 
 	allow := make(map[string]stateSnapshotNode, len(graph))
@@ -125,23 +149,23 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 
 	events, cursors, err := allowlistedSyncEvents(first, allow)
 	if err != nil {
-		return err
+		return capturedStateSnapshot{}, err
 	}
 
 	second, err := s.client.SyncHistory(ctx, cursors)
 	if err != nil {
-		return fmt.Errorf("verify OpenCode sync watermark: %w", err)
+		return capturedStateSnapshot{}, fmt.Errorf("verify OpenCode sync watermark: %w", err)
 	}
 
 	for _, event := range second {
 		if _, ok := allow[event.AggregateID]; ok {
-			return fmt.Errorf("OpenCode graph changed during export")
+			return capturedStateSnapshot{}, fmt.Errorf("OpenCode graph changed during export")
 		}
 	}
 
 	generation, err := newRestoreGeneration()
 	if err != nil {
-		return err
+		return capturedStateSnapshot{}, err
 	}
 
 	now := time.Now().UnixMilli()
@@ -165,11 +189,11 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 
 		entry, marshalErr := json.Marshal(bundle)
 		if marshalErr != nil {
-			return marshalErr
+			return capturedStateSnapshot{}, marshalErr
 		}
 
 		if err := scanSyncBundle(entry, s.agent.graphSecretNeedles(graph)); err != nil {
-			return err
+			return capturedStateSnapshot{}, err
 		}
 
 		replacements = append(replacements, SessionStoreReplacement{
@@ -177,9 +201,6 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 			Entries: []SessionStoreEntry{entry},
 		})
 	}
-
-	storeCtx, cancel := context.WithTimeout(ctx, sessionStateReplaceTimeout)
-	defer cancel()
 
 	s.agent.restoreMu.Lock()
 	ownershipErr := recordSnapshotOwnership(s.client, stateSnapshot{
@@ -189,10 +210,25 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 	s.agent.restoreMu.Unlock()
 
 	if ownershipErr != nil {
-		return ownershipErr
+		return capturedStateSnapshot{}, ownershipErr
 	}
 
-	return s.agent.sessionStore().Replace(storeCtx, SessionKey{SessionID: string(s.id)}, replacements)
+	return capturedStateSnapshot{replacements: replacements}, nil
+}
+
+func (s *session) commitStateSnapshot(ctx context.Context, captured capturedStateSnapshot) error {
+	if len(captured.replacements) == 0 {
+		return nil
+	}
+
+	storeCtx, cancel := context.WithTimeout(ctx, sessionStateReplaceTimeout)
+	defer cancel()
+
+	return s.agent.sessionStore().Replace(
+		storeCtx,
+		SessionKey{SessionID: string(s.id)},
+		captured.replacements,
+	)
 }
 
 func (s *session) snapshotBlockedReason() string {

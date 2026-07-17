@@ -388,6 +388,19 @@ func (s *session) beginCancellation(turnNonce string, requireMatch bool, markCan
 		return epoch, nil
 	}
 
+	// A failed containment/snapshot fence remains the terminal result for this
+	// turn epoch. The prompt-side fence may arrive after the notification-side
+	// resolver finished; return the same epoch so resolveCancellation publishes
+	// the memoized error instead of mistaking the detached cancel function for
+	// an unstarted cancellation.
+	if !s.cancelling && s.cancellationEpoch == s.turnEpoch && s.cancellationErr != nil {
+		s.cancelled = s.cancelled || markCancelled
+		epoch := s.cancellationEpoch
+		s.mu.Unlock()
+
+		return epoch, nil
+	}
+
 	if s.cancelling {
 		s.cancelled = s.cancelled || markCancelled
 		epoch := s.cancellationEpoch
@@ -454,12 +467,30 @@ func (s *session) resolveCancellation(ctx context.Context, epoch uint64) error {
 			_ = client.Abort(ctx, nativeID)
 		}
 
+		// The abort response is the only online boundary at which the
+		// interrupted turn's user message, assistant/tool prefix, and terminal
+		// state can be exported through /sync/history. Capture that stable
+		// generation now, but defer remote store I/O until after the shared
+		// process tree is proved gone so a slow store cannot delay containment.
+		var captured capturedStateSnapshot
+
+		var captureErr error
+		if agent != nil && client != nil && nativeID != "" {
+			captured, captureErr = s.captureStateSnapshot(ctx, true)
+		}
+
 		var err error
 		if agent == nil {
 			err = errors.Join(opencode.ErrProcessTreeUnproven, errors.New("native runtime owner is unavailable"))
 		} else {
 			err = agent.retireSharedRuntime(generation, "shared OpenCode runtime retired after turn cancellation", s)
 		}
+
+		if captureErr == nil {
+			captureErr = s.commitStateSnapshot(ctx, captured)
+		}
+
+		err = errors.Join(err, captureErr)
 
 		s.mu.Lock()
 		if s.cancellationEpoch == epoch {

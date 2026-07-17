@@ -234,7 +234,7 @@ func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T)
 	require.Equal(t, 1, releases)
 }
 
-func TestCloseSessionAfterCancellationRetirementPreservesCommittedCheckpoint(t *testing.T) {
+func TestCancellationPublishesInterruptedCheckpointBeforeRetiredClose(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemorySessionStore()
 	client := newFakeOpenCodeClient()
@@ -243,9 +243,25 @@ func TestCloseSessionAfterCancellationRetirementPreservesCommittedCheckpoint(t *
 	agent.sessions[current.id] = current
 
 	committed := validSyncSnapshot(string(current.id), current.idmap.NativeSessionID, current.cwd)
+	committedAssistant := terminalMessageEvent(
+		current.idmap.NativeSessionID, 1, "assistant-before-interrupt", "assistant", "stop", nil,
+	)
+	committedAssistant.ID = "event-assistant-before-interrupt"
 	committed.Events[current.idmap.NativeSessionID] = append(
-		committed.Events[current.idmap.NativeSessionID],
-		terminalMessageEvent(current.idmap.NativeSessionID, 1, "assistant-before-interrupt", "assistant", "stop", nil),
+		committed.Events[current.idmap.NativeSessionID], committedAssistant,
+	)
+	interruptedUser := terminalMessageEvent(
+		current.idmap.NativeSessionID, 2, "user-interrupted", "user", "", nil,
+	)
+	interruptedUser.ID = "event-user-interrupted"
+	interruptedAssistant := terminalMessageEvent(
+		current.idmap.NativeSessionID, 3, "assistant-interrupted", "assistant", "", nil,
+	)
+	interruptedAssistant.ID = "event-assistant-interrupted"
+	client.syncEvents = append(
+		append([]opencode.SyncEvent(nil), committed.Events[current.idmap.NativeSessionID]...),
+		interruptedUser,
+		interruptedAssistant,
 	)
 	entry, err := json.Marshal(committed)
 	require.NoError(t, err)
@@ -255,12 +271,35 @@ func TestCloseSessionAfterCancellationRetirementPreservesCommittedCheckpoint(t *
 	}}))
 
 	turnCtx := current.beginTurn(ctx, "interrupted-turn")
+	current.mu.Lock()
+	current.activeMessageIDs["assistant-interrupted"] = struct{}{}
+	current.mu.Unlock()
 	epoch, err := current.beginCancellation("interrupted-turn", true, true)
 	require.NoError(t, err)
 	require.NoError(t, current.resolveCancellation(ctx, epoch))
 	current.finishTurn()
 	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
 	require.Equal(t, "shared OpenCode runtime retired after turn cancellation", current.runtimeLostCause)
+
+	captured, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
+	require.NoError(t, err)
+	require.Len(t, captured, 1)
+	require.NotEqual(t, SessionStoreEntry(entry), captured[0])
+	var interrupted stateSnapshot
+	require.NoError(t, json.Unmarshal(captured[0], &interrupted))
+	require.Equal(t, []opencode.SyncEvent{
+		client.syncEvents[0], client.syncEvents[1], interruptedUser, interruptedAssistant,
+	}, interrupted.Events[current.idmap.NativeSessionID])
+	terminal, err := InspectSessionStoreTerminalState(string(current.id), captured)
+	require.NoError(t, err)
+	require.Equal(t, "assistant-before-interrupt", terminal.MessageID)
+
+	restored := newFakeOpenCodeClient()
+	restored.xdg = client.xdg
+	restored.getSession = testNativeSession(current.idmap.NativeSessionID)
+	_, err = restoreSyncState(ctx, restored, interrupted, current.idmap.NativeSessionID, current.cwd)
+	require.NoError(t, err)
+	require.Equal(t, interrupted.Events[current.idmap.NativeSessionID], restored.syncEvents)
 
 	var historyCalls atomic.Int64
 	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
@@ -276,10 +315,45 @@ func TestCloseSessionAfterCancellationRetirementPreservesCommittedCheckpoint(t *
 
 	retained, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
 	require.NoError(t, err)
-	require.Equal(t, []SessionStoreEntry{entry}, retained)
-	terminal, err := InspectSessionStoreTerminalState(string(current.id), retained)
+	require.Equal(t, captured, retained)
+	terminal, err = InspectSessionStoreTerminalState(string(current.id), retained)
 	require.NoError(t, err)
 	require.Equal(t, "assistant-before-interrupt", terminal.MessageID)
+}
+
+func TestCancellationCaptureFailureStillRetiresAndPreservesPriorCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemorySessionStore()
+	client := newFakeOpenCodeClient()
+	agent := NewAgent(WithHome(t.TempDir()), WithSessionStore(store))
+	current := testSession(agent, client)
+	agent.sessions[current.id] = current
+
+	committed := validSyncSnapshot(string(current.id), current.idmap.NativeSessionID, current.cwd)
+	entry, err := json.Marshal(committed)
+	require.NoError(t, err)
+	require.NoError(t, store.Replace(ctx, SessionKey{SessionID: string(current.id)}, []SessionStoreReplacement{{
+		Key:     SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath},
+		Entries: []SessionStoreEntry{entry},
+	}}))
+	client.syncHistoryErr = errors.New("sync history unavailable")
+
+	current.beginTurn(ctx, "interrupted-turn")
+	epoch, err := current.beginCancellation("interrupted-turn", true, true)
+	require.NoError(t, err)
+	err = current.resolveCancellation(ctx, epoch)
+	require.ErrorContains(t, err, "sync history unavailable")
+	retryEpoch, err := current.beginCancellation("", false, true)
+	require.NoError(t, err)
+	require.Equal(t, epoch, retryEpoch)
+	require.ErrorContains(t, current.resolveCancellation(ctx, retryEpoch), "sync history unavailable")
+	require.Equal(t, "shared OpenCode runtime retired after turn cancellation", current.runtimeLostCause)
+	require.Nil(t, agent.runtime)
+	require.Error(t, current.ensureNotPoisoned())
+
+	retained, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
+	require.NoError(t, err)
+	require.Equal(t, []SessionStoreEntry{entry}, retained)
 }
 
 func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
