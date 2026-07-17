@@ -81,6 +81,21 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 		return err
 	}
 
+	// Cancellation retires and proves the complete shared native process tree
+	// before the cancelled ACP turn settles. detachRuntime records that loss
+	// before the loopback server is stopped. A later session/close must retain
+	// the last committed sync-event generation: the interrupted native
+	// generation is no longer an online snapshot source and reconnecting to its
+	// dead loopback address can neither make that generation durable nor improve
+	// the prior checkpoint.
+	s.mu.Lock()
+	runtimeLost := s.runtimeLostCause != ""
+	s.mu.Unlock()
+
+	if runtimeLost {
+		return nil
+	}
+
 	graph := s.agent.adoptedGraph(s)
 	for _, member := range graph {
 		if reason := member.snapshotBlockedReason(); reason != "" {

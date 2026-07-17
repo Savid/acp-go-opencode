@@ -234,6 +234,54 @@ func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T)
 	require.Equal(t, 1, releases)
 }
 
+func TestCloseSessionAfterCancellationRetirementPreservesCommittedCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemorySessionStore()
+	client := newFakeOpenCodeClient()
+	agent := NewAgent(WithHome(t.TempDir()), WithSessionStore(store))
+	current := testSession(agent, client)
+	agent.sessions[current.id] = current
+
+	committed := validSyncSnapshot(string(current.id), current.idmap.NativeSessionID, current.cwd)
+	committed.Events[current.idmap.NativeSessionID] = append(
+		committed.Events[current.idmap.NativeSessionID],
+		terminalMessageEvent(current.idmap.NativeSessionID, 1, "assistant-before-interrupt", "assistant", "stop", nil),
+	)
+	entry, err := json.Marshal(committed)
+	require.NoError(t, err)
+	require.NoError(t, store.Replace(ctx, SessionKey{SessionID: string(current.id)}, []SessionStoreReplacement{{
+		Key:     SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath},
+		Entries: []SessionStoreEntry{entry},
+	}}))
+
+	turnCtx := current.beginTurn(ctx, "interrupted-turn")
+	epoch, err := current.beginCancellation("interrupted-turn", true, true)
+	require.NoError(t, err)
+	require.NoError(t, current.resolveCancellation(ctx, epoch))
+	current.finishTurn()
+	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+	require.Equal(t, "shared OpenCode runtime retired after turn cancellation", current.runtimeLostCause)
+
+	var historyCalls atomic.Int64
+	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
+		historyCalls.Add(1)
+
+		return nil, errors.New("Post http://127.0.0.1:1/sync/history: connect: connection refused")
+	}
+
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: current.id})
+	require.NoError(t, err)
+	require.Zero(t, historyCalls.Load(), "a retired generation must never be contacted during close")
+	require.NotContains(t, agent.sessions, current.id)
+
+	retained, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
+	require.NoError(t, err)
+	require.Equal(t, []SessionStoreEntry{entry}, retained)
+	terminal, err := InspectSessionStoreTerminalState(string(current.id), retained)
+	require.NoError(t, err)
+	require.Equal(t, "assistant-before-interrupt", terminal.MessageID)
+}
+
 func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
