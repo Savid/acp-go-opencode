@@ -123,7 +123,7 @@ func releaseIndependentSupervisorWaiter(cmd *exec.Cmd, waiter *supervisorWaiter)
 func querySupervisorProcessSnapshot(string) (int, bool) { return 0, false }
 
 func quiesceLinuxReaper(nativePID int, waitOwnedPID int, timeout time.Duration) error {
-	if nativePID <= 0 {
+	if nativePID < 0 {
 		return errors.New("native process group ID is required")
 	}
 
@@ -134,7 +134,10 @@ func quiesceLinuxReaper(nativePID int, waitOwnedPID int, timeout time.Duration) 
 		termDeadline = deadline
 	}
 
-	_ = signalProcessGroup(nativePID, syscall.SIGTERM)
+	if nativePID > 0 {
+		_ = signalProcessGroup(nativePID, syscall.SIGTERM)
+	}
+
 	for time.Now().Before(termDeadline) {
 		_, err := signalLinuxReaperChildren(waitOwnedPID, unix.SIGTERM)
 		if err != nil {
@@ -153,7 +156,9 @@ func quiesceLinuxReaper(nativePID int, waitOwnedPID int, timeout time.Duration) 
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	_ = signalProcessGroup(nativePID, syscall.SIGKILL)
+	if nativePID > 0 {
+		_ = signalProcessGroup(nativePID, syscall.SIGKILL)
+	}
 
 	for time.Now().Before(deadline) {
 		_, err := signalLinuxReaperChildren(waitOwnedPID, unix.SIGKILL)

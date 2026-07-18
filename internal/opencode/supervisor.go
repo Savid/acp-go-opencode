@@ -63,10 +63,15 @@ var supervisorEncodeConfig = func(writer io.Writer, config supervisorConfig) err
 	return json.NewEncoder(writer).Encode(config)
 }
 var supervisorNewGuardianContainment = newGuardianContainment
+var supervisorGuardianName = func(containment *guardianContainment) string { return containment.Name() }
 var supervisorGuardianQuiesce = func(containment *guardianContainment, nativePID int, timeout time.Duration) error {
 	return containment.Quiesce(nativePID, timeout)
 }
 var supervisorOpenLivenessContainment = openLivenessContainment
+var supervisorLivenessQuiesce = func(containment *livenessContainment, nativePID int, timeout time.Duration) error {
+	return containment.Quiesce(nativePID, timeout)
+}
+var supervisorReleaseIndependentWaiter = releaseIndependentSupervisorWaiter
 var supervisorInput io.Reader = os.Stdin
 var supervisorOutput io.Writer = os.Stdout
 var supervisorError io.Writer = os.Stderr
@@ -302,7 +307,7 @@ func runGuardian(config supervisorConfig) error {
 	}
 	defer containment.Close()
 
-	config.JobName = containment.Name()
+	config.JobName = supervisorGuardianName(containment)
 	if config.JobName == "darwin-best-effort" {
 		config.DarwinBestEffort = true
 
@@ -369,7 +374,7 @@ func runGuardian(config supervisorConfig) error {
 	}
 
 	livenessWaiter := newSupervisorWaiter(cmd, true)
-	if _, err := releaseIndependentSupervisorWaiter(cmd, livenessWaiter); err != nil {
+	if _, err := supervisorReleaseIndependentWaiter(cmd, livenessWaiter); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
@@ -506,7 +511,7 @@ func runLiveness(config supervisorConfig) error {
 	pidErr := writeNativePID(config.NativePIDFile, cmd.Process.Pid)
 	if pidErr != nil {
 		proofErr := awaitQuiescence(func() error {
-			return containment.Quiesce(cmd.Process.Pid, supervisorQuiesceWindow)
+			return supervisorLivenessQuiesce(containment, cmd.Process.Pid, supervisorQuiesceWindow)
 		})
 
 		<-waitDone
@@ -523,7 +528,7 @@ func runLiveness(config supervisorConfig) error {
 
 	if _, err := fmt.Fprintln(errorOutput, supervisorReadyPrefix+string(ready)); err != nil {
 		proofErr := awaitQuiescence(func() error {
-			return containment.Quiesce(cmd.Process.Pid, supervisorQuiesceWindow)
+			return supervisorLivenessQuiesce(containment, cmd.Process.Pid, supervisorQuiesceWindow)
 		})
 
 		<-waitDone
@@ -551,7 +556,7 @@ func runLiveness(config supervisorConfig) error {
 		proofErr := awaitQuiescence(func() error {
 			// The root has already been reaped. The containment retains the
 			// captured original identity and must not rediscover a reused PID.
-			return containment.Quiesce(0, supervisorQuiesceWindow)
+			return supervisorLivenessQuiesce(containment, 0, supervisorQuiesceWindow)
 		})
 		if proofErr == nil {
 			proofErr = writeSupervisorMarker(config.Completion)
@@ -568,7 +573,7 @@ func runLiveness(config supervisorConfig) error {
 		return nil
 	case <-controlDone:
 		proofErr := awaitQuiescence(func() error {
-			return containment.Quiesce(cmd.Process.Pid, supervisorQuiesceWindow)
+			return supervisorLivenessQuiesce(containment, cmd.Process.Pid, supervisorQuiesceWindow)
 		})
 
 		<-waitDone

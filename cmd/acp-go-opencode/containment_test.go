@@ -155,3 +155,34 @@ func TestRunContainmentCleanupOperationalFailure(t *testing.T) {
 		t.Fatalf("cleanup = %d, stderr=%q", code, stderr.String())
 	}
 }
+
+func TestRunContainmentOperationalSuccess(t *testing.T) {
+	originalDiagnose := diagnoseContainment
+	originalCleanup := cleanupContainment
+	t.Cleanup(func() {
+		diagnoseContainment = originalDiagnose
+		cleanupContainment = originalCleanup
+	})
+
+	diagnoseCalled := false
+	diagnoseContainment = func(scratchDir string, output io.Writer) error {
+		diagnoseCalled = scratchDir == "scratch" && output != nil
+
+		return nil
+	}
+	cleanupCalled := false
+	cleanupContainment = func(scratchDir, runtimeID string, force bool, output io.Writer) error {
+		cleanupCalled = scratchDir == "scratch" && runtimeID == strings.Repeat("a", 32) && force && output != nil
+
+		return nil
+	}
+
+	if code := runContainment([]string{"diagnose", "-scratch-dir", "scratch"}, io.Discard, io.Discard); code != 0 || !diagnoseCalled {
+		t.Fatalf("diagnose = %d, called=%v", code, diagnoseCalled)
+	}
+	if code := runContainment([]string{
+		"cleanup", "-scratch-dir", "scratch", "-runtime-id", strings.Repeat("a", 32), "-force",
+	}, io.Discard, io.Discard); code != 0 || !cleanupCalled {
+		t.Fatalf("cleanup = %d, called=%v", code, cleanupCalled)
+	}
+}

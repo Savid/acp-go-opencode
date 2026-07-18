@@ -1668,6 +1668,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	killProcess := openCodeKillProcess
 	waitCommand := openCodeWaitCommand
 	removeAll := openCodeRemoveAll
+	prepareRuntimeGeneration := openCodePrepareRuntimeGeneration
 	after := openCodeAfter
 	readyPoll := openCodeReadyPollInterval
 	reconnectDelay := openCodeEventReconnectDelay
@@ -1682,6 +1683,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodeKillProcess = killProcess
 		openCodeWaitCommand = waitCommand
 		openCodeRemoveAll = removeAll
+		openCodePrepareRuntimeGeneration = prepareRuntimeGeneration
 		openCodeAfter = after
 		openCodeReadyPollInterval = readyPoll
 		openCodeEventReconnectDelay = reconnectDelay

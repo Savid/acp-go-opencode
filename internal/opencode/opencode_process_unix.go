@@ -10,6 +10,7 @@ import (
 )
 
 var openCodeSyscallKill = syscall.Kill
+var openCodeProcessSignal = func(process *os.Process, signal syscall.Signal) error { return process.Signal(signal) }
 
 func terminateOpenCodeProcess(process *os.Process, originalGroup int) error {
 	return signalOpenCodeProcessGroup(process, originalGroup, syscall.SIGTERM)
@@ -30,7 +31,7 @@ func signalOpenCodeProcessGroup(process *os.Process, originalGroup int, signal s
 
 	if err := openCodeSyscallKill(-originalGroup, signal); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
-			directErr := process.Signal(signal)
+			directErr := openCodeProcessSignal(process, signal)
 			if errors.Is(directErr, os.ErrProcessDone) || errors.Is(directErr, syscall.ESRCH) {
 				return nil
 			}

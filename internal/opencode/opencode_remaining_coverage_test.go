@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -50,7 +52,69 @@ func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestStartServerContainmentPreparationAndWaiterFailures(t *testing.T) {
+	t.Run("prepare generation", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		want := errors.New("prepare generation failed")
+		openCodePrepareRuntimeGeneration = func(context.Context, StartOptions) (string, func() error, error) {
+			return "", nil, want
+		}
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t)})
+		require.ErrorIs(t, err, want)
+	})
+
+	t.Run("generation scratch reaches supervisor", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		preserveSupervisorGlobals(t)
+		generationRoot := t.TempDir()
+		openCodePrepareRuntimeGeneration = func(context.Context, StartOptions) (string, func() error, error) {
+			return generationRoot, func() error { return nil }, nil
+		}
+		want := errors.New("encode config failed")
+		supervisorEncodeConfig = func(_ io.Writer, config supervisorConfig) error {
+			require.Equal(t, generationRoot, config.Scratch)
+
+			return want
+		}
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t)})
+		require.ErrorIs(t, err, want)
+	})
+
+	t.Run("release runtime waiter", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		preserveSupervisorGlobals(t)
+		want := errors.New("release waiter failed")
+		supervisorReleaseIndependentWaiter = func(*exec.Cmd, *supervisorWaiter) (int, error) {
+			return 0, want
+		}
+		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 30")
+		}
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t), SkipSupervisor: true})
+		require.ErrorIs(t, err, want)
+	})
+
+	t.Run("release supervised runtime waiter", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		preserveSupervisorGlobals(t)
+		want := errors.New("release supervised waiter failed")
+		supervisorExecutable = func() (string, error) { return "/bin/sh", nil }
+		supervisorReleaseIndependentWaiter = func(*exec.Cmd, *supervisorWaiter) (int, error) {
+			return 0, want
+		}
+		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 30")
+		}
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t)})
+		require.ErrorIs(t, err, want)
+	})
+}
+
 func TestStartServerDarwinContainmentFailures(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin generation registry is platform-specific")
+	}
+
 	t.Run("generation root", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		parentFile := filepath.Join(t.TempDir(), "parent-file")

@@ -231,12 +231,15 @@ func (s *session) promptWithRoute(ctx context.Context, params acp.PromptRequest,
 	}
 	defer release()
 
-	turnCtx := s.beginTurn(ctx, turnNonce)
-	defer s.finishTurn()
-
-	if recoveryErr := s.ensureRuntime(turnCtx); recoveryErr != nil {
+	// A crashed runtime retires its exact generation asynchronously. Recover
+	// before publishing this turn's cancellation handle so the retiring
+	// generation cannot cancel a prompt that has not touched it.
+	if recoveryErr := s.ensureRuntime(ctx); recoveryErr != nil {
 		return acp.PromptResponse{}, recoveryErr
 	}
+
+	turnCtx := s.beginTurn(ctx, turnNonce)
+	defer s.finishTurn()
 
 	invocation, command, matchedCommand, err := s.resolvePromptCommand(turnCtx, params)
 	if err != nil {

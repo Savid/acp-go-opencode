@@ -400,61 +400,6 @@ func newRuntimeShutdownState() *runtimeShutdownState {
 	return &runtimeShutdownState{done: make(chan struct{})}
 }
 
-func prepareDarwinRuntimeGeneration(ctx context.Context, options StartOptions) (string, func() error, error) {
-	if !options.DarwinBestEffort {
-		return "", func() error { return nil }, nil
-	}
-
-	if options.ReserveContainmentScratch == nil {
-		return "", nil, errors.New("darwin containment scratch reservation is required")
-	}
-
-	reservationRelease, err := options.ReserveContainmentScratch(ctx)
-	if err != nil {
-		return "", nil, fmt.Errorf("reserve Darwin containment generation scratch: %w", err)
-	}
-
-	if reservationRelease == nil {
-		return "", nil, errors.New("reserve Darwin containment generation scratch returned a nil release")
-	}
-
-	parent := options.ContainmentScratchParent
-	if parent == "" {
-		parent = options.ScratchParent
-	}
-
-	root, err := newDarwinRuntimeGenerationRoot(parent)
-	if err != nil {
-		if root == "" {
-			reservationRelease()
-		}
-
-		return root, nil, err
-	}
-
-	var (
-		cleanupOnce sync.Once
-		cleanupErr  error
-	)
-
-	return root, func() error {
-		cleanupOnce.Do(func() {
-			if err := openCodeRemoveAll(root); err != nil {
-				cleanupErr = errors.Join(
-					ErrRuntimeScratchCleanup,
-					fmt.Errorf("remove Darwin containment generation: %w", err),
-				)
-
-				return
-			}
-
-			reservationRelease()
-		})
-
-		return cleanupErr
-	}, nil
-}
-
 type NativeSession struct {
 	ID        string `json:"id"`
 	Title     string `json:"title"`
@@ -824,19 +769,20 @@ type ProviderModelModalities struct {
 }
 
 var (
-	openCodeCommandContext                = exec.CommandContext
-	openCodeListen                        = net.Listen
-	openCodeRandReader          io.Reader = rand.Reader
-	openCodeMarshalIndent                 = json.MarshalIndent
-	openCodeTerminateProcess              = terminateOpenCodeProcess
-	openCodeKillProcess                   = killOpenCodeProcess
-	openCodeWaitCommand                   = func(cmd *exec.Cmd) error { return cmd.Wait() }
-	openCodeRemoveAll                     = os.RemoveAll
-	openCodeAfter                         = time.After
-	openCodeReadyPollInterval             = 100 * time.Millisecond
-	openCodeEventReconnectDelay           = 250 * time.Millisecond
-	openCodeShutdownTimeout               = 5 * time.Second
-	openCodeContainmentTimeout            = 15 * time.Second
+	openCodeCommandContext                     = exec.CommandContext
+	openCodeListen                             = net.Listen
+	openCodeRandReader               io.Reader = rand.Reader
+	openCodeMarshalIndent                      = json.MarshalIndent
+	openCodeTerminateProcess                   = terminateOpenCodeProcess
+	openCodeKillProcess                        = killOpenCodeProcess
+	openCodeWaitCommand                        = func(cmd *exec.Cmd) error { return cmd.Wait() }
+	openCodeRemoveAll                          = os.RemoveAll
+	openCodePrepareRuntimeGeneration           = prepareDarwinRuntimeGeneration
+	openCodeAfter                              = time.After
+	openCodeReadyPollInterval                  = 100 * time.Millisecond
+	openCodeEventReconnectDelay                = 250 * time.Millisecond
+	openCodeShutdownTimeout                    = 5 * time.Second
+	openCodeContainmentTimeout                 = 15 * time.Second
 )
 
 // HealthCheckTimeout is the default bound on OpenCode server readiness checks.
@@ -931,7 +877,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	nativeEnv := envMapToSlice(env)
 	processCtx, cancel := context.WithCancel(context.Background())
 
-	containmentGenerationRoot, releaseContainmentGeneration, err := prepareDarwinRuntimeGeneration(ctx, options)
+	containmentGenerationRoot, releaseContainmentGeneration, err := openCodePrepareRuntimeGeneration(ctx, options)
 	if err != nil {
 		cancel()
 
@@ -1025,7 +971,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	runtimeWaiter := newSupervisorWaiterFunc(func() error { return openCodeWaitCommand(cmd) }, true)
 
-	originalProcessGroup, err := releaseIndependentSupervisorWaiter(cmd, runtimeWaiter)
+	originalProcessGroup, err := supervisorReleaseIndependentWaiter(cmd, runtimeWaiter)
 	if err != nil {
 		observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, err)
 

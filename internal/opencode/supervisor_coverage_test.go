@@ -45,8 +45,11 @@ func preserveSupervisorGlobals(t *testing.T) {
 	oldOpenFile := supervisorOpenFile
 	oldEncode := supervisorEncodeConfig
 	oldGuardianContainment := supervisorNewGuardianContainment
+	oldGuardianName := supervisorGuardianName
 	oldGuardianQuiesce := supervisorGuardianQuiesce
 	oldLivenessContainment := supervisorOpenLivenessContainment
+	oldLivenessQuiesce := supervisorLivenessQuiesce
+	oldReleaseWaiter := supervisorReleaseIndependentWaiter
 	oldInput := supervisorInput
 	oldOutput := supervisorOutput
 	oldError := supervisorError
@@ -60,8 +63,11 @@ func preserveSupervisorGlobals(t *testing.T) {
 		supervisorOpenFile = oldOpenFile
 		supervisorEncodeConfig = oldEncode
 		supervisorNewGuardianContainment = oldGuardianContainment
+		supervisorGuardianName = oldGuardianName
 		supervisorGuardianQuiesce = oldGuardianQuiesce
 		supervisorOpenLivenessContainment = oldLivenessContainment
+		supervisorLivenessQuiesce = oldLivenessQuiesce
+		supervisorReleaseIndependentWaiter = oldReleaseWaiter
 		supervisorInput = oldInput
 		supervisorOutput = oldOutput
 		supervisorError = oldError
@@ -511,7 +517,7 @@ func TestUnixQuiescenceSignalEscalationAndTimeout(t *testing.T) {
 
 		return nil
 	}
-	require.ErrorContains(t, quiesceProcessGroup(123, time.Millisecond), "remained observable")
+	require.ErrorContains(t, quiesceProcessGroup(123, time.Millisecond), "did not become quiescent")
 
 	containmentConfig := supervisorConfig{
 		DarwinBestEffort: true,
@@ -737,6 +743,75 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 }
 
 func TestSupervisorFinalRemainingBranches(t *testing.T) {
+	t.Run("guardian Darwin metadata", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		want := errors.New("stop after metadata")
+		supervisorGuardianName = func(*guardianContainment) string { return "darwin-best-effort" }
+		supervisorEncodeConfig = func(_ io.Writer, config supervisorConfig) error {
+			require.True(t, config.DarwinBestEffort)
+			require.Equal(t, filepath.Dir(root), config.ScratchParent)
+			require.Equal(t, darwinLifecycleRuntime, config.LifecycleKind)
+			require.Equal(t, "darwin-best-effort", config.JobName)
+
+			return want
+		}
+		err := runGuardian(supervisorConfig{
+			Home: filepath.Join(root, "home"), Scratch: root,
+			InventoryIdentity: filepath.Join(root, "inventory"),
+		})
+		require.ErrorIs(t, err, want)
+	})
+
+	t.Run("guardian waiter release", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		want := errors.New("release failed")
+		supervisorExecutable = func() (string, error) { return "/bin/sh", nil }
+		supervisorReleaseIndependentWaiter = func(*exec.Cmd, *supervisorWaiter) (int, error) {
+			return 0, want
+		}
+		err := runGuardian(supervisorConfig{Home: filepath.Join(root, "home"), Scratch: root})
+		require.ErrorIs(t, err, want)
+	})
+
+	t.Run("guardian post-readiness proof failure", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		liveness := filepath.Join(root, "liveness")
+		require.NoError(t, os.WriteFile(liveness, []byte("#!/bin/sh\nprintf '%s\\n' '"+supervisorReadyPrefix+`{"nativePid":99999999}`+"' >&2\nexit 0\n"), 0o700))
+		supervisorExecutable = func() (string, error) { return liveness, nil }
+		supervisorInput = strings.NewReader("")
+		supervisorOutput = io.Discard
+		supervisorError = io.Discard
+		want := errors.New("proof failed")
+		supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error { return want }
+		err := runGuardian(supervisorConfig{
+			Home: filepath.Join(root, "home"), Scratch: root,
+			Completion: filepath.Join(root, "complete"),
+		})
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+		require.ErrorContains(t, err, want.Error())
+	})
+
+	t.Run("liveness post-exit proof failure", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		input, writer := io.Pipe()
+		t.Cleanup(func() { _ = writer.Close() })
+		supervisorInput = input
+		supervisorOutput = io.Discard
+		supervisorError = io.Discard
+		want := errors.New("proof failed")
+		supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error { return want }
+		err := runLiveness(supervisorConfig{
+			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
+		})
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+		require.ErrorContains(t, err, want.Error())
+	})
+
 	t.Run("guardian dispatch", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()

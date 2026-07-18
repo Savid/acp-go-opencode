@@ -5,6 +5,7 @@ package opencode
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -47,17 +48,21 @@ func preservePlatformSupervisorGlobals(t *testing.T) {
 }
 
 func TestLinuxContainmentCapabilityFailures(t *testing.T) {
+	if _, err := releaseIndependentSupervisorWaiter((*exec.Cmd)(nil), nil); !errors.Is(err, ErrProcessContainmentIncomplete) {
+		t.Fatalf("invalid waiter release = %v", err)
+	}
+
 	t.Run("prctl", func(t *testing.T) {
 		preservePlatformSupervisorGlobals(t)
 		supervisorLinuxPrctl = func(int, uintptr, uintptr, uintptr, uintptr) error { return errors.New("prctl failed") }
-		_, err := newGuardianContainment()
+		_, err := newGuardianContainment(supervisorConfig{})
 		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	})
 
 	t.Run("pidfd", func(t *testing.T) {
 		preservePlatformSupervisorGlobals(t)
 		supervisorLinuxPIDFDOpen = func(int, int) (int, error) { return -1, errors.New("pidfd failed") }
-		_, err := openLivenessContainment("")
+		_, err := openLivenessContainment(supervisorConfig{})
 		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	})
 
@@ -71,7 +76,7 @@ func TestLinuxContainmentCapabilityFailures(t *testing.T) {
 
 func TestLinuxReaperQuiescenceBranches(t *testing.T) {
 	t.Run("invalid root", func(t *testing.T) {
-		require.Error(t, quiesceLinuxReaper(0, 0, time.Second))
+		require.Error(t, quiesceLinuxReaper(-1, 0, time.Second))
 	})
 
 	t.Run("term reaches quiet", func(t *testing.T) {
