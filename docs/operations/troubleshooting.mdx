@@ -1,0 +1,100 @@
+---
+title: Troubleshooting
+description: Diagnose slow startup, permission surprises, stale slash commands, unexpected runtime exits, and version gating.
+---
+
+The adapter wraps a local `opencode serve` process. The failure modes on this
+page come from how that native server behaves; each section names the symptom,
+the OpenCode server behavior behind it, and how this adapter handles it.
+
+## Slow first session creation
+
+A fresh `opencode serve` process begins listening quickly, but a health request
+issued while the server is still starting can hang far longer than the startup
+itself. The adapter gives every health attempt its own 500 ms deadline inside
+the overall readiness budget, so one stalled attempt cannot consume the whole
+startup window; the loop simply polls again.
+
+The overall readiness budget defaults to 60 seconds and is configurable with
+`WithOpenCodeHealthCheckTimeout` (CLI: `-opencode-health-timeout`). If first
+session creation stays slow, raise `-debug` logging and watch the per-stage
+startup timings on stderr.
+
+Reproduced by `TestHealthAttemptDeadlineReleaseGate` in
+`internal/opencode/opencode_client_lifecycle_test.go`.
+
+## Denied tools raise no permission callback
+
+On the OpenCode server, a `deny` rule withholds the matching tool from the
+session's toolset server-side and raises no permission event; only `ask`
+produces a routable permission request. Watching for permission callbacks to
+observe denials yields nothing — the denied tool is simply absent from the
+session.
+
+The server also appends to a session's permission ruleset on
+`PATCH /session/:id` rather than replacing it. It evaluates the last matching
+rule, so an appended rule wins, and a policy sent as a replacement would
+silently retain stale rules. The adapter is built around both behaviors: it
+sends the complete permission ruleset once, at native session creation
+(`CreateSessionWithPolicy`), and never updates the ruleset over `PATCH`.
+
+<Note>
+A session's permission policy is fixed at creation. To run under a different
+policy, create a session with the desired [permission
+mode](/docs/features/permissions); there is no in-place ruleset update.
+</Note>
+
+## Slash command rejected mid-turn
+
+The native command catalog can change between the adapter's availability check
+and the prompt that names the command. When the OpenCode server rejects a
+slash command that has since disappeared, the adapter refreshes the catalog,
+sends the client an updated available-commands list, and fails the prompt with
+the command error. It never re-sends the slash text as a plain prompt, which
+would silently run something other than what the user asked for. A failed
+catalog refresh is logged without emitting a misleading commands update.
+
+Reproduced by `TestPromptSlashCommandStaleRaceRefreshesWithoutPlainRetry` in
+`session_prompt_test.go`.
+
+## Native server exits unexpectedly
+
+All of an Agent's sessions share one `opencode serve` runtime. When that
+process exits unexpectedly, the adapter releases the dead runtime's resources,
+retains the loaded sessions, and recovers them on a fresh runtime before the
+next prompt runs; that prompt then completes normally on the replacement
+server.
+
+Reproduced by
+`TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt` in
+`agent_session_test.go`.
+
+## Startup fails on a version mismatch
+
+The adapter requires exactly OpenCode 1.18.3. The native version is read from
+the health endpoint's JSON response — the adapter probes no version flag on the
+OpenCode CLI — and startup fails closed when the reported version differs from
+the required one. The `-opencode-version` flag (embedded hosts: `WithVersion`)
+selects the exact expected version; version ranges and minimum-version
+fallbacks are unsupported.
+
+## Questions never reach the client, or are rejected mid-turn
+
+The native server raises a `question.asked` event for each elicitation-style
+prompt a tool run needs answered. The adapter forwards it as an ACP
+elicitation only when the client advertised elicitation form support at
+`initialize` and the question names the tool call the active turn just
+started; it rejects the native question outright in either failing case,
+without waiting on any client answer.
+
+A client that never advertised the elicitation form capability never sees a
+question at all — the adapter rejects it immediately by design instead of
+surfacing a prompt the client cannot answer. Reproduced by
+`TestQuestionToolElicitationAcceptDeclineAndNoCapability` in
+`session_prompt_test.go`.
+
+A question naming a tool call other than the one the active turn just
+published — a stale or foreign call ID — is rejected the same way instead of
+reaching the client. Reproduced by
+`TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire` in
+`session_prompt_test.go`.
