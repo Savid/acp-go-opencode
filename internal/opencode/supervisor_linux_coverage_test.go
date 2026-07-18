@@ -51,21 +51,21 @@ func TestLinuxContainmentCapabilityFailures(t *testing.T) {
 		preservePlatformSupervisorGlobals(t)
 		supervisorLinuxPrctl = func(int, uintptr, uintptr, uintptr, uintptr) error { return errors.New("prctl failed") }
 		_, err := newGuardianContainment()
-		require.ErrorIs(t, err, ErrProcessTreeUnproven)
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	})
 
 	t.Run("pidfd", func(t *testing.T) {
 		preservePlatformSupervisorGlobals(t)
 		supervisorLinuxPIDFDOpen = func(int, int) (int, error) { return -1, errors.New("pidfd failed") }
 		_, err := openLivenessContainment("")
-		require.ErrorIs(t, err, ErrProcessTreeUnproven)
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	})
 
 	t.Run("close probe", func(t *testing.T) {
 		preservePlatformSupervisorGlobals(t)
 		supervisorLinuxPIDFDOpen = func(int, int) (int, error) { return 7, nil }
 		supervisorLinuxClose = func(int) error { return errors.New("close failed") }
-		require.ErrorIs(t, enableLinuxSubreaper(supervisorModeGuardian), ErrProcessTreeUnproven)
+		require.ErrorIs(t, enableLinuxSubreaper(supervisorModeGuardian), ErrProcessContainmentIncomplete)
 	})
 }
 
@@ -102,7 +102,7 @@ func TestLinuxReaperQuiescenceBranches(t *testing.T) {
 			return errors.New("term waitid failed")
 		}
 		err := quiesceLinuxReaper(123, 0, time.Second)
-		require.ErrorIs(t, err, ErrProcessTreeUnproven)
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 		require.ErrorContains(t, err, "term waitid failed")
 	})
 
@@ -177,7 +177,7 @@ func TestLinuxReaperQuiescenceBranches(t *testing.T) {
 			return nil
 		}
 		err := quiesceLinuxReaper(123, 0, 750*time.Millisecond)
-		require.ErrorIs(t, err, ErrProcessTreeUnproven)
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 		require.ErrorContains(t, err, "kill waitid failed")
 	})
 
@@ -220,7 +220,7 @@ func TestLinuxReaperNoChildrenBranches(t *testing.T) {
 			quiescent, err := linuxReaperNoChildren()
 			require.Equal(t, test.quiescent, quiescent)
 			if test.wantErr {
-				require.ErrorIs(t, err, ErrProcessTreeUnproven)
+				require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 			} else {
 				require.NoError(t, err)
 			}

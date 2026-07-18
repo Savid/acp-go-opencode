@@ -322,6 +322,10 @@ func TestCrashGenerationCancellationAndPromptFailureBranches(t *testing.T) {
 func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {
 	agent := NewAgent()
 	cwd := t.TempDir()
+	canonical, err := runtimeEvalSymlinks(cwd)
+	require.NoError(t, err)
+	canonical, err = runtimeAbs(canonical)
+	require.NoError(t, err)
 
 	staleRelease, err := agent.bindDirectory("session-1", cwd, nil)
 	require.NoError(t, err)
@@ -348,7 +352,7 @@ func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {
 	<-staleReleased
 
 	agent.mu.Lock()
-	recovered, ok := agent.directories[cwd]
+	recovered, ok := agent.directories[canonical]
 	agent.mu.Unlock()
 	require.True(t, ok)
 	require.Equal(t, acp.SessionId("session-1"), recovered.SessionID)
@@ -356,7 +360,7 @@ func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {
 
 	recoveredRelease()
 	agent.mu.Lock()
-	_, ok = agent.directories[cwd]
+	_, ok = agent.directories[canonical]
 	agent.mu.Unlock()
 	require.False(t, ok)
 }

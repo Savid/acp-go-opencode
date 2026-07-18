@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -25,6 +26,22 @@ import (
 )
 
 const releaseGateRepetitions = 5
+
+func testContainmentScratchReservation(context.Context) (func(), error) {
+	return func() {}, nil
+}
+
+func platformStartOptions(t *testing.T, options StartOptions) StartOptions {
+	t.Helper()
+
+	if runtime.GOOS == "darwin" {
+		options.DarwinBestEffort = true
+		options.ContainmentScratchParent = t.TempDir()
+		options.ReserveContainmentScratch = testContainmentScratchReservation
+	}
+
+	return options
+}
 
 type openCodeMethodsRecorder struct {
 	seen        []string
@@ -458,7 +475,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	helper := fakeOpenCodeExecutable(t)
 	root := t.TempDir()
 	logger := slog.New(slog.DiscardHandler)
-	client, err := StartServer(context.Background(), StartOptions{
+	client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
 		Root:            root,
 		ExecutablePath:  helper,
 		Env:             map[string]string{"BASE_ENV": "base"},
@@ -469,7 +486,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		HealthTimeout:   5 * time.Second,
 		Logger:          logger,
 		SkipVersionGate: false,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("StartServer: %v", err)
 	}
@@ -510,7 +527,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 
 func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneContainmentResult(t *testing.T) {
 	restoreOpenCodeClientSeams(t)
-	openCodeTerminateProcess = func(*exec.Cmd) error { return nil }
+	openCodeTerminateProcess = func(*os.Process, int) error { return nil }
 	openCodeAfter = func(time.Duration) <-chan time.Time {
 		ready := make(chan time.Time, 1)
 		ready <- time.Now()
@@ -520,7 +537,7 @@ func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneContainmentResult(t *testing.T)
 
 	var kills atomic.Int32
 	killed := make(chan struct{})
-	openCodeKillProcess = func(*exec.Cmd) error {
+	openCodeKillProcess = func(*os.Process, int) error {
 		if kills.Add(1) == 1 {
 			close(killed)
 		}
@@ -580,18 +597,18 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	})
 
 	t.Run("create xdg failure", func(t *testing.T) {
-		_, err := StartServer(ctx, StartOptions{
+		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
 			Root: filepath.Join(t.TempDir(), string([]byte{0})),
-		})
+		}))
 		if err == nil {
 			t.Fatal("invalid session xdg path unexpectedly succeeded")
 		}
 	})
 
 	t.Run("ensure existing xdg failure", func(t *testing.T) {
-		_, err := StartServer(ctx, StartOptions{
+		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
 			ExistingXDG: XDGDirs{Root: filepath.Join(t.TempDir(), "root")},
-		})
+		}))
 		if err == nil {
 			t.Fatal("incomplete existing xdg unexpectedly succeeded")
 		}
@@ -653,14 +670,14 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 	t.Run("readiness failure closes process", func(t *testing.T) {
 		helper := fakeOpenCodeExecutable(t)
-		_, err := StartServer(ctx, StartOptions{
+		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  helper,
 			ExactVersion:    "99.0.0",
-			HealthTimeout:   2 * time.Second,
+			HealthTimeout:   5 * time.Second,
 			SkipVersionGate: false,
 			Logger:          slog.New(slog.DiscardHandler),
-		})
+		}))
 		if err == nil || !strings.Contains(err.Error(), "does not match required") {
 			t.Fatalf("readiness error = %v", err)
 		}
@@ -1039,8 +1056,8 @@ func TestOpenCodeServerCloseTimeoutAndContext(t *testing.T) {
 			restoreOpenCodeClientSeams(t)
 			openCodeContainmentTimeout = 10 * time.Millisecond
 			cmd := &exec.Cmd{Process: &os.Process{Pid: 1234}}
-			openCodeTerminateProcess = func(*exec.Cmd) error { return nil }
-			openCodeKillProcess = func(*exec.Cmd) error { return nil }
+			openCodeTerminateProcess = func(*os.Process, int) error { return nil }
+			openCodeKillProcess = func(*os.Process, int) error { return nil }
 			openCodeWaitCommand = func(*exec.Cmd) error {
 				select {}
 			}
@@ -1650,6 +1667,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	terminateProcess := openCodeTerminateProcess
 	killProcess := openCodeKillProcess
 	waitCommand := openCodeWaitCommand
+	removeAll := openCodeRemoveAll
 	after := openCodeAfter
 	readyPoll := openCodeReadyPollInterval
 	reconnectDelay := openCodeEventReconnectDelay
@@ -1663,6 +1681,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodeTerminateProcess = terminateProcess
 		openCodeKillProcess = killProcess
 		openCodeWaitCommand = waitCommand
+		openCodeRemoveAll = removeAll
 		openCodeAfter = after
 		openCodeReadyPollInterval = readyPoll
 		openCodeEventReconnectDelay = reconnectDelay
@@ -1881,13 +1900,13 @@ func TestColdStartupReleaseGate(t *testing.T) {
 
 	for range releaseGateRepetitions {
 		started := time.Now()
-		client, err := StartServer(context.Background(), StartOptions{
+		client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  executable,
 			ExactVersion:    "1.18.3",
 			HealthTimeout:   5 * time.Second,
 			SkipVersionGate: false,
-		})
+		}))
 		durations = append(durations, time.Since(started))
 		require.NoError(t, err)
 		require.NoError(t, client.Shutdown(context.Background()))

@@ -102,9 +102,11 @@ OpenTelemetry providers.
   cancel or timeout can retire the shared generation without killing unrelated
   concurrent work.
 - Cancel and timeout send native abort only as an advisory hint, then await one
-  memoized whole-runtime containment result for the exact generation. Fenced
-  stream/control failures use the same path. Linux helper-owned subreapers catch `setsid` escapees;
-  Windows uses a Job Object; unsupported containment backends fail closed.
+  memoized containment result for the exact runtime generation. Fenced
+  stream/control failures use the same path. Linux helper-owned subreapers catch
+  `setsid` escapees; Windows uses a Job Object. Darwin fails closed unless the
+  operator explicitly selects best-effort process-group containment with
+  `-darwin-best-effort-containment` or `WithDarwinBestEffortContainment`.
 - A native-server crash fails the active turn, retains loaded logical
   sessions, and reconstructs a session from its last committed sync-event
   generation before a following prompt can reach the replacement runtime.

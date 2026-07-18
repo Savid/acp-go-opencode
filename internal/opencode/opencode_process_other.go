@@ -10,15 +10,15 @@ import (
 
 func configureOpenCodeProcess(*exec.Cmd) {}
 
-func terminateOpenCodeProcess(cmd *exec.Cmd) error {
-	return killOpenCodeProcess(cmd)
+func terminateOpenCodeProcess(process *os.Process, originalGroup int) error {
+	return killOpenCodeProcess(process, originalGroup)
 }
 
-func killOpenCodeProcess(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
+func killOpenCodeProcess(process *os.Process, _ int) error {
+	if process == nil {
 		return nil
 	}
-	if err := cmd.Process.Kill(); err != nil {
+	if err := process.Kill(); err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
 			return nil
 		}

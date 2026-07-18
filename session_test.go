@@ -308,7 +308,7 @@ func TestSessionCancellationEpochCoordinationRemainingBranches(t *testing.T) {
 	epoch, err = orphan.beginCancellation("", false, false)
 	require.NoError(t, err)
 	orphan.agent = nil
-	require.ErrorContains(t, orphan.resolveCancellation(context.Background(), epoch), opencode.ErrProcessTreeUnproven.Error())
+	require.ErrorContains(t, orphan.resolveCancellation(context.Background(), epoch), opencode.ErrProcessContainmentIncomplete.Error())
 }
 
 func TestDeleteNativeAndCloseFencesActiveTurn(t *testing.T) {

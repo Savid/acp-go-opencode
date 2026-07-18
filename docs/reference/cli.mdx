@@ -17,6 +17,7 @@ diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 | `-path` | Path to the `opencode` CLI. | resolved from `PATH` |
 | `-scratch-dir` | Parent for the shared runtime root and transient adapter scratch. | system temp directory |
 | `-home` | Exact exclusive shared OpenCode XDG root. | — |
+| `-darwin-best-effort-containment` | Explicitly accept Darwin process-group containment, escaped-descendant risk, and numeric-PGID-reuse risk. | off |
 | `-model` | Default model as `provider/model`. | — |
 | `-debug` | Write debug logs to stderr. | off |
 | `-version` | Print the adapter version and exit. | — |
@@ -26,6 +27,35 @@ diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 | `-opencode-version` | Exact native version required by the event store. | `1.18.3` |
 | `-opencode-health-timeout` | OpenCode server readiness timeout. | `60s` |
 | `-seed-file <relpath>=<hostpath>` | Seed a file into the shared runtime config root (repeatable). | — |
+
+On Darwin, native startup fails closed unless
+`-darwin-best-effort-containment` is supplied. The command emits a warning to
+stderr when selected. This mode terminates and reaps the directly owned native
+root and its captured original process group, but descendants that call
+`setsid` or otherwise escape that group can survive. It never reports an
+authoritative provider-descendant inventory.
+
+Operators can inspect retained records without signalling processes:
+
+```sh
+acp-go-opencode containment diagnose -scratch-dir /path/to/scratch
+```
+
+Cleanup is deliberately explicit and revalidates every marker-correlated PID:
+
+```sh
+acp-go-opencode containment cleanup \
+  -scratch-dir /path/to/scratch \
+  -runtime-id 0123456789abcdef0123456789abcdef \
+  -force
+```
+
+PID-by-PID cleanup has an unavoidable PID-reuse time-of-check/time-of-use race:
+the PID can be reassigned after revalidation and an unrelated process can be
+signalled. Marker correlation is not ownership. Markers can be scrubbed, so
+cleanup can leave escaped processes behind; ambiguous identities are reported
+and are not signalled. The fixed five-second cleanup deadline starts before the
+first process enumeration.
 
 ## Seeding files
 

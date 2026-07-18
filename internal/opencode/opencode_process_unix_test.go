@@ -5,49 +5,48 @@ package opencode
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"syscall"
 	"testing"
 )
 
 func TestOpenCodeProcessSignalBranches(t *testing.T) {
-	oldGetpgid := openCodeSyscallGetpgid
 	oldKill := openCodeSyscallKill
 	t.Cleanup(func() {
-		openCodeSyscallGetpgid = oldGetpgid
 		openCodeSyscallKill = oldKill
 	})
 
-	if err := terminateOpenCodeProcess(nil); err != nil {
+	if err := terminateOpenCodeProcess(nil, 0); err != nil {
 		t.Fatalf("terminate nil: %v", err)
 	}
-	if err := killOpenCodeProcess(nil); err != nil {
+	if err := killOpenCodeProcess(nil, 0); err != nil {
 		t.Fatalf("kill nil: %v", err)
 	}
-	cmd := &exec.Cmd{Process: &os.Process{Pid: 123}}
+	process := &os.Process{Pid: 123}
 
-	openCodeSyscallGetpgid = func(int) (int, error) { return 0, syscall.ESRCH }
-	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err != nil {
-		t.Fatalf("ESRCH getpgid: %v", err)
+	if err := signalOpenCodeProcessGroup(process, 0, syscall.SIGTERM); err == nil {
+		t.Fatal("missing captured process group accepted")
 	}
-	openCodeSyscallGetpgid = func(int) (int, error) { return 0, errors.New("getpgid failed") }
-	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err == nil {
-		t.Fatal("getpgid error ignored")
-	}
-	openCodeSyscallGetpgid = func(int) (int, error) { return 123, nil }
 	openCodeSyscallKill = func(int, syscall.Signal) error { return syscall.ESRCH }
-	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err != nil {
+	if err := signalOpenCodeProcessGroup(process, 123, syscall.SIGTERM); err != nil {
 		t.Fatalf("ESRCH kill: %v", err)
 	}
 	openCodeSyscallKill = func(int, syscall.Signal) error { return errors.New("kill failed") }
-	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err == nil {
+	if err := signalOpenCodeProcessGroup(process, 123, syscall.SIGTERM); err == nil {
 		t.Fatal("kill error ignored")
 	}
-	openCodeSyscallKill = func(int, syscall.Signal) error { return nil }
-	if err := signalOpenCodeProcessGroup(cmd, syscall.SIGTERM); err != nil {
+	var signaledPID int
+	openCodeSyscallKill = func(pid int, _ syscall.Signal) error {
+		signaledPID = pid
+
+		return nil
+	}
+	if err := signalOpenCodeProcessGroup(process, 123, syscall.SIGTERM); err != nil {
 		t.Fatalf("signal success: %v", err)
 	}
-	if err := killOpenCodeProcess(cmd); err != nil {
+	if signaledPID != -123 {
+		t.Fatalf("signaled process group = %d, want captured -123", signaledPID)
+	}
+	if err := killOpenCodeProcess(process, 123); err != nil {
 		t.Fatalf("killOpenCodeProcess: %v", err)
 	}
 }

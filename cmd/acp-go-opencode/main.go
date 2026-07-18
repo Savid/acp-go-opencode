@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 
 	opencodeacp "github.com/savid/acp-go-opencode"
@@ -18,6 +19,12 @@ var serve = opencodeacp.Serve
 var agentVersion = version
 var exit = os.Exit
 var shutdownOpenTelemetry = shutdownTelemetry
+var runtimeGOOS = runtime.GOOS
+
+const (
+	containmentCommand = "containment"
+	platformDarwin     = "darwin"
+)
 
 func main() {
 	if code := run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr); code != 0 {
@@ -26,6 +33,10 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == containmentCommand {
+		return runContainment(args[1:], stdout, stderr)
+	}
+
 	flags := flag.NewFlagSet("acp-go-opencode", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
@@ -40,12 +51,19 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	logLevel := flags.String("opencode-log-level", "", "OpenCode native server log level")
 	nativeVersion := flags.String("opencode-version", "1.18.3", "exact OpenCode version required by the sync-event store")
 	healthTimeout := flags.Duration("opencode-health-timeout", opencode.HealthCheckTimeout, "OpenCode server readiness timeout")
+	darwinBestEffort := flags.Bool("darwin-best-effort-containment", false, "accept Darwin process-group containment and its escaped-descendant and PGID-reuse risks")
 
 	var seedFiles seedFileFlag
 
 	flags.Var(&seedFiles, "seed-file", "seed a file into the shared runtime config root as <relpath>=<hostpath> (repeatable)")
 
 	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+
+	if *darwinBestEffort && runtimeGOOS != platformDarwin {
+		_, _ = fmt.Fprintln(stderr, "acp-go-opencode: -darwin-best-effort-containment is valid only on darwin")
+
 		return 2
 	}
 
@@ -58,6 +76,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	logger := slog.New(slog.DiscardHandler)
 	if *debug {
 		logger = slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
+
+	if *darwinBestEffort {
+		_, _ = fmt.Fprintln(stderr, "WARNING containment=best_effort: escaped descendants may survive; numeric PGID reuse can cause collateral signalling; marker correlation is not ownership; markers can be scrubbed; native-root permits do not bound escaped provider work")
 	}
 
 	signals := forwardedSignals()
@@ -101,6 +123,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 
 	if len(seedFiles.files) > 0 {
 		opts = append(opts, opencodeacp.WithSeedFiles(seedFiles.files))
+	}
+
+	if *darwinBestEffort {
+		opts = append(opts, opencodeacp.WithDarwinBestEffortContainment())
 	}
 
 	opts = append(opts, telemetry.options...)

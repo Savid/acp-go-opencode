@@ -93,6 +93,7 @@ var (
 	ErrSSEDisconnect         = errors.New("opencode SSE disconnected")
 	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
 	ErrScopeRuntimeShutdown  = errors.New("directory-scoped OpenCode client cannot shut down the shared runtime")
+	ErrRuntimeScratchCleanup = errors.New("OpenCode runtime scratch cleanup incomplete")
 )
 
 type Client interface {
@@ -161,22 +162,29 @@ type StartOptions struct {
 	// on-disk materialization. The root package resolves it (system temp
 	// directory when unset); this package never consults the system temp
 	// directory itself. It is used only as the fallback root when Root is empty.
-	ScratchParent          string
-	ExecutablePath         string
-	Env                    map[string]string
-	Pure                   bool
-	QuestionTool           bool
-	LogLevel               string
-	ExactVersion           string
-	HealthTimeout          time.Duration
-	Logger                 *slog.Logger
-	ExistingXDG            XDGDirs
-	SkipVersionGate        bool
-	SeedFiles              map[string]string
-	SkipSupervisor         bool
-	ObserveProcess         func(context.Context, string, int64)
-	ObserveProcessSnapshot func(context.Context, string, int)
-	ObserveStartupStage    func(context.Context, string, string, time.Duration, error)
+	ScratchParent            string
+	ExecutablePath           string
+	Env                      map[string]string
+	Pure                     bool
+	QuestionTool             bool
+	LogLevel                 string
+	ExactVersion             string
+	HealthTimeout            time.Duration
+	Logger                   *slog.Logger
+	ExistingXDG              XDGDirs
+	SkipVersionGate          bool
+	SeedFiles                map[string]string
+	SkipSupervisor           bool
+	DarwinBestEffort         bool
+	ContainmentScratchParent string
+	// ReserveContainmentScratch reserves one adapter-created Darwin generation
+	// root. DarwinBestEffort requires this callback; StartServer invokes it
+	// immediately before creating the generation root and owns the returned
+	// release until that exact root has been deleted.
+	ReserveContainmentScratch func(context.Context) (func(), error)
+	ObserveProcess            func(context.Context, string, int64)
+	ObserveProcessSnapshot    func(context.Context, string, int)
+	ObserveStartupStage       func(context.Context, string, string, time.Duration, error)
 }
 
 type runtimeProcessObservation struct {
@@ -352,27 +360,30 @@ type openCodeServer struct {
 	username                     string
 	password                     string
 	cmd                          *exec.Cmd
+	process                      *os.Process
+	originalProcessGroup         int
 	cancel                       context.CancelFunc
 	xdg                          XDGDirs
 	log                          *slog.Logger
 	sessionPermissionListSupport bool
 	sessionQuestionListSupport   bool
 
-	events             chan Event
-	errs               chan error
-	closed             chan struct{}
-	directory          string
-	scopeCancel        context.CancelFunc
-	runtimeShutdown    *runtimeShutdownState
-	runtimeClosed      chan struct{}
-	runtimeExited      chan struct{}
-	mcpNames           []string
-	scopeCloseMu       sync.Mutex
-	scopeClosed        bool
-	supervisorControl  io.WriteCloser
-	supervisor         *supervisorProof
-	processObservation *runtimeProcessObservation
-	waitDone           chan error
+	events                       chan Event
+	errs                         chan error
+	closed                       chan struct{}
+	directory                    string
+	scopeCancel                  context.CancelFunc
+	runtimeShutdown              *runtimeShutdownState
+	runtimeClosed                chan struct{}
+	runtimeExited                chan struct{}
+	mcpNames                     []string
+	scopeCloseMu                 sync.Mutex
+	scopeClosed                  bool
+	supervisorControl            io.WriteCloser
+	supervisor                   *supervisorProof
+	processObservation           *runtimeProcessObservation
+	waitDone                     chan error
+	containmentGenerationCleanup func() error
 
 	streamMu    sync.Mutex
 	streamEpoch uint64
@@ -387,6 +398,61 @@ type runtimeShutdownState struct {
 
 func newRuntimeShutdownState() *runtimeShutdownState {
 	return &runtimeShutdownState{done: make(chan struct{})}
+}
+
+func prepareDarwinRuntimeGeneration(ctx context.Context, options StartOptions) (string, func() error, error) {
+	if !options.DarwinBestEffort {
+		return "", func() error { return nil }, nil
+	}
+
+	if options.ReserveContainmentScratch == nil {
+		return "", nil, errors.New("darwin containment scratch reservation is required")
+	}
+
+	reservationRelease, err := options.ReserveContainmentScratch(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("reserve Darwin containment generation scratch: %w", err)
+	}
+
+	if reservationRelease == nil {
+		return "", nil, errors.New("reserve Darwin containment generation scratch returned a nil release")
+	}
+
+	parent := options.ContainmentScratchParent
+	if parent == "" {
+		parent = options.ScratchParent
+	}
+
+	root, err := newDarwinRuntimeGenerationRoot(parent)
+	if err != nil {
+		if root == "" {
+			reservationRelease()
+		}
+
+		return root, nil, err
+	}
+
+	var (
+		cleanupOnce sync.Once
+		cleanupErr  error
+	)
+
+	return root, func() error {
+		cleanupOnce.Do(func() {
+			if err := openCodeRemoveAll(root); err != nil {
+				cleanupErr = errors.Join(
+					ErrRuntimeScratchCleanup,
+					fmt.Errorf("remove Darwin containment generation: %w", err),
+				)
+
+				return
+			}
+
+			reservationRelease()
+		})
+
+		return cleanupErr
+	}, nil
 }
 
 type NativeSession struct {
@@ -765,6 +831,7 @@ var (
 	openCodeTerminateProcess              = terminateOpenCodeProcess
 	openCodeKillProcess                   = killOpenCodeProcess
 	openCodeWaitCommand                   = func(cmd *exec.Cmd) error { return cmd.Wait() }
+	openCodeRemoveAll                     = os.RemoveAll
 	openCodeAfter                         = time.After
 	openCodeReadyPollInterval             = 100 * time.Millisecond
 	openCodeEventReconnectDelay           = 250 * time.Millisecond
@@ -775,7 +842,7 @@ var (
 // HealthCheckTimeout is the default bound on OpenCode server readiness checks.
 const HealthCheckTimeout = 60 * time.Second
 
-func StartServer(ctx context.Context, options StartOptions) (Client, error) {
+func normalizedStartOptions(options StartOptions) StartOptions {
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
@@ -783,6 +850,12 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 	if options.HealthTimeout <= 0 {
 		options.HealthTimeout = HealthCheckTimeout
 	}
+
+	return options
+}
+
+func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) {
+	options = normalizedStartOptions(options)
 
 	xdg := options.ExistingXDG
 	if xdg.Root == "" {
@@ -858,6 +931,24 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 	nativeEnv := envMapToSlice(env)
 	processCtx, cancel := context.WithCancel(context.Background())
 
+	containmentGenerationRoot, releaseContainmentGeneration, err := prepareDarwinRuntimeGeneration(ctx, options)
+	if err != nil {
+		cancel()
+
+		return nil, err
+	}
+
+	containmentGenerationTransferred := false
+
+	defer func() {
+		// Once native start makes containment incomplete, neither this frame nor
+		// its caller can prove the generation is quiescent. Keep both the root and
+		// its reservation; the root agent latches the returned sentinel.
+		if !containmentGenerationTransferred && !errors.Is(resultErr, ErrProcessContainmentIncomplete) {
+			resultErr = errors.Join(resultErr, releaseContainmentGeneration())
+		}
+	}()
+
 	var cmd *exec.Cmd
 
 	var supervisor *supervisorProof
@@ -867,13 +958,21 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		cmd.Env = nativeEnv
 		configureOpenCodeProcess(cmd)
 	} else {
+		supervisorScratch := filepath.Join(xdg.State, "runtime-supervisor")
+		if containmentGenerationRoot != "" {
+			supervisorScratch = containmentGenerationRoot
+		}
+
 		cmd, supervisor, err = supervisorCommand(processCtx, supervisorConfig{
-			NativePath: executable,
-			NativeArgs: args,
-			NativeEnv:  nativeEnv,
-			NativeDir:  "",
-			Home:       xdg.Root,
-			Scratch:    filepath.Join(xdg.State, "runtime-supervisor"),
+			NativePath:       executable,
+			NativeArgs:       args,
+			NativeEnv:        nativeEnv,
+			NativeDir:        "",
+			Home:             xdg.Root,
+			Scratch:          supervisorScratch,
+			ScratchParent:    options.ContainmentScratchParent,
+			LifecycleKind:    darwinLifecycleRuntime,
+			DarwinBestEffort: options.DarwinBestEffort,
 		})
 		if err != nil {
 			cancel()
@@ -910,7 +1009,24 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 
 	spawnStarted := time.Now()
 
-	if err := cmd.Start(); err != nil {
+	if startErr := cmd.Start(); startErr != nil {
+		observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, startErr)
+
+		if supervisorControl != nil {
+			_ = supervisorControl.Close()
+		}
+
+		cancel()
+
+		return nil, startErr
+	}
+
+	process := cmd.Process
+
+	runtimeWaiter := newSupervisorWaiterFunc(func() error { return openCodeWaitCommand(cmd) }, true)
+
+	originalProcessGroup, err := releaseIndependentSupervisorWaiter(cmd, runtimeWaiter)
+	if err != nil {
 		observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, err)
 
 		if supervisorControl != nil {
@@ -928,9 +1044,8 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 		options.Logger.DebugContext(ctx, "opencode startup stage complete", slog.String("stage", "spawn"), slog.Duration("elapsed", time.Since(spawnStarted)))
 	}
 
-	waitDone := make(chan error, 1)
+	waitDone := runtimeWaiter.result()
 	runtimeExited := make(chan struct{})
-	waitCommand := openCodeWaitCommand
 	processObservation := &runtimeProcessObservation{
 		observe:         options.ObserveProcess,
 		observeSnapshot: options.ObserveProcessSnapshot,
@@ -939,7 +1054,7 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 	go func() {
 		defer processObservation.markExited()
 
-		waitDone <- waitCommand(cmd)
+		<-runtimeWaiter.done
 
 		close(runtimeExited)
 	}()
@@ -948,25 +1063,29 @@ func StartServer(ctx context.Context, options StartOptions) (Client, error) {
 	go drainProcessPipe(options.Logger, "opencode stderr", stderr)
 
 	server := &openCodeServer{
-		httpClient:         &http.Client{Timeout: 30 * time.Second},
-		baseURL:            "http://127.0.0.1:" + strconv.Itoa(port),
-		username:           username,
-		password:           password,
-		cmd:                cmd,
-		cancel:             cancel,
-		xdg:                xdg,
-		log:                options.Logger,
-		events:             make(chan Event, 256),
-		errs:               make(chan error, 8),
-		closed:             make(chan struct{}),
-		runtimeShutdown:    newRuntimeShutdownState(),
-		runtimeClosed:      make(chan struct{}),
-		runtimeExited:      runtimeExited,
-		supervisorControl:  supervisorControl,
-		supervisor:         supervisor,
-		processObservation: processObservation,
-		waitDone:           waitDone,
+		httpClient:                   &http.Client{Timeout: 30 * time.Second},
+		baseURL:                      "http://127.0.0.1:" + strconv.Itoa(port),
+		username:                     username,
+		password:                     password,
+		cmd:                          cmd,
+		process:                      process,
+		originalProcessGroup:         originalProcessGroup,
+		cancel:                       cancel,
+		xdg:                          xdg,
+		log:                          options.Logger,
+		events:                       make(chan Event, 256),
+		errs:                         make(chan error, 8),
+		closed:                       make(chan struct{}),
+		runtimeShutdown:              newRuntimeShutdownState(),
+		runtimeClosed:                make(chan struct{}),
+		runtimeExited:                runtimeExited,
+		supervisorControl:            supervisorControl,
+		supervisor:                   supervisor,
+		processObservation:           processObservation,
+		waitDone:                     waitDone,
+		containmentGenerationCleanup: releaseContainmentGeneration,
 	}
+	containmentGenerationTransferred = true
 
 	readyCtx, readyCancel := context.WithTimeout(ctx, options.HealthTimeout)
 	defer readyCancel()
@@ -1130,10 +1249,15 @@ func (s *openCodeServer) shutdownRuntime() error {
 	var err error
 
 	if s.cmd != nil && s.cmd.Process != nil {
+		process := s.process
+		if process == nil {
+			process = s.cmd.Process
+		}
+
 		if s.supervisorControl != nil {
 			_ = s.supervisorControl.Close()
 		} else {
-			_ = terminateProcess(s.cmd)
+			_ = terminateProcess(process, s.originalProcessGroup)
 		}
 
 		done := s.waitDone
@@ -1152,11 +1276,11 @@ func (s *openCodeServer) shutdownRuntime() error {
 				s.log.DebugContext(proofCtx, "opencode exited during shutdown", slog.Any("error", waitErr))
 			}
 		case <-after(shutdownTimeout):
-			_ = killProcess(s.cmd)
+			_ = killProcess(process, s.originalProcessGroup)
 			err = errors.New("opencode process did not exit after shutdown")
 		case <-proofCtx.Done():
-			_ = killProcess(s.cmd)
-			err = errors.Join(ErrProcessTreeUnproven, proofCtx.Err())
+			_ = killProcess(process, s.originalProcessGroup)
+			err = errors.Join(ErrProcessContainmentIncomplete, proofCtx.Err())
 		}
 
 		if !waited {
@@ -1164,7 +1288,7 @@ func (s *openCodeServer) shutdownRuntime() error {
 			case <-done:
 				waited = true
 			case <-proofCtx.Done():
-				err = errors.Join(err, ErrProcessTreeUnproven, proofCtx.Err())
+				err = errors.Join(err, ErrProcessContainmentIncomplete, proofCtx.Err())
 			}
 		}
 
@@ -1176,12 +1300,16 @@ func (s *openCodeServer) shutdownRuntime() error {
 
 			err = errors.Join(err, proofErr)
 		} else if !waited {
-			err = errors.Join(err, ErrProcessTreeUnproven)
+			err = errors.Join(err, ErrProcessContainmentIncomplete)
 		}
 	}
 
 	if s.cancel != nil {
 		s.cancel()
+	}
+
+	if s.containmentGenerationCleanup != nil && !errors.Is(err, ErrProcessContainmentIncomplete) {
+		err = errors.Join(err, s.containmentGenerationCleanup())
 	}
 
 	return err
@@ -2774,7 +2902,7 @@ func validateOpenCodeSeedPath(rel string) (string, error) {
 	}
 
 	for _, segment := range strings.Split(filepath.ToSlash(rel), "/") {
-		if segment == ".." {
+		if segment == parentPathSegment {
 			return "", unsupportedField(seedFileField(rel))
 		}
 	}

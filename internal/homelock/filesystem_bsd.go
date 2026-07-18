@@ -10,9 +10,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var bsdFstatfs = unix.Fstatfs
+
 func validateLockFilesystem(file *os.File) error {
 	var stat unix.Statfs_t
-	if err := unix.Fstatfs(int(file.Fd()), &stat); err != nil {
+	if err := bsdFstatfs(int(file.Fd()), &stat); err != nil {
 		return fmt.Errorf("inspect filesystem containing runtime lock: %w", err)
 	}
 

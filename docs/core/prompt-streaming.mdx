@@ -73,9 +73,11 @@ The failure payload's `cause` names the failure class:
 By default there is no deadline. `WithTurnTimeout` bounds a single turn; when it
 elapses the adapter sends native abort as a best-effort hint, retires that
 turn's exact shared-runtime generation, and waits for the one memoized
-whole-process-tree containment result before reopening turn admission. Native
-`idle` status is never accepted as process containment. Failure to prove the
-tree empty poisons the affected session and quarantines the runtime resources.
+containment result before reopening turn admission. Native `idle` status is
+never accepted as process containment. Failure to complete the selected
+boundary poisons the affected session and quarantines the runtime resources.
+Darwin best-effort completes only the captured original process group plus
+direct-child reap and never claims escaped descendants are absent.
 The same fence is used for host cancellation and stream/control failures that
 can leave native work running. See
 [Models and config](/docs/features/models-config) for the

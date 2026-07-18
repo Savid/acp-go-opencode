@@ -34,34 +34,35 @@ var (
 
 // Agent exposes OpenCode through ACP.
 type Agent struct {
-	options    Options
-	log        *slog.Logger
-	observe    *observer.Observer
-	optionsErr error
+	options         Options
+	log             *slog.Logger
+	observe         *observer.Observer
+	optionsErr      error
+	containmentMode RuntimeContainmentMode
 
-	mu                    sync.Mutex
-	closed                bool
-	conn                  agentClient
-	closeDone             chan struct{}
-	closeErr              error
-	sessions              map[acp.SessionId]*session
-	deleted               map[acp.SessionId]struct{}
-	clientCalls           chan struct{}
-	nativeTurns           chan struct{}
-	clientCapabilities    acp.ClientCapabilities
-	positionEncoding      acp.PositionEncodingKind
-	runtime               opencode.Client
-	runtimeGeneration     uint64
-	runtimeStarting       chan struct{}
-	runtimeStartErr       error
-	runtimeFatalErr       error
-	runtimeNativeRelease  func()
-	runtimeScratchRelease func()
-	runtimeRetirements    map[uint64]*runtimeRetirement
-	directories           map[string]directoryBinding
-	directoryIncarnation  directoryBindingIncarnation
-	fingerprintKey        [32]byte
-	restoreMu             sync.Mutex
+	mu                       sync.Mutex
+	closed                   bool
+	conn                     agentClient
+	closeDone                chan struct{}
+	closeErr                 error
+	sessions                 map[acp.SessionId]*session
+	deleted                  map[acp.SessionId]struct{}
+	clientCalls              chan struct{}
+	nativeTurns              chan struct{}
+	clientCapabilities       acp.ClientCapabilities
+	positionEncoding         acp.PositionEncodingKind
+	runtime                  opencode.Client
+	runtimeGeneration        uint64
+	runtimeStarting          chan struct{}
+	runtimeStartErr          error
+	runtimeFatalErr          error
+	runtimeNativeRelease     func()
+	runtimeXDGScratchRelease func()
+	runtimeRetirements       map[uint64]*runtimeRetirement
+	directories              map[string]directoryBinding
+	directoryIncarnation     directoryBindingIncarnation
+	fingerprintKey           [32]byte
+	restoreMu                sync.Mutex
 }
 
 type directoryBinding struct {
@@ -79,6 +80,7 @@ var (
 func NewAgent(opts ...Option) *Agent {
 	options := applyOptions(opts)
 	limits, optionsErr := normalizeConcurrencyLimits(options.ConcurrencyLimits)
+	optionsErr = errors.Join(optionsErr, validateContainmentOptions(options))
 
 	options.ConcurrencyLimits = limits
 
@@ -111,10 +113,26 @@ func NewAgent(opts ...Option) *Agent {
 	})
 	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe)
 
+	mode := containmentMode(options)
+	if options.RuntimeResourceHooks.ObserveContainment != nil {
+		options.RuntimeResourceHooks.ObserveContainment(context.Background(), mode)
+	}
+
+	if mode == RuntimeContainmentBestEffort {
+		options.RuntimeResourceHooks.ObserveProcessSnapshot = nil
+	}
+
+	if mode == RuntimeContainmentBestEffort {
+		log.Warn("Darwin best-effort process containment is enabled; escaped descendants may survive, numeric PGID reuse can cause collateral signalling, marker correlation is not ownership, markers can be scrubbed, and native-root permits do not bound escaped provider work",
+			slog.String("containment", string(mode)),
+		)
+	}
+
 	agent := &Agent{
 		options:            options,
 		log:                log,
 		optionsErr:         optionsErr,
+		containmentMode:    mode,
 		observe:            observe,
 		sessions:           make(map[acp.SessionId]*session),
 		deleted:            make(map[acp.SessionId]struct{}),
@@ -128,6 +146,15 @@ func NewAgent(opts ...Option) *Agent {
 	}
 
 	return agent
+}
+
+// ContainmentMode reports the effective native process boundary.
+func (a *Agent) ContainmentMode() RuntimeContainmentMode {
+	if a == nil {
+		return RuntimeContainmentUnavailable
+	}
+
+	return a.containmentMode
 }
 
 func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) (serveErr error) {
@@ -192,22 +219,33 @@ func (a *Agent) Close() error {
 	runtime := a.runtime
 	generation := a.runtimeGeneration
 	waiting := a.runtimeStarting
+
+	stickyRuntimeErr := a.runtimeFatalErr
+	if !fatalRuntimeCleanup(stickyRuntimeErr) {
+		stickyRuntimeErr = nil
+	}
+
 	a.closed = true
 	a.conn = nil
 	a.mu.Unlock()
 
-	var err error
+	err := stickyRuntimeErr
 	if runtime != nil {
 		err = errors.Join(err, a.retireSharedRuntime(generation, "shared OpenCode runtime retired while closing agent"))
 	} else if waiting != nil {
 		<-waiting
 		a.mu.Lock()
 		retirement := a.runtimeRetirements[generation]
+		startErr := a.runtimeStartErr
 		a.mu.Unlock()
 
 		if retirement != nil {
 			<-retirement.done
 			err = errors.Join(err, retirement.err)
+		}
+
+		if fatalRuntimeCleanup(startErr) {
+			err = errors.Join(err, startErr)
 		}
 	}
 

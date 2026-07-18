@@ -14,6 +14,11 @@
 // root. When it is empty, the adapter materializes the root beneath the parent
 // selected by [WithScratchDir].
 //
+// Darwin native startup fails closed unless
+// [WithDarwinBestEffortContainment] is selected. That option accepts a bounded
+// original-process-group cleanup and direct-child reap; descendants that escape
+// the group can survive, so it is not an authoritative absence proof.
+//
 // Hosts that need durable remote resume can provide [WithSessionStore]. A
 // session store receives `opencode-sync-events-v1` native event bundles keyed
 // by the ACP-visible session ID and subpath, can back session/list, and can

@@ -21,7 +21,9 @@ const linuxSupervisorTaskRoot = "/proc/self/task"
 
 type guardianContainment struct{}
 
-type livenessContainment struct{}
+type livenessContainment struct {
+	waiter *supervisorWaiter
+}
 
 var (
 	supervisorLinuxPrctl           = unix.Prctl
@@ -35,7 +37,7 @@ var (
 	supervisorLinuxClose           = unix.Close
 )
 
-func newGuardianContainment() (*guardianContainment, error) {
+func newGuardianContainment(supervisorConfig) (*guardianContainment, error) {
 	if err := enableLinuxSubreaper(supervisorModeGuardian); err != nil {
 		return nil, err
 	}
@@ -51,7 +53,7 @@ func (*guardianContainment) Quiesce(nativePID int, timeout time.Duration) error 
 	return quiesceLinuxReaper(nativePID, 0, timeout)
 }
 
-func openLivenessContainment(string) (*livenessContainment, error) {
+func openLivenessContainment(supervisorConfig) (*livenessContainment, error) {
 	if err := enableLinuxSubreaper(supervisorModeLiveness); err != nil {
 		return nil, err
 	}
@@ -59,10 +61,20 @@ func openLivenessContainment(string) (*livenessContainment, error) {
 	return &livenessContainment{}, nil
 }
 
-func (*livenessContainment) Start(cmd *exec.Cmd) error {
+func (containment *livenessContainment) Start(cmd *exec.Cmd) error {
 	configureOpenCodeProcess(cmd)
 
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	containment.waiter = newSupervisorWaiter(cmd, false)
+
+	return nil
+}
+
+func (containment *livenessContainment) Wait() <-chan error {
+	return containment.waiter.result()
 }
 
 func (*livenessContainment) Close() error { return nil }
@@ -79,16 +91,16 @@ func enableLinuxSubreaper(_ string) error {
 	// runGuardian/runLiveness, after supervisorBootstrap has replaced the
 	// embedding command with a dedicated helper mode.
 	if err := supervisorLinuxPrctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
-		return errors.Join(ErrProcessTreeUnproven, fmt.Errorf("enable Linux child subreaper: %w", err))
+		return errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("enable Linux child subreaper: %w", err))
 	}
 
 	fd, err := supervisorLinuxPIDFDOpen(os.Getpid(), 0)
 	if err != nil {
-		return errors.Join(ErrProcessTreeUnproven, fmt.Errorf("open Linux pidfd containment probe: %w", err))
+		return errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("open Linux pidfd containment probe: %w", err))
 	}
 
 	if err := supervisorLinuxClose(fd); err != nil {
-		return errors.Join(ErrProcessTreeUnproven, fmt.Errorf("close Linux pidfd containment probe: %w", err))
+		return errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("close Linux pidfd containment probe: %w", err))
 	}
 
 	return nil
@@ -98,8 +110,14 @@ func configureIndependentSupervisor(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func terminateIndependentSupervisor(cmd *exec.Cmd) error {
-	return signalOpenCodeProcessGroup(cmd, syscall.SIGKILL)
+func releaseIndependentSupervisorWaiter(cmd *exec.Cmd, waiter *supervisorWaiter) (int, error) {
+	if cmd == nil || cmd.Process == nil || waiter == nil {
+		return 0, errors.Join(ErrProcessContainmentIncomplete, errors.New("direct-child waiter is unavailable"))
+	}
+
+	waiter.start()
+
+	return cmd.Process.Pid, nil
 }
 
 func querySupervisorProcessSnapshot(string) (int, bool) { return 0, false }
@@ -178,7 +196,7 @@ func linuxReaperNoChildren() (bool, error) {
 	case err == nil, errors.Is(err, unix.EINTR):
 		return false, nil
 	default:
-		return false, errors.Join(ErrProcessTreeUnproven, fmt.Errorf("fence Linux child subreaper: %w", err))
+		return false, errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("fence Linux child subreaper: %w", err))
 	}
 }
 

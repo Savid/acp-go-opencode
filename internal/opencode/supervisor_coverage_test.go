@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -44,6 +45,7 @@ func preserveSupervisorGlobals(t *testing.T) {
 	oldOpenFile := supervisorOpenFile
 	oldEncode := supervisorEncodeConfig
 	oldGuardianContainment := supervisorNewGuardianContainment
+	oldGuardianQuiesce := supervisorGuardianQuiesce
 	oldLivenessContainment := supervisorOpenLivenessContainment
 	oldInput := supervisorInput
 	oldOutput := supervisorOutput
@@ -58,6 +60,7 @@ func preserveSupervisorGlobals(t *testing.T) {
 		supervisorOpenFile = oldOpenFile
 		supervisorEncodeConfig = oldEncode
 		supervisorNewGuardianContainment = oldGuardianContainment
+		supervisorGuardianQuiesce = oldGuardianQuiesce
 		supervisorOpenLivenessContainment = oldLivenessContainment
 		supervisorInput = oldInput
 		supervisorOutput = oldOutput
@@ -115,7 +118,7 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 
 	supervisorExecutable = os.Executable
 	cmd, proof, err := supervisorCommand(context.Background(), supervisorConfig{
-		NativePath: "/bin/true", Home: filepath.Join(root, "home"), Scratch: root,
+		NativePath: "/usr/bin/true", Home: filepath.Join(root, "home"), Scratch: root,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, cmd)
@@ -135,9 +138,9 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 	require.NotContains(t, env, supervisorModeEnv+"=old")
 
 	require.NoError(t, (*supervisorProof)(nil).awaitCompletion(context.Background()))
-	require.NoError(t, (&supervisorProof{
+	require.ErrorIs(t, (&supervisorProof{
 		started: filepath.Join(root, "never-started"), completion: filepath.Join(root, "never-completed"),
-	}).awaitCompletion(context.Background()))
+	}).awaitCompletion(context.Background()), ErrProcessContainmentIncomplete)
 
 	started := filepath.Join(root, "started")
 	completed := filepath.Join(root, "completed")
@@ -195,7 +198,17 @@ func TestSupervisorMarkerPIDReadyAndCopyUtilities(t *testing.T) {
 	supervisorOpenFile = func(string, int, os.FileMode) (*os.File, error) {
 		return os.OpenFile("/dev/full", os.O_WRONLY, 0)
 	}
-	require.ErrorContains(t, writeSupervisorInventoryIdentity(filepath.Join(root, "full"), "job-name"), "write private")
+	identityErr := writeSupervisorInventoryIdentity(filepath.Join(root, "full"), "job-name")
+	require.Error(t, identityErr)
+	require.True(t,
+		strings.Contains(identityErr.Error(), "create private") || strings.Contains(identityErr.Error(), "write private"),
+		"unexpected identity error: %v", identityErr,
+	)
+	closed, err := os.CreateTemp(t.TempDir(), "closed-")
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	supervisorOpenFile = func(string, int, os.FileMode) (*os.File, error) { return closed, nil }
+	require.ErrorContains(t, writeSupervisorInventoryIdentity(filepath.Join(root, "closed"), "job-name"), "write private")
 
 	count, available := querySupervisorProcessSnapshot(identityPath)
 	require.Zero(t, count)
@@ -219,15 +232,13 @@ func TestSupervisorMarkerPIDReadyAndCopyUtilities(t *testing.T) {
 	require.True(t, buffer.closed)
 
 	tries := 0
-	awaitQuiescence(func() error {
+	err = awaitQuiescence(func() error {
 		tries++
-		if tries < 2 {
-			return errors.New("not yet")
-		}
 
-		return nil
+		return errors.New("not yet")
 	})
-	require.Equal(t, 2, tries)
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, tries)
 }
 
 func TestRunLivenessControlEOFAndNativeFailure(t *testing.T) {
@@ -298,7 +309,7 @@ func TestRunGuardianHappyPathAndPreReadinessFailure(t *testing.T) {
 	require.NoError(t, runGuardian(config))
 
 	root = t.TempDir()
-	supervisorExecutable = func() (string, error) { return "/bin/false", nil }
+	supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
 	config.Home = filepath.Join(root, "home")
 	config.Scratch = root
 	config.Started = filepath.Join(root, "started")
@@ -318,15 +329,22 @@ func TestSupervisorBootstrapAndUnixContainmentBranches(t *testing.T) {
 	t.Setenv(supervisorConfigEnv, "")
 	supervisorBootstrap()
 
-	guardian, err := newGuardianContainment()
+	containmentConfig := supervisorConfig{
+		DarwinBestEffort: true,
+		ScratchParent:    t.TempDir(),
+		LifecycleKind:    "runtime",
+	}
+	containmentConfig.Scratch = filepath.Join(containmentConfig.ScratchParent, "acp-go-opencode-runtime-test")
+	require.NoError(t, os.Mkdir(containmentConfig.Scratch, 0o700))
+
+	guardian, err := newGuardianContainment(containmentConfig)
 	require.NoError(t, err)
-	require.Empty(t, guardian.Name())
 	require.NoError(t, guardian.Close())
-	liveness, err := openLivenessContainment("")
+	liveness, err := openLivenessContainment(containmentConfig)
 	require.NoError(t, err)
 	require.NoError(t, liveness.Close())
 
-	cmd := exec.Command("/bin/true")
+	cmd := exec.Command("/usr/bin/true")
 	configureIndependentSupervisor(cmd)
 	require.True(t, cmd.SysProcAttr.Setpgid)
 
@@ -370,20 +388,20 @@ func TestSupervisorEntropyAndProofStatFailures(t *testing.T) {
 	require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
 	err = (&supervisorProof{completion: filepath.Join(notDirectory, "child")}).awaitCompletion(context.Background())
 	require.ErrorContains(t, err, "stat liveness completion")
-	require.ErrorIs(t, err, ErrProcessTreeUnproven)
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	err = (&supervisorProof{started: filepath.Join(notDirectory, "child"), completion: filepath.Join(root, "missing")}).awaitCompletion(context.Background())
 	require.ErrorContains(t, err, "stat liveness start")
-	require.ErrorIs(t, err, ErrProcessTreeUnproven)
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	err = (&supervisorProof{started: filepath.Join(root, "absent-start"), completion: filepath.Join(root, "absent-complete")}).awaitCompletion(cancelled)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 
 	started := filepath.Join(root, "started")
 	require.NoError(t, writeSupervisorMarker(started))
 	err = (&supervisorProof{started: started, completion: filepath.Join(root, "still-absent")}).awaitCompletion(cancelled)
-	require.ErrorIs(t, err, ErrProcessTreeUnproven)
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -397,7 +415,7 @@ func TestRunGuardianPipeAndStartFailures(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			preserveSupervisorGlobals(t)
 			root := t.TempDir()
-			supervisorExecutable = func() (string, error) { return "/bin/true", nil }
+			supervisorExecutable = func() (string, error) { return "/usr/bin/true", nil }
 			supervisorExecCommand = func(name string, args ...string) *exec.Cmd {
 				command := exec.Command(name, args...)
 				configure(command)
@@ -444,7 +462,7 @@ func TestRunLivenessPipeAndExitFailures(t *testing.T) {
 				return command
 			}
 			err := runLiveness(supervisorConfig{
-				NativePath: "/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+				NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 				Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 			})
 			require.ErrorContains(t, err, "open native")
@@ -460,7 +478,7 @@ func TestRunLivenessPipeAndExitFailures(t *testing.T) {
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		err := runLiveness(supervisorConfig{
-			NativePath: "/bin/false", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativePath: "/usr/bin/false", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.ErrorContains(t, err, "native root exited")
@@ -469,10 +487,8 @@ func TestRunLivenessPipeAndExitFailures(t *testing.T) {
 
 func TestUnixQuiescenceSignalEscalationAndTimeout(t *testing.T) {
 	oldKill := openCodeSyscallKill
-	oldGetpgid := openCodeSyscallGetpgid
 	t.Cleanup(func() {
 		openCodeSyscallKill = oldKill
-		openCodeSyscallGetpgid = oldGetpgid
 	})
 
 	probes := 0
@@ -495,23 +511,31 @@ func TestUnixQuiescenceSignalEscalationAndTimeout(t *testing.T) {
 
 		return nil
 	}
-	require.ErrorContains(t, quiesceProcessGroup(123, time.Millisecond), "did not become quiescent")
+	require.ErrorContains(t, quiesceProcessGroup(123, time.Millisecond), "remained observable")
 
-	command := &exec.Cmd{Process: &os.Process{Pid: 123}}
-	openCodeSyscallGetpgid = func(int) (int, error) { return 123, nil }
-	openCodeSyscallKill = func(int, syscall.Signal) error { return syscall.ESRCH }
-	require.NoError(t, terminateIndependentSupervisor(command))
+	containmentConfig := supervisorConfig{
+		DarwinBestEffort: true,
+		ScratchParent:    t.TempDir(),
+		LifecycleKind:    "runtime",
+	}
+	containmentConfig.Scratch = filepath.Join(containmentConfig.ScratchParent, "acp-go-opencode-runtime-test")
+	require.NoError(t, os.Mkdir(containmentConfig.Scratch, 0o700))
 
-	liveness, err := openLivenessContainment("")
+	liveness, err := openLivenessContainment(containmentConfig)
 	require.NoError(t, err)
-	command = exec.Command("/bin/true")
+	command := exec.Command("/usr/bin/true")
 	require.NoError(t, liveness.Start(command))
-	require.NoError(t, command.Wait())
+	require.NoError(t, <-liveness.Wait())
 	openCodeSyscallKill = func(int, syscall.Signal) error { return syscall.ESRCH }
 	require.NoError(t, liveness.Quiesce(command.Process.Pid, time.Second))
-	guardian, err := newGuardianContainment()
+	guardian, err := newGuardianContainment(containmentConfig)
 	require.NoError(t, err)
-	require.NoError(t, guardian.Quiesce(command.Process.Pid, time.Second))
+	guardianErr := guardian.Quiesce(command.Process.Pid, time.Second)
+	if runtime.GOOS == "darwin" {
+		require.ErrorIs(t, guardianErr, ErrProcessContainmentIncomplete)
+	} else {
+		require.NoError(t, guardianErr)
+	}
 }
 
 func TestSupervisorInjectedFilesystemAndContainmentFailures(t *testing.T) {
@@ -538,7 +562,9 @@ func TestSupervisorInjectedFilesystemAndContainmentFailures(t *testing.T) {
 
 	t.Run("guardian containment", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
-		supervisorNewGuardianContainment = func() (*guardianContainment, error) { return nil, errors.New("containment failed") }
+		supervisorNewGuardianContainment = func(supervisorConfig) (*guardianContainment, error) {
+			return nil, errors.New("containment failed")
+		}
 		root := t.TempDir()
 		err := runGuardian(supervisorConfig{Home: filepath.Join(root, "home"), Scratch: root})
 		require.ErrorContains(t, err, "containment failed")
@@ -546,7 +572,9 @@ func TestSupervisorInjectedFilesystemAndContainmentFailures(t *testing.T) {
 
 	t.Run("liveness containment", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
-		supervisorOpenLivenessContainment = func(string) (*livenessContainment, error) { return nil, errors.New("containment failed") }
+		supervisorOpenLivenessContainment = func(supervisorConfig) (*livenessContainment, error) {
+			return nil, errors.New("containment failed")
+		}
 		root := t.TempDir()
 		err := runLiveness(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root, Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
@@ -559,7 +587,7 @@ func TestSupervisorDispatchBootstrapAndEarlyFailures(t *testing.T) {
 	preserveSupervisorGlobals(t)
 	root := t.TempDir()
 	config := supervisorConfig{
-		NativePath: "/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+		NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 	}
 	path, err := writeSupervisorConfig(root, config)
@@ -629,7 +657,7 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		root := t.TempDir()
 		notDirectory := filepath.Join(root, "file")
 		require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
-		supervisorExecutable = func() (string, error) { return "/bin/false", nil }
+		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root, Completion: filepath.Join(notDirectory, "child"),
 		})
@@ -641,7 +669,7 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		root := t.TempDir()
 		notDirectory := filepath.Join(root, "file")
 		require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
-		supervisorExecutable = func() (string, error) { return "/bin/false", nil }
+		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(notDirectory, "child"), Completion: filepath.Join(root, "missing"),
@@ -656,13 +684,36 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		pid := filepath.Join(root, "pid")
 		require.NoError(t, writeSupervisorMarker(started))
 		require.NoError(t, writeNativePID(pid, 99999999))
-		supervisorExecutable = func() (string, error) { return "/bin/false", nil }
+		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root, Started: started,
 			Completion: filepath.Join(root, "complete"), NativePIDFile: pid,
 		})
 		require.Error(t, err)
 		_, statErr := os.Stat(filepath.Join(root, "complete"))
+		if runtime.GOOS == "darwin" {
+			require.ErrorIs(t, statErr, os.ErrNotExist)
+		} else {
+			require.NoError(t, statErr)
+		}
+	})
+
+	t.Run("recoverable platform publishes proof", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		started := filepath.Join(root, "started")
+		completion := filepath.Join(root, "complete")
+		pid := filepath.Join(root, "pid")
+		require.NoError(t, writeSupervisorMarker(started))
+		require.NoError(t, writeNativePID(pid, 99999999))
+		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+		supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error { return nil }
+		err := runGuardian(supervisorConfig{
+			Home: filepath.Join(root, "home"), Scratch: root, Started: started,
+			Completion: completion, NativePIDFile: pid,
+		})
+		require.Error(t, err)
+		_, statErr := os.Stat(completion)
 		require.NoError(t, statErr)
 	})
 
@@ -672,7 +723,7 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		started := filepath.Join(root, "started")
 		completion := filepath.Join(root, "complete")
 		require.NoError(t, writeSupervisorMarker(started))
-		supervisorExecutable = func() (string, error) { return "/bin/false", nil }
+		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
 		go func() {
 			time.Sleep(20 * time.Millisecond)
 			_ = writeSupervisorMarker(completion)
@@ -693,7 +744,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		config := supervisorConfig{
-			NativePath: "/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		}
 		path, err := writeSupervisorConfig(root, config)
@@ -715,8 +766,9 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
+		supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error { return nil }
 		err := runGuardian(supervisorConfig{
-			NativePath: "/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(notDirectory, "child"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.Error(t, err)
@@ -731,9 +783,11 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
+		completion := filepath.Join(root, "complete")
+		require.NoError(t, writeSupervisorMarker(completion))
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root,
-			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
+			Started: filepath.Join(root, "started"), Completion: completion, NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.ErrorContains(t, err, "liveness supervisor exited")
 	})
@@ -747,7 +801,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		err := runLiveness(supervisorConfig{
-			NativePath: "/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.NoError(t, err)
@@ -765,7 +819,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		}()
 		err := (&supervisorProof{started: started, completion: completion}).awaitCompletion(context.Background())
 		require.ErrorContains(t, err, "stat liveness completion")
-		require.ErrorIs(t, err, ErrProcessTreeUnproven)
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	})
 }
 

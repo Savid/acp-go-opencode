@@ -4,43 +4,41 @@ package opencode
 
 import (
 	"errors"
-	"os/exec"
+	"fmt"
+	"os"
 	"syscall"
 )
 
-var (
-	openCodeSyscallGetpgid = syscall.Getpgid
-	openCodeSyscallKill    = syscall.Kill
-)
+var openCodeSyscallKill = syscall.Kill
 
-func terminateOpenCodeProcess(cmd *exec.Cmd) error {
-	return signalOpenCodeProcessGroup(cmd, syscall.SIGTERM)
+func terminateOpenCodeProcess(process *os.Process, originalGroup int) error {
+	return signalOpenCodeProcessGroup(process, originalGroup, syscall.SIGTERM)
 }
 
-func killOpenCodeProcess(cmd *exec.Cmd) error {
-	return signalOpenCodeProcessGroup(cmd, syscall.SIGKILL)
+func killOpenCodeProcess(process *os.Process, originalGroup int) error {
+	return signalOpenCodeProcessGroup(process, originalGroup, syscall.SIGKILL)
 }
 
-func signalOpenCodeProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
-	if cmd == nil || cmd.Process == nil {
+func signalOpenCodeProcessGroup(process *os.Process, originalGroup int, signal syscall.Signal) error {
+	if process == nil {
 		return nil
 	}
 
-	pgid, err := openCodeSyscallGetpgid(cmd.Process.Pid)
-	if err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-
-		return err
+	if originalGroup <= 0 {
+		return errors.New("captured OpenCode process group is unavailable")
 	}
 
-	if err := openCodeSyscallKill(-pgid, signal); err != nil {
+	if err := openCodeSyscallKill(-originalGroup, signal); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
-			return nil
+			directErr := process.Signal(signal)
+			if errors.Is(directErr, os.ErrProcessDone) || errors.Is(directErr, syscall.ESRCH) {
+				return nil
+			}
+
+			return directErr
 		}
 
-		return err
+		return fmt.Errorf("signal captured OpenCode process group %d: %w", originalGroup, err)
 	}
 
 	return nil

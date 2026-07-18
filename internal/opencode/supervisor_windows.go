@@ -23,7 +23,8 @@ type guardianContainment struct {
 }
 
 type livenessContainment struct {
-	job windows.Handle
+	job    windows.Handle
+	waiter *supervisorWaiter
 }
 
 type jobBasicAccounting struct {
@@ -37,7 +38,7 @@ type jobBasicAccounting struct {
 	TotalTerminatedProcesses  uint32
 }
 
-func newGuardianContainment() (*guardianContainment, error) {
+func newGuardianContainment(supervisorConfig) (*guardianContainment, error) {
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, fmt.Errorf("create Windows Job Object nonce: %w", err)
@@ -84,7 +85,8 @@ func (c *guardianContainment) Quiesce(_ int, timeout time.Duration) error {
 	return quiesceJob(c.job, timeout)
 }
 
-func openLivenessContainment(name string) (*livenessContainment, error) {
+func openLivenessContainment(config supervisorConfig) (*livenessContainment, error) {
+	name := config.JobName
 	if name == "" {
 		return nil, errors.New("Windows Job Object name is required")
 	}
@@ -103,6 +105,8 @@ func (c *livenessContainment) Start(cmd *exec.Cmd) error {
 		return err
 	}
 
+	c.waiter = newSupervisorWaiter(cmd, true)
+
 	process, err := windows.OpenProcess(
 		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_INFORMATION,
 		false,
@@ -117,11 +121,18 @@ func (c *livenessContainment) Start(cmd *exec.Cmd) error {
 	}
 	if err != nil {
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		c.waiter.start()
+		<-c.waiter.result()
+
 		return fmt.Errorf("assign suspended native root to Windows Job Object: %w", err)
 	}
+
+	c.waiter.start()
+
 	return nil
 }
+
+func (c *livenessContainment) Wait() <-chan error { return c.waiter.result() }
 
 func resumePrimaryThread(pid uint32) error {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
@@ -235,13 +246,12 @@ func configureIndependentSupervisor(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP}
 }
 
-func terminateIndependentSupervisor(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
+func releaseIndependentSupervisorWaiter(cmd *exec.Cmd, waiter *supervisorWaiter) (int, error) {
+	if cmd == nil || cmd.Process == nil || waiter == nil {
+		return 0, errors.Join(ErrProcessContainmentIncomplete, errors.New("direct-child waiter is unavailable"))
 	}
-	err := cmd.Process.Kill()
-	if errors.Is(err, os.ErrProcessDone) {
-		return nil
-	}
-	return err
+
+	waiter.start()
+
+	return cmd.Process.Pid, nil
 }

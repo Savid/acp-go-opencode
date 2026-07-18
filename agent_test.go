@@ -42,7 +42,7 @@ func TestOutputSchemaInvalidRejected(t *testing.T) {
 func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.closeErr = errors.Join(errors.New("close failed"), opencode.ErrProcessTreeUnproven)
+	client.closeErr = errors.Join(errors.New("close failed"), opencode.ErrProcessContainmentIncomplete)
 	agent := NewAgent()
 	session := testSession(agent, client)
 	agent.sessions[session.id] = session
@@ -51,8 +51,8 @@ func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	newAgentForServe = func(...Option) *Agent { return agent }
 	t.Cleanup(func() { newAgentForServe = oldNewAgent })
 	err := Serve(ctx, strings.NewReader(""), io.Discard)
-	require.ErrorIs(t, err, ErrProcessTreeUnproven)
-	require.ErrorIs(t, ErrProcessTreeUnproven, opencode.ErrProcessTreeUnproven)
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, ErrProcessContainmentIncomplete, opencode.ErrProcessContainmentIncomplete)
 
 	oldMarshal := agentJSONMarshal
 	oldUnmarshal := agentJSONUnmarshal

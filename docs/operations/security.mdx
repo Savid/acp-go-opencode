@@ -17,7 +17,7 @@ only trusted peer:
   SSE calls authenticate with it.
 - The Agent exclusively owns the shared XDG root. Never-unlinked claim and
   liveness locks plus the native supervisor prevent a second writer and retain
-  the resource permit until the whole process tree is gone.
+  the resource permit until the selected native containment boundary completes.
 - On Linux, each supervisor helper is its own child subreaper and uses pidfds
   plus `/proc` child inventory to terminate and reap descendants that escape
   the native process group with `setsid` or `setpgid`. It accepts only the
@@ -25,13 +25,24 @@ only trusted peer:
   empty-tree proof; quiet `/proc` snapshots cannot close a fork/reparent race.
   The embedding host is never made a subreaper. Windows uses a kill-on-close
   Job Object. Platforms without one of these proof-capable containment backends
-  fail closed before native startup.
+  fail closed before native startup by default.
+- Darwin can be selected only through the explicit best-effort option. It
+  captures the original native process group before releasing its sole paused
+  waiter, sends SIGTERM, escalates to SIGKILL after 500ms, and stops after a
+  fixed five-second cleanup deadline while always reaping directly owned
+  children. Descendants that escape the group can survive; numeric PGID reuse
+  can cause collateral signalling. Runtime markers support diagnosis and
+  individually revalidated operator cleanup, but marker correlation is not
+  ownership or proof of absence and markers can be scrubbed. PID-by-PID
+  operator cleanup has an unavoidable PID-reuse time-of-check/time-of-use race:
+  reassignment after revalidation can signal an unrelated process. Its fixed
+  five-second deadline starts before the first process enumeration.
 - The writable home must have approved local lock semantics. Linux admits
   ext4, XFS, Btrfs, F2FS, and tmpfs; macOS/FreeBSD/OpenBSD admit their explicit
   local-filesystem allowlists; Windows admits fixed or RAM drives formatted as
   NTFS or ReFS. Network mounts, overlay filesystems, and unrecognized backends
   fail before native startup. Filesystem admission alone does not override the
-  proof-capable containment requirement.
+  selected containment requirement.
 - Native session IDs, canonical directory scopes, and turn nonces bind every
   prompt, abort, permission, question, and event route.
 

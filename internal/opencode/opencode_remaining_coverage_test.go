@@ -50,6 +50,54 @@ func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestStartServerDarwinContainmentFailures(t *testing.T) {
+	t.Run("generation root", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		parentFile := filepath.Join(t.TempDir(), "parent-file")
+		require.NoError(t, os.WriteFile(parentFile, nil, 0o600))
+		_, err := StartServer(context.Background(), StartOptions{
+			ExistingXDG:               testXDGDirs(t),
+			DarwinBestEffort:          true,
+			ContainmentScratchParent:  parentFile,
+			ReserveContainmentScratch: testContainmentScratchReservation,
+		})
+		require.ErrorContains(t, err, "scratch parent")
+	})
+
+	t.Run("untransferred generation removal", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		parent := t.TempDir()
+		removeErr := errors.New("remove failed")
+		openCodeRemoveAll = func(string) error { return removeErr }
+		_, err := StartServer(context.Background(), StartOptions{
+			ExistingXDG:               testXDGDirs(t),
+			ExecutablePath:            filepath.Join(t.TempDir(), "missing-opencode"),
+			SkipSupervisor:            true,
+			DarwinBestEffort:          true,
+			ContainmentScratchParent:  parent,
+			ReserveContainmentScratch: testContainmentScratchReservation,
+		})
+		require.ErrorIs(t, err, removeErr)
+		require.ErrorIs(t, err, ErrRuntimeScratchCleanup)
+	})
+
+	t.Run("completed generation removal", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		want := errors.New("remove failed")
+		openCodeRemoveAll = func(string) error { return want }
+		_, cleanup, prepareErr := prepareDarwinRuntimeGeneration(context.Background(), StartOptions{
+			DarwinBestEffort:          true,
+			ContainmentScratchParent:  t.TempDir(),
+			ReserveContainmentScratch: testContainmentScratchReservation,
+		})
+		require.NoError(t, prepareErr)
+		server := &openCodeServer{containmentGenerationCleanup: cleanup}
+		err := server.shutdownRuntime()
+		require.ErrorIs(t, err, want)
+		require.ErrorIs(t, err, ErrRuntimeScratchCleanup)
+	})
+}
+
 func TestShutdownSupervisorWaitAndLoggingBranches(t *testing.T) {
 	for name, setup := range map[string]func(*openCodeServer) context.Context{
 		"wait error": func(server *openCodeServer) context.Context {
@@ -84,8 +132,8 @@ func TestShutdownSupervisorWaitAndLoggingBranches(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			restoreOpenCodeClientSeams(t)
-			openCodeTerminateProcess = func(*exec.Cmd) error { return nil }
-			openCodeKillProcess = func(*exec.Cmd) error { return nil }
+			openCodeTerminateProcess = func(*os.Process, int) error { return nil }
+			openCodeKillProcess = func(*os.Process, int) error { return nil }
 			root := t.TempDir()
 			completion := filepath.Join(root, "complete")
 			require.NoError(t, writeSupervisorMarker(completion))
@@ -144,7 +192,7 @@ func TestShutdownEmitsZeroOnlyForProvenDescendantQuiescence(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, []int{3, 0}, snapshots)
 			} else {
-				require.ErrorIs(t, err, ErrProcessTreeUnproven)
+				require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 				require.Equal(t, []int{3}, snapshots)
 			}
 		})

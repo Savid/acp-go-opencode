@@ -1,4 +1,4 @@
-//go:build darwin || freebsd || openbsd
+//go:build freebsd || openbsd
 
 package opencode
 
@@ -15,8 +15,8 @@ type guardianContainment struct{}
 
 type livenessContainment struct{}
 
-func newGuardianContainment() (*guardianContainment, error) {
-	return nil, errors.Join(ErrProcessTreeUnproven, fmt.Errorf("proof-capable OpenCode runtime containment is unavailable on %s", runtime.GOOS))
+func newGuardianContainment(supervisorConfig) (*guardianContainment, error) {
+	return nil, errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("proof-capable OpenCode runtime containment is unavailable on %s", runtime.GOOS))
 }
 
 func (*guardianContainment) Name() string { return "" }
@@ -27,14 +27,21 @@ func (*guardianContainment) Quiesce(nativePID int, timeout time.Duration) error 
 	return quiesceProcessGroup(nativePID, timeout)
 }
 
-func openLivenessContainment(string) (*livenessContainment, error) {
-	return nil, errors.Join(ErrProcessTreeUnproven, fmt.Errorf("proof-capable OpenCode runtime containment is unavailable on %s", runtime.GOOS))
+func openLivenessContainment(supervisorConfig) (*livenessContainment, error) {
+	return nil, errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("proof-capable OpenCode runtime containment is unavailable on %s", runtime.GOOS))
 }
 
 func (*livenessContainment) Start(cmd *exec.Cmd) error {
 	configureOpenCodeProcess(cmd)
 
 	return cmd.Start()
+}
+
+func (*livenessContainment) Wait() <-chan error {
+	result := make(chan error, 1)
+	result <- nil
+
+	return result
 }
 
 func (*livenessContainment) Close() error { return nil }
@@ -47,8 +54,14 @@ func configureIndependentSupervisor(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func terminateIndependentSupervisor(cmd *exec.Cmd) error {
-	return signalOpenCodeProcessGroup(cmd, syscall.SIGKILL)
+func releaseIndependentSupervisorWaiter(cmd *exec.Cmd, waiter *supervisorWaiter) (int, error) {
+	if cmd == nil || cmd.Process == nil || waiter == nil {
+		return 0, errors.Join(ErrProcessContainmentIncomplete, errors.New("direct-child waiter is unavailable"))
+	}
+
+	waiter.start()
+
+	return cmd.Process.Pid, nil
 }
 
 func querySupervisorProcessSnapshot(string) (int, bool) { return 0, false }

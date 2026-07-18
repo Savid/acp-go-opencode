@@ -34,7 +34,7 @@ func (client *proofFailureRuntimeClient) Shutdown(context.Context) error {
 }
 
 func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
-	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessTreeUnproven)
+	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessContainmentIncomplete)
 	client := &proofFailureRuntimeClient{
 		fakeOpenCodeClient: newFakeOpenCodeClient(),
 		entered:            make(chan struct{}),
@@ -66,7 +66,7 @@ func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 	require.True(t, first == agent.retireSharedRuntime(1, "late first-generation waiter"))
 
 	missing := NewAgent()
-	require.ErrorIs(t, missing.retireSharedRuntime(9, "missing"), opencode.ErrProcessTreeUnproven)
+	require.ErrorIs(t, missing.retireSharedRuntime(9, "missing"), opencode.ErrProcessContainmentIncomplete)
 	missing.runtimeFatalErr = containmentErr
 	require.ErrorIs(t, missing.retireSharedRuntime(9, "fatal"), containmentErr)
 
@@ -77,7 +77,7 @@ func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 }
 
 func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.T) {
-	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessTreeUnproven)
+	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessContainmentIncomplete)
 	client := &proofFailureRuntimeClient{
 		fakeOpenCodeClient: newFakeOpenCodeClient(),
 		entered:            make(chan struct{}),
@@ -108,6 +108,58 @@ func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.
 	go func() { done <- waiting.Close() }()
 	close(retirement.done)
 	require.ErrorIs(t, <-done, containmentErr)
+
+	completed := NewAgent()
+	completed.runtimeFatalErr = containmentErr
+	require.ErrorIs(t, completed.Close(), containmentErr)
+	require.ErrorIs(t, completed.Close(), containmentErr)
+}
+
+func TestAgentCloseWaitsForConstructionCleanupAndReturnsContainmentFailure(t *testing.T) {
+	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessContainmentIncomplete)
+	client := &proofFailureRuntimeClient{
+		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		entered:            make(chan struct{}),
+		resume:             make(chan struct{}),
+		err:                containmentErr,
+	}
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	agent := NewAgent(WithHome(t.TempDir()))
+	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+		close(factoryEntered)
+		<-releaseFactory
+
+		return client, nil
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		_, err := agent.sharedRuntime(context.Background())
+		startResult <- err
+	}()
+	<-factoryEntered
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- agent.Close() }()
+	require.Eventually(t, func() bool {
+		agent.mu.Lock()
+		defer agent.mu.Unlock()
+
+		return agent.closed
+	}, time.Second, time.Millisecond)
+	close(releaseFactory)
+	<-client.entered
+	select {
+	case err := <-closeResult:
+		t.Fatalf("Close returned before construction cleanup completed: %v", err)
+	default:
+	}
+	close(client.resume)
+
+	require.ErrorIs(t, <-startResult, containmentErr)
+	require.ErrorIs(t, <-closeResult, containmentErr)
+	require.EqualValues(t, 1, client.calls.Load())
 }
 
 func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
@@ -210,14 +262,13 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	require.NoError(t, err)
 	require.Same(t, observedClient, runtime)
 	require.NotNil(t, nativeRelease)
-	require.NotNil(t, scratchRelease)
+	require.Nil(t, scratchRelease)
 	require.Equal(t, RuntimeProcessHomeLockSupervisor, observedProcess)
 	require.EqualValues(t, 2, observedDelta)
 	require.Equal(t, 3, observedSnapshot)
 	require.Equal(t, RuntimeResourceRuntime, observedLifecycle)
 	require.Equal(t, RuntimeStartupReadiness, observedStage)
 	nativeRelease()
-	scratchRelease()
 
 	scratchFailure := NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
 		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
@@ -399,20 +450,20 @@ func TestRuntimeResourceCleanupProofAndDeletionGates(t *testing.T) {
 		require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
 
 		var nativeReleased, scratchReleased atomic.Bool
-		unproven := errors.Join(errors.New("shutdown failed"), opencode.ErrProcessTreeUnproven)
+		unproven := errors.Join(errors.New("shutdown failed"), opencode.ErrProcessContainmentIncomplete)
 		err := agent.cleanupRuntimeResources(
 			unproven,
 			func() { nativeReleased.Store(true) },
 			func() { scratchReleased.Store(true) },
 		)
-		require.ErrorIs(t, err, opencode.ErrProcessTreeUnproven)
+		require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
 		require.False(t, nativeReleased.Load())
 		require.False(t, scratchReleased.Load())
 		_, statErr := os.Stat(agent.homeRoot())
 		require.NoError(t, statErr)
 	})
 
-	t.Run("delete failure releases native but retains scratch reservation", func(t *testing.T) {
+	t.Run("XDG delete failure releases native but retains XDG reservation", func(t *testing.T) {
 		root := t.TempDir()
 		agent := NewAgent(WithScratchDir(root))
 		removeErr := errors.New("remove failed")
@@ -445,6 +496,141 @@ func TestRuntimeResourceCleanupProofAndDeletionGates(t *testing.T) {
 		_, statErr := os.Stat(home)
 		require.NoError(t, statErr)
 	})
+
+	t.Run("generation delete failure independently releases XDG after deletion", func(t *testing.T) {
+		agent := NewAgent(WithScratchDir(t.TempDir()))
+		require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
+		var nativeReleased, xdgReleased atomic.Bool
+		cleanupFailure := errors.Join(errors.New("generation removal failed"), opencode.ErrRuntimeScratchCleanup)
+		err := agent.cleanupRuntimeResources(
+			cleanupFailure,
+			func() { nativeReleased.Store(true) },
+			func() { xdgReleased.Store(true) },
+		)
+		require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
+		require.True(t, nativeReleased.Load())
+		require.True(t, xdgReleased.Load())
+		_, statErr := os.Stat(agent.homeRoot())
+		require.ErrorIs(t, statErr, os.ErrNotExist)
+		require.True(t, fatalRuntimeCleanup(err))
+	})
+
+	t.Run("dual generation and XDG delete failures retain both scratch reservations", func(t *testing.T) {
+		agent := NewAgent(WithScratchDir(t.TempDir()))
+		xdgRemoveErr := errors.New("XDG removal failed")
+		runtimeRemoveAll = func(string) error { return xdgRemoveErr }
+		t.Cleanup(func() { runtimeRemoveAll = originalRemoveAll })
+
+		var nativeReleased, xdgReleased atomic.Bool
+		generationRemoveErr := errors.New("generation removal failed")
+		err := agent.cleanupRuntimeResources(
+			errors.Join(opencode.ErrRuntimeScratchCleanup, generationRemoveErr),
+			func() { nativeReleased.Store(true) },
+			func() { xdgReleased.Store(true) },
+		)
+		require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
+		require.ErrorIs(t, err, generationRemoveErr)
+		require.ErrorIs(t, err, errRuntimeScratchCleanup)
+		require.ErrorIs(t, err, xdgRemoveErr)
+		require.True(t, nativeReleased.Load())
+		require.False(t, xdgReleased.Load())
+		require.True(t, fatalRuntimeCleanup(err))
+	})
+}
+
+func TestDarwinBestEffortScratchReservationCardinality(t *testing.T) {
+	client := newFakeOpenCodeClient()
+
+	t.Run("adapter XDG and containment generation each hold one live reservation", func(t *testing.T) {
+		var acquired, live, released atomic.Int64
+		agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ReserveScratchRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
+				require.Equal(t, RuntimeResourceRuntime, kind)
+				acquired.Add(1)
+				live.Add(1)
+
+				return func() {
+					released.Add(1)
+					live.Add(-1)
+				}, nil
+			},
+		}))
+		agent.containmentMode = RuntimeContainmentBestEffort
+
+		var generationRelease func()
+		agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
+			require.EqualValues(t, 1, acquired.Load(), "XDG must be the only reservation before generation creation")
+			require.EqualValues(t, 1, live.Load())
+			require.DirExists(t, agent.homeRoot())
+			require.NotNil(t, options.ReserveContainmentScratch)
+
+			var err error
+			generationRelease, err = options.ReserveContainmentScratch(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, acquired.Load())
+			require.EqualValues(t, 2, live.Load(), "both roots must have independent live reservations")
+
+			return client, nil
+		}
+
+		runtime, nativeRelease, xdgRelease, err := agent.startSharedRuntime(context.Background())
+		require.NoError(t, err)
+		require.Same(t, client, runtime)
+		require.NotNil(t, xdgRelease)
+		require.EqualValues(t, 2, live.Load())
+
+		generationRelease()
+		require.EqualValues(t, 1, live.Load())
+		require.NoError(t, agent.cleanupRuntimeResources(nil, nativeRelease, xdgRelease))
+		require.EqualValues(t, 0, live.Load())
+		require.EqualValues(t, 2, released.Load())
+	})
+
+	t.Run("explicit home reserves only containment generation", func(t *testing.T) {
+		var acquired, live, released atomic.Int64
+		home := t.TempDir()
+		agent := NewAgent(WithHome(home), WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ReserveScratchRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
+				require.Equal(t, RuntimeResourceRuntime, kind)
+				acquired.Add(1)
+				live.Add(1)
+
+				return func() {
+					released.Add(1)
+					live.Add(-1)
+				}, nil
+			},
+		}))
+		agent.containmentMode = RuntimeContainmentBestEffort
+
+		var generationRelease func()
+		agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
+			require.Zero(t, acquired.Load(), "explicit Home must not reserve adapter XDG scratch")
+			require.True(t, options.DarwinBestEffort)
+
+			var err error
+			generationRelease, err = options.ReserveContainmentScratch(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, acquired.Load())
+			require.EqualValues(t, 1, live.Load())
+
+			return client, nil
+		}
+
+		runtime, nativeRelease, xdgRelease, err := agent.startSharedRuntime(context.Background())
+		require.NoError(t, err)
+		require.Same(t, client, runtime)
+		require.Nil(t, xdgRelease)
+		require.EqualValues(t, 1, live.Load())
+
+		generationRelease()
+		require.NoError(t, agent.cleanupRuntimeResources(nil, nativeRelease, xdgRelease))
+		require.EqualValues(t, 0, live.Load())
+		require.EqualValues(t, 1, acquired.Load())
+		require.EqualValues(t, 1, released.Load())
+		_, statErr := os.Stat(home)
+		require.NoError(t, statErr)
+	})
 }
 
 func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
@@ -453,7 +639,7 @@ func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
 		fakeOpenCodeClient: base,
 		entered:            make(chan struct{}),
 		resume:             make(chan struct{}),
-		err:                errors.Join(errors.New("containment proof missing"), opencode.ErrProcessTreeUnproven),
+		err:                errors.Join(errors.New("containment proof missing"), opencode.ErrProcessContainmentIncomplete),
 	}
 	var nativeReleased, scratchReleased atomic.Bool
 	var replacementStarts atomic.Int32
@@ -466,7 +652,7 @@ func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
 	agent.runtime = client
 	agent.runtimeGeneration = 1
 	agent.runtimeNativeRelease = func() { nativeReleased.Store(true) }
-	agent.runtimeScratchRelease = func() { scratchReleased.Store(true) }
+	agent.runtimeXDGScratchRelease = func() { scratchReleased.Store(true) }
 	require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
 
 	go agent.watchSharedRuntime(client, 1)
@@ -483,7 +669,7 @@ func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
 	require.False(t, nativeReleased.Load())
 	require.False(t, scratchReleased.Load())
 	_, err := agent.sharedRuntime(context.Background())
-	require.ErrorIs(t, err, opencode.ErrProcessTreeUnproven)
+	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
 	require.EqualValues(t, 0, replacementStarts.Load())
 }
 
@@ -510,7 +696,7 @@ func TestRuntimeExitWatcherLatchesScratchCleanupFailure(t *testing.T) {
 	agent.runtime = client
 	agent.runtimeGeneration = 1
 	agent.runtimeNativeRelease = func() { nativeReleased.Store(true) }
-	agent.runtimeScratchRelease = func() { scratchReleased.Store(true) }
+	agent.runtimeXDGScratchRelease = func() { scratchReleased.Store(true) }
 	require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
 
 	go agent.watchSharedRuntime(client, 1)
@@ -546,13 +732,13 @@ func TestRuntimeStartLatchesUnprovenTree(t *testing.T) {
 	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 		starts.Add(1)
 
-		return nil, errors.Join(errors.New("start containment failed"), opencode.ErrProcessTreeUnproven)
+		return nil, errors.Join(errors.New("start containment failed"), opencode.ErrProcessContainmentIncomplete)
 	}
 
 	_, err := agent.sharedRuntime(context.Background())
-	require.ErrorIs(t, err, opencode.ErrProcessTreeUnproven)
+	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
 	_, err = agent.sharedRuntime(context.Background())
-	require.ErrorIs(t, err, opencode.ErrProcessTreeUnproven)
+	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
 	require.EqualValues(t, 1, starts.Load())
 	require.False(t, nativeReleased.Load())
 	require.False(t, scratchReleased.Load())
@@ -588,6 +774,40 @@ func TestRuntimeStartLatchesScratchCleanupFailure(t *testing.T) {
 	require.EqualValues(t, 1, starts.Load())
 	require.True(t, nativeReleased.Load())
 	require.False(t, scratchReleased.Load())
+}
+
+func TestRuntimeStartLatchesGenerationScratchCleanupFailure(t *testing.T) {
+	var starts, scratchAcquired atomic.Int32
+	var nativeReleased, generationReleased atomic.Bool
+	agent := NewAgent(WithHome(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
+		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+			return func() { nativeReleased.Store(true) }, nil
+		},
+		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+			scratchAcquired.Add(1)
+
+			return func() { generationReleased.Store(true) }, nil
+		},
+	}))
+	agent.containmentMode = RuntimeContainmentBestEffort
+	generationRemoveErr := errors.New("generation removal failed")
+	agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		starts.Add(1)
+		_, err := options.ReserveContainmentScratch(ctx)
+		require.NoError(t, err)
+
+		return nil, errors.Join(opencode.ErrRuntimeScratchCleanup, generationRemoveErr)
+	}
+
+	_, err := agent.sharedRuntime(context.Background())
+	require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
+	require.ErrorIs(t, err, generationRemoveErr)
+	_, err = agent.sharedRuntime(context.Background())
+	require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
+	require.EqualValues(t, 1, starts.Load())
+	require.EqualValues(t, 1, scratchAcquired.Load())
+	require.True(t, nativeReleased.Load())
+	require.False(t, generationReleased.Load())
 }
 
 // TestReadySharedRuntimeSessionReleaseGate times each logical session from the

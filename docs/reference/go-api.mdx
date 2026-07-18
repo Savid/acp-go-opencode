@@ -20,8 +20,8 @@ agent when you need a reference first. Both take the same `Option` values.
 
 `Serve` closes the agent before it returns. If shutdown fails, that close error
 takes precedence over EOF or context cancellation. In particular,
-`errors.Is(err, opencodeacp.ErrProcessTreeUnproven)` means the adapter could not
-prove every native OpenCode descendant exited; an embedding host must keep that
+`errors.Is(err, opencodeacp.ErrProcessContainmentIncomplete)` means the selected
+native containment boundary did not complete; an embedding host must keep that
 runtime and its resources quarantined.
 
 ## Agent options
@@ -31,6 +31,7 @@ runtime and its resources quarantined.
 | `WithExecutablePath` | Path to the `opencode` binary. |
 | `WithScratchDir` | Parent for a materialized shared runtime root and transient adapter scratch; empty uses the system temp directory. |
 | `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
+| `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant and numeric-PGID-reuse risks. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
 | `WithEnv` | Immutable environment overrides for the shared native process. |
 | `WithSeedFiles` | Immutable files written into the shared config root before launch. |
@@ -44,11 +45,14 @@ runtime and its resources quarantined.
 | `WithTracerProvider` / `WithMeterProvider` / `WithTextMapPropagator` | OpenTelemetry wiring. |
 
 `RuntimeResourceHooks` also carries `ObserveProcess`,
-`ObserveProcessSnapshot`, and `ObserveStartupStage`. OpenCode reports its two
+`ObserveProcessSnapshot`, `ObserveStartupStage`, and `ObserveContainment`.
+`Agent.ContainmentMode` returns `authoritative`, `best_effort`, or `unavailable`.
+OpenCode reports its two
 actual home-lock supervisors only after native readiness and removes them when
-the supervisor waiter proves exit; it never derives that count from root
+the supervisor waiter observes exit; it never derives that count from root
 permits. Absolute provider-descendant snapshots are emitted only when the
-containment backend can prove them. Startup observations distinguish
+containment backend is authoritative; Darwin best-effort suppresses snapshots,
+including fabricated zeroes. Startup observations distinguish
 `spawn`, `readiness`, `configuration`, and native `session` creation and carry
 the stage error.
 

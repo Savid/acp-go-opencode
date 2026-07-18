@@ -481,7 +481,7 @@ func (s *session) resolveCancellation(ctx context.Context, epoch uint64) error {
 
 		var err error
 		if agent == nil {
-			err = errors.Join(opencode.ErrProcessTreeUnproven, errors.New("native runtime owner is unavailable"))
+			err = errors.Join(opencode.ErrProcessContainmentIncomplete, errors.New("native runtime owner is unavailable"))
 		} else {
 			err = agent.retireSharedRuntime(generation, "shared OpenCode runtime retired after turn cancellation", s)
 		}

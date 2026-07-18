@@ -52,8 +52,9 @@ credential fingerprint is rejected.
 If initial scope setup fails and its partial registration cannot be disproved,
 there is no live session handle through which cleanup could be retried. The
 adapter therefore retains the principal and quarantines that shared runtime;
-closing the Agent terminates the native process tree and supplies the final
-disconnect proof.
+closing the Agent completes the selected native containment boundary. On
+authoritative platforms that supplies the final disconnect proof. Darwin
+best-effort cannot prove an escaped MCP descendant is absent.
 
 <Note>
 The adapter forwards MCP servers into OpenCode's native config; it does not

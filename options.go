@@ -29,6 +29,18 @@ const (
 	RuntimeProcessProviderDescendant RuntimeProcessKind = "provider_descendant"
 )
 
+// RuntimeContainmentMode reports the selected native process boundary.
+type RuntimeContainmentMode string
+
+const (
+	// RuntimeContainmentAuthoritative identifies a platform proof boundary.
+	RuntimeContainmentAuthoritative RuntimeContainmentMode = "authoritative"
+	// RuntimeContainmentBestEffort identifies explicitly accepted Darwin process-group containment.
+	RuntimeContainmentBestEffort RuntimeContainmentMode = "best_effort"
+	// RuntimeContainmentUnavailable identifies a platform with no selected boundary.
+	RuntimeContainmentUnavailable RuntimeContainmentMode = "unavailable"
+)
+
 type RuntimeStartupStage string
 
 const (
@@ -47,6 +59,7 @@ type RuntimeResourceHooks struct {
 	ObserveProcess         func(context.Context, RuntimeProcessKind, int64)
 	ObserveProcessSnapshot func(context.Context, RuntimeProcessKind, int)
 	ObserveStartupStage    func(context.Context, RuntimeResourceKind, RuntimeStartupStage, time.Duration, error)
+	ObserveContainment     func(context.Context, RuntimeContainmentMode)
 }
 
 // Option configures the OpenCode ACP agent.
@@ -84,13 +97,14 @@ type Options struct {
 	ConcurrencyLimits       ConcurrencyLimits
 	SeedFiles               map[string]string
 
-	Pure                 bool
-	QuestionTool         bool
-	LogLevel             string
-	NativeVersion        string
-	HealthCheckTimeout   time.Duration
-	TurnTimeout          time.Duration
-	RuntimeResourceHooks RuntimeResourceHooks
+	Pure                        bool
+	QuestionTool                bool
+	LogLevel                    string
+	NativeVersion               string
+	HealthCheckTimeout          time.Duration
+	TurnTimeout                 time.Duration
+	RuntimeResourceHooks        RuntimeResourceHooks
+	DarwinBestEffortContainment bool
 
 	clientFactory func(context.Context, opencode.StartOptions) (opencode.Client, error)
 }
@@ -155,6 +169,13 @@ func WithHome(path string) Option {
 func WithScratchDir(dir string) Option {
 	return func(options *Options) {
 		options.ScratchDir = dir
+	}
+}
+
+// WithDarwinBestEffortContainment explicitly accepts Darwin process-group containment.
+func WithDarwinBestEffortContainment() Option {
+	return func(options *Options) {
+		options.DarwinBestEffortContainment = true
 	}
 }
 
