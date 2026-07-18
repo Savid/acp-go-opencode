@@ -24,6 +24,14 @@ type proofFailureRuntimeClient struct {
 	calls   atomic.Int32
 }
 
+type panickingRuntimeExitClient struct {
+	*fakeOpenCodeClient
+}
+
+func (*panickingRuntimeExitClient) RuntimeExited() <-chan struct{} {
+	panic("runtime exit channel panic")
+}
+
 func (client *proofFailureRuntimeClient) Shutdown(context.Context) error {
 	if client.calls.Add(1) == 1 {
 		close(client.entered)
@@ -74,6 +82,29 @@ func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 	nilTarget.runtime = newFakeOpenCodeClient()
 	nilTarget.runtimeGeneration = 1
 	require.NoError(t, nilTarget.retireSharedRuntime(1, "nil target", nil))
+}
+
+func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	current := &session{
+		runtimeGeneration: 1,
+		directoryRelease: func() {
+			panic("detach release panic")
+		},
+	}
+	agent := NewAgent(WithHome(t.TempDir()))
+	agent.runtime = client
+	agent.runtimeGeneration = 1
+	agent.sessions["panic"] = current
+
+	var err error
+	require.NotPanics(t, func() {
+		err = agent.retireSharedRuntime(1, "runtime exited")
+	})
+	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrProcessContainmentIncomplete)
+	require.Zero(t, current.runtimeGeneration)
+	require.Equal(t, "runtime exited", current.runtimeLostCause)
 }
 
 func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.T) {
@@ -213,21 +244,25 @@ func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
 }
 
 func TestWatchSharedRuntimeRemainingBranches(t *testing.T) {
+	require.NotPanics(t, func() {
+		NewAgent().watchSharedRuntime(context.Background(), &panickingRuntimeExitClient{fakeOpenCodeClient: newFakeOpenCodeClient()}, 0)
+	})
+
 	nilExit := newFakeOpenCodeClient()
 	nilExit.runtimeExited = nil
-	NewAgent().watchSharedRuntime(nilExit, 0)
+	NewAgent().watchSharedRuntime(context.Background(), nilExit, 0)
 
 	stale := newFakeOpenCodeClient()
 	close(stale.runtimeExited)
 	agent := NewAgent()
 	agent.runtime = newFakeOpenCodeClient()
-	agent.watchSharedRuntime(stale, 0)
+	agent.watchSharedRuntime(context.Background(), stale, 0)
 
 	closedClient := newFakeOpenCodeClient()
 	close(closedClient.runtimeExited)
 	agent.runtime = closedClient
 	agent.closed = true
-	agent.watchSharedRuntime(closedClient, 0)
+	agent.watchSharedRuntime(context.Background(), closedClient, 0)
 }
 
 func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
@@ -655,7 +690,7 @@ func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
 	agent.runtimeXDGScratchRelease = func() { scratchReleased.Store(true) }
 	require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
 
-	go agent.watchSharedRuntime(client, 1)
+	go agent.watchSharedRuntime(context.Background(), client, 1)
 	close(base.runtimeExited)
 	<-client.entered
 
@@ -699,7 +734,7 @@ func TestRuntimeExitWatcherLatchesScratchCleanupFailure(t *testing.T) {
 	agent.runtimeXDGScratchRelease = func() { scratchReleased.Store(true) }
 	require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
 
-	go agent.watchSharedRuntime(client, 1)
+	go agent.watchSharedRuntime(context.Background(), client, 1)
 	close(base.runtimeExited)
 	<-client.entered
 

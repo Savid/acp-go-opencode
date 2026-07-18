@@ -115,7 +115,7 @@ func (a *Agent) sharedRuntimeBinding(ctx context.Context) (opencode.Client, uint
 
 			// The watcher belongs to the published runtime, not the request that
 			// happened to start it.
-			go a.watchSharedRuntime(runtime, generation)
+			go a.watchSharedRuntime(context.WithoutCancel(ctx), runtime, generation)
 
 			return runtime, generation, nil
 		}
@@ -159,7 +159,9 @@ func (a *Agent) sharedRuntimeBinding(ctx context.Context) (opencode.Client, uint
 	}
 }
 
-func (a *Agent) watchSharedRuntime(runtime opencode.Client, generation uint64) {
+func (a *Agent) watchSharedRuntime(ctx context.Context, runtime opencode.Client, generation uint64) {
+	defer recoverAgentGoroutine(ctx, a.log, "shared runtime watcher")
+
 	exited := runtime.RuntimeExited()
 	if exited == nil {
 		return
@@ -243,12 +245,33 @@ func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...
 	a.runtimeXDGScratchRelease = nil
 	a.mu.Unlock()
 
-	var detachGroup sync.WaitGroup
+	var (
+		detachGroup sync.WaitGroup
+		detachErrMu sync.Mutex
+		detachErr   error
+	)
+
 	detachGroup.Add(len(sessions))
 
 	for _, current := range sessions {
 		go func() {
 			defer detachGroup.Done()
+			defer func() {
+				recovered := recover()
+				handleAgentGoroutinePanic(context.Background(), a.log, "shared runtime detach", nil, recovered)
+
+				if recovered == nil {
+					return
+				}
+
+				detachErrMu.Lock()
+				detachErr = errors.Join(
+					detachErr,
+					opencode.ErrProcessContainmentIncomplete,
+					fmt.Errorf("detach OpenCode session from runtime generation %d: %v", generation, recovered),
+				)
+				detachErrMu.Unlock()
+			}()
 
 			current.detachRuntime(generation, cause)
 		}()
@@ -257,7 +280,7 @@ func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...
 	detachGroup.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
-	shutdownErr := runtime.Shutdown(ctx)
+	shutdownErr := errors.Join(runtime.Shutdown(ctx), detachErr)
 
 	cancel()
 
