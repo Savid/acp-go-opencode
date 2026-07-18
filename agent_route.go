@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -49,7 +50,7 @@ func requestRouteCarrier(turnNonce string) map[string]any {
 }
 
 func validRouteTurnNonce(turnNonce string) bool {
-	return turnNonce != "" && len(turnNonce) <= routeTurnNonceMaxBytes
+	return strings.TrimSpace(turnNonce) != "" && len(turnNonce) <= routeTurnNonceMaxBytes
 }
 
 func withTurnRoute(ctx context.Context, turnNonce string) context.Context {
@@ -88,7 +89,7 @@ func parseInboundTurnRoute(meta map[string]any) (inboundTurnRoute, error) {
 	}
 
 	nonce, nonceOK := obj[routeFieldTurnNonce].(string)
-	if !ok || version != routeEnvelopeVersion || !nonceOK || nonce == "" {
+	if !ok || version != routeEnvelopeVersion || !nonceOK || strings.TrimSpace(nonce) == "" {
 		return inboundTurnRoute{}, invalidRoute("unknown route version or empty turnNonce")
 	}
 
@@ -104,7 +105,7 @@ func invalidRoute(reason string) error {
 }
 
 func outboundRoute(scope elicitationScope) (map[string]any, error) {
-	if scope.SessionID == "" || scope.TurnNonce == "" {
+	if scope.SessionID == "" || strings.TrimSpace(scope.TurnNonce) == "" {
 		return nil, fmt.Errorf("turn-scoped elicitation route is incomplete")
 	}
 

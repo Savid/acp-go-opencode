@@ -72,6 +72,8 @@ func TestTurnRequestBuildersFailClosedOnInvalidNonce(t *testing.T) {
 		wantRoute bool
 	}{
 		{name: "empty", turnNonce: ""},
+		{name: "whitespace only", turnNonce: " \t\n"},
+		{name: "opaque surrounding whitespace", turnNonce: " nonce ", wantRoute: true},
 		{name: "maximum bytes", turnNonce: strings.Repeat("n", routeTurnNonceMaxBytes), wantRoute: true},
 		{name: "over maximum bytes", turnNonce: strings.Repeat("n", routeTurnNonceMaxBytes+1)},
 	}
