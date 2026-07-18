@@ -36,7 +36,7 @@ empty session id fail, and `Delete` of an empty-id key is a pure no-op.
 A snapshot is taken after a completed turn and on lifecycle boundaries. The
 `main` subpath contains one atomic bundle with:
 
-- adapter, exact native (`1.18.1`), and event-schema versions;
+- adapter, exact native (`1.18.3`), and event-schema versions;
 - a restore generation and the selected ACP/native session identity;
 - the adopted parent/child graph in parent-first order, including source cwd
   and per-session permission policy; and

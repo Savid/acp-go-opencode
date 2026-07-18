@@ -19,7 +19,7 @@ import (
 
 const (
 	syncEventSchemaVersion  = "1"
-	syncNativeVersion       = "1.18.1"
+	syncNativeVersion       = "1.18.3"
 	snapshotBlockGeneration = "generation"
 	syncTypeSessionCreated  = "session.created.1"
 	syncFieldPart           = "part"

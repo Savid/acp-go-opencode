@@ -119,7 +119,7 @@ OpenTelemetry providers.
   `_meta.opencode.options`.
 - Durable, credential-free native event snapshots through a host-provided
   `SessionStore`; stored rows use `opencode-sync-events-v1`, keyed by
-  `{SessionID, Subpath}` and pinned to OpenCode `1.18.1`.
+  `{SessionID, Subpath}` and pinned to OpenCode `1.18.3`.
 - Versioned `acp-go.dev/route` envelopes bind each prompt, cancellation,
   session update, raw event, and elicitation to one turn nonce. Permission
   requests are fenced structurally by session id plus a tool-call id already
@@ -156,7 +156,7 @@ make test-integration-cover
 
 `make audit` runs the full local gate: format, lint, build, unit tests,
 coverage, cross-compile, vuln, and docs checks. Live integration tests require a
-local authenticated OpenCode `1.18.1` CLI. `make test-integration-smoke` sets
+local authenticated OpenCode `1.18.3` CLI. `make test-integration-smoke` sets
 `ACP_GO_OPENCODE_RUN_INTEGRATION=1` and avoids model spend;
 `make test-integration-live` additionally sets `ACP_GO_OPENCODE_RUN_LIVE_TOKENS=1`
 and may spend model tokens; `make test-integration-cover` runs the smoke suite
