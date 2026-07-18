@@ -245,6 +245,49 @@ func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...
 	a.runtimeXDGScratchRelease = nil
 	a.mu.Unlock()
 
+	cleanupErr := a.settleSharedRuntimeRetirement(
+		runtime,
+		generation,
+		cause,
+		sessions,
+		nativeRelease,
+		xdgScratchRelease,
+	)
+
+	a.mu.Lock()
+	retirement.err = cleanupErr
+
+	if fatalRuntimeCleanup(cleanupErr) {
+		a.runtimeFatalErr = cleanupErr
+	}
+
+	if a.runtimeStarting == retirement.done {
+		a.runtimeStarting = nil
+	}
+
+	close(retirement.done)
+	a.mu.Unlock()
+
+	return cleanupErr
+}
+
+func (a *Agent) settleSharedRuntimeRetirement(
+	runtime opencode.Client,
+	generation uint64,
+	cause string,
+	sessions []*session,
+	nativeRelease func(),
+	xdgScratchRelease func(),
+) (cleanupErr error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			cleanupErr = errors.Join(
+				opencode.ErrProcessContainmentIncomplete,
+				fmt.Errorf("retire OpenCode runtime generation %d: %v", generation, recovered),
+			)
+		}
+	}()
+
 	var (
 		detachGroup sync.WaitGroup
 		detachErrMu sync.Mutex
@@ -280,27 +323,11 @@ func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...
 	detachGroup.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+	defer cancel()
+
 	shutdownErr := errors.Join(runtime.Shutdown(ctx), detachErr)
 
-	cancel()
-
-	cleanupErr := a.cleanupRuntimeResources(shutdownErr, nativeRelease, xdgScratchRelease)
-
-	a.mu.Lock()
-	retirement.err = cleanupErr
-
-	if fatalRuntimeCleanup(cleanupErr) {
-		a.runtimeFatalErr = cleanupErr
-	}
-
-	if a.runtimeStarting == retirement.done {
-		a.runtimeStarting = nil
-	}
-
-	close(retirement.done)
-	a.mu.Unlock()
-
-	return cleanupErr
+	return a.cleanupRuntimeResources(shutdownErr, nativeRelease, xdgScratchRelease)
 }
 
 func (a *Agent) runtimeGenerationIsCurrent(generation uint64) bool {

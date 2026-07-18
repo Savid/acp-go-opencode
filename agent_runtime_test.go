@@ -28,8 +28,16 @@ type panickingRuntimeExitClient struct {
 	*fakeOpenCodeClient
 }
 
+type panickingRuntimeShutdownClient struct {
+	*fakeOpenCodeClient
+}
+
 func (*panickingRuntimeExitClient) RuntimeExited() <-chan struct{} {
 	panic("runtime exit channel panic")
+}
+
+func (*panickingRuntimeShutdownClient) Shutdown(context.Context) error {
+	panic("runtime shutdown panic")
 }
 
 func (client *proofFailureRuntimeClient) Shutdown(context.Context) error {
@@ -105,6 +113,73 @@ func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {
 	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrProcessContainmentIncomplete)
 	require.Zero(t, current.runtimeGeneration)
 	require.Equal(t, "runtime exited", current.runtimeLostCause)
+}
+
+func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
+	shutdownBase := newFakeOpenCodeClient()
+	releaseBase := newFakeOpenCodeClient()
+	tests := []struct {
+		name      string
+		client    opencode.Client
+		release   func()
+		exitCh    chan struct{}
+		panicText string
+	}{
+		{
+			name: "shutdown",
+			client: &panickingRuntimeShutdownClient{
+				fakeOpenCodeClient: shutdownBase,
+			},
+			exitCh:    shutdownBase.runtimeExited,
+			panicText: "runtime shutdown panic",
+		},
+		{
+			name:   "resource release",
+			client: releaseBase,
+			release: func() {
+				panic("runtime release panic")
+			},
+			exitCh:    releaseBase.runtimeExited,
+			panicText: "runtime release panic",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := NewAgent(WithHome(t.TempDir()))
+			agent.runtime = test.client
+			agent.runtimeGeneration = 1
+			agent.runtimeNativeRelease = test.release
+
+			go agent.watchSharedRuntime(context.Background(), test.client, 1)
+			close(test.exitCh)
+
+			require.Eventually(t, func() bool {
+				agent.mu.Lock()
+				retirement := agent.runtimeRetirements[1]
+				agent.mu.Unlock()
+				if retirement == nil {
+					return false
+				}
+
+				select {
+				case <-retirement.done:
+					return true
+				default:
+					return false
+				}
+			}, time.Second, time.Millisecond)
+
+			agent.mu.Lock()
+			retirement := agent.runtimeRetirements[1]
+			fatalErr := agent.runtimeFatalErr
+			agent.mu.Unlock()
+			require.ErrorIs(t, retirement.err, opencode.ErrProcessContainmentIncomplete)
+			require.ErrorContains(t, retirement.err, test.panicText)
+			require.ErrorIs(t, fatalErr, opencode.ErrProcessContainmentIncomplete)
+			require.True(t, retirement.err == agent.retireSharedRuntime(1, "late waiter"))
+		})
+	}
 }
 
 func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.T) {
