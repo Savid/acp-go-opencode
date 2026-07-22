@@ -316,6 +316,10 @@ func (c *fakeOpenCodeClient) XDGDirs() opencode.XDGDirs {
 	return c.xdg
 }
 
+func (c *fakeOpenCodeClient) NativeVersion() string {
+	return "1.18.3"
+}
+
 func (c *fakeOpenCodeClient) SyncHistory(ctx context.Context, cursors map[string]int64) ([]opencode.SyncEvent, error) {
 	if c.syncHistoryFunc != nil {
 		return c.syncHistoryFunc(ctx, cursors)

@@ -22,5 +22,5 @@ normal ACP `session/load`, and the prompt uses normal ACP `session/prompt`.
 Pass `-prompt "..."` to change the smoke-test turn, `-path` to point at a
 specific `opencode` CLI, and `-scratch-dir` to set the parent directory for
 shared runtime scratch (empty uses the system temp directory). A local OpenCode
-`1.18.3` CLI must be installed and authenticated to load a real session and
-run the prompt.
+`1.18.3`-or-newer CLI must be installed and authenticated to load a real
+session and run the prompt.

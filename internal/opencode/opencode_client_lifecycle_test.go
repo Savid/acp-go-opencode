@@ -482,7 +482,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		Pure:            true,
 		QuestionTool:    true,
 		LogLevel:        "DEBUG",
-		ExactVersion:    "1.18.3",
+		MinVersion:      "1.18.3",
 		HealthTimeout:   5 * time.Second,
 		Logger:          logger,
 		SkipVersionGate: false,
@@ -673,12 +673,12 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  helper,
-			ExactVersion:    "99.0.0",
+			MinVersion:      "99.0.0",
 			HealthTimeout:   5 * time.Second,
 			SkipVersionGate: false,
 			Logger:          slog.New(slog.DiscardHandler),
 		}))
-		if err == nil || !strings.Contains(err.Error(), "does not match required") {
+		if err == nil || !strings.Contains(err.Error(), "below minimum supported") {
 			t.Fatalf("readiness error = %v", err)
 		}
 	})
@@ -702,7 +702,7 @@ func TestOpenCodeServerReadinessGateAndStreamFailures(t *testing.T) {
 			}
 		})
 		defer closeServer()
-		if err := client.waitReady(ctx, ctx, StartOptions{ExactVersion: "9.0.0"}); err == nil {
+		if err := client.waitReady(ctx, ctx, StartOptions{MinVersion: "9.0.0"}); err == nil {
 			t.Fatal("old version unexpectedly passed readiness")
 		}
 	})
@@ -1869,7 +1869,7 @@ func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		err := client.waitReady(ctx, eventCtx, StartOptions{ExactVersion: "1.18.3"})
+		err := client.waitReady(ctx, eventCtx, StartOptions{MinVersion: "1.18.3"})
 		cancel()
 		cancelEvents()
 		close(client.closed)
@@ -1894,7 +1894,7 @@ func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
 // through health, /doc validation, and the first server.connected event.
 // Fixture construction and shutdown are outside the interval. Each repetition
 // uses a fresh local XDG root and a fake HTTP/SSE process that implements the
-// exact pinned contract; this is not a physical OpenCode 1.18.3 p95 claim.
+// version contract; this is not a physical OpenCode p95 claim.
 // With five samples, nearest-rank p95 is the slowest sample.
 func TestColdStartupReleaseGate(t *testing.T) {
 	executable := fakeOpenCodeExecutable(t)
@@ -1905,7 +1905,7 @@ func TestColdStartupReleaseGate(t *testing.T) {
 		client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  executable,
-			ExactVersion:    "1.18.3",
+			MinVersion:      "1.18.3",
 			HealthTimeout:   5 * time.Second,
 			SkipVersionGate: false,
 		}))

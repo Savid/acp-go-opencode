@@ -827,10 +827,9 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 	require.ErrorContains(t, err, "fingerprint entropy failed")
 
 	for name, option := range map[string]Option{
-		"native version": WithVersion("wrong"),
-		"health":         WithOpenCodeHealthCheckTimeout(0),
-		"turn timeout":   WithTurnTimeout(-time.Second),
-		"limits":         WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: -1}),
+		"health":       WithOpenCodeHealthCheckTimeout(0),
+		"turn timeout": WithTurnTimeout(-time.Second),
+		"limits":       WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: -1}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := NewAgent(option).Initialize(context.Background(), acp.InitializeRequest{})

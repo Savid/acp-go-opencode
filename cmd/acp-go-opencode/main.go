@@ -49,7 +49,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	pure := flags.Bool("opencode-pure", false, "start OpenCode without external plugins")
 	questionTool := flags.Bool("opencode-question-tool", false, "enable OpenCode native question tool mapping")
 	logLevel := flags.String("opencode-log-level", "", "OpenCode native server log level")
-	nativeVersion := flags.String("opencode-version", "1.18.3", "exact OpenCode version required by the sync-event store")
 	healthTimeout := flags.Duration("opencode-health-timeout", opencode.HealthCheckTimeout, "OpenCode server readiness timeout")
 	darwinBestEffort := flags.Bool("darwin-best-effort-containment", false, "accept Darwin process-group containment and its escaped-descendant and PGID-reuse risks")
 
@@ -116,10 +115,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		opencodeacp.WithOpenCodeLogLevel(*logLevel),
 		opencodeacp.WithOpenCodeHealthCheckTimeout(*healthTimeout),
 	)
-
-	if *nativeVersion != "" {
-		opts = append(opts, opencodeacp.WithVersion(*nativeVersion))
-	}
 
 	if len(seedFiles.files) > 0 {
 		opts = append(opts, opencodeacp.WithSeedFiles(seedFiles.files))

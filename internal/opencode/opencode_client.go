@@ -125,6 +125,7 @@ type Client interface {
 	EventErrors() <-chan error
 	RuntimeExited() <-chan struct{}
 	XDGDirs() XDGDirs
+	NativeVersion() string
 	SyncHistory(context.Context, map[string]int64) ([]SyncEvent, error)
 	SyncReplay(context.Context, string, []SyncReplayEvent) error
 }
@@ -168,7 +169,7 @@ type StartOptions struct {
 	Pure                     bool
 	QuestionTool             bool
 	LogLevel                 string
-	ExactVersion             string
+	MinVersion               string
 	HealthTimeout            time.Duration
 	Logger                   *slog.Logger
 	ExistingXDG              XDGDirs
@@ -367,6 +368,7 @@ type openCodeServer struct {
 	log                          *slog.Logger
 	sessionPermissionListSupport bool
 	sessionQuestionListSupport   bool
+	nativeVersion                string
 
 	events                       chan Event
 	errs                         chan error
@@ -1084,9 +1086,13 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 		}
 	}
 
-	if !options.SkipVersionGate && options.ExactVersion != "" && health.Version != options.ExactVersion {
-		return fmt.Errorf("opencode version %s does not match required sync-store version %s", health.Version, options.ExactVersion)
+	if !options.SkipVersionGate && options.MinVersion != "" {
+		if err := checkMinVersion(health.Version, options.MinVersion); err != nil {
+			return err
+		}
 	}
+
+	s.nativeVersion = health.Version
 
 	if s.log != nil {
 		s.log.DebugContext(ctx, "opencode startup stage complete", slog.String("stage", "health"), slog.Duration("elapsed", time.Since(started)))
@@ -1272,6 +1278,7 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		password: s.password, cmd: s.cmd, cancel: s.cancel, xdg: s.xdg,
 		log: s.log, sessionPermissionListSupport: s.sessionPermissionListSupport,
 		sessionQuestionListSupport: s.sessionQuestionListSupport,
+		nativeVersion:              s.nativeVersion,
 		events:                     make(chan Event, 256), errs: make(chan error, 8),
 		closed: make(chan struct{}), directory: options.Directory,
 		scopeCancel: cancel, runtimeShutdown: s.runtimeShutdown, runtimeClosed: s.runtimeClosed,
@@ -1404,6 +1411,75 @@ func (s *openCodeServer) RuntimeExited() <-chan struct{} {
 
 func (s *openCodeServer) XDGDirs() XDGDirs {
 	return s.xdg
+}
+
+// NativeVersion reports the OpenCode server version probed during readiness.
+func (s *openCodeServer) NativeVersion() string {
+	return s.nativeVersion
+}
+
+// checkMinVersion fails closed when the installed version is below the
+// minimum or when either version does not parse as dotted integers.
+func checkMinVersion(installed, minimum string) error {
+	cmp, err := compareVersions(installed, minimum)
+	if err != nil {
+		return fmt.Errorf("opencode version gate: %w", err)
+	}
+
+	if cmp < 0 {
+		return fmt.Errorf("opencode version %s is below minimum supported version %s", installed, minimum)
+	}
+
+	return nil
+}
+
+func compareVersions(a, b string) (int, error) {
+	left, err := parseVersion(a)
+	if err != nil {
+		return 0, err
+	}
+
+	right, err := parseVersion(b)
+	if err != nil {
+		return 0, err
+	}
+
+	for i := range max(len(left), len(right)) {
+		var l, r int
+		if i < len(left) {
+			l = left[i]
+		}
+
+		if i < len(right) {
+			r = right[i]
+		}
+
+		if l != r {
+			if l < r {
+				return -1, nil
+			}
+
+			return 1, nil
+		}
+	}
+
+	return 0, nil
+}
+
+func parseVersion(version string) ([]int, error) {
+	segments := strings.Split(strings.TrimPrefix(version, "v"), ".")
+	parsed := make([]int, 0, len(segments))
+
+	for _, segment := range segments {
+		value, err := strconv.Atoi(segment)
+		if err != nil || value < 0 {
+			return nil, fmt.Errorf("unparseable opencode version %q", version)
+		}
+
+		parsed = append(parsed, value)
+	}
+
+	return parsed, nil
 }
 
 func (s *openCodeServer) CreateSession(ctx context.Context, title string) (NativeSession, error) {

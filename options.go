@@ -100,7 +100,6 @@ type Options struct {
 	Pure                        bool
 	QuestionTool                bool
 	LogLevel                    string
-	NativeVersion               string
 	HealthCheckTimeout          time.Duration
 	TurnTimeout                 time.Duration
 	RuntimeResourceHooks        RuntimeResourceHooks
@@ -116,7 +115,6 @@ func applyOptions(opts []Option) Options {
 		AgentVersion:            "0.1.0",
 		SessionStoreLoadTimeout: 10 * time.Second,
 		HealthCheckTimeout:      opencode.HealthCheckTimeout,
-		NativeVersion:           syncNativeVersion,
 		clientFactory:           opencode.StartServer,
 	}
 	for _, opt := range opts {
@@ -257,14 +255,6 @@ func WithOpenCodeQuestionTool(enabled bool) Option {
 func WithOpenCodeLogLevel(level string) Option {
 	return func(options *Options) {
 		options.LogLevel = level
-	}
-}
-
-// WithVersion selects the exact native version required by the sync
-// event store. Version ranges and minimum-version fallbacks are unsupported.
-func WithVersion(version string) Option {
-	return func(options *Options) {
-		options.NativeVersion = version
 	}
 }
 

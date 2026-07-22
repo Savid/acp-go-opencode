@@ -71,12 +71,11 @@ Reproduced by
 
 ## Startup fails on a version mismatch
 
-The adapter requires exactly OpenCode 1.18.3. The native version is read from
+The adapter requires OpenCode 1.18.3 or newer. The native version is read from
 the health endpoint's JSON response — the adapter probes no version flag on the
-OpenCode CLI — and startup fails closed when the reported version differs from
-the required one. The `-opencode-version` flag (embedded hosts: `WithVersion`)
-selects the exact expected version; version ranges and minimum-version
-fallbacks are unsupported.
+OpenCode CLI — and startup fails closed when the reported version is below the
+minimum or does not parse as dotted integers (for example a prerelease tag).
+The minimum is an adapter constant and is not configurable.
 
 ## Questions never reach the client, or are rejected mid-turn
 

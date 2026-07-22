@@ -115,7 +115,7 @@ func validSyncSnapshot(sessionID, nativeID, cwd string) stateSnapshot {
 	event := syncTestEvent(nativeID, 0, "session.created.1", nil)
 
 	return stateSnapshot{
-		Format: SessionStoreFormat, AdapterVersion: "test", NativeVersion: syncNativeVersion,
+		Format: SessionStoreFormat, AdapterVersion: "test", NativeVersion: minNativeVersion,
 		EventSchemaVersion: syncEventSchemaVersion, RestoreGeneration: "generation",
 		Session: stateSnapshotSession{SessionID: sessionID, NativeSessionID: nativeID, Cwd: cwd},
 		Graph:   []stateSnapshotNode{{SessionID: sessionID, NativeSessionID: nativeID, SourceCwd: cwd, Permission: "ask"}},
@@ -128,7 +128,6 @@ func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
 
 	tests := map[string]func(*stateSnapshot){
 		"format":              func(value *stateSnapshot) { value.Format = "old" },
-		"native version":      func(value *stateSnapshot) { value.NativeVersion = "old" },
 		"event schema":        func(value *stateSnapshot) { value.EventSchemaVersion = "old" },
 		"session identity":    func(value *stateSnapshot) { value.Session.SessionID = "other" },
 		"native identity":     func(value *stateSnapshot) { value.Session.NativeSessionID = "" },

@@ -84,10 +84,6 @@ func NewAgent(opts ...Option) *Agent {
 
 	options.ConcurrencyLimits = limits
 
-	if options.NativeVersion != syncNativeVersion {
-		optionsErr = errors.Join(optionsErr, fmt.Errorf("OpenCode version must be exactly %s for %s", syncNativeVersion, SessionStoreFormat))
-	}
-
 	if options.HealthCheckTimeout <= 0 {
 		optionsErr = errors.Join(optionsErr, errors.New("OpenCode health check timeout must be positive"))
 	}

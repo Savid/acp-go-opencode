@@ -440,7 +440,7 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, func()
 		ExecutablePath: a.options.ExecutablePath,
 		Env:            a.observe.InjectTraceEnv(ctx, cloneStringMap(a.options.Env)),
 		Pure:           a.options.Pure, QuestionTool: a.options.QuestionTool,
-		LogLevel: a.options.LogLevel, ExactVersion: a.options.NativeVersion,
+		LogLevel: a.options.LogLevel, MinVersion: minNativeVersion,
 		HealthTimeout: a.options.HealthCheckTimeout, Logger: a.log,
 		ExistingXDG: xdg, SeedFiles: a.options.SeedFiles,
 		ObserveProcess: func(processCtx context.Context, kind string, delta int64) {

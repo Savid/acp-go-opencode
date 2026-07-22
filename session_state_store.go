@@ -18,8 +18,12 @@ import (
 )
 
 const (
-	syncEventSchemaVersion  = "1"
-	syncNativeVersion       = "1.18.3"
+	syncEventSchemaVersion = "1"
+	// minNativeVersion is the oldest OpenCode release whose sync-event
+	// surface has been validated for SessionStoreFormat. Startup fails
+	// closed below it; newer releases are accepted and covered by the
+	// event allowlist plus online replay verification on restore.
+	minNativeVersion        = "1.18.3"
 	snapshotBlockGeneration = "generation"
 	syncTypeSessionCreated  = "session.created.1"
 	syncFieldPart           = "part"
@@ -175,7 +179,7 @@ func (s *session) captureStateSnapshot(
 		memberSnapshot := member.snapshot()
 		bundle := stateSnapshot{
 			Format: SessionStoreFormat, AdapterVersion: s.agent.options.AgentVersion,
-			NativeVersion: syncNativeVersion, EventSchemaVersion: syncEventSchemaVersion,
+			NativeVersion: s.client.NativeVersion(), EventSchemaVersion: syncEventSchemaVersion,
 			CapturedAtUnixMilli: now, RestoreGeneration: generation,
 			Session: stateSnapshotSession{
 				SessionID: string(memberSnapshot.id), NativeSessionID: memberSnapshot.idmap.NativeSessionID,
@@ -436,7 +440,7 @@ func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID st
 }
 
 func validateSyncSnapshot(sessionID string, snapshot stateSnapshot) error {
-	if snapshot.Format != SessionStoreFormat || snapshot.NativeVersion != syncNativeVersion || snapshot.EventSchemaVersion != syncEventSchemaVersion {
+	if snapshot.Format != SessionStoreFormat || snapshot.EventSchemaVersion != syncEventSchemaVersion {
 		return fmt.Errorf("unsupported opencode store format or native event schema")
 	}
 
