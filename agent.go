@@ -92,6 +92,8 @@ func NewAgent(opts ...Option) *Agent {
 		optionsErr = errors.Join(optionsErr, errors.New("OpenCode turn timeout cannot be negative"))
 	}
 
+	optionsErr = errors.Join(optionsErr, validateImageLimits(options.ImageLimits))
+
 	log := options.Logger
 	if log == nil {
 		log = slog.Default()

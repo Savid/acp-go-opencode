@@ -89,6 +89,12 @@ const (
 // openAPITypeArray is the OpenAPI schema "type" value for arrays.
 const openAPITypeArray = "array"
 
+// sseEventLineLimitBytes caps one native SSE event line. Tool-state
+// attachments ride the event stream as base64 data URLs, so a single line can
+// carry several multi-megabyte images; the cap only bounds a runaway line from
+// the wrapper-owned loopback server, far above any configured image limit.
+const sseEventLineLimitBytes = 64 * 1024 * 1024
+
 var (
 	ErrSSEDisconnect         = errors.New("opencode SSE disconnected")
 	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
@@ -528,9 +534,23 @@ type NativePart struct {
 	Tool      string          `json:"tool"`
 	State     json.RawMessage `json:"state"`
 	Reason    string          `json:"reason"`
+	Mime      string          `json:"mime"`
+	Filename  string          `json:"filename"`
+	URL       string          `json:"url"`
 	Cost      float64         `json:"cost"`
 	Tokens    NativeTokens    `json:"tokens"`
 	Raw       json.RawMessage `json:"-"`
+}
+
+// NativeAttachment is a native file part carried inside a completed tool
+// state's attachments array. The URL is a data URL, a file URL/path, or a
+// remote location.
+type NativeAttachment struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Mime     string `json:"mime"`
+	Filename string `json:"filename"`
+	URL      string `json:"url"`
 }
 
 func (p *NativePart) UnmarshalJSON(data []byte) error {
@@ -757,17 +777,25 @@ type ProviderInfo struct {
 }
 
 type ProviderModel struct {
-	ID         string                  `json:"id"`
-	Name       string                  `json:"name"`
-	Limit      map[string]any          `json:"limit"`
-	Reasoning  bool                    `json:"reasoning"`
-	ToolCall   bool                    `json:"tool_call"`
-	Modalities ProviderModelModalities `json:"modalities"`
-	Options    map[string]any          `json:"options"`
+	ID           string                     `json:"id"`
+	Name         string                     `json:"name"`
+	Limit        map[string]any             `json:"limit"`
+	Reasoning    bool                       `json:"reasoning"`
+	ToolCall     bool                       `json:"tool_call"`
+	Capabilities *ProviderModelCapabilities `json:"capabilities"`
+	Options      map[string]any             `json:"options"`
 }
 
-type ProviderModelModalities struct {
-	Input []string `json:"input"`
+// ProviderModelCapabilities is the authenticated provider catalog's exhaustive
+// per-model capability record.
+type ProviderModelCapabilities struct {
+	Input ProviderModelInputCapabilities `json:"input"`
+}
+
+// ProviderModelInputCapabilities reports which input kinds the model accepts.
+// A nil field means the catalog did not state the fact either way.
+type ProviderModelInputCapabilities struct {
+	Image *bool `json:"image"`
 }
 
 var (
@@ -2102,7 +2130,7 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), sseEventLineLimitBytes)
 
 	var data strings.Builder
 

@@ -96,6 +96,7 @@ type Options struct {
 	SessionStoreLoadTimeout time.Duration
 	ConcurrencyLimits       ConcurrencyLimits
 	SeedFiles               map[string]string
+	ImageLimits             ImageLimits
 
 	Pure                        bool
 	QuestionTool                bool
@@ -115,6 +116,7 @@ func applyOptions(opts []Option) Options {
 		AgentVersion:            "0.1.0",
 		SessionStoreLoadTimeout: 10 * time.Second,
 		HealthCheckTimeout:      opencode.HealthCheckTimeout,
+		ImageLimits:             defaultImageLimits(),
 		clientFactory:           opencode.StartServer,
 	}
 	for _, opt := range opts {

@@ -366,3 +366,27 @@ func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {
 }
 
 var _ acp.Agent = (*Agent)(nil)
+
+func TestArtifactLoadRejectsCorruptRecordOnRecoveryPaths(t *testing.T) {
+	corrupt := func(t *testing.T, agent *Agent) {
+		t.Helper()
+
+		key := SessionKey{SessionID: "session-1", Subpath: imageArtifactSubpath("corrupt")}
+		require.NoError(t, agent.sessionStore().Append(context.Background(), key, []SessionStoreEntry{json.RawMessage(`{`)}))
+	}
+
+	t.Run("load or resume", func(t *testing.T) {
+		agent, current := recoveryFixture(t, nil, readyRecoveryClient())
+		corrupt(t, agent)
+		_, err := agent.loadOrResumeSession(context.Background(), "session-1", current.cwd, nil, nil, nil)
+		require.Error(t, err)
+		require.NoError(t, agent.Close())
+	})
+
+	t.Run("ensure runtime", func(t *testing.T) {
+		agent, current := recoveryFixture(t, nil, readyRecoveryClient())
+		corrupt(t, agent)
+		require.Error(t, current.ensureRuntime(context.Background()))
+		require.NoError(t, agent.Close())
+	})
+}

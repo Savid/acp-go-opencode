@@ -205,6 +205,11 @@ func (a *Agent) loadOrResumeSession(
 		meta.Mode = snapshot.Session.Model.Agent
 	}
 
+	artifacts, artifactsErr := a.loadAndRehydrateArtifacts(ctx, string(id), snapshot.Events)
+	if artifactsErr != nil {
+		return nil, artifactsErr
+	}
+
 	mcpConfigs := nativeMCPServerConfigs(mcpServers)
 
 	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, cwd, mcpConfigs)
@@ -234,6 +239,7 @@ func (a *Agent) loadOrResumeSession(
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
+	session.setImageArtifacts(artifacts)
 
 	if err := a.storeStartedSession(session); err != nil {
 		closeErr := a.closeFailedSession(session)
@@ -466,6 +472,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
+	session.setImageArtifacts(parent.cloneImageArtifacts())
 
 	if err := a.storeStartedSession(session); err != nil {
 		closeErr := a.closeFailedSession(session)

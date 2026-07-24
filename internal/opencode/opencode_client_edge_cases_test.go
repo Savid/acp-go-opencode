@@ -18,6 +18,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNativeVersionReportsHealthVersion(t *testing.T) {
+	server := &openCodeServer{nativeVersion: "1.18.3"}
+	require.Equal(t, "1.18.3", server.NativeVersion())
+}
+
 func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 	_, err := StartServer(context.Background(), StartOptions{})
 	require.ErrorContains(t, err, "runtime root is required")

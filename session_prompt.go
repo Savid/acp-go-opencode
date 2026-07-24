@@ -3,6 +3,7 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,15 +35,18 @@ const (
 
 	fieldPrompt         = "prompt"
 	fieldPromptResource = "prompt.resource"
-	partTypeText        = "text"
-	partTypeReasoning   = "reasoning"
-	partTypeFile        = "file"
-	partTypeTool        = "tool"
-	partTypeStepFinish  = "step-finish"
-	contentTypeAudio    = "audio"
-	mediaTypeImage      = "image"
-	roleUser            = "user"
-	defaultMimeType     = "application/octet-stream"
+
+	updateUserMessageChunk  = "user_message_chunk"
+	updateAgentMessageChunk = "agent_message_chunk"
+	partTypeText            = "text"
+	partTypeReasoning       = "reasoning"
+	partTypeFile            = "file"
+	partTypeTool            = "tool"
+	partTypeStepFinish      = "step-finish"
+	contentTypeAudio        = "audio"
+	mediaTypeImage          = "image"
+	roleUser                = "user"
+	defaultMimeType         = "application/octet-stream"
 
 	permissionReplyOnce   = "once"
 	permissionReplyAlways = "always"
@@ -288,6 +292,10 @@ func (s *session) resolvePromptCommand(ctx context.Context, params acp.PromptReq
 }
 
 func (s *session) commandNativeRun(ctx context.Context, params acp.PromptRequest, invocation slashCommandPrompt, command opencode.NativeCommand) (func(context.Context) (opencode.NativeMessage, error), error) {
+	if err := s.validatePromptImages(ctx, params.Prompt[1:]); err != nil {
+		return nil, err
+	}
+
 	parts, err := commandPromptParts(params.Prompt[1:])
 	if err != nil {
 		return nil, err
@@ -315,6 +323,10 @@ func (s *session) commandNativeRun(ctx context.Context, params acp.PromptRequest
 }
 
 func (s *session) messageNativeRun(ctx context.Context, params acp.PromptRequest) (func(context.Context) (opencode.NativeMessage, error), error) {
+	if err := s.validatePromptImages(ctx, params.Prompt); err != nil {
+		return nil, err
+	}
+
 	parts, err := promptToOpenCodeParts(params.Prompt)
 	if err != nil {
 		return nil, err
@@ -711,12 +723,7 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock) ([]map[string]any, error) 
 
 			parts = append(parts, part)
 		case block.Image != nil:
-			part, err := imageOpenCodePart(block.Image)
-			if err != nil {
-				return nil, err
-			}
-
-			parts = append(parts, part)
+			parts = append(parts, imageOpenCodePart(block.Image))
 		default:
 			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fieldPrompt})
 		}
@@ -757,9 +764,7 @@ func commandPromptParts(blocks []acp.ContentBlock) ([]map[string]any, error) {
 func commandFilePart(block acp.ContentBlock) (map[string]any, bool, error) {
 	switch {
 	case block.Image != nil:
-		part, err := imageOpenCodePart(block.Image)
-
-		return part, true, err
+		return imageOpenCodePart(block.Image), true, nil
 	case block.ResourceLink != nil:
 		return resourceLinkOpenCodePart(block.ResourceLink), true, nil
 	case block.Resource != nil && block.Resource.Resource.BlobResourceContents != nil:
@@ -818,31 +823,21 @@ func blobResourceOpenCodePart(resource *acp.BlobResourceContents) (map[string]an
 	return part, nil
 }
 
-func imageOpenCodePart(image *acp.ContentBlockImage) (map[string]any, error) {
-	mimeType := image.MimeType
-	if mimeType == "" {
-		mimeType = defaultMimeType
-	}
-
+// imageOpenCodePart maps one validated ACP image block to its native file
+// part. Embedded data is authoritative and always validated before mapping;
+// the URI, when present, contributes filename provenance only.
+func imageOpenCodePart(image *acp.ContentBlockImage) map[string]any {
 	part := map[string]any{
 		jsonFieldType: partTypeFile,
-		jsonFieldMime: mimeType,
-	}
-
-	switch {
-	case image.Data != "":
-		part[jsonFieldURL] = "data:" + mimeType + ";base64," + image.Data
-	case image.Uri != nil && *image.Uri != "":
-		part[jsonFieldURL] = *image.Uri
-	default:
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldField: "prompt.image", jsonFieldError: "missing image data or uri"})
+		jsonFieldMime: image.MimeType,
+		jsonFieldURL:  "data:" + image.MimeType + ";base64," + image.Data,
 	}
 
 	if filename := imageFilename(image); filename != "" {
 		part["filename"] = filename
 	}
 
-	return part, nil
+	return part
 }
 
 func imageFilename(image *acp.ContentBlockImage) string {
@@ -914,19 +909,22 @@ func (s *session) replayMessages(ctx context.Context) error {
 	return nil
 }
 
-func (s *session) emitMessage(ctx context.Context, message opencode.NativeMessage, includeUser bool) error {
+// emitMessage projects one native message. replay marks stored-transcript
+// emission: user parts are included and image artifacts must come from the
+// canonical store instead of fresh local reads.
+func (s *session) emitMessage(ctx context.Context, message opencode.NativeMessage, replay bool) error {
 	if err := s.validateNativeMessageSession(ctx, message); err != nil {
 		return err
 	}
 
 	isUser := message.Info.Role == roleUser
-	if isUser && !includeUser {
+	if isUser && !replay {
 		return nil
 	}
 
 	for i := range message.Parts {
 		part := &message.Parts[i]
-		if err := s.emitPartUpdates(ctx, message.Info.Role, *part, ""); err != nil {
+		if err := s.emitPartUpdates(ctx, message.Info.Role, *part, "", replay); err != nil {
 			return err
 		}
 
@@ -992,19 +990,23 @@ type nativeToolState struct {
 	hasOutput bool
 }
 
+// emitPartUpdates maps one native part and emits its updates. A mapping
+// error still emits the attribution updates built alongside it (the failed
+// tool state) and commits their bookkeeping before the error fails the turn.
 func (s *session) emitPartUpdates(
 	ctx context.Context,
 	role string,
 	part opencode.NativePart,
 	nativeDelta string,
+	replay bool,
 ) error {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
 
-	updates, commit := s.partUpdates(role, part, nativeDelta)
+	updates, commit, mapErr := s.partUpdates(ctx, role, part, nativeDelta, replay)
 	for _, update := range updates {
 		if err := s.emitUpdate(ctx, update); err != nil {
-			return err
+			return errors.Join(mapErr, err)
 		}
 	}
 
@@ -1012,51 +1014,142 @@ func (s *session) emitPartUpdates(
 		commit()
 	}
 
-	return nil
+	return mapErr
 }
 
 func (s *session) partUpdates(
+	ctx context.Context,
 	role string,
 	part opencode.NativePart,
 	nativeDelta string,
-) ([]acp.SessionUpdate, func()) {
+	replay bool,
+) ([]acp.SessionUpdate, func(), error) {
 	messageID := part.MessageID
 	switch part.Type {
 	case partTypeText:
 		text, commit := s.partTextDelta(part, nativeDelta)
 		if text == "" {
-			return nil, commit
+			return nil, commit, nil
 		}
 
 		if role == roleUser {
 			return []acp.SessionUpdate{{UserMessageChunk: &acp.SessionUpdateUserMessageChunk{
-				SessionUpdate: "user_message_chunk",
+				SessionUpdate: updateUserMessageChunk,
 				MessageId:     &messageID,
 				Content:       acp.TextBlock(text),
-			}}}, commit
+			}}}, commit, nil
 		}
 
 		return []acp.SessionUpdate{{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
-			SessionUpdate: "agent_message_chunk",
+			SessionUpdate: updateAgentMessageChunk,
 			MessageId:     &messageID,
 			Content:       acp.TextBlock(text),
-		}}}, commit
+		}}}, commit, nil
 	case partTypeReasoning:
 		text, commit := s.partTextDelta(part, nativeDelta)
 		if text == "" {
-			return nil, commit
+			return nil, commit, nil
 		}
 
 		return []acp.SessionUpdate{{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
 			SessionUpdate: "agent_thought_chunk",
 			MessageId:     &messageID,
 			Content:       acp.TextBlock(text),
-		}}}, commit
+		}}}, commit, nil
+	case partTypeFile:
+		return s.filePartUpdates(ctx, role, part, replay)
 	case partTypeTool:
-		return s.toolPartUpdates(part)
+		return s.toolPartUpdates(ctx, part, replay)
 	default:
-		return nil, nil
+		return nil, nil, nil
 	}
+}
+
+// filePartUpdates maps a standalone native file part. User file parts are
+// replayed as user message content; assistant file parts are mapped
+// defensively as agent-provenance image output, each image alone in its own
+// chunk.
+func (s *session) filePartUpdates(
+	ctx context.Context,
+	role string,
+	part opencode.NativePart,
+	replay bool,
+) ([]acp.SessionUpdate, func(), error) {
+	messageID := part.MessageID
+
+	if role == roleUser {
+		block, ok := userFilePartBlock(part)
+		if !ok {
+			return nil, nil, nil
+		}
+
+		dedupeKey := "user/" + part.ID
+		if _, emitted := s.emittedFileParts[dedupeKey]; emitted {
+			return nil, nil, nil
+		}
+
+		return []acp.SessionUpdate{{UserMessageChunk: &acp.SessionUpdateUserMessageChunk{
+				SessionUpdate: updateUserMessageChunk,
+				MessageId:     &messageID,
+				Content:       block,
+			}}}, func() {
+				s.emittedFileParts[dedupeKey] = struct{}{}
+			}, nil
+	}
+
+	artifact := opencode.NativeAttachment{
+		ID:       part.ID,
+		Type:     partTypeFile,
+		Mime:     part.Mime,
+		Filename: part.Filename,
+		URL:      part.URL,
+	}
+
+	item, mapped, err := s.mapOutputArtifact(ctx, artifact, "file/"+part.ID, provenanceAgent, replay)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !mapped {
+		return nil, nil, nil
+	}
+
+	dedupeKey := "agent/" + part.ID + "/" + item.key()
+	if _, emitted := s.emittedFileParts[dedupeKey]; emitted {
+		return nil, nil, nil
+	}
+
+	return []acp.SessionUpdate{{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+			SessionUpdate: updateAgentMessageChunk,
+			MessageId:     &messageID,
+			Content:       item.block,
+		}}}, func() {
+			s.emittedFileParts[dedupeKey] = struct{}{}
+		}, nil
+}
+
+// userFilePartBlock restores the prompt content a user file part carries: an
+// embedded image for an image data URL, a resource link for a remote URI.
+func userFilePartBlock(part opencode.NativePart) (acp.ContentBlock, bool) {
+	if _, mime, payload, ok := parseImageDataURL(part.URL); ok {
+		if !isImageMIME(firstNonEmpty(mime, part.Mime)) {
+			return acp.ContentBlock{}, false
+		}
+
+		if _, err := base64.StdEncoding.DecodeString(payload); err != nil {
+			return acp.ContentBlock{}, false
+		}
+
+		return acp.ImageBlock(payload, firstNonEmpty(mime, part.Mime)), true
+	}
+
+	if remoteArtifactURL(part.URL) {
+		name := firstNonEmpty(part.Filename, filenameFromURI(part.URL), part.URL)
+
+		return acp.ResourceLinkBlock(name, part.URL), true
+	}
+
+	return acp.ContentBlock{}, false
 }
 
 func (s *session) partTextDelta(part opencode.NativePart, nativeDelta string) (string, func()) {
@@ -1110,11 +1203,30 @@ func (s *session) logNonAppendPartRewrite(part opencode.NativePart, previousLeng
 	)
 }
 
-func (s *session) toolPartUpdates(part opencode.NativePart) ([]acp.SessionUpdate, func()) {
+func (s *session) toolPartUpdates(ctx context.Context, part opencode.NativePart, replay bool) ([]acp.SessionUpdate, func(), error) {
 	id := acp.ToolCallId(firstNonEmpty(part.CallID, part.ID, "opencode-tool"))
 	current := nativeToolPartState(part, id)
 
+	var (
+		content        []imageOutputItem
+		contentChanged bool
+		mapErr         error
+	)
+
+	if current.status == acp.ToolCallStatusCompleted {
+		if attachments := nativeToolAttachments(part.State); len(attachments) > 0 {
+			content, contentChanged, mapErr = s.toolContentSnapshot(ctx, string(id), part, attachments, replay)
+		}
+	}
+
 	previous, seen := s.emittedTools[string(id)]
+
+	// An attachment the adapter cannot represent is turn-fatal, but the tool
+	// call first reports a failed state, without content, for attribution.
+	if mapErr != nil {
+		return s.failedToolAttribution(id, part, current, previous, seen, mapErr)
+	}
+
 	if !seen {
 		opts := []acp.ToolCallStartOpt{
 			acp.WithStartKind(toolKind(part.Tool)),
@@ -1128,14 +1240,22 @@ func (s *session) toolPartUpdates(part opencode.NativePart) ([]acp.SessionUpdate
 			opts = append(opts, acp.WithStartRawOutput(current.output))
 		}
 
+		if contentChanged {
+			opts = append(opts, acp.WithStartContent(toolCallContentFromItems(content)))
+		}
+
 		return []acp.SessionUpdate{acp.StartToolCall(id, current.title, opts...)}, func() {
 			s.emittedTools[string(id)] = emittedToolState(current)
+			if contentChanged {
+				s.emittedToolContent[string(id)] = content
+			}
+
 			s.markActiveToolCallID(string(id))
-		}
+		}, nil
 	}
 
 	if current.status != previous.status && !toolStatusCanAdvance(previous.status, current.status) {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	next := previous
@@ -1165,14 +1285,59 @@ func (s *session) toolPartUpdates(part opencode.NativePart) ([]acp.SessionUpdate
 		opts = append(opts, acp.WithUpdateRawOutput(current.output))
 	}
 
+	if contentChanged {
+		opts = append(opts, acp.WithUpdateContent(toolCallContentFromItems(content)))
+	}
+
 	if len(opts) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	return []acp.SessionUpdate{acp.UpdateToolCall(id, opts...)}, func() {
 		s.emittedTools[string(id)] = next
+		if contentChanged {
+			s.emittedToolContent[string(id)] = content
+		}
+
 		s.markActiveToolCallID(string(id))
+	}, nil
+}
+
+// failedToolAttribution builds the status-only failed tool state emitted
+// before an adapter image mapping failure fails the turn. Content already
+// delivered for the tool call is left intact by omitting the content field.
+func (s *session) failedToolAttribution(
+	id acp.ToolCallId,
+	part opencode.NativePart,
+	current nativeToolState,
+	previous emittedToolState,
+	seen bool,
+	mapErr error,
+) ([]acp.SessionUpdate, func(), error) {
+	if !seen {
+		failed := current
+		failed.status = acp.ToolCallStatusFailed
+
+		return []acp.SessionUpdate{acp.StartToolCall(id, current.title,
+				acp.WithStartKind(toolKind(part.Tool)),
+				acp.WithStartStatus(acp.ToolCallStatusFailed),
+			)}, func() {
+				s.emittedTools[string(id)] = emittedToolState(failed)
+				s.markActiveToolCallID(string(id))
+			}, mapErr
 	}
+
+	if !toolStatusCanAdvance(previous.status, acp.ToolCallStatusFailed) {
+		return nil, nil, mapErr
+	}
+
+	next := previous
+	next.status = acp.ToolCallStatusFailed
+
+	return []acp.SessionUpdate{acp.UpdateToolCall(id, acp.WithUpdateStatus(acp.ToolCallStatusFailed))}, func() {
+		s.emittedTools[string(id)] = next
+		s.markActiveToolCallID(string(id))
+	}, mapErr
 }
 
 func nativeToolPartState(part opencode.NativePart, id acp.ToolCallId) nativeToolState {
@@ -1288,7 +1453,7 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 
 			s.markActiveMessageID(part.MessageID)
 
-			return s.emitPartUpdates(ctx, "assistant", part, delta)
+			return s.emitPartUpdates(ctx, "assistant", part, delta, false)
 		}
 	case eventQuestionV2Asked, eventQuestionAsked:
 		req, ok := eventQuestion(event.Properties)
@@ -1911,6 +2076,8 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 		return nil
 	}
 
+	sanitizeRawEventValue(raw)
+
 	s.rawEventMu.Lock()
 	defer s.rawEventMu.Unlock()
 
@@ -1938,6 +2105,52 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 	s.rawSeq = sequence
 
 	return nil
+}
+
+// sanitizeRawEventValue keeps raw diagnostic events free of image payloads
+// and signed locations: base64 data URLs collapse to a size marker and
+// remote URL fields lose their query and fragment.
+func sanitizeRawEventValue(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if text, ok := child.(string); ok {
+				typed[key] = sanitizeRawEventString(key, text)
+
+				continue
+			}
+
+			sanitizeRawEventValue(child)
+		}
+	case []any:
+		for index, child := range typed {
+			if text, ok := child.(string); ok {
+				typed[index] = sanitizeRawEventString("", text)
+
+				continue
+			}
+
+			sanitizeRawEventValue(child)
+		}
+	}
+}
+
+func sanitizeRawEventString(key, value string) string {
+	if _, mime, payload, ok := parseImageDataURL(value); ok {
+		return fmt.Sprintf("data:%s;base64,[redacted %d bytes]", mime, len(payload))
+	}
+
+	if key == jsonFieldURL || key == "uri" {
+		parsed, err := url.Parse(value)
+		if err == nil && (parsed.Scheme == schemeHTTP || parsed.Scheme == schemeHTTPS) {
+			parsed.RawQuery = ""
+			parsed.Fragment = ""
+
+			return parsed.String()
+		}
+	}
+
+	return value
 }
 
 func (s *session) emitUsageUpdate(

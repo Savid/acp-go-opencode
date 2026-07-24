@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -17,6 +18,81 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func fixtureImage(tb testing.TB, name string) []byte {
+	tb.Helper()
+
+	data, err := os.ReadFile(filepath.Join("testdata", "images", name))
+	require.NoError(tb, err)
+
+	return data
+}
+
+func fixtureImageBase64(tb testing.TB, name string) string {
+	tb.Helper()
+
+	return base64.StdEncoding.EncodeToString(fixtureImage(tb, name))
+}
+
+// newImageSession returns a session whose workspace is a real temp directory,
+// with a recording agent connection wired so update emission is observable.
+func newImageSession(t *testing.T) (*session, *recordingAgentClient) {
+	t.Helper()
+
+	conn := newRecordingAgentClient()
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	session := testSession(agent, newFakeOpenCodeClient())
+	session.cwd = t.TempDir()
+
+	return session, conn
+}
+
+func dataURL(mime string, decoded []byte) string {
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(decoded)
+}
+
+// hookSessionStore lets a test inject failures on individual store operations
+// while delegating everything else to a real in-memory store.
+type hookSessionStore struct {
+	*InMemorySessionStore
+
+	onList   func() ([]string, error)
+	onLoad   func(SessionKey) ([]SessionStoreEntry, error)
+	onDelete func(SessionKey) error
+}
+
+func (s *hookSessionStore) ListSubkeys(ctx context.Context, key SessionKey) ([]string, error) {
+	if s.onList != nil {
+		return s.onList()
+	}
+
+	return s.InMemorySessionStore.ListSubkeys(ctx, key)
+}
+
+func (s *hookSessionStore) Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error) {
+	if s.onLoad != nil {
+		return s.onLoad(key)
+	}
+
+	return s.InMemorySessionStore.Load(ctx, key)
+}
+
+func (s *hookSessionStore) Delete(ctx context.Context, key SessionKey) error {
+	if s.onDelete != nil {
+		return s.onDelete(key)
+	}
+
+	return s.InMemorySessionStore.Delete(ctx, key)
+}
 
 func mustJSON(t *testing.T, value any) json.RawMessage {
 	t.Helper()

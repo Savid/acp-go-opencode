@@ -634,14 +634,14 @@ func TestUpdateReconciliationCommitsOnlyAfterDelivery(t *testing.T) {
 		Type:      partTypeText,
 		Text:      "delivered once",
 	}
-	if err := session.emitPartUpdates(ctx, "assistant", textPart, ""); err == nil {
+	if err := session.emitPartUpdates(ctx, "assistant", textPart, "", false); err == nil {
 		t.Fatal("text delivery unexpectedly succeeded")
 	}
 	if _, ok := session.emittedPartText[textPart.ID]; ok {
 		t.Fatal("failed text delivery committed reconciliation state")
 	}
 	conn.updateErr = nil
-	if err := session.emitPartUpdates(ctx, "assistant", textPart, ""); err != nil {
+	if err := session.emitPartUpdates(ctx, "assistant", textPart, "", false); err != nil {
 		t.Fatalf("text retry: %v", err)
 	}
 	if session.emittedPartText[textPart.ID] != textPart.Text {
@@ -656,14 +656,14 @@ func TestUpdateReconciliationCommitsOnlyAfterDelivery(t *testing.T) {
 		State:  json.RawMessage(`{"status":"pending","input":{"command":"true"}}`),
 	}
 	conn.updateErr = errors.New("delivery failed")
-	if err := session.emitPartUpdates(ctx, "assistant", toolPart, ""); err == nil {
+	if err := session.emitPartUpdates(ctx, "assistant", toolPart, "", false); err == nil {
 		t.Fatal("tool delivery unexpectedly succeeded")
 	}
 	if _, ok := session.emittedTools[toolPart.CallID]; ok {
 		t.Fatal("failed tool delivery committed reconciliation state")
 	}
 	conn.updateErr = nil
-	if err := session.emitPartUpdates(ctx, "assistant", toolPart, ""); err != nil {
+	if err := session.emitPartUpdates(ctx, "assistant", toolPart, "", false); err != nil {
 		t.Fatalf("tool retry: %v", err)
 	}
 	lastUpdate := conn.updates[len(conn.updates)-1].Update
@@ -733,7 +733,11 @@ func committedPartUpdates(
 	part opencode.NativePart,
 	nativeDelta string,
 ) []acp.SessionUpdate {
-	updates, commit := session.partUpdates(role, part, nativeDelta)
+	updates, commit, err := session.partUpdates(context.Background(), role, part, nativeDelta, false)
+	if err != nil {
+		panic(err)
+	}
+
 	if commit != nil {
 		commit()
 	}
@@ -1946,23 +1950,25 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 	if _, err = promptToOpenCodeParts([]acp.ContentBlock{{Audio: &acp.ContentBlockAudio{Type: "audio", Data: "AA==", MimeType: "audio/wav"}}}); err == nil {
 		t.Fatal("audio prompt accepted")
 	}
-	if _, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image"}}}); err == nil {
-		t.Fatal("empty image prompt accepted")
-	}
 	if _, err = promptToOpenCodeParts([]acp.ContentBlock{{Resource: &acp.ContentBlockResource{
 		Type: "resource", Resource: acp.EmbeddedResourceResource{TextResourceContents: &acp.TextResourceContents{}},
 	}}}); err == nil {
 		t.Fatal("empty embedded text resource accepted")
 	}
 	invalidURI := "%"
-	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Uri: &invalidURI}}})
-	if err != nil || parts[0]["filename"] != nil || parts[0]["mime"] != "application/octet-stream" || parts[0]["url"] != invalidURI {
+	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &invalidURI}}})
+	if err != nil || parts[0]["filename"] != nil || parts[0]["url"] != "data:image/png;base64,AA==" {
 		t.Fatalf("invalid uri image parts = %#v err=%v", parts, err)
 	}
 	rootURI := "https://example.com"
-	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Uri: &rootURI}}})
-	if err != nil || parts[0]["filename"] != nil || parts[0]["url"] != rootURI {
+	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &rootURI}}})
+	if err != nil || parts[0]["filename"] != nil || parts[0]["url"] != "data:image/png;base64,AA==" {
 		t.Fatalf("root uri image parts = %#v err=%v", parts, err)
+	}
+	namedURI := "file:///tmp/shot.png"
+	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &namedURI}}})
+	if err != nil || parts[0]["filename"] != "shot.png" {
+		t.Fatalf("named uri image parts = %#v err=%v", parts, err)
 	}
 	req, ids := questionElicitationRequest(opencode.QuestionRequest{ID: "q", SessionID: "s"})
 	if req.Form == nil || req.Form.Message != "OpenCode needs input" || !reflect.DeepEqual(ids, []string{"question_1"}) {
@@ -1983,12 +1989,14 @@ func TestPromptSendsNativeImageFileParts(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	agent := NewAgent()
 	session := testSession(agent, client)
-	imageURI := "file:///tmp/screenshot.png"
+	png := fixtureImageBase64(t, "valid.png")
+	jpeg := fixtureImageBase64(t, "valid.jpg")
+	imageURI := "file:///tmp/screenshot.jpg"
 	client.sendMessage = func(_ context.Context, id string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
 		want := []map[string]any{
 			{"type": "text", "text": "look"},
-			{"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA=="},
-			{"type": "file", "mime": "image/jpeg", "url": "file:///tmp/screenshot.png", "filename": "screenshot.png"},
+			{"type": "file", "mime": "image/png", "url": "data:image/png;base64," + png},
+			{"type": "file", "mime": "image/jpeg", "url": "data:image/jpeg;base64," + jpeg, "filename": "screenshot.jpg"},
 		}
 		if !reflect.DeepEqual(req.Parts, want) {
 			t.Fatalf("native parts = %#v, want %#v", req.Parts, want)
@@ -1996,12 +2004,15 @@ func TestPromptSendsNativeImageFileParts(t *testing.T) {
 
 		return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
 	}
+
+	// The second image carries provenance URI alongside authoritative data:
+	// the submitted pixels come from data, the URI contributes the filename.
 	_, err := session.Prompt(context.Background(), acp.PromptRequest{
 		SessionId: session.id,
 		Prompt: []acp.ContentBlock{
 			acp.TextBlock("look"),
-			{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}},
-			{Image: &acp.ContentBlockImage{Type: "image", Uri: &imageURI, MimeType: "image/jpeg"}},
+			{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: "image/png"}},
+			{Image: &acp.ContentBlockImage{Type: "image", Data: jpeg, MimeType: "image/jpeg", Uri: &imageURI}},
 		},
 	})
 	if err != nil {
@@ -2281,13 +2292,12 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
 		session := testSession(NewAgent(), client)
-		imageURI := "file:///tmp/screenshot.png"
+		png := fixtureImageBase64(t, "valid.png")
 		resourceMime := "text/plain"
 		blobMime := "application/octet-stream"
 		client.runCommand = func(_ context.Context, id string, req opencode.CommandRequest) (opencode.NativeMessage, error) {
 			want := []map[string]any{
-				{"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA=="},
-				{"type": "file", "mime": "image/jpeg", "url": "file:///tmp/screenshot.png", "filename": "screenshot.png"},
+				{"type": "file", "mime": "image/png", "url": "data:image/png;base64," + png},
 				{"type": "file", "mime": "text/plain", "url": "file:///tmp/notes.txt", "filename": "notes.txt"},
 				{"type": "file", "mime": "application/octet-stream", "url": "data:application/octet-stream;base64,AA==", "filename": "blob.bin"},
 			}
@@ -2301,8 +2311,7 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 			SessionId: session.id,
 			Prompt: []acp.ContentBlock{
 				acp.TextBlock("/review"),
-				{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}},
-				{Image: &acp.ContentBlockImage{Type: "image", Uri: &imageURI, MimeType: "image/jpeg"}},
+				{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: "image/png"}},
 				{ResourceLink: &acp.ContentBlockResourceLink{Type: "resource_link", Uri: "file:///tmp/notes.txt", MimeType: &resourceMime}},
 				{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
 					BlobResourceContents: &acp.BlobResourceContents{Blob: "AA==", Uri: "file:///tmp/blob.bin", MimeType: &blobMime},
@@ -2334,9 +2343,6 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 	})
 
 	t.Run("command part conversion errors use the uniform prompt shape", func(t *testing.T) {
-		if _, err := commandPromptParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image"}}}); err == nil {
-			t.Fatal("empty command image accepted")
-		}
 		for _, block := range []acp.ContentBlock{
 			acp.TextBlock("extra text"),
 			{Resource: &acp.ContentBlockResource{Type: "resource"}},
@@ -2372,7 +2378,7 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 			SessionId: session.id,
 			Prompt: []acp.ContentBlock{
 				acp.TextBlock("/missing"),
-				{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}},
+				{Image: &acp.ContentBlockImage{Type: "image", Data: fixtureImageBase64(t, "valid.png"), MimeType: "image/png"}},
 			},
 		})
 		if err != nil {
@@ -3985,4 +3991,217 @@ func TestPartTextDeltaEmptyNativeDeltaBranch(t *testing.T) {
 	text, commit := current.partTextDelta(opencode.NativePart{ID: "part"}, "")
 	require.Empty(t, text)
 	require.Nil(t, commit)
+}
+
+func TestFilePartUpdates(t *testing.T) {
+	ctx := context.Background()
+	png := fixtureImage(t, "valid.png")
+
+	t.Run("user image data url becomes user chunk", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		part := opencode.NativePart{ID: "f1", MessageID: "m1", Type: partTypeFile, Mime: mimePNG, URL: dataURL(mimePNG, png)}
+		require.NoError(t, session.emitPartUpdates(ctx, roleUser, part, "", true))
+		require.NoError(t, session.emitPartUpdates(ctx, roleUser, part, "", true))
+		require.Len(t, conn.updates, 1)
+		require.NotNil(t, conn.updates[0].Update.UserMessageChunk)
+	})
+
+	t.Run("user remote url becomes resource link", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		part := opencode.NativePart{ID: "f2", MessageID: "m1", Type: partTypeFile, Mime: mimePNG, URL: "https://x/g.png", Filename: "g.png"}
+		require.NoError(t, session.emitPartUpdates(ctx, roleUser, part, "", true))
+		require.Len(t, conn.updates, 1)
+		require.NotNil(t, conn.updates[0].Update.UserMessageChunk.Content.ResourceLink)
+	})
+
+	t.Run("user non-image data url is skipped", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		part := opencode.NativePart{ID: "f3", MessageID: "m1", Type: partTypeFile, URL: "data:text/plain;base64,QUJD"}
+		require.NoError(t, session.emitPartUpdates(ctx, roleUser, part, "", true))
+		require.Empty(t, conn.updates)
+	})
+
+	t.Run("user image data url with bad base64 is skipped", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		part := opencode.NativePart{ID: "f3b", MessageID: "m1", Type: partTypeFile, Mime: mimePNG, URL: "data:image/png;base64,!!!!"}
+		require.NoError(t, session.emitPartUpdates(ctx, roleUser, part, "", true))
+		require.Empty(t, conn.updates)
+	})
+
+	t.Run("user local file is skipped", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		part := opencode.NativePart{ID: "f4", MessageID: "m1", Type: partTypeFile, URL: "file:///tmp/note.txt"}
+		require.NoError(t, session.emitPartUpdates(ctx, roleUser, part, "", true))
+		require.Empty(t, conn.updates)
+	})
+
+	t.Run("assistant image data url becomes agent chunk", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		part := opencode.NativePart{ID: "f5", MessageID: "m1", Type: partTypeFile, Mime: mimePNG, URL: dataURL(mimePNG, png)}
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", part, "", false))
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", part, "", false))
+		require.Len(t, conn.updates, 1)
+		require.NotNil(t, conn.updates[0].Update.AgentMessageChunk.Content.Image)
+	})
+
+	t.Run("assistant non-image is skipped", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		part := opencode.NativePart{ID: "f6", MessageID: "m1", Type: partTypeFile, Mime: "text/plain", URL: "data:text/plain;base64,QUJD"}
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", part, "", false))
+		require.Empty(t, conn.updates)
+	})
+
+	t.Run("assistant mapping error is turn fatal", func(t *testing.T) {
+		session, _ := newImageSession(t)
+		part := opencode.NativePart{ID: "f7", MessageID: "m1", Type: partTypeFile, Mime: mimePNG, URL: "data:image/png;base64,!!!!"}
+		err := session.emitPartUpdates(ctx, "assistant", part, "", false)
+		data := assertTurnFailed(t, err, causeTransport, "")
+		require.Equal(t, outputReasonInvalidBase64, data[jsonFieldReason])
+	})
+}
+
+func TestToolPartUpdatesWithAttachments(t *testing.T) {
+	ctx := context.Background()
+	png := fixtureImage(t, "valid.png")
+
+	t.Run("completed tool carries image content", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		state, err := json.Marshal(map[string]any{
+			"status":      "completed",
+			"title":       "read",
+			"attachments": []map[string]any{{"id": "a", "type": "file", "mime": mimePNG, "url": dataURL(mimePNG, png)}},
+		})
+		require.NoError(t, err)
+		part := opencode.NativePart{CallID: "call-1", Type: partTypeTool, Tool: "read", State: state}
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", part, "", false))
+		require.Len(t, conn.updates, 1)
+		require.NotNil(t, conn.updates[0].Update.ToolCall)
+		require.Len(t, conn.updates[0].Update.ToolCall.Content, 1)
+	})
+
+	t.Run("failed attachment reports failed tool then fails turn", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		state, err := json.Marshal(map[string]any{
+			"status":      "completed",
+			"title":       "read",
+			"attachments": []map[string]any{{"id": "a", "type": "file", "mime": mimePNG}},
+		})
+		require.NoError(t, err)
+		part := opencode.NativePart{CallID: "call-2", Type: partTypeTool, Tool: "read", State: state}
+		err = session.emitPartUpdates(ctx, "assistant", part, "", false)
+		require.Error(t, err)
+		require.Len(t, conn.updates, 1)
+		require.Equal(t, acp.ToolCallStatusFailed, conn.updates[0].Update.ToolCall.Status)
+	})
+}
+
+func TestToolPartUpdateSnapshotAdvances(t *testing.T) {
+	ctx := context.Background()
+	png := fixtureImage(t, "valid.png")
+	session, conn := newImageSession(t)
+
+	pending := opencode.NativePart{CallID: "call-1", Type: partTypeTool, Tool: "read", State: json.RawMessage(`{"status":"pending","title":"read"}`)}
+	require.NoError(t, session.emitPartUpdates(ctx, "assistant", pending, "", false))
+
+	state, err := json.Marshal(map[string]any{
+		"status":      "completed",
+		"title":       "read",
+		"attachments": []map[string]any{{"id": "a", "type": "file", "mime": mimePNG, "url": dataURL(mimePNG, png)}},
+	})
+	require.NoError(t, err)
+	completed := opencode.NativePart{CallID: "call-1", Type: partTypeTool, Tool: "read", State: state}
+	require.NoError(t, session.emitPartUpdates(ctx, "assistant", completed, "", false))
+
+	last := conn.updates[len(conn.updates)-1].Update
+	require.NotNil(t, last.ToolCallUpdate)
+	require.Len(t, last.ToolCallUpdate.Content, 1)
+	require.Len(t, session.emittedToolContent["call-1"], 1)
+}
+
+func TestFailedToolAttributionSeenBranches(t *testing.T) {
+	session, _ := newImageSession(t)
+	id := acp.ToolCallId("call-1")
+	part := opencode.NativePart{CallID: "call-1", Tool: "read"}
+	current := nativeToolState{status: acp.ToolCallStatusCompleted, title: "read"}
+	mapErr := errors.New("boom")
+
+	t.Run("seen and can advance", func(t *testing.T) {
+		previous := emittedToolState{status: acp.ToolCallStatusInProgress}
+		updates, commit, err := session.failedToolAttribution(id, part, current, previous, true, mapErr)
+		require.ErrorIs(t, err, mapErr)
+		require.Len(t, updates, 1)
+		require.NotNil(t, commit)
+		commit()
+	})
+
+	t.Run("seen and cannot advance", func(t *testing.T) {
+		previous := emittedToolState{status: acp.ToolCallStatusCompleted}
+		updates, _, err := session.failedToolAttribution(id, part, current, previous, true, mapErr)
+		require.ErrorIs(t, err, mapErr)
+		require.Nil(t, updates)
+	})
+}
+
+func TestPromptRejectsInvalidImage(t *testing.T) {
+	ctx := context.Background()
+	badImage := acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", MimeType: mimePNG}}
+
+	t.Run("message path", func(t *testing.T) {
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		_, err := session.Prompt(ctx, acp.PromptRequest{
+			SessionId: session.id,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("look"), badImage},
+		})
+		requireInvalidParamsData(t, err, map[string]any{
+			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorMissingData, jsonFieldIndex: 0,
+		})
+	})
+
+	t.Run("slash command path", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+		session := testSession(NewAgent(), client)
+		_, err := session.Prompt(ctx, acp.PromptRequest{
+			SessionId: session.id,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("/review"), badImage},
+		})
+		requireInvalidParamsData(t, err, map[string]any{
+			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorMissingData, jsonFieldIndex: 0,
+		})
+	})
+}
+
+func TestSanitizeRawEventValue(t *testing.T) {
+	png := fixtureImage(t, "valid.png")
+	value := map[string]any{
+		"url":  "https://cdn.example.com/a.png?token=secret#frag",
+		"data": dataURL(mimePNG, png),
+		"nested": []any{
+			map[string]any{"uri": "https://x/y?sig=abc"},
+			dataURL(mimePNG, png),
+		},
+		"plain": "not touched",
+	}
+
+	sanitizeRawEventValue(value)
+
+	require.Equal(t, "https://cdn.example.com/a.png", value["url"])
+	require.Contains(t, value["data"], "[redacted")
+	require.Equal(t, "not touched", value["plain"])
+
+	nested, ok := value["nested"].([]any)
+	require.True(t, ok)
+	first, ok := nested[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "https://x/y", first["uri"])
+	second, ok := nested[1].(string)
+	require.True(t, ok)
+	require.Contains(t, second, "[redacted")
+}
+
+func TestCommandPromptPartsPropagatesBlobError(t *testing.T) {
+	_, err := commandPromptParts([]acp.ContentBlock{{Resource: &acp.ContentBlockResource{
+		Type: "resource", Resource: acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{}},
+	}}})
+	require.Error(t, err)
 }

@@ -285,39 +285,12 @@ func modelMeta(providerID string, modelID string, model opencode.ProviderModel) 
 		meta["maxOutputTokens"] = n
 	}
 
-	capabilities := modelCapabilities(model)
-	if len(capabilities) > 0 {
-		meta["capabilities"] = capabilities
-	}
-
 	efforts := supportedEfforts(model)
 	if len(efforts) > 0 {
 		meta["supportedEffortLevels"] = efforts
 	}
 
 	return meta
-}
-
-func modelCapabilities(model opencode.ProviderModel) []string {
-	var caps []string
-	if model.Reasoning {
-		caps = append(caps, "reasoning")
-	}
-
-	if model.ToolCall {
-		caps = append(caps, "tools")
-	}
-
-	for _, value := range model.Modalities.Input {
-		switch strings.ToLower(value) {
-		case mediaTypeImage, contentTypeAudio, "pdf", "video":
-			caps = append(caps, strings.ToLower(value))
-		}
-	}
-
-	slices.Sort(caps)
-
-	return slices.Compact(caps)
 }
 
 func supportedEfforts(model opencode.ProviderModel) []string {

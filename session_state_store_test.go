@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -440,4 +441,26 @@ func cloneStateSnapshot(t *testing.T, value stateSnapshot) stateSnapshot {
 	require.NoError(t, json.Unmarshal(encoded, &cloned))
 
 	return cloned
+}
+
+func TestCaptureStateSnapshotArtifactReplacementError(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native-1")
+	conn := newRecordingAgentClient()
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	session := testSession(agent, client)
+	session.cwd = t.TempDir()
+
+	png := fixtureImage(t, "valid.png")
+	require.NoError(t, session.registerImageArtifact(context.Background(), "id-1", imageArtifactRecord{
+		Version: imageArtifactRecordVersion, Fingerprint: imageFingerprint(png), Mime: mimePNG,
+		Data: base64.StdEncoding.EncodeToString(png), CreatedAtUnixMilli: imageArtifactNow().UnixMilli(),
+	}))
+
+	original := imageJSONMarshal
+	imageJSONMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal boom") }
+	t.Cleanup(func() { imageJSONMarshal = original })
+
+	require.Error(t, session.snapshotToStore(context.Background()))
 }

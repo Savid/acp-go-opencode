@@ -22,9 +22,9 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 					"context": float64(1000),
 					"output":  float64(200),
 				},
-				Reasoning:  true,
-				ToolCall:   true,
-				Modalities: opencode.ProviderModelModalities{Input: []string{"image", "pdf"}},
+				Reasoning:    true,
+				ToolCall:     true,
+				Capabilities: &opencode.ProviderModelCapabilities{Input: opencode.ProviderModelInputCapabilities{Image: boolPtr(true)}},
 				Options: map[string]any{
 					"reasoningEffort": map[string]any{"options": []any{"low", "medium"}},
 				},
@@ -56,9 +56,8 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 	if got := meta["modelId"]; got != "openai/gpt-test" {
 		t.Fatalf("modelId = %#v", got)
 	}
-	if got := meta["capabilities"]; !containsStringAny(got, "tools") || !containsStringAny(got, "reasoning") ||
-		!containsStringAny(got, "image") || !containsStringAny(got, "pdf") {
-		t.Fatalf("capabilities meta = %#v", got)
+	if got, present := meta["capabilities"]; present {
+		t.Fatalf("capabilities meta unexpectedly present: %#v", got)
 	}
 	if got := meta["supportedEffortLevels"]; !containsStringAny(got, "low") || !containsStringAny(got, "medium") {
 		t.Fatalf("effort meta = %#v", got)
@@ -72,9 +71,8 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 		{ID: "", Models: map[string]opencode.ProviderModel{"skip": {}}},
 		{ID: "p", Models: map[string]opencode.ProviderModel{
 			"m": {
-				Limit:      map[string]any{"context": int(42), "output": json.Number("7")},
-				Modalities: opencode.ProviderModelModalities{Input: []string{"audio", "video"}},
-				Options:    map[string]any{"reasoningEffort": []any{"medium"}},
+				Limit:   map[string]any{"context": int(42), "output": json.Number("7")},
+				Options: map[string]any{"reasoningEffort": []any{"medium"}},
 			},
 		}},
 	}}

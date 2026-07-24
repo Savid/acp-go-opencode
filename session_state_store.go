@@ -156,6 +156,12 @@ func (s *session) captureStateSnapshot(
 		return capturedStateSnapshot{}, err
 	}
 
+	// Emitted image bytes live once, in the canonical artifact records that
+	// ride this same replacement set; the captured native events keep
+	// references instead of a second base64 copy.
+	artifacts := unionImageArtifacts(graph)
+	sanitizeSyncEventImages(events, artifacts)
+
 	second, err := s.client.SyncHistory(ctx, cursors)
 	if err != nil {
 		return capturedStateSnapshot{}, fmt.Errorf("verify OpenCode sync watermark: %w", err)
@@ -204,6 +210,13 @@ func (s *session) captureStateSnapshot(
 			Key:     SessionKey{SessionID: string(memberSnapshot.id), Subpath: SessionStoreMainSubpath},
 			Entries: []SessionStoreEntry{entry},
 		})
+
+		artifactReplacements, artifactErr := imageArtifactReplacements(string(memberSnapshot.id), artifacts)
+		if artifactErr != nil {
+			return capturedStateSnapshot{}, artifactErr
+		}
+
+		replacements = append(replacements, artifactReplacements...)
 	}
 
 	s.agent.restoreMu.Lock()

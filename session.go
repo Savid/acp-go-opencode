@@ -64,6 +64,10 @@ type session struct {
 	processedQuestion         map[string]struct{}
 	turnEpoch                 uint64
 	turnNonce                 string
+	imageArtifacts            map[string]imageArtifactRecord
+	imageArtifactIdentities   map[string]string
+	emittedToolContent        map[string][]imageOutputItem
+	emittedFileParts          map[string]struct{}
 	activeMessageIDs          map[string]struct{}
 	activeToolCallIDs         map[string]struct{}
 	failedStreamEpochs        map[uint64]struct{}
@@ -132,30 +136,34 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 	idmap.UpdatedAtUnixMilli = now
 
 	return &session{
-		agent:                 agent,
-		id:                    id,
-		cwd:                   cwd,
-		additionalDirectories: append([]string(nil), additionalDirectories...),
-		idmap:                 idmap,
-		title:                 title,
-		updatedAt:             updatedAt,
-		providerID:            providerID,
-		modelID:               modelID,
-		mode:                  firstNonEmpty(meta.Mode, native.Agent, "build"),
-		permission:            normalizeOpenCodePermission(meta.Permission),
-		outputSchema:          cloneAnyMap(meta.OutputSchema),
-		rawMessages:           meta.RawMessages,
-		client:                client,
-		emittedPartText:       map[string]string{},
-		emittedTools:          map[string]emittedToolState{},
-		emittedUsage:          map[string]emittedUsageState{},
-		pending:               map[string]opencode.PermissionRequest{},
-		questions:             map[string]opencode.QuestionRequest{},
-		processedPermission:   map[string]struct{}{},
-		processedQuestion:     map[string]struct{}{},
-		activeMessageIDs:      map[string]struct{}{},
-		failedStreamEpochs:    map[uint64]struct{}{},
-		failedMessageIDs:      map[string]struct{}{},
+		agent:                   agent,
+		id:                      id,
+		cwd:                     cwd,
+		additionalDirectories:   append([]string(nil), additionalDirectories...),
+		idmap:                   idmap,
+		title:                   title,
+		updatedAt:               updatedAt,
+		providerID:              providerID,
+		modelID:                 modelID,
+		mode:                    firstNonEmpty(meta.Mode, native.Agent, "build"),
+		permission:              normalizeOpenCodePermission(meta.Permission),
+		outputSchema:            cloneAnyMap(meta.OutputSchema),
+		rawMessages:             meta.RawMessages,
+		client:                  client,
+		emittedPartText:         map[string]string{},
+		emittedTools:            map[string]emittedToolState{},
+		emittedUsage:            map[string]emittedUsageState{},
+		imageArtifacts:          map[string]imageArtifactRecord{},
+		imageArtifactIdentities: map[string]string{},
+		emittedToolContent:      map[string][]imageOutputItem{},
+		emittedFileParts:        map[string]struct{}{},
+		pending:                 map[string]opencode.PermissionRequest{},
+		questions:               map[string]opencode.QuestionRequest{},
+		processedPermission:     map[string]struct{}{},
+		processedQuestion:       map[string]struct{}{},
+		activeMessageIDs:        map[string]struct{}{},
+		failedStreamEpochs:      map[uint64]struct{}{},
+		failedMessageIDs:        map[string]struct{}{},
 	}
 }
 
@@ -1118,6 +1126,11 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "opencode_recovery_generation_missing"})
 	}
 
+	artifacts, err := s.agent.loadAndRehydrateArtifacts(ctx, string(id), snapshot.Events)
+	if err != nil {
+		return err
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1171,6 +1184,8 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 
 		installed, closed := s.installRecoveredRuntime(client, releaseDirectory, idmap, generation)
 		if installed {
+			s.setImageArtifacts(artifacts)
+
 			return nil
 		}
 

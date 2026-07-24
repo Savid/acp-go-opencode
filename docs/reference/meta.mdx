@@ -71,6 +71,12 @@ The initialize response advertises adapter surfaces under
 path, result path, and schema mode). `AgentCapabilities.Meta` also advertises
 `"acp-go.dev/route": {"versions": [1]}`.
 
+`promptCapabilities.image` is advertised `true`: the adapter accepts a standard
+ACP image content block and maps it to OpenCode. Per-model `_meta.opencode`
+metadata carries no capabilities list; selected-model image support is an
+internal decision sourced only from authenticated provider
+`capabilities.input.image`.
+
 Outbound elicitation requests preserve native metadata and add the reserved
 route envelope with `version`, `sessionId`, `turnNonce`, and exactly one of
 `toolCallId` or `requestId`. A native metadata collision with that reserved key
@@ -88,3 +94,5 @@ A failed turn returns an ACP internal error whose `data` carries:
 | `message` | The real native cause text. |
 | `statusCode` / `providerCode` | Included when the provider reports them. |
 | `structuredOutputRequested` | `true` when the turn sent a native output schema. |
+| `stage` / `reason` | Present on an image-output failure: `stage` is `image_output`; `reason` is one of `invalid_base64`, `not_a_raster`, `media_type_mismatch`, `missing_file`, `path_not_allowed`, `too_large`, or `storage_failed`. |
+| `sizeBytes` / `maxBytes` | Present when an image-output failure carries decoded sizes. |

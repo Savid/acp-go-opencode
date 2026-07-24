@@ -28,6 +28,17 @@ agent := opencodeacp.NewAgent(
 defaults to `10s`. Store writes are bounded separately by a fixed `60s`
 deadline, so a slow store can never stall a snapshot commit indefinitely.
 
+## Image artifacts
+
+Emitted image bytes live once, in canonical artifact records the store owns
+alongside the sanitized native events (under `images/<fingerprint>` subpaths);
+the captured events keep a reference, never a second base64 copy. On load,
+resume, and fork the records are rehydrated so replay reproduces the same image
+content and native identity as live output. The store is a bounded replay
+window, not permanent history: a record is reclaimed with its session and swept
+after a 24-hour TTL, and a replay that needs a swept artifact fails the load
+with a `storage_failed` reason rather than replaying a transcript with a hole.
+
 Store keys require a non-empty `SessionID`: `Append` and `Replace` with an
 empty session id fail, and `Delete` of an empty-id key is a pure no-op.
 

@@ -830,6 +830,7 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 		"health":       WithOpenCodeHealthCheckTimeout(0),
 		"turn timeout": WithTurnTimeout(-time.Second),
 		"limits":       WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: -1}),
+		"image limits": WithImageLimits(ImageLimits{MaxOutputBytesPerToolCall: -1}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := NewAgent(option).Initialize(context.Background(), acp.InitializeRequest{})

@@ -24,10 +24,35 @@ Native part events map onto ACP update variants:
 | Token totals | `usage_update` |
 
 ACP text blocks and text embedded resources become native text parts. A blob
-embedded resource whose MIME type is `image/*` becomes a native file part using
-its base64 data (or URI); a non-image blob may be mentioned by URI, but opaque
-blob bytes without a supported image MIME type are rejected rather than
-silently dropped. Direct ACP image blocks use the same native file-part path.
+embedded resource whose MIME type is `image/*`, and a direct ACP image block,
+become a native file part carrying the embedded base64 data as a data URL. When
+an image block also carries a `uri`, the embedded `data` is authoritative for the
+submitted pixels and the URI contributes only filename provenance; the adapter
+never fetches it.
+
+Prompt images are validated before the turn starts, deterministically at the
+first failing block. The input allowlist is exactly `image/png`, `image/jpeg`,
+`image/gif`, and `image/webp`, static frames only: a multi-descriptor GIF, a
+WebP `VP8X` `ANIM` flag, and a PNG `acTL` chunk (APNG) are rejected without
+decoding any raster. Missing data, undecodable base64, a MIME outside the
+allowlist, a sniffed/declared MIME mismatch, unreadable dimensions, and decoded
+bytes over the configured `ImageLimits` each fail with JSON-RPC `-32602` and a
+`prompt.image` error taxonomy (`error`, `index`, and byte sizes). When the
+selected model's authenticated provider metadata (`capabilities.input.image`)
+says the model cannot accept images, the prompt is rejected as
+`unsupported_by_model`; absent metadata forwards the turn and lets the provider
+decide.
+
+Native tool results and assistant file parts that carry an image are mapped back
+to ACP as embedded image content (each agent image alone in its own
+`agent_message_chunk`, tool images as the tool call's complete content array).
+Tool-result images are the common path; an assistant file part is the defensive,
+rarely exercised case, since model-native image output does not survive as a
+standalone assistant file part in practice. A
+remote URI-only artifact becomes an ACP `resource_link` on its true provenance;
+the adapter never downloads it. Output MIME is the truthful sniffed type and is
+not allowlisted. Emitted bytes over the configured or transport-frame limit fail
+the turn with a `stage: "image_output"` envelope rather than reaching the wire.
 
 OpenCode text and reasoning part events carry the complete part plus, on live
 updates, an explicit appended `delta`. The adapter forwards that delta and

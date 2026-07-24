@@ -24,6 +24,13 @@ are enumerable.
 Set either at session start via `_meta.opencode.options` or on a running session
 with `session/set_config_option`.
 
+The selected model also gates image prompts. The adapter reads the model's
+authenticated provider `capabilities.input.image`: `true` accepts image blocks,
+`false` rejects an image prompt before the turn as `unsupported_by_model`, and a
+catalog that states nothing forwards the turn and lets the provider decide. The
+gate is evaluated per prompt against the current selection, so a mid-session
+model switch takes effect on the next prompt.
+
 ## Structured output
 
 Structured output is native. Supplying a JSON Schema object at
