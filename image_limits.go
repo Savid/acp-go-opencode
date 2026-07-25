@@ -30,6 +30,32 @@ func effectiveOutputLimit(configured int64) int64 {
 	return configured
 }
 
+// effectiveInputBytesPerImage is the per-image decoded-byte gate the input
+// path enforces: the configured policy limit while it fits the transport frame
+// bound, and the frame bound itself when that policy is disabled or wider than
+// a frame. Both the gate and the advertisement read it, so the number a host
+// pre-checks against is the number that rejects.
+func effectiveInputBytesPerImage(configured int64) int64 {
+	if configured <= 0 || configured > imageFrameBoundBytes {
+		return imageFrameBoundBytes
+	}
+
+	return configured
+}
+
+// effectiveInputBytesPerPrompt is the per-prompt aggregate decoded-byte gate.
+// Nothing floors it: a disabled policy limit enforces no aggregate at all, and
+// that is what the advertisement reports. The handoff block-count cap bounds
+// the work in that configuration and is a count rather than a byte number, so
+// it never enters this bound.
+func effectiveInputBytesPerPrompt(configured int64) int64 {
+	if configured <= 0 {
+		return 0
+	}
+
+	return configured
+}
+
 const (
 	// mediaEnvelopeKey is the family-reserved capability metadata key carrying
 	// the effective inbound media bounds a host can pre-check against.
@@ -49,12 +75,12 @@ const (
 
 // mediaEnvelope reports the effective inbound media bounds: the per-image and
 // per-prompt decoded-byte gates this adapter enforces, read from the same
-// limits the gates read, the input format allowlist in advertised order, and an
-// empty document list because no MIME maps to a native document here.
+// functions the gates read, the input format allowlist in advertised order, and
+// an empty document list because no MIME maps to a native document here.
 func (o Options) mediaEnvelope() map[string]any {
 	return map[string]any{
-		mediaEnvelopeFieldMaxBytes:        o.ImageLimits.MaxInputBytesPerImage,
-		mediaEnvelopeFieldMaxPromptBytes:  o.ImageLimits.MaxInputBytesPerPrompt,
+		mediaEnvelopeFieldMaxBytes:        effectiveInputBytesPerImage(o.ImageLimits.MaxInputBytesPerImage),
+		mediaEnvelopeFieldMaxPromptBytes:  effectiveInputBytesPerPrompt(o.ImageLimits.MaxInputBytesPerPrompt),
 		mediaEnvelopeFieldMaxDimension:    mediaEnvelopeMaxDimension,
 		mediaEnvelopeFieldImageFormats:    slices.Clone(imageInputFormats),
 		mediaEnvelopeFieldDocumentFormats: []string{},

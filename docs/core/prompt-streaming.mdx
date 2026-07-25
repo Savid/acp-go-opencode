@@ -25,10 +25,12 @@ Native part events map onto ACP update variants:
 
 ACP text blocks and text embedded resources become native text parts. A blob
 embedded resource whose MIME type is `image/*`, and a direct ACP image block,
-become a native file part carrying the embedded base64 data as a data URL. When
-an image block carries both `data` and a `uri`, the embedded `data` is
-authoritative for the submitted pixels and the URI contributes only filename
-provenance; the adapter never fetches it.
+become a native file part carrying the image bytes as a data URL. The bytes are
+re-encoded from what validation inspected, so the payload OpenCode receives is
+canonical whatever base64 spelling the host sent. When an image block carries
+both `data` and a `uri`, the embedded `data` is authoritative and the URI
+contributes nothing at all: no native filename is derived from it, and the
+adapter never fetches it.
 
 ## Prompt media validation
 
@@ -55,9 +57,14 @@ decide.
 A blob embedded resource is gated whatever its MIME. Its base64 must decode, its
 decoded bytes must fit the per-image bound, and they count toward the per-prompt
 total, so no resource channel carries unbounded or unvalidated bytes to the
-harness. A blob outside the image contract is verdicted under `prompt.resource`
-with the same `error` values, and its native representation is otherwise
-unchanged.
+harness. A text embedded resource is charged to that same per-prompt total, so
+bytes cannot evade the aggregate by arriving as text instead of as a blob; its
+native representation is otherwise unchanged.
+
+A verdict names the request member the bytes arrived on, never the gate chain
+they were routed through: a resource block is reported under `prompt.resource`
+even when an `image/*` MIME sends it through the image contract, and an image
+block is always reported under `prompt.image`.
 
 ## Handoff input form
 
@@ -77,25 +84,47 @@ A handoff block resolves in a fixed order, first failure winning:
 | `error` | Cause |
 |---|---|
 | `invalid_handoff` | The block is malformed as a block: no configured read root, an absent or undecodable envelope, an unsupported `version`, an unrecognized envelope field, a malformed `digest` or `sizeBytes`, or a URI that is not an absolute local `file://` path. |
-| `path_not_allowed` | The path resolves outside the read root, escapes it through a symlink, or is not a regular file. |
-| `missing_file` | A path inside the read root that does not exist or cannot be opened or read. |
+| `path_not_allowed` | The path does not open inside the read root, or the file it opens is not a regular file. |
+| `missing_file` | A path inside the read root that does not exist or cannot be read. |
 | `handoff_digest_mismatch` | The bytes do not match the declared `sizeBytes` and `digest`. |
 
-Resolution is bounded and symlink-safe: containment is checked on the cleaned
-path, symlinks are resolved, containment is checked again on the resolved path,
-and only then is the file mode inspected. The read is bounded at the per-image
-byte gate plus one byte. Verification is fail-closed — a mismatch is a rejection
-and never a fall back to the embedded form — and a file that overran the bound
-cannot be verified, so the byte gate rejects it `too_large` on its real on-disk
-size. All four verdicts are JSON-RPC `-32602`, are fatal before the turn starts,
-and carry a `message` naming the real cause without repeating the host path.
+The file is opened relative to the read root, which the operating system
+enforces as the resolution boundary at the open itself: a name that would leave
+the root — through `..`, an absolute path, an absolute symbolic link, or a
+symbolic link pointing outside — is refused, and there is no window between
+deciding and opening for a component to be swapped in. A symbolic link with a
+relative target inside the root is followed normally. The open cannot block, and
+the opened descriptor must be a regular file, so a FIFO or device node placed
+under the root is refused rather than left holding the turn.
+
+The read root bounds where a *name* may resolve, not which bytes a directory
+entry may point at: a hard link placed under the root is read like any other
+file. The digest, not the root, is what makes the transport trustworthy.
+
+The declared media type and the declared `sizeBytes` are checked next, so a
+block that was always going to be refused costs one open rather than a full read
+and a hash. The read itself is bounded at the per-image byte gate plus one byte,
+and the size verdict is decided on the bytes actually read: a file that grew
+after it was declared is rejected `too_large` and none of its bytes are carried
+forward. Every surviving byte reaches verification, which is fail-closed — a
+mismatch is a rejection and never a fall back to the embedded form. All four
+verdicts are JSON-RPC `-32602`, are fatal before the turn starts, and carry a
+`message` naming the real cause without repeating the host path, the file name,
+the digest, or an observed size.
+
+At most 64 handoff-form blocks are read for one prompt. The block that crosses
+the cap is rejected `too_large` before it is read, with `sizeBytes` carrying the
+block count and `maxBytes` carrying the cap. The cap applies whatever the
+per-prompt byte aggregate is set to, so a deployment that disables the aggregate
+still bounds the work a single prompt can ask for.
 
 Bytes that pass then run the same gate chain as the embedded form, minus the two
-gates that need base64, and count toward the per-prompt total identically. The
-validated bytes reach OpenCode as the same data URL an embedded block builds, so
-a handoff turn and an embedded turn over the same bytes produce byte-identical
-native requests. The handoff path itself never appears in the native request:
-nothing derives a filename from it, and it does not outlive the validation read.
+gates that need base64, and count toward the per-prompt total identically. Both
+forms send OpenCode a data URL built from the bytes the adapter validated, and
+neither derives a native filename from a block URI, so a handoff turn and an
+embedded turn over the same bytes produce byte-identical native requests
+whatever base64 spelling or URI the host chose. The handoff path itself never
+appears in the native request and does not outlive the validation read.
 
 Native tool results and assistant file parts that carry an image are mapped back
 to ACP as embedded image content (each agent image alone in its own

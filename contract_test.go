@@ -5,8 +5,8 @@ package opencodeacp
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -77,27 +77,87 @@ func TestInitializeAdvertisesTheMediaEnvelope(t *testing.T) {
 	require.Equal(t, mimePNG, imageInputFormats[0], "advertisement aliases the input allowlist")
 }
 
-// TestMediaEnvelopeMatchesTheEnforcedGate binds the advertised bytes to the
-// bound the input gate actually rejects on, so the two cannot drift.
-func TestMediaEnvelopeMatchesTheEnforcedGate(t *testing.T) {
-	decoded := fixtureImage(t, "valid.png")
-	gate := int64(len(decoded)) - 1
+// mediaEnvelopeOf initializes an agent and returns the media bounds it
+// advertises, which is the only thing a host can pre-check against.
+func mediaEnvelopeOf(t *testing.T, agent *Agent) map[string]any {
+	t.Helper()
 
-	agent := NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerImage: gate, MaxInputBytesPerPrompt: gate}))
 	resp, err := agent.Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
 
 	envelope, ok := resp.AgentCapabilities.Meta[mediaEnvelopeKey].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, gate, envelope[mediaEnvelopeFieldMaxBytes])
-	require.Equal(t, gate, envelope[mediaEnvelopeFieldMaxPromptBytes])
+	require.True(t, ok, "media envelope missing from agent capabilities")
 
-	session := testSession(agent, newFakeOpenCodeClient())
-	requireInvalidParamsData(t, validatePromptMediaError(session, acp.ContentBlock{Image: &acp.ContentBlockImage{
-		Type: "image", MimeType: mimePNG, Data: base64.StdEncoding.EncodeToString(decoded),
-	}}), map[string]any{
-		jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
-		jsonFieldSizeBytes: int64(len(decoded)), jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxBytes],
+	return envelope
+}
+
+// TestMediaEnvelopeAdvertisesTheBoundTheGateReports binds both advertised byte
+// bounds to the numbers the gates actually reject on, across the configured
+// values where the two could drift apart: inside the transport bound, disabled,
+// and wider than a frame.
+func TestMediaEnvelopeAdvertisesTheBoundTheGateReports(t *testing.T) {
+	decoded := fixtureImage(t, "valid.png")
+
+	t.Run("per image", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			configured int64
+			want       int64
+		}{
+			{name: "inside the transport bound", configured: int64(len(decoded)) - 1, want: int64(len(decoded)) - 1},
+			{name: "disabled", configured: 0, want: imageFrameBoundBytes},
+			{name: "wider than a frame", configured: 100 * imageFrameBoundBytes, want: imageFrameBoundBytes},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				root := t.TempDir()
+
+				// One byte past the advertised bound, so the gate under test is
+				// the only one that can answer.
+				path := writeHandoffFile(t, root, "shot.png", decoded)
+				require.NoError(t, os.Truncate(path, tt.want+1))
+
+				agent := NewAgent(WithInputHandoffRoot(root), WithImageLimits(ImageLimits{MaxInputBytesPerImage: tt.configured}))
+				envelope := mediaEnvelopeOf(t, agent)
+				require.Equal(t, tt.want, envelope[mediaEnvelopeFieldMaxBytes])
+
+				block := handoffBlock(mimePNG, path, handoffEnvelope(decoded))
+				requireInvalidParamsData(t, validatePromptMediaError(testSession(agent, newFakeOpenCodeClient()), block), map[string]any{
+					jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
+					jsonFieldSizeBytes: tt.want + 1, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxBytes],
+				})
+			})
+		}
+	})
+
+	t.Run("per prompt", func(t *testing.T) {
+		root := t.TempDir()
+		path := writeHandoffFile(t, root, "shot.png", decoded)
+
+		// The two bounds differ, so an advertisement that reported the per-image
+		// number for both would disagree with the aggregate rejection.
+		perImage := int64(len(decoded))
+		perPrompt := 2*perImage - 1
+
+		agent := NewAgent(WithInputHandoffRoot(root), WithImageLimits(ImageLimits{
+			MaxInputBytesPerImage:  perImage,
+			MaxInputBytesPerPrompt: perPrompt,
+		}))
+		envelope := mediaEnvelopeOf(t, agent)
+		require.Equal(t, perImage, envelope[mediaEnvelopeFieldMaxBytes])
+		require.Equal(t, perPrompt, envelope[mediaEnvelopeFieldMaxPromptBytes])
+
+		block := handoffBlock(mimePNG, path, handoffEnvelope(decoded))
+		requireInvalidParamsData(t, validatePromptMediaError(testSession(agent, newFakeOpenCodeClient()), block, block), map[string]any{
+			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
+			jsonFieldSizeBytes: 2 * perImage, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxPromptBytes],
+		})
+	})
+
+	t.Run("a disabled aggregate advertises no aggregate", func(t *testing.T) {
+		envelope := mediaEnvelopeOf(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerImage: defaultImageLimitBytes})))
+		require.Equal(t, int64(0), envelope[mediaEnvelopeFieldMaxPromptBytes])
 	})
 }
 

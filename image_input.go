@@ -43,10 +43,10 @@ const (
 	imageInputSupported
 )
 
-// promptMedia is one media-bearing prompt block: an image content block or an
-// embedded blob resource. Indexes are assigned across media-bearing blocks in
-// request order and stay stable in errors; block records the position in the
-// prompt slice so validated handoff bytes reach native mapping.
+// promptMedia is one byte-bearing prompt block: an image content block, an
+// embedded blob resource, or an embedded text resource. Indexes are assigned
+// across these blocks in request order and stay stable in errors; block records
+// the position in the prompt slice so validated bytes reach native mapping.
 type promptMedia struct {
 	index int
 	block int
@@ -55,15 +55,21 @@ type promptMedia struct {
 	// the image prefix. Every other blob resource is gated for base64 validity
 	// and decoded bytes only, leaving its native representation untouched.
 	raster bool
-	mime   string
-	data   string
-	image  *acp.ContentBlockImage
+	// text marks an embedded text resource. It carries no image contract and no
+	// base64, but the characters it forwards are prompt bytes all the same, so
+	// they are charged to the per-prompt aggregate.
+	text  bool
+	mime  string
+	data  string
+	image *acp.ContentBlockImage
 }
 
-// field names the request member a verdict belongs to: the image contract for
-// raster media, the resource channel for every other embedded blob.
+// field names the request member a verdict belongs to. It follows the block
+// the bytes arrived on, never the gate chain they were routed through: a
+// resource block stays a resource verdict even when an image MIME sends it
+// through the raster chain.
 func (m promptMedia) field() string {
-	if m.raster {
+	if m.image != nil {
 		return fieldPromptImage
 	}
 
@@ -100,9 +106,10 @@ func handoffInputError(index int, errValue, message string) error {
 	})
 }
 
-// promptMediaBlocks collects the media-bearing blocks with stable indexes. The
-// blob-resource predicate matches the native mapping exactly, so every block
-// whose bytes can reach the harness is validated first.
+// promptMediaBlocks collects the byte-bearing blocks with stable indexes. The
+// resource predicates match the native mapping exactly, including which variant
+// wins when a resource carries both, so every block whose bytes can reach the
+// harness is validated first.
 func promptMediaBlocks(blocks []acp.ContentBlock) []promptMedia {
 	media := make([]promptMedia, 0, len(blocks))
 
@@ -116,6 +123,15 @@ func promptMediaBlocks(blocks []acp.ContentBlock) []promptMedia {
 				mime:   block.Image.MimeType,
 				data:   block.Image.Data,
 				image:  block.Image,
+			})
+		case block.Resource != nil && block.Resource.Resource.TextResourceContents != nil:
+			contents := block.Resource.Resource.TextResourceContents
+
+			media = append(media, promptMedia{
+				index: len(media),
+				block: position,
+				text:  true,
+				data:  firstNonEmpty(contents.Text, contents.Uri),
 			})
 		case block.Resource != nil && block.Resource.Resource.BlobResourceContents != nil:
 			blob := block.Resource.Resource.BlobResourceContents
@@ -141,10 +157,10 @@ func promptMediaBlocks(blocks []acp.ContentBlock) []promptMedia {
 // validatePromptMedia rejects invalid, unsupported, animated, or oversize
 // prompt media before the native turn starts, deterministically at the first
 // failing block in request order, then consults the selected-model gate. It
-// returns the handoff-form bytes native mapping substitutes for the blocks
-// that carried no embedded data.
-func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentBlock) (resolvedHandoffImages, error) {
-	resolved := make(resolvedHandoffImages)
+// returns the validated bytes native mapping sends for every image block, in
+// either input form.
+func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentBlock) (resolvedPromptImages, error) {
+	resolved := make(resolvedPromptImages)
 
 	media := promptMediaBlocks(blocks)
 	if len(media) == 0 {
@@ -152,14 +168,29 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 	}
 
 	limits := s.imageLimits()
+	promptGate := effectiveInputBytesPerPrompt(limits.MaxInputBytesPerPrompt)
 
 	var (
 		totalBytes int64
+		handoffs   int
 		firstImage = -1
 	)
 
 	for _, block := range media {
-		decoded, size, err := s.validatePromptMediaBlock(block, limits)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		if isHandoffForm(block) {
+			// Counted before the block is read, because bounding the reads is
+			// the whole point of the cap.
+			handoffs++
+			if handoffs > maxHandoffBlocksPerPrompt {
+				return nil, mediaInputSizeError(block.field(), block.index, int64(handoffs), maxHandoffBlocksPerPrompt)
+			}
+		}
+
+		decoded, size, err := s.validatePromptMediaBlock(ctx, block, limits)
 		if err != nil {
 			return nil, err
 		}
@@ -168,16 +199,16 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 			firstImage = block.index
 		}
 
-		if block.image != nil && block.data == "" {
-			resolved[block.block] = resolvedHandoffImage{
+		if block.image != nil {
+			resolved[block.block] = resolvedPromptImage{
 				mime: block.mime,
 				data: base64.StdEncoding.EncodeToString(decoded),
 			}
 		}
 
 		totalBytes += size
-		if limits.MaxInputBytesPerPrompt > 0 && totalBytes > limits.MaxInputBytesPerPrompt {
-			return nil, mediaInputSizeError(block.field(), block.index, totalBytes, limits.MaxInputBytesPerPrompt)
+		if promptGate > 0 && totalBytes > promptGate {
+			return nil, mediaInputSizeError(block.field(), block.index, totalBytes, promptGate)
 		}
 	}
 
@@ -188,21 +219,27 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 	return resolved, nil
 }
 
+// isHandoffForm reports whether a block arrived in the handoff form: an image
+// block carrying no embedded data that signals a local handoff reference.
+func isHandoffForm(media promptMedia) bool {
+	return media.image != nil && media.data == "" && handoffIntent(media.image)
+}
+
 // validatePromptMediaBlock resolves one block's decoded bytes and the size to
-// charge against the byte gates. An image block with empty data that signals
-// handoff intent resolves through the handoff pre-gate; every other block
-// decodes its embedded base64.
-func (s *session) validatePromptMediaBlock(media promptMedia, limits ImageLimits) ([]byte, int64, error) {
+// charge against the byte gates. A handoff-form block resolves through the
+// handoff pre-gate; every other block decodes its embedded base64. Either way
+// the size charged is the length of the bytes the block contributes.
+func (s *session) validatePromptMediaBlock(ctx context.Context, media promptMedia, limits ImageLimits) ([]byte, int64, error) {
 	switch {
-	case media.image != nil && media.data == "" && handoffIntent(media.image):
-		decoded, size, err := s.readHandoffImage(media, limits)
+	case media.text:
+		return nil, int64(len(media.data)), nil
+	case isHandoffForm(media):
+		decoded, err := s.readHandoffImage(ctx, media, limits)
 		if err != nil {
 			return nil, 0, err
 		}
 
-		if err := checkMediaAllowlist(media); err != nil {
-			return nil, 0, err
-		}
+		size := int64(len(decoded))
 
 		return decoded, size, validateRasterMedia(media, decoded, size, limits)
 	case media.raster:
@@ -284,8 +321,9 @@ func validateRasterMedia(media promptMedia, decoded []byte, size int64, limits I
 }
 
 func checkMediaSize(media promptMedia, size int64, limits ImageLimits) error {
-	if limits.MaxInputBytesPerImage > 0 && size > limits.MaxInputBytesPerImage {
-		return mediaInputSizeError(media.field(), media.index, size, limits.MaxInputBytesPerImage)
+	gate := effectiveInputBytesPerImage(limits.MaxInputBytesPerImage)
+	if size > gate {
+		return mediaInputSizeError(media.field(), media.index, size, gate)
 	}
 
 	return nil

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -47,17 +48,22 @@ func TestValidatePromptImagesInputTaxonomy(t *testing.T) {
 		{
 			name:  "blob resource case-variant media type",
 			block: blobResourceBlock(png, stringPtr("IMAGE/PNG")),
-			want:  map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
+			want:  map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
 		},
 		{
 			name:  "blob resource leading-whitespace media type",
 			block: blobResourceBlock(png, stringPtr(" image/png")),
-			want:  map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
+			want:  map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
 		},
 		{
 			name:  "blob resource parameterized media type",
 			block: blobResourceBlock(png, stringPtr("image/png; charset=binary")),
-			want:  map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
+			want:  map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
+		},
+		{
+			name:  "blob resource rejected deep in the raster chain",
+			block: blobResourceBlock(fixtureImageBase64(t, "truncated.png"), stringPtr(mimePNG)),
+			want:  map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidDimensions, jsonFieldIndex: 0},
 		},
 		{
 			name:  "recognized raster with bad dimensions and mismatched declared type",
@@ -122,13 +128,6 @@ func TestValidatePromptImagesSizeLimits(t *testing.T) {
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
 			jsonFieldSizeBytes: 2 * decodedSize, jsonFieldMaxBytes: decodedSize + 1,
 		})
-	})
-
-	t.Run("zero disables input limits", func(t *testing.T) {
-		session := testSession(NewAgent(WithImageLimits(ImageLimits{})), newFakeOpenCodeClient())
-		require.NoError(t, validatePromptMediaError(session,
-			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
-		))
 	})
 }
 
@@ -339,4 +338,87 @@ func TestNormalizeMediaType(t *testing.T) {
 	require.Equal(t, "", normalizeMediaType(""))
 	require.True(t, isImageMediaType("IMAGE/JPEG;q=1"))
 	require.False(t, isImageMediaType("application/pdf"))
+}
+
+// TestValidatePromptMediaChargesTextResources pins the text resource variant to
+// the same per-prompt budget as every other inbound byte channel, so bytes
+// cannot escape the aggregate by arriving as text instead of as a blob.
+func TestValidatePromptMediaChargesTextResources(t *testing.T) {
+	textBlock := func(text, uri string) acp.ContentBlock {
+		return acp.ContentBlock{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
+			TextResourceContents: &acp.TextResourceContents{Text: text, Uri: uri},
+		}}}
+	}
+
+	t.Run("text crosses the aggregate on its own", func(t *testing.T) {
+		text := strings.Repeat("t", 1024)
+		limit := int64(len(text)*2) - 1
+
+		session := testSession(NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient())
+		requireInvalidParamsData(t, validatePromptMediaError(session,
+			textBlock(text, "file:///tmp/notes"),
+			textBlock(text, "file:///tmp/notes"),
+		), map[string]any{
+			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
+			jsonFieldSizeBytes: int64(2 * len(text)), jsonFieldMaxBytes: limit,
+		})
+	})
+
+	t.Run("text shares the budget with image bytes", func(t *testing.T) {
+		png := fixtureImage(t, "valid.png")
+		text := strings.Repeat("t", 64)
+		limit := int64(len(png)+len(text)) - 1
+
+		session := testSession(NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient())
+		requireInvalidParamsData(t, validatePromptMediaError(session,
+			textBlock(text, ""),
+			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", MimeType: mimePNG, Data: base64.StdEncoding.EncodeToString(png)}},
+		), map[string]any{
+			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
+			jsonFieldSizeBytes: int64(len(png) + len(text)), jsonFieldMaxBytes: limit,
+		})
+	})
+
+	t.Run("a resource with no text charges the uri it forwards", func(t *testing.T) {
+		uri := "file:///tmp/" + strings.Repeat("u", 512)
+		limit := int64(len(uri)) - 1
+
+		session := testSession(NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient())
+		requireInvalidParamsData(t, validatePromptMediaError(session, textBlock("", uri)), map[string]any{
+			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
+			jsonFieldSizeBytes: int64(len(uri)), jsonFieldMaxBytes: limit,
+		})
+	})
+
+	t.Run("a charged text resource still maps to its unchanged native form", func(t *testing.T) {
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		block := textBlock("notes", "file:///tmp/notes")
+		require.NoError(t, validatePromptMediaError(session, block))
+
+		parts, err := promptToOpenCodeParts([]acp.ContentBlock{block}, nil)
+		require.NoError(t, err)
+		require.Equal(t, map[string]any{jsonFieldType: partTypeText, partTypeText: "notes"}, parts[0])
+	})
+}
+
+// TestValidatePromptImagesRejectsBytesPastTheTransportBound pins the frame
+// bound as a gate rather than a retention limit: an image wider than a frame is
+// refused whole, never trimmed to fit and forwarded as if it had been accepted.
+func TestValidatePromptImagesRejectsBytesPastTheTransportBound(t *testing.T) {
+	png := fixtureImage(t, "valid.png")
+	oversize := append(append([]byte(nil), png...), bytes.Repeat([]byte{0x41}, int(imageFrameBoundBytes)+1-len(png))...)
+
+	// The per-image policy limit is disabled, so only the transport bound can
+	// decide, and it is the bound the advertisement reports.
+	session := testSession(NewAgent(WithImageLimits(ImageLimits{})), newFakeOpenCodeClient())
+	block := acp.ContentBlock{Image: &acp.ContentBlockImage{
+		Type: "image", MimeType: mimePNG, Data: base64.StdEncoding.EncodeToString(oversize),
+	}}
+
+	resolved, err := session.validatePromptMedia(context.Background(), []acp.ContentBlock{block})
+	requireInvalidParamsData(t, err, map[string]any{
+		jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
+		jsonFieldSizeBytes: imageFrameBoundBytes + 1, jsonFieldMaxBytes: imageFrameBoundBytes,
+	})
+	require.Empty(t, resolved)
 }

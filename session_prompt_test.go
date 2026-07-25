@@ -1955,20 +1955,13 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 	}}}, nil); err == nil {
 		t.Fatal("empty embedded text resource accepted")
 	}
-	invalidURI := "%"
-	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &invalidURI}}}, nil)
-	if err != nil || parts[0]["filename"] != nil || parts[0]["url"] != "data:image/png;base64,AA==" {
-		t.Fatalf("invalid uri image parts = %#v err=%v", parts, err)
-	}
-	rootURI := "https://example.com"
-	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &rootURI}}}, nil)
-	if err != nil || parts[0]["filename"] != nil || parts[0]["url"] != "data:image/png;base64,AA==" {
-		t.Fatalf("root uri image parts = %#v err=%v", parts, err)
-	}
-	namedURI := "file:///tmp/shot.png"
-	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &namedURI}}}, nil)
-	if err != nil || parts[0]["filename"] != "shot.png" {
-		t.Fatalf("named uri image parts = %#v err=%v", parts, err)
+	// No image block URI contributes anything to the native part, whatever it
+	// spells: the part is built from the media type and the bytes alone.
+	for _, uri := range []string{"%", "https://example.com", "file:///tmp/shot.png"} {
+		parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &uri}}}, nil)
+		if err != nil || !reflect.DeepEqual(parts[0], map[string]any{"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA=="}) {
+			t.Fatalf("image parts for uri %q = %#v err=%v", uri, parts, err)
+		}
 	}
 	req, ids := questionElicitationRequest(opencode.QuestionRequest{ID: "q", SessionID: "s"})
 	if req.Form == nil || req.Form.Message != "OpenCode needs input" || !reflect.DeepEqual(ids, []string{"question_1"}) {
@@ -1996,7 +1989,7 @@ func TestPromptSendsNativeImageFileParts(t *testing.T) {
 		want := []map[string]any{
 			{"type": "text", "text": "look"},
 			{"type": "file", "mime": "image/png", "url": "data:image/png;base64," + png},
-			{"type": "file", "mime": "image/jpeg", "url": "data:image/jpeg;base64," + jpeg, "filename": "screenshot.jpg"},
+			{"type": "file", "mime": "image/jpeg", "url": "data:image/jpeg;base64," + jpeg},
 		}
 		if !reflect.DeepEqual(req.Parts, want) {
 			t.Fatalf("native parts = %#v, want %#v", req.Parts, want)
@@ -2005,8 +1998,9 @@ func TestPromptSendsNativeImageFileParts(t *testing.T) {
 		return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
 	}
 
-	// The second image carries provenance URI alongside authoritative data:
-	// the submitted pixels come from data, the URI contributes the filename.
+	// The second image carries a URI alongside authoritative data. The
+	// submitted pixels come from the data, and the URI contributes nothing:
+	// the two images build the same shape of native part.
 	_, err := session.Prompt(context.Background(), acp.PromptRequest{
 		SessionId: session.id,
 		Prompt: []acp.ContentBlock{

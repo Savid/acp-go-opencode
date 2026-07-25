@@ -709,7 +709,7 @@ func slashCommandInvocation(blocks []acp.ContentBlock) (slashCommandPrompt, bool
 	return slashCommandPrompt{name: rest}, true
 }
 
-func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedHandoffImages) ([]map[string]any, error) {
+func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedPromptImages) ([]map[string]any, error) {
 	parts := make([]map[string]any, 0, len(blocks))
 	for position, block := range blocks {
 		switch {
@@ -738,7 +738,7 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedHandoffIma
 	return parts, nil
 }
 
-func commandPromptParts(blocks []acp.ContentBlock, handoff resolvedHandoffImages) ([]map[string]any, error) {
+func commandPromptParts(blocks []acp.ContentBlock, handoff resolvedPromptImages) ([]map[string]any, error) {
 	if len(blocks) == 0 {
 		return nil, nil
 	}
@@ -763,7 +763,7 @@ func commandPromptParts(blocks []acp.ContentBlock, handoff resolvedHandoffImages
 	return parts, nil
 }
 
-func commandFilePart(position int, block acp.ContentBlock, handoff resolvedHandoffImages) (map[string]any, bool, error) {
+func commandFilePart(position int, block acp.ContentBlock, handoff resolvedPromptImages) (map[string]any, bool, error) {
 	switch {
 	case block.Image != nil:
 		return handoff.imagePart(position, block.Image), true, nil
@@ -825,29 +825,16 @@ func blobResourceOpenCodePart(resource *acp.BlobResourceContents) (map[string]an
 	return part, nil
 }
 
-// imageOpenCodePart maps one validated ACP image block to its native file
-// part. Embedded data is authoritative and always validated before mapping;
-// the URI, when present, contributes filename provenance only.
+// imageOpenCodePart maps one ACP image block to its native file part. No name
+// is derived from the block URI: the handoff form has no name it is allowed to
+// pass on, so neither form contributes one and both build the same native part
+// for the same image.
 func imageOpenCodePart(image *acp.ContentBlockImage) map[string]any {
-	part := map[string]any{
+	return map[string]any{
 		jsonFieldType: partTypeFile,
 		jsonFieldMime: image.MimeType,
 		jsonFieldURL:  "data:" + image.MimeType + ";base64," + image.Data,
 	}
-
-	if filename := imageFilename(image); filename != "" {
-		part["filename"] = filename
-	}
-
-	return part
-}
-
-func imageFilename(image *acp.ContentBlockImage) string {
-	if image.Uri == nil || *image.Uri == "" {
-		return ""
-	}
-
-	return filenameFromURI(*image.Uri)
 }
 
 func filenameFromURI(uri string) string {

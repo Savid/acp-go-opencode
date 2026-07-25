@@ -93,8 +93,8 @@ internal decision sourced only from authenticated provider
 
 | Field | Meaning |
 |---|---|
-| `maxBytes` | Effective per-image decoded byte gate — `ImageLimits.MaxInputBytesPerImage`, so a configured value is reported instead of the default. |
-| `maxPromptBytes` | Effective per-prompt aggregate decoded byte gate (`ImageLimits.MaxInputBytesPerPrompt`). |
+| `maxBytes` | Effective per-image decoded byte gate: `ImageLimits.MaxInputBytesPerImage` while it fits the transport frame, and `7864155` when that limit is disabled or set wider than one frame. |
+| `maxPromptBytes` | Effective per-prompt aggregate decoded byte gate (`ImageLimits.MaxInputBytesPerPrompt`). `0` is truthful: no aggregate is enforced, and the handoff block-count cap bounds the turn instead. |
 | `maxDimension` | Per-dimension pixel bound; `0` because OpenCode bounds no image dimension. `0` means unbounded, never zero pixels. |
 | `imageFormats` | The inbound allowlist, in this order. |
 | `documentFormats` | MIME types mapped to a native document representation. Always an empty array here: no MIME has one. |
