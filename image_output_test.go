@@ -346,6 +346,40 @@ func TestMaterializeLocalImage(t *testing.T) {
 		require.Equal(t, base64.StdEncoding.EncodeToString(png), item.block.Image.Data)
 	})
 
+	t.Run("reads a temp directory reached through a symlink", func(t *testing.T) {
+		session, _ := newImageSession(t)
+
+		base := t.TempDir()
+		session.agent.options.ScratchDir = filepath.Join(base, "scratch")
+		require.NoError(t, os.Mkdir(session.agent.options.ScratchDir, 0o700))
+
+		// The temp directory is a symlink on macOS, so the root has to be
+		// resolved to the same degree as the candidate or it never matches.
+		// Narrowing os.TempDir to a link built here puts that on every host
+		// rather than only on the hosts whose temp directory happens to be one.
+		target := filepath.Join(base, "tmp-target")
+		require.NoError(t, os.Mkdir(target, 0o700))
+
+		tempRoot := filepath.Join(base, "tmp")
+		require.NoError(t, os.Symlink(target, tempRoot))
+
+		for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+			t.Setenv(name, tempRoot)
+		}
+
+		require.Equal(t, tempRoot, os.TempDir())
+
+		path := filepath.Join(tempRoot, "frame_01.png")
+		require.NoError(t, os.WriteFile(path, png, 0o600))
+
+		item, mapped, err := session.mapOutputArtifact(ctx, opencode.NativeAttachment{
+			Mime: mimePNG, URL: "file://" + path,
+		}, "id-temp-link", provenanceTool, false)
+		require.NoError(t, err)
+		require.True(t, mapped)
+		require.Equal(t, base64.StdEncoding.EncodeToString(png), item.block.Image.Data)
+	})
+
 	t.Run("path outside allowed roots", func(t *testing.T) {
 		session, _ := newImageSession(t)
 		outside := filepath.Join(narrowedOutsideRoot(t, session), "elsewhere.png")
