@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -29,7 +30,62 @@ const (
 	outputReasonPathNotAllowed    = "path_not_allowed"
 	outputReasonTooLarge          = "too_large"
 	outputReasonStorageFailed     = "storage_failed"
+
+	// Guidance carried back in place of an image output the adapter will not
+	// ship. Each string is a fixed constant keyed only by the verdict token: it
+	// says what to do next and never describes the path, filename, size, or
+	// operating-system error that produced the verdict.
+	imageGuidancePathNotAllowed = "write the image inside the workspace and try again"
+	imageGuidanceMissingFile    = "the image file could not be read; write the image inside the workspace and try again"
+	imageGuidanceTooLarge       = "the image is too large to send; write a smaller image and try again"
+	imageGuidanceNotRaster      = "the file is not a supported raster image; write a PNG, JPEG, GIF, WebP, BMP, ICO, or TIFF and try again"
+	imageGuidanceInvalidBase64  = "the image payload could not be decoded; write the image to a file inside the workspace and try again"
+	imageGuidanceMIMEMismatched = "the declared media type does not match the image; write the image again with a matching media type"
+
+	// Wire messages for a refused local artifact. Like the guidance above they
+	// are fixed: a refusal never names the path, filename, or byte count it
+	// refused, so it cannot answer questions about the filesystem.
+	outputMessageUnreadable   = "native image artifact is not readable"
+	outputMessageOutsideRoots = "native image artifact resolves outside the allowed roots"
+	outputMessageNotRegular   = "native image artifact is not a regular file"
+	outputMessageMIMEMismatch = "native image artifact declares a media type its bytes contradict"
 )
+
+// imageOutputGuidance classifies an image-output failure. A recoverable
+// verdict is an ordinary mistake that can be retried — the bytes were written
+// somewhere the adapter may not read, are gone, are too big, or are not an
+// image — and comes back with fixed guidance. A storage failure is the
+// adapter's own artifact store breaking, which no retry addresses.
+func imageOutputGuidance(err error) (string, bool) {
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) {
+		return "", false
+	}
+
+	data, _ := failure.Data.(map[string]any)
+	if data[jsonFieldStage] != imageOutputStage {
+		return "", false
+	}
+
+	reason, _ := data[jsonFieldReason].(string)
+
+	switch reason {
+	case outputReasonPathNotAllowed:
+		return imageGuidancePathNotAllowed, true
+	case outputReasonMissingFile:
+		return imageGuidanceMissingFile, true
+	case outputReasonTooLarge:
+		return imageGuidanceTooLarge, true
+	case outputReasonNotARaster:
+		return imageGuidanceNotRaster, true
+	case outputReasonInvalidBase64:
+		return imageGuidanceInvalidBase64, true
+	case outputReasonMediaTypeMismatch:
+		return imageGuidanceMIMEMismatched, true
+	default:
+		return "", false
+	}
+}
 
 // Filesystem seams for deterministic materialization fault tests.
 var (
@@ -348,27 +404,34 @@ func validateOutputImageBytes(decoded []byte, declaredMime string) (string, erro
 
 	declared := strings.ToLower(strings.TrimSpace(declaredMime))
 	if _, verifiable := outputComparableMIMEs[declared]; verifiable && declared != sniffed {
-		return "", imageOutputFailure(
-			outputReasonMediaTypeMismatch,
-			fmt.Sprintf("native artifact declared %s but its bytes are %s", declared, sniffed),
-			0, 0,
-		)
+		return "", imageOutputFailure(outputReasonMediaTypeMismatch, outputMessageMIMEMismatch, 0, 0)
 	}
 
 	return sniffed, nil
 }
 
 // allowedImageRoots are the only roots a harness-returned artifact path may
-// resolve into: the session workspace directories and the wrapper-owned
-// scratch parent. The configured native home is never readable as a whole.
+// resolve into: the session workspace directories, the wrapper-owned scratch
+// parent, and the operating-system temporary directory the harness sandbox
+// already writes to. The configured native home is never readable as a whole.
+// The roots stop accidental reads of arbitrary paths; they are not an
+// exfiltration boundary against a shell-capable agent, which can copy any
+// readable file into the workspace.
 func (s *session) allowedImageRoots() []string {
-	roots := make([]string, 0, len(s.additionalDirectories)+2)
+	roots := make([]string, 0, len(s.additionalDirectories)+3)
 	roots = append(roots, s.cwd)
 	roots = append(roots, s.additionalDirectories...)
 
 	if s.agent != nil {
 		roots = append(roots, scratchParent(s.agent.options.ScratchDir))
 	}
+
+	// The harness sandbox already permits writing to the OS temp directory, so
+	// a root set without it refuses reads of files the model was allowed to
+	// create. A temp file stays subject to every check in
+	// materializeLocalImage: the temp directory is shared with every process on
+	// the host, and nothing in it is trusted for being there.
+	roots = append(roots, os.TempDir())
 
 	return roots
 }
@@ -379,20 +442,20 @@ func (s *session) allowedImageRoots() []string {
 func (s *session) materializeLocalImage(path string) ([]byte, error) {
 	resolved, err := imageEvalSymlinks(path)
 	if err != nil {
-		return nil, imageOutputFailure(outputReasonMissingFile, fmt.Sprintf("native image artifact %s is not readable", filepath.Base(path)), 0, 0)
+		return nil, imageOutputFailure(outputReasonMissingFile, outputMessageUnreadable, 0, 0)
 	}
 
 	if !s.imagePathAllowed(resolved) {
-		return nil, imageOutputFailure(outputReasonPathNotAllowed, fmt.Sprintf("native image artifact %s resolves outside the allowed roots", filepath.Base(path)), 0, 0)
+		return nil, imageOutputFailure(outputReasonPathNotAllowed, outputMessageOutsideRoots, 0, 0)
 	}
 
 	info, err := imageStat(resolved)
 	if err != nil {
-		return nil, imageOutputFailure(outputReasonMissingFile, fmt.Sprintf("native image artifact %s is not readable", filepath.Base(path)), 0, 0)
+		return nil, imageOutputFailure(outputReasonMissingFile, outputMessageUnreadable, 0, 0)
 	}
 
 	if !info.Mode().IsRegular() {
-		return nil, imageOutputFailure(outputReasonPathNotAllowed, fmt.Sprintf("native image artifact %s is not a regular file", filepath.Base(path)), 0, 0)
+		return nil, imageOutputFailure(outputReasonPathNotAllowed, outputMessageNotRegular, 0, 0)
 	}
 
 	maxBytes := effectiveOutputLimit(s.imageLimits().MaxOutputBytesPerImage)
@@ -402,13 +465,13 @@ func (s *session) materializeLocalImage(path string) ([]byte, error) {
 
 	file, err := imageOpen(resolved)
 	if err != nil {
-		return nil, imageOutputFailure(outputReasonMissingFile, fmt.Sprintf("native image artifact %s is not readable", filepath.Base(path)), 0, 0)
+		return nil, imageOutputFailure(outputReasonMissingFile, outputMessageUnreadable, 0, 0)
 	}
 	defer file.Close()
 
 	decoded, err := imageReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
-		return nil, imageOutputFailure(outputReasonMissingFile, fmt.Sprintf("native image artifact %s is not readable", filepath.Base(path)), 0, 0)
+		return nil, imageOutputFailure(outputReasonMissingFile, outputMessageUnreadable, 0, 0)
 	}
 
 	if int64(len(decoded)) > maxBytes {

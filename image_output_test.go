@@ -269,6 +269,39 @@ func TestMapLocalImageArtifactReplay(t *testing.T) {
 	})
 }
 
+// TestImageOutputGuidanceSplitsRecoverableFromFatal pins the blast radius of
+// every image-output verdict: an ordinary mistake that can be retried carries
+// guidance and keeps the turn, the adapter's own store breaking does not.
+func TestImageOutputGuidanceSplitsRecoverableFromFatal(t *testing.T) {
+	recoverable := map[string]string{
+		outputReasonPathNotAllowed:    imageGuidancePathNotAllowed,
+		outputReasonMissingFile:       imageGuidanceMissingFile,
+		outputReasonTooLarge:          imageGuidanceTooLarge,
+		outputReasonNotARaster:        imageGuidanceNotRaster,
+		outputReasonInvalidBase64:     imageGuidanceInvalidBase64,
+		outputReasonMediaTypeMismatch: imageGuidanceMIMEMismatched,
+	}
+
+	for reason, guidance := range recoverable {
+		message, ok := imageOutputGuidance(imageOutputFailure(reason, "detail", 0, 0))
+		require.True(t, ok, reason)
+		require.Equal(t, guidance, message)
+
+		// The guidance says what to do next and never describes the input.
+		require.NotContains(t, message, "root")
+		require.NotContains(t, message, "path")
+	}
+
+	_, ok := imageOutputGuidance(imageOutputFailure(outputReasonStorageFailed, "detail", 0, 0))
+	require.False(t, ok)
+
+	_, ok = imageOutputGuidance(acp.NewInternalError(map[string]any{jsonFieldStage: "other"}))
+	require.False(t, ok)
+
+	_, ok = imageOutputGuidance(errors.New("not a request error"))
+	require.False(t, ok)
+}
+
 func TestMaterializeLocalImage(t *testing.T) {
 	ctx := context.Background()
 	png := fixtureImage(t, "valid.png")
@@ -286,12 +319,36 @@ func TestMaterializeLocalImage(t *testing.T) {
 		require.Equal(t, base64.StdEncoding.EncodeToString(png), item.block.Image.Data)
 	})
 
+	t.Run("reads the operating-system temp directory", func(t *testing.T) {
+		session, _ := newImageSession(t)
+
+		// A configured scratch dir moves the scratch parent off the temp
+		// directory, so the temp directory is a root here on its own account.
+		session.agent.options.ScratchDir = t.TempDir()
+
+		// The real os.TempDir, not a narrowed one, and reached through
+		// os.MkdirTemp so the fixture sits wherever this platform actually puts
+		// temp files, symlinked parents included.
+		dir, err := os.MkdirTemp("", "opencode-image-output")
+		require.NoError(t, err)
+
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+		path := filepath.Join(dir, "frame_01.png")
+		require.NoError(t, os.WriteFile(path, png, 0o600))
+		require.False(t, pathWithinRoot(session.cwd, path))
+
+		item, mapped, err := session.mapOutputArtifact(ctx, opencode.NativeAttachment{
+			Mime: mimePNG, URL: "file://" + path,
+		}, "id-temp", provenanceTool, false)
+		require.NoError(t, err)
+		require.True(t, mapped)
+		require.Equal(t, base64.StdEncoding.EncodeToString(png), item.block.Image.Data)
+	})
+
 	t.Run("path outside allowed roots", func(t *testing.T) {
 		session, _ := newImageSession(t)
-		// A set scratch dir removes the system temp dir from the allowed roots,
-		// so a file in a distinct temp subtree is genuinely outside them.
-		session.agent.options.ScratchDir = t.TempDir()
-		outside := filepath.Join(t.TempDir(), "elsewhere.png")
+		outside := filepath.Join(narrowedOutsideRoot(t, session), "elsewhere.png")
 		require.NoError(t, os.WriteFile(outside, png, 0o600))
 
 		_, _, err := session.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: "file://" + outside}, "id-1", provenanceTool, false)
@@ -317,10 +374,7 @@ func TestMaterializeLocalImage(t *testing.T) {
 
 	t.Run("symlink escaping the allowed roots", func(t *testing.T) {
 		session, _ := newImageSession(t)
-		// A set scratch dir removes the system temp dir from the allowed roots,
-		// so the symlink target below lives in a genuinely outside subtree.
-		session.agent.options.ScratchDir = t.TempDir()
-		outside := filepath.Join(t.TempDir(), "outside.png")
+		outside := filepath.Join(narrowedOutsideRoot(t, session), "outside.png")
 		require.NoError(t, os.WriteFile(outside, png, 0o600))
 		link := filepath.Join(session.cwd, "escape.png")
 		require.NoError(t, os.Symlink(outside, link))

@@ -4045,12 +4045,34 @@ func TestFilePartUpdates(t *testing.T) {
 		require.Empty(t, conn.updates)
 	})
 
-	t.Run("assistant mapping error is turn fatal", func(t *testing.T) {
-		session, _ := newImageSession(t)
+	// An assistant image the adapter will not ship has no tool call to
+	// attribute to, so its guidance takes the image's place and the turn
+	// keeps its context instead of ending.
+	t.Run("assistant refusal becomes agent guidance and keeps the turn", func(t *testing.T) {
+		session, conn := newImageSession(t)
 		part := opencode.NativePart{ID: "f7", MessageID: "m1", Type: partTypeFile, Mime: mimePNG, URL: "data:image/png;base64,!!!!"}
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", part, "", false))
+		require.Len(t, conn.updates, 1)
+		require.Equal(t, imageGuidanceInvalidBase64, conn.updates[0].Update.AgentMessageChunk.Content.Text.Text)
+
+		next := opencode.NativePart{ID: "f8", MessageID: "m1", Type: partTypeText, Text: "still here"}
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", next, "", false))
+		require.Len(t, conn.updates, 2)
+	})
+
+	// The artifact store breaking is the adapter's own durability failing, so
+	// it still ends the turn.
+	t.Run("assistant storage failure is turn fatal", func(t *testing.T) {
+		session, _ := newImageSession(t)
+		original := imageJSONMarshal
+		imageJSONMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal boom") }
+
+		t.Cleanup(func() { imageJSONMarshal = original })
+
+		part := opencode.NativePart{ID: "f9", MessageID: "m1", Type: partTypeFile, Mime: mimePNG, URL: dataURL(mimePNG, png)}
 		err := session.emitPartUpdates(ctx, "assistant", part, "", false)
 		data := assertTurnFailed(t, err, causeTransport, "")
-		require.Equal(t, outputReasonInvalidBase64, data[jsonFieldReason])
+		require.Equal(t, outputReasonStorageFailed, data[jsonFieldReason])
 	})
 }
 
@@ -4073,7 +4095,7 @@ func TestToolPartUpdatesWithAttachments(t *testing.T) {
 		require.Len(t, conn.updates[0].Update.ToolCall.Content, 1)
 	})
 
-	t.Run("failed attachment reports failed tool then fails turn", func(t *testing.T) {
+	t.Run("refused attachment fails the tool call and keeps the turn", func(t *testing.T) {
 		session, conn := newImageSession(t)
 		state, err := json.Marshal(map[string]any{
 			"status":      "completed",
@@ -4082,10 +4104,44 @@ func TestToolPartUpdatesWithAttachments(t *testing.T) {
 		})
 		require.NoError(t, err)
 		part := opencode.NativePart{CallID: "call-2", Type: partTypeTool, Tool: "read", State: state}
-		err = session.emitPartUpdates(ctx, "assistant", part, "", false)
-		require.Error(t, err)
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", part, "", false))
 		require.Len(t, conn.updates, 1)
-		require.Equal(t, acp.ToolCallStatusFailed, conn.updates[0].Update.ToolCall.Status)
+
+		call := conn.updates[0].Update.ToolCall
+		require.Equal(t, acp.ToolCallStatusFailed, call.Status)
+		require.Len(t, call.Content, 1)
+		require.Equal(t, imageGuidanceMissingFile, call.Content[0].Content.Content.Text.Text)
+
+		// The turn keeps making progress after the refusal.
+		next := opencode.NativePart{ID: "t2", MessageID: "m1", Type: partTypeText, Text: "still here"}
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", next, "", false))
+		require.Len(t, conn.updates, 2)
+	})
+
+	// A tool call already published advances to failed and carries the same
+	// guidance on the update rather than on a start.
+	t.Run("refused attachment on a published tool call carries guidance", func(t *testing.T) {
+		session, conn := newImageSession(t)
+		pending := opencode.NativePart{
+			CallID: "call-3", Type: partTypeTool, Tool: "read",
+			State: json.RawMessage(`{"status":"pending","title":"read"}`),
+		}
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", pending, "", false))
+
+		state, err := json.Marshal(map[string]any{
+			"status":      "completed",
+			"title":       "read",
+			"attachments": []map[string]any{{"id": "a", "type": "file", "mime": mimePNG}},
+		})
+		require.NoError(t, err)
+
+		part := opencode.NativePart{CallID: "call-3", Type: partTypeTool, Tool: "read", State: state}
+		require.NoError(t, session.emitPartUpdates(ctx, "assistant", part, "", false))
+
+		update := conn.updates[len(conn.updates)-1].Update.ToolCallUpdate
+		require.Equal(t, acp.ToolCallStatusFailed, *update.Status)
+		require.Len(t, update.Content, 1)
+		require.Equal(t, imageGuidanceMissingFile, update.Content[0].Content.Content.Text.Text)
 	})
 }
 

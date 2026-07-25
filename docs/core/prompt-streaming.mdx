@@ -139,8 +139,20 @@ rarely exercised case, since model-native image output does not survive as a
 standalone assistant file part in practice. A
 remote URI-only artifact becomes an ACP `resource_link` on its true provenance;
 the adapter never downloads it. Output MIME is the truthful sniffed type and is
-not allowlisted. Emitted bytes over the configured or transport-frame limit fail
-the turn with a `stage: "image_output"` envelope rather than reaching the wire.
+not allowlisted. A local artifact path is read only when it resolves, through
+its symlinks, to a regular file inside the session workspace, an additional
+directory, the scratch parent, or the operating-system temporary directory the
+harness sandbox already writes to.
+
+An image the adapter will not ship — outside those roots, missing, not a
+regular file, over the configured or transport-frame limit, not a raster, or
+declaring a media type its bytes contradict — fails **that tool call only**.
+The failed tool call carries fixed guidance as its own content, saying what to
+do next without naming the path, filename, size, or operating-system error, and
+the turn keeps running with its context; an assistant file part, which has no
+tool call to attribute to, is replaced by the same guidance as agent text. Only
+a session-store failure (`reason: "storage_failed"`) still ends the turn with a
+`stage: "image_output"` envelope.
 
 OpenCode text and reasoning part events carry the complete part plus, on live
 updates, an explicit appended `delta`. The adapter forwards that delta and

@@ -130,5 +130,5 @@ A failed turn returns an ACP internal error whose `data` carries:
 | `message` | The real native cause text. |
 | `statusCode` / `providerCode` | Included when the provider reports them. |
 | `structuredOutputRequested` | `true` when the turn sent a native output schema. |
-| `stage` / `reason` | Present on an image-output failure: `stage` is `image_output`; `reason` is one of `invalid_base64`, `not_a_raster`, `media_type_mismatch`, `missing_file`, `path_not_allowed`, `too_large`, or `storage_failed`. |
+| `stage` / `reason` | Present on an image-output failure: `stage` is `image_output`; `reason` is always `storage_failed`, because the other image-output verdicts refuse the tool call without ending the turn. |
 | `sizeBytes` / `maxBytes` | Present when an image-output failure carries decoded sizes. |

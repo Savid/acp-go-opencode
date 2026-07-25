@@ -1104,7 +1104,18 @@ func (s *session) filePartUpdates(
 
 	item, mapped, err := s.mapOutputArtifact(ctx, artifact, "file/"+part.ID, provenanceAgent, replay)
 	if err != nil {
-		return nil, nil, err
+		// An assistant file part has no tool call to attribute to, so the
+		// guidance takes the image's place rather than the image vanishing.
+		guidance, recoverable := imageOutputGuidance(err)
+		if !recoverable {
+			return nil, nil, err
+		}
+
+		return []acp.SessionUpdate{{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+			SessionUpdate: updateAgentMessageChunk,
+			MessageId:     &messageID,
+			Content:       acp.TextBlock(guidance),
+		}}}, nil, nil
 	}
 
 	if !mapped {
@@ -1218,8 +1229,9 @@ func (s *session) toolPartUpdates(ctx context.Context, part opencode.NativePart,
 
 	previous, seen := s.emittedTools[string(id)]
 
-	// An attachment the adapter cannot represent is turn-fatal, but the tool
-	// call first reports a failed state, without content, for attribution.
+	// An attachment the adapter will not ship fails the tool call. A verdict
+	// the model can act on carries its guidance there and the turn runs on;
+	// only the artifact store breaking is still turn-fatal.
 	if mapErr != nil {
 		return s.failedToolAttribution(id, part, current, previous, seen, mapErr)
 	}
@@ -1300,9 +1312,12 @@ func (s *session) toolPartUpdates(ctx context.Context, part opencode.NativePart,
 	}, nil
 }
 
-// failedToolAttribution builds the status-only failed tool state emitted
-// before an adapter image mapping failure fails the turn. Content already
-// delivered for the tool call is left intact by omitting the content field.
+// failedToolAttribution builds the failed tool state for an attachment the
+// adapter will not ship. A recoverable verdict carries its guidance as the
+// tool call's own content and returns no error, so the turn keeps its context
+// and can write the image somewhere readable; the artifact store breaking
+// returns the error and stays turn-fatal, with content already delivered for
+// the tool call left intact by omitting the content field.
 func (s *session) failedToolAttribution(
 	id acp.ToolCallId,
 	part opencode.NativePart,
@@ -1311,30 +1326,55 @@ func (s *session) failedToolAttribution(
 	seen bool,
 	mapErr error,
 ) ([]acp.SessionUpdate, func(), error) {
+	guidance, recoverable := imageOutputGuidance(mapErr)
+
+	turnErr := mapErr
+	if recoverable {
+		turnErr = nil
+	}
+
+	refusalContent := func() []acp.ToolCallContent {
+		if !recoverable {
+			return nil
+		}
+
+		return []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(guidance))}
+	}()
+
 	if !seen {
 		failed := current
 		failed.status = acp.ToolCallStatusFailed
 
-		return []acp.SessionUpdate{acp.StartToolCall(id, current.title,
-				acp.WithStartKind(toolKind(part.Tool)),
-				acp.WithStartStatus(acp.ToolCallStatusFailed),
-			)}, func() {
-				s.emittedTools[string(id)] = emittedToolState(failed)
-				s.markActiveToolCallID(string(id))
-			}, mapErr
+		opts := []acp.ToolCallStartOpt{
+			acp.WithStartKind(toolKind(part.Tool)),
+			acp.WithStartStatus(acp.ToolCallStatusFailed),
+		}
+		if refusalContent != nil {
+			opts = append(opts, acp.WithStartContent(refusalContent))
+		}
+
+		return []acp.SessionUpdate{acp.StartToolCall(id, current.title, opts...)}, func() {
+			s.emittedTools[string(id)] = emittedToolState(failed)
+			s.markActiveToolCallID(string(id))
+		}, turnErr
 	}
 
 	if !toolStatusCanAdvance(previous.status, acp.ToolCallStatusFailed) {
-		return nil, nil, mapErr
+		return nil, nil, turnErr
 	}
 
 	next := previous
 	next.status = acp.ToolCallStatusFailed
 
-	return []acp.SessionUpdate{acp.UpdateToolCall(id, acp.WithUpdateStatus(acp.ToolCallStatusFailed))}, func() {
+	opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(acp.ToolCallStatusFailed)}
+	if refusalContent != nil {
+		opts = append(opts, acp.WithUpdateContent(refusalContent))
+	}
+
+	return []acp.SessionUpdate{acp.UpdateToolCall(id, opts...)}, func() {
 		s.emittedTools[string(id)] = next
 		s.markActiveToolCallID(string(id))
-	}, mapErr
+	}, turnErr
 }
 
 func nativeToolPartState(part opencode.NativePart, id acp.ToolCallId) nativeToolState {

@@ -56,6 +56,33 @@ func newImageSession(t *testing.T) (*session, *recordingAgentClient) {
 	return session, conn
 }
 
+// narrowedOutsideRoot points os.TempDir at a directory of its own and returns
+// a sibling directory outside every allowed image root, so a case can hold a
+// path the adapter must refuse even though the real temp directory is a root.
+// Every variable os.TempDir consults on any supported platform is set, and the
+// session's scratch parent is pinned so it does not follow the narrowing.
+func narrowedOutsideRoot(t *testing.T, sess *session) string {
+	t.Helper()
+
+	base := t.TempDir()
+	sess.agent.options.ScratchDir = filepath.Join(base, "scratch")
+	require.NoError(t, os.Mkdir(sess.agent.options.ScratchDir, 0o700))
+
+	tempRoot := filepath.Join(base, "tmp")
+	require.NoError(t, os.Mkdir(tempRoot, 0o700))
+
+	outside := filepath.Join(base, "outside")
+	require.NoError(t, os.Mkdir(outside, 0o700))
+
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(name, tempRoot)
+	}
+
+	require.Equal(t, tempRoot, os.TempDir())
+
+	return outside
+}
+
 func dataURL(mime string, decoded []byte) string {
 	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(decoded)
 }
