@@ -385,12 +385,20 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 	}
 }
 
+// ensureOpen refuses an agent that is closed or was built with options this
+// package rejected. The options answer is not left to initialize alone: an
+// in-process host may never call it, and an agent whose limits or read root were
+// refused must not serve a turn under them.
 func (a *Agent) ensureOpen() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.closed {
 		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+	}
+
+	if a.optionsErr != nil {
+		return acp.NewInvalidParams(map[string]any{jsonFieldError: a.optionsErr.Error()})
 	}
 
 	return nil

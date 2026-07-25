@@ -82,23 +82,23 @@ type handoffReference struct {
 	sizeBytes int64
 }
 
-// resolvedPromptImage carries one validated image's bytes re-encoded from the
+// resolvedPromptBytes carries one validated block's bytes re-encoded from the
 // bytes validation actually inspected, which is what native mapping sends. A
 // host's own base64 spelling never reaches the harness, so two spellings of
-// the same image cannot become two different native requests, and neither form
-// contributes a name derived from a block URI.
-type resolvedPromptImage struct {
+// the same payload cannot become two different native requests, and no image
+// form contributes a name derived from a block URI.
+type resolvedPromptBytes struct {
 	mime string
 	data string
 }
 
-// resolvedPromptImages indexes validated images by their position in the
-// prompt block slice that validation and native mapping both walk.
-type resolvedPromptImages map[int]resolvedPromptImage
+// resolvedPromptMedia indexes validated byte-bearing blocks by their position in
+// the prompt block slice that validation and native mapping both walk.
+type resolvedPromptMedia map[int]resolvedPromptBytes
 
 // imagePart maps one image block to its native file part from the validated
 // bytes recorded for it.
-func (r resolvedPromptImages) imagePart(index int, image *acp.ContentBlockImage) map[string]any {
+func (r resolvedPromptMedia) imagePart(index int, image *acp.ContentBlockImage) map[string]any {
 	validated, ok := r[index]
 	if !ok {
 		return imageOpenCodePart(image)
@@ -109,6 +109,17 @@ func (r resolvedPromptImages) imagePart(index int, image *acp.ContentBlockImage)
 		jsonFieldMime: validated.mime,
 		jsonFieldURL:  "data:" + validated.mime + ";base64," + validated.data,
 	}
+}
+
+// blobPart maps one embedded blob resource to its native file part, carrying the
+// re-encoding of the bytes validation decoded rather than the host's own base64.
+func (r resolvedPromptMedia) blobPart(index int, resource *acp.BlobResourceContents) (map[string]any, error) {
+	validated, ok := r[index]
+	if !ok {
+		return blobResourceOpenCodePart(resource, resource.Blob)
+	}
+
+	return blobResourceOpenCodePart(resource, validated.data)
 }
 
 // handoffIntent reports whether an image block with empty data is attempting
@@ -128,11 +139,14 @@ func handoffIntent(image *acp.ContentBlockImage) bool {
 	return err == nil && parsed.Scheme == schemeFile
 }
 
-// readHandoffImage runs the handoff pre-gate ahead of every embedded gate:
-// envelope shape, URI shape, an open the read root confines, the declared media
-// type, the declared size, a bounded read, then a fail-closed digest
-// verification. Every byte it returns has been verified against the declared
-// digest.
+// readHandoffImage runs the handoff pre-gate ahead of every embedded gate.
+//
+// Everything the request decides on its own is decided first — envelope shape,
+// URI shape, the declared media type, the declared size — so a block this
+// adapter was never going to accept costs no filesystem access, and a refused
+// declaration cannot be used to learn whether the path it named exists. Only
+// then is the file opened inside the read root, read to its declaration, and
+// verified. Every byte it returns has been verified against the declared digest.
 func (s *session) readHandoffImage(ctx context.Context, media promptMedia, limits ImageLimits) ([]byte, error) {
 	dir := s.inputHandoffRoot()
 	if dir == "" {
@@ -142,6 +156,18 @@ func (s *session) readHandoffImage(ctx context.Context, media promptMedia, limit
 	reference, cause := handoffReferenceFrom(media.image)
 	if cause != "" {
 		return nil, handoffInputError(media.index, imageErrorInvalidHandoff, cause)
+	}
+
+	if refused := checkMediaAllowlist(media); refused != nil {
+		return nil, refused
+	}
+
+	// The size gate reads the host's own declaration, so an oversize block is
+	// refused with nothing opened and without measuring a file the caller may
+	// not be entitled to measure.
+	gate := effectiveInputBytesPerImage(limits.MaxInputBytesPerImage)
+	if reference.sizeBytes > gate {
+		return nil, mediaInputSizeError(media.field(), media.index, reference.sizeBytes, gate)
 	}
 
 	// The open and the read are the only syscalls a hung filesystem can park
@@ -159,26 +185,14 @@ func (s *session) readHandoffImage(ctx context.Context, media promptMedia, limit
 	// on each refusal path.
 	defer file.Close()
 
-	// The declared media type decides before any bytes are read, so a block
-	// outside the format contract costs one open rather than a read and a hash.
-	if refused := checkMediaAllowlist(media); refused != nil {
-		return nil, refused
-	}
-
-	gate := effectiveInputBytesPerImage(limits.MaxInputBytesPerImage)
-	if reference.sizeBytes > gate {
-		return nil, mediaInputSizeError(media.field(), media.index, reference.sizeBytes, gate)
-	}
-
-	decoded, err := imageReadAll(io.LimitReader(file, gate+1))
+	// The read is bounded by the declaration rather than by the policy gate, so
+	// a host cannot commit this adapter to a large read without declaring one.
+	// One byte past the declaration is all it takes to see the file is not the
+	// one described, and the verification below refuses it: a file bigger than
+	// it claims is not the file the declared digest covers.
+	decoded, err := imageReadAll(io.LimitReader(file, reference.sizeBytes+1))
 	if err != nil {
 		return nil, handoffInputError(media.index, imageErrorMissingFile, handoffCauseUnreadable)
-	}
-
-	// The size verdict is decided on the bytes read and on nothing else, so a
-	// file that grew while it was being read is rejected rather than forwarded.
-	if int64(len(decoded)) > gate {
-		return nil, mediaInputSizeError(media.field(), media.index, int64(len(decoded)), gate)
 	}
 
 	if int64(len(decoded)) != reference.sizeBytes || !handoffDigestMatches(decoded, reference.digest) {

@@ -46,15 +46,19 @@ only trusted peer:
 - Native session IDs, canonical directory scopes, and turn nonces bind every
   prompt, abort, permission, question, and event route.
 - Prompt images are read from a local path only when `WithInputHandoffRoot`
-  configures one, and only from beneath it. The file is opened relative to that
+  configures one, and only from beneath it. The envelope, the URI, the declared
+  media type, and the declared size are all judged before anything is opened, so
+  a malformed block never reaches the filesystem and cannot be used to probe
+  which paths under the root exist. The file is then opened relative to that
   root, so the operating system enforces containment atomically with the open
   and no component can be swapped in between deciding and reading; the open
   cannot block; the opened descriptor must be a regular file; the read is
-  bounded at the per-image byte gate; and the declared digest is verified
-  fail-closed on the bytes actually read, so nothing unverified is forwarded.
-  Without the option no inbound path is ever read. The root is a read root: the
-  adapter never writes, moves, or deletes anything under it, and a resolved path
-  never reaches the native request or a log of it.
+  bounded at one byte more than the block declared, so a host cannot commit the
+  adapter to reading more than it stood behind; and the declared digest is
+  verified fail-closed on the bytes actually read, so nothing unverified is
+  forwarded. Without the option no inbound path is ever read. The root is a read
+  root: the adapter never writes, moves, or deletes anything under it, and a
+  resolved path never reaches the native request or a log of it.
 - The read root bounds name resolution, not the bytes a directory entry points
   at. A hard link placed under the root by something already able to write there
   is read like any other file, so the root is not a boundary against a process

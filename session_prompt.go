@@ -709,7 +709,7 @@ func slashCommandInvocation(blocks []acp.ContentBlock) (slashCommandPrompt, bool
 	return slashCommandPrompt{name: rest}, true
 }
 
-func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedPromptImages) ([]map[string]any, error) {
+func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedPromptMedia) ([]map[string]any, error) {
 	parts := make([]map[string]any, 0, len(blocks))
 	for position, block := range blocks {
 		switch {
@@ -718,7 +718,7 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedPromptImag
 		case block.ResourceLink != nil:
 			parts = append(parts, map[string]any{jsonFieldType: partTypeText, partTypeText: block.ResourceLink.Uri})
 		case block.Resource != nil:
-			part, err := embeddedResourceOpenCodePart(block.Resource.Resource)
+			part, err := embeddedResourceOpenCodePart(position, block.Resource.Resource, handoff)
 			if err != nil {
 				return nil, err
 			}
@@ -738,7 +738,7 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedPromptImag
 	return parts, nil
 }
 
-func commandPromptParts(blocks []acp.ContentBlock, handoff resolvedPromptImages) ([]map[string]any, error) {
+func commandPromptParts(blocks []acp.ContentBlock, handoff resolvedPromptMedia) ([]map[string]any, error) {
 	if len(blocks) == 0 {
 		return nil, nil
 	}
@@ -763,14 +763,14 @@ func commandPromptParts(blocks []acp.ContentBlock, handoff resolvedPromptImages)
 	return parts, nil
 }
 
-func commandFilePart(position int, block acp.ContentBlock, handoff resolvedPromptImages) (map[string]any, bool, error) {
+func commandFilePart(position int, block acp.ContentBlock, handoff resolvedPromptMedia) (map[string]any, bool, error) {
 	switch {
 	case block.Image != nil:
 		return handoff.imagePart(position, block.Image), true, nil
 	case block.ResourceLink != nil:
 		return resourceLinkOpenCodePart(block.ResourceLink), true, nil
 	case block.Resource != nil && block.Resource.Resource.BlobResourceContents != nil:
-		part, err := blobResourceOpenCodePart(block.Resource.Resource.BlobResourceContents)
+		part, err := handoff.blobPart(position, block.Resource.Resource.BlobResourceContents)
 
 		return part, true, err
 	default:
@@ -798,15 +798,19 @@ func resourceLinkOpenCodePart(resource *acp.ContentBlockResourceLink) map[string
 	return part
 }
 
-func blobResourceOpenCodePart(resource *acp.BlobResourceContents) (map[string]any, error) {
+// blobResourceOpenCodePart maps one embedded blob resource to its native file
+// part. The base64 it inlines is passed in rather than read off the block, so the
+// caller decides whether the harness sees the host's spelling or the re-encoding
+// of the bytes the gates measured.
+func blobResourceOpenCodePart(resource *acp.BlobResourceContents, blob string) (map[string]any, error) {
 	mimeType := defaultMimeType
 	if resource.MimeType != nil && *resource.MimeType != "" {
 		mimeType = *resource.MimeType
 	}
 
 	nativeURL := resource.Uri
-	if resource.Blob != "" {
-		nativeURL = "data:" + mimeType + ";base64," + resource.Blob
+	if blob != "" {
+		nativeURL = "data:" + mimeType + ";base64," + blob
 	}
 
 	if nativeURL == "" {
@@ -851,7 +855,11 @@ func filenameFromURI(uri string) string {
 	return name
 }
 
-func embeddedResourceOpenCodePart(resource acp.EmbeddedResourceResource) (map[string]any, error) {
+func embeddedResourceOpenCodePart(
+	position int,
+	resource acp.EmbeddedResourceResource,
+	media resolvedPromptMedia,
+) (map[string]any, error) {
 	if text := resource.TextResourceContents; text != nil {
 		value := firstNonEmpty(text.Text, text.Uri)
 		if value == "" {
@@ -868,7 +876,7 @@ func embeddedResourceOpenCodePart(resource acp.EmbeddedResourceResource) (map[st
 		}
 
 		if isImageMediaType(declared) {
-			return blobResourceOpenCodePart(blob)
+			return media.blobPart(position, blob)
 		}
 
 		if blob.Uri != "" {

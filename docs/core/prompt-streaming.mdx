@@ -79,11 +79,16 @@ embedded form, even alongside a handoff envelope. Empty `data` with a handoff
 envelope or a `file://` URI is the handoff form. Empty `data` with neither stays
 `missing_data`.
 
-A handoff block resolves in a fixed order, first failure winning:
+A handoff block resolves in a fixed order, first failure winning. The first three
+rows are decided from the request alone, so a block that was always going to be
+refused costs no filesystem access — and a refused declaration cannot be used to
+learn whether the path it named exists:
 
 | `error` | Cause |
 |---|---|
 | `invalid_handoff` | The block is malformed as a block: no configured read root, an absent or undecodable envelope, an unsupported `version`, an unrecognized envelope field, a malformed `digest` or `sizeBytes`, or a URI that is not an absolute local `file://` path. |
+| `invalid_media_type` | The declared media type is outside the four-format allowlist. |
+| `too_large` | The declared `sizeBytes` is past the effective per-image byte gate. |
 | `path_not_allowed` | The path does not open inside the read root, or the file it opens is not a regular file. |
 | `missing_file` | A path inside the read root that does not exist or cannot be read. |
 | `handoff_digest_mismatch` | The bytes do not match the declared `sizeBytes` and `digest`. |
@@ -101,16 +106,16 @@ The read root bounds where a *name* may resolve, not which bytes a directory
 entry may point at: a hard link placed under the root is read like any other
 file. The digest, not the root, is what makes the transport trustworthy.
 
-The declared media type and the declared `sizeBytes` are checked next, so a
-block that was always going to be refused costs one open rather than a full read
-and a hash. The read itself is bounded at the per-image byte gate plus one byte,
-and the size verdict is decided on the bytes actually read: a file that grew
-after it was declared is rejected `too_large` and none of its bytes are carried
-forward. Every surviving byte reaches verification, which is fail-closed — a
-mismatch is a rejection and never a fall back to the embedded form. All four
-verdicts are JSON-RPC `-32602`, are fatal before the turn starts, and carry a
-`message` naming the real cause without repeating the host path, the file name,
-the digest, or an observed size.
+The read is bounded at one byte more than the block declared, not at the
+per-image byte gate: the work a block commits the adapter to is charged to the
+size its own envelope stood behind, so a host cannot provoke a large read without
+declaring one. A file larger than it declares is `handoff_digest_mismatch`,
+because it is not the file the declared digest covers, and none of its bytes are
+carried forward. Every surviving byte reaches verification, which is
+fail-closed — a mismatch is a rejection and never a fall back to the embedded
+form. All four handoff verdicts are JSON-RPC `-32602`, are fatal before the turn
+starts, and carry a `message` naming the real cause without repeating the host
+path, the file name, the digest, or an observed size.
 
 At most 64 handoff-form blocks are read for one prompt. The block that crosses
 the cap is rejected `too_large` before it is read, with `sizeBytes` carrying the

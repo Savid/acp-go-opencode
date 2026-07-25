@@ -159,8 +159,8 @@ func promptMediaBlocks(blocks []acp.ContentBlock) []promptMedia {
 // failing block in request order, then consults the selected-model gate. It
 // returns the validated bytes native mapping sends for every image block, in
 // either input form.
-func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentBlock) (resolvedPromptImages, error) {
-	resolved := make(resolvedPromptImages)
+func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentBlock) (resolvedPromptMedia, error) {
+	resolved := make(resolvedPromptMedia)
 
 	media := promptMediaBlocks(blocks)
 	if len(media) == 0 {
@@ -170,10 +170,15 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 	limits := s.imageLimits()
 	promptGate := effectiveInputBytesPerPrompt(limits.MaxInputBytesPerPrompt)
 
+	// The selected-model gate answers for the first raster in the prompt, which
+	// may have arrived on a resource blob rather than on an image block. Its
+	// field is carried alongside its index so the verdict names the member the
+	// bytes came in on, as every other media verdict does.
 	var (
-		totalBytes int64
-		handoffs   int
-		firstImage = -1
+		totalBytes  int64
+		handoffs    int
+		firstRaster = -1
+		rasterField string
 	)
 
 	for _, block := range media {
@@ -195,12 +200,17 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 			return nil, err
 		}
 
-		if block.raster && firstImage < 0 {
-			firstImage = block.index
+		if block.raster && firstRaster < 0 {
+			firstRaster = block.index
+			rasterField = block.field()
 		}
 
-		if block.image != nil {
-			resolved[block.block] = resolvedPromptImage{
+		// The base64 native mapping forwards is re-encoded from the bytes the
+		// gates measured, for a blob resource as much as for an image block: the
+		// host's own spelling never reaches the harness, so a payload no gate
+		// inspected cannot ride along with one that passed.
+		if decoded != nil {
+			resolved[block.block] = resolvedPromptBytes{
 				mime: block.mime,
 				data: base64.StdEncoding.EncodeToString(decoded),
 			}
@@ -212,8 +222,8 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 		}
 	}
 
-	if firstImage >= 0 && s.selectedModelImageSupport(ctx) == imageInputUnsupported {
-		return nil, mediaInputError(fieldPromptImage, imageErrorUnsupportedByModel, firstImage)
+	if firstRaster >= 0 && s.selectedModelImageSupport(ctx) == imageInputUnsupported {
+		return nil, mediaInputError(rasterField, imageErrorUnsupportedByModel, firstRaster)
 	}
 
 	return resolved, nil

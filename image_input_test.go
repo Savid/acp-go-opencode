@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -193,6 +194,38 @@ func TestValidatePromptMediaGatesBlobResourceChannel(t *testing.T) {
 			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidBase64, jsonFieldIndex: 0,
 		})
 	})
+
+	// The native part a blob resource builds carries the re-encoding of the bytes
+	// the gates measured, exactly as an image block's does. Forwarding the host's
+	// own spelling would let one payload reach the harness in as many shapes as
+	// the decoder tolerates, none of them the shape validation inspected.
+	t.Run("blob base64 is re-encoded from the bytes the gates measured", func(t *testing.T) {
+		pngMime := mimePNG
+		png := fixtureImage(t, "valid.png")
+		canonical := base64.StdEncoding.EncodeToString(png)
+		wrapped := wrapBase64(canonical, 76)
+		require.Contains(t, wrapped, "\n")
+
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+
+		for _, mime := range []*string{&pngMime, &pdfMime} {
+			blocks := []acp.ContentBlock{blobResourceBlock(wrapped, mime)}
+
+			resolved, err := session.validatePromptMedia(context.Background(), blocks)
+			require.NoError(t, err)
+			require.Equal(t, canonical, resolved[0].data)
+
+			// The command path inlines every blob whatever its media type, so it
+			// is where a verbatim forward would still reach the harness.
+			parts, err := commandPromptParts(blocks, resolved)
+			require.NoError(t, err)
+
+			encoded, err := json.Marshal(parts)
+			require.NoError(t, err)
+			require.Contains(t, string(encoded), canonical)
+			require.NotContains(t, string(encoded), `\n`)
+		}
+	})
 }
 
 func TestValidatePromptImagesModelGate(t *testing.T) {
@@ -230,6 +263,23 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 		), map[string]any{
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorUnsupportedByModel,
 			jsonFieldIndex: 1,
+		})
+	})
+
+	// A raster can arrive on a resource blob, and the model gate is the one
+	// verdict that reports an index it did not compute on the spot. Naming
+	// prompt.image for it would point the host at a block that is not there.
+	t.Run("unsupported names the member the raster arrived on", func(t *testing.T) {
+		pngMime := mimePNG
+		client := newFakeOpenCodeClient()
+		client.providers = providersWith(boolPtr(false))
+		session := testSession(NewAgent(), client)
+		requireInvalidParamsData(t, validatePromptMediaError(session,
+			acp.TextBlock("look at this"),
+			blobResourceBlock(fixtureImageBase64(t, "valid.png"), &pngMime),
+		), map[string]any{
+			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorUnsupportedByModel,
+			jsonFieldIndex: 0,
 		})
 	})
 

@@ -2348,7 +2348,7 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 			}
 			requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "prompt"})
 		}
-		if _, err := blobResourceOpenCodePart(&acp.BlobResourceContents{}); err == nil {
+		if _, err := blobResourceOpenCodePart(&acp.BlobResourceContents{}, ""); err == nil {
 			t.Fatal("empty blob resource accepted")
 		}
 		named := resourceLinkOpenCodePart(&acp.ContentBlockResourceLink{Name: "named.txt", Uri: "file:///tmp/ignored"})
@@ -3106,7 +3106,7 @@ func assertEventEdgeAndHelperBranches(t *testing.T, ctx context.Context, session
 		t.Fatal("empty tokens produced usage")
 	}
 	var emptyResource acp.EmbeddedResourceResource
-	if _, err := embeddedResourceOpenCodePart(emptyResource); err == nil {
+	if _, err := embeddedResourceOpenCodePart(0, emptyResource, nil); err == nil {
 		t.Fatal("empty embedded resource accepted")
 	}
 	if updates := committedPartUpdates(rawSession, "assistant", opencode.NativePart{Type: "text"}, ""); updates != nil {
@@ -3469,7 +3469,7 @@ func TestPromptMappingHelpers(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"uri":"file:///tmp/a","text":"body"}`), &resource); err != nil {
 		t.Fatal(err)
 	}
-	part, err := embeddedResourceOpenCodePart(resource)
+	part, err := embeddedResourceOpenCodePart(0, resource, nil)
 	if err != nil || part[partTypeText] != "body" {
 		t.Fatalf("embeddedResourceOpenCodePart = %#v, %v", part, err)
 	}

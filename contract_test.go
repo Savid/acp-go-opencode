@@ -6,7 +6,6 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -112,17 +111,18 @@ func TestMediaEnvelopeAdvertisesTheBoundTheGateReports(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				root := t.TempDir()
-
-				// One byte past the advertised bound, so the gate under test is
-				// the only one that can answer.
 				path := writeHandoffFile(t, root, "shot.png", decoded)
-				require.NoError(t, os.Truncate(path, tt.want+1))
 
 				agent := NewAgent(WithInputHandoffRoot(root), WithImageLimits(ImageLimits{MaxInputBytesPerImage: tt.configured}))
 				envelope := mediaEnvelopeOf(t, agent)
 				require.Equal(t, tt.want, envelope[mediaEnvelopeFieldMaxBytes])
 
-				block := handoffBlock(mimePNG, path, handoffEnvelope(decoded))
+				// A declaration one byte past the advertised bound, so the gate
+				// under test is the only one that can answer.
+				declaration := handoffEnvelope(decoded)
+				declaration[handoffFieldSizeBytes] = tt.want + 1
+
+				block := handoffBlock(mimePNG, path, declaration)
 				requireInvalidParamsData(t, validatePromptMediaError(testSession(agent, newFakeOpenCodeClient()), block), map[string]any{
 					jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 					jsonFieldSizeBytes: tt.want + 1, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxBytes],

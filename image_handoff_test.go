@@ -566,6 +566,34 @@ func TestHandoffFormRunsTheEmbeddedGateChain(t *testing.T) {
 	})
 }
 
+// TestHandoffDeclaredMediaTypeIsJudgedBeforeTheFilesystem pins the declared media
+// type ahead of every filesystem verdict. The absent-path case is the decisive
+// one: the only way to answer it on the declared type is to never have looked, so
+// an implementation that opens first reports missing_file and thereby tells the
+// caller whether its guess about the path was right.
+func TestHandoffDeclaredMediaTypeIsJudgedBeforeTheFilesystem(t *testing.T) {
+	root := t.TempDir()
+	decoded := fixtureImage(t, "valid.png")
+	present := writeHandoffFile(t, root, "shot.png", decoded)
+
+	restore := handoffOpen
+	handoffOpen = func(string, string, int) (io.ReadCloser, error) {
+		require.FailNow(t, "the filesystem was consulted for a media type the allowlist refuses")
+
+		return nil, errors.New("unreachable")
+	}
+
+	t.Cleanup(func() { handoffOpen = restore })
+
+	session := handoffSession(t, root)
+
+	for _, path := range []string{present, filepath.Join(root, "absent.png")} {
+		requireInvalidParamsData(t, validatePromptMediaError(session, handoffBlock("application/pdf", path, handoffEnvelope(decoded))), map[string]any{
+			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0,
+		})
+	}
+}
+
 func TestHandoffFormEnforcesTheByteGates(t *testing.T) {
 	decoded := fixtureImage(t, "valid.png")
 
@@ -615,29 +643,33 @@ func TestHandoffFormEnforcesTheByteGates(t *testing.T) {
 		require.Zero(t, reads, "a block the declared size already fails must not be read")
 	})
 
-	t.Run("a disabled per image gate clamps the read to the frame bound", func(t *testing.T) {
-		root := t.TempDir()
-		path := writeHandoffFile(t, root, "huge.png", nil)
-		require.NoError(t, os.Truncate(path, imageFrameBoundBytes+1))
+	// Both clamped configurations are driven with a declaration one byte past the
+	// frame bound and a real, valid file behind it, so the clamp is the only thing
+	// that can produce the refusal.
+	for _, clamped := range []struct {
+		name   string
+		limits ImageLimits
+	}{
+		{name: "a disabled per image gate clamps to the frame bound", limits: ImageLimits{}},
+		{
+			name:   "a configured gate wider than a frame is clamped to the frame bound",
+			limits: ImageLimits{MaxInputBytesPerImage: 100 * imageFrameBoundBytes},
+		},
+	} {
+		t.Run(clamped.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := writeHandoffFile(t, root, "shot.png", decoded)
 
-		session := handoffSession(t, root, WithImageLimits(ImageLimits{}))
-		requireInvalidParamsData(t, validatePromptMediaError(session, handoffBlock(mimePNG, path, handoffEnvelope(decoded))), map[string]any{
-			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
-			jsonFieldSizeBytes: imageFrameBoundBytes + 1, jsonFieldMaxBytes: imageFrameBoundBytes,
+			declaration := handoffEnvelope(decoded)
+			declaration[handoffFieldSizeBytes] = imageFrameBoundBytes + 1
+
+			session := handoffSession(t, root, WithImageLimits(clamped.limits))
+			requireInvalidParamsData(t, validatePromptMediaError(session, handoffBlock(mimePNG, path, declaration)), map[string]any{
+				jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
+				jsonFieldSizeBytes: imageFrameBoundBytes + 1, jsonFieldMaxBytes: imageFrameBoundBytes,
+			})
 		})
-	})
-
-	t.Run("a configured gate wider than a frame is clamped to the frame bound", func(t *testing.T) {
-		root := t.TempDir()
-		path := writeHandoffFile(t, root, "huge.png", nil)
-		require.NoError(t, os.Truncate(path, imageFrameBoundBytes+1))
-
-		session := handoffSession(t, root, WithImageLimits(ImageLimits{MaxInputBytesPerImage: 100 * imageFrameBoundBytes}))
-		requireInvalidParamsData(t, validatePromptMediaError(session, handoffBlock(mimePNG, path, handoffEnvelope(decoded))), map[string]any{
-			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
-			jsonFieldSizeBytes: imageFrameBoundBytes + 1, jsonFieldMaxBytes: imageFrameBoundBytes,
-		})
-	})
+	}
 }
 
 // TestHandoffFormSelection pins the pre-gate's form selection: embedded data
@@ -732,6 +764,14 @@ func TestInputHandoffRootValidation(t *testing.T) {
 	})
 	require.Error(t, err)
 
+	// An in-process host is free to skip initialize entirely, so the refusal
+	// cannot live only there: opening a session under a root this agent already
+	// rejected would run a whole turn against options that never validated.
+	_, err = NewAgent(WithInputHandoffRoot("relative")).NewSession(context.Background(), acp.NewSessionRequest{
+		Cwd: t.TempDir(),
+	})
+	require.ErrorContains(t, err, "input handoff root must be an absolute path")
+
 	require.Empty(t, (&session{}).inputHandoffRoot())
 }
 
@@ -746,21 +786,23 @@ func requireHandoffVerdict(t *testing.T, session *session, block acp.ContentBloc
 	})
 }
 
-// TestHandoffOverBoundReadIsRejectedAndForwardsNoBytes drives the shape a
+// TestHandoffUnderDeclaredFileIsRejectedAndForwardsNoBytes drives the shape a
 // process sharing the read root produces: the file named by the block grows
-// past the bound while it is being read. The bytes that come back are not the
-// bytes the envelope describes, so none of them may reach the harness and none
-// of them may be charged as if they were the small file that was declared.
-func TestHandoffOverBoundReadIsRejectedAndForwardsNoBytes(t *testing.T) {
+// while it is being read, well inside the byte gate the whole time. The gate
+// therefore cannot be what refuses it — only reading to the declaration and
+// finding more can — and the bytes that come back are not the bytes the envelope
+// describes, so none of them may reach the harness or be charged as if they were.
+func TestHandoffUnderDeclaredFileIsRejectedAndForwardsNoBytes(t *testing.T) {
 	root := t.TempDir()
 	png := fixtureImage(t, "valid.png")
 	gate := int64(len(png)) + 512
 	path := writeHandoffFile(t, root, "shot.png", png)
 
 	// A run of one byte value, so its base64 is recognisable wherever it lands.
-	filler := bytes.Repeat([]byte{0x41}, int(gate)+1-len(png))
+	filler := bytes.Repeat([]byte{0x41}, 256)
 	marker := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x41}, 48))
 
+	read := 0
 	restore := imageReadAll
 	imageReadAll = func(reader io.Reader) ([]byte, error) {
 		handle, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -770,7 +812,10 @@ func TestHandoffOverBoundReadIsRejectedAndForwardsNoBytes(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, handle.Close())
 
-		return io.ReadAll(reader)
+		data, err := io.ReadAll(reader)
+		read += len(data)
+
+		return data, err
 	}
 	t.Cleanup(func() { imageReadAll = restore })
 
@@ -789,16 +834,20 @@ func TestHandoffOverBoundReadIsRejectedAndForwardsNoBytes(t *testing.T) {
 
 	resolved, err := session.validatePromptMedia(context.Background(), blocks)
 	requireInvalidParamsData(t, err, map[string]any{
-		jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
-		jsonFieldSizeBytes: gate + 1, jsonFieldMaxBytes: gate,
+		jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorDigestMismatch, jsonFieldIndex: 1,
+		jsonFieldMessage: handoffCauseDigestMismatch,
 	})
+
+	// The read stopped one byte past the declaration, so a file that grew under
+	// the adapter cost it the size its host declared and not the size it became.
+	require.LessOrEqual(t, read, len(png)+1)
 
 	parts, err := promptToOpenCodeParts(blocks, resolved)
 	require.NoError(t, err)
 
 	encoded, err := json.Marshal(parts)
 	require.NoError(t, err)
-	require.NotContains(t, string(encoded), marker, "bytes past the bound reached the native request")
+	require.NotContains(t, string(encoded), marker, "bytes past the declaration reached the native request")
 }
 
 // TestHandoffBlockCountIsCappedWithTheAggregateDisabled pins the bound on the
@@ -1245,6 +1294,8 @@ func TestHandoffRefusalsReleaseTheirDescriptor(t *testing.T) {
 	png := fixtureImage(t, "valid.png")
 	gate := int64(len(png)) + 512
 
+	// The verdicts a declaration decides on its own are not here: they are settled
+	// before anything is opened, and this test requires a descriptor to exist.
 	tests := []struct {
 		name    string
 		mime    string
@@ -1253,9 +1304,7 @@ func TestHandoffRefusalsReleaseTheirDescriptor(t *testing.T) {
 		errCode string
 	}{
 		{name: "accepted", mime: mimePNG, errCode: ""},
-		{name: "outside the format contract", mime: mimeBMP, errCode: imageErrorInvalidMediaType},
-		{name: "declared larger than the gate", mime: mimePNG, size: gate + 1, errCode: imageErrorTooLarge},
-		{name: "grown past the gate while read", mime: mimePNG, grow: true, errCode: imageErrorTooLarge},
+		{name: "grown past the declaration while read", mime: mimePNG, grow: true, errCode: imageErrorDigestMismatch},
 		{name: "bytes disagree with the envelope", mime: mimePNG, size: int64(len(png)) - 1, errCode: imageErrorDigestMismatch},
 	}
 
@@ -1270,7 +1319,7 @@ func TestHandoffRefusalsReleaseTheirDescriptor(t *testing.T) {
 					handle, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
 					require.NoError(t, err)
 
-					_, err = handle.Write(bytes.Repeat([]byte{0x41}, int(gate)+1-len(png)))
+					_, err = handle.Write(bytes.Repeat([]byte{0x41}, 256))
 					require.NoError(t, err)
 					require.NoError(t, handle.Close())
 
