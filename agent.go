@@ -93,6 +93,7 @@ func NewAgent(opts ...Option) *Agent {
 	}
 
 	optionsErr = errors.Join(optionsErr, validateImageLimits(options.ImageLimits))
+	optionsErr = errors.Join(optionsErr, validateInputHandoffRoot(options.InputHandoffRoot))
 
 	log := options.Logger
 	if log == nil {
@@ -308,6 +309,18 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		},
 	}
 
+	capabilityMeta := map[string]any{
+		opencodeMetaKey:  opencodeMeta,
+		routeEnvelopeKey: map[string]any{metaFieldVersions: []int{routeEnvelopeVersion}},
+		mediaEnvelopeKey: a.options.mediaEnvelope(),
+	}
+
+	// The handoff advertisement answers whether the host's read root reached
+	// this adapter, so it is present only when one is configured.
+	if a.options.InputHandoffRoot != "" {
+		capabilityMeta[handoffEnvelopeKey] = map[string]any{metaFieldVersions: []int{handoffEnvelopeVersion}}
+	}
+
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
@@ -317,10 +330,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		},
 		AuthMethods: []acp.AuthMethod{},
 		AgentCapabilities: acp.AgentCapabilities{
-			Meta: map[string]any{
-				opencodeMetaKey:  opencodeMeta,
-				routeEnvelopeKey: map[string]any{"versions": []int{routeEnvelopeVersion}},
-			},
+			Meta:        capabilityMeta,
 			LoadSession: true,
 			McpCapabilities: acp.McpCapabilities{
 				Http: true,

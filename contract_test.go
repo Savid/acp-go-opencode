@@ -5,10 +5,12 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/stretchr/testify/require"
 )
 
 func TestInitializeCapabilitiesHardCutover(t *testing.T) {
@@ -45,6 +47,76 @@ func TestInitializeCapabilitiesHardCutover(t *testing.T) {
 	if store, _ := meta["sessionStore"].(map[string]any); store["format"] != SessionStoreFormat {
 		t.Fatalf("sessionStore meta = %#v", store)
 	}
+}
+
+// TestInitializeAdvertisesTheMediaEnvelope pins the family-reserved media
+// envelope: the exact field set, this adapter's effective values, and a
+// document list emitted as an empty array rather than null.
+func TestInitializeAdvertisesTheMediaEnvelope(t *testing.T) {
+	resp, err := NewAgent().Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+
+	envelope, ok := resp.AgentCapabilities.Meta[mediaEnvelopeKey].(map[string]any)
+	require.True(t, ok, "media envelope missing from agent capabilities")
+	require.Equal(t, map[string]any{
+		mediaEnvelopeFieldMaxBytes:        defaultImageLimitBytes,
+		mediaEnvelopeFieldMaxPromptBytes:  defaultImageLimitBytes,
+		mediaEnvelopeFieldMaxDimension:    0,
+		mediaEnvelopeFieldImageFormats:    []string{mimePNG, mimeJPEG, mimeGIF, mimeWebP},
+		mediaEnvelopeFieldDocumentFormats: []string{},
+	}, envelope)
+
+	encoded, err := json.Marshal(envelope)
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"documentFormats":[]`)
+	require.NotContains(t, string(encoded), "null")
+
+	formats, ok := envelope[mediaEnvelopeFieldImageFormats].([]string)
+	require.True(t, ok)
+	formats[0] = "mutated"
+	require.Equal(t, mimePNG, imageInputFormats[0], "advertisement aliases the input allowlist")
+}
+
+// TestMediaEnvelopeMatchesTheEnforcedGate binds the advertised bytes to the
+// bound the input gate actually rejects on, so the two cannot drift.
+func TestMediaEnvelopeMatchesTheEnforcedGate(t *testing.T) {
+	decoded := fixtureImage(t, "valid.png")
+	gate := int64(len(decoded)) - 1
+
+	agent := NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerImage: gate, MaxInputBytesPerPrompt: gate}))
+	resp, err := agent.Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+
+	envelope, ok := resp.AgentCapabilities.Meta[mediaEnvelopeKey].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, gate, envelope[mediaEnvelopeFieldMaxBytes])
+	require.Equal(t, gate, envelope[mediaEnvelopeFieldMaxPromptBytes])
+
+	session := testSession(agent, newFakeOpenCodeClient())
+	requireInvalidParamsData(t, validatePromptMediaError(session, acp.ContentBlock{Image: &acp.ContentBlockImage{
+		Type: "image", MimeType: mimePNG, Data: base64.StdEncoding.EncodeToString(decoded),
+	}}), map[string]any{
+		jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
+		jsonFieldSizeBytes: int64(len(decoded)), jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxBytes],
+	})
+}
+
+// TestInitializeAdvertisesHandoffOnlyWhenConfigured pins the handoff
+// advertisement as the answer to whether the host's read root reached this
+// adapter: present with a root, absent without one.
+func TestInitializeAdvertisesHandoffOnlyWhenConfigured(t *testing.T) {
+	request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
+
+	without, err := NewAgent().Initialize(context.Background(), request)
+	require.NoError(t, err)
+	require.NotContains(t, without.AgentCapabilities.Meta, handoffEnvelopeKey)
+
+	root := t.TempDir()
+
+	with, err := NewAgent(WithInputHandoffRoot(root)).Initialize(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, map[string]any{metaFieldVersions: []int{handoffEnvelopeVersion}}, with.AgentCapabilities.Meta[handoffEnvelopeKey])
+	require.Equal(t, map[string]any{metaFieldVersions: []int{routeEnvelopeVersion}}, with.AgentCapabilities.Meta[routeEnvelopeKey])
 }
 
 func TestStableForkRouteMethodNotFound(t *testing.T) {

@@ -26,22 +26,76 @@ Native part events map onto ACP update variants:
 ACP text blocks and text embedded resources become native text parts. A blob
 embedded resource whose MIME type is `image/*`, and a direct ACP image block,
 become a native file part carrying the embedded base64 data as a data URL. When
-an image block also carries a `uri`, the embedded `data` is authoritative for the
-submitted pixels and the URI contributes only filename provenance; the adapter
-never fetches it.
+an image block carries both `data` and a `uri`, the embedded `data` is
+authoritative for the submitted pixels and the URI contributes only filename
+provenance; the adapter never fetches it.
 
-Prompt images are validated before the turn starts, deterministically at the
-first failing block. The input allowlist is exactly `image/png`, `image/jpeg`,
+## Prompt media validation
+
+Prompt media is validated before the turn starts, deterministically at the first
+failing block, and indexes are assigned across media-bearing blocks in request
+order. The image input allowlist is exactly `image/png`, `image/jpeg`,
 `image/gif`, and `image/webp`, static frames only: a multi-descriptor GIF, a
 WebP `VP8X` `ANIM` flag, and a PNG `acTL` chunk (APNG) are rejected without
-decoding any raster. Missing data, undecodable base64, a MIME outside the
-allowlist, a sniffed/declared MIME mismatch, unreadable dimensions, and decoded
-bytes over the configured `ImageLimits` each fail with JSON-RPC `-32602` and a
+decoding any raster. A declared MIME is normalized — lowercased, trimmed, and
+stripped of parameters — before it is tested for the `image/` prefix, so a
+case or parameter variant is routed to the image contract and then rejected on
+the allowlist rather than escaping it. The allowlist itself compares the
+declared type exactly, so `IMAGE/PNG` is `invalid_media_type`.
+
+Missing data, undecodable base64, a MIME outside the allowlist, a
+sniffed/declared MIME mismatch, unreadable dimensions, and decoded bytes over
+the configured `ImageLimits` each fail with JSON-RPC `-32602` and a
 `prompt.image` error taxonomy (`error`, `index`, and byte sizes). When the
 selected model's authenticated provider metadata (`capabilities.input.image`)
 says the model cannot accept images, the prompt is rejected as
 `unsupported_by_model`; absent metadata forwards the turn and lets the provider
 decide.
+
+A blob embedded resource is gated whatever its MIME. Its base64 must decode, its
+decoded bytes must fit the per-image bound, and they count toward the per-prompt
+total, so no resource channel carries unbounded or unvalidated bytes to the
+harness. A blob outside the image contract is verdicted under `prompt.resource`
+with the same `error` values, and its native representation is otherwise
+unchanged.
+
+## Handoff input form
+
+When the host sets `WithInputHandoffRoot`, an image block may carry its bytes by
+reference instead of inline: empty `data`, a `file://` URI beneath the
+configured read root, and a
+`_meta["acp-go.dev/handoff"]` object containing exactly `version: 1`, a
+64-character lowercase-hexadecimal `digest`, and an integer `sizeBytes`.
+
+Form selection runs ahead of every embedded gate. Non-empty `data` is always the
+embedded form, even alongside a handoff envelope. Empty `data` with a handoff
+envelope or a `file://` URI is the handoff form. Empty `data` with neither stays
+`missing_data`.
+
+A handoff block resolves in a fixed order, first failure winning:
+
+| `error` | Cause |
+|---|---|
+| `invalid_handoff` | The block is malformed as a block: no configured read root, an absent or undecodable envelope, an unsupported `version`, an unrecognized envelope field, a malformed `digest` or `sizeBytes`, or a URI that is not an absolute local `file://` path. |
+| `path_not_allowed` | The path resolves outside the read root, escapes it through a symlink, or is not a regular file. |
+| `missing_file` | A path inside the read root that does not exist or cannot be opened or read. |
+| `handoff_digest_mismatch` | The bytes do not match the declared `sizeBytes` and `digest`. |
+
+Resolution is bounded and symlink-safe: containment is checked on the cleaned
+path, symlinks are resolved, containment is checked again on the resolved path,
+and only then is the file mode inspected. The read is bounded at the per-image
+byte gate plus one byte. Verification is fail-closed — a mismatch is a rejection
+and never a fall back to the embedded form — and a file that overran the bound
+cannot be verified, so the byte gate rejects it `too_large` on its real on-disk
+size. All four verdicts are JSON-RPC `-32602`, are fatal before the turn starts,
+and carry a `message` naming the real cause without repeating the host path.
+
+Bytes that pass then run the same gate chain as the embedded form, minus the two
+gates that need base64, and count toward the per-prompt total identically. The
+validated bytes reach OpenCode as the same data URL an embedded block builds, so
+a handoff turn and an embedded turn over the same bytes produce byte-identical
+native requests. The handoff path itself never appears in the native request:
+nothing derives a filename from it, and it does not outlive the validation read.
 
 Native tool results and assistant file parts that carry an image are mapped back
 to ACP as embedded image content (each agent image alone in its own

@@ -77,6 +77,42 @@ metadata carries no capabilities list; selected-model image support is an
 internal decision sourced only from authenticated provider
 `capabilities.input.image`.
 
+`AgentCapabilities.Meta` always advertises the effective inbound media bounds:
+
+```json
+{
+  "acp-go.dev/mediaEnvelope": {
+    "maxBytes": 6291456,
+    "maxPromptBytes": 6291456,
+    "maxDimension": 0,
+    "imageFormats": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+    "documentFormats": []
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `maxBytes` | Effective per-image decoded byte gate — `ImageLimits.MaxInputBytesPerImage`, so a configured value is reported instead of the default. |
+| `maxPromptBytes` | Effective per-prompt aggregate decoded byte gate (`ImageLimits.MaxInputBytesPerPrompt`). |
+| `maxDimension` | Per-dimension pixel bound; `0` because OpenCode bounds no image dimension. `0` means unbounded, never zero pixels. |
+| `imageFormats` | The inbound allowlist, in this order. |
+| `documentFormats` | MIME types mapped to a native document representation. Always an empty array here: no MIME has one. |
+
+The numbers are the gates themselves rather than a restatement of them, so a
+host pre-check that passes cannot be rejected on bytes by the adapter.
+
+```json
+{
+  "acp-go.dev/handoff": {"versions": [1]}
+}
+```
+
+The handoff advertisement appears **only** when the host set
+`WithInputHandoffRoot`. Its absence is the actionable signal that the option
+never reached this adapter, and every handoff-form block is then rejected
+`invalid_handoff`.
+
 Outbound elicitation requests preserve native metadata and add the reserved
 route envelope with `version`, `sessionId`, `turnNonce`, and exactly one of
 `toolCallId` or `requestId`. A native metadata collision with that reserved key

@@ -1,6 +1,7 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -10,6 +11,20 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
+
+// validatePromptMediaError runs prompt media validation and keeps only the
+// verdict, which is what the taxonomy assertions compare.
+func validatePromptMediaError(session *session, blocks ...acp.ContentBlock) error {
+	_, err := session.validatePromptMedia(context.Background(), blocks)
+
+	return err
+}
+
+func blobResourceBlock(blob string, mime *string) acp.ContentBlock {
+	return acp.ContentBlock{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
+		BlobResourceContents: &acp.BlobResourceContents{Blob: blob, Uri: "file:///tmp/blob", MimeType: mime},
+	}}}
+}
 
 func TestValidatePromptImagesInputTaxonomy(t *testing.T) {
 	png := fixtureImageBase64(t, "valid.png")
@@ -30,18 +45,19 @@ func TestValidatePromptImagesInputTaxonomy(t *testing.T) {
 			want:  map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
 		},
 		{
-			name: "blob resource case-variant media type",
-			block: acp.ContentBlock{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
-				BlobResourceContents: &acp.BlobResourceContents{Blob: png, MimeType: stringPtr("IMAGE/PNG")},
-			}}},
-			want: map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
+			name:  "blob resource case-variant media type",
+			block: blobResourceBlock(png, stringPtr("IMAGE/PNG")),
+			want:  map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
 		},
 		{
-			name: "blob resource leading-whitespace media type",
-			block: acp.ContentBlock{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
-				BlobResourceContents: &acp.BlobResourceContents{Blob: png, MimeType: stringPtr(" image/png")},
-			}}},
-			want: map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
+			name:  "blob resource leading-whitespace media type",
+			block: blobResourceBlock(png, stringPtr(" image/png")),
+			want:  map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
+		},
+		{
+			name:  "blob resource parameterized media type",
+			block: blobResourceBlock(png, stringPtr("image/png; charset=binary")),
+			want:  map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
 		},
 		{
 			name:  "recognized raster with bad dimensions and mismatched declared type",
@@ -77,7 +93,7 @@ func TestValidatePromptImagesInputTaxonomy(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			session := testSession(NewAgent(), newFakeOpenCodeClient())
-			requireInvalidParamsData(t, session.validatePromptImages(context.Background(), []acp.ContentBlock{tt.block}), tt.want)
+			requireInvalidParamsData(t, validatePromptMediaError(session, tt.block), tt.want)
 		})
 	}
 }
@@ -88,9 +104,9 @@ func TestValidatePromptImagesSizeLimits(t *testing.T) {
 
 	t.Run("per image", func(t *testing.T) {
 		session := testSession(NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerImage: 1})), newFakeOpenCodeClient())
-		requireInvalidParamsData(t, session.validatePromptImages(context.Background(), []acp.ContentBlock{
-			{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
-		}), map[string]any{
+		requireInvalidParamsData(t, validatePromptMediaError(session,
+			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
+		), map[string]any{
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 			jsonFieldSizeBytes: decodedSize, jsonFieldMaxBytes: int64(1),
 		})
@@ -98,10 +114,10 @@ func TestValidatePromptImagesSizeLimits(t *testing.T) {
 
 	t.Run("per prompt aggregate", func(t *testing.T) {
 		session := testSession(NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: decodedSize + 1})), newFakeOpenCodeClient())
-		err := session.validatePromptImages(context.Background(), []acp.ContentBlock{
-			{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
-			{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
-		})
+		err := validatePromptMediaError(session,
+			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
+			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
+		)
 		requireInvalidParamsData(t, err, map[string]any{
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
 			jsonFieldSizeBytes: 2 * decodedSize, jsonFieldMaxBytes: decodedSize + 1,
@@ -110,9 +126,73 @@ func TestValidatePromptImagesSizeLimits(t *testing.T) {
 
 	t.Run("zero disables input limits", func(t *testing.T) {
 		session := testSession(NewAgent(WithImageLimits(ImageLimits{})), newFakeOpenCodeClient())
-		require.NoError(t, session.validatePromptImages(context.Background(), []acp.ContentBlock{
-			{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
-		}))
+		require.NoError(t, validatePromptMediaError(session,
+			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
+		))
+	})
+}
+
+// TestValidatePromptMediaGatesBlobResourceChannel pins the embedded resource
+// blob channel closed for a blob of any MIME: base64 validity, the per-image
+// decoded-byte gate, and per-prompt accounting all apply, while the blob's
+// native representation is left exactly as it was.
+func TestValidatePromptMediaGatesBlobResourceChannel(t *testing.T) {
+	pdfMime := "application/pdf"
+
+	t.Run("oversize pdf blob is rejected", func(t *testing.T) {
+		// Larger than the per-image limit the same adapter enforces for an
+		// image blob, which this channel previously accepted unbounded.
+		oversize := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("P"), 6295951))
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		requireInvalidParamsData(t, validatePromptMediaError(session, blobResourceBlock(oversize, &pdfMime)), map[string]any{
+			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
+			jsonFieldSizeBytes: int64(6295951), jsonFieldMaxBytes: defaultImageLimitBytes,
+		})
+	})
+
+	t.Run("corrupt base64 blob is rejected", func(t *testing.T) {
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		requireInvalidParamsData(t, validatePromptMediaError(session, blobResourceBlock("!!!!", &pdfMime)), map[string]any{
+			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidBase64, jsonFieldIndex: 0,
+		})
+	})
+
+	t.Run("blob bytes count toward per-prompt accounting", func(t *testing.T) {
+		png := fixtureImage(t, "valid.png")
+		document := bytes.Repeat([]byte("P"), 64)
+		limit := int64(len(png)) + int64(len(document)) - 1
+
+		session := testSession(NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient())
+		requireInvalidParamsData(t, validatePromptMediaError(session,
+			blobResourceBlock(base64.StdEncoding.EncodeToString(document), &pdfMime),
+			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: base64.StdEncoding.EncodeToString(png), MimeType: mimePNG}},
+		), map[string]any{
+			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
+			jsonFieldSizeBytes: int64(len(document)) + int64(len(png)), jsonFieldMaxBytes: limit,
+		})
+	})
+
+	t.Run("conforming pdf blob still maps to its unchanged native form", func(t *testing.T) {
+		document := base64.StdEncoding.EncodeToString([]byte("%PDF-1.7"))
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		block := blobResourceBlock(document, &pdfMime)
+		require.NoError(t, validatePromptMediaError(session, block))
+
+		parts, err := promptToOpenCodeParts([]acp.ContentBlock{block}, nil)
+		require.NoError(t, err)
+		require.Equal(t, map[string]any{jsonFieldType: partTypeText, partTypeText: "file:///tmp/blob"}, parts[0])
+	})
+
+	t.Run("blob without data is left alone", func(t *testing.T) {
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		require.NoError(t, validatePromptMediaError(session, blobResourceBlock("", &pdfMime)))
+	})
+
+	t.Run("blob without a declared media type is gated as a document", func(t *testing.T) {
+		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		requireInvalidParamsData(t, validatePromptMediaError(session, blobResourceBlock("!!!!", nil)), map[string]any{
+			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidBase64, jsonFieldIndex: 0,
+		})
 	})
 }
 
@@ -134,27 +214,51 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.providers = providersWith(boolPtr(false))
 		session := testSession(NewAgent(), client)
-		requireInvalidParamsData(t, session.validatePromptImages(context.Background(), []acp.ContentBlock{block}), map[string]any{
+		requireInvalidParamsData(t, validatePromptMediaError(session, block), map[string]any{
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorUnsupportedByModel,
 			jsonFieldIndex: 0,
 		})
+	})
+
+	t.Run("unsupported names the first raster block", func(t *testing.T) {
+		pdfMime := "application/pdf"
+		client := newFakeOpenCodeClient()
+		client.providers = providersWith(boolPtr(false))
+		session := testSession(NewAgent(), client)
+		requireInvalidParamsData(t, validatePromptMediaError(session,
+			blobResourceBlock(base64.StdEncoding.EncodeToString([]byte("%PDF-1.7")), &pdfMime),
+			block,
+		), map[string]any{
+			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorUnsupportedByModel,
+			jsonFieldIndex: 1,
+		})
+	})
+
+	t.Run("a document-only prompt never consults the image model gate", func(t *testing.T) {
+		pdfMime := "application/pdf"
+		client := newFakeOpenCodeClient()
+		client.providers = providersWith(boolPtr(false))
+		session := testSession(NewAgent(), client)
+		require.NoError(t, validatePromptMediaError(session,
+			blobResourceBlock(base64.StdEncoding.EncodeToString([]byte("%PDF-1.7")), &pdfMime),
+		))
 	})
 
 	t.Run("supported forwards", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.providers = providersWith(boolPtr(true))
 		session := testSession(NewAgent(), client)
-		require.NoError(t, session.validatePromptImages(context.Background(), []acp.ContentBlock{block}))
+		require.NoError(t, validatePromptMediaError(session, block))
 	})
 
 	t.Run("unknown catalog forwards", func(t *testing.T) {
 		session := testSession(NewAgent(), newFakeOpenCodeClient())
-		require.NoError(t, session.validatePromptImages(context.Background(), []acp.ContentBlock{block}))
+		require.NoError(t, validatePromptMediaError(session, block))
 	})
 
 	t.Run("no images returns nil", func(t *testing.T) {
 		session := testSession(NewAgent(), newFakeOpenCodeClient())
-		require.NoError(t, session.validatePromptImages(context.Background(), []acp.ContentBlock{acp.TextBlock("hi")}))
+		require.NoError(t, validatePromptMediaError(session, acp.TextBlock("hi")))
 	})
 }
 
@@ -194,10 +298,11 @@ func TestSelectedModelImageSupportSources(t *testing.T) {
 	})
 }
 
-func TestPromptImageBlocksCollectsBlobResource(t *testing.T) {
+func TestPromptMediaBlocksCollectsEveryBlobResource(t *testing.T) {
 	blobMime := "image/png"
 	textMime := "text/plain"
 	blocks := []acp.ContentBlock{
+		acp.TextBlock("hello"),
 		{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: mimePNG}},
 		{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
 			BlobResourceContents: &acp.BlobResourceContents{Blob: "BB==", MimeType: &blobMime},
@@ -207,10 +312,31 @@ func TestPromptImageBlocksCollectsBlobResource(t *testing.T) {
 		}}},
 	}
 
-	images := promptImageBlocks(blocks)
-	require.Len(t, images, 2)
-	require.Equal(t, 0, images[0].index)
-	require.Equal(t, "AA==", images[0].data)
-	require.Equal(t, 1, images[1].index)
-	require.Equal(t, "BB==", images[1].data)
+	media := promptMediaBlocks(blocks)
+	require.Len(t, media, 3)
+
+	require.Equal(t, 0, media[0].index)
+	require.Equal(t, 1, media[0].block)
+	require.True(t, media[0].raster)
+	require.Equal(t, "AA==", media[0].data)
+	require.Equal(t, fieldPromptImage, media[0].field())
+
+	require.Equal(t, 1, media[1].index)
+	require.Equal(t, 2, media[1].block)
+	require.True(t, media[1].raster)
+	require.Equal(t, "BB==", media[1].data)
+
+	require.Equal(t, 2, media[2].index)
+	require.Equal(t, 3, media[2].block)
+	require.False(t, media[2].raster)
+	require.Equal(t, "CC==", media[2].data)
+	require.Equal(t, fieldPromptResource, media[2].field())
+}
+
+func TestNormalizeMediaType(t *testing.T) {
+	require.Equal(t, mimePNG, normalizeMediaType("  IMAGE/PNG  "))
+	require.Equal(t, mimePNG, normalizeMediaType("Image/PNG; charset=binary"))
+	require.Equal(t, "", normalizeMediaType(""))
+	require.True(t, isImageMediaType("IMAGE/JPEG;q=1"))
+	require.False(t, isImageMediaType("application/pdf"))
 }

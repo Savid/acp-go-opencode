@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 )
 
 const (
@@ -14,6 +15,25 @@ const (
 	mimeICO  = "image/x-icon"
 	mimeTIFF = "image/tiff"
 )
+
+// normalizeMediaType reduces a declared media type to its comparable form:
+// ASCII-lowercased, trimmed, and stripped of any parameters. Every media-type
+// prefix test runs on this form so a case or parameter variant can never route
+// bytes past a gate that a canonical declaration would meet.
+func normalizeMediaType(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if semicolon := strings.IndexByte(normalized, ';'); semicolon >= 0 {
+		normalized = strings.TrimSpace(normalized[:semicolon])
+	}
+
+	return normalized
+}
+
+// isImageMediaType reports whether a declared media type names a raster, on
+// the normalized form so no case or parameter variant escapes the test.
+func isImageMediaType(value string) bool {
+	return strings.HasPrefix(normalizeMediaType(value), mediaTypeImage+"/")
+}
 
 // rasterInfo is the result of a structural, decode-free image inspection:
 // signature sniffing, header dimensions, and container-level animation

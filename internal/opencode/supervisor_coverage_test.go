@@ -941,3 +941,32 @@ func TestUnixQuiescenceRemainingProbeBranches(t *testing.T) {
 	}
 	require.NoError(t, quiesceProcessGroup(123, 600*time.Millisecond))
 }
+
+// TestRunGuardianWritesCompletionProofWhenLivenessLeftNone covers the
+// guardian's post-readiness proof path: a liveness supervisor that published
+// readiness and exited without a completion marker leaves the guardian to
+// prove quiescence and write the marker itself.
+func TestRunGuardianWritesCompletionProofWhenLivenessLeftNone(t *testing.T) {
+	preserveSupervisorGlobals(t)
+
+	root := t.TempDir()
+	script := filepath.Join(root, "liveness.sh")
+	require.NoError(t, os.WriteFile(script, []byte(
+		"#!/bin/sh\nprintf '"+supervisorReadyPrefix+"{\"nativePid\":4242}\\n' >&2\n",
+	), 0o700))
+
+	supervisorInput = strings.NewReader("")
+	supervisorOutput = io.Discard
+	supervisorError = io.Discard
+	supervisorExecutable = func() (string, error) { return script, nil }
+	supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error { return nil }
+
+	completion := filepath.Join(root, "complete")
+	require.NoError(t, runGuardian(supervisorConfig{
+		NativePath: "/bin/sh", NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
+		Home: filepath.Join(root, "home"), Scratch: root,
+		Started: filepath.Join(root, "started"), Completion: completion,
+		NativePIDFile: filepath.Join(root, "native.pid"),
+	}))
+	require.FileExists(t, completion)
+}

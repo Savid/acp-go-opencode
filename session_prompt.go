@@ -292,11 +292,12 @@ func (s *session) resolvePromptCommand(ctx context.Context, params acp.PromptReq
 }
 
 func (s *session) commandNativeRun(ctx context.Context, params acp.PromptRequest, invocation slashCommandPrompt, command opencode.NativeCommand) (func(context.Context) (opencode.NativeMessage, error), error) {
-	if err := s.validatePromptImages(ctx, params.Prompt[1:]); err != nil {
+	handoff, err := s.validatePromptMedia(ctx, params.Prompt[1:])
+	if err != nil {
 		return nil, err
 	}
 
-	parts, err := commandPromptParts(params.Prompt[1:])
+	parts, err := commandPromptParts(params.Prompt[1:], handoff)
 	if err != nil {
 		return nil, err
 	}
@@ -323,11 +324,12 @@ func (s *session) commandNativeRun(ctx context.Context, params acp.PromptRequest
 }
 
 func (s *session) messageNativeRun(ctx context.Context, params acp.PromptRequest) (func(context.Context) (opencode.NativeMessage, error), error) {
-	if err := s.validatePromptImages(ctx, params.Prompt); err != nil {
+	handoff, err := s.validatePromptMedia(ctx, params.Prompt)
+	if err != nil {
 		return nil, err
 	}
 
-	parts, err := promptToOpenCodeParts(params.Prompt)
+	parts, err := promptToOpenCodeParts(params.Prompt, handoff)
 	if err != nil {
 		return nil, err
 	}
@@ -707,9 +709,9 @@ func slashCommandInvocation(blocks []acp.ContentBlock) (slashCommandPrompt, bool
 	return slashCommandPrompt{name: rest}, true
 }
 
-func promptToOpenCodeParts(blocks []acp.ContentBlock) ([]map[string]any, error) {
+func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedHandoffImages) ([]map[string]any, error) {
 	parts := make([]map[string]any, 0, len(blocks))
-	for _, block := range blocks {
+	for position, block := range blocks {
 		switch {
 		case block.Text != nil:
 			parts = append(parts, map[string]any{jsonFieldType: partTypeText, partTypeText: block.Text.Text})
@@ -723,7 +725,7 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock) ([]map[string]any, error) 
 
 			parts = append(parts, part)
 		case block.Image != nil:
-			parts = append(parts, imageOpenCodePart(block.Image))
+			parts = append(parts, handoff.imagePart(position, block.Image))
 		default:
 			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fieldPrompt})
 		}
@@ -736,14 +738,14 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock) ([]map[string]any, error) 
 	return parts, nil
 }
 
-func commandPromptParts(blocks []acp.ContentBlock) ([]map[string]any, error) {
+func commandPromptParts(blocks []acp.ContentBlock, handoff resolvedHandoffImages) ([]map[string]any, error) {
 	if len(blocks) == 0 {
 		return nil, nil
 	}
 
 	parts := make([]map[string]any, 0, len(blocks))
-	for _, block := range blocks {
-		part, ok, err := commandFilePart(block)
+	for position, block := range blocks {
+		part, ok, err := commandFilePart(position, block, handoff)
 		if err != nil {
 			return nil, err
 		}
@@ -761,10 +763,10 @@ func commandPromptParts(blocks []acp.ContentBlock) ([]map[string]any, error) {
 	return parts, nil
 }
 
-func commandFilePart(block acp.ContentBlock) (map[string]any, bool, error) {
+func commandFilePart(position int, block acp.ContentBlock, handoff resolvedHandoffImages) (map[string]any, bool, error) {
 	switch {
 	case block.Image != nil:
-		return imageOpenCodePart(block.Image), true, nil
+		return handoff.imagePart(position, block.Image), true, nil
 	case block.ResourceLink != nil:
 		return resourceLinkOpenCodePart(block.ResourceLink), true, nil
 	case block.Resource != nil && block.Resource.Resource.BlobResourceContents != nil:
@@ -873,12 +875,12 @@ func embeddedResourceOpenCodePart(resource acp.EmbeddedResourceResource) (map[st
 	}
 
 	if blob := resource.BlobResourceContents; blob != nil {
-		mimeType := ""
+		declared := ""
 		if blob.MimeType != nil {
-			mimeType = strings.ToLower(strings.TrimSpace(*blob.MimeType))
+			declared = *blob.MimeType
 		}
 
-		if strings.HasPrefix(mimeType, mediaTypeImage+"/") {
+		if isImageMediaType(declared) {
 			return blobResourceOpenCodePart(blob)
 		}
 
@@ -1132,7 +1134,7 @@ func (s *session) filePartUpdates(
 // embedded image for an image data URL, a resource link for a remote URI.
 func userFilePartBlock(part opencode.NativePart) (acp.ContentBlock, bool) {
 	if _, mime, payload, ok := parseImageDataURL(part.URL); ok {
-		if !isImageMIME(firstNonEmpty(mime, part.Mime)) {
+		if !isImageMediaType(firstNonEmpty(mime, part.Mime)) {
 			return acp.ContentBlock{}, false
 		}
 

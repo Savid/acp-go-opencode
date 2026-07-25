@@ -220,6 +220,20 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		require.NoError(t, agent.Close())
 	})
 
+	t.Run("cancelled between recovery attempts", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		crashed := readyRecoveryClient()
+		crashed.providersFunc = func(context.Context) (opencode.ProvidersResponse, error) {
+			close(crashed.runtimeExited)
+			cancel()
+
+			return opencode.ProvidersResponse{}, errors.New("generation exited")
+		}
+		agent, current := recoveryFixture(t, nil, crashed)
+		require.ErrorIs(t, current.ensureRuntime(ctx), context.Canceled)
+		require.NoError(t, agent.Close())
+	})
+
 	t.Run("runtime construction error", func(t *testing.T) {
 		agent, current := recoveryFixture(t, nil)
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), "unexpected recovery factory call")

@@ -45,6 +45,15 @@ only trusted peer:
   selected containment requirement.
 - Native session IDs, canonical directory scopes, and turn nonces bind every
   prompt, abort, permission, question, and event route.
+- Prompt images are read from a local path only when `WithInputHandoffRoot`
+  configures one, and only from beneath it. Containment is checked before and
+  after symlink resolution, the target must be a regular file, the read is
+  bounded at the per-image byte gate, and the declared digest is verified
+  fail-closed. Without the option no inbound path is ever read. The root is a
+  read root: the adapter never writes, moves, or deletes anything under it, and
+  a resolved path never reaches the native request or a log of it.
+- Every inbound resource blob is decoded and byte-bounded whatever its MIME, so
+  no prompt channel forwards unvalidated or unbounded bytes to the harness.
 
 ## stdout is protocol-only
 

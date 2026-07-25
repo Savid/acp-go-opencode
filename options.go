@@ -83,9 +83,12 @@ type Options struct {
 	Home string
 	// ScratchDir is the parent for a generated shared runtime root and transient
 	// adapter scratch material. It is never a per-session OpenCode home.
-	ScratchDir   string
-	DefaultModel string
-	Env          map[string]string
+	ScratchDir string
+	// InputHandoffRoot is the only directory a prompt image may be read from.
+	// Empty rejects the handoff input form outright.
+	InputHandoffRoot string
+	DefaultModel     string
+	Env              map[string]string
 
 	Logger            *slog.Logger
 	TracerProvider    trace.TracerProvider
@@ -169,6 +172,17 @@ func WithHome(path string) Option {
 func WithScratchDir(dir string) Option {
 	return func(options *Options) {
 		options.ScratchDir = dir
+	}
+}
+
+// WithInputHandoffRoot sets the absolute directory a prompt image may be read
+// from when it arrives in the handoff form: an image block with empty data, a
+// file URI, and a digest envelope. It is a read root only — the wrapper never
+// writes, moves, or deletes anything beneath it, and it materializes nothing,
+// so it carries no scratch semantics. Unset rejects every handoff-form block.
+func WithInputHandoffRoot(dir string) Option {
+	return func(options *Options) {
+		options.InputHandoffRoot = dir
 	}
 }
 

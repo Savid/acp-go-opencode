@@ -40,6 +40,7 @@ runtime and its resources quarantined.
 | `WithConcurrencyLimits` | Cap concurrent client calls and active sessions; native prompt turns are additionally serialized Agent-wide because cancellation retires their shared runtime. |
 | `WithTurnTimeout` | Per-turn deadline; `0` (default) disables it. |
 | `WithImageLimits` | Decoded-byte bounds for prompt and emitted image content (`ImageLimits`); each field defaults to 6 MiB, `0` disables that policy limit, and a negative value is rejected at construction. |
+| `WithInputHandoffRoot` | Absolute directory a prompt image may be read from in the handoff input form. Read-only, unset by default, and a relative value is rejected at construction. |
 | `WithRuntimeResourceHooks` | Worker-global native-root and scratch-root permit hooks; a non-nil hook must return a non-nil release function. |
 | `WithAgentName` / `WithAgentTitle` / `WithAgentVersion` | Identity in the initialize response. |
 | `WithLogger` | `*slog.Logger` for adapter diagnostics. |
@@ -53,6 +54,17 @@ but the output bounds are additionally clamped to the ACP transport frame limit
 (7,864,155 decoded bytes), which a larger configured value cannot exceed. The
 input allowlist is exactly `image/png`, `image/jpeg`, `image/gif`, and
 `image/webp`, static frames only; animated members are rejected before the turn.
+Both input bounds are advertised at initialize, so a host can pre-check a prompt
+against the exact numbers the gates enforce.
+
+`WithInputHandoffRoot` enables the handoff input form described in
+[Prompt Streaming](/core/prompt-streaming). It is a read root: the adapter
+resolves a prompt image's `file://` URI beneath it, verifies the declared
+digest, and reads the bytes, and it never writes, moves, or deletes anything
+there. It materializes nothing and therefore carries no scratch semantics, and
+it is independent of `WithScratchDir`. Files beneath it belong to the host,
+which may delete one the moment the prompt call returns. Leaving it unset
+rejects every handoff-form block with `invalid_handoff`.
 
 `RuntimeResourceHooks` also carries `ObserveProcess`,
 `ObserveProcessSnapshot`, `ObserveStartupStage`, and `ObserveContainment`.

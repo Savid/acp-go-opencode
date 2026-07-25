@@ -31,8 +31,8 @@ func TestOutputHelperPredicates(t *testing.T) {
 	})
 
 	t.Run("isImageMIME", func(t *testing.T) {
-		require.True(t, isImageMIME("  IMAGE/PNG  "))
-		require.False(t, isImageMIME("text/plain"))
+		require.True(t, isImageMediaType("  IMAGE/PNG  "))
+		require.False(t, isImageMediaType("text/plain"))
 	})
 
 	t.Run("remoteArtifactURL", func(t *testing.T) {
@@ -494,4 +494,11 @@ func TestMapLocalImageArtifactReplayFinishError(t *testing.T) {
 	_, _, err := sess.mapOutputArtifact(context.Background(), opencode.NativeAttachment{Mime: mimePNG, URL: "file:///tmp/x.png"}, "id-x", provenanceTool, true)
 	data := assertTurnFailed(t, err, causeTransport, "")
 	require.Equal(t, outputReasonNotARaster, data[jsonFieldReason])
+}
+
+// TestPathWithinRootRejectsIncomparablePaths covers the containment
+// predicate's relation failure: an absolute path has no relation to a
+// relative root, which is a containment failure rather than an error.
+func TestPathWithinRootRejectsIncomparablePaths(t *testing.T) {
+	require.False(t, pathWithinRoot("relative-root", filepath.Join(string(filepath.Separator), "absolute", "path")))
 }

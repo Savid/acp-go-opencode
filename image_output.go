@@ -127,10 +127,6 @@ func parseImageDataURL(value string) (prefix, mime, payload string, ok bool) {
 	return value[:comma+1], mime, value[comma+1:], true
 }
 
-func isImageMIME(mime string) bool {
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(mime)), mediaTypeImage+"/")
-}
-
 // mapOutputArtifact normalizes one native artifact to at most one content
 // item. mapped reports whether the artifact has a representation on the image
 // surface; errors are adapter representation failures and turn-fatal.
@@ -141,7 +137,7 @@ func (s *session) mapOutputArtifact(
 	provenance string,
 	replay bool,
 ) (imageOutputItem, bool, error) {
-	image := isImageMIME(artifact.Mime)
+	image := isImageMediaType(artifact.Mime)
 
 	switch {
 	case artifact.URL == "":

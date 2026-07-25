@@ -1934,7 +1934,7 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 			BlobResourceContents: &acp.BlobResourceContents{Blob: "AA==", Uri: "file:///tmp/image.png", MimeType: &imageMime},
 		}}},
 		{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png"}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("promptToOpenCodeParts: %v", err)
 	}
@@ -1944,29 +1944,29 @@ func TestPromptHelpersAndAnswerMapping(t *testing.T) {
 		parts[5]["type"] != "file" || parts[5]["mime"] != "image/png" || parts[5]["url"] != "data:image/png;base64,AA==" {
 		t.Fatalf("parts = %#v", parts)
 	}
-	if _, err = promptToOpenCodeParts(nil); err == nil {
+	if _, err = promptToOpenCodeParts(nil, nil); err == nil {
 		t.Fatal("empty prompt accepted")
 	}
-	if _, err = promptToOpenCodeParts([]acp.ContentBlock{{Audio: &acp.ContentBlockAudio{Type: "audio", Data: "AA==", MimeType: "audio/wav"}}}); err == nil {
+	if _, err = promptToOpenCodeParts([]acp.ContentBlock{{Audio: &acp.ContentBlockAudio{Type: "audio", Data: "AA==", MimeType: "audio/wav"}}}, nil); err == nil {
 		t.Fatal("audio prompt accepted")
 	}
 	if _, err = promptToOpenCodeParts([]acp.ContentBlock{{Resource: &acp.ContentBlockResource{
 		Type: "resource", Resource: acp.EmbeddedResourceResource{TextResourceContents: &acp.TextResourceContents{}},
-	}}}); err == nil {
+	}}}, nil); err == nil {
 		t.Fatal("empty embedded text resource accepted")
 	}
 	invalidURI := "%"
-	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &invalidURI}}})
+	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &invalidURI}}}, nil)
 	if err != nil || parts[0]["filename"] != nil || parts[0]["url"] != "data:image/png;base64,AA==" {
 		t.Fatalf("invalid uri image parts = %#v err=%v", parts, err)
 	}
 	rootURI := "https://example.com"
-	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &rootURI}}})
+	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &rootURI}}}, nil)
 	if err != nil || parts[0]["filename"] != nil || parts[0]["url"] != "data:image/png;base64,AA==" {
 		t.Fatalf("root uri image parts = %#v err=%v", parts, err)
 	}
 	namedURI := "file:///tmp/shot.png"
-	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &namedURI}}})
+	parts, err = promptToOpenCodeParts([]acp.ContentBlock{{Image: &acp.ContentBlockImage{Type: "image", Data: "AA==", MimeType: "image/png", Uri: &namedURI}}}, nil)
 	if err != nil || parts[0]["filename"] != "shot.png" {
 		t.Fatalf("named uri image parts = %#v err=%v", parts, err)
 	}
@@ -2348,7 +2348,7 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 			{Resource: &acp.ContentBlockResource{Type: "resource"}},
 			{},
 		} {
-			_, err := commandPromptParts([]acp.ContentBlock{block})
+			_, err := commandPromptParts([]acp.ContentBlock{block}, nil)
 			if err == nil {
 				t.Fatalf("unconvertible command block accepted: %#v", block)
 			}
@@ -4202,6 +4202,6 @@ func TestSanitizeRawEventValue(t *testing.T) {
 func TestCommandPromptPartsPropagatesBlobError(t *testing.T) {
 	_, err := commandPromptParts([]acp.ContentBlock{{Resource: &acp.ContentBlockResource{
 		Type: "resource", Resource: acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{}},
-	}}})
+	}}}, nil)
 	require.Error(t, err)
 }

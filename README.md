@@ -113,6 +113,13 @@ OpenTelemetry providers.
 - Native OpenCode REST calls and an SSE event stream mapped to ACP prompt
   streaming for messages, reasoning, plans, tool calls, usage, and session
   metadata.
+- Prompt image and resource-blob input gated before a turn starts, with the
+  effective per-image and per-prompt byte bounds advertised at initialize under
+  `acp-go.dev/mediaEnvelope` so a host can pre-check against the exact numbers
+  the gates enforce. `WithInputHandoffRoot` additionally accepts a
+  digest-verified local handoff form: an image block whose bytes are read from
+  beneath that read root instead of being carried inline. Unset, no inbound path
+  is ever read.
 - Permission and question requests bridged to ACP permission and elicitation
   flows.
 - MCP stdio and streamable HTTP server configuration through ACP session

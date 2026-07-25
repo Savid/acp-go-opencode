@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // defaultImageLimitBytes is the default decoded-byte bound for every
@@ -27,6 +28,37 @@ func effectiveOutputLimit(configured int64) int64 {
 	}
 
 	return configured
+}
+
+const (
+	// mediaEnvelopeKey is the family-reserved capability metadata key carrying
+	// the effective inbound media bounds a host can pre-check against.
+	mediaEnvelopeKey = "acp-go.dev/mediaEnvelope"
+
+	mediaEnvelopeFieldMaxBytes        = "maxBytes"
+	mediaEnvelopeFieldMaxPromptBytes  = "maxPromptBytes"
+	mediaEnvelopeFieldMaxDimension    = "maxDimension"
+	mediaEnvelopeFieldImageFormats    = "imageFormats"
+	mediaEnvelopeFieldDocumentFormats = "documentFormats"
+
+	// mediaEnvelopeMaxDimension is zero because OpenCode bounds no image
+	// dimension: the input contract asks only whether a raster's dimensions are
+	// readable, never whether they are large.
+	mediaEnvelopeMaxDimension = 0
+)
+
+// mediaEnvelope reports the effective inbound media bounds: the per-image and
+// per-prompt decoded-byte gates this adapter enforces, read from the same
+// limits the gates read, the input format allowlist in advertised order, and an
+// empty document list because no MIME maps to a native document here.
+func (o Options) mediaEnvelope() map[string]any {
+	return map[string]any{
+		mediaEnvelopeFieldMaxBytes:        o.ImageLimits.MaxInputBytesPerImage,
+		mediaEnvelopeFieldMaxPromptBytes:  o.ImageLimits.MaxInputBytesPerPrompt,
+		mediaEnvelopeFieldMaxDimension:    mediaEnvelopeMaxDimension,
+		mediaEnvelopeFieldImageFormats:    slices.Clone(imageInputFormats),
+		mediaEnvelopeFieldDocumentFormats: []string{},
+	}
 }
 
 // ImageLimits bounds decoded image bytes crossing the ACP boundary. Input
