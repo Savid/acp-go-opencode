@@ -890,6 +890,31 @@ func TestHandoffBlockCountIsCappedWithTheAggregateDisabled(t *testing.T) {
 	require.Equal(t, maxHandoffBlocksPerPrompt, reads, "the block that crossed the cap was read")
 }
 
+// TestHandoffUnsetRootAnswersAheadOfTheBlockCap pins the order of the two
+// pre-gate refusals one prompt can earn at once. An adapter with no read root
+// has no handoff work for the cap to bound, and invalid_handoff is what tells a
+// host its read root never reached the agent, so a prompt carrying more blocks
+// than the cap must still be answered with the root and not with too_large.
+func TestHandoffUnsetRootAnswersAheadOfTheBlockCap(t *testing.T) {
+	root := t.TempDir()
+	png := fixtureImage(t, "valid.png")
+	path := writeHandoffFile(t, root, "shot.png", png)
+
+	blocks := make([]acp.ContentBlock, 0, maxHandoffBlocksPerPrompt+1)
+	for range maxHandoffBlocksPerPrompt + 1 {
+		blocks = append(blocks, handoffBlock(mimePNG, path, handoffEnvelope(png)))
+	}
+
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+
+	requireInvalidParamsData(t, validatePromptMediaError(session, blocks...), map[string]any{
+		jsonFieldField:   fieldPromptImage,
+		jsonFieldError:   imageErrorInvalidHandoff,
+		jsonFieldIndex:   0,
+		jsonFieldMessage: handoffCauseRootUnset,
+	})
+}
+
 // TestHandoffFileSwappedAfterContainmentIsRejected replaces the named file
 // between one read of it and the next. Neither substitution reaches the
 // harness: a name that now leaves the root is refused by the open, and a

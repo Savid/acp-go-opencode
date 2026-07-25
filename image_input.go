@@ -169,6 +169,7 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 
 	limits := s.imageLimits()
 	promptGate := effectiveInputBytesPerPrompt(limits.MaxInputBytesPerPrompt)
+	handoffRoot := s.inputHandoffRoot()
 
 	// The selected-model gate answers for the first raster in the prompt, which
 	// may have arrived on a resource blob rather than on an image block. Its
@@ -186,7 +187,11 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 			return nil, err
 		}
 
-		if isHandoffForm(block) {
+		// An adapter with no read root reads nothing, so there is no work here
+		// for the cap to bound, and the root-unset invalid_handoff the read
+		// reports is how a host learns its root never arrived. Nothing may stand
+		// in front of it, so the cap sits behind the root.
+		if handoffRoot != "" && isHandoffForm(block) {
 			// Counted before the block is read, because bounding the reads is
 			// the whole point of the cap.
 			handoffs++
