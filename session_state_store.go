@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -30,8 +31,56 @@ const (
 	syncFieldDirectory      = "directory"
 )
 
+// A native write that lands between the two /sync/history reads invalidates the
+// generation being exported. The reads are loopback-fast (measured p50 3ms, max
+// 28ms) while native writes on a working session arrive hundreds of milliseconds
+// apart (measured p50 96-278ms, max 1.23s), and a settling session stops writing
+// within about 0.75s of its turn going idle. Re-reading a whole generation is
+// therefore near-certain to land in a quiet window: five retries spend 1.55s of
+// backoff, which outlasts both the longest measured write gap and the longest
+// measured post-idle tail.
+const (
+	stateCaptureAttempts    = 6
+	stateCaptureBackoffBase = 50 * time.Millisecond
+	stateCaptureBackoffCap  = 800 * time.Millisecond
+)
+
+// errGraphChangedDuringExport reports that the native graph was written while
+// the generation was being read. It is the only retryable capture failure:
+// every other error names a durable defect rather than a transient overlap.
+var errGraphChangedDuringExport = errors.New("OpenCode graph changed during export")
+
 var sessionStateReplaceTimeout = 60 * time.Second
 var restoreRandRead = rand.Read
+
+// stateCaptureSettleBudget caps the wall clock the retries may add to a single
+// snapshot, so a session that never stops writing cannot make the snapshot
+// outlive the turn or the cancellation containment it belongs to. The prompt
+// path snapshots under a context detached from the turn, so without this bound
+// nothing would stop the loop; the cancellation path already carries a deadline
+// and keeps whichever bound expires first.
+var stateCaptureSettleBudget = 5 * time.Second
+
+var stateCaptureWait = func(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func stateCaptureBackoff(attempt int) time.Duration {
+	backoff := stateCaptureBackoffBase << attempt
+	if backoff <= 0 || backoff > stateCaptureBackoffCap {
+		return stateCaptureBackoffCap
+	}
+
+	return backoff
+}
 
 type idmapRecord struct {
 	SessionID             string `json:"sessionId"`
@@ -131,11 +180,6 @@ func (s *session) captureStateSnapshot(
 		}
 	}
 
-	first, err := s.client.SyncHistory(ctx, map[string]int64{})
-	if err != nil {
-		return capturedStateSnapshot{}, fmt.Errorf("capture OpenCode sync history: %w", err)
-	}
-
 	allow := make(map[string]stateSnapshotNode, len(graph))
 	nodes := make([]stateSnapshotNode, 0, len(graph))
 
@@ -151,26 +195,14 @@ func (s *session) captureStateSnapshot(
 		nodes = append(nodes, node)
 	}
 
-	events, cursors, err := allowlistedSyncEvents(first, allow)
-	if err != nil {
-		return capturedStateSnapshot{}, err
-	}
-
 	// Emitted image bytes live once, in the canonical artifact records that
 	// ride this same replacement set; the captured native events keep
 	// references instead of a second base64 copy.
 	artifacts := unionImageArtifacts(graph)
-	sanitizeSyncEventImages(events, artifacts)
 
-	second, err := s.client.SyncHistory(ctx, cursors)
+	events, err := s.stableSyncGeneration(ctx, allow, artifacts)
 	if err != nil {
-		return capturedStateSnapshot{}, fmt.Errorf("verify OpenCode sync watermark: %w", err)
-	}
-
-	for _, event := range second {
-		if _, ok := allow[event.AggregateID]; ok {
-			return capturedStateSnapshot{}, fmt.Errorf("OpenCode graph changed during export")
-		}
+		return capturedStateSnapshot{}, err
 	}
 
 	generation, err := newRestoreGeneration()
@@ -231,6 +263,84 @@ func (s *session) captureStateSnapshot(
 	}
 
 	return capturedStateSnapshot{replacements: replacements}, nil
+}
+
+// stableSyncGeneration reads one native generation and proves nothing in the
+// allowlisted graph was written while it was being read, repeating the whole
+// read when that proof fails. A detected change never narrows the proof: every
+// retry re-reads every aggregate and re-applies the same predicate over every
+// event kind, so the exported generation is always one the native harness held
+// still for.
+func (s *session) stableSyncGeneration(
+	ctx context.Context,
+	allow map[string]stateSnapshotNode,
+	artifacts map[string]imageArtifactRecord,
+) (map[string][]opencode.SyncEvent, error) {
+	deadline := time.Now().Add(stateCaptureSettleBudget)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+
+	var changed error
+
+	for attempt := range stateCaptureAttempts {
+		events, err := s.readSyncGeneration(ctx, allow, artifacts)
+		if err == nil {
+			return events, nil
+		}
+
+		if !errors.Is(err, errGraphChangedDuringExport) {
+			return nil, err
+		}
+
+		changed = err
+
+		if attempt == stateCaptureAttempts-1 {
+			break
+		}
+
+		backoff := stateCaptureBackoff(attempt)
+		if time.Now().Add(backoff).After(deadline) {
+			break
+		}
+
+		if waitErr := stateCaptureWait(ctx, backoff); waitErr != nil {
+			return nil, waitErr
+		}
+	}
+
+	return nil, changed
+}
+
+func (s *session) readSyncGeneration(
+	ctx context.Context,
+	allow map[string]stateSnapshotNode,
+	artifacts map[string]imageArtifactRecord,
+) (map[string][]opencode.SyncEvent, error) {
+	first, err := s.client.SyncHistory(ctx, map[string]int64{})
+	if err != nil {
+		return nil, fmt.Errorf("capture OpenCode sync history: %w", err)
+	}
+
+	events, cursors, err := allowlistedSyncEvents(first, allow)
+	if err != nil {
+		return nil, err
+	}
+
+	sanitizeSyncEventImages(events, artifacts)
+
+	second, err := s.client.SyncHistory(ctx, cursors)
+	if err != nil {
+		return nil, fmt.Errorf("verify OpenCode sync watermark: %w", err)
+	}
+
+	for _, event := range second {
+		if _, ok := allow[event.AggregateID]; ok {
+			return nil, errGraphChangedDuringExport
+		}
+	}
+
+	return events, nil
 }
 
 func (s *session) commitStateSnapshot(ctx context.Context, captured capturedStateSnapshot) error {

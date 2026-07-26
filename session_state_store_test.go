@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"errors"
 
@@ -341,16 +342,17 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	require.ErrorContains(t, current.snapshotToStore(context.Background()), "watermark failed")
 
 	current, client = newSnapshotSession()
-	historyCalls = 0
-	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
-		historyCalls++
-		if historyCalls == 2 {
+	originalWait := stateCaptureWait
+	stateCaptureWait = func(context.Context, time.Duration) error { return nil }
+	client.syncHistoryFunc = func(_ context.Context, cursors map[string]int64) ([]opencode.SyncEvent, error) {
+		if len(cursors) > 0 {
 			return []opencode.SyncEvent{syncTestEvent("native-1", 1, "session.updated.1", nil)}, nil
 		}
 
 		return append([]opencode.SyncEvent(nil), client.syncEvents...), nil
 	}
 	require.ErrorContains(t, current.snapshotToStore(context.Background()), "changed during export")
+	stateCaptureWait = originalWait
 
 	current, _ = newSnapshotSession()
 	originalRead := restoreRandRead
@@ -463,4 +465,170 @@ func TestCaptureStateSnapshotArtifactReplacementError(t *testing.T) {
 	t.Cleanup(func() { imageJSONMarshal = original })
 
 	require.Error(t, session.snapshotToStore(context.Background()))
+}
+
+func TestCaptureStateSnapshotRetriesUnstableSyncGeneration(t *testing.T) {
+	newSnapshotSession := func() (*session, *fakeOpenCodeClient) {
+		agent := NewAgent()
+		client := newFakeOpenCodeClient()
+		current := testSession(agent, client)
+		agent.sessions[current.id] = current
+
+		return current, client
+	}
+
+	// unstableHistory reports an allowlisted native write on the watermark read
+	// of the first trips capture attempts, then goes quiet.
+	unstableHistory := func(client *fakeOpenCodeClient, trips int, attempts *int) func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
+		return func(_ context.Context, cursors map[string]int64) ([]opencode.SyncEvent, error) {
+			if len(cursors) == 0 {
+				*attempts++
+
+				return append([]opencode.SyncEvent(nil), client.syncEvents...), nil
+			}
+
+			if *attempts <= trips {
+				return []opencode.SyncEvent{syncTestEvent("native-1", 1, "session.updated.1", nil)}, nil
+			}
+
+			return nil, nil
+		}
+	}
+
+	recordWaits := func(t *testing.T) *[]time.Duration {
+		t.Helper()
+
+		waits := &[]time.Duration{}
+		original := stateCaptureWait
+		stateCaptureWait = func(_ context.Context, delay time.Duration) error {
+			*waits = append(*waits, delay)
+
+			return nil
+		}
+
+		t.Cleanup(func() { stateCaptureWait = original })
+
+		return waits
+	}
+
+	t.Run("retries past a write that lands between the two reads", func(t *testing.T) {
+		current, client := newSnapshotSession()
+		attempts := 0
+		client.syncHistoryFunc = unstableHistory(client, 1, &attempts)
+		waits := recordWaits(t)
+
+		require.NoError(t, current.snapshotToStore(context.Background()))
+		require.Equal(t, 2, attempts)
+		require.Equal(t, []time.Duration{stateCaptureBackoffBase}, *waits)
+	})
+
+	t.Run("exhausts the bounded schedule and reports the change", func(t *testing.T) {
+		current, client := newSnapshotSession()
+		attempts := 0
+		client.syncHistoryFunc = unstableHistory(client, stateCaptureAttempts, &attempts)
+		waits := recordWaits(t)
+
+		err := current.snapshotToStore(context.Background())
+		require.ErrorIs(t, err, errGraphChangedDuringExport)
+		require.EqualError(t, err, "OpenCode graph changed during export")
+		require.Equal(t, stateCaptureAttempts, attempts)
+		require.Equal(t, []time.Duration{
+			50 * time.Millisecond,
+			100 * time.Millisecond,
+			200 * time.Millisecond,
+			400 * time.Millisecond,
+			800 * time.Millisecond,
+		}, *waits)
+	})
+
+	t.Run("stops retrying when the settle budget is spent", func(t *testing.T) {
+		current, client := newSnapshotSession()
+		attempts := 0
+		client.syncHistoryFunc = unstableHistory(client, stateCaptureAttempts, &attempts)
+		waits := recordWaits(t)
+
+		originalBudget := stateCaptureSettleBudget
+		stateCaptureSettleBudget = 0
+
+		t.Cleanup(func() { stateCaptureSettleBudget = originalBudget })
+
+		require.ErrorIs(t, current.snapshotToStore(context.Background()), errGraphChangedDuringExport)
+		require.Equal(t, 1, attempts)
+		require.Empty(t, *waits)
+	})
+
+	t.Run("keeps a caller deadline shorter than the settle budget", func(t *testing.T) {
+		current, client := newSnapshotSession()
+		attempts := 0
+		client.syncHistoryFunc = unstableHistory(client, stateCaptureAttempts, &attempts)
+		waits := recordWaits(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		defer cancel()
+
+		require.ErrorIs(t, current.snapshotToStore(ctx), errGraphChangedDuringExport)
+		require.Equal(t, 1, attempts)
+		require.Empty(t, *waits)
+	})
+
+	t.Run("surfaces a cancelled backoff", func(t *testing.T) {
+		current, client := newSnapshotSession()
+		attempts := 0
+		client.syncHistoryFunc = unstableHistory(client, stateCaptureAttempts, &attempts)
+
+		original := stateCaptureWait
+		stateCaptureWait = func(context.Context, time.Duration) error { return context.Canceled }
+
+		t.Cleanup(func() { stateCaptureWait = original })
+
+		require.ErrorIs(t, current.snapshotToStore(context.Background()), context.Canceled)
+		require.Equal(t, 1, attempts)
+	})
+
+	t.Run("never retries a durable capture defect", func(t *testing.T) {
+		current, client := newSnapshotSession()
+		attempts := 0
+		client.syncHistoryFunc = func(_ context.Context, cursors map[string]int64) ([]opencode.SyncEvent, error) {
+			if len(cursors) == 0 {
+				attempts++
+
+				return append([]opencode.SyncEvent(nil), client.syncEvents...), nil
+			}
+
+			return nil, errors.New("watermark failed")
+		}
+		waits := recordWaits(t)
+
+		require.ErrorContains(t, current.snapshotToStore(context.Background()), "watermark failed")
+		require.Equal(t, 1, attempts)
+		require.Empty(t, *waits)
+	})
+}
+
+func TestStateCaptureBackoffGrowsExponentiallyAndCaps(t *testing.T) {
+	require.Equal(t, []time.Duration{
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+		800 * time.Millisecond,
+	}, []time.Duration{
+		stateCaptureBackoff(0),
+		stateCaptureBackoff(1),
+		stateCaptureBackoff(2),
+		stateCaptureBackoff(3),
+		stateCaptureBackoff(4),
+	})
+
+	require.Equal(t, stateCaptureBackoffCap, stateCaptureBackoff(5))
+	require.Equal(t, stateCaptureBackoffCap, stateCaptureBackoff(62))
+}
+
+func TestStateCaptureWaitHonoursDelayAndCancellation(t *testing.T) {
+	require.NoError(t, stateCaptureWait(context.Background(), time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, stateCaptureWait(ctx, time.Hour), context.Canceled)
 }
