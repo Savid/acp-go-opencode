@@ -29,6 +29,16 @@ extension. This page lists each method and its behavior.
   state into a new session.
 - `_opencode/rawEvent` — an outbound notification, not a request (see
   [Raw events](/docs/features/raw-events)).
+- `_opencode/auth/methods`, `_opencode/auth/authorize`,
+  `_opencode/auth/callback`, `_opencode/auth/status`, `_opencode/auth/cancel`,
+  `_opencode/auth/inventory`, and `_opencode/auth/disconnect` — the brokered
+  provider-login surface. All seven are advertised together under
+  `agentCapabilities._meta.opencode.providerAuth`, and only while both
+  `-provider-auth-root` and `-home` are configured; otherwise every one of them
+  returns method-not-found (see
+  [Authentication](/docs/features/authentication)). There is no
+  `_opencode/auth/credential` leg and no injection key: a completed login is
+  installed into OpenCode's own durable store and never crosses back out.
 - `session/set_mode` — returns method-not-found; mode is a config option set
   through `session/set_config_option`, not a dedicated method.
 

@@ -1,11 +1,11 @@
 ---
 title: Authentication
-description: Why the adapter advertises no ACP auth methods and how it secures the shared OpenCode runtime.
+description: The empty ACP auth-method list, the loopback runtime credentials, and the brokered provider-login surface.
 ---
 
-Provider authentication belongs to OpenCode, not to the adapter. You sign in to
-your providers through OpenCode's own tooling; the adapter never manages that
-credential state and never signs in on your behalf.
+The adapter advertises no ACP auth method of its own, and it brokers provider
+logins through a session-scoped extension surface when a host configures a
+durable ledger root and a durable home.
 
 ## No ACP auth methods
 
@@ -14,9 +14,8 @@ response. An `authenticate` request is rejected with an invalid-params error
 echoing the requested `methodId`, and `logout` is a no-op that clears only
 adapter-owned session state — it never touches OpenCode's provider credentials.
 
-Because provider auth is native, the [models and config](/docs/features/models-config)
-option catalog is populated only from providers OpenCode is already
-authenticated for.
+The [models and config](/docs/features/models-config) option catalog is
+populated only from providers OpenCode is already authenticated for.
 
 ## Runtime server credentials
 
@@ -30,3 +29,121 @@ Session snapshots contain only allowlisted native sync events. Native files,
 provider credentials, MCP credentials, and control secrets are never copied
 into the session store.
 </Note>
+
+## Provider auth
+
+A host that wants to sign a worker in to a model provider drives the
+`_opencode/auth/*` extension methods listed in
+[ACP methods](/docs/reference/acp-methods). The adapter is a broker: OpenCode
+mints, exchanges, refreshes, and stores every credential, and the adapter never
+acts as an OAuth client.
+
+### Turning the surface on
+
+Seven legs are advertised when **both** of these are configured:
+
+- `WithProviderAuthRoot` (`-provider-auth-root`) — an absolute, durable,
+  host-owned directory holding the adapter's values-free ledger. It sits
+  outside session scratch and outlives every session and native generation.
+- `WithHome` (`-home`) — the exclusive shared XDG runtime root. OpenCode keeps
+  one credential store per XDG root and an adapter-created root is removed on
+  runtime teardown, so a login completed without a durable home would report
+  success and leave nothing resident.
+
+With either missing, `agentCapabilities._meta.opencode.providerAuth` is absent
+and every leg returns method-not-found. The same holds for a configured root
+that cannot be created, is not a directory, or is not writable.
+
+`WithProviderAuthDirectHome` (`-provider-auth-direct-home`) is declared for
+configuration symmetry and is **rejected** here: a set value fails session start
+with `{"error":"unsupported","field":"providerAuthDirectHome"}`. OpenCode
+removes a credential with `DELETE /auth/{providerId}`, a scoped per-provider
+call that consents to nothing beyond the slot it names, so there is no canonical
+home for the gate to authorize.
+
+### The flow
+
+1. `_opencode/auth/methods` returns the provider catalog and an opaque
+   `generation` token naming that exact result. The catalog merges OpenCode's
+   provider list with its special login methods; a provider with no special
+   method receives one synthesized API-key method under the reserved id
+   `default-api`. A method id is a native array index, so it is meaningful only
+   inside the generation that produced it.
+2. `_opencode/auth/authorize` starts one flow per `(sessionId, providerId)`. It
+   carries the `methodsGeneration` token, a caller-minted `authorizeRequestId`
+   idempotency key, and the answers to the method's prompts. A repeat of the
+   same `authorizeRequestId` replays the recorded presentation verbatim with no
+   native call.
+3. `_opencode/auth/callback` submits the flow's expected value and is the
+   completion driver. For a device method the empty input drives a bounded
+   blocking wait on OpenCode's callback endpoint; for a paste-back method the
+   input is the code; for an API-key method the input is the key.
+4. `_opencode/auth/status` reports the flow state. Its `expiresAt` is
+   **credential** expiry, never flow expiry.
+5. `_opencode/auth/cancel` abandons a flow. It never claims provider-side
+   cancellation — an issued device code stays valid at the provider until it
+   expires there.
+6. `_opencode/auth/inventory` answers residence from the ledger **and** a probe
+   of the named native slot.
+7. `_opencode/auth/disconnect` bumps the binding generation, removes the
+   exactly-fenced slot with `DELETE /auth/{providerId}`, and verifies absence.
+   It promises no provider-side revocation.
+
+There is no `credential` leg and no injection key. A completed login is
+installed by the adapter into OpenCode's own durable runtime store, so no
+credential ever crosses back out to the host.
+
+### Per-flow broker homes
+
+A device or paste-back flow runs against a dedicated short-lived
+`opencode serve` in its own XDG root under the scratch parent, named
+`acp-go-opencode-auth-broker-*`. On native completion the adapter reads the
+finished credential out of that broker home's own store, performs one fenced
+install into the durable runtime store, and destroys the home — terminating the
+process first, then removing the directory. Destruction happens on every
+terminal transition, including expiry, cancellation, and failure, and a
+superseding `authorize` destroys the abandoned home without installing anything
+from it.
+
+### What the ledger holds
+
+The ledger under `ProviderAuthRoot` is values-free and its content is closed:
+provider slot identity, connection id, revision, binding generation, flow id,
+`authorizeRequestId`, state, and timestamps. It never holds credential
+material, authorization URLs, user codes, prompt answers, or native text.
+Entries are written atomically and durably — write-temp, fsync, rename,
+fsync-dir — with files `0600` under a `0700` root.
+
+The authorize presentation an idempotent repeat replays lives only in the
+session-scoped in-memory flow record. It never reaches the ledger and never
+reaches the session store.
+
+### Bounds and validation
+
+Native presentation text crosses on four fields only, and each is NFC-normalised
+before it is measured, checked, relayed, and stored:
+
+| Field | Bound |
+| --- | --- |
+| `url` | at most 2048 bytes, scheme exactly `https`, no userinfo, no fragment |
+| `message` | at most 2048 bytes |
+| `userCode` | at most 64 bytes, fully matching `[A-Za-z0-9-]+` |
+| `label` | at most 256 bytes |
+
+`message` and `label` are additionally restricted to Unicode categories L, N,
+P, S, and Zs. A field violating its bound is dropped rather than truncated: on
+a flow leg the call then fails closed, while on `methods` only the offending
+catalog entry is omitted.
+
+Prompt answers are validated by value before any native call: a `select` answer
+must be byte-equal to an advertised option of the same generation, a `text`
+answer is at most 1024 bytes of control-free, newline-free UTF-8, and the whole
+`inputs` object is at most 8192 bytes across at most sixteen keys. A prompt
+whose value OpenCode interpolates into a URL or hostname is additionally checked
+against a per-provider registrable-domain allowlist, and a method whose
+hostname-forming prompt has no allowlist entry is omitted from the catalog
+entirely.
+
+Native error text never crosses. Every leg failure is the closed
+`opencode_auth_failed` error (JSON-RPC `-32000`) carrying a `cause` from a fixed
+enum and no native message.

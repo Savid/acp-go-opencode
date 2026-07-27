@@ -46,7 +46,7 @@ func newGuardianContainment(config supervisorConfig) (*guardianContainment, erro
 	return &guardianContainment{}, nil
 }
 
-func (*guardianContainment) Name() string { return "darwin-best-effort" }
+func (*guardianContainment) Name() string { return darwinBestEffortJobName }
 
 func (*guardianContainment) Close() error { return nil }
 

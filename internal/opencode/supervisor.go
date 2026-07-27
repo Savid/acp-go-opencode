@@ -26,6 +26,7 @@ const (
 	supervisorReadyPrefix   = "acp-go-opencode supervisor-ready "
 	supervisorConfigPrefix  = "supervisor-config-"
 	supervisorQuiesceWindow = 5 * time.Second
+	darwinBestEffortJobName = "darwin-best-effort"
 )
 
 // ErrProcessContainmentIncomplete marks shutdown failures for which the native process
@@ -308,7 +309,7 @@ func runGuardian(config supervisorConfig) error {
 	defer containment.Close()
 
 	config.JobName = supervisorGuardianName(containment)
-	if config.JobName == "darwin-best-effort" {
+	if config.JobName == darwinBestEffortJobName {
 		config.DarwinBestEffort = true
 
 		if config.ScratchParent == "" {

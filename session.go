@@ -1017,6 +1017,16 @@ func (s *session) Close(_ context.Context) error {
 		}
 	}
 
+	// Pending provider-auth flows are cancelled after pending elicitation is
+	// resolved and before the native interrupt, so a flow is never abandoned to
+	// a process that is already being torn down.
+	if s.agent != nil && s.agent.providerAuth != nil {
+		flowCtx, flowCancel := context.WithTimeout(context.Background(), closeTimeout)
+		s.agent.providerAuth.closeSession(flowCtx, s.id)
+
+		flowCancel()
+	}
+
 	s.mu.Lock()
 	client := s.client
 	nativeID := s.idmap.NativeSessionID

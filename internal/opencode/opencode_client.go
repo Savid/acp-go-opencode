@@ -134,6 +134,14 @@ type Client interface {
 	NativeVersion() string
 	SyncHistory(context.Context, map[string]int64) ([]SyncEvent, error)
 	SyncReplay(context.Context, string, []SyncReplayEvent) error
+	ProviderCatalog(context.Context) ([]ProviderCatalogEntry, error)
+	ProviderAuthMethods(context.Context) (map[string][]ProviderAuthMethod, error)
+	ProviderAuthorize(context.Context, string, int, map[string]string) (ProviderAuthorization, error)
+	ProviderAuthCallback(context.Context, string, int, string) error
+	SetProviderAuth(context.Context, string, ProviderAuthCredential) error
+	RemoveProviderAuth(context.Context, string) error
+	StoredProviderAuth(context.Context, string) (ProviderAuthCredential, bool, error)
+	DisposeInstance(context.Context) error
 }
 
 type ScopeOptions struct {

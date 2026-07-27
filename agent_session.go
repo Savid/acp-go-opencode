@@ -22,6 +22,10 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
+	if err := validateProviderAuthOptions(a.options); err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+
 	if err := validateSessionStartPaths(params.Cwd, params.AdditionalDirectories); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -169,6 +173,10 @@ func (a *Agent) loadOrResumeSession(
 
 	if a.isDeleted(id) {
 		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	}
+
+	if err := validateProviderAuthOptions(a.options); err != nil {
+		return nil, err
 	}
 
 	if err := validateSessionStartPaths(cwd, additionalDirectories); err != nil {
@@ -390,6 +398,10 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
 	ctx = a.observe.Extract(ctx, params.Meta)
+	if err := validateProviderAuthOptions(a.options); err != nil {
+		return acp.UnstableForkSessionResponse{}, err
+	}
+
 	if err := validateSessionStartPaths(params.Cwd, params.AdditionalDirectories); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}

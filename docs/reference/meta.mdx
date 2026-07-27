@@ -68,7 +68,12 @@ load-history updates remain outside a turn epoch and omit the envelope.
 The initialize response advertises adapter surfaces under
 `_meta.opencode`: `fork`, `elicitation`, `rawEvent` (method, enable path, and
 `maxBytes`), `sessionStore` (format and key), and `structuredOutput` (config
-path, result path, and schema mode). `AgentCapabilities.Meta` also advertises
+path, result path, and schema mode). It additionally advertises
+`providerAuth` — a single `methods` array naming the seven enabled
+`_opencode/auth/*` extension names — but only while both `-provider-auth-root`
+and `-home` are configured. The array carries no `injectionKey`, because the
+adapter accepts no injected credential (see
+[Authentication](/docs/features/authentication)). `AgentCapabilities.Meta` also advertises
 `"acp-go.dev/route": {"versions": [1]}`.
 
 `promptCapabilities.image` is advertised `true`: the adapter accepts a standard
@@ -132,3 +137,20 @@ A failed turn returns an ACP internal error whose `data` carries:
 | `structuredOutputRequested` | `true` when the turn sent a native output schema. |
 | `stage` / `reason` | Present on an image-output failure: `stage` is `image_output`; `reason` is always `storage_failed`, because the other image-output verdicts refuse the tool call without ending the turn. |
 | `sizeBytes` / `maxBytes` | Present when an image-output failure carries decoded sizes. |
+
+## Provider-auth error data
+
+A failed provider-auth leg returns JSON-RPC `-32000` whose `data` carries:
+
+| Field | Meaning |
+|---|---|
+| `error` | Always `opencode_auth_failed`. |
+| `cause` | One of `native_veto`, `provider_refused`, `transport`, `process`, `timeout`, `harvest_failed`, `unsupported_variant`, `flow_expired`, `flow_state`, `flow_cancelled`, `policy`. |
+| `retryable` | Always present; `true` only for the transport-shaped causes. |
+| `providerId` / `method` / `flowId` | Present when the failure names one. |
+
+There is no free-form field and no native message text. A caller-owned
+addressing failure — an unknown, superseded, or cross-session `flowId`, a stale
+`methodsGeneration`, a `method` that does not match the flow, or a prompt answer
+that fails validation — is invalid params (`-32602`) carrying the offending
+field path instead.

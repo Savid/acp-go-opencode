@@ -8,6 +8,21 @@ import (
 	"github.com/coder/acp-go-sdk"
 )
 
+// optionFieldProviderAuthDirectHome names the exact-home consent gate in the
+// uniform unsupported-option error. OpenCode removes a credential with
+// DELETE /auth/{providerId}, a scoped per-provider call that consents to
+// nothing beyond the slot it names, so there is no canonical home for the gate
+// to authorize.
+const optionFieldProviderAuthDirectHome = "providerAuthDirectHome"
+
+func validateProviderAuthOptions(options Options) error {
+	if options.ProviderAuthDirectHome == "" {
+		return nil
+	}
+
+	return unsupportedField(optionFieldProviderAuthDirectHome)
+}
+
 func validateSessionStartPaths(cwd string, additionalDirectories []string) error {
 	if err := validateRequiredAbsolutePath(jsonFieldCwd, cwd); err != nil {
 		return err

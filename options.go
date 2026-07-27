@@ -87,8 +87,17 @@ type Options struct {
 	// InputHandoffRoot is the only directory a prompt image may be read from.
 	// Empty rejects the handoff input form outright.
 	InputHandoffRoot string
-	DefaultModel     string
-	Env              map[string]string
+	// ProviderAuthRoot is the durable host-owned directory holding the
+	// values-free provider-auth ledger. Empty leaves every provider-auth method
+	// unadvertised.
+	ProviderAuthRoot string
+	// ProviderAuthDirectHome names a canonical native home an account-level
+	// provider-auth leg may read or clear. OpenCode removes a credential with a
+	// scoped per-provider call and has no such leg, so a configured value is
+	// rejected at session start.
+	ProviderAuthDirectHome string
+	DefaultModel           string
+	Env                    map[string]string
 
 	Logger            *slog.Logger
 	TracerProvider    trace.TracerProvider
@@ -183,6 +192,27 @@ func WithScratchDir(dir string) Option {
 func WithInputHandoffRoot(dir string) Option {
 	return func(options *Options) {
 		options.InputHandoffRoot = dir
+	}
+}
+
+// WithProviderAuthRoot sets the absolute durable directory holding the
+// values-free provider-auth ledger. It sits outside session scratch, outlives
+// every session and native generation, and carries no config or
+// auth-resolution semantics. Unset — or set alongside no Home — leaves every
+// provider-auth method unadvertised.
+func WithProviderAuthRoot(path string) Option {
+	return func(options *Options) {
+		options.ProviderAuthRoot = path
+	}
+}
+
+// WithProviderAuthDirectHome names the canonical native home an operator
+// consents to an account-level provider-auth leg reading or clearing. OpenCode
+// removes a credential through a scoped per-provider call, so it has no leg to
+// gate and rejects any configured value at session start.
+func WithProviderAuthDirectHome(path string) Option {
+	return func(options *Options) {
+		options.ProviderAuthDirectHome = path
 	}
 }
 

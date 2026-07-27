@@ -120,6 +120,14 @@ OpenTelemetry providers.
   digest-verified local handoff form: an image block whose bytes are read from
   beneath that read root instead of being carried inline. Unset, no inbound path
   is ever read.
+- Brokered provider logins through the seven `_opencode/auth/*` extension
+  methods, advertised only while both `-provider-auth-root` /
+  `WithProviderAuthRoot` and `-home` / `WithHome` are configured. The adapter
+  installs a completed credential into OpenCode's own durable store and hands
+  none back: there is no credential leg and no injection key. Each device or
+  paste-back flow runs in a short-lived broker home destroyed on every terminal
+  transition, and the durable ledger under the auth root records slot identity
+  and provenance only, never credential material.
 - Permission and question requests bridged to ACP permission and elicitation
   flows.
 - MCP stdio and streamable HTTP server configuration through ACP session

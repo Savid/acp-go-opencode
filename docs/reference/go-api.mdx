@@ -41,6 +41,8 @@ runtime and its resources quarantined.
 | `WithTurnTimeout` | Per-turn deadline; `0` (default) disables it. |
 | `WithImageLimits` | Decoded-byte bounds for prompt and emitted image content (`ImageLimits`); each field defaults to 6 MiB, `0` disables that policy limit, and a negative value is rejected at construction. |
 | `WithInputHandoffRoot` | Absolute directory a prompt image may be read from in the handoff input form. Read-only, unset by default, and a relative value is rejected at construction. |
+| `WithProviderAuthRoot` | Absolute durable directory holding the values-free provider-auth ledger. Unset — or set without `WithHome` — leaves every `_opencode/auth/*` method unadvertised. |
+| `WithProviderAuthDirectHome` | Declared for configuration symmetry; a set value is rejected at session start with the uniform unsupported error. |
 | `WithRuntimeResourceHooks` | Worker-global native-root and scratch-root permit hooks; a non-nil hook must return a non-nil release function. |
 | `WithAgentName` / `WithAgentTitle` / `WithAgentVersion` | Identity in the initialize response. |
 | `WithLogger` | `*slog.Logger` for adapter diagnostics. |
@@ -65,6 +67,15 @@ there. It materializes nothing and therefore carries no scratch semantics, and
 it is independent of `WithScratchDir`. Files beneath it belong to the host,
 which may delete one the moment the prompt call returns. Leaving it unset
 rejects every handoff-form block with `invalid_handoff`.
+
+`WithProviderAuthRoot` turns on the brokered provider-login surface described
+in [Authentication](/docs/features/authentication). It is durable adapter-owned
+bookkeeping rather than ephemeral materialization, so it is independent of
+`WithScratchDir` and is never a scratch parent, and it carries no config or
+auth-resolution semantics. The adapter creates it `0700` when missing and
+writes ledger entries `0600`; a root it cannot create, that is not a directory,
+or that is not writable leaves the surface unadvertised exactly as an unset one
+does.
 
 `RuntimeResourceHooks` also carries `ObserveProcess`,
 `ObserveProcessSnapshot`, `ObserveStartupStage`, and `ObserveContainment`.

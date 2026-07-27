@@ -43,6 +43,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	opencodePath := flags.String("path", "", "path to opencode CLI")
 	opencodeHome := flags.String("home", "", "exclusive shared OpenCode XDG runtime root")
 	scratchDir := flags.String("scratch-dir", "", "parent for a generated runtime root and transient scratch")
+	providerAuthRoot := flags.String("provider-auth-root", "", "durable root holding the provider-auth ledger; empty leaves the provider-auth surface unadvertised")
+	providerAuthDirectHome := flags.String("provider-auth-direct-home", "", "canonical native home an account-level provider-auth leg may read or clear; rejected by this adapter")
 	model := flags.String("model", "", "default OpenCode model as provider/model")
 	debug := flags.Bool("debug", false, "write debug logs to stderr")
 	printVersion := flags.Bool("version", false, "print adapter version and exit")
@@ -108,6 +110,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		opencodeacp.WithExecutablePath(*opencodePath),
 		opencodeacp.WithHome(*opencodeHome),
 		opencodeacp.WithScratchDir(*scratchDir),
+		opencodeacp.WithProviderAuthRoot(*providerAuthRoot),
+		opencodeacp.WithProviderAuthDirectHome(*providerAuthDirectHome),
 		opencodeacp.WithDefaultModel(*model),
 		opencodeacp.WithLogger(logger),
 		opencodeacp.WithOpenCodePure(*pure),

@@ -185,6 +185,27 @@ type fakeOpenCodeClient struct {
 	syncReplayErr  error
 	refreshMCPErr  error
 	syncEvents     []opencode.SyncEvent
+
+	providerCatalog        []opencode.ProviderCatalogEntry
+	providerCatalogErr     error
+	providerCatalogFunc    func() ([]opencode.ProviderCatalogEntry, error)
+	providerAuthMethods    map[string][]opencode.ProviderAuthMethod
+	providerAuthMethodsErr error
+	authorization          opencode.ProviderAuthorization
+	authorizeErr           error
+	authorizeFunc          func(string, int, map[string]string) (opencode.ProviderAuthorization, error)
+	authorizeCalls         []fakeAuthorizeCall
+	authCallbackErr        error
+	authCallbackFunc       func(string, int, string) error
+	callbackCalls          []fakeAuthorizeCall
+	storedAuth             map[string]opencode.ProviderAuthCredential
+	storedAuthErr          error
+	setAuthErr             error
+	setAuthCalls           []fakeSetAuthCall
+	removeAuthErr          error
+	removedAuth            []string
+	disposeErr             error
+	disposed               int
 }
 
 type errorSessionStore struct{ err error }
@@ -796,4 +817,101 @@ type errorReader struct {
 
 func (r errorReader) Read([]byte) (int, error) {
 	return 0, r.err
+}
+
+func (c *fakeOpenCodeClient) ProviderCatalog(context.Context) ([]opencode.ProviderCatalogEntry, error) {
+	if c.providerCatalogFunc != nil {
+		return c.providerCatalogFunc()
+	}
+
+	return append([]opencode.ProviderCatalogEntry(nil), c.providerCatalog...), c.providerCatalogErr
+}
+
+func (c *fakeOpenCodeClient) ProviderAuthMethods(context.Context) (map[string][]opencode.ProviderAuthMethod, error) {
+	return c.providerAuthMethods, c.providerAuthMethodsErr
+}
+
+func (c *fakeOpenCodeClient) ProviderAuthorize(_ context.Context, providerID string, method int, inputs map[string]string) (opencode.ProviderAuthorization, error) {
+	c.mu.Lock()
+	c.authorizeCalls = append(c.authorizeCalls, fakeAuthorizeCall{providerID: providerID, method: method, inputs: inputs})
+	c.mu.Unlock()
+
+	if c.authorizeFunc != nil {
+		return c.authorizeFunc(providerID, method, inputs)
+	}
+
+	return c.authorization, c.authorizeErr
+}
+
+func (c *fakeOpenCodeClient) ProviderAuthCallback(_ context.Context, providerID string, method int, code string) error {
+	c.mu.Lock()
+	c.callbackCalls = append(c.callbackCalls, fakeAuthorizeCall{providerID: providerID, method: method, code: code})
+	c.mu.Unlock()
+
+	if c.authCallbackFunc != nil {
+		return c.authCallbackFunc(providerID, method, code)
+	}
+
+	return c.authCallbackErr
+}
+
+func (c *fakeOpenCodeClient) SetProviderAuth(_ context.Context, providerID string, credential opencode.ProviderAuthCredential) error {
+	c.mu.Lock()
+	c.setAuthCalls = append(c.setAuthCalls, fakeSetAuthCall{providerID: providerID, credential: credential})
+
+	if c.setAuthErr == nil {
+		if c.storedAuth == nil {
+			c.storedAuth = make(map[string]opencode.ProviderAuthCredential, 1)
+		}
+
+		c.storedAuth[providerID] = credential
+	}
+	c.mu.Unlock()
+
+	return c.setAuthErr
+}
+
+func (c *fakeOpenCodeClient) RemoveProviderAuth(_ context.Context, providerID string) error {
+	c.mu.Lock()
+	c.removedAuth = append(c.removedAuth, providerID)
+
+	if c.removeAuthErr == nil {
+		delete(c.storedAuth, providerID)
+	}
+	c.mu.Unlock()
+
+	return c.removeAuthErr
+}
+
+func (c *fakeOpenCodeClient) StoredProviderAuth(_ context.Context, providerID string) (opencode.ProviderAuthCredential, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.storedAuthErr != nil {
+		return opencode.ProviderAuthCredential{}, false, c.storedAuthErr
+	}
+
+	credential, ok := c.storedAuth[providerID]
+
+	return credential, ok, nil
+}
+
+func (c *fakeOpenCodeClient) DisposeInstance(context.Context) error {
+	c.mu.Lock()
+	c.disposed++
+	c.mu.Unlock()
+
+	return c.disposeErr
+}
+
+type fakeAuthorizeCall struct {
+	providerID string
+	method     int
+	inputs     map[string]string
+	code       string
+}
+
+type fakeSetAuthCall struct {
+	providerID string
+	credential opencode.ProviderAuthCredential
 }

@@ -39,6 +39,7 @@ type Agent struct {
 	observe         *observer.Observer
 	optionsErr      error
 	containmentMode RuntimeContainmentMode
+	providerAuth    *providerAuth
 
 	mu                       sync.Mutex
 	closed                   bool
@@ -143,6 +144,8 @@ func NewAgent(opts ...Option) *Agent {
 	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
 		agent.optionsErr = errors.Join(agent.optionsErr, fmt.Errorf("create runtime fingerprint key: %w", err))
 	}
+
+	agent.providerAuth = newProviderAuth(agent)
 
 	return agent
 }
@@ -309,6 +312,10 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		},
 	}
 
+	if a.providerAuth != nil {
+		opencodeMeta[providerAuthCapabilityKey] = a.providerAuth.capability()
+	}
+
 	capabilityMeta := map[string]any{
 		opencodeMetaKey:  opencodeMeta,
 		routeEnvelopeKey: map[string]any{metaFieldVersions: []int{routeEnvelopeVersion}},
@@ -381,6 +388,10 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 
 		return a.forkSession(ctx, req)
 	default:
+		if result, handled, err := a.handleAuthExtensionMethod(ctx, method, params); handled {
+			return result, err
+		}
+
 		return nil, acp.NewMethodNotFound(method)
 	}
 }

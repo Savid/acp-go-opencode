@@ -6,6 +6,7 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -214,4 +215,60 @@ func TestLifecycleMetaStrictAllowlist(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProviderAuthCapabilityWireShape(t *testing.T) {
+	harness := newAuthAgent(t)
+
+	response, err := harness.agent.Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+
+	encoded, err := json.Marshal(response.AgentCapabilities.Meta[opencodeMetaKey])
+	require.NoError(t, err)
+
+	var vendor map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(encoded, &vendor))
+
+	var capability map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(vendor[providerAuthCapabilityKey], &capability))
+
+	// The array is the host's only discovery surface for which legs exist, and
+	// injectionKey is absent because this adapter accepts no injected binding.
+	require.Len(t, capability, 1)
+
+	var methods []string
+	require.NoError(t, json.Unmarshal(capability[providerAuthMethodsField], &methods))
+	require.Equal(t, []string{
+		"_opencode/auth/methods",
+		"_opencode/auth/authorize",
+		"_opencode/auth/callback",
+		"_opencode/auth/status",
+		"_opencode/auth/cancel",
+		"_opencode/auth/inventory",
+		"_opencode/auth/disconnect",
+	}, methods)
+
+	require.NotContains(t, methods, "_opencode/auth/credential")
+}
+
+func TestProviderAuthFailureWireShape(t *testing.T) {
+	fixture := newAuthFixture(t)
+	fixture.brokerNode.authorizeErr = errors.New("dial tcp 127.0.0.1:1: connection refused")
+
+	_, err := fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
+
+	var reqErr *acp.RequestError
+
+	require.ErrorAs(t, err, &reqErr)
+	require.Equal(t, -32000, reqErr.Code)
+
+	encoded, marshalErr := json.Marshal(reqErr.Data)
+	require.NoError(t, marshalErr)
+
+	var data map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &data))
+	require.Equal(t, "opencode_auth_failed", data[jsonFieldError])
+	require.Equal(t, authCauseTransport, data[jsonFieldCause])
+	require.Equal(t, true, data["retryable"])
+	require.NotContains(t, encoded, "connection refused")
 }
