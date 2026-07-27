@@ -517,7 +517,16 @@ func TestUnixQuiescenceSignalEscalationAndTimeout(t *testing.T) {
 
 		return nil
 	}
-	require.ErrorContains(t, quiesceProcessGroup(123, time.Millisecond), "did not become quiescent")
+	// A group that never stops answering exhausts the deadline. Darwin routes
+	// quiescence through the containment boundary and reports its sentinel;
+	// every other platform here reports the process-group timeout directly.
+	stubborn := quiesceProcessGroup(123, time.Millisecond)
+	if runtime.GOOS == "darwin" {
+		require.ErrorIs(t, stubborn, ErrProcessContainmentIncomplete)
+		require.ErrorContains(t, stubborn, "original process group 123 remained observable")
+	} else {
+		require.ErrorContains(t, stubborn, "native process group 123 did not become quiescent")
+	}
 
 	containmentConfig := supervisorConfig{
 		DarwinBestEffort: true,

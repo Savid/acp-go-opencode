@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -25,7 +26,14 @@ func TestOpenCodeProcessSignalBranches(t *testing.T) {
 	if err := killOpenCodeProcess(nil, 0); err != nil {
 		t.Fatalf("kill nil: %v", err)
 	}
-	command := exec.Command("/bin/true")
+	// The test writes its own executable rather than naming one: the shipped
+	// path of a trivial exit-zero binary differs between Linux and macOS.
+	exitZero := filepath.Join(t.TempDir(), "exit-zero")
+	if err := os.WriteFile(exitZero, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(exitZero)
 	if err := command.Run(); err != nil {
 		t.Fatal(err)
 	}

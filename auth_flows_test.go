@@ -993,11 +993,30 @@ func TestCompleterExpiresAPendingFlow(t *testing.T) {
 
 	t.Cleanup(func() { authNow = original })
 
+	// The completer publishes the expired state before it destroys the flow's
+	// broker home, so the test joins the destruction too. Returning on the state
+	// alone leaves that goroutine reading the broker seams a later test restores.
+	restoreBrokerSeams(t)
+
+	removeAll := brokerRemoveAll
+	destroyed := make(chan struct{})
+	brokerRemoveAll = func(path string) error {
+		defer close(destroyed)
+
+		return removeAll(path)
+	}
+
 	flow := fixture.authorize(t, nil)
 
 	require.Eventually(t, func() bool {
 		return fixture.status(t, flow.FlowID).State == authStateExpired
 	}, time.Second, 5*time.Millisecond)
+
+	select {
+	case <-destroyed:
+	case <-time.After(time.Second):
+		t.Fatal("the expired flow's broker home was never destroyed")
+	}
 }
 
 func TestNewAuthTokenReportsEntropyFailure(t *testing.T) {

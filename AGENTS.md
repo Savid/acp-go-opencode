@@ -93,6 +93,13 @@ coverage. The live suite reads `ACP_GO_OPENCODE_MODEL`,
 tune the model and the prompts used to exercise permission and question flows.
 Live tests always launch OpenCode under an exclusive test runtime XDG root.
 
+`make test-integration-attended` sets `ACP_GO_OPENCODE_RUN_ATTENDED=1` and runs
+the provider-auth flows a human must approve at the provider.
+`make test-integration-keystore` sets `ACP_GO_OPENCODE_RUN_KEYSTORE=1` and runs
+the credential-residence matrix against the container fixture in
+`integration/keystore`; it fails rather than skips when no container runtime is
+available. Neither target joins `make audit`.
+
 ## Coding Rules
 
 - Follow standard Go idioms: `ctx` first, no `ctx` in structs, and `%w` for
