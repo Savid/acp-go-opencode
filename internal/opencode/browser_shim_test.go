@@ -37,7 +37,7 @@ func browserProbeDir(t *testing.T, marker string) string {
 	probe := t.TempDir()
 	body := fmt.Sprintf("#!/bin/sh\necho \"$0 $*\" >> %q\nexit 0\n", marker)
 
-	for _, name := range []string{"open", "xdg-open"} {
+	for _, name := range browserLauncherNames {
 		require.NoError(t, os.WriteFile(filepath.Join(probe, name), []byte(body), 0o700))
 	}
 
@@ -53,13 +53,22 @@ func browserLaunchingOpenCodeExecutable(t *testing.T) string {
 	testBinary, err := os.Executable()
 	require.NoError(t, err)
 
-	script := filepath.Join(t.TempDir(), "fake-opencode")
-	body := fmt.Sprintf(
-		"#!/bin/sh\nopen \"https://example.invalid/\"\nxdg-open \"https://example.invalid/\"\n"+
-			"ACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n",
+	var body strings.Builder
+
+	body.WriteString("#!/bin/sh\n")
+
+	for _, name := range browserLauncherNames {
+		fmt.Fprintf(&body, "%s \"https://example.invalid/\"\n", name)
+	}
+
+	fmt.Fprintf(
+		&body,
+		"ACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n",
 		testBinary,
 	)
-	require.NoError(t, os.WriteFile(script, []byte(body), 0o700))
+
+	script := filepath.Join(t.TempDir(), "fake-opencode")
+	require.NoError(t, os.WriteFile(script, []byte(body.String()), 0o700))
 
 	return script
 }
@@ -70,8 +79,11 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 
 	t.Setenv("PATH", probe+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	require.NoError(t, exec.Command("open", "https://example.invalid/").Run())
-	require.FileExists(t, marker, "the probe launcher never recorded a call, so a missing marker proves nothing")
+	for _, name := range browserLauncherNames {
+		require.NoError(t, exec.Command(name, "https://example.invalid/").Run())
+	}
+
+	require.FileExists(t, marker, "the probe launchers never recorded a call, so a missing marker proves nothing")
 	require.NoError(t, os.Remove(marker))
 
 	shim, err := NewBrowserShim(t.TempDir())

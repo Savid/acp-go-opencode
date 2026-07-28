@@ -69,7 +69,7 @@ func TestKeystoreLinuxCredentialResidence(t *testing.T) {
 		}
 	})
 
-	probe := buildResidenceProbe(t)
+	probe := buildLinuxProbe(t, "residence.test")
 
 	if err := container.CopyFileToContainer(ctx, probe, keystoreProbePath, 0o755); err != nil {
 		t.Fatalf("copy residence probe: %v", err)
@@ -133,20 +133,20 @@ func TestKeystoreLinuxArtifactCarriesNoSecretServiceClient(t *testing.T) {
 	}
 }
 
-// buildResidenceProbe compiles the package that owns the read path for the
-// fixture's platform. The matrix cannot run on the host: only the container has
-// a Secret Service to answer it.
-func buildResidenceProbe(t *testing.T) string {
+// buildLinuxProbe compiles the package that owns the native runtime for the
+// fixture's platform. Its claims cannot be made on the host: only the container
+// carries the Secret Service and the launcher names Linux resolves.
+func buildLinuxProbe(t *testing.T, name string) string {
 	t.Helper()
 
-	out := filepath.Join(t.TempDir(), "residence.test")
+	out := filepath.Join(t.TempDir(), name)
 
 	command := exec.CommandContext(t.Context(), "go", "test", "-c", "-tags=integration", "-o", out, "./internal/opencode")
 	command.Dir = ".."
 	command.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
 
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("build residence probe: %v: %s", err, output)
+		t.Fatalf("build %s: %v: %s", name, err, output)
 	}
 
 	return out

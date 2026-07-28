@@ -96,9 +96,9 @@ Live tests always launch OpenCode under an exclusive test runtime XDG root.
 `make test-integration-attended` sets `ACP_GO_OPENCODE_RUN_ATTENDED=1` and runs
 the provider-auth flows a human must approve at the provider.
 `make test-integration-keystore` sets `ACP_GO_OPENCODE_RUN_KEYSTORE=1` and runs
-the credential-residence matrix against the container fixture in
-`integration/keystore`; it fails rather than skips when no container runtime is
-available. Neither target joins `make audit`.
+the credential-residence matrix and the Linux browser-launcher proof against the
+container fixture in `integration/keystore`; it fails rather than skips when no
+container runtime is available. Neither target joins `make audit`.
 
 ## Coding Rules
 
