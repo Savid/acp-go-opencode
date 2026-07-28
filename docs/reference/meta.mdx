@@ -145,7 +145,7 @@ A failed provider-auth leg returns JSON-RPC `-32000` whose `data` carries:
 | Field | Meaning |
 |---|---|
 | `error` | Always `opencode_auth_failed`. |
-| `cause` | One of `native_veto`, `provider_refused`, `transport`, `process`, `timeout`, `harvest_failed`, `unsupported_variant`, `flow_expired`, `flow_state`, `flow_cancelled`, `policy`. |
+| `cause` | One of `native_veto`, `provider_refused`, `transport`, `process`, `timeout`, `harvest_failed`, `unsupported_variant`, `flow_expired`, `flow_state`, `flow_cancelled`, `policy`, `binding_conflict`. |
 | `retryable` | Always present; `true` only for the transport-shaped causes. |
 | `providerId` / `method` / `flowId` | Present when the failure names one. |
 
@@ -154,3 +154,11 @@ addressing failure — an unknown, superseded, or cross-session `flowId`, a stal
 `methodsGeneration`, a `method` that does not match the flow, or a prompt answer
 that fails validation — is invalid params (`-32602`) carrying the offending
 field path instead.
+
+`binding_conflict` comes only from `_opencode/auth/disconnect`, and it means the
+`connectionId` and `bindingGeneration` you sent do not match the binding the
+adapter recorded — no entry, a different connection, or a generation already
+spent. Nothing is mutated: no generation bump and no `DELETE /auth/{id}`.
+Reconnect to get a current binding; retrying the same one never succeeds. It is
+deliberately not `policy`, which is the adapter refusing on its own terms and
+which reconnecting does not clear.

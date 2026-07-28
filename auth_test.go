@@ -256,7 +256,7 @@ func TestAuthCauseRetryable(t *testing.T) {
 	for _, cause := range []string{
 		authCauseNativeVeto, authCauseProviderRefused, authCauseHarvestFailed,
 		authCauseUnsupportedVariant, authCauseFlowExpired, authCauseFlowState,
-		authCauseFlowCancelled, authCausePolicy,
+		authCauseFlowCancelled, authCausePolicy, authCauseBindingConflict,
 	} {
 		require.False(t, authCauseRetryable(cause))
 	}
@@ -281,6 +281,7 @@ func TestAuthFlowTransitionMatrix(t *testing.T) {
 		{cause: authCauseHarvestFailed, state: authStateFailed, reason: authReasonHarvestFailed},
 		{cause: authCauseFlowExpired, state: authStateExpired, reason: authReasonDeadline},
 		{cause: authCausePolicy},
+		{cause: authCauseBindingConflict},
 		{cause: authCauseFlowState},
 		{cause: authCauseFlowCancelled},
 	}

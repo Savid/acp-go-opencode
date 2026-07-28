@@ -59,6 +59,7 @@ const (
 	authCauseFlowState          = "flow_state"
 	authCauseFlowCancelled      = "flow_cancelled"
 	authCausePolicy             = "policy"
+	authCauseBindingConflict    = "binding_conflict"
 )
 
 // authMethodNames lists every advertised leg, in the order the capability

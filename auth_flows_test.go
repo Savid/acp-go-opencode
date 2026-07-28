@@ -862,17 +862,25 @@ func TestDisconnectFencesOnTheLedgerEntry(t *testing.T) {
 	fixture := newAuthFixture(t)
 
 	_, err := fixture.disconnect(t, "conn-1", 1)
-	requireAuthFailure(t, err, authCausePolicy)
+	requireAuthFailure(t, err, authCauseBindingConflict)
 
 	require.NoError(t, fixture.broker.ledger.write(authLedgerRecord{
 		ProviderID: "xai", ConnectionID: "conn-1", BindingGeneration: 1, State: authLedgerConfirmed,
 	}))
 
 	_, err = fixture.disconnect(t, "other", 1)
-	requireAuthFailure(t, err, authCausePolicy)
+	requireAuthFailure(t, err, authCauseBindingConflict)
 
 	_, err = fixture.disconnect(t, "conn-1", 9)
-	requireAuthFailure(t, err, authCausePolicy)
+	requireAuthFailure(t, err, authCauseBindingConflict)
+
+	// Each refusal landed before the generation bump and before the native
+	// removal, so the entry the live binding names is untouched.
+	live, ok, readErr := fixture.broker.ledger.read("xai")
+	require.NoError(t, readErr)
+	require.True(t, ok)
+	require.Equal(t, int64(1), live.BindingGeneration)
+	require.Equal(t, authLedgerConfirmed, live.State)
 }
 
 func TestDisconnectAddressingFailures(t *testing.T) {
