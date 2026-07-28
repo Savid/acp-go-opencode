@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newProviderAuthServer(t *testing.T, handler http.HandlerFunc) *openCodeServer {
@@ -263,14 +264,32 @@ func TestProviderAuthCallbackCarriesTheCodeWhenPresent(t *testing.T) {
 	}
 }
 
+// TestProviderAuthCallbackUsesADeadlineFreeClient drives the leg against a
+// server that answers long after the configured client deadline. Callback
+// blocks until the owner finishes at the provider, so any deadline carried into
+// it aborts a login that was going to succeed — and the deadline belongs to the
+// shared client, which must still have it afterwards.
 func TestProviderAuthCallbackUsesADeadlineFreeClient(t *testing.T) {
+	const deadline = 25 * time.Millisecond
+
 	client := newProviderAuthServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(4 * deadline)
 		writeJSON(t, w, true)
 	})
-	client.httpClient = nil
+	client.httpClient.Timeout = deadline
 
 	if err := client.ProviderAuthCallback(context.Background(), "xai", 0, ""); err != nil {
 		t.Fatalf("ProviderAuthCallback: %v", err)
+	}
+
+	if client.httpClient.Timeout != deadline {
+		t.Fatalf("the shared client's deadline is now %v", client.httpClient.Timeout)
+	}
+
+	client.httpClient = nil
+
+	if err := client.ProviderAuthCallback(context.Background(), "xai", 0, ""); err != nil {
+		t.Fatalf("ProviderAuthCallback without a configured client: %v", err)
 	}
 }
 
