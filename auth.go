@@ -79,15 +79,36 @@ func authMethodNames() []string {
 // providerAuth is the agent-scoped broker behind the provider-auth legs. It
 // owns the current method catalog, the per-session flow records, the durable
 // values-free ledger, and the per-flow broker homes.
+//
+// Every inbound ACP request runs on a goroutine of its own and its context is
+// cancelled only when that handler returns; the connection serializes
+// notifications and nothing else. So two provider-auth legs addressing the same
+// flow, the same session, or the same credential slot really do run at once,
+// and every read state / native call / write state sequence below is a
+// check-then-set whose window is the whole native call. The admission gates,
+// the per-flow claim, and the closed-session set exist for that reason and for
+// no other.
 type providerAuth struct {
 	agent  *Agent
 	ledger *authLedger
 
-	mu         sync.Mutex
-	generation string
-	catalog    map[string][]authCatalogMethod
-	flows      map[authFlowKey]*authFlow
-	byID       map[string]*authFlow
+	// admissions serializes authorize per (session, provider), so the sequence
+	// that makes an idempotency key mean anything — replay check, retired check,
+	// supersede, ledger intent, publication, mint — is one atomic step against
+	// another authorize for the same key.
+	admissions *authGate[authFlowKey]
+	// slots serializes every mutation of one provider's credential slot. The
+	// key is the identity of the native store a mutation rewrites, which for
+	// OpenCode is the provider id.
+	slots *authGate[string]
+
+	mu             sync.Mutex
+	generation     string
+	catalog        map[string][]authCatalogMethod
+	flows          map[authFlowKey]*authFlow
+	byID           map[string]*authFlow
+	retired        map[authFlowKey]map[string]struct{}
+	closedSessions map[acp.SessionId]struct{}
 }
 
 type authFlowKey struct {
@@ -112,10 +133,14 @@ func newProviderAuth(agent *Agent) *providerAuth {
 	}
 
 	return &providerAuth{
-		agent:  agent,
-		ledger: ledger,
-		flows:  make(map[authFlowKey]*authFlow),
-		byID:   make(map[string]*authFlow),
+		agent:          agent,
+		ledger:         ledger,
+		admissions:     newAuthGate[authFlowKey](),
+		slots:          newAuthGate[string](),
+		flows:          make(map[authFlowKey]*authFlow),
+		byID:           make(map[string]*authFlow),
+		retired:        make(map[authFlowKey]map[string]struct{}),
+		closedSessions: make(map[acp.SessionId]struct{}),
 	}
 }
 
@@ -256,9 +281,25 @@ func authFlowTransition(cause string, materialInFlight bool) (string, string) {
 }
 
 // authSession resolves the session a leg addresses. An unknown, unloaded, or
-// tombstoned session gets the uniform unknown-session rejection.
+// tombstoned session gets the uniform unknown-session rejection, and so does a
+// session this broker has already closed: the agent still answers for it until
+// its own registry entry is dropped, which is after close has swept the flows.
+// This is the cheap rejection of an ordinary late leg; publication is the
+// rejection that is actually authoritative.
 func (p *providerAuth) authSession(id string) (*session, error) {
-	return p.agent.session(acp.SessionId(id))
+	session, err := p.agent.session(acp.SessionId(id))
+	if err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.sessionAdmitted(session.id) {
+		return nil, authSessionUnknown()
+	}
+
+	return session, nil
 }
 
 // authParamFields walks a leg's params object once, rejecting an unknown field,

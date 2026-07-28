@@ -99,6 +99,37 @@ There is no `credential` leg and no injection key. A completed login is
 installed by the adapter into OpenCode's own durable runtime store, so no
 credential ever crosses back out to the host.
 
+### Concurrent legs
+
+Every inbound ACP request is handled on a goroutine of its own, so two
+provider-auth legs addressing one flow, one session, or one provider's
+credential slot really do run at once. Four admissions decide what happens when
+they do, and each is visible to a host as an ordinary leg answer:
+
+- Two `authorize` calls for one `(sessionId, providerId)` are admitted one at a
+  time, so the second sees the first's record and replays it rather than
+  starting a second login. A repeat that waited longer than its own context
+  allows answers `timeout`.
+- An `authorizeRequestId` a later `authorize` already replaced is retired. A
+  delayed retry of it fails on the `authorizeRequestId` field rather than
+  cancelling the flow that replaced it, so the code the operator is looking at
+  keeps addressing the live flow.
+- One flow admits one completion. A second `callback` against a flow another leg
+  is already driving answers `flow_state` and applies nothing, and a `status`
+  poll that lands in the same window reports the cached state instead of driving
+  a second native read.
+- `disconnect` and a login's install serialize on the provider's credential
+  slot, and the install re-reads the recorded binding before it writes. So a
+  login that completed after a `disconnect` bumped the generation answers
+  `binding_conflict` and writes nothing, rather than refilling a slot
+  `disconnect` verified empty and left the ledger unable to name.
+
+`session/close` marks the session closed in the same step that takes its cleanup
+set. It never waits for an in-flight leg, because a native login has no bound
+short enough to block a close on. An `authorize` that had already passed session
+lookup is instead refused when it goes to publish its flow, with the same
+unknown-session answer an unknown id gets, and it starts no broker.
+
 ### Per-flow broker homes
 
 A device or paste-back flow runs against a dedicated short-lived

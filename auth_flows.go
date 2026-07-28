@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"sync"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -87,14 +86,13 @@ type authFlow struct {
 	expiresAt           time.Time
 	credentialExpiresAt int64
 
+	// claimed is held by the one leg driving this flow's native completion.
+	claimed bool
+
 	// mintErr records why the native mint never produced a presentation, so a
 	// repeated idempotency key is answered with the same failure rather than
 	// driving a second native login.
 	mintErr error
-	// ready closes once the mint has settled either way, which is what an
-	// idempotent repeat arriving mid-mint waits on before it replays.
-	ready     chan struct{}
-	readyOnce sync.Once
 
 	broker *authBroker
 
@@ -127,17 +125,6 @@ type authStatusResult struct {
 
 func authTerminal(state string) bool {
 	return state != authStatePending
-}
-
-// terminalFlow reads the state of a flow the caller does not hold the lock for.
-// Every transition is written under that lock while a leg addressing the same
-// flow is still running, so the read that decides whether a leg may start has
-// to take it too.
-func (p *providerAuth) terminalFlow(flow *authFlow) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return authTerminal(flow.state)
 }
 
 // newAuthToken mints an opaque adapter-owned identifier from 16 CSPRNG bytes,
@@ -174,13 +161,31 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 
 	key := authFlowKey{sessionID: session.id, providerID: request.providerID}
 
-	replay, replayed, err := p.replayAuthorize(ctx, key, request.authorizeRequestID)
+	// The gate is held to the end of the mint, so everything below — the replay
+	// check, the retired check, the supersede, the ledger intent, the
+	// publication, and the native mint itself — settles as one step against
+	// another authorize for the same key. Two requests that only compared
+	// records before publishing would both miss and both mint, and the loser
+	// would then be cancelled by the winner's supersede after the operator had
+	// already been shown its code.
+	release, admitted := p.admissions.admit(ctx, key)
+	if !admitted {
+		return nil, authFailed(authCauseTimeout, request.providerID, request.method, "")
+	}
+
+	defer release()
+
+	replay, replayed, err := p.replayAuthorize(key, request.authorizeRequestID)
 	if replayed {
 		if err != nil {
 			return nil, err
 		}
 
 		return replay, nil
+	}
+
+	if p.requestRetired(key, request.authorizeRequestID) {
+		return nil, invalidAuthField(authFieldAuthorizeRequestID)
 	}
 
 	method, err := p.resolveMethod(request)
@@ -236,17 +241,16 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 		state:              authStatePending,
 		expiresAt:          now.Add(authSafetyDeadline),
 		probeInterval:      authPollFloor,
-		ready:              make(chan struct{}),
 		disarm:             make(chan struct{}),
 	}
 
 	// The flow is registered against the ledger entry that already names it, so
 	// the flowId every later answer carries — a mint failure's included —
-	// addresses a real record.
-	p.mu.Lock()
-	p.flows[key] = flow
-	p.byID[flowID] = flow
-	p.mu.Unlock()
+	// addresses a real record. Nothing native has been started yet, so a
+	// publication the session refuses leaves no process and no directory behind.
+	if err := p.publishFlow(key, flow); err != nil {
+		return nil, err
+	}
 
 	presentation, cause := p.mintPresentation(ctx, flow)
 	if cause != "" {
@@ -257,7 +261,6 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 	flow.presentation = presentation
 	p.mu.Unlock()
 
-	flow.markReady()
 	p.armCompleter(flow)
 
 	return presentation, nil
@@ -274,13 +277,7 @@ func (p *providerAuth) failMint(flow *authFlow, cause string) error {
 	flow.mintErr = err
 	p.mu.Unlock()
 
-	flow.markReady()
-
 	return err
-}
-
-func (f *authFlow) markReady() {
-	f.readyOnce.Do(func() { close(f.ready) })
 }
 
 type authorizeRequest struct {
@@ -339,29 +336,16 @@ func decodeAuthorizeRequest(fields map[string]json.RawMessage) (authorizeRequest
 // completion returns what the first call returned instead of driving a second
 // login. A record whose mint failed replays that failure for the same reason:
 // a second native login would answer a different flowId under a different
-// cause, and a repeat is never allowed to change the answer.
-func (p *providerAuth) replayAuthorize(
-	ctx context.Context,
-	key authFlowKey,
-	requestID string,
-) (authAuthorizeResult, bool, error) {
-	p.mu.Lock()
-	flow, ok := p.flows[key]
-	matched := ok && flow.authorizeRequestID == requestID
-	p.mu.Unlock()
-
-	if !matched {
-		return authAuthorizeResult{}, false, nil
-	}
-
-	select {
-	case <-flow.ready:
-	case <-ctx.Done():
-		return authAuthorizeResult{}, true, authFailed(authCauseTransport, flow.providerID, flow.method.ID, flow.id)
-	}
-
+// cause, and a repeat is never allowed to change the answer. Its caller holds
+// the key's admission gate, so the record it finds has always settled.
+func (p *providerAuth) replayAuthorize(key authFlowKey, requestID string) (authAuthorizeResult, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	flow, ok := p.flows[key]
+	if !ok || flow.authorizeRequestID != requestID {
+		return authAuthorizeResult{}, false, nil
+	}
 
 	if flow.mintErr != nil {
 		return authAuthorizeResult{}, true, flow.mintErr
@@ -512,16 +496,25 @@ func (p *providerAuth) expire(flow *authFlow) {
 	broker.destroy(ctx)
 }
 
-// supersede terminalizes the flow a new authorize replaces. The abandoned
-// broker home is destroyed without installing anything from it, so a stale
-// native approval completes into a store that no longer exists. A flow that
-// already terminalized was not superseded by anything and keeps both its record
-// and its id.
+// supersede terminalizes the flow a new authorize replaces and retires the
+// request id that named it, because from here on only the replacing record can
+// be replayed. The abandoned broker home is destroyed without installing
+// anything from it, so a stale native approval completes into a store that no
+// longer exists. A flow that already terminalized was not superseded by
+// anything and keeps both its record and its id.
 func (p *providerAuth) supersede(key authFlowKey, reason string) {
 	p.mu.Lock()
 
 	flow, ok := p.flows[key]
-	if !ok || authTerminal(flow.state) {
+	if !ok {
+		p.mu.Unlock()
+
+		return
+	}
+
+	p.retire(key, flow.authorizeRequestID)
+
+	if authTerminal(flow.state) {
 		p.mu.Unlock()
 
 		return
@@ -622,9 +615,11 @@ func (p *providerAuth) callback(ctx context.Context, params json.RawMessage) (an
 		return nil, invalidAuthField(authFieldMethod)
 	}
 
-	if p.terminalFlow(flow) {
-		return nil, authFailed(authCauseFlowState, providerID, method, flowID)
+	if err := p.claimFlow(flow); err != nil {
+		return nil, err
 	}
+
+	defer p.releaseFlow(flow)
 
 	if flow.method.Type == authMethodTypeAPI {
 		return p.applySecret(ctx, session, flow, input)
@@ -719,10 +714,34 @@ func (p *providerAuth) completeOAuth(ctx context.Context, session *session, flow
 
 // install performs the single fenced write into the durable runtime store and
 // publishes it without a restart, then records the post-mutation confirmation.
+// It holds the provider's credential-slot gate across the whole sequence,
+// because disconnect rewrites the same slot and the two must not interleave.
 func (p *providerAuth) install(ctx context.Context, session *session, flow *authFlow, credential opencode.ProviderAuthCredential) error {
 	client := session.nativeClient()
 	if client == nil {
 		return p.failInstall(flow, authCauseTransport)
+	}
+
+	release, admitted := p.slots.admit(ctx, flow.providerID)
+	if !admitted {
+		return p.fail(flow, authCauseTimeout, false)
+	}
+
+	defer release()
+
+	record := authLedgerRecord{
+		ProviderID:         flow.providerID,
+		ConnectionID:       flow.connectionID,
+		Revision:           flow.revision,
+		BindingGeneration:  flow.bindingGeneration,
+		FlowID:             flow.id,
+		AuthorizeRequestID: flow.authorizeRequestID,
+		State:              authLedgerConfirmed,
+		CreatedAt:          flow.createdAt,
+	}
+
+	if cause := p.staleLineage(record); cause != "" {
+		return p.failInstall(flow, cause)
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, authNativeCallTimeout)
@@ -736,36 +755,42 @@ func (p *providerAuth) install(ctx context.Context, session *session, flow *auth
 		return p.failInstall(flow, authNativeCause(err))
 	}
 
-	now := authNow().UnixMilli()
+	record.UpdatedAt = authNow().UnixMilli()
 
-	record := authLedgerRecord{
-		ProviderID:         flow.providerID,
-		ConnectionID:       flow.connectionID,
-		Revision:           flow.revision,
-		BindingGeneration:  flow.bindingGeneration,
-		FlowID:             flow.id,
-		AuthorizeRequestID: flow.authorizeRequestID,
-		State:              authLedgerConfirmed,
-		CreatedAt:          flow.createdAt,
-		UpdatedAt:          now,
-	}
-
-	// The native write is unconditional because the credential is resident either
-	// way and a slot nothing names is invisible to every residence answer. The
-	// provenance write is not: while this leg was inside the native call a fresh
-	// authorize may have minted the next revision or a disconnect may have bumped
-	// the generation, and the entry then belongs to that binding rather than to
-	// this one.
-	current, err := p.ledger.writeIfCurrent(record)
+	// authorize mints the provider's next revision without holding this gate, so
+	// the entry can still have moved on under the native write above; the
+	// provenance write stays conditional for that one remaining writer.
+	committed, err := p.ledger.writeIfCurrent(record)
 	if err != nil {
 		return p.failInstall(flow, authCauseProcess)
 	}
 
-	if !current {
+	if !committed {
 		return p.failInstall(flow, authCauseBindingConflict)
 	}
 
 	return nil
+}
+
+// staleLineage reports the cause install must answer with before it writes,
+// and the empty string when the entry still names this binding. The check runs
+// ahead of the native write and not only after it: a disconnect that already
+// bumped the generation removed this provider's credential and verified the
+// slot empty, so writing would refill the slot it verified — and the
+// confirmation the ledger then correctly refuses leaves the entry reading
+// removed while the credential is resident, which makes it live and invisible
+// on every residence answer this surface has.
+func (p *providerAuth) staleLineage(record authLedgerRecord) string {
+	current, ok, err := p.ledger.read(record.ProviderID)
+	if err != nil {
+		return authCauseProcess
+	}
+
+	if ok && !current.namesLineage(record) {
+		return authCauseBindingConflict
+	}
+
+	return ""
 }
 
 // failInstall answers an install that could not complete. The transition it
@@ -883,9 +908,20 @@ func (p *providerAuth) probe(ctx context.Context, flow *authFlow) {
 		return
 	}
 
+	// A poll declines rather than fails when the owner's own callback is already
+	// driving the same flow: both would read the same settled credential out of
+	// the same broker home and both would install it.
+	if p.claimFlowLocked(flow) != nil {
+		p.mu.Unlock()
+
+		return
+	}
+
 	flow.nextProbeAt = now.Add(flow.probeInterval)
 	broker := flow.broker
 	p.mu.Unlock()
+
+	defer p.releaseFlow(flow)
 
 	credential, ok, err := broker.client.StoredProviderAuth(ctx, flow.providerID)
 	if err != nil {
@@ -980,7 +1016,11 @@ func (p *providerAuth) addressedFlowLeg(params json.RawMessage) (*authFlow, erro
 
 // disconnect bumps the binding generation before it touches anything else, then
 // removes only the exactly-fenced slot and verifies absence. It never removes a
-// differently fenced entry and promises no provider-side revocation.
+// differently fenced entry and promises no provider-side revocation. The whole
+// sequence — the read, the generation compare, the bump, the native removal,
+// the absence check and the removed-write — is held under the provider's
+// credential-slot gate, because a login completing into the same slot would
+// otherwise refill it between the verify and the answer.
 func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (any, error) {
 	fields, err := authParamFields(params, authFieldSessionID, authFieldProviderID, authFieldConnectionID, authFieldBindingGeneration)
 	if err != nil {
@@ -1011,6 +1051,13 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 	if err != nil {
 		return nil, err
 	}
+
+	release, admitted := p.slots.admit(ctx, providerID)
+	if !admitted {
+		return nil, authFailed(authCauseTimeout, providerID, "", "")
+	}
+
+	defer release()
 
 	record, ok, err := p.ledger.read(providerID)
 	if err != nil {
@@ -1060,10 +1107,24 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 // record the session could still replay an idempotency key from. It runs before
 // the native interrupt, so a flow is never abandoned to a process already being
 // torn down.
+//
+// The session is marked closed in the same critical section that takes the
+// cleanup set, and an authorize still in flight is refused at publication
+// rather than waited for. Waiting would be the other way to keep the invariant
+// that no flow escapes this set, but it would block close for the length of an
+// unbounded native login.
 func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId) {
 	p.mu.Lock()
 
+	p.closedSessions[sessionID] = struct{}{}
+
 	brokers := make([]*authBroker, 0, len(p.flows))
+
+	for key := range p.retired {
+		if key.sessionID == sessionID {
+			delete(p.retired, key)
+		}
+	}
 
 	for key, flow := range p.flows {
 		if key.sessionID != sessionID {
@@ -1085,6 +1146,8 @@ func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId
 	}
 
 	p.mu.Unlock()
+
+	p.admissions.forget(func(key authFlowKey) bool { return key.sessionID == sessionID })
 
 	for _, broker := range brokers {
 		broker.destroy(ctx)

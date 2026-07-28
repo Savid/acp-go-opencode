@@ -195,7 +195,8 @@ func TestAuthorizeReplaysARepeatedRequestIDAfterTheFlowTerminalized(t *testing.T
 }
 
 // TestAuthorizeStopsReplayingOnceTheSessionCloses pins the other half: the
-// record lives exactly as long as the session that owns it.
+// record lives exactly as long as the session that owns it, and the closed
+// session admits no leg that could mint a replacement.
 func TestAuthorizeStopsReplayingOnceTheSessionCloses(t *testing.T) {
 	fixture := newAuthFixture(t)
 
@@ -203,8 +204,15 @@ func TestAuthorizeStopsReplayingOnceTheSessionCloses(t *testing.T) {
 
 	fixture.broker.closeSession(context.Background(), fixture.session.id)
 
-	second := fixture.authorize(t, nil)
-	require.NotEqual(t, first.FlowID, second.FlowID)
+	_, err := fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
+	requireInvalidParams(t, err, jsonFieldSessionID)
+
+	_, err = fixture.broker.status(context.Background(), mustJSON(t, map[string]any{
+		authFieldSessionID:  string(fixture.session.id),
+		authFieldProviderID: "xai",
+		authFieldFlowID:     first.FlowID,
+	}))
+	requireInvalidParams(t, err, jsonFieldSessionID)
 }
 
 // TestAuthorizeMintFailureAddressesTheFlowItNames pins the flowId a failed mint
@@ -293,7 +301,8 @@ func TestAuthorizeReplayWaitsOutAMintStillUnderWay(t *testing.T) {
 }
 
 // TestAuthorizeReplayAbandonsAMintOnCallerCancellation pins that the repeat's
-// own context, not the mint, bounds how long it waits.
+// own context, not the mint it is queued behind, bounds how long it waits at
+// the key's admission gate.
 func TestAuthorizeReplayAbandonsAMintOnCallerCancellation(t *testing.T) {
 	fixture := newAuthFixture(t)
 
@@ -321,7 +330,7 @@ func TestAuthorizeReplayAbandonsAMintOnCallerCancellation(t *testing.T) {
 	cancel()
 
 	_, err := fixture.broker.authorize(ctx, params)
-	requireAuthFailure(t, err, authCauseTransport)
+	requireAuthFailure(t, err, authCauseTimeout)
 
 	close(release)
 	<-minted
@@ -898,11 +907,13 @@ func TestSecretApplyOutlivingCancelAnswersForTheClosedFlow(t *testing.T) {
 
 // TestStatusAndCallbackClaimTheBrokerOnce runs the two legs that can both
 // observe a settled provider at the same time — the host's status poll and the
-// owner's callback, which is the ordinary shape of an oauth login. Both read
-// the credential out of the broker home and both go on to destroy it, so the
-// claim on the handle has to decide which one does: an unserialized claim
-// terminates one process, walks one directory tree, and unlinks one browser
-// shim twice.
+// owner's callback, which is the ordinary shape of an oauth login. Both would
+// read the credential out of the broker home and both would go on to destroy
+// it, so the claim on the flow has to decide which one does: unclaimed, the two
+// install the same credential twice and then terminate one process, walk one
+// directory tree, and unlink one browser shim twice. Whichever leg claims
+// first, the other never reaches the native read, so only one arrival is ever
+// waited for.
 func TestStatusAndCallbackClaimTheBrokerOnce(t *testing.T) {
 	fixture := newAuthFixture(t)
 	flow := fixture.authorize(t, nil)
@@ -945,15 +956,20 @@ func TestStatusAndCallbackClaimTheBrokerOnce(t *testing.T) {
 	}()
 
 	<-arrived
-	<-arrived
 	close(release)
 	<-settled
 	<-settled
 
 	fixture.brokerNode.mu.Lock()
-	defer fixture.brokerNode.mu.Unlock()
+	closeCalls := fixture.brokerNode.closeCalls
+	fixture.brokerNode.mu.Unlock()
 
-	require.Equal(t, 1, fixture.brokerNode.closeCalls)
+	require.Equal(t, 1, closeCalls)
+
+	fixture.runtime.mu.Lock()
+	defer fixture.runtime.mu.Unlock()
+
+	require.Len(t, fixture.runtime.setAuthCalls, 1)
 }
 
 // TestSupersededSecretApplyLeavesTheSuccessorsLedgerEntry pins the provenance

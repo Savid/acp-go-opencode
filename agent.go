@@ -495,6 +495,10 @@ func (a *Agent) storeStartedSession(session *session) error {
 	a.sessions[session.id] = session
 	delete(a.deleted, session.id)
 
+	if a.providerAuth != nil {
+		a.providerAuth.reopenSession(session.id)
+	}
+
 	a.observe.AddActiveSession(context.Background(), 1)
 
 	return nil

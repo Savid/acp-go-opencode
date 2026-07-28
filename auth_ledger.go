@@ -224,9 +224,7 @@ func (l *authLedger) writeIfCurrent(record authLedgerRecord) (bool, error) {
 		return false, err
 	}
 
-	if ok && (current.ConnectionID != record.ConnectionID ||
-		current.Revision != record.Revision ||
-		current.BindingGeneration != record.BindingGeneration) {
+	if ok && !current.namesLineage(record) {
 		return false, nil
 	}
 
@@ -235,6 +233,16 @@ func (l *authLedger) writeIfCurrent(record authLedgerRecord) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// namesLineage reports whether the stored entry still names the binding record
+// was minted against. The three fields together are the binding: the connection
+// that owns the slot, the login that claimed it, and the generation a
+// disconnect bumps.
+func (r authLedgerRecord) namesLineage(record authLedgerRecord) bool {
+	return r.ConnectionID == record.ConnectionID &&
+		r.Revision == record.Revision &&
+		r.BindingGeneration == record.BindingGeneration
 }
 
 func (l *authLedger) writeEntry(record authLedgerRecord) error {
