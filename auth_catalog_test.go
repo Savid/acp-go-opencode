@@ -130,18 +130,73 @@ func TestBuildProviderMethodsOmitsUnpublishableEntries(t *testing.T) {
 	require.Len(t, published, 1)
 }
 
+// TestBuildAuthCatalogDropsProvidersWithNoPublishableMethod drives the omission
+// through the prompt github-copilot gates today, presented ungated. A harness
+// cut that stops gating a deployment-chosen host leaves the method no branch
+// that avoids the prompt, and the provider loses its only entry.
 func TestBuildAuthCatalogDropsProvidersWithNoPublishableMethod(t *testing.T) {
 	methods, entries, err := buildAuthCatalog(
-		[]opencode.ProviderCatalogEntry{{ID: "gitlab", Name: "GitLab"}},
-		map[string][]opencode.ProviderAuthMethod{"gitlab": {{
-			Type:    authMethodTypeOAuth,
-			Label:   "GitLab OAuth",
-			Prompts: []opencode.ProviderAuthPrompt{{Type: "text", Key: "instanceUrl", Message: "Instance URL"}},
+		[]opencode.ProviderCatalogEntry{{ID: authProviderCopilot, Name: "GitHub Copilot"}},
+		map[string][]opencode.ProviderAuthMethod{authProviderCopilot: {{
+			Type:  authMethodTypeOAuth,
+			Label: "Login with GitHub Copilot",
+			Prompts: []opencode.ProviderAuthPrompt{
+				{Type: authPromptTypeText, Key: authPromptKeyEnterprise, Message: "Enter your GitHub Enterprise URL"},
+			},
 		}}},
 	)
 	require.NoError(t, err)
 	require.Empty(t, methods)
 	require.Empty(t, entries)
+}
+
+// gitlabNativeMethods is gitlab's native method array exactly as OpenCode
+// publishes it: a browser OAuth method and a personal-access-token method,
+// each asking the same ungated instance URL.
+func gitlabNativeMethods() []opencode.ProviderAuthMethod {
+	prompts := []opencode.ProviderAuthPrompt{
+		{Type: authPromptTypeText, Key: authPromptKeyInstance, Message: "GitLab instance URL", Placeholder: "https://gitlab.com"},
+	}
+
+	return []opencode.ProviderAuthMethod{
+		{Type: authMethodTypeOAuth, Label: "GitLab OAuth", Prompts: prompts},
+		{Type: authMethodTypeAPI, Label: "GitLab Personal Access Token", Prompts: prompts},
+	}
+}
+
+// TestBuildAuthCatalogPublishesGitLabAgainstItsVendorHost pins what the
+// instance URL costs and what it does not. The prompt is ungated on both
+// methods, so nothing about `when` reaches gitlab; the fixed vendor host is
+// still an allowlist entry the prompt can have, which is what keeps the
+// token method addressable instead of dropping the provider outright. The
+// OAuth method goes for the other reason entirely: its callback lands on a
+// listener the harness binds on the worker host while it mints.
+func TestBuildAuthCatalogPublishesGitLabAgainstItsVendorHost(t *testing.T) {
+	methods, entries, err := buildAuthCatalog(
+		[]opencode.ProviderCatalogEntry{{ID: authProviderGitLab, Name: "GitLab"}},
+		map[string][]opencode.ProviderAuthMethod{authProviderGitLab: gitlabNativeMethods()},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []authMethodEntry{{
+		ID:    "1",
+		Type:  authMethodTypeAPI,
+		Label: "GitLab Personal Access Token",
+		Prompts: []authPrompt{
+			{Type: authPromptTypeText, Key: authPromptKeyInstance, Message: "GitLab instance URL", Placeholder: "https://gitlab.com"},
+		},
+	}}, entries[authProviderGitLab])
+	require.Equal(t, 1, methods[authProviderGitLab][0].Index)
+
+	method := methods[authProviderGitLab][0]
+	require.NoError(t, validateAuthInputs(authProviderGitLab, method, map[string]string{authPromptKeyInstance: "https://gitlab.com"}))
+
+	// A deployment-chosen host has no entry it could have, so the self-hosted
+	// branch stays unanswerable rather than riding in on the vendor one.
+	for _, value := range []string{"https://gitlab.example.com", "https://gitlab.com.example.com", "http://gitlab.com"} {
+		requireInvalidParams(t, validateAuthInputs(authProviderGitLab, method, map[string]string{
+			authPromptKeyInstance: value,
+		}), authFieldInputs+"."+authPromptKeyInstance)
+	}
 }
 
 // copilotNativeMethod is github-copilot's single native method exactly as

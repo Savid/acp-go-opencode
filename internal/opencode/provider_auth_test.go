@@ -539,7 +539,61 @@ func TestReapAbandonedHomesKillsTheOrphanALeaseNames(t *testing.T) {
 	}
 }
 
+// TestReapAbandonedHomesWaitsOutDescendantsStillWritingIntoTheHome pins the
+// half of the sweep the lease cannot answer for. A lease says which adapter
+// owned the home and which server it started, and the sweep removes the tree
+// once both are gone — but a plugin install spawned under that server is
+// neither, and it keeps creating directories as the removal walks them. A
+// single pass leaves the home standing, which is a directory a stale native
+// approval can still complete into.
+func TestReapAbandonedHomesWaitsOutDescendantsStillWritingIntoTheHome(t *testing.T) {
+	backoff := reapRemoveBackoff
+	reapRemoveBackoff = time.Millisecond
+
+	original := reapRemoveAll
+	attempts := 0
+
+	reapRemoveAll = func(path string) error {
+		attempts++
+
+		if attempts < 3 {
+			return errors.New("directory not empty")
+		}
+
+		return original(path)
+	}
+
+	t.Cleanup(func() {
+		reapRemoveAll = original
+		reapRemoveBackoff = backoff
+	})
+
+	parent := t.TempDir()
+
+	home := filepath.Join(parent, "prefix-repopulating")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+
+	if err := ReapAbandonedHomes(parent, "prefix-"); err != nil {
+		t.Fatalf("ReapAbandonedHomes: %v", err)
+	}
+
+	if attempts != 3 {
+		t.Fatalf("the sweep removed the home in %d attempts", attempts)
+	}
+
+	if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the home survived the sweep")
+	}
+}
+
 func TestReapAbandonedHomesReportsFailures(t *testing.T) {
+	backoff := reapRemoveBackoff
+	reapRemoveBackoff = time.Millisecond
+
+	t.Cleanup(func() { reapRemoveBackoff = backoff })
+
 	if err := ReapAbandonedHomes(filepath.Join(t.TempDir(), "absent"), "prefix-"); err == nil {
 		t.Fatal("expected a scan failure")
 	}

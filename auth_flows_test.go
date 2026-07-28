@@ -823,6 +823,80 @@ func TestCallbackOutlivingCancelDoesNotReTerminalizeTheFlow(t *testing.T) {
 	}
 }
 
+// TestSecretApplyOutlivingCancelAnswersForTheClosedFlow pins the secret leg
+// against the oauth one it sits beside. Its native apply blocks too, so cancel
+// closes the flow underneath it just as readily — and an apply that then failed
+// wrote nothing, so answering with a retryable native cause reports a failure
+// against a flow that no longer exists. An apply that landed is reported as the
+// acceptance it was, because the value is in the store either way.
+func TestSecretApplyOutlivingCancelAnswersForTheClosedFlow(t *testing.T) {
+	cases := []struct {
+		name      string
+		native    error
+		expects   string
+		installed int
+	}{
+		{name: "native apply fails", native: errors.New("http"), expects: authCauseFlowCancelled},
+		{name: "native apply lands", native: nil, installed: 1},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newAuthFixture(t)
+			fixture.runtime.providerAuthMethods = map[string][]opencode.ProviderAuthMethod{
+				"xai": {{Type: authMethodTypeAPI, Label: "Manually enter API Key"}},
+			}
+			fixture.refreshCatalog(t)
+
+			flow := fixture.authorize(t, nil)
+
+			cancelled := make(chan struct{})
+			fixture.runtime.setAuthFunc = func(string, opencode.ProviderAuthCredential) error {
+				<-cancelled
+
+				return testCase.native
+			}
+
+			callbackParams := mustJSON(t, map[string]any{
+				authFieldSessionID:  string(fixture.session.id),
+				authFieldProviderID: "xai",
+				authFieldMethod:     "0",
+				authFieldFlowID:     flow.FlowID,
+				authFieldInput:      "sk-secret",
+			})
+			cancelParams := mustJSON(t, map[string]any{
+				authFieldSessionID:  string(fixture.session.id),
+				authFieldProviderID: "xai",
+				authFieldFlowID:     flow.FlowID,
+			})
+
+			answered := make(chan error, 1)
+
+			go func() {
+				_, err := fixture.broker.callback(context.Background(), callbackParams)
+				answered <- err
+			}()
+
+			time.Sleep(50 * time.Millisecond)
+
+			_, err := fixture.broker.cancel(context.Background(), cancelParams)
+			require.NoError(t, err)
+			close(cancelled)
+
+			if testCase.expects == "" {
+				require.NoError(t, <-answered)
+			} else {
+				requireAuthFailure(t, <-answered, testCase.expects)
+			}
+
+			status := fixture.status(t, flow.FlowID)
+			require.Equal(t, authStateCancelled, status.State)
+			require.Equal(t, authReasonOwnerCancel, status.Reason)
+			require.Len(t, fixture.runtime.setAuthCalls, testCase.installed)
+		})
+	}
+}
+
 // TestTerminalizeKeepsTheFirstTerminalTransition pins the record itself: a
 // flow has one terminal transition, and a later one is dropped rather than
 // overwriting the owner's.

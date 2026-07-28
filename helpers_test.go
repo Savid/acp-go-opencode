@@ -201,6 +201,7 @@ type fakeOpenCodeClient struct {
 	storedAuth             map[string]opencode.ProviderAuthCredential
 	storedAuthErr          error
 	setAuthErr             error
+	setAuthFunc            func(string, opencode.ProviderAuthCredential) error
 	setAuthCalls           []fakeSetAuthCall
 	removeAuthErr          error
 	removedAuth            []string
@@ -856,6 +857,18 @@ func (c *fakeOpenCodeClient) ProviderAuthCallback(_ context.Context, providerID 
 }
 
 func (c *fakeOpenCodeClient) SetProviderAuth(_ context.Context, providerID string, credential opencode.ProviderAuthCredential) error {
+	c.mu.Lock()
+	hook := c.setAuthFunc
+	c.mu.Unlock()
+
+	// A hook that refuses stands in for a write that never landed, so it records
+	// no call and leaves the store as it found it.
+	if hook != nil {
+		if err := hook(providerID, credential); err != nil {
+			return err
+		}
+	}
+
 	c.mu.Lock()
 	c.setAuthCalls = append(c.setAuthCalls, fakeSetAuthCall{providerID: providerID, credential: credential})
 

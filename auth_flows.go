@@ -130,6 +130,17 @@ func authTerminal(state string) bool {
 	return state != authStatePending
 }
 
+// terminalFlow reads the state of a flow the caller does not hold the lock for.
+// Every transition is written under that lock while a leg addressing the same
+// flow is still running, so the read that decides whether a leg may start has
+// to take it too.
+func (p *providerAuth) terminalFlow(flow *authFlow) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return authTerminal(flow.state)
+}
+
 // newAuthToken mints an opaque adapter-owned identifier from 16 CSPRNG bytes,
 // encoded unpadded base64url. Native flow handles never cross the boundary.
 func newAuthToken() (string, error) {
@@ -601,7 +612,7 @@ func (p *providerAuth) callback(ctx context.Context, params json.RawMessage) (an
 		return nil, invalidAuthField(authFieldMethod)
 	}
 
-	if authTerminal(flow.state) {
+	if p.terminalFlow(flow) {
 		return nil, authFailed(authCauseFlowState, providerID, method, flowID)
 	}
 
@@ -615,6 +626,14 @@ func (p *providerAuth) callback(ctx context.Context, params json.RawMessage) (an
 // applySecret writes an operator-supplied key into the durable store. No
 // harness validates a secret at write time, so the flow reaches saved rather
 // than authenticated.
+//
+// The native apply blocks like the oauth leg's native callback does, so the
+// flow can reach a terminal state underneath it here too. A write that failed
+// is answered for that closed record by install itself; a write that landed is
+// not, because the value is resident and a no-transition cause over a value the
+// store now holds would hide it. Either way the terminal record belongs to
+// whoever closed the flow first, and the resident credential is what inventory
+// reports.
 func (p *providerAuth) applySecret(ctx context.Context, session *session, flow *authFlow, input string) (any, error) {
 	if input == "" || len(input) > authMaxTextInputBytes {
 		return nil, invalidAuthField(authFieldInput)
@@ -692,18 +711,18 @@ func (p *providerAuth) completeOAuth(ctx context.Context, session *session, flow
 func (p *providerAuth) install(ctx context.Context, session *session, flow *authFlow, credential opencode.ProviderAuthCredential) error {
 	client := session.nativeClient()
 	if client == nil {
-		return p.fail(flow, authCauseTransport, true)
+		return p.failInstall(flow, authCauseTransport)
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, authNativeCallTimeout)
 	defer cancel()
 
 	if err := client.SetProviderAuth(callCtx, flow.providerID, credential); err != nil {
-		return p.fail(flow, authNativeCause(err), true)
+		return p.failInstall(flow, authNativeCause(err))
 	}
 
 	if err := client.DisposeInstance(callCtx); err != nil {
-		return p.fail(flow, authNativeCause(err), true)
+		return p.failInstall(flow, authNativeCause(err))
 	}
 
 	now := authNow().UnixMilli()
@@ -721,10 +740,22 @@ func (p *providerAuth) install(ctx context.Context, session *session, flow *auth
 	}
 
 	if err := p.ledger.write(record); err != nil {
-		return p.fail(flow, authCauseProcess, true)
+		return p.failInstall(flow, authCauseProcess)
 	}
 
 	return nil
+}
+
+// failInstall answers an install that could not complete. The transition it
+// would otherwise perform is the leg's own, so terminality has to be read
+// before it: a flow that closed while the write was in flight is answered for
+// the record its owner already closed, and this leg consumes nothing.
+func (p *providerAuth) failInstall(flow *authFlow, cause string) error {
+	if abandonedCause, abandoned := p.abandonedCause(flow); abandoned {
+		return authFailed(abandonedCause, flow.providerID, flow.method.ID, flow.id)
+	}
+
+	return p.fail(flow, cause, true)
 }
 
 // abandonedCause reports the cause a leg answers with when the flow reached a

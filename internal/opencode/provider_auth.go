@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/savid/acp-go-opencode/internal/homelock"
 )
@@ -380,11 +381,38 @@ func ReapAbandonedHomes(parent string, prefix string) error {
 		}
 
 		if removable {
-			errs = append(errs, reapRemoveAll(home))
+			errs = append(errs, removeReapedHome(home))
 		}
 	}
 
 	return errors.Join(errs...)
+}
+
+// reapRemoveAttempts bounds how long the sweep waits out descendants still
+// writing into a home it decided nothing owns. The lease names the adapter and
+// the server it started, and neither is what repopulates the tree: a plugin
+// install under that server outlives the process group signal that ended its
+// leader, so a single pass walks a directory that is still growing and fails
+// with a not-empty error the caller only logs.
+const reapRemoveAttempts = 5
+
+// reapRemoveBackoff is the pause between removal attempts.
+var reapRemoveBackoff = 100 * time.Millisecond
+
+func removeReapedHome(home string) error {
+	var err error
+
+	for attempt := range reapRemoveAttempts {
+		if err = reapRemoveAll(home); err == nil {
+			return nil
+		}
+
+		if attempt < reapRemoveAttempts-1 {
+			time.Sleep(reapRemoveBackoff)
+		}
+	}
+
+	return err
 }
 
 // reapHome answers for one candidate home. A home carrying a lease is decided

@@ -38,7 +38,9 @@ const (
 	authProviderOpenAI      = "openai"
 	authPromptKeyAccount    = "account"
 	authPromptKeyEnterprise = "enterpriseUrl"
+	authPromptKeyInstance   = "instanceUrl"
 	authSnowflakeHost       = "snowflakecomputing.com"
+	authGitLabHost          = "gitlab.com"
 )
 
 // authDefaultAPIMethodID is the reserved id of the adapter-synthesized default
@@ -127,25 +129,35 @@ type authHostFormingRule struct {
 // a loopback listener the harness opens inside the broker home, keyed by
 // provider and by the native method label that identifies it.
 //
-// Such a method is omitted from the catalog rather than refused at authorize.
-// The harness binds that listener while it mints, and it binds it on the
-// wildcard address rather than on loopback, so refusing after the mint has
-// already opened a port on every interface of the worker host: the only place
-// the adapter can hold the broker's bind-loopback-only property is before the
-// native call exists to make. Each entry is a per-provider constant recorded in
-// the family registry, on the same terms as the host-forming allowlists below.
+// Such a method is omitted from the catalog rather than refused at authorize,
+// because the harness opens that listener while it mints and the refusal can
+// only run on the answer. OpenAI's binds the wildcard address rather than
+// loopback, exposing a port on every interface of the worker host; GitLab's
+// binds a fixed port and, in the same call, execs the platform browser launcher
+// at the authorization URL, which only the broker's own shim then stops. The
+// one place the adapter can hold the broker's bind-loopback-only property is
+// before the native call exists to make. Each entry is a per-provider constant
+// recorded in the family registry, on the same terms as the host-forming
+// allowlists below.
 var authLoopbackMethods = map[string]map[string]struct{}{
 	authProviderOpenAI: {"ChatGPT Pro/Plus (browser)": {}},
+	authProviderGitLab: {"GitLab OAuth": {}},
 }
 
 // authHostFormingRules names every native prompt whose value is interpolated
 // into a URL or a hostname, per provider. A prompt key absent from a provider's
 // map is an ordinary text answer.
+//
+// GitLab's instance URL names the vendor's own SaaS host as readily as a
+// customer's self-hosted one, so the fixed vendor host is an entry the prompt
+// can have even though a deployment-chosen host is not: the SaaS branch is
+// answerable and every self-hosted answer is refused, which is the same split
+// github-copilot's gated enterprise prompt makes with a select.
 var authHostFormingRules = map[string]map[string]authHostFormingRule{
 	authProviderSnowflake: {authPromptKeyAccount: {HostSuffix: authSnowflakeHost, Domains: []string{authSnowflakeHost}}},
 	authProviderAzure:     {"resourceName": {HostSuffix: "openai.azure.com", Domains: []string{"azure.com"}}},
 	authProviderCopilot:   {authPromptKeyEnterprise: {}},
-	authProviderGitLab:    {"instanceUrl": {}},
+	authProviderGitLab:    {authPromptKeyInstance: {Domains: []string{authGitLabHost}}},
 }
 
 // methods enumerates the catalog and mints the generation that names this exact
