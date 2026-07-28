@@ -420,7 +420,11 @@ func TestStartServerWritesTheLeaseBeforeItSpawns(t *testing.T) {
 		t.Fatalf("StartServer: %v", err)
 	}
 
-	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	t.Cleanup(func() {
+		if shutdownErr := client.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown: %v", shutdownErr)
+		}
+	})
 
 	if len(written) != 2 {
 		t.Fatalf("the server wrote %d leases", len(written))
