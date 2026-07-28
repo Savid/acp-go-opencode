@@ -153,7 +153,10 @@ There is no free-form field and no native message text. A caller-owned
 addressing failure — an unknown, superseded, or cross-session `flowId`, a stale
 `methodsGeneration`, a `method` that does not match the flow, or a prompt answer
 that fails validation — is invalid params (`-32602`) carrying the offending
-field path instead.
+field path instead. `connectionId` is caller-minted and bounded to at most 128
+bytes of `A-Z`, `a-z`, `0-9`, `-`, and `_`; every leg that carries one checks it
+before the value is compared or recorded, and anything outside that shape is
+`-32602` naming `connectionId`.
 
 `binding_conflict` comes only from `_opencode/auth/disconnect`, and it means the
 `connectionId` and `bindingGeneration` you sent do not match the binding the

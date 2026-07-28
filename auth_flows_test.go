@@ -114,7 +114,6 @@ func TestAuthorizeMintsADeviceFlow(t *testing.T) {
 	require.Empty(t, result.CallbackInput)
 	require.NotEmpty(t, result.FlowID)
 	require.Positive(t, result.FlowExpiresAt)
-	require.Zero(t, result.PollIntervalMs)
 
 	record, ok, err := fixture.broker.ledger.read("xai")
 	require.NoError(t, err)
@@ -1589,4 +1588,64 @@ func TestDisconnectFailsWhenTheAbsenceProbeFails(t *testing.T) {
 
 	_, err := fixture.disconnect(t, "conn-1", 1)
 	requireAuthFailure(t, err, authCauseHarvestFailed)
+}
+
+// adversarialConnectionIDs are the caller-minted values the bound refuses. Each
+// is a shape the id would otherwise carry into a durable ledger entry and into
+// the adapter's own logs, and the two replacement-rune spellings are one Go
+// string reached from two different wire encodings, which aliases one
+// connection onto another's entry.
+func adversarialConnectionIDs() map[string]string {
+	return map[string]string{
+		"empty":              "",
+		"path separators":    "../../../etc/passwd",
+		"windows separators": `..\..\connection`,
+		"newline":            "connection\n1",
+		"nul":                "connection\x00 1",
+		"bidi override":      "connection\u202e1",
+		"space":              "connection 1",
+		"colon":              "connection:1",
+		"replacement rune":   "connection-�",
+		"non ascii":          "connection-é",
+		"unbounded":          strings.Repeat("c", authConnectionIDMaxBytes+1),
+	}
+}
+
+func TestConnectionIDIsRefusedAtEverySurfaceEntry(t *testing.T) {
+	fixture := newAuthFixture(t)
+
+	require.NoError(t, fixture.broker.ledger.write(authLedgerRecord{
+		ProviderID: "xai", ConnectionID: "conn-1", BindingGeneration: 1, State: authLedgerConfirmed,
+	}))
+
+	for name, connectionID := range adversarialConnectionIDs() {
+		t.Run(name, func(t *testing.T) {
+			_, err := fixture.broker.authorize(context.Background(),
+				fixture.authorizeParams(t, map[string]any{authFieldConnectionID: connectionID}))
+			requireInvalidParams(t, err, authFieldConnectionID)
+
+			_, err = fixture.disconnect(t, connectionID, 1)
+			requireInvalidParams(t, err, authFieldConnectionID)
+		})
+	}
+
+	// Every refusal landed before the leg read the entry the live binding names,
+	// so nothing recorded a value the bound rejects.
+	live, ok, err := fixture.broker.ledger.read("xai")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "conn-1", live.ConnectionID)
+	require.Equal(t, int64(1), live.BindingGeneration)
+	require.Equal(t, authLedgerConfirmed, live.State)
+}
+
+func TestConnectionIDAcceptsTheOpaqueTokenAConsumerMints(t *testing.T) {
+	for _, connectionID := range []string{
+		"pac_2f1c9b4e-8d3a-4c17-9f21-0b6e5a7c8d90",
+		"conn-1",
+		"C0",
+		strings.Repeat("c", authConnectionIDMaxBytes),
+	} {
+		require.True(t, authValidConnectionID(connectionID), connectionID)
+	}
 }

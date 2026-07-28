@@ -105,14 +105,13 @@ type authFlow struct {
 }
 
 type authAuthorizeResult struct {
-	Interaction    string `json:"interaction"`
-	URL            string `json:"url,omitempty"`
-	Message        string `json:"message"`
-	UserCode       string `json:"userCode,omitempty"`
-	CallbackInput  string `json:"callbackInput,omitempty"`
-	FlowID         string `json:"flowId"`
-	FlowExpiresAt  int64  `json:"flowExpiresAt"`
-	PollIntervalMs int64  `json:"pollIntervalMs,omitempty"`
+	Interaction   string `json:"interaction"`
+	URL           string `json:"url,omitempty"`
+	Message       string `json:"message"`
+	UserCode      string `json:"userCode,omitempty"`
+	CallbackInput string `json:"callbackInput,omitempty"`
+	FlowID        string `json:"flowId"`
+	FlowExpiresAt int64  `json:"flowExpiresAt"`
 }
 
 type authFlowIDResult struct {
@@ -308,7 +307,7 @@ func decodeAuthorizeRequest(fields map[string]json.RawMessage) (authorizeRequest
 		return request, err
 	}
 
-	if request.connectionID, err = authRequiredString(fields, authFieldConnectionID); err != nil {
+	if request.connectionID, err = authRequiredConnectionID(fields); err != nil {
 		return request, err
 	}
 
@@ -998,7 +997,7 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 		return nil, err
 	}
 
-	connectionID, err := authRequiredString(fields, authFieldConnectionID)
+	connectionID, err := authRequiredConnectionID(fields)
 	if err != nil {
 		return nil, err
 	}
