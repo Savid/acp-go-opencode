@@ -50,7 +50,7 @@ test-integration-attended:
 
 ## test-integration-keystore: run credential-residence tests against the container fixture
 test-integration-keystore:
-	ACP_GO_OPENCODE_RUN_INTEGRATION=1 ACP_GO_OPENCODE_RUN_KEYSTORE=1 go test -race -count=1 -tags=integration -timeout=600s -v -run TestKeystore ./integration/...
+	ACP_GO_OPENCODE_RUN_INTEGRATION=1 ACP_GO_OPENCODE_RUN_KEYSTORE=1 go test -race -count=1 -tags=integration -timeout=600s -v -run TestKeystore ./...
 
 ## test-integration-cover: run smoke integration tests with compiled binary coverage
 test-integration-cover:

@@ -5,7 +5,10 @@ package integration
 import (
 	"context"
 	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +58,7 @@ func TestKeystoreLinuxLoginNeverExecsABrowserLauncher(t *testing.T) {
 		}
 	})
 
-	probe := buildLinuxProbe(t, "browser-shim.test")
+	probe := buildBrowserShimProbe(t)
 
 	if copyErr := container.CopyFileToContainer(ctx, probe, browserShimProbePath, 0o755); copyErr != nil {
 		t.Fatalf("copy launcher probe: %v", copyErr)
@@ -86,4 +89,25 @@ func TestKeystoreLinuxLoginNeverExecsABrowserLauncher(t *testing.T) {
 	if !strings.Contains(string(logs), "--- PASS: TestLoginNeverExecsABrowserLauncher") {
 		t.Fatalf("the launcher probe reported no passing run: %s", logs)
 	}
+}
+
+// buildBrowserShimProbe compiles the package that owns the login leg for the
+// fixture's platform. The launcher names under test are the ones Linux resolves,
+// so the proof only means anything from a Linux binary.
+func buildBrowserShimProbe(t *testing.T) string {
+	t.Helper()
+
+	out := filepath.Join(t.TempDir(), "browser-shim.test")
+
+	command := exec.CommandContext(t.Context(), "go", "test", "-c", "-tags=integration", "-o", out, "./internal/opencode")
+	command.Dir = ".."
+	// GOWORK=off is load-bearing: a go.work in scope otherwise builds the probe
+	// from another module's requirements.
+	command.Env = append(os.Environ(), "GOWORK=off", "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
+
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build the browser shim probe: %v: %s", err, output)
+	}
+
+	return out
 }

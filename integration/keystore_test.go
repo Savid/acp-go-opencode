@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/testcontainers/testcontainers-go"
+	tcexec "github.com/testcontainers/testcontainers-go/exec"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
@@ -45,6 +46,55 @@ func TestKeystoreLinuxCredentialResidence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
+	container := startKeystoreFixture(ctx, t)
+
+	probe := buildResidenceProbe(t)
+	if err := container.CopyFileToContainer(ctx, probe, keystoreProbePath, 0o755); err != nil {
+		t.Fatalf("copy residence probe: %v", err)
+	}
+
+	t.Run("keystore-absent", func(t *testing.T) {
+		runResidenceMatrix(ctx, t, container, false)
+	})
+
+	t.Run("keystore-present", func(t *testing.T) {
+		runResidenceMatrix(ctx, t, container, true)
+	})
+}
+
+// TestKeystoreLinuxArtifactCarriesNoSecretServiceClient pins the mechanism
+// behind the identity above from this repo's own side: the adapter compiled for
+// Linux links no Secret Service client, so no keystore item can be created or
+// read whatever a live service on the box offers.
+func TestKeystoreLinuxArtifactCarriesNoSecretServiceClient(t *testing.T) {
+	requireRunKeystore(t)
+
+	binary := filepath.Join(t.TempDir(), "acp-go-opencode-linux")
+
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", binary, "../cmd/acp-go-opencode")
+	build.Env = append(os.Environ(), "GOWORK=off", "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
+
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the Linux artifact: %v: %s", err, output)
+	}
+
+	contents, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatalf("read the Linux artifact: %v", err)
+	}
+
+	for _, symbol := range []string{"libsecret", "org.freedesktop.secrets", "gnome-keyring"} {
+		if strings.Contains(string(contents), symbol) {
+			t.Fatalf("the Linux artifact carries %q", symbol)
+		}
+	}
+}
+
+// startKeystoreFixture builds and starts the Secret Service fixture and
+// registers its teardown.
+func startKeystoreFixture(ctx context.Context, t *testing.T) testcontainers.Container {
+	t.Helper()
+
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			FromDockerfile: testcontainers.FromDockerfile{
@@ -64,90 +114,72 @@ func TestKeystoreLinuxCredentialResidence(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
-		if err := container.Terminate(context.WithoutCancel(ctx)); err != nil {
-			t.Errorf("terminate keystore fixture: %v", err)
+		if terminateErr := container.Terminate(context.WithoutCancel(ctx)); terminateErr != nil {
+			t.Errorf("terminate keystore fixture: %v", terminateErr)
 		}
 	})
 
-	probe := buildLinuxProbe(t, "residence.test")
-
-	if err := container.CopyFileToContainer(ctx, probe, keystoreProbePath, 0o755); err != nil {
-		t.Fatalf("copy residence probe: %v", err)
-	}
-
-	matrix := keystoreProbePath + " -test.v -test.run '^TestKeystoreResidenceMatrix$'"
-
-	for name, command := range map[string]string{
-		"keystore-present": ". " + keystoreEnvFile + "; export DBUS_SESSION_BUS_ADDRESS; exec " + matrix,
-		"keystore-absent":  "unset DBUS_SESSION_BUS_ADDRESS; exec " + matrix,
-	} {
-		t.Run(name, func(t *testing.T) {
-			code, output, err := container.Exec(ctx, []string{"/bin/sh", "-c", command})
-			if err != nil {
-				t.Fatalf("run residence matrix: %v", err)
-			}
-
-			logs, readErr := io.ReadAll(output)
-			if readErr != nil {
-				t.Fatalf("read residence output: %v", readErr)
-			}
-
-			t.Log(string(logs))
-
-			if code != 0 {
-				t.Fatalf("residence matrix exited %d", code)
-			}
-
-			if strings.Contains(string(logs), "SKIP") {
-				t.Fatalf("the residence matrix skipped inside the fixture: %s", logs)
-			}
-		})
-	}
+	return container
 }
 
-// TestKeystoreLinuxArtifactCarriesNoSecretServiceClient pins the mechanism
-// behind the identity above from this repo's own side: the adapter compiled for
-// Linux links no Secret Service client, so no keystore item can be created or
-// read whatever a live service on the box offers.
-func TestKeystoreLinuxArtifactCarriesNoSecretServiceClient(t *testing.T) {
-	requireRunKeystore(t)
-
-	binary := filepath.Join(t.TempDir(), "acp-go-opencode-linux")
-
-	build := exec.CommandContext(t.Context(), "go", "build", "-o", binary, "../cmd/acp-go-opencode")
-	build.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
-
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build the Linux artifact: %v: %s", err, output)
-	}
-
-	contents, err := os.ReadFile(binary)
-	if err != nil {
-		t.Fatalf("read the Linux artifact: %v", err)
-	}
-
-	for _, symbol := range []string{"libsecret", "org.freedesktop.secrets", "gnome-keyring"} {
-		if strings.Contains(string(contents), symbol) {
-			t.Fatalf("the Linux artifact carries %q", symbol)
-		}
-	}
-}
-
-// buildLinuxProbe compiles the package that owns the native runtime for the
-// fixture's platform. Its claims cannot be made on the host: only the container
-// carries the Secret Service and the launcher names Linux resolves.
-func buildLinuxProbe(t *testing.T, name string) string {
+// buildResidenceProbe compiles the package that owns the credential read path
+// for the fixture's platform. Its claims cannot be made on the host: only the
+// container carries a Secret Service to make the two Linux configurations
+// differ.
+func buildResidenceProbe(t *testing.T) string {
 	t.Helper()
 
-	out := filepath.Join(t.TempDir(), name)
+	out := filepath.Join(t.TempDir(), "residence.test")
 
 	command := exec.CommandContext(t.Context(), "go", "test", "-c", "-tags=integration", "-o", out, "./internal/opencode")
 	command.Dir = ".."
-	command.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
+	// GOWORK=off is load-bearing: a go.work in scope otherwise builds the probe
+	// from another module's requirements.
+	command.Env = append(os.Environ(), "GOWORK=off", "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
 
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("build %s: %v: %s", name, err, output)
+		t.Fatalf("build the residence probe: %v: %s", err, output)
 	}
 
 	return out
+}
+
+// runResidenceMatrix runs the probe in one configuration. The two runs differ
+// only in whether the fixture's session bus is exported, which is what turns the
+// matrix's identity claim into a comparison.
+func runResidenceMatrix(ctx context.Context, t *testing.T, container testcontainers.Container, bus bool) {
+	t.Helper()
+
+	prelude := "unset DBUS_SESSION_BUS_ADDRESS; "
+	if bus {
+		prelude = ". " + keystoreEnvFile + "; export DBUS_SESSION_BUS_ADDRESS; "
+	}
+
+	command := prelude +
+		"export " + envRunIntegration + "=1 " + envRunKeystore + "=1; " +
+		"exec " + keystoreProbePath + " -test.v -test.run '^TestKeystoreResidenceMatrix$'"
+
+	// The stream is demultiplexed so a frame header can never land inside the
+	// result line this test matches on.
+	code, output, err := container.Exec(ctx, []string{"/bin/sh", "-c", command}, tcexec.Multiplexed())
+	if err != nil {
+		t.Fatalf("run residence matrix: %v", err)
+	}
+
+	logs, readErr := io.ReadAll(output)
+	if readErr != nil {
+		t.Fatalf("read residence output: %v", readErr)
+	}
+
+	t.Log(string(logs))
+
+	if code != 0 {
+		t.Fatalf("residence matrix exited %d", code)
+	}
+
+	// A skipped run also exits 0, which is the silent success this tier exists
+	// to prevent, so the per-test result line is what reports the proof ran.
+	if !strings.Contains(string(logs), "--- PASS: TestKeystoreResidenceMatrix") {
+		t.Fatalf("the residence matrix reported no passing run: %s", logs)
+	}
 }
