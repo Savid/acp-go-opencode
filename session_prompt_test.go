@@ -2357,6 +2357,27 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 		}
 	})
 
+	t.Run("a uri the parser rejects contributes no filename", func(t *testing.T) {
+		// The uri is host-supplied and never validated before this point, so the
+		// name derivation has to answer for one net/url refuses outright. The
+		// blob still carries the bytes, so the part is built and sent — it just
+		// names nothing.
+		blobMime := "application/octet-stream"
+		part, err := blobResourceOpenCodePart(&acp.BlobResourceContents{
+			Uri:      "file:///tmp/re\x7fjected.bin",
+			MimeType: &blobMime,
+		}, "AA==")
+		if err != nil {
+			t.Fatalf("blob resource with an unparsable uri: %v", err)
+		}
+		if _, named := part["filename"]; named {
+			t.Fatalf("part = %#v, want no filename", part)
+		}
+		if part["url"] != "data:application/octet-stream;base64,AA==" {
+			t.Fatalf("part = %#v, want the blob inlined", part)
+		}
+	})
+
 	t.Run("unmatched slash keeps supported mixed content as plain message", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}

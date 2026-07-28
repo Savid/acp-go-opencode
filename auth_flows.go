@@ -781,9 +781,9 @@ func (p *providerAuth) install(ctx context.Context, session *session, flow *auth
 	record.UpdatedAt = authNow().UnixMilli()
 
 	// Every writer of this entry — a fresh authorize's intent, a disconnect's
-	// bump, and this confirmation — holds the gate above, so the lineage read
-	// before the native write is still the stored lineage here. The write needs
-	// no compare of its own.
+	// bump, and this confirmation — holds the credential-slot gate this leg took
+	// above, so the lineage read before the native write is still the stored
+	// lineage here. The write needs no compare of its own.
 	if err := p.ledger.write(record); err != nil {
 		return p.failInstall(flow, authCauseProcess)
 	}
@@ -799,6 +799,14 @@ func (p *providerAuth) install(ctx context.Context, session *session, flow *auth
 // confirmation the ledger then correctly refuses leaves the entry reading
 // removed while the credential is resident, which makes it live and invisible
 // on every residence answer this surface has.
+//
+// One read ahead of the write is the whole check only because of the
+// credential-slot gate — p.slots, keyed by provider id — which install holds
+// from before this read through the confirmation write, and which every other
+// writer of the entry takes too: authorize's intent in mintLedgerIntent, and
+// disconnect's generation bump and its removed-write. Shorten that hold and the
+// entry can move between this read and the write again, and the write needs a
+// compare of its own back.
 func (p *providerAuth) staleLineage(record authLedgerRecord) string {
 	current, ok, err := p.ledger.read(record.ProviderID)
 	if err != nil {
