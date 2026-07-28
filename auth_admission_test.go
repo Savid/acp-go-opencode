@@ -320,6 +320,43 @@ func TestCredentialSlotGateRefusesACancelledLeg(t *testing.T) {
 	require.Empty(t, fixture.runtime.removedAuth)
 }
 
+// TestALedgerIntentThatNeverGotTheSlotWritesNothing pins the authorize half of
+// the slot gate. The leg cancels between taking its key gate and reaching the
+// slot, so the slot is the admission it loses: it claims no revision, records
+// no intent, and drives no native mint.
+func TestALedgerIntentThatNeverGotTheSlotWritesNothing(t *testing.T) {
+	fixture := newAuthFixture(t)
+
+	release, admitted := fixture.broker.slots.admit(context.Background(), "xai")
+	require.True(t, admitted)
+
+	t.Cleanup(release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	original := authRandRead
+	authRandRead = func(value []byte) (int, error) {
+		cancel()
+
+		return original(value)
+	}
+
+	t.Cleanup(func() { authRandRead = original })
+
+	_, err := fixture.broker.authorize(ctx, fixture.authorizeParams(t, nil))
+	requireAuthFailure(t, err, authCauseTimeout)
+
+	_, ok, readErr := fixture.broker.ledger.read("xai")
+	require.NoError(t, readErr)
+	require.False(t, ok)
+
+	fixture.brokerNode.mu.Lock()
+	defer fixture.brokerNode.mu.Unlock()
+
+	require.Empty(t, fixture.brokerNode.authorizeCalls)
+}
+
 // TestInstallRefusesABindingTheLedgerHasAlreadyLeft pins the pre-write half of
 // the lineage check. The post-hoc confirmation refusal is not enough on its
 // own: it correctly declines to record the stale binding, but by then the
@@ -377,6 +414,168 @@ func TestProbeDeclinesAFlowAnotherLegHolds(t *testing.T) {
 
 	require.Equal(t, authStatePending, fixture.status(t, flow.FlowID).State)
 	require.Zero(t, reads.Load())
+}
+
+// TestAdmissionGatesAreDroppedOnlyWhenNobodyHoldsThem pins that a settled leg
+// leaves no gate behind. The keys are unbounded over the life of an agent that
+// outlives every session it serves, so a gate that survives its last holder is
+// a leak, and one dropped while a holder remains is worse than a leak: the next
+// leg mints a fresh gate and runs beside the leg still holding the old one.
+func TestAdmissionGatesAreDroppedOnlyWhenNobodyHoldsThem(t *testing.T) {
+	fixture := authSecretFixture(t)
+
+	flow := fixture.authorize(t, nil)
+
+	_, err := fixture.callback(t, flow.FlowID, "0", "sk-secret")
+	require.NoError(t, err)
+
+	_, err = fixture.disconnect(t, "conn-1", 1)
+	require.NoError(t, err)
+
+	fixture.broker.admissions.mu.Lock()
+	require.Empty(t, fixture.broker.admissions.gates)
+	fixture.broker.admissions.mu.Unlock()
+
+	fixture.broker.slots.mu.Lock()
+	defer fixture.broker.slots.mu.Unlock()
+
+	require.Empty(t, fixture.broker.slots.gates)
+}
+
+// TestAReopenedSessionCannotSlipPastAHeldGate is the reason nothing may delete
+// a gate out from under its holder. A session that closes and is loaded again
+// admits legs under the same key, and if the close dropped the gate entry the
+// new leg mints its own and runs concurrently with the one still inside the
+// admission it is supposed to be queued behind.
+func TestAReopenedSessionCannotSlipPastAHeldGate(t *testing.T) {
+	fixture := newAuthFixture(t)
+	params := fixture.authorizeParams(t, nil)
+
+	var inside, peak atomic.Int64
+
+	hold := authTokenHold{arrived: make(chan struct{}), release: make(chan struct{})}
+	original := authRandRead
+
+	var held atomic.Bool
+
+	authRandRead = func(value []byte) (int, error) {
+		recordPeak(inside.Add(1), &peak)
+
+		if held.CompareAndSwap(false, true) {
+			close(hold.arrived)
+			<-hold.release
+		}
+
+		inside.Add(-1)
+
+		return original(value)
+	}
+
+	t.Cleanup(func() { authRandRead = original })
+
+	first := make(chan struct{})
+
+	go func() {
+		defer close(first)
+
+		_, _ = fixture.broker.authorize(context.Background(), params)
+	}()
+
+	<-hold.arrived
+
+	fixture.broker.closeSession(context.Background(), fixture.session.id)
+	require.NoError(t, fixture.agent.storeStartedSession(fixture.session))
+
+	second := make(chan struct{})
+
+	go func() {
+		defer close(second)
+
+		_, _ = fixture.broker.authorize(context.Background(), params)
+	}()
+
+	time.Sleep(authAdmissionSettleWait)
+	close(hold.release)
+	<-first
+	<-second
+
+	require.Equal(t, int64(1), peak.Load())
+}
+
+func recordPeak(current int64, peak *atomic.Int64) {
+	for {
+		top := peak.Load()
+		if current <= top || peak.CompareAndSwap(top, current) {
+			return
+		}
+	}
+}
+
+// TestDisconnectAndAuthorizeCannotClobberOneLedgerEntry holds a disconnect
+// between reading the provider's record and writing its generation bump, and
+// runs a whole authorize underneath it. Both are read-modify-writes of one
+// ledger entry, so both have to hold the same credential-slot gate a login and
+// a removal already hold: ungated, the copy disconnect read before the new
+// login existed is written back over it, erasing the revision the login is
+// bound to and leaving that login unable to ever confirm.
+func TestDisconnectAndAuthorizeCannotClobberOneLedgerEntry(t *testing.T) {
+	fixture := newAuthFixture(t)
+
+	require.NoError(t, fixture.broker.ledger.write(authLedgerRecord{
+		ProviderID: "xai", ConnectionID: "conn-1", Revision: 1, BindingGeneration: 1, State: authLedgerConfirmed,
+	}))
+
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	original := authNow
+
+	var armed, held atomic.Bool
+
+	// disconnect stamps the bump it is about to write between its read and that
+	// write, which is the one point inside the read-modify-write that holds no
+	// ledger mutex.
+	authNow = func() time.Time {
+		if armed.Load() && held.CompareAndSwap(false, true) {
+			close(arrived)
+			<-release
+		}
+
+		return original()
+	}
+
+	t.Cleanup(func() { authNow = original })
+
+	disconnected := make(chan error, 1)
+
+	armed.Store(true)
+
+	go func() {
+		_, err := fixture.disconnect(t, "conn-1", 1)
+		disconnected <- err
+	}()
+
+	<-arrived
+
+	authorized := make(chan struct{})
+
+	go func() {
+		defer close(authorized)
+
+		_, _ = fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
+	}()
+
+	time.Sleep(authAdmissionSettleWait)
+	close(release)
+
+	require.NoError(t, <-disconnected)
+	<-authorized
+
+	record, ok, err := fixture.broker.ledger.read("xai")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, int64(2), record.Revision)
+	require.Equal(t, int64(2), record.BindingGeneration)
+	require.Equal(t, authLedgerIntent, record.State)
 }
 
 // authTokenHold parks the first flow-id mint, which is the one point every

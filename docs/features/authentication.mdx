@@ -118,11 +118,14 @@ they do, and each is visible to a host as an ordinary leg answer:
   is already driving answers `flow_state` and applies nothing, and a `status`
   poll that lands in the same window reports the cached state instead of driving
   a second native read.
-- `disconnect` and a login's install serialize on the provider's credential
-  slot, and the install re-reads the recorded binding before it writes. So a
-  login that completed after a `disconnect` bumped the generation answers
+- Every mutation of one provider's credential slot serializes on it: the
+  revision an `authorize` claims, a login's install, and a `disconnect`. The
+  install re-reads the recorded binding before it writes, so a login that
+  completed after a `disconnect` bumped the generation answers
   `binding_conflict` and writes nothing, rather than refilling a slot
-  `disconnect` verified empty and left the ledger unable to name.
+  `disconnect` verified empty and left the ledger unable to name. A leg whose
+  own context ends while it waits for the slot answers `timeout` and mutates
+  nothing.
 
 `session/close` marks the session closed in the same step that takes its cleanup
 set. It never waits for an in-flight leg, because a native login has no bound

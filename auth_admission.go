@@ -14,11 +14,24 @@ import (
 // against state this one is about to replace.
 type authGate[K comparable] struct {
 	mu    sync.Mutex
-	gates map[K]chan struct{}
+	gates map[K]*authGateEntry
+}
+
+// authGateEntry is one key's gate and the number of legs that hold it or are
+// waiting for it. The count is what decides when the entry may be dropped:
+// dropping it while a leg still holds the channel would not free anything the
+// holder needs, but the next leg for that key would mint a second channel and
+// run beside the leg it was supposed to queue behind, which is the gate
+// silently ceasing to serialize. Nothing outside admit may remove an entry, and
+// the keys are unbounded over the life of an agent that outlives its sessions,
+// so the count is also the only thing keeping the map from growing forever.
+type authGateEntry struct {
+	gate    chan struct{}
+	pending int
 }
 
 func newAuthGate[K comparable]() *authGate[K] {
-	return &authGate[K]{gates: make(map[K]chan struct{})}
+	return &authGate[K]{gates: make(map[K]*authGateEntry)}
 }
 
 // admit waits for the key's gate and returns the release its caller defers. It
@@ -27,33 +40,40 @@ func newAuthGate[K comparable]() *authGate[K] {
 func (g *authGate[K]) admit(ctx context.Context, key K) (func(), bool) {
 	g.mu.Lock()
 
-	gate, ok := g.gates[key]
+	entry, ok := g.gates[key]
 	if !ok {
-		gate = make(chan struct{}, 1)
-		g.gates[key] = gate
+		entry = &authGateEntry{gate: make(chan struct{}, 1)}
+		g.gates[key] = entry
 	}
 
+	entry.pending++
 	g.mu.Unlock()
 
 	select {
-	case gate <- struct{}{}:
-		return func() { <-gate }, true
+	case entry.gate <- struct{}{}:
+		return func() {
+			<-entry.gate
+
+			g.depart(key)
+		}, true
 	case <-ctx.Done():
+		g.depart(key)
+
 		return nil, false
 	}
 }
 
-// forget drops the gates whose keys match. A gate a leg still holds is dropped
-// from the map but not from that leg: the release closure captured the channel,
-// so it drains the gate it took rather than a successor's.
-func (g *authGate[K]) forget(match func(K) bool) {
+// depart drops the caller from the key's entry and removes the entry once
+// nobody holds it or waits for it.
+func (g *authGate[K]) depart(key K) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	for key := range g.gates {
-		if match(key) {
-			delete(g.gates, key)
-		}
+	entry := g.gates[key]
+
+	entry.pending--
+	if entry.pending == 0 {
+		delete(g.gates, key)
 	}
 }
 

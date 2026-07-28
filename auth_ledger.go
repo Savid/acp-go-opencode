@@ -208,33 +208,6 @@ func (l *authLedger) write(record authLedgerRecord) error {
 	return l.writeEntry(record)
 }
 
-// writeIfCurrent commits a record only while the stored entry still names the
-// lineage this record was minted against, and reports whether it did. A leg
-// whose native call outlived its own flow arrives after a supersede has minted
-// the provider's next revision or a disconnect has bumped its generation, and
-// an unconditional rename would put the closed flow's binding back over the one
-// that replaced it — leaving the host holding a generation the entry no longer
-// names and a credential no disconnect can ever fence.
-func (l *authLedger) writeIfCurrent(record authLedgerRecord) (bool, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	current, ok, err := l.readEntry(record.ProviderID)
-	if err != nil {
-		return false, err
-	}
-
-	if ok && !current.namesLineage(record) {
-		return false, nil
-	}
-
-	if err := l.writeEntry(record); err != nil {
-		return false, err
-	}
-
-	return true, nil
-}
-
 // namesLineage reports whether the stored entry still names the binding record
 // was minted against. The three fields together are the binding: the connection
 // that owns the slot, the login that claimed it, and the generation a

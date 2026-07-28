@@ -217,14 +217,9 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 		UpdatedAt:          now.UnixMilli(),
 	}
 
-	if prior, ok, readErr := p.ledger.read(request.providerID); readErr == nil && ok {
-		record.Revision = prior.Revision + 1
-		record.BindingGeneration = prior.BindingGeneration
-		record.CreatedAt = prior.CreatedAt
-	}
-
-	if writeErr := p.ledger.write(record); writeErr != nil {
-		return nil, authFailed(authCauseProcess, request.providerID, request.method, "")
+	record, cause := p.mintLedgerIntent(ctx, record)
+	if cause != "" {
+		return nil, authFailed(cause, request.providerID, request.method, "")
 	}
 
 	flow := &authFlow{
@@ -264,6 +259,35 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 	p.armCompleter(flow)
 
 	return presentation, nil
+}
+
+// mintLedgerIntent claims the provider's next revision and persists the intent
+// as one step, under the credential-slot gate authorize takes after the key
+// gate and never the other way round. The claim is a read-modify-write of the
+// same entry disconnect and install rewrite, so ungated it both loses and
+// destroys: the generation a disconnect bumped in between is read back stale
+// and overwritten by the revision this write carries, and the copy a disconnect
+// read before this record existed is written back over it, leaving the login
+// bound to a revision no entry names and unable to ever confirm.
+func (p *providerAuth) mintLedgerIntent(ctx context.Context, record authLedgerRecord) (authLedgerRecord, string) {
+	release, admitted := p.slots.admit(ctx, record.ProviderID)
+	if !admitted {
+		return record, authCauseTimeout
+	}
+
+	defer release()
+
+	if prior, ok, err := p.ledger.read(record.ProviderID); err == nil && ok {
+		record.Revision = prior.Revision + 1
+		record.BindingGeneration = prior.BindingGeneration
+		record.CreatedAt = prior.CreatedAt
+	}
+
+	if err := p.ledger.write(record); err != nil {
+		return record, authCauseProcess
+	}
+
+	return record, ""
 }
 
 // failMint terminalizes a flow whose native mint never produced a presentation
@@ -635,11 +659,10 @@ func (p *providerAuth) callback(ctx context.Context, params json.RawMessage) (an
 // The native apply blocks like the oauth leg's native callback does, so the
 // flow can reach a terminal state underneath it here too. A write that failed
 // is answered for that closed record by install itself; a write that landed is
-// not, because the value is resident and a no-transition cause over a value the
-// store now holds would hide it — unless the provenance entry has meanwhile
-// passed to a newer binding, which install will not overwrite. Either way the
-// terminal record belongs to whoever closed the flow first, and the resident
-// credential is what inventory reports.
+// not, because the value is resident and a no-transition cause over a value
+// the store now holds would hide it. Either way the terminal record belongs to
+// whoever closed the flow first, and the resident credential is what inventory
+// reports.
 func (p *providerAuth) applySecret(ctx context.Context, session *session, flow *authFlow, input string) (any, error) {
 	if input == "" || len(input) > authMaxTextInputBytes {
 		return nil, invalidAuthField(authFieldInput)
@@ -757,16 +780,12 @@ func (p *providerAuth) install(ctx context.Context, session *session, flow *auth
 
 	record.UpdatedAt = authNow().UnixMilli()
 
-	// authorize mints the provider's next revision without holding this gate, so
-	// the entry can still have moved on under the native write above; the
-	// provenance write stays conditional for that one remaining writer.
-	committed, err := p.ledger.writeIfCurrent(record)
-	if err != nil {
+	// Every writer of this entry — a fresh authorize's intent, a disconnect's
+	// bump, and this confirmation — holds the gate above, so the lineage read
+	// before the native write is still the stored lineage here. The write needs
+	// no compare of its own.
+	if err := p.ledger.write(record); err != nil {
 		return p.failInstall(flow, authCauseProcess)
-	}
-
-	if !committed {
-		return p.failInstall(flow, authCauseBindingConflict)
 	}
 
 	return nil
@@ -1146,8 +1165,6 @@ func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId
 	}
 
 	p.mu.Unlock()
-
-	p.admissions.forget(func(key authFlowKey) bool { return key.sessionID == sessionID })
 
 	for _, broker := range brokers {
 		broker.destroy(ctx)

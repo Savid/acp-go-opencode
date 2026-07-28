@@ -215,62 +215,25 @@ func TestAuthLedgerReadFailures(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestAuthLedgerWriteIfCurrentGuardsTheStoredLineage pins the compare half of
-// the compare-and-set: a record whose lineage no longer matches the stored
-// entry is refused rather than renamed over it, while a first entry and a
-// repeat of the same lineage both commit.
-func TestAuthLedgerWriteIfCurrentGuardsTheStoredLineage(t *testing.T) {
-	ledger := newTestLedger(t)
-
+// TestAuthLedgerNamesLineageComparesTheWholeBinding pins what makes a stored
+// entry still this record's: the connection that owns the slot, the login that
+// claimed it, and the generation a disconnect bumps. Any one of them differing
+// means the entry has moved on.
+func TestAuthLedgerNamesLineageComparesTheWholeBinding(t *testing.T) {
 	minted := authLedgerRecord{ProviderID: "xai", ConnectionID: "conn-1", Revision: 1, BindingGeneration: 1, State: authLedgerIntent}
-
-	written, err := ledger.writeIfCurrent(minted)
-	require.NoError(t, err)
-	require.True(t, written)
 
 	confirmed := minted
 	confirmed.State = authLedgerConfirmed
 
-	written, err = ledger.writeIfCurrent(confirmed)
-	require.NoError(t, err)
-	require.True(t, written)
+	require.True(t, confirmed.namesLineage(minted))
 
 	for _, stale := range []authLedgerRecord{
-		{ProviderID: "xai", ConnectionID: "conn-2", Revision: 1, BindingGeneration: 1, State: authLedgerConfirmed},
-		{ProviderID: "xai", ConnectionID: "conn-1", Revision: 0, BindingGeneration: 1, State: authLedgerConfirmed},
-		{ProviderID: "xai", ConnectionID: "conn-1", Revision: 1, BindingGeneration: 0, State: authLedgerConfirmed},
+		{ProviderID: "xai", ConnectionID: "conn-2", Revision: 1, BindingGeneration: 1},
+		{ProviderID: "xai", ConnectionID: "conn-1", Revision: 0, BindingGeneration: 1},
+		{ProviderID: "xai", ConnectionID: "conn-1", Revision: 1, BindingGeneration: 0},
 	} {
-		written, err = ledger.writeIfCurrent(stale)
-		require.NoError(t, err)
-		require.False(t, written)
+		require.False(t, stale.namesLineage(minted))
 	}
-
-	record, ok, err := ledger.read("xai")
-	require.NoError(t, err)
-	require.True(t, ok)
-	require.Equal(t, confirmed, record)
-}
-
-func TestAuthLedgerWriteIfCurrentFailures(t *testing.T) {
-	ledger := newTestLedger(t)
-
-	t.Cleanup(func() {
-		ledgerReadFile = os.ReadFile
-		ledgerCreateTemp = func(dir string, pattern string) (ledgerFile, error) { return os.CreateTemp(dir, pattern) }
-	})
-
-	ledgerReadFile = func(string) ([]byte, error) { return nil, errors.New("io") }
-
-	written, err := ledger.writeIfCurrent(authLedgerRecord{ProviderID: "xai"})
-	require.Error(t, err)
-	require.False(t, written)
-
-	ledgerReadFile = os.ReadFile
-	ledgerCreateTemp = func(string, string) (ledgerFile, error) { return nil, errors.New("create") }
-
-	written, err = ledger.writeIfCurrent(authLedgerRecord{ProviderID: "xai"})
-	require.Error(t, err)
-	require.False(t, written)
 }
 
 func TestAuthLedgerWriteFailures(t *testing.T) {

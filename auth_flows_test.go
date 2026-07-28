@@ -973,11 +973,11 @@ func TestStatusAndCallbackClaimTheBrokerOnce(t *testing.T) {
 }
 
 // TestSupersededSecretApplyLeavesTheSuccessorsLedgerEntry pins the provenance
-// half of an apply that outlived its own flow. The credential is resident
-// either way, but the entry now names the revision the replacing authorize
-// minted, and confirming the closed flow's binding over it would leave the host
-// holding a generation the entry no longer names and a credential no
-// disconnect could ever fence.
+// half of an apply that outlived its own flow. The replacing authorize cancels
+// the flow before the apply's native write returns, but it cannot claim the
+// provider's next revision until that write has confirmed its own — so the
+// entry ends up naming the successor, and no closed flow's binding is left
+// sitting over the one that replaced it.
 func TestSupersededSecretApplyLeavesTheSuccessorsLedgerEntry(t *testing.T) {
 	fixture := newAuthFixture(t)
 	fixture.runtime.providerAuthMethods = map[string][]opencode.ProviderAuthMethod{
@@ -1011,11 +1011,22 @@ func TestSupersededSecretApplyLeavesTheSuccessorsLedgerEntry(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	successor := fixture.authorize(t, map[string]any{authFieldAuthorizeRequestID: "req-2"})
+	replaced := make(chan authAuthorizeResult, 1)
+
+	go func() {
+		replaced <- fixture.authorize(t, map[string]any{authFieldAuthorizeRequestID: "req-2"})
+	}()
+
+	// The successor supersedes the flow immediately and then parks on the slot,
+	// so it is the apply's own write that decides the entry it later replaces.
+	time.Sleep(authAdmissionSettleWait)
 	close(superseded)
 
-	requireAuthFailure(t, <-answered, authCauseFlowCancelled)
+	require.NoError(t, <-answered)
+
+	successor := <-replaced
 	require.Len(t, fixture.runtime.setAuthCalls, 1)
+	require.Equal(t, authStatePending, fixture.status(t, successor.FlowID).State)
 
 	record, ok, err := fixture.broker.ledger.read("xai")
 	require.NoError(t, err)
