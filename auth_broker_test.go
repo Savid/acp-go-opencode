@@ -21,6 +21,7 @@ func restoreBrokerSeams(t *testing.T) {
 		brokerMkdirTemp = os.MkdirTemp
 		brokerCreateXDG = opencode.CreateRuntimeXDGDirs
 		brokerRemoveAll = os.RemoveAll
+		brokerNewBrowserShim = opencode.NewBrowserShim
 	})
 }
 
@@ -86,6 +87,9 @@ func TestStartBrokerFailures(t *testing.T) {
 		{name: "xdg creation", setup: func(_ *testing.T, _ *Agent) {
 			brokerCreateXDG = func(string) (opencode.XDGDirs, error) { return opencode.XDGDirs{}, failure }
 		}},
+		{name: "browser shim", setup: func(_ *testing.T, _ *Agent) {
+			brokerNewBrowserShim = func(string) (*opencode.BrowserShim, error) { return nil, failure }
+		}},
 		{name: "server start", setup: func(_ *testing.T, agent *Agent) {
 			agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 				return nil, failure
@@ -145,6 +149,50 @@ func TestDestroyToleratesANilBroker(t *testing.T) {
 	var broker *authBroker
 
 	broker.destroy(context.Background())
+}
+
+func TestStartBrokerShadowsEveryBrowserLauncherTheBrokerCouldExec(t *testing.T) {
+	harness := newAuthAgent(t)
+	agent, broker := harness.agent, harness.broker
+	restoreBrokerSeams(t)
+
+	node := newFakeOpenCodeClient()
+
+	var handed *opencode.BrowserShim
+
+	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		handed = options.BrowserShim
+
+		return node, nil
+	}
+
+	created, err := broker.startBroker(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, handed)
+	require.Same(t, created.shim, handed)
+	require.Equal(t, agent.options.ScratchDir, filepath.Dir(handed.Dir()))
+	require.True(t, strings.HasPrefix(filepath.Base(handed.Dir()), "acp-go-opencode-browser-shim-"))
+	require.FileExists(t, filepath.Join(handed.Dir(), "open"))
+
+	created.destroy(context.Background())
+	require.NoDirExists(t, handed.Dir())
+}
+
+func TestDestroyReportsBrowserShimRemovalFailure(t *testing.T) {
+	restoreBrokerSeams(t)
+
+	parent := t.TempDir()
+
+	shim, err := opencode.NewBrowserShim(parent)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(parent, 0o500))
+
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+
+	broker := &authBroker{home: t.TempDir(), shim: shim, client: newFakeOpenCodeClient(), log: slog.New(slog.DiscardHandler)}
+	broker.destroy(context.Background())
+
+	require.DirExists(t, shim.Dir())
 }
 
 func TestStartBrokerReservesOneContainmentScratchRoot(t *testing.T) {

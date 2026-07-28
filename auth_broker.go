@@ -11,10 +11,11 @@ import (
 )
 
 var (
-	brokerReapHomes = opencode.ReapAbandonedHomes
-	brokerMkdirTemp = os.MkdirTemp
-	brokerCreateXDG = opencode.CreateRuntimeXDGDirs
-	brokerRemoveAll = os.RemoveAll
+	brokerReapHomes      = opencode.ReapAbandonedHomes
+	brokerMkdirTemp      = os.MkdirTemp
+	brokerCreateXDG      = opencode.CreateRuntimeXDGDirs
+	brokerRemoveAll      = os.RemoveAll
+	brokerNewBrowserShim = opencode.NewBrowserShim
 )
 
 // authBrokerPrefix names every per-flow broker home under the scratch parent.
@@ -29,6 +30,7 @@ const authBrokerPrefix = "acp-go-opencode-auth-broker-"
 // destroyed on every terminal transition of its flow.
 type authBroker struct {
 	home   string
+	shim   *opencode.BrowserShim
 	client opencode.Client
 	log    *slog.Logger
 }
@@ -53,9 +55,18 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 		return nil, fmt.Errorf("create provider auth broker home: %w", err)
 	}
 
+	// A login leg the operator's browser can reach is an uncontrolled grant, not
+	// noise: the native callback listens on this host. The shim shadows every
+	// launcher the broker could exec, and a platform where it cannot refuses the
+	// leg instead.
+	shim, err := brokerNewBrowserShim(parent)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("neutralize provider auth broker browser launch: %w", err), brokerRemoveAll(home))
+	}
+
 	xdg, err := brokerCreateXDG(home)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("create provider auth broker root: %w", err), brokerRemoveAll(home))
+		return nil, errors.Join(fmt.Errorf("create provider auth broker root: %w", err), shim.Remove(), brokerRemoveAll(home))
 	}
 
 	factory := agent.options.clientFactory
@@ -77,6 +88,7 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 		},
 		ExecutablePath:  agent.options.ExecutablePath,
 		LeaseDir:        home,
+		BrowserShim:     shim,
 		Env:             cloneStringMap(agent.options.Env),
 		Pure:            agent.options.Pure,
 		LogLevel:        agent.options.LogLevel,
@@ -86,10 +98,10 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 		SkipVersionGate: true,
 	})
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("start provider auth broker: %w", err), brokerRemoveAll(home))
+		return nil, errors.Join(fmt.Errorf("start provider auth broker: %w", err), shim.Remove(), brokerRemoveAll(home))
 	}
 
-	return &authBroker{home: home, client: client, log: agent.log}, nil
+	return &authBroker{home: home, shim: shim, client: client, log: agent.log}, nil
 }
 
 // destroy terminates the broker process first and removes its directory after.
@@ -106,5 +118,10 @@ func (b *authBroker) destroy(ctx context.Context) {
 
 	if err := brokerRemoveAll(b.home); err != nil {
 		b.log.WarnContext(ctx, "remove provider auth broker home failed", loggableError(err))
+	}
+
+	// The shim outlives the process it shadows, so it goes last.
+	if err := b.shim.Remove(); err != nil {
+		b.log.WarnContext(ctx, "remove provider auth broker browser shim failed", loggableError(err))
 	}
 }

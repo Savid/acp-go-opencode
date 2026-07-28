@@ -105,6 +105,24 @@ terminal transition, including expiry, cancellation, and failure, and a
 superseding `authorize` destroys the abandoned home without installing anything
 from it.
 
+### Neutralized browser launches
+
+The broker never opens a browser on the operator's desktop. Every launcher a
+native login leg could exec — `open`, `xdg-open`, `x-www-browser`,
+`www-browser`, `sensible-browser` — is shadowed by an executable no-op in a
+`0700` directory named `acp-go-opencode-browser-shim-*` under the scratch
+parent, placed ahead of every other entry on the broker's `PATH`. `BROWSER`
+points at the same no-op. Setting `BROWSER` on its own would not be enough: a
+launcher that execs `open` directly never reads it, and OpenCode's login
+callback listens on this host, so a tab that reached it would complete a real
+grant unattended. The directory is removed with the broker home on every
+terminal transition.
+
+On Windows the shadowing is impossible — the system directory resolves ahead of
+every `PATH` entry and the `start` that opens a URL is a shell builtin with no
+image to shadow — so the flow refuses to start rather than opening a browser it
+cannot contain.
+
 ### What the ledger holds
 
 The ledger under `ProviderAuthRoot` is values-free and its content is closed:

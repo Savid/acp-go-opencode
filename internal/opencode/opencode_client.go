@@ -183,7 +183,11 @@ type StartOptions struct {
 	// server starts. It is set for a per-flow broker home, which is the one
 	// server whose home a later startup has to tell apart from an abandoned
 	// one; an empty value writes no lease.
-	LeaseDir                 string
+	LeaseDir string
+	// BrowserShim shadows every browser launcher on the child's PATH for the
+	// lifetime of a login leg. The caller owns the directory; leaving it nil
+	// leaves the child free to open the operator's desktop browser.
+	BrowserShim              *BrowserShim
 	Env                      map[string]string
 	Pure                     bool
 	QuestionTool             bool
@@ -929,6 +933,12 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	}
 
 	nativeEnv := envMapToSlice(env)
+	// The shim has to reach the assembled slice rather than the map above: it
+	// prepends to the inherited PATH instead of replacing it.
+	if options.BrowserShim != nil {
+		nativeEnv = options.BrowserShim.environ(nativeEnv)
+	}
+
 	processCtx, cancel := context.WithCancel(context.Background())
 
 	containmentGenerationRoot, releaseContainmentGeneration, err := openCodePrepareRuntimeGeneration(ctx, options)
