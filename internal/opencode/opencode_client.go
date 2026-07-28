@@ -177,8 +177,13 @@ type StartOptions struct {
 	// on-disk materialization. The root package resolves it (system temp
 	// directory when unset); this package never consults the system temp
 	// directory itself. It is used only as the fallback root when Root is empty.
-	ScratchParent            string
-	ExecutablePath           string
+	ScratchParent  string
+	ExecutablePath string
+	// LeaseDir names the directory a server lease is written into before the
+	// server starts. It is set for a per-flow broker home, which is the one
+	// server whose home a later startup has to tell apart from an abandoned
+	// one; an empty value writes no lease.
+	LeaseDir                 string
 	Env                      map[string]string
 	Pure                     bool
 	QuestionTool             bool
@@ -838,29 +843,40 @@ func normalizedStartOptions(options StartOptions) StartOptions {
 	return options
 }
 
-func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) {
-	options = normalizedStartOptions(options)
-
+// resolveRuntimeXDG resolves the XDG root this server owns, creating it when the
+// caller named a path rather than supplying an existing set.
+func resolveRuntimeXDG(options StartOptions) (XDGDirs, error) {
 	xdg := options.ExistingXDG
 	if xdg.Root == "" {
 		root := options.Root
 		if root == "" {
 			if options.ScratchParent == "" {
-				return nil, fmt.Errorf("OpenCode runtime root is required")
+				return XDGDirs{}, fmt.Errorf("OpenCode runtime root is required")
 			}
 
 			root = filepath.Join(options.ScratchParent, "acp-go-opencode")
 		}
 
-		var err error
-
-		xdg, err = CreateRuntimeXDGDirs(root)
+		created, err := CreateRuntimeXDGDirs(root)
 		if err != nil {
-			return nil, err
+			return XDGDirs{}, err
 		}
+
+		xdg = created
 	}
 
 	if err := ensureXDGDirs(xdg); err != nil {
+		return XDGDirs{}, err
+	}
+
+	return xdg, nil
+}
+
+func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) {
+	options = normalizedStartOptions(options)
+
+	xdg, err := resolveRuntimeXDG(options)
+	if err != nil {
 		return nil, err
 	}
 
@@ -991,6 +1007,11 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		return nil, err
 	}
 
+	lease, leaseErr := leasePendingServer(options, port, username, password, cancel)
+	if leaseErr != nil {
+		return nil, leaseErr
+	}
+
 	spawnStarted := time.Now()
 
 	if startErr := cmd.Start(); startErr != nil {
@@ -1006,6 +1027,10 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	}
 
 	process := cmd.Process
+
+	if leaseErr := leaseStartedServer(options, lease, process, supervisorControl, cancel); leaseErr != nil {
+		return nil, leaseErr
+	}
 
 	runtimeWaiter := newSupervisorWaiterFunc(func() error { return openCodeWaitCommand(cmd) }, true)
 

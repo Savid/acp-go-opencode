@@ -378,7 +378,19 @@ func convertAuthPrompt(providerID string, prompt opencode.ProviderAuthPrompt) (a
 				return authPrompt{}, false, nil
 			}
 
-			converted.Options = append(converted.Options, authPromptOption{Label: label, Value: option.Value, Hint: option.Hint})
+			hint := ""
+
+			if option.Hint != "" {
+				// A hint is display text like every other string beside it, and
+				// an unnormalised unbounded one crosses the boundary carrying
+				// whatever the catalog put there.
+				hint, ok = authDisplayText(option.Hint, authMaxLabelBytes)
+				if !ok {
+					return authPrompt{}, false, nil
+				}
+			}
+
+			converted.Options = append(converted.Options, authPromptOption{Label: label, Value: option.Value, Hint: hint})
 		}
 	default:
 		return authPrompt{}, false, authFailed(authCauseNativeVeto, providerID, "", "")

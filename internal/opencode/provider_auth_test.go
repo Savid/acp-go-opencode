@@ -434,6 +434,92 @@ func TestReapAbandonedHomesRemovesOnlyUnlockedHomes(t *testing.T) {
 	}
 }
 
+// TestReapAbandonedHomesKillsTheOrphanALeaseNames pins the case the locks read
+// backwards: a crashed adapter leaves its supervisor pair holding them, so the
+// home looks live while the server inside it is an orphan still holding a
+// pending flow.
+func TestReapAbandonedHomesKillsTheOrphanALeaseNames(t *testing.T) {
+	restoreLeaseHooks(t)
+
+	parent := t.TempDir()
+
+	orphaned := filepath.Join(parent, "acp-go-opencode-auth-broker-orphaned")
+	if err := os.MkdirAll(orphaned, 0o700); err != nil {
+		t.Fatalf("create orphaned home: %v", err)
+	}
+
+	if err := writeBrokerLease(orphaned, BrokerLease{
+		PID: 8, ProcessStart: "eight", Port: 1234, IdentityHash: "hash",
+		OwnerPID: 7, OwnerStart: "seven",
+	}); err != nil {
+		t.Fatalf("write lease: %v", err)
+	}
+
+	// The orphan's own locks are still held, exactly as a crashed adapter
+	// leaves them.
+	held, err := reapAcquire(orphaned)
+	if err != nil {
+		t.Fatalf("hold the orphaned home: %v", err)
+	}
+
+	defer func() { _ = held.Release() }()
+
+	live := filepath.Join(parent, "acp-go-opencode-auth-broker-live")
+	if err := os.MkdirAll(live, 0o700); err != nil {
+		t.Fatalf("create live home: %v", err)
+	}
+
+	if err := writeBrokerLease(live, newBrokerLease(4321, "hash")); err != nil {
+		t.Fatalf("write live lease: %v", err)
+	}
+
+	alive := true
+	realStartTime := leaseStartTime
+
+	leaseStartTime = func(pid int) (string, error) {
+		if pid == 8 && alive {
+			return "eight", nil
+		}
+
+		if pid == 8 || pid == 7 {
+			return "", os.ErrNotExist
+		}
+
+		return realStartTime(pid)
+	}
+
+	killed := 0
+
+	leaseSignalGroup = func(pid int, _ bool) error {
+		if pid != 8 {
+			t.Fatalf("the reaper signalled %d", pid)
+		}
+
+		killed++
+		alive = false
+
+		return nil
+	}
+
+	if err := ReapAbandonedHomes(parent, "acp-go-opencode-auth-broker-"); err != nil {
+		t.Fatalf("ReapAbandonedHomes: %v", err)
+	}
+
+	if killed != 1 {
+		t.Fatalf("the orphan was signalled %d times", killed)
+	}
+
+	if _, err := os.Stat(orphaned); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the orphaned home survived the sweep")
+	}
+
+	// A home this process still owns is a concurrent pending flow, not an
+	// orphan, and killing it would terminate a live login.
+	if _, err := os.Stat(live); err != nil {
+		t.Fatal("a live owner's home was reclaimed")
+	}
+}
+
 func TestReapAbandonedHomesReportsFailures(t *testing.T) {
 	if err := ReapAbandonedHomes(filepath.Join(t.TempDir(), "absent"), "prefix-"); err == nil {
 		t.Fatal("expected a scan failure")
@@ -451,5 +537,27 @@ func TestReapAbandonedHomesReportsFailures(t *testing.T) {
 
 	if err := ReapAbandonedHomes(parent, "prefix-"); err == nil {
 		t.Fatal("expected a removal failure")
+	}
+
+	reapRemoveAll = originalRemove
+
+	// An orphan that survived the ladder is reported, and its home is left
+	// where it is so the next startup tries again.
+	originalLease := reapLease
+	reapLease = func(BrokerLease) (bool, error) { return false, errors.New("orphan survived") }
+
+	t.Cleanup(func() { reapLease = originalLease })
+
+	home := filepath.Join(parent, "prefix-one")
+	if err := writeBrokerLease(home, BrokerLease{PID: 8}); err != nil {
+		t.Fatalf("write lease: %v", err)
+	}
+
+	if err := ReapAbandonedHomes(parent, "prefix-"); err == nil {
+		t.Fatal("expected a reap failure")
+	}
+
+	if _, err := os.Stat(home); err != nil {
+		t.Fatal("a home whose orphan survived was reclaimed")
 	}
 }

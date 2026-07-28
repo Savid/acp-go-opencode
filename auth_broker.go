@@ -76,6 +76,7 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 			)
 		},
 		ExecutablePath:  agent.options.ExecutablePath,
+		LeaseDir:        home,
 		Env:             cloneStringMap(agent.options.Env),
 		Pure:            agent.options.Pure,
 		LogLevel:        agent.options.LogLevel,

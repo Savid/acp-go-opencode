@@ -43,11 +43,19 @@ func newTestLedger(t *testing.T) *authLedger {
 }
 
 func TestNewAuthLedgerValidatesTheConfiguredRoot(t *testing.T) {
-	root := t.TempDir()
+	// The configured root is a pre-existing directory whose mode the operator
+	// chose; the ledger under it is only as private as the directory holding
+	// it, so the root is restricted too rather than only its leaf.
+	root := filepath.Join(t.TempDir(), "root")
+	require.NoError(t, os.Mkdir(root, 0o755))
 
 	ledger, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: "/home/opencode"})
 	require.NoError(t, err)
 	require.Equal(t, filepath.Join(root, authLedgerVendorDir, authLedgerHomeKey("/home/opencode"), authLedgerLeafDir), ledger.dir)
+
+	rootInfo, err := os.Stat(root)
+	require.NoError(t, err)
+	require.Equal(t, fs.FileMode(authLedgerDirMode), rootInfo.Mode().Perm())
 
 	info, err := os.Stat(ledger.dir)
 	require.NoError(t, err)
@@ -72,6 +80,32 @@ func TestNewAuthLedgerRejectsUnusableRoots(t *testing.T) {
 			t.Helper()
 
 			ledgerChmod = func(string, fs.FileMode) error { return failure }
+			t.Cleanup(func() { ledgerChmod = os.Chmod })
+		}},
+		// The configured root and the leaf under it are prepared separately, so
+		// a failure that only the leaf reaches is its own case.
+		{name: "leaf mkdir fails", setup: func(t *testing.T) {
+			t.Helper()
+
+			ledgerMkdirAll = func(path string, mode fs.FileMode) error {
+				if filepath.Base(path) == authLedgerLeafDir {
+					return failure
+				}
+
+				return os.MkdirAll(path, mode)
+			}
+			t.Cleanup(func() { ledgerMkdirAll = os.MkdirAll })
+		}},
+		{name: "leaf chmod fails", setup: func(t *testing.T) {
+			t.Helper()
+
+			ledgerChmod = func(path string, mode fs.FileMode) error {
+				if filepath.Base(path) == authLedgerLeafDir {
+					return failure
+				}
+
+				return os.Chmod(path, mode)
+			}
 			t.Cleanup(func() { ledgerChmod = os.Chmod })
 		}},
 		{name: "stat fails", setup: func(t *testing.T) {

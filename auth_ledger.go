@@ -91,6 +91,17 @@ func authLedgerRootConfigured(options Options) bool {
 	return options.ProviderAuthRoot != ""
 }
 
+// validateProviderAuthRoot fails an agent whose ledger root is relative. It is
+// a configuration failure rather than a silently unadvertised surface, and it
+// joins the same construction verdict a relative handoff root reaches.
+func validateProviderAuthRoot(options Options) error {
+	if options.ProviderAuthRoot == "" || filepath.IsAbs(options.ProviderAuthRoot) {
+		return nil
+	}
+
+	return fmt.Errorf("ProviderAuthRoot must be an absolute path, got %q", options.ProviderAuthRoot)
+}
+
 // newAuthLedger resolves and validates the configured durable root. A root that
 // does not exist and cannot be created, is not a directory, or is not writable
 // leaves the provider-auth surface unadvertised, exactly as an unset one does.
@@ -98,6 +109,18 @@ func newAuthLedger(options Options) (*authLedger, error) {
 	root := options.ProviderAuthRoot
 	if !filepath.IsAbs(root) {
 		return nil, errors.New("provider auth root must be an absolute path")
+	}
+
+	// The configured root is restricted in its own right, not merely the leaf
+	// under it: an operator-supplied directory that already exists keeps
+	// whatever mode it was created with, and the ledger under it is only as
+	// private as the directory holding it.
+	if err := ledgerMkdirAll(root, authLedgerDirMode); err != nil {
+		return nil, fmt.Errorf("create provider auth root: %w", err)
+	}
+
+	if err := ledgerChmod(root, authLedgerDirMode); err != nil {
+		return nil, fmt.Errorf("restrict provider auth root: %w", err)
 	}
 
 	dir := filepath.Join(root, authLedgerVendorDir, authLedgerHomeKey(options.Home), authLedgerLeafDir)

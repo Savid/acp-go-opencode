@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -157,6 +158,89 @@ func TestAuthorizeReplaysARepeatedRequestID(t *testing.T) {
 	require.Len(t, fixture.brokerNode.authorizeCalls, 1)
 }
 
+// TestAuthorizeReplaysARepeatedRequestIDAfterTheFlowTerminalized pins the whole
+// point of the idempotency key: the repeat that matters is the one a caller
+// sends after the first answer was lost, which is exactly when the flow it
+// names has already completed. Superseding there would drive a fresh native
+// login and destroy the credential the caller had already earned.
+func TestAuthorizeReplaysARepeatedRequestIDAfterTheFlowTerminalized(t *testing.T) {
+	fixture := newAuthFixture(t)
+
+	first := fixture.authorize(t, nil)
+	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
+		"xai": {Type: opencode.ProviderAuthTypeOAuth, Refresh: "r", Access: "a", Expires: 1783945909169},
+	}
+
+	_, err := fixture.callback(t, first.FlowID, "0", "")
+	require.NoError(t, err)
+	require.Equal(t, authStateAuthenticated, fixture.status(t, first.FlowID).State)
+
+	before, _, err := fixture.broker.ledger.read("xai")
+	require.NoError(t, err)
+
+	installs := len(fixture.runtime.setAuthCalls)
+
+	replayed := fixture.authorize(t, nil)
+	require.Equal(t, first, replayed)
+
+	// No supersede, no second native mint, no second install, and no ledger
+	// revision: the repeat consumed nothing the first call had earned.
+	require.Len(t, fixture.brokerNode.authorizeCalls, 1)
+	require.Len(t, fixture.runtime.setAuthCalls, installs)
+
+	after, _, err := fixture.broker.ledger.read("xai")
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+
+	require.Equal(t, authStateAuthenticated, fixture.status(t, first.FlowID).State)
+}
+
+// TestAuthorizeStopsReplayingOnceTheSessionCloses pins the other half: the
+// record lives exactly as long as the session that owns it.
+func TestAuthorizeStopsReplayingOnceTheSessionCloses(t *testing.T) {
+	fixture := newAuthFixture(t)
+
+	first := fixture.authorize(t, nil)
+
+	fixture.broker.closeSession(context.Background(), fixture.session.id)
+
+	second := fixture.authorize(t, nil)
+	require.NotEqual(t, first.FlowID, second.FlowID)
+}
+
+// TestAuthorizeMintFailureAddressesTheFlowItNames pins the flowId a failed mint
+// returns against a record a caller can actually address, and pins that the
+// same key retries rather than replaying a presentation that was never
+// published.
+func TestAuthorizeMintFailureAddressesTheFlowItNames(t *testing.T) {
+	fixture := newAuthFixture(t)
+	fixture.brokerNode.authorizeErr = errors.New("native authorize refused")
+
+	_, err := fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
+	requireAuthFailure(t, err, authCauseTransport)
+
+	var reqErr *acp.RequestError
+
+	require.ErrorAs(t, err, &reqErr)
+
+	data, ok := reqErr.Data.(map[string]any)
+	require.True(t, ok)
+
+	flowID, ok := data[authFieldFlowID].(string)
+	require.True(t, ok)
+	require.NotEmpty(t, flowID)
+
+	status := fixture.status(t, flowID)
+	require.Equal(t, authStateFailed, status.State)
+	require.Equal(t, authReasonTransport, status.Reason)
+
+	fixture.brokerNode.authorizeErr = nil
+
+	retried := fixture.authorize(t, nil)
+	require.NotEqual(t, flowID, retried.FlowID)
+	require.NotEmpty(t, retried.URL)
+}
+
 func TestAuthorizeSupersedesTheEarlierFlow(t *testing.T) {
 	fixture := newAuthFixture(t)
 
@@ -187,10 +271,6 @@ func TestAuthorizeSupersedeIgnoresATerminalFlow(t *testing.T) {
 		authFieldFlowID:     first.FlowID,
 	}))
 	require.NoError(t, err)
-
-	fixture.broker.mu.Lock()
-	fixture.broker.flows[authFlowKey{sessionID: fixture.session.id, providerID: "xai"}] = fixture.broker.byID[first.FlowID]
-	fixture.broker.mu.Unlock()
 
 	second := fixture.authorize(t, map[string]any{authFieldAuthorizeRequestID: "req-2"})
 	require.NotEqual(t, first.FlowID, second.FlowID)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -121,6 +122,30 @@ func TestNewProviderAuthRequiresRootAndHome(t *testing.T) {
 			require.Nil(t, agent.providerAuth)
 		})
 	}
+}
+
+// TestRelativeProviderAuthRootIsAConstructionVerdict pins a relative root as a
+// configuration failure rather than a warning: an operator who supplied one
+// asked for the surface, and silently dropping it leaves the agent running
+// against options that never validated.
+func TestRelativeProviderAuthRootIsAConstructionVerdict(t *testing.T) {
+	require.NoError(t, validateProviderAuthRoot(Options{}))
+	require.NoError(t, validateProviderAuthRoot(Options{ProviderAuthRoot: t.TempDir()}))
+	require.Error(t, validateProviderAuthRoot(Options{ProviderAuthRoot: filepath.Join("relative", "ledger")}))
+
+	options := []Option{
+		WithProviderAuthRoot("relative"),
+		WithHome(t.TempDir()),
+		WithLogger(slog.New(slog.DiscardHandler)),
+	}
+
+	_, err := NewAgent(options...).Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+	})
+	require.Error(t, err)
+
+	_, err = NewAgent(options...).NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	require.ErrorContains(t, err, "ProviderAuthRoot must be an absolute path")
 }
 
 func TestInitializeAdvertisesProviderAuthOnlyWhenEnabled(t *testing.T) {

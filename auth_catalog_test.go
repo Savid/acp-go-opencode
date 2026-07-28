@@ -216,6 +216,18 @@ func TestBuildAuthPromptsOmitsMethodsWithUnpublishableText(t *testing.T) {
 				{Label: strings.Repeat("l", authMaxLabelBytes+1), Value: "v"},
 			}},
 		}},
+		// A hint is display text like every string beside it, and it crosses
+		// the boundary through the same path rather than raw.
+		{name: "option hint over bound", prompts: []opencode.ProviderAuthPrompt{
+			{Type: "select", Key: "a", Message: "m", Options: []opencode.ProviderAuthPromptOption{
+				{Label: "l", Value: "v", Hint: strings.Repeat("h", authMaxLabelBytes+1)},
+			}},
+		}},
+		{name: "option hint carrying a bidi override", prompts: []opencode.ProviderAuthPrompt{
+			{Type: "select", Key: "a", Message: "m", Options: []opencode.ProviderAuthPromptOption{
+				{Label: "l", Value: "v", Hint: "a\u202Eb"},
+			}},
+		}},
 	}
 
 	for _, testCase := range cases {
@@ -242,6 +254,8 @@ func TestBuildAuthPromptsKeepsAWellFormedSchema(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, prompts, 2)
 	require.Equal(t, "cloud", prompts[0].Options[0].Value)
+	require.Equal(t, "hosted", prompts[0].Options[0].Hint)
+	require.Empty(t, prompts[0].Options[1].Hint)
 	require.Equal(t, "myorg-myaccount", prompts[1].Placeholder)
 	require.Equal(t, &authPromptWhen{Key: "deploymentType", Op: "eq", Value: "cloud"}, prompts[1].When)
 

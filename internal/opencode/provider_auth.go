@@ -346,14 +346,17 @@ func IsRateLimited(err error) bool {
 	return isHTTPStatus(err, http.StatusTooManyRequests)
 }
 
-// ReapAbandonedHomes removes every prefixed home under parent whose runtime
-// locks are free. A crashed adapter otherwise leaks an orphan server still
-// holding a pending flow, and a home a live server still owns keeps its locks
-// and is left alone.
+// ReapAbandonedHomes reclaims every prefixed home under parent that no live
+// adapter owns, terminating the orphan server each one still holds. The locks
+// are held by the supervisor pair rather than by the adapter, so a crashed
+// adapter leaves them held: reading them as "a live owner" is what would let an
+// orphan server keep a pending flow — and, after native completion, a live
+// refresh token in a directory no ledger entry names.
 var (
 	reapReadDir   = os.ReadDir
 	reapAcquire   = homelock.Acquire
 	reapRemoveAll = os.RemoveAll
+	reapLease     = reapBrokerLease
 )
 
 func ReapAbandonedHomes(parent string, prefix string) error {
@@ -371,13 +374,43 @@ func ReapAbandonedHomes(parent string, prefix string) error {
 
 		home := filepath.Join(parent, entry.Name())
 
-		lock, err := reapAcquire(home)
+		removable, err := reapHome(home)
 		if err != nil {
-			continue
+			errs = append(errs, err)
 		}
 
-		errs = append(errs, lock.Release(), reapRemoveAll(home))
+		if removable {
+			errs = append(errs, reapRemoveAll(home))
+		}
 	}
 
 	return errors.Join(errs...)
+}
+
+// reapHome answers for one candidate home. A home carrying a lease is decided
+// by the lease alone, because that is the only record that distinguishes the
+// adapter that owns it from the server it started. A home carrying none never
+// got as far as starting a server, and free locks are enough to reclaim it.
+func reapHome(home string) (bool, error) {
+	if lease, leased := readBrokerLease(home); leased {
+		return reapLease(lease)
+	}
+
+	lock, free := acquireForReap(home)
+	if !free {
+		return false, nil
+	}
+
+	return true, lock.Release()
+}
+
+// acquireForReap reports whether nothing holds the home's locks. A busy lock is
+// an answer about the home rather than a failure to report.
+func acquireForReap(home string) (*homelock.Lock, bool) {
+	lock, err := reapAcquire(home)
+	if err != nil {
+		return nil, false
+	}
+
+	return lock, true
 }

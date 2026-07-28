@@ -85,6 +85,9 @@ type authFlow struct {
 	reason              string
 	expiresAt           time.Time
 	credentialExpiresAt int64
+	// presented reports whether the mint published this record's presentation.
+	// A record that never reached one has no verbatim answer to replay.
+	presented bool
 
 	broker *authBroker
 
@@ -214,18 +217,22 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 		disarm:             make(chan struct{}),
 	}
 
-	presentation, err := p.mintPresentation(ctx, flow)
-	if err != nil {
-		flow.destroyBroker(ctx)
-
-		return nil, err
-	}
-
-	flow.presentation = presentation
-
+	// The flow is registered against the ledger entry that already names it, so
+	// the flowId every later answer carries — a mint failure's included —
+	// addresses a real record.
 	p.mu.Lock()
 	p.flows[key] = flow
 	p.byID[flowID] = flow
+	p.mu.Unlock()
+
+	presentation, cause := p.mintPresentation(ctx, flow)
+	if cause != "" {
+		return nil, p.fail(flow, cause, false)
+	}
+
+	p.mu.Lock()
+	flow.presentation = presentation
+	flow.presented = true
 	p.mu.Unlock()
 
 	p.armCompleter(flow)
@@ -284,13 +291,17 @@ func decodeAuthorizeRequest(fields map[string]json.RawMessage) (authorizeRequest
 
 // replayAuthorize answers a repeated idempotency key verbatim from memory: no
 // supersede, no completer disarm, no destruction of flow or broker state, and
-// no native call.
+// no native call. The record it answers from survives every terminal
+// transition and is dropped only when the session closes, so a repeat after
+// completion returns what the first call returned instead of driving a second
+// login. A record whose mint never published a presentation has nothing to
+// replay.
 func (p *providerAuth) replayAuthorize(key authFlowKey, requestID string) (authAuthorizeResult, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	flow, ok := p.flows[key]
-	if !ok || flow.authorizeRequestID != requestID {
+	if !ok || !flow.presented || flow.authorizeRequestID != requestID {
 		return authAuthorizeResult{}, false
 	}
 
@@ -318,8 +329,9 @@ func (p *providerAuth) resolveMethod(request authorizeRequest) (authCatalogMetho
 
 // mintPresentation performs the native mint for an oauth method and builds the
 // wire presentation. An api method has nothing to mint: its value is submitted
-// through callback and applied natively there.
-func (p *providerAuth) mintPresentation(ctx context.Context, flow *authFlow) (authAuthorizeResult, error) {
+// through callback and applied natively there. A non-empty cause is the leg's
+// failure, and the flow it names owns the transition and the broker teardown.
+func (p *providerAuth) mintPresentation(ctx context.Context, flow *authFlow) (authAuthorizeResult, string) {
 	result := authAuthorizeResult{
 		FlowID:        flow.id,
 		FlowExpiresAt: flow.expiresAt.UnixMilli(),
@@ -329,36 +341,38 @@ func (p *providerAuth) mintPresentation(ctx context.Context, flow *authFlow) (au
 	if flow.method.Type == authMethodTypeAPI {
 		result.Interaction = authInteractionSecret
 
-		return result, nil
+		return result, ""
 	}
 
 	broker, err := p.startBroker(ctx)
 	if err != nil {
-		return authAuthorizeResult{}, authFailed(authCauseProcess, flow.providerID, flow.method.ID, flow.id)
+		return authAuthorizeResult{}, authCauseProcess
 	}
 
+	p.mu.Lock()
 	flow.broker = broker
+	p.mu.Unlock()
 
 	callCtx, cancel := context.WithTimeout(ctx, authNativeCallTimeout)
 	defer cancel()
 
 	authorization, err := broker.client.ProviderAuthorize(callCtx, flow.providerID, flow.method.Index, flow.inputs)
 	if err != nil {
-		return authAuthorizeResult{}, authFailed(authNativeCause(err), flow.providerID, flow.method.ID, flow.id)
+		return authAuthorizeResult{}, authNativeCause(err)
 	}
 
 	if authLoopbackHost(authorization.URL) {
-		return authAuthorizeResult{}, authFailed(authCauseUnsupportedVariant, flow.providerID, flow.method.ID, flow.id)
+		return authAuthorizeResult{}, authCauseUnsupportedVariant
 	}
 
 	authorizeURL, ok := authDisplayURL(authorization.URL)
 	if !ok {
-		return authAuthorizeResult{}, authFailed(authCauseNativeVeto, flow.providerID, flow.method.ID, flow.id)
+		return authAuthorizeResult{}, authCauseNativeVeto
 	}
 
 	message, ok := authDisplayText(authorization.Instructions, authMaxMessageBytes)
 	if !ok {
-		return authAuthorizeResult{}, authFailed(authCauseNativeVeto, flow.providerID, flow.method.ID, flow.id)
+		return authAuthorizeResult{}, authCauseNativeVeto
 	}
 
 	result.URL = authorizeURL
@@ -375,7 +389,7 @@ func (p *providerAuth) mintPresentation(ctx context.Context, flow *authFlow) (au
 		result.Interaction = authInteractionWait
 	}
 
-	return result, nil
+	return result, ""
 }
 
 // authUserCodeFromURL reads the code out of the one machine-readable place the
@@ -428,7 +442,6 @@ func (p *providerAuth) expire(flow *authFlow) {
 	flow.reason = authReasonDeadline
 	broker := flow.takeBroker()
 
-	delete(p.flows, authFlowKey{sessionID: flow.sessionID, providerID: flow.providerID})
 	p.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
@@ -439,12 +452,14 @@ func (p *providerAuth) expire(flow *authFlow) {
 
 // supersede terminalizes the flow a new authorize replaces. The abandoned
 // broker home is destroyed without installing anything from it, so a stale
-// native approval completes into a store that no longer exists.
+// native approval completes into a store that no longer exists. A flow that
+// already terminalized was not superseded by anything and keeps both its record
+// and its id.
 func (p *providerAuth) supersede(key authFlowKey, reason string) {
 	p.mu.Lock()
 
 	flow, ok := p.flows[key]
-	if !ok {
+	if !ok || authTerminal(flow.state) {
 		p.mu.Unlock()
 
 		return
@@ -452,12 +467,6 @@ func (p *providerAuth) supersede(key authFlowKey, reason string) {
 
 	delete(p.flows, key)
 	delete(p.byID, flow.id)
-
-	if authTerminal(flow.state) {
-		p.mu.Unlock()
-
-		return
-	}
 
 	flow.state = authStateCancelled
 	flow.reason = reason
@@ -679,7 +688,6 @@ func (p *providerAuth) terminalize(flow *authFlow, state string, reason string, 
 	flow.credentialExpiresAt = credentialExpiresAt
 
 	flow.stopCompleter()
-	delete(p.flows, authFlowKey{sessionID: flow.sessionID, providerID: flow.providerID})
 }
 
 // addressFlow resolves a flowId a caller supplied. A missing, unknown,
@@ -792,7 +800,6 @@ func (p *providerAuth) cancel(ctx context.Context, params json.RawMessage) (any,
 	broker := flow.takeBroker()
 
 	flow.stopCompleter()
-	delete(p.flows, authFlowKey{sessionID: flow.sessionID, providerID: flow.providerID})
 	p.mu.Unlock()
 
 	broker.destroy(ctx)
@@ -907,7 +914,8 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 }
 
 // closeSession cancels every pending flow the session owns, terminalizing each
-// as cancelled/session_closed and destroying its broker home. It runs before
+// as cancelled/session_closed and destroying its broker home, and drops every
+// record the session could still replay an idempotency key from. It runs before
 // the native interrupt, so a flow is never abandoned to a process already being
 // torn down.
 func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId) {
