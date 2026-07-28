@@ -209,15 +209,127 @@ func TestAuthorizeStopsReplayingOnceTheSessionCloses(t *testing.T) {
 }
 
 // TestAuthorizeMintFailureAddressesTheFlowItNames pins the flowId a failed mint
-// returns against a record a caller can actually address, and pins that the
-// same key retries rather than replaying a presentation that was never
-// published.
+// returns against a record a caller can actually address, and pins that a
+// different key retries.
 func TestAuthorizeMintFailureAddressesTheFlowItNames(t *testing.T) {
 	fixture := newAuthFixture(t)
 	fixture.brokerNode.authorizeErr = errors.New("native authorize refused")
 
 	_, err := fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
 	requireAuthFailure(t, err, authCauseTransport)
+
+	flowID := authFailureFlowID(t, err)
+
+	status := fixture.status(t, flowID)
+	require.Equal(t, authStateFailed, status.State)
+	require.Equal(t, authReasonTransport, status.Reason)
+
+	fixture.brokerNode.authorizeErr = nil
+
+	retried := fixture.authorize(t, map[string]any{authFieldAuthorizeRequestID: "req-2"})
+	require.NotEqual(t, flowID, retried.FlowID)
+	require.NotEmpty(t, retried.URL)
+}
+
+// TestAuthorizeReplaysAFailedMintVerbatim pins the half of the idempotency rule
+// a failed mint is most likely to break: a repeat of the same key must answer
+// with the same flowId and the same cause rather than drive a second native
+// login, which would both mint a second flow at the provider and hand a caller
+// a different retryability than the call it repeats.
+func TestAuthorizeReplaysAFailedMintVerbatim(t *testing.T) {
+	fixture := newAuthFixture(t)
+	fixture.brokerNode.authorizeErr = &opencode.HTTPError{StatusCode: http.StatusBadRequest}
+
+	_, first := fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
+	requireAuthFailure(t, first, authCauseProviderRefused)
+
+	fixture.brokerNode.authorizeErr = nil
+
+	_, second := fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
+	requireAuthFailure(t, second, authCauseProviderRefused)
+
+	require.Equal(t, authFailureFlowID(t, first), authFailureFlowID(t, second))
+	require.Len(t, fixture.brokerNode.authorizeCalls, 1)
+	require.False(t, authFailureRetryable(t, second))
+}
+
+// TestAuthorizeReplayWaitsOutAMintStillUnderWay pins that a repeat arriving
+// while the first mint is still running answers that mint's outcome instead of
+// racing past it into a second native login.
+func TestAuthorizeReplayWaitsOutAMintStillUnderWay(t *testing.T) {
+	fixture := newAuthFixture(t)
+
+	release := make(chan struct{})
+	authorization := fixture.brokerNode.authorization
+
+	fixture.brokerNode.authorizeFunc = func(string, int, map[string]string) (opencode.ProviderAuthorization, error) {
+		<-release
+
+		return authorization, nil
+	}
+
+	params := fixture.authorizeParams(t, nil)
+	minted := make(chan any, 1)
+	replayed := make(chan any, 1)
+
+	go func() {
+		result, _ := fixture.broker.authorize(context.Background(), params)
+		minted <- result
+	}()
+
+	// The repeat is registered against a flow whose mint has not settled, so it
+	// blocks on that mint rather than starting one of its own.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+
+		result, _ := fixture.broker.authorize(context.Background(), params)
+		replayed <- result
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	close(release)
+
+	require.Equal(t, <-minted, <-replayed)
+	require.Len(t, fixture.brokerNode.authorizeCalls, 1)
+}
+
+// TestAuthorizeReplayAbandonsAMintOnCallerCancellation pins that the repeat's
+// own context, not the mint, bounds how long it waits.
+func TestAuthorizeReplayAbandonsAMintOnCallerCancellation(t *testing.T) {
+	fixture := newAuthFixture(t)
+
+	release := make(chan struct{})
+	authorization := fixture.brokerNode.authorization
+
+	fixture.brokerNode.authorizeFunc = func(string, int, map[string]string) (opencode.ProviderAuthorization, error) {
+		<-release
+
+		return authorization, nil
+	}
+
+	params := fixture.authorizeParams(t, nil)
+	minted := make(chan struct{})
+
+	go func() {
+		defer close(minted)
+
+		_, _ = fixture.broker.authorize(context.Background(), params)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := fixture.broker.authorize(ctx, params)
+	requireAuthFailure(t, err, authCauseTransport)
+
+	close(release)
+	<-minted
+}
+
+func authFailureData(t *testing.T, err error) map[string]any {
+	t.Helper()
 
 	var reqErr *acp.RequestError
 
@@ -226,19 +338,26 @@ func TestAuthorizeMintFailureAddressesTheFlowItNames(t *testing.T) {
 	data, ok := reqErr.Data.(map[string]any)
 	require.True(t, ok)
 
-	flowID, ok := data[authFieldFlowID].(string)
+	return data
+}
+
+func authFailureFlowID(t *testing.T, err error) string {
+	t.Helper()
+
+	flowID, ok := authFailureData(t, err)[authFieldFlowID].(string)
 	require.True(t, ok)
 	require.NotEmpty(t, flowID)
 
-	status := fixture.status(t, flowID)
-	require.Equal(t, authStateFailed, status.State)
-	require.Equal(t, authReasonTransport, status.Reason)
+	return flowID
+}
 
-	fixture.brokerNode.authorizeErr = nil
+func authFailureRetryable(t *testing.T, err error) bool {
+	t.Helper()
 
-	retried := fixture.authorize(t, nil)
-	require.NotEqual(t, flowID, retried.FlowID)
-	require.NotEmpty(t, retried.URL)
+	retryable, ok := authFailureData(t, err)["retryable"].(bool)
+	require.True(t, ok)
+
+	return retryable
 }
 
 func TestAuthorizeSupersedesTheEarlierFlow(t *testing.T) {
@@ -638,6 +757,122 @@ func TestCallbackFailsWhenTheRuntimeIsGone(t *testing.T) {
 
 	_, err := fixture.callback(t, flow.FlowID, "0", "")
 	requireAuthFailure(t, err, authCauseTransport)
+}
+
+// TestCallbackOutlivingCancelDoesNotReTerminalizeTheFlow pins the one leg on
+// this surface that can answer after the flow it addresses is closed. The
+// native callback route blocks until the provider settles and runs on a client
+// with no request timeout, so cancel is what unblocks it — and the answer that
+// then arrives must not overwrite the owner's own terminal transition, nor
+// install anything into the durable store.
+func TestCallbackOutlivingCancelDoesNotReTerminalizeTheFlow(t *testing.T) {
+	cases := []struct {
+		name    string
+		native  error
+		expects string
+	}{
+		{name: "native callback fails", native: errors.New("http"), expects: authCauseFlowCancelled},
+		{name: "native callback settles", native: nil, expects: authCauseFlowCancelled},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newAuthFixture(t)
+			flow := fixture.authorize(t, nil)
+			fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
+				"xai": {Type: opencode.ProviderAuthTypeOAuth, Refresh: "r", Access: "a"},
+			}
+
+			cancelled := make(chan struct{})
+			fixture.brokerNode.authCallbackFunc = func(string, int, string) error {
+				<-cancelled
+
+				return testCase.native
+			}
+
+			answered := make(chan error, 1)
+
+			go func() {
+				_, err := fixture.broker.callback(context.Background(), mustJSON(t, map[string]any{
+					authFieldSessionID:  string(fixture.session.id),
+					authFieldProviderID: "xai",
+					authFieldMethod:     "0",
+					authFieldFlowID:     flow.FlowID,
+					authFieldInput:      "",
+				}))
+				answered <- err
+			}()
+
+			time.Sleep(50 * time.Millisecond)
+
+			_, err := fixture.broker.cancel(context.Background(), mustJSON(t, map[string]any{
+				authFieldSessionID:  string(fixture.session.id),
+				authFieldProviderID: "xai",
+				authFieldFlowID:     flow.FlowID,
+			}))
+			require.NoError(t, err)
+			close(cancelled)
+
+			requireAuthFailure(t, <-answered, testCase.expects)
+
+			status := fixture.status(t, flow.FlowID)
+			require.Equal(t, authStateCancelled, status.State)
+			require.Equal(t, authReasonOwnerCancel, status.Reason)
+			require.Empty(t, fixture.runtime.setAuthCalls)
+		})
+	}
+}
+
+// TestTerminalizeKeepsTheFirstTerminalTransition pins the record itself: a
+// flow has one terminal transition, and a later one is dropped rather than
+// overwriting the owner's.
+func TestTerminalizeKeepsTheFirstTerminalTransition(t *testing.T) {
+	fixture := newAuthFixture(t)
+	flow := fixture.authorize(t, nil)
+	record := fixture.broker.byID[flow.FlowID]
+
+	fixture.broker.terminalize(record, authStateCancelled, authReasonOwnerCancel, 0)
+	fixture.broker.terminalize(record, authStateFailed, authReasonTransport, 0)
+
+	status := fixture.status(t, flow.FlowID)
+	require.Equal(t, authStateCancelled, status.State)
+	require.Equal(t, authReasonOwnerCancel, status.Reason)
+}
+
+// TestCallbackOutlivingCompletionAnswersFlowState pins the other terminal
+// state a leg can find on its return: a flow the status poll already completed
+// is not a cancelled one, and the two answers stay distinguishable.
+func TestCallbackOutlivingCompletionAnswersFlowState(t *testing.T) {
+	fixture := newAuthFixture(t)
+	flow := fixture.authorize(t, nil)
+
+	settled := make(chan struct{})
+	fixture.brokerNode.authCallbackFunc = func(string, int, string) error {
+		<-settled
+
+		return nil
+	}
+
+	answered := make(chan error, 1)
+
+	go func() {
+		_, err := fixture.broker.callback(context.Background(), mustJSON(t, map[string]any{
+			authFieldSessionID:  string(fixture.session.id),
+			authFieldProviderID: "xai",
+			authFieldMethod:     "0",
+			authFieldFlowID:     flow.FlowID,
+			authFieldInput:      "",
+		}))
+		answered <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	fixture.broker.terminalize(fixture.broker.byID[flow.FlowID], authStateAuthenticated, "", 0)
+	close(settled)
+
+	requireAuthFailure(t, <-answered, authCauseFlowState)
+	require.Equal(t, authStateAuthenticated, fixture.status(t, flow.FlowID).State)
 }
 
 func TestCallbackFailsWhenTheBrokerIsAlreadyGone(t *testing.T) {

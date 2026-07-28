@@ -31,12 +31,14 @@ const (
 
 // Native providers whose prompt answers reach a hostname.
 const (
-	authProviderSnowflake = "snowflake-cortex"
-	authProviderAzure     = "azure"
-	authProviderCopilot   = "github-copilot"
-	authProviderGitLab    = "gitlab"
-	authPromptKeyAccount  = "account"
-	authSnowflakeHost     = "snowflakecomputing.com"
+	authProviderSnowflake   = "snowflake-cortex"
+	authProviderAzure       = "azure"
+	authProviderCopilot     = "github-copilot"
+	authProviderGitLab      = "gitlab"
+	authProviderOpenAI      = "openai"
+	authPromptKeyAccount    = "account"
+	authPromptKeyEnterprise = "enterpriseUrl"
+	authSnowflakeHost       = "snowflakecomputing.com"
 )
 
 // authDefaultAPIMethodID is the reserved id of the adapter-synthesized default
@@ -121,13 +123,28 @@ type authHostFormingRule struct {
 	Domains []string
 }
 
+// authLoopbackMethods names every native login method whose completion lands on
+// a loopback listener the harness opens inside the broker home, keyed by
+// provider and by the native method label that identifies it.
+//
+// Such a method is omitted from the catalog rather than refused at authorize.
+// The harness binds that listener while it mints, and it binds it on the
+// wildcard address rather than on loopback, so refusing after the mint has
+// already opened a port on every interface of the worker host: the only place
+// the adapter can hold the broker's bind-loopback-only property is before the
+// native call exists to make. Each entry is a per-provider constant recorded in
+// the family registry, on the same terms as the host-forming allowlists below.
+var authLoopbackMethods = map[string]map[string]struct{}{
+	authProviderOpenAI: {"ChatGPT Pro/Plus (browser)": {}},
+}
+
 // authHostFormingRules names every native prompt whose value is interpolated
 // into a URL or a hostname, per provider. A prompt key absent from a provider's
 // map is an ordinary text answer.
 var authHostFormingRules = map[string]map[string]authHostFormingRule{
 	authProviderSnowflake: {authPromptKeyAccount: {HostSuffix: authSnowflakeHost, Domains: []string{authSnowflakeHost}}},
 	authProviderAzure:     {"resourceName": {HostSuffix: "openai.azure.com", Domains: []string{"azure.com"}}},
-	authProviderCopilot:   {"enterpriseUrl": {}},
+	authProviderCopilot:   {authPromptKeyEnterprise: {}},
 	authProviderGitLab:    {"instanceUrl": {}},
 }
 
@@ -253,6 +270,10 @@ func buildProviderMethods(
 			continue
 		}
 
+		if _, loopback := authLoopbackMethods[providerID][method.Label]; loopback {
+			continue
+		}
+
 		prompts, ok, err := buildAuthPrompts(providerID, method.Prompts)
 		if err != nil {
 			return nil, nil, err
@@ -310,7 +331,12 @@ func buildAuthPrompts(providerID string, native []opencode.ProviderAuthPrompt) (
 			}
 		}
 
-		if rule, hostForming := authHostFormingRules[providerID][prompt.Key]; hostForming && len(rule.Domains) == 0 {
+		// A prompt with no allowlist entry it could have has no safe answer, but
+		// it only costs the method its whole catalog entry when the method always
+		// asks it. A `when`-gated one leaves the branch where it stays invisible
+		// intact, which is the branch visibleAuthPromptKeys already resolves, and
+		// authorize refuses every visible answer to it under the same rule.
+		if rule, hostForming := authHostFormingRules[providerID][prompt.Key]; hostForming && len(rule.Domains) == 0 && prompt.When == nil {
 			return nil, false, nil
 		}
 

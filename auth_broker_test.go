@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
@@ -16,12 +17,16 @@ import (
 func restoreBrokerSeams(t *testing.T) {
 	t.Helper()
 
+	backoff := authBrokerRemoveBackoff
+	authBrokerRemoveBackoff = time.Millisecond
+
 	t.Cleanup(func() {
 		brokerReapHomes = opencode.ReapAbandonedHomes
 		brokerMkdirTemp = os.MkdirTemp
 		brokerCreateXDG = opencode.CreateRuntimeXDGDirs
 		brokerRemoveAll = os.RemoveAll
 		brokerNewBrowserShim = opencode.NewBrowserShim
+		authBrokerRemoveBackoff = backoff
 	})
 }
 
@@ -143,6 +148,34 @@ func TestDestroyReportsCloseAndRemoveFailures(t *testing.T) {
 	broker.destroy(context.Background())
 
 	require.True(t, node.closed)
+}
+
+// TestDestroyWaitsOutDescendantsStillWritingIntoTheHome pins the mechanism the
+// whole containment argument rests on. Closing the broker returns before its
+// descendants stop writing, so the first removal walks a tree that is still
+// growing and fails with a not-empty directory; a home that survives that is a
+// home a stale native approval can still complete into.
+func TestDestroyWaitsOutDescendantsStillWritingIntoTheHome(t *testing.T) {
+	restoreBrokerSeams(t)
+
+	home := t.TempDir()
+	attempts := 0
+
+	brokerRemoveAll = func(path string) error {
+		attempts++
+
+		if attempts < 3 {
+			return errors.New("directory not empty")
+		}
+
+		return os.RemoveAll(path)
+	}
+
+	broker := &authBroker{home: home, shim: nil, client: newFakeOpenCodeClient(), log: slog.New(slog.DiscardHandler)}
+	broker.destroy(context.Background())
+
+	require.Equal(t, 3, attempts)
+	require.NoDirExists(t, home)
 }
 
 func TestDestroyToleratesANilBroker(t *testing.T) {

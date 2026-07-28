@@ -144,6 +144,80 @@ func TestBuildAuthCatalogDropsProvidersWithNoPublishableMethod(t *testing.T) {
 	require.Empty(t, entries)
 }
 
+// copilotNativeMethod is github-copilot's single native method exactly as
+// OpenCode publishes it: one select that chooses the deployment, and one
+// hostname-forming text prompt gated on the enterprise branch of that select.
+func copilotNativeMethod() opencode.ProviderAuthMethod {
+	return opencode.ProviderAuthMethod{
+		Type:  authMethodTypeOAuth,
+		Label: "Login with GitHub Copilot",
+		Prompts: []opencode.ProviderAuthPrompt{
+			{Type: authPromptTypeSelect, Key: "deploymentType", Message: "Select GitHub deployment type", Options: []opencode.ProviderAuthPromptOption{
+				{Label: "GitHub.com", Value: "github.com", Hint: "Public"},
+				{Label: "GitHub Enterprise", Value: "enterprise", Hint: "Self-hosted"},
+			}},
+			{Type: authPromptTypeText, Key: "enterpriseUrl", Message: "Enter your GitHub Enterprise URL or domain",
+				Placeholder: "company.ghe.com",
+				When:        &opencode.ProviderAuthPromptWhen{Key: "deploymentType", Op: authWhenOpEq, Value: "enterprise"}},
+		},
+	}
+}
+
+// TestBuildAuthCatalogKeepsAMethodWhoseUnallowlistedPromptIsGated pins the two
+// resolvers against each other: buildAuthPrompts must read `when` the same way
+// visibleAuthPromptKeys does. A prompt that has no allowlist entry it could
+// have costs the method its catalog entry only when the method always asks it;
+// github-copilot's public path never does, and dropping the provider made the
+// single most likely OpenCode subscription unbrokerable.
+func TestBuildAuthCatalogKeepsAMethodWhoseUnallowlistedPromptIsGated(t *testing.T) {
+	methods, entries, err := buildAuthCatalog(
+		[]opencode.ProviderCatalogEntry{{ID: authProviderCopilot, Name: "GitHub Copilot"}},
+		map[string][]opencode.ProviderAuthMethod{authProviderCopilot: {copilotNativeMethod()}},
+	)
+	require.NoError(t, err)
+	require.Len(t, methods[authProviderCopilot], 1)
+	require.Len(t, entries[authProviderCopilot], 1)
+
+	prompts := entries[authProviderCopilot][0].Prompts
+	require.Len(t, prompts, 2)
+	require.Equal(t, "enterpriseUrl", prompts[1].Key)
+	require.NotNil(t, prompts[1].When)
+
+	// The gated branch is still the one with no allowlist entry it could have,
+	// so it stays unanswerable rather than becoming reachable.
+	require.Equal(t, []string{"deploymentType"}, visibleAuthPromptKeys(prompts, map[string]string{"deploymentType": "github.com"}))
+	require.NoError(t, validateAuthInputs(authProviderCopilot, methods[authProviderCopilot][0], map[string]string{"deploymentType": "github.com"}))
+	requireInvalidParams(t, validateAuthInputs(authProviderCopilot, methods[authProviderCopilot][0], map[string]string{
+		"deploymentType": "enterprise",
+		"enterpriseUrl":  "company.ghe.com",
+	}), authFieldInputs+".enterpriseUrl")
+}
+
+// TestBuildAuthCatalogOmitsLoopbackCompletingMethods pins the one place the
+// adapter can hold the broker's bind-loopback-only property. The harness opens
+// its wildcard callback listener while it mints, so a method refused after the
+// mint has already exposed a port on every interface of the worker host.
+func TestBuildAuthCatalogOmitsLoopbackCompletingMethods(t *testing.T) {
+	methods, entries, err := buildAuthCatalog(
+		[]opencode.ProviderCatalogEntry{{ID: "openai", Name: "OpenAI"}},
+		map[string][]opencode.ProviderAuthMethod{"openai": {
+			nativeOAuthMethod("ChatGPT Pro/Plus (browser)"),
+			nativeOAuthMethod("ChatGPT Pro/Plus (headless)"),
+			{Type: authMethodTypeAPI, Label: "Manually enter API Key"},
+		}},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []authMethodEntry{
+		{ID: "1", Type: authMethodTypeOAuth, Label: "ChatGPT Pro/Plus (headless)"},
+		{ID: "2", Type: authMethodTypeAPI, Label: "Manually enter API Key"},
+	}, entries["openai"])
+
+	// The published ids stay the native array indices the omitted method left
+	// behind, so the remaining methods still address their own native slots.
+	require.Equal(t, 1, methods["openai"][0].Index)
+	require.Equal(t, 2, methods["openai"][1].Index)
+}
+
 func TestBuildAuthCatalogPropagatesPromptDrift(t *testing.T) {
 	_, _, err := buildAuthCatalog(
 		[]opencode.ProviderCatalogEntry{{ID: "xai", Name: "xAI"}},

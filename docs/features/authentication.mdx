@@ -68,12 +68,16 @@ home for the gate to authorize.
    provider list with its special login methods; a provider with no special
    method receives one synthesized API-key method under the reserved id
    `default-api`. A method id is a native array index, so it is meaningful only
-   inside the generation that produced it.
+   inside the generation that produced it. A method whose native login completes
+   on a loopback callback listener is omitted: OpenCode opens that listener on
+   the wildcard address while it mints, so the only place the adapter can hold
+   the broker's loopback-only bind is before the native call exists to make.
 2. `_opencode/auth/authorize` starts one flow per `(sessionId, providerId)`. It
    carries the `methodsGeneration` token, a caller-minted `authorizeRequestId`
    idempotency key, and the answers to the method's prompts. A repeat of the
-   same `authorizeRequestId` replays the recorded presentation verbatim with no
-   native call.
+   same `authorizeRequestId` replays the first call's answer verbatim with no
+   native call — the recorded presentation when the mint succeeded, and the same
+   `flowId` and `cause` when it failed.
 3. `_opencode/auth/callback` submits the flow's expected value and is the
    completion driver. For a device method the empty input drives a bounded
    blocking wait on OpenCode's callback endpoint; for a paste-back method the
@@ -82,7 +86,9 @@ home for the gate to authorize.
    **credential** expiry, never flow expiry.
 5. `_opencode/auth/cancel` abandons a flow. It never claims provider-side
    cancellation — an issued device code stays valid at the provider until it
-   expires there.
+   expires there. A flow has exactly one terminal transition: a `callback` still
+   blocked in OpenCode when the owner cancels answers `flow_cancelled`, installs
+   nothing, and leaves the cancellation as the flow's outcome.
 6. `_opencode/auth/inventory` answers residence from the ledger **and** a probe
    of the named native slot.
 7. `_opencode/auth/disconnect` bumps the binding generation, removes the
@@ -103,7 +109,9 @@ install into the durable runtime store, and destroys the home — terminating th
 process first, then removing the directory. Destruction happens on every
 terminal transition, including expiry, cancellation, and failure, and a
 superseding `authorize` destroys the abandoned home without installing anything
-from it.
+from it. Removal is retried while descendants of the closed server are still
+writing into the tree, because a home that survives its flow is a home a stale
+native approval can still complete into.
 
 ### Neutralized browser launches
 
@@ -160,7 +168,11 @@ answer is at most 1024 bytes of control-free, newline-free UTF-8, and the whole
 whose value OpenCode interpolates into a URL or hostname is additionally checked
 against a per-provider registrable-domain allowlist, and a method whose
 hostname-forming prompt has no allowlist entry is omitted from the catalog
-entirely.
+entirely — unless that prompt is gated by a `when` condition, in which case the
+method keeps the branch where the prompt is never asked and every answer to the
+gated branch is rejected. GitHub Copilot is that case: the public GitHub.com
+path is brokerable, and the enterprise path, whose host is customer-chosen and
+therefore has no allowlist entry it could have, is not.
 
 Native error text never crosses. Every leg failure is the closed
 `opencode_auth_failed` error (JSON-RPC `-32000`) carrying a `cause` from a fixed

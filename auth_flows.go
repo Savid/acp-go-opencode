@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -85,9 +86,15 @@ type authFlow struct {
 	reason              string
 	expiresAt           time.Time
 	credentialExpiresAt int64
-	// presented reports whether the mint published this record's presentation.
-	// A record that never reached one has no verbatim answer to replay.
-	presented bool
+
+	// mintErr records why the native mint never produced a presentation, so a
+	// repeated idempotency key is answered with the same failure rather than
+	// driving a second native login.
+	mintErr error
+	// ready closes once the mint has settled either way, which is what an
+	// idempotent repeat arriving mid-mint waits on before it replays.
+	ready     chan struct{}
+	readyOnce sync.Once
 
 	broker *authBroker
 
@@ -157,7 +164,12 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 
 	key := authFlowKey{sessionID: session.id, providerID: request.providerID}
 
-	if replay, ok := p.replayAuthorize(key, request.authorizeRequestID); ok {
+	replay, replayed, err := p.replayAuthorize(ctx, key, request.authorizeRequestID)
+	if replayed {
+		if err != nil {
+			return nil, err
+		}
+
 		return replay, nil
 	}
 
@@ -214,6 +226,7 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 		state:              authStatePending,
 		expiresAt:          now.Add(authSafetyDeadline),
 		probeInterval:      authPollFloor,
+		ready:              make(chan struct{}),
 		disarm:             make(chan struct{}),
 	}
 
@@ -227,17 +240,37 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 
 	presentation, cause := p.mintPresentation(ctx, flow)
 	if cause != "" {
-		return nil, p.fail(flow, cause, false)
+		return nil, p.failMint(flow, cause)
 	}
 
 	p.mu.Lock()
 	flow.presentation = presentation
-	flow.presented = true
 	p.mu.Unlock()
 
+	flow.markReady()
 	p.armCompleter(flow)
 
 	return presentation, nil
+}
+
+// failMint terminalizes a flow whose native mint never produced a presentation
+// and records the failure the idempotency key replays. A repeat that re-drove
+// the native login would mint a second flow at the provider and answer with a
+// different cause and a different retryability than the call it repeats.
+func (p *providerAuth) failMint(flow *authFlow, cause string) error {
+	err := p.fail(flow, cause, false)
+
+	p.mu.Lock()
+	flow.mintErr = err
+	p.mu.Unlock()
+
+	flow.markReady()
+
+	return err
+}
+
+func (f *authFlow) markReady() {
+	f.readyOnce.Do(func() { close(f.ready) })
 }
 
 type authorizeRequest struct {
@@ -294,18 +327,37 @@ func decodeAuthorizeRequest(fields map[string]json.RawMessage) (authorizeRequest
 // no native call. The record it answers from survives every terminal
 // transition and is dropped only when the session closes, so a repeat after
 // completion returns what the first call returned instead of driving a second
-// login. A record whose mint never published a presentation has nothing to
-// replay.
-func (p *providerAuth) replayAuthorize(key authFlowKey, requestID string) (authAuthorizeResult, bool) {
+// login. A record whose mint failed replays that failure for the same reason:
+// a second native login would answer a different flowId under a different
+// cause, and a repeat is never allowed to change the answer.
+func (p *providerAuth) replayAuthorize(
+	ctx context.Context,
+	key authFlowKey,
+	requestID string,
+) (authAuthorizeResult, bool, error) {
+	p.mu.Lock()
+	flow, ok := p.flows[key]
+	matched := ok && flow.authorizeRequestID == requestID
+	p.mu.Unlock()
+
+	if !matched {
+		return authAuthorizeResult{}, false, nil
+	}
+
+	select {
+	case <-flow.ready:
+	case <-ctx.Done():
+		return authAuthorizeResult{}, true, authFailed(authCauseTransport, flow.providerID, flow.method.ID, flow.id)
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	flow, ok := p.flows[key]
-	if !ok || !flow.presented || flow.authorizeRequestID != requestID {
-		return authAuthorizeResult{}, false
+	if flow.mintErr != nil {
+		return authAuthorizeResult{}, true, flow.mintErr
 	}
 
-	return flow.presentation, true
+	return flow.presentation, true, nil
 }
 
 // resolveMethod fences a method id against the generation that produced it. A
@@ -596,13 +648,24 @@ func (p *providerAuth) completeOAuth(ctx context.Context, session *session, flow
 		return nil, invalidAuthField(authFieldInput)
 	}
 
+	p.mu.Lock()
 	broker := flow.broker
+	p.mu.Unlock()
+
 	if broker == nil {
 		return nil, p.fail(flow, authCauseFlowState, false)
 	}
 
 	if err := broker.client.ProviderAuthCallback(ctx, flow.providerID, flow.method.Index, input); err != nil {
+		if cause, abandoned := p.abandonedCause(flow); abandoned {
+			return nil, authFailed(cause, flow.providerID, flow.method.ID, flow.id)
+		}
+
 		return nil, p.fail(flow, authNativeCause(err), input != "")
+	}
+
+	if cause, abandoned := p.abandonedCause(flow); abandoned {
+		return nil, authFailed(cause, flow.providerID, flow.method.ID, flow.id)
 	}
 
 	credential, ok, err := broker.client.StoredProviderAuth(ctx, flow.providerID)
@@ -664,6 +727,24 @@ func (p *providerAuth) install(ctx context.Context, session *session, flow *auth
 	return nil
 }
 
+// abandonedCause reports the cause a leg answers with when the flow reached a
+// terminal state while the native call this leg started was still in flight.
+// Such a leg owns no transition and installs nothing: the record it addressed
+// is already closed, and the outcome it carries is no longer the flow's.
+func (p *providerAuth) abandonedCause(flow *authFlow) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	switch {
+	case !authTerminal(flow.state):
+		return "", false
+	case flow.state == authStateCancelled:
+		return authCauseFlowCancelled, true
+	default:
+		return authCauseFlowState, true
+	}
+}
+
 // fail returns the leg's closed error and performs the transition its cause
 // pairs with. A cause with no transition consumes nothing.
 func (p *providerAuth) fail(flow *authFlow, cause string, materialInFlight bool) error {
@@ -679,9 +760,17 @@ func (p *providerAuth) fail(flow *authFlow, cause string, materialInFlight bool)
 	return authFailed(cause, flow.providerID, flow.method.ID, flow.id)
 }
 
+// terminalize records the flow's one terminal transition. A flow that already
+// reached one keeps it: a native call still in flight when the owner cancelled
+// answers into a record the owner already closed, and the answer it carries is
+// no longer the flow's outcome.
 func (p *providerAuth) terminalize(flow *authFlow, state string, reason string, credentialExpiresAt int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if authTerminal(flow.state) {
+		return
+	}
 
 	flow.state = state
 	flow.reason = reason
