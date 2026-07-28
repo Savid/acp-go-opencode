@@ -53,13 +53,8 @@ func TestKeystoreLinuxCredentialResidence(t *testing.T) {
 		t.Fatalf("copy residence probe: %v", err)
 	}
 
-	t.Run("keystore-absent", func(t *testing.T) {
-		runResidenceMatrix(ctx, t, container, false)
-	})
-
-	t.Run("keystore-present", func(t *testing.T) {
-		runResidenceMatrix(ctx, t, container, true)
-	})
+	runResidenceMatrix(ctx, t, container, false)
+	runResidenceMatrix(ctx, t, container, true)
 }
 
 // TestKeystoreLinuxArtifactCarriesNoSecretServiceClient pins the mechanism
@@ -150,36 +145,39 @@ func buildResidenceProbe(t *testing.T) string {
 func runResidenceMatrix(ctx context.Context, t *testing.T, container testcontainers.Container, bus bool) {
 	t.Helper()
 
-	prelude := "unset DBUS_SESSION_BUS_ADDRESS; "
+	name, prelude := "keystore-absent", "unset DBUS_SESSION_BUS_ADDRESS; "
 	if bus {
-		prelude = ". " + keystoreEnvFile + "; export DBUS_SESSION_BUS_ADDRESS; "
+		name, prelude = "keystore-present", ". "+keystoreEnvFile+"; export DBUS_SESSION_BUS_ADDRESS; "
 	}
 
 	command := prelude +
 		"export " + envRunIntegration + "=1 " + envRunKeystore + "=1; " +
 		"exec " + keystoreProbePath + " -test.v -test.run '^TestKeystoreResidenceMatrix$'"
 
-	// The stream is demultiplexed so a frame header can never land inside the
-	// result line this test matches on.
-	code, output, err := container.Exec(ctx, []string{"/bin/sh", "-c", command}, tcexec.Multiplexed())
-	if err != nil {
-		t.Fatalf("run residence matrix: %v", err)
-	}
+	t.Run(name, func(t *testing.T) {
+		// The stream is demultiplexed so a frame header can never land inside
+		// the result line this test matches on.
+		code, output, err := container.Exec(ctx, []string{"/bin/sh", "-c", command}, tcexec.Multiplexed())
+		if err != nil {
+			t.Fatalf("run residence matrix: %v", err)
+		}
 
-	logs, readErr := io.ReadAll(output)
-	if readErr != nil {
-		t.Fatalf("read residence output: %v", readErr)
-	}
+		logs, readErr := io.ReadAll(output)
+		if readErr != nil {
+			t.Fatalf("read residence output: %v", readErr)
+		}
 
-	t.Log(string(logs))
+		t.Log(string(logs))
 
-	if code != 0 {
-		t.Fatalf("residence matrix exited %d", code)
-	}
+		if code != 0 {
+			t.Fatalf("residence matrix exited %d", code)
+		}
 
-	// A skipped run also exits 0, which is the silent success this tier exists
-	// to prevent, so the per-test result line is what reports the proof ran.
-	if !strings.Contains(string(logs), "--- PASS: TestKeystoreResidenceMatrix") {
-		t.Fatalf("the residence matrix reported no passing run: %s", logs)
-	}
+		// A skipped run also exits 0, which is the silent success this tier
+		// exists to prevent, so the per-test result line is what reports the
+		// proof ran.
+		if !strings.Contains(string(logs), "--- PASS: TestKeystoreResidenceMatrix") {
+			t.Fatalf("the residence matrix reported no passing run: %s", logs)
+		}
+	})
 }
