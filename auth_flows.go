@@ -552,6 +552,11 @@ func (f *authFlow) stopCompleter() {
 	}
 }
 
+// takeBroker claims the flow's broker home for destruction. Callers hold p.mu:
+// the claim is what decides which leg destroys, so a read that is not
+// serialized with the matching write lets two legs both see the same live
+// handle and close one process, remove one directory, and unlink one shim
+// twice.
 func (f *authFlow) takeBroker() *authBroker {
 	broker := f.broker
 	f.broker = nil
@@ -559,8 +564,14 @@ func (f *authFlow) takeBroker() *authBroker {
 	return broker
 }
 
-func (f *authFlow) destroyBroker(ctx context.Context) {
-	f.takeBroker().destroy(ctx)
+// destroyBroker claims the flow's broker under p.mu and destroys it outside the
+// lock, because destruction terminates a process and walks a directory tree.
+func (p *providerAuth) destroyBroker(ctx context.Context, flow *authFlow) {
+	p.mu.Lock()
+	broker := flow.takeBroker()
+	p.mu.Unlock()
+
+	broker.destroy(ctx)
 }
 
 // callback submits the flow's expected value. For an oauth flow it is the
@@ -631,9 +642,10 @@ func (p *providerAuth) callback(ctx context.Context, params json.RawMessage) (an
 // flow can reach a terminal state underneath it here too. A write that failed
 // is answered for that closed record by install itself; a write that landed is
 // not, because the value is resident and a no-transition cause over a value the
-// store now holds would hide it. Either way the terminal record belongs to
-// whoever closed the flow first, and the resident credential is what inventory
-// reports.
+// store now holds would hide it — unless the provenance entry has meanwhile
+// passed to a newer binding, which install will not overwrite. Either way the
+// terminal record belongs to whoever closed the flow first, and the resident
+// credential is what inventory reports.
 func (p *providerAuth) applySecret(ctx context.Context, session *session, flow *authFlow, input string) (any, error) {
 	if input == "" || len(input) > authMaxTextInputBytes {
 		return nil, invalidAuthField(authFieldInput)
@@ -701,7 +713,7 @@ func (p *providerAuth) completeOAuth(ctx context.Context, session *session, flow
 	destroyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 
-	flow.destroyBroker(destroyCtx)
+	p.destroyBroker(destroyCtx, flow)
 
 	return authFlowIDResult{FlowID: flow.id}, nil
 }
@@ -739,8 +751,19 @@ func (p *providerAuth) install(ctx context.Context, session *session, flow *auth
 		UpdatedAt:          now,
 	}
 
-	if err := p.ledger.write(record); err != nil {
+	// The native write is unconditional because the credential is resident either
+	// way and a slot nothing names is invisible to every residence answer. The
+	// provenance write is not: while this leg was inside the native call a fresh
+	// authorize may have minted the next revision or a disconnect may have bumped
+	// the generation, and the entry then belongs to that binding rather than to
+	// this one.
+	current, err := p.ledger.writeIfCurrent(record)
+	if err != nil {
 		return p.failInstall(flow, authCauseProcess)
+	}
+
+	if !current {
+		return p.failInstall(flow, authCauseBindingConflict)
 	}
 
 	return nil
@@ -785,7 +808,7 @@ func (p *providerAuth) fail(flow *authFlow, cause string, materialInFlight bool)
 		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 		defer cancel()
 
-		flow.destroyBroker(ctx)
+		p.destroyBroker(ctx, flow)
 	}
 
 	return authFailed(cause, flow.providerID, flow.method.ID, flow.id)
@@ -895,7 +918,7 @@ func (p *providerAuth) probe(ctx context.Context, flow *authFlow) {
 	destroyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 
-	flow.destroyBroker(destroyCtx)
+	p.destroyBroker(destroyCtx, flow)
 }
 
 // cancel is adapter-owned: OpenCode has no native cancel route, so the leg does

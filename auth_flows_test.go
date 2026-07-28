@@ -897,6 +897,119 @@ func TestSecretApplyOutlivingCancelAnswersForTheClosedFlow(t *testing.T) {
 	}
 }
 
+// TestStatusAndCallbackClaimTheBrokerOnce runs the two legs that can both
+// observe a settled provider at the same time — the host's status poll and the
+// owner's callback, which is the ordinary shape of an oauth login. Both read
+// the credential out of the broker home and both go on to destroy it, so the
+// claim on the handle has to decide which one does: an unserialized claim
+// terminates one process, walks one directory tree, and unlinks one browser
+// shim twice.
+func TestStatusAndCallbackClaimTheBrokerOnce(t *testing.T) {
+	fixture := newAuthFixture(t)
+	flow := fixture.authorize(t, nil)
+
+	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
+		"xai": {Type: opencode.ProviderAuthTypeOAuth, Refresh: "r", Access: "a", Expires: 1783945909169},
+	}
+
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+
+	fixture.brokerNode.storedAuthFunc = func(string) {
+		arrived <- struct{}{}
+		<-release
+	}
+
+	callbackParams := mustJSON(t, map[string]any{
+		authFieldSessionID:  string(fixture.session.id),
+		authFieldProviderID: "xai",
+		authFieldMethod:     "0",
+		authFieldFlowID:     flow.FlowID,
+		authFieldInput:      "",
+	})
+	statusParams := mustJSON(t, map[string]any{
+		authFieldSessionID:  string(fixture.session.id),
+		authFieldProviderID: "xai",
+		authFieldFlowID:     flow.FlowID,
+	})
+
+	settled := make(chan struct{}, 2)
+
+	go func() {
+		_, _ = fixture.broker.callback(context.Background(), callbackParams)
+		settled <- struct{}{}
+	}()
+
+	go func() {
+		_, _ = fixture.broker.status(context.Background(), statusParams)
+		settled <- struct{}{}
+	}()
+
+	<-arrived
+	<-arrived
+	close(release)
+	<-settled
+	<-settled
+
+	fixture.brokerNode.mu.Lock()
+	defer fixture.brokerNode.mu.Unlock()
+
+	require.Equal(t, 1, fixture.brokerNode.closeCalls)
+}
+
+// TestSupersededSecretApplyLeavesTheSuccessorsLedgerEntry pins the provenance
+// half of an apply that outlived its own flow. The credential is resident
+// either way, but the entry now names the revision the replacing authorize
+// minted, and confirming the closed flow's binding over it would leave the host
+// holding a generation the entry no longer names and a credential no
+// disconnect could ever fence.
+func TestSupersededSecretApplyLeavesTheSuccessorsLedgerEntry(t *testing.T) {
+	fixture := newAuthFixture(t)
+	fixture.runtime.providerAuthMethods = map[string][]opencode.ProviderAuthMethod{
+		"xai": {{Type: authMethodTypeAPI, Label: "Manually enter API Key"}},
+	}
+	fixture.refreshCatalog(t)
+
+	flow := fixture.authorize(t, nil)
+
+	superseded := make(chan struct{})
+	fixture.runtime.setAuthFunc = func(string, opencode.ProviderAuthCredential) error {
+		<-superseded
+
+		return nil
+	}
+
+	callbackParams := mustJSON(t, map[string]any{
+		authFieldSessionID:  string(fixture.session.id),
+		authFieldProviderID: "xai",
+		authFieldMethod:     "0",
+		authFieldFlowID:     flow.FlowID,
+		authFieldInput:      "sk-secret",
+	})
+
+	answered := make(chan error, 1)
+
+	go func() {
+		_, err := fixture.broker.callback(context.Background(), callbackParams)
+		answered <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	successor := fixture.authorize(t, map[string]any{authFieldAuthorizeRequestID: "req-2"})
+	close(superseded)
+
+	requireAuthFailure(t, <-answered, authCauseFlowCancelled)
+	require.Len(t, fixture.runtime.setAuthCalls, 1)
+
+	record, ok, err := fixture.broker.ledger.read("xai")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, successor.FlowID, record.FlowID)
+	require.Equal(t, int64(2), record.Revision)
+	require.Equal(t, authLedgerIntent, record.State)
+}
+
 // TestTerminalizeKeepsTheFirstTerminalTransition pins the record itself: a
 // flow has one terminal transition, and a later one is dropped rather than
 // overwriting the owner's.
@@ -1449,8 +1562,8 @@ func TestStopCompleterIsIdempotent(t *testing.T) {
 }
 
 func TestDestroyBrokerToleratesNoBroker(t *testing.T) {
-	flow := &authFlow{}
-	flow.destroyBroker(context.Background())
+	broker := newAuthAgent(t).broker
+	broker.destroyBroker(context.Background(), &authFlow{})
 }
 
 func TestApplySecretFailsWhenTheInstallFails(t *testing.T) {

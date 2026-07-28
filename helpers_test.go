@@ -160,6 +160,7 @@ type fakeOpenCodeClient struct {
 	aborts         []string
 	deleted        []string
 	closed         bool
+	closeCalls     int
 	events         chan opencode.Event
 	errs           chan error
 	runtimeExited  chan struct{}
@@ -200,6 +201,7 @@ type fakeOpenCodeClient struct {
 	callbackCalls          []fakeAuthorizeCall
 	storedAuth             map[string]opencode.ProviderAuthCredential
 	storedAuthErr          error
+	storedAuthFunc         func(string)
 	setAuthErr             error
 	setAuthFunc            func(string, opencode.ProviderAuthCredential) error
 	setAuthCalls           []fakeSetAuthCall
@@ -276,6 +278,7 @@ func testProviders() opencode.ProvidersResponse {
 func (c *fakeOpenCodeClient) Close(context.Context) error {
 	c.mu.Lock()
 	c.closed = true
+	c.closeCalls++
 	c.mu.Unlock()
 
 	return c.closeErr
@@ -897,6 +900,16 @@ func (c *fakeOpenCodeClient) RemoveProviderAuth(_ context.Context, providerID st
 }
 
 func (c *fakeOpenCodeClient) StoredProviderAuth(_ context.Context, providerID string) (opencode.ProviderAuthCredential, bool, error) {
+	c.mu.Lock()
+	hook := c.storedAuthFunc
+	c.mu.Unlock()
+
+	// The hook runs outside the lock so two legs reading the same provider can be
+	// held open at the same time rather than serialized by the fake itself.
+	if hook != nil {
+		hook(providerID)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
