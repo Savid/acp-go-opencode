@@ -36,6 +36,7 @@ const (
 	authProviderCopilot     = "github-copilot"
 	authProviderGitLab      = "gitlab"
 	authProviderOpenAI      = "openai"
+	authProviderXAI         = "xai"
 	authPromptKeyAccount    = "account"
 	authPromptKeyEnterprise = "enterpriseUrl"
 	authPromptKeyInstance   = "instanceUrl"
@@ -134,14 +135,15 @@ type authHostFormingRule struct {
 // only run on the answer. OpenAI's binds the wildcard address rather than
 // loopback, exposing a port on every interface of the worker host; GitLab's
 // binds a fixed port and, in the same call, execs the platform browser launcher
-// at the authorization URL, which only the broker's own shim then stops. The
-// one place the adapter can hold the broker's bind-loopback-only property is
-// before the native call exists to make. Each entry is a per-provider constant
-// recorded in the family registry, on the same terms as the host-forming
-// allowlists below.
+// at the authorization URL, which only the broker's own shim then stops; xAI's
+// binds its registered fixed loopback address before returning. The one place
+// the adapter can hold the broker's bind-loopback-only property is before the
+// native call exists to make. Each entry is a per-provider constant recorded in
+// the family registry, on the same terms as the host-forming allowlists below.
 var authLoopbackMethods = map[string]map[string]struct{}{
 	authProviderOpenAI: {"ChatGPT Pro/Plus (browser)": {}},
 	authProviderGitLab: {"GitLab OAuth": {}},
+	authProviderXAI:    {"xAI Grok OAuth (SuperGrok Subscription)": {}},
 }
 
 // authHostFormingRules names every native prompt whose value is interpolated

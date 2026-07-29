@@ -273,6 +273,29 @@ func TestBuildAuthCatalogOmitsLoopbackCompletingMethods(t *testing.T) {
 	require.Equal(t, 2, methods["openai"][1].Index)
 }
 
+// TestBuildAuthCatalogOmitsXAILoopbackMethod pins OpenCode 1.18.5's xAI
+// method split. The browser method opens 127.0.0.1:56121 while it mints, but
+// the headless method uses an RFC 8628 device flow and opens no callback
+// listener. Omitting the first native slot must not renumber the other two.
+func TestBuildAuthCatalogOmitsXAILoopbackMethod(t *testing.T) {
+	methods, entries, err := buildAuthCatalog(
+		[]opencode.ProviderCatalogEntry{{ID: authProviderXAI, Name: "xAI"}},
+		map[string][]opencode.ProviderAuthMethod{authProviderXAI: {
+			nativeOAuthMethod("xAI Grok OAuth (SuperGrok Subscription)"),
+			nativeOAuthMethod("xAI Grok OAuth (Headless / Remote / VPS)"),
+			{Type: authMethodTypeAPI, Label: "Manually enter API Key"},
+		}},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []authMethodEntry{
+		{ID: "1", Type: authMethodTypeOAuth, Label: "xAI Grok OAuth (Headless / Remote / VPS)"},
+		{ID: "2", Type: authMethodTypeAPI, Label: "Manually enter API Key"},
+	}, entries[authProviderXAI])
+
+	require.Equal(t, 1, methods[authProviderXAI][0].Index)
+	require.Equal(t, 2, methods[authProviderXAI][1].Index)
+}
+
 func TestBuildAuthCatalogPropagatesPromptDrift(t *testing.T) {
 	_, _, err := buildAuthCatalog(
 		[]opencode.ProviderCatalogEntry{{ID: "xai", Name: "xAI"}},

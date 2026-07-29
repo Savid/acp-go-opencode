@@ -125,6 +125,43 @@ type authStatusWire struct {
 	Reason string `json:"reason"`
 }
 
+// TestProviderAuthCatalogOmitsXAILoopbackMethod pins the live OpenCode method
+// split that the catalog filter depends on. The browser flow is native slot 0
+// and must be absent; the headless and API-key flows keep native slots 1 and 2.
+func TestProviderAuthCatalogOmitsXAILoopbackMethod(t *testing.T) {
+	requireRunIntegration(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	conn, agent, _, _, _ := providerAuthAgent(t, ctx)
+	defer agent.close()
+
+	sessionID := newProviderAuthSession(t, ctx, conn)
+
+	var methods authMethodsWire
+	if err := callAuthLeg(t, ctx, conn, "_opencode/auth/methods", map[string]any{"sessionId": string(sessionID)}, &methods); err != nil {
+		t.Fatalf("_opencode/auth/methods: %v", err)
+	}
+
+	entries, ok := methods.Providers["xai"]
+	if !ok {
+		t.Fatalf("catalog carried no %q provider: %#v", "xai", methods.Providers)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("xAI methods = %#v, want exactly the headless and API-key methods", entries)
+	}
+
+	if got := entries[0]; got.ID != "1" || got.Type != "oauth" || got.Label != "xAI Grok OAuth (Headless / Remote / VPS)" {
+		t.Fatalf("xAI method 1 = %#v, want the headless OAuth method", got)
+	}
+
+	if got := entries[1]; got.ID != "2" || got.Type != "api" || got.Label != "Manually enter API Key" {
+		t.Fatalf("xAI method 2 = %#v, want the API-key method", got)
+	}
+}
+
 // TestAttendedProviderAuthDeviceFlowCompletes drives one real device login end
 // to end. The operator names the provider and the method id, opens the relayed
 // URL, and approves at the provider before the flow's deadline.
