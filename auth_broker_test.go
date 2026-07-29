@@ -30,6 +30,34 @@ func restoreBrokerSeams(t *testing.T) {
 	})
 }
 
+type brokerRootLifecycleClient struct {
+	*fakeOpenCodeClient
+	runtimeRunning    bool
+	scopeCloseCalls   int
+	rootShutdownCalls int
+	shutdownErr       error
+}
+
+func newBrokerRootLifecycleClient() *brokerRootLifecycleClient {
+	return &brokerRootLifecycleClient{
+		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		runtimeRunning:     true,
+	}
+}
+
+func (c *brokerRootLifecycleClient) Close(context.Context) error {
+	c.scopeCloseCalls++
+
+	return nil
+}
+
+func (c *brokerRootLifecycleClient) Shutdown(context.Context) error {
+	c.rootShutdownCalls++
+	c.runtimeRunning = false
+
+	return c.shutdownErr
+}
+
 func TestStartBrokerCreatesAPrefixedHomeUnderTheScratchParent(t *testing.T) {
 	harness := newAuthAgent(t)
 	agent, broker := harness.agent, harness.broker
@@ -136,25 +164,41 @@ func TestStartBrokerFallsBackToTheDefaultFactory(t *testing.T) {
 	require.Nil(t, created)
 }
 
-func TestDestroyReportsCloseAndRemoveFailures(t *testing.T) {
+func TestDestroyShutsDownTheRootRuntimeBeforeRemovingItsHome(t *testing.T) {
 	restoreBrokerSeams(t)
 
-	node := newFakeOpenCodeClient()
-	node.closeErr = errors.New("close")
+	home := t.TempDir()
+	node := newBrokerRootLifecycleClient()
+	broker := &authBroker{home: home, client: node, log: slog.New(slog.DiscardHandler)}
+	broker.destroy(context.Background())
+
+	require.False(t, node.runtimeRunning)
+	require.Zero(t, node.scopeCloseCalls)
+	require.Equal(t, 1, node.rootShutdownCalls)
+	require.NoDirExists(t, home)
+}
+
+func TestDestroyReportsShutdownAndRemoveFailures(t *testing.T) {
+	restoreBrokerSeams(t)
+
+	node := newBrokerRootLifecycleClient()
+	node.shutdownErr = errors.New("shutdown")
 
 	brokerRemoveAll = func(string) error { return errors.New("remove") }
 
 	broker := &authBroker{home: t.TempDir(), client: node, log: slog.New(slog.DiscardHandler)}
 	broker.destroy(context.Background())
 
-	require.True(t, node.closed)
+	require.False(t, node.runtimeRunning)
+	require.Zero(t, node.scopeCloseCalls)
+	require.Equal(t, 1, node.rootShutdownCalls)
 }
 
 // TestDestroyWaitsOutDescendantsStillWritingIntoTheHome pins the mechanism the
-// whole containment argument rests on. Closing the broker returns before its
-// descendants stop writing, so the first removal walks a tree that is still
-// growing and fails with a not-empty directory; a home that survives that is a
-// home a stale native approval can still complete into.
+// whole containment argument rests on. Shutting down the broker can return
+// before its descendants stop writing, so the first removal walks a tree that
+// is still growing and fails with a not-empty directory; a home that survives
+// that is a home a stale native approval can still complete into.
 func TestDestroyWaitsOutDescendantsStillWritingIntoTheHome(t *testing.T) {
 	restoreBrokerSeams(t)
 

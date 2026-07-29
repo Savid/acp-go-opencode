@@ -122,8 +122,8 @@ func (b *authBroker) destroy(ctx context.Context) {
 		return
 	}
 
-	if err := b.client.Close(ctx); err != nil {
-		b.log.WarnContext(ctx, "close provider auth broker failed", loggableError(err))
+	if err := b.client.Shutdown(ctx); err != nil {
+		b.log.WarnContext(ctx, "shutdown provider auth broker failed", loggableError(err))
 	}
 
 	if err := removeBrokerHome(b.home); err != nil {
