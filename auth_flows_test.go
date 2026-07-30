@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,9 @@ type authFixture struct {
 	brokerNode *fakeOpenCodeClient
 	session    *session
 	generation string
+
+	callbackRelease chan struct{}
+	releaseOnce     sync.Once
 }
 
 func newAuthFixture(t *testing.T) *authFixture {
@@ -48,11 +52,41 @@ func newAuthFixture(t *testing.T) *authFixture {
 		Method:       opencode.ProviderAuthNativeMethodAuto,
 		Instructions: "Open the device page and enter the displayed code",
 	}
+	callbackRelease := make(chan struct{})
+	brokerNode.authCallbackRelease = callbackRelease
 
-	fixture := &authFixture{agent: agent, broker: broker, runtime: runtime, brokerNode: brokerNode, session: session}
+	fixture := &authFixture{
+		agent: agent, broker: broker, runtime: runtime, brokerNode: brokerNode, session: session,
+		callbackRelease: callbackRelease,
+	}
 	fixture.refreshCatalog(t)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		fixture.broker.closeSession(ctx, fixture.session.id)
+		fixture.releaseCallback()
+	})
 
 	return fixture
+}
+
+func (f *authFixture) releaseCallback() {
+	f.releaseOnce.Do(func() {
+		close(f.callbackRelease)
+	})
+}
+
+func (f *authFixture) useCodeAuthorization() {
+	f.brokerNode.mu.Lock()
+	defer f.brokerNode.mu.Unlock()
+
+	f.brokerNode.authorization = opencode.ProviderAuthorization{
+		URL:          "https://accounts.x.ai/oauth2/authorize",
+		Method:       opencode.ProviderAuthNativeMethodCode,
+		Instructions: "Paste the code shown after login",
+	}
+	f.brokerNode.authCallbackRelease = nil
 }
 
 func (f *authFixture) refreshCatalog(t *testing.T) {
@@ -124,6 +158,109 @@ func TestAuthorizeMintsADeviceFlow(t *testing.T) {
 	require.Equal(t, "req-1", record.AuthorizeRequestID)
 }
 
+func TestAuthorizeDrivesWaitCompletionExactlyOnce(t *testing.T) {
+	fixture := newAuthFixture(t)
+	started := make(chan struct{})
+	fixture.brokerNode.authCallbackStarted = started
+
+	flow := fixture.authorize(t, nil)
+	<-started
+
+	fixture.brokerNode.mu.Lock()
+	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
+		"xai": {Type: opencode.ProviderAuthTypeOAuth, Refresh: "r", Access: "a", Expires: 1783945909169},
+	}
+	fixture.brokerNode.mu.Unlock()
+	fixture.releaseCallback()
+
+	require.Eventually(t, func() bool {
+		return fixture.status(t, flow.FlowID).State == authStateAuthenticated
+	}, time.Second, time.Millisecond)
+
+	for range 3 {
+		require.Equal(t, authStateAuthenticated, fixture.status(t, flow.FlowID).State)
+	}
+
+	require.Equal(t, flow, fixture.authorize(t, nil))
+
+	fixture.brokerNode.mu.Lock()
+	require.Len(t, fixture.brokerNode.callbackCalls, 1)
+	require.Empty(t, fixture.brokerNode.callbackCalls[0].code)
+	fixture.brokerNode.mu.Unlock()
+
+	fixture.runtime.mu.Lock()
+	require.Len(t, fixture.runtime.setAuthCalls, 1)
+	fixture.runtime.mu.Unlock()
+}
+
+func TestWaitCompletionRecordsNativeRefusal(t *testing.T) {
+	fixture := newAuthFixture(t)
+	started := make(chan struct{})
+	fixture.brokerNode.authCallbackStarted = started
+	fixture.brokerNode.authCallbackErr = &opencode.HTTPError{StatusCode: http.StatusBadRequest}
+
+	flow := fixture.authorize(t, nil)
+	<-started
+	fixture.releaseCallback()
+
+	require.Eventually(t, func() bool {
+		status := fixture.status(t, flow.FlowID)
+
+		return status.State == authStateFailed && status.Reason == authReasonProviderRefused
+	}, time.Second, time.Millisecond)
+
+	fixture.brokerNode.mu.Lock()
+	require.Len(t, fixture.brokerNode.callbackCalls, 1)
+	fixture.brokerNode.mu.Unlock()
+
+	fixture.runtime.mu.Lock()
+	require.Empty(t, fixture.runtime.setAuthCalls)
+	fixture.runtime.mu.Unlock()
+}
+
+func TestCancelStopsWaitCompletionWithoutInstalling(t *testing.T) {
+	fixture := newAuthFixture(t)
+	started := make(chan struct{})
+	fixture.brokerNode.authCallbackStarted = started
+
+	flow := fixture.authorize(t, nil)
+	<-started
+
+	_, err := fixture.broker.cancel(context.Background(), mustJSON(t, map[string]any{
+		authFieldSessionID:  string(fixture.session.id),
+		authFieldProviderID: "xai",
+		authFieldFlowID:     flow.FlowID,
+	}))
+	require.NoError(t, err)
+	fixture.releaseCallback()
+
+	require.Eventually(t, func() bool {
+		status := fixture.status(t, flow.FlowID)
+
+		return status.State == authStateCancelled && status.Reason == authReasonOwnerCancel
+	}, time.Second, time.Millisecond)
+
+	fixture.runtime.mu.Lock()
+	require.Empty(t, fixture.runtime.setAuthCalls)
+	fixture.runtime.mu.Unlock()
+}
+
+func TestWaitFlowRejectsASecondCompletionDriver(t *testing.T) {
+	fixture := newAuthFixture(t)
+	started := make(chan struct{})
+	fixture.brokerNode.authCallbackStarted = started
+
+	flow := fixture.authorize(t, nil)
+	<-started
+
+	_, err := fixture.callback(t, flow.FlowID, "0", "")
+	requireAuthFailure(t, err, authCauseFlowState)
+
+	fixture.brokerNode.mu.Lock()
+	require.Len(t, fixture.brokerNode.callbackCalls, 1)
+	fixture.brokerNode.mu.Unlock()
+}
+
 func TestAuthorizeMintsAPasteBackFlow(t *testing.T) {
 	fixture := newAuthFixture(t)
 	fixture.brokerNode.authorization = opencode.ProviderAuthorization{
@@ -164,13 +301,14 @@ func TestAuthorizeReplaysARepeatedRequestID(t *testing.T) {
 // login and destroy the credential the caller had already earned.
 func TestAuthorizeReplaysARepeatedRequestIDAfterTheFlowTerminalized(t *testing.T) {
 	fixture := newAuthFixture(t)
+	fixture.useCodeAuthorization()
 
 	first := fixture.authorize(t, nil)
 	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
 		"xai": {Type: opencode.ProviderAuthTypeOAuth, Refresh: "r", Access: "a", Expires: 1783945909169},
 	}
 
-	_, err := fixture.callback(t, first.FlowID, "0", "")
+	_, err := fixture.callback(t, first.FlowID, "0", "accepted")
 	require.NoError(t, err)
 	require.Equal(t, authStateAuthenticated, fixture.status(t, first.FlowID).State)
 
@@ -584,18 +722,19 @@ func (f *authFixture) callback(t *testing.T, flowID string, method string, input
 	}))
 }
 
-func TestCallbackDrivesOAuthCompletion(t *testing.T) {
+func TestCallbackDrivesCodeOAuthCompletion(t *testing.T) {
 	fixture := newAuthFixture(t)
+	fixture.useCodeAuthorization()
 
 	flow := fixture.authorize(t, nil)
 	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
 		"xai": {Type: opencode.ProviderAuthTypeOAuth, Refresh: "r", Access: "a", Expires: 1783945909169},
 	}
 
-	result, err := fixture.callback(t, flow.FlowID, "0", "")
+	result, err := fixture.callback(t, flow.FlowID, "0", "accepted")
 	require.NoError(t, err)
 	require.Equal(t, authFlowIDResult{FlowID: flow.FlowID}, result)
-	require.Equal(t, "", fixture.brokerNode.callbackCalls[0].code)
+	require.Equal(t, "accepted", fixture.brokerNode.callbackCalls[0].code)
 	require.Equal(t, "xai", fixture.runtime.setAuthCalls[0].providerID)
 
 	status := fixture.status(t, flow.FlowID)
@@ -650,6 +789,7 @@ func TestCallbackAddressingFailures(t *testing.T) {
 
 func TestCallbackOnATerminalFlowIsAFlowStateFailure(t *testing.T) {
 	fixture := newAuthFixture(t)
+	fixture.useCodeAuthorization()
 
 	flow := fixture.authorize(t, nil)
 
@@ -660,7 +800,7 @@ func TestCallbackOnATerminalFlowIsAFlowStateFailure(t *testing.T) {
 	}))
 	require.NoError(t, err)
 
-	_, err = fixture.callback(t, flow.FlowID, "0", "")
+	_, err = fixture.callback(t, flow.FlowID, "0", "accepted")
 	requireAuthFailure(t, err, authCauseFlowState)
 }
 
@@ -672,7 +812,7 @@ func TestCallbackInputValidation(t *testing.T) {
 	_, err := fixture.callback(t, waitFlow.FlowID, "0", "unexpected")
 	requireInvalidParams(t, err, authFieldInput)
 
-	fixture.brokerNode.authorization.Method = opencode.ProviderAuthNativeMethodCode
+	fixture.useCodeAuthorization()
 
 	codeFlow := fixture.authorize(t, map[string]any{authFieldAuthorizeRequestID: "req-2"})
 
@@ -698,7 +838,7 @@ func TestCallbackFailuresTerminalizeTheFlow(t *testing.T) {
 		cause  string
 		reason string
 	}{
-		{name: "native callback transport", cause: authCauseTransport, reason: authReasonTransport, setup: func(fixture *authFixture) {
+		{name: "native callback transport", cause: authCauseTransport, reason: authReasonAcceptanceUnknown, setup: func(fixture *authFixture) {
 			fixture.brokerNode.authCallbackErr = errors.New("http")
 		}},
 		{name: "native callback refusal", cause: authCauseProviderRefused, reason: authReasonProviderRefused, setup: func(fixture *authFixture) {
@@ -721,11 +861,12 @@ func TestCallbackFailuresTerminalizeTheFlow(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			fixture := newAuthFixture(t)
+			fixture.useCodeAuthorization()
 			flow := fixture.authorize(t, nil)
 
 			testCase.setup(fixture)
 
-			_, err := fixture.callback(t, flow.FlowID, "0", "")
+			_, err := fixture.callback(t, flow.FlowID, "0", "accepted")
 			requireAuthFailure(t, err, testCase.cause)
 
 			status := fixture.status(t, flow.FlowID)
@@ -737,6 +878,7 @@ func TestCallbackFailuresTerminalizeTheFlow(t *testing.T) {
 
 func TestCallbackFailsWhenTheLedgerConfirmationCannotBeWritten(t *testing.T) {
 	fixture := newAuthFixture(t)
+	fixture.useCodeAuthorization()
 
 	flow := fixture.authorize(t, nil)
 	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{"xai": {Type: opencode.ProviderAuthTypeOAuth}}
@@ -749,12 +891,13 @@ func TestCallbackFailsWhenTheLedgerConfirmationCannotBeWritten(t *testing.T) {
 		ledgerRemove = os.Remove
 	})
 
-	_, err := fixture.callback(t, flow.FlowID, "0", "")
+	_, err := fixture.callback(t, flow.FlowID, "0", "accepted")
 	requireAuthFailure(t, err, authCauseProcess)
 }
 
 func TestCallbackFailsWhenTheRuntimeIsGone(t *testing.T) {
 	fixture := newAuthFixture(t)
+	fixture.useCodeAuthorization()
 
 	flow := fixture.authorize(t, nil)
 	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{"xai": {Type: opencode.ProviderAuthTypeOAuth}}
@@ -763,7 +906,7 @@ func TestCallbackFailsWhenTheRuntimeIsGone(t *testing.T) {
 	fixture.session.client = nil
 	fixture.session.mu.Unlock()
 
-	_, err := fixture.callback(t, flow.FlowID, "0", "")
+	_, err := fixture.callback(t, flow.FlowID, "0", "accepted")
 	requireAuthFailure(t, err, authCauseTransport)
 }
 
@@ -786,6 +929,7 @@ func TestCallbackOutlivingCancelDoesNotReTerminalizeTheFlow(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			fixture := newAuthFixture(t)
+			fixture.useCodeAuthorization()
 			flow := fixture.authorize(t, nil)
 			fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
 				"xai": {Type: opencode.ProviderAuthTypeOAuth, Refresh: "r", Access: "a"},
@@ -806,7 +950,7 @@ func TestCallbackOutlivingCancelDoesNotReTerminalizeTheFlow(t *testing.T) {
 					authFieldProviderID: "xai",
 					authFieldMethod:     "0",
 					authFieldFlowID:     flow.FlowID,
-					authFieldInput:      "",
+					authFieldInput:      "accepted",
 				}))
 				answered <- err
 			}()
@@ -905,73 +1049,6 @@ func TestSecretApplyOutlivingCancelAnswersForTheClosedFlow(t *testing.T) {
 	}
 }
 
-// TestStatusAndCallbackClaimTheBrokerOnce runs the two legs that can both
-// observe a settled provider at the same time — the host's status poll and the
-// owner's callback, which is the ordinary shape of an oauth login. Both would
-// read the credential out of the broker home and both would go on to destroy
-// it, so the claim on the flow has to decide which one does: unclaimed, the two
-// install the same credential twice and then terminate one process, walk one
-// directory tree, and unlink one browser shim twice. Whichever leg claims
-// first, the other never reaches the native read, so only one arrival is ever
-// waited for.
-func TestStatusAndCallbackClaimTheBrokerOnce(t *testing.T) {
-	fixture := newAuthFixture(t)
-	flow := fixture.authorize(t, nil)
-
-	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
-		"xai": {Type: opencode.ProviderAuthTypeOAuth, Refresh: "r", Access: "a", Expires: 1783945909169},
-	}
-
-	arrived := make(chan struct{}, 2)
-	release := make(chan struct{})
-
-	fixture.brokerNode.storedAuthFunc = func(string) {
-		arrived <- struct{}{}
-		<-release
-	}
-
-	callbackParams := mustJSON(t, map[string]any{
-		authFieldSessionID:  string(fixture.session.id),
-		authFieldProviderID: "xai",
-		authFieldMethod:     "0",
-		authFieldFlowID:     flow.FlowID,
-		authFieldInput:      "",
-	})
-	statusParams := mustJSON(t, map[string]any{
-		authFieldSessionID:  string(fixture.session.id),
-		authFieldProviderID: "xai",
-		authFieldFlowID:     flow.FlowID,
-	})
-
-	settled := make(chan struct{}, 2)
-
-	go func() {
-		_, _ = fixture.broker.callback(context.Background(), callbackParams)
-		settled <- struct{}{}
-	}()
-
-	go func() {
-		_, _ = fixture.broker.status(context.Background(), statusParams)
-		settled <- struct{}{}
-	}()
-
-	<-arrived
-	close(release)
-	<-settled
-	<-settled
-
-	fixture.brokerNode.mu.Lock()
-	closeCalls := fixture.brokerNode.closeCalls
-	fixture.brokerNode.mu.Unlock()
-
-	require.Equal(t, 1, closeCalls)
-
-	fixture.runtime.mu.Lock()
-	defer fixture.runtime.mu.Unlock()
-
-	require.Len(t, fixture.runtime.setAuthCalls, 1)
-}
-
 // TestSupersededSecretApplyLeavesTheSuccessorsLedgerEntry pins the provenance
 // half of an apply that outlived its own flow. The replacing authorize cancels
 // the flow before the apply's native write returns, but it cannot claim the
@@ -1053,10 +1130,11 @@ func TestTerminalizeKeepsTheFirstTerminalTransition(t *testing.T) {
 }
 
 // TestCallbackOutlivingCompletionAnswersFlowState pins the other terminal
-// state a leg can find on its return: a flow the status poll already completed
+// state a leg can find on its return: a flow another owner already completed
 // is not a cancelled one, and the two answers stay distinguishable.
 func TestCallbackOutlivingCompletionAnswersFlowState(t *testing.T) {
 	fixture := newAuthFixture(t)
+	fixture.useCodeAuthorization()
 	flow := fixture.authorize(t, nil)
 
 	settled := make(chan struct{})
@@ -1074,7 +1152,7 @@ func TestCallbackOutlivingCompletionAnswersFlowState(t *testing.T) {
 			authFieldProviderID: "xai",
 			authFieldMethod:     "0",
 			authFieldFlowID:     flow.FlowID,
-			authFieldInput:      "",
+			authFieldInput:      "accepted",
 		}))
 		answered <- err
 	}()
@@ -1099,91 +1177,6 @@ func TestCallbackFailsWhenTheBrokerIsAlreadyGone(t *testing.T) {
 
 	_, err := fixture.callback(t, flow.FlowID, "0", "")
 	requireAuthFailure(t, err, authCauseFlowState)
-}
-
-func TestStatusServesCachedStateBehindThePollFloor(t *testing.T) {
-	fixture := newAuthFixture(t)
-
-	flow := fixture.authorize(t, nil)
-	require.Equal(t, authStatePending, fixture.status(t, flow.FlowID).State)
-
-	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{"xai": {Type: opencode.ProviderAuthTypeOAuth}}
-
-	// The first status consumed the interval, so the freshly resident
-	// credential is not observed until the floor elapses.
-	require.Equal(t, authStatePending, fixture.status(t, flow.FlowID).State)
-
-	fixture.advanceProbe(flow.FlowID, authPollFloor)
-	require.Equal(t, authStateAuthenticated, fixture.status(t, flow.FlowID).State)
-}
-
-func (f *authFixture) advanceProbe(flowID string, by time.Duration) {
-	f.broker.mu.Lock()
-	defer f.broker.mu.Unlock()
-
-	f.broker.byID[flowID].nextProbeAt = f.broker.byID[flowID].nextProbeAt.Add(-by)
-}
-
-func TestStatusHonoursASlowDownRefusal(t *testing.T) {
-	fixture := newAuthFixture(t)
-
-	flow := fixture.authorize(t, nil)
-	fixture.brokerNode.storedAuthErr = &opencode.HTTPError{StatusCode: http.StatusTooManyRequests}
-
-	require.Equal(t, authStatePending, fixture.status(t, flow.FlowID).State)
-
-	fixture.broker.mu.Lock()
-	interval := fixture.broker.byID[flow.FlowID].probeInterval
-	fixture.broker.mu.Unlock()
-
-	require.Equal(t, authPollFloor+authSlowDownStep, interval)
-}
-
-func TestStatusIgnoresAnOrdinaryProbeFailure(t *testing.T) {
-	fixture := newAuthFixture(t)
-
-	flow := fixture.authorize(t, nil)
-	fixture.brokerNode.storedAuthErr = errors.New("io")
-
-	require.Equal(t, authStatePending, fixture.status(t, flow.FlowID).State)
-
-	fixture.broker.mu.Lock()
-	interval := fixture.broker.byID[flow.FlowID].probeInterval
-	fixture.broker.mu.Unlock()
-
-	require.Equal(t, authPollFloor, interval)
-}
-
-func TestStatusProbeSkipsASecretFlowAndAnUnknownSession(t *testing.T) {
-	fixture := newAuthFixture(t)
-
-	secret := fixture.authorize(t, map[string]any{authFieldMethod: "1"})
-	require.Equal(t, authStatePending, fixture.status(t, secret.FlowID).State)
-
-	flow := fixture.authorize(t, map[string]any{authFieldAuthorizeRequestID: "req-2"})
-	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{"xai": {Type: opencode.ProviderAuthTypeOAuth}}
-
-	fixture.agent.mu.Lock()
-	delete(fixture.agent.sessions, fixture.session.id)
-	fixture.agent.mu.Unlock()
-
-	fixture.broker.probe(context.Background(), fixture.broker.byID[flow.FlowID])
-
-	fixture.broker.mu.Lock()
-	state := fixture.broker.byID[flow.FlowID].state
-	fixture.broker.mu.Unlock()
-
-	require.Equal(t, authStatePending, state)
-}
-
-func TestStatusProbeStopsOnAnInstallFailure(t *testing.T) {
-	fixture := newAuthFixture(t)
-
-	flow := fixture.authorize(t, nil)
-	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{"xai": {Type: opencode.ProviderAuthTypeOAuth}}
-	fixture.runtime.setAuthErr = errors.New("http")
-
-	require.Equal(t, authStateFailed, fixture.status(t, flow.FlowID).State)
 }
 
 func TestStatusAddressingFailures(t *testing.T) {

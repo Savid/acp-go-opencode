@@ -201,28 +201,33 @@ func TestAttendedProviderAuthDeviceFlowCompletes(t *testing.T) {
 	if !strings.HasPrefix(authorization.URL, "https://") {
 		t.Fatalf("authorize relayed no https url: %+v", authorization)
 	}
+	if authorization.Interaction != "wait" {
+		t.Fatalf("authorize interaction = %q, want wait", authorization.Interaction)
+	}
 
 	t.Logf("approve this login before %s:\n  url:  %s\n  code: %s\n  %s",
 		time.UnixMilli(authorization.FlowExpiresAt).Format(time.RFC3339),
 		authorization.URL, authorization.UserCode, authorization.Message)
 
-	if err := callAuthLeg(t, ctx, conn, "_opencode/auth/callback", map[string]any{
-		"sessionId":  string(sessionID),
-		"providerId": providerID,
-		"method":     methodID,
-		"flowId":     authorization.FlowID,
-		"input":      "",
-	}, nil); err != nil {
-		t.Fatalf("_opencode/auth/callback: the human did not approve in time, or the provider refused: %v", err)
-	}
-
 	var status authStatusWire
-	if err := callAuthLeg(t, ctx, conn, "_opencode/auth/status", map[string]any{
-		"sessionId":  string(sessionID),
-		"providerId": providerID,
-		"flowId":     authorization.FlowID,
-	}, &status); err != nil {
-		t.Fatalf("_opencode/auth/status: %v", err)
+	for {
+		if err := callAuthLeg(t, ctx, conn, "_opencode/auth/status", map[string]any{
+			"sessionId":  string(sessionID),
+			"providerId": providerID,
+			"flowId":     authorization.FlowID,
+		}, &status); err != nil {
+			t.Fatalf("_opencode/auth/status: %v", err)
+		}
+
+		if status.State != "pending" {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for provider approval: %v", ctx.Err())
+		case <-time.After(time.Second):
+		}
 	}
 
 	if status.State != "authenticated" {

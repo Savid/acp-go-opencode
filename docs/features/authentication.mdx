@@ -78,10 +78,10 @@ home for the gate to authorize.
    same `authorizeRequestId` replays the first call's answer verbatim with no
    native call — the recorded presentation when the mint succeeded, and the same
    `flowId` and `cause` when it failed.
-3. `_opencode/auth/callback` submits the flow's expected value and is the
-   completion driver. For a device method the empty input drives a bounded
-   blocking wait on OpenCode's callback endpoint; for a paste-back method the
-   input is the code; for an API-key method the input is the key.
+3. A `wait` authorization starts OpenCode's bounded no-code callback
+   immediately; that native callback performs provider polling and installs the
+   approved credential in the isolated broker. `_opencode/auth/callback`
+   submits the code for a paste-back method or the key for an API-key method.
 4. `_opencode/auth/status` reports the flow state. Its `expiresAt` is
    **credential** expiry, never flow expiry.
 5. `_opencode/auth/cancel` abandons a flow. It never claims provider-side
@@ -114,10 +114,9 @@ they do, and each is visible to a host as an ordinary leg answer:
   delayed retry of it fails on the `authorizeRequestId` field rather than
   cancelling the flow that replaced it, so the code the operator is looking at
   keeps addressing the live flow.
-- One flow admits one completion. A second `callback` against a flow another leg
-  is already driving answers `flow_state` and applies nothing, and a `status`
-  poll that lands in the same window reports the cached state instead of driving
-  a second native read.
+- One flow admits one completion. A `wait` flow claims completion before
+  `authorize` returns; a second `callback` answers `flow_state` and applies
+  nothing. `status` only reports the cached flow state.
 - Every mutation of one provider's credential slot serializes on it: the
   revision an `authorize` claims, a login's install, and a `disconnect`. The
   install re-reads the recorded binding before it writes, so a login that

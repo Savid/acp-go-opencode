@@ -50,12 +50,6 @@ const (
 	// authSafetyDeadline bounds a flow independently of the harness, which
 	// supplies no expiry of its own on this surface.
 	authSafetyDeadline = 15 * time.Minute
-	// authPollFloor is the fastest cadence a status call may drive a native
-	// read at, so consumer poll cadence never propagates into a provider.
-	authPollFloor = 5 * time.Second
-	// authSlowDownStep is added to the adapter's own interval when a native
-	// read answers with a rate-limit refusal.
-	authSlowDownStep = 5 * time.Second
 	// authNativeCallTimeout bounds one non-blocking native auth call.
 	authNativeCallTimeout = 30 * time.Second
 )
@@ -96,10 +90,8 @@ type authFlow struct {
 
 	broker *authBroker
 
-	nextProbeAt   time.Time
-	probeInterval time.Duration
-
-	disarm chan struct{}
+	completionDone chan struct{}
+	disarm         chan struct{}
 }
 
 type authAuthorizeResult struct {
@@ -235,7 +227,6 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 		createdAt:          record.CreatedAt,
 		state:              authStatePending,
 		expiresAt:          now.Add(authSafetyDeadline),
-		probeInterval:      authPollFloor,
 		disarm:             make(chan struct{}),
 	}
 
@@ -257,6 +248,10 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 	p.mu.Unlock()
 
 	p.armCompleter(flow)
+
+	if presentation.Interaction == authInteractionWait {
+		p.driveWaitCompletion(flow, session)
+	}
 
 	return presentation, nil
 }
@@ -499,6 +494,30 @@ func (p *providerAuth) armCompleter(flow *authFlow) {
 	})
 }
 
+func (p *providerAuth) driveWaitCompletion(flow *authFlow, session *session) {
+	done := make(chan struct{})
+
+	p.mu.Lock()
+	if err := p.claimFlowLocked(flow); err != nil {
+		p.mu.Unlock()
+
+		return
+	}
+
+	flow.completionDone = done
+	p.mu.Unlock()
+
+	p.goSafe("provider auth wait completion", func() {
+		defer close(done)
+		defer p.releaseFlow(flow)
+
+		ctx, cancel := context.WithDeadline(context.Background(), flow.expiresAt.Add(closeTimeout))
+		defer cancel()
+
+		_, _ = p.completeOAuth(ctx, session, flow, "")
+	})
+}
+
 func (p *providerAuth) expire(flow *authFlow) {
 	p.mu.Lock()
 
@@ -518,6 +537,7 @@ func (p *providerAuth) expire(flow *authFlow) {
 	defer cancel()
 
 	broker.destroy(ctx)
+	p.waitCompletion(ctx, flow)
 }
 
 // supersede terminalizes the flow a new authorize replaces and retires the
@@ -558,6 +578,7 @@ func (p *providerAuth) supersede(key authFlowKey, reason string) {
 	defer cancel()
 
 	broker.destroy(ctx)
+	p.waitCompletion(ctx, flow)
 }
 
 func (f *authFlow) stopCompleter() {
@@ -590,10 +611,23 @@ func (p *providerAuth) destroyBroker(ctx context.Context, flow *authFlow) {
 	broker.destroy(ctx)
 }
 
-// callback submits the flow's expected value. For an oauth flow it is the
-// completion driver: the native endpoint blocks until the provider settles,
-// after which the completed credential is read out of the broker home's own
-// store and installed once into the durable runtime store.
+func (p *providerAuth) waitCompletion(ctx context.Context, flow *authFlow) {
+	p.mu.Lock()
+	done := flow.completionDone
+	p.mu.Unlock()
+
+	if done == nil {
+		return
+	}
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+// callback submits the operator-supplied value for a code or API-key flow.
+// Wait flows drive their no-code native callback as soon as authorize returns.
 func (p *providerAuth) callback(ctx context.Context, params json.RawMessage) (any, error) {
 	fields, err := authParamFields(params, authFieldSessionID, authFieldProviderID, authFieldMethod, authFieldFlowID, authFieldInput)
 	if err != nil {
@@ -637,6 +671,12 @@ func (p *providerAuth) callback(ctx context.Context, params json.RawMessage) (an
 
 	if flow.method.ID != method {
 		return nil, invalidAuthField(authFieldMethod)
+	}
+
+	if flow.method.Type != authMethodTypeAPI {
+		if err := validateOAuthCallbackInput(flow, input); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := p.claimFlow(flow); err != nil {
@@ -684,16 +724,8 @@ func (p *providerAuth) applySecret(ctx context.Context, session *session, flow *
 }
 
 func (p *providerAuth) completeOAuth(ctx context.Context, session *session, flow *authFlow, input string) (any, error) {
-	if flow.presentation.CallbackInput == "" && input != "" {
-		return nil, invalidAuthField(authFieldInput)
-	}
-
-	if flow.presentation.CallbackInput != "" && input == "" {
-		return nil, invalidAuthField(authFieldInput)
-	}
-
-	if len(input) > authMaxTextInputBytes {
-		return nil, invalidAuthField(authFieldInput)
+	if err := validateOAuthCallbackInput(flow, input); err != nil {
+		return nil, err
 	}
 
 	p.mu.Lock()
@@ -733,6 +765,22 @@ func (p *providerAuth) completeOAuth(ctx context.Context, session *session, flow
 	p.destroyBroker(destroyCtx, flow)
 
 	return authFlowIDResult{FlowID: flow.id}, nil
+}
+
+func validateOAuthCallbackInput(flow *authFlow, input string) error {
+	if flow.presentation.CallbackInput == "" && input != "" {
+		return invalidAuthField(authFieldInput)
+	}
+
+	if flow.presentation.CallbackInput != "" && input == "" {
+		return invalidAuthField(authFieldInput)
+	}
+
+	if len(input) > authMaxTextInputBytes {
+		return invalidAuthField(authFieldInput)
+	}
+
+	return nil
 }
 
 // install performs the single fenced write into the durable runtime store and
@@ -901,13 +949,11 @@ func (p *providerAuth) addressFlow(sessionID acp.SessionId, providerID string, f
 
 // status reports the flow, not the connection. Its expiresAt is credential
 // expiry and never flow expiry.
-func (p *providerAuth) status(ctx context.Context, params json.RawMessage) (any, error) {
+func (p *providerAuth) status(_ context.Context, params json.RawMessage) (any, error) {
 	flow, err := p.addressedFlowLeg(params)
 	if err != nil {
 		return nil, err
 	}
-
-	p.probe(ctx, flow)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -918,69 +964,6 @@ func (p *providerAuth) status(ctx context.Context, params json.RawMessage) (any,
 	}
 
 	return result, nil
-}
-
-// probe refreshes a pending flow from the native store behind the adapter's own
-// interval floor, serving the cached state in between so a consumer's poll
-// cadence never reaches the provider. A native rate-limit refusal adds five
-// seconds to the interval, reported on the next call through the slower cadence
-// it produces.
-func (p *providerAuth) probe(ctx context.Context, flow *authFlow) {
-	p.mu.Lock()
-
-	now := authNow()
-	if authTerminal(flow.state) || flow.broker == nil || now.Before(flow.nextProbeAt) {
-		p.mu.Unlock()
-
-		return
-	}
-
-	// A poll declines rather than fails when the owner's own callback is already
-	// driving the same flow: both would read the same settled credential out of
-	// the same broker home and both would install it.
-	if p.claimFlowLocked(flow) != nil {
-		p.mu.Unlock()
-
-		return
-	}
-
-	flow.nextProbeAt = now.Add(flow.probeInterval)
-	broker := flow.broker
-	p.mu.Unlock()
-
-	defer p.releaseFlow(flow)
-
-	credential, ok, err := broker.client.StoredProviderAuth(ctx, flow.providerID)
-	if err != nil {
-		if opencode.IsRateLimited(err) {
-			p.mu.Lock()
-			flow.probeInterval += authSlowDownStep
-			flow.nextProbeAt = now.Add(flow.probeInterval)
-			p.mu.Unlock()
-		}
-
-		return
-	}
-
-	if !ok {
-		return
-	}
-
-	session, err := p.agent.session(flow.sessionID)
-	if err != nil {
-		return
-	}
-
-	if err := p.install(ctx, session, flow, credential); err != nil {
-		return
-	}
-
-	p.terminalize(flow, authStateAuthenticated, "", credential.Expires)
-
-	destroyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-	defer cancel()
-
-	p.destroyBroker(destroyCtx, flow)
 }
 
 // cancel is adapter-owned: OpenCode has no native cancel route, so the leg does
@@ -1008,6 +991,7 @@ func (p *providerAuth) cancel(ctx context.Context, params json.RawMessage) (any,
 	p.mu.Unlock()
 
 	broker.destroy(ctx)
+	p.waitCompletion(ctx, flow)
 
 	return authFlowIDResult{FlowID: flow.id}, nil
 }
@@ -1146,6 +1130,7 @@ func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId
 	p.closedSessions[sessionID] = struct{}{}
 
 	brokers := make([]*authBroker, 0, len(p.flows))
+	completions := make([]chan struct{}, 0, len(p.flows))
 
 	for key := range p.retired {
 		if key.sessionID == sessionID {
@@ -1161,7 +1146,13 @@ func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId
 		delete(p.flows, key)
 		delete(p.byID, flow.id)
 
+		if flow.completionDone != nil {
+			completions = append(completions, flow.completionDone)
+		}
+
 		if authTerminal(flow.state) {
+			brokers = append(brokers, flow.takeBroker())
+
 			continue
 		}
 
@@ -1176,6 +1167,14 @@ func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId
 
 	for _, broker := range brokers {
 		broker.destroy(ctx)
+	}
+
+	for _, done := range completions {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

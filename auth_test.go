@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -52,6 +53,14 @@ func withBrokerFactory(t *testing.T, agent *Agent) *fakeOpenCodeClient {
 
 	broker := newFakeOpenCodeClient()
 	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+		broker.mu.Lock()
+		if broker.closed {
+			broker.closed = false
+			broker.closeSignal = make(chan struct{})
+			broker.closeOnce = sync.Once{}
+		}
+		broker.mu.Unlock()
+
 		return broker, nil
 	}
 

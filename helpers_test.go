@@ -198,6 +198,8 @@ type fakeOpenCodeClient struct {
 	authorizeCalls         []fakeAuthorizeCall
 	authCallbackErr        error
 	authCallbackFunc       func(string, int, string) error
+	authCallbackStarted    chan struct{}
+	authCallbackRelease    chan struct{}
 	callbackCalls          []fakeAuthorizeCall
 	storedAuth             map[string]opencode.ProviderAuthCredential
 	storedAuthErr          error
@@ -209,6 +211,9 @@ type fakeOpenCodeClient struct {
 	removedAuth            []string
 	disposeErr             error
 	disposed               int
+
+	closeSignal chan struct{}
+	closeOnce   sync.Once
 }
 
 type errorSessionStore struct{ err error }
@@ -263,6 +268,7 @@ func newFakeOpenCodeClient() *fakeOpenCodeClient {
 		events:        make(chan opencode.Event, 16),
 		errs:          make(chan error, 16),
 		runtimeExited: make(chan struct{}),
+		closeSignal:   make(chan struct{}),
 	}
 }
 
@@ -280,6 +286,9 @@ func (c *fakeOpenCodeClient) Close(context.Context) error {
 	c.closed = true
 	c.closeCalls++
 	c.mu.Unlock()
+	c.closeOnce.Do(func() {
+		close(c.closeSignal)
+	})
 
 	return c.closeErr
 }
@@ -847,10 +856,25 @@ func (c *fakeOpenCodeClient) ProviderAuthorize(_ context.Context, providerID str
 	return c.authorization, c.authorizeErr
 }
 
-func (c *fakeOpenCodeClient) ProviderAuthCallback(_ context.Context, providerID string, method int, code string) error {
+func (c *fakeOpenCodeClient) ProviderAuthCallback(ctx context.Context, providerID string, method int, code string) error {
 	c.mu.Lock()
 	c.callbackCalls = append(c.callbackCalls, fakeAuthorizeCall{providerID: providerID, method: method, code: code})
+	started := c.authCallbackStarted
+	release := c.authCallbackRelease
+	closeSignal := c.closeSignal
 	c.mu.Unlock()
+
+	signalTestHook(started)
+
+	if release != nil {
+		select {
+		case <-release:
+		case <-closeSignal:
+			return context.Canceled
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 
 	if c.authCallbackFunc != nil {
 		return c.authCallbackFunc(providerID, method, code)
