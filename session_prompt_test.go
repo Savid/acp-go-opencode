@@ -3689,6 +3689,75 @@ func TestPromptStreamErrorIsStructuredTransportFailure(t *testing.T) {
 	}
 }
 
+func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	client.sendMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		close(started)
+		<-ctx.Done()
+		close(stopped)
+
+		return opencode.NativeMessage{}, ctx.Err()
+	}
+	session := testSession(NewAgent(), client)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := session.Prompt(ctx, acp.PromptRequest{
+			SessionId: session.id,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("hi")},
+		})
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("Prompt did not start")
+	}
+
+	client.events <- opencode.Event{
+		Type: eventSessionError,
+		Properties: mustJSON(t, opencode.SessionError{
+			SessionID: "foreign-session",
+			Error:     providerNativeError("foreign failure", 400, "foreign"),
+		}),
+	}
+	client.events <- opencode.Event{
+		Type: eventSessionError,
+		Properties: mustJSON(t, opencode.SessionError{
+			SessionID: session.idmap.NativeSessionID,
+			Error:     providerNativeError("model rejected", 400, "invalid_model"),
+		}),
+	}
+
+	select {
+	case err := <-done:
+		data := assertTurnFailed(t, err, causeProvider, "model rejected")
+		if data[jsonFieldStatusCode] != 400 || data[jsonFieldProviderCode] != "invalid_model" {
+			t.Fatalf("session error data = %#v", data)
+		}
+	case <-ctx.Done():
+		t.Fatal("Prompt did not return after session.error")
+	}
+
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("native prompt polling did not stop")
+	}
+
+	client.mu.Lock()
+	closed := client.closed
+	client.mu.Unlock()
+	if closed {
+		t.Fatal("session.error retired the shared runtime")
+	}
+}
+
 // T5 — a native error observed while the turn is cancelled maps to StopReason
 // cancelled with a nil error: the cancel guard runs before failure mapping.
 func TestPromptCancelSuppressesNativeError(t *testing.T) {

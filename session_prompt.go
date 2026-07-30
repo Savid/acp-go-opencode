@@ -30,6 +30,7 @@ const (
 	eventMessagePartCreated = "message.part.created"
 	eventMessagePartUpdated = "message.part.updated"
 	eventMessageUpdated     = "message.updated"
+	eventSessionError       = "session.error"
 	eventQuestionAsked      = "question.asked"
 	eventQuestionV2Asked    = "question.v2.asked"
 
@@ -461,6 +462,15 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 			}
 
 			if err := s.handleEvent(turnCtx, event); err != nil {
+				var assistantErr *opencode.AssistantError
+				if errors.As(err, &assistantErr) {
+					if response, cancelErr, cancelled := s.settlePromptCancellation(ctx, fenceTurn, params); cancelled {
+						return response, cancelErr
+					}
+
+					return s.finishPromptTurn(ctx, turnCtx, params, promptTurnResult{err: err}, command, matchedCommand)
+				}
+
 				return failTurn(err)
 			}
 		case err := <-s.client.EventErrors():
@@ -1477,6 +1487,14 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 	case eventMessageUpdated:
 		if info, ok := eventMessageInfo(event.Properties); ok && info.SessionID == s.idmap.NativeSessionID {
 			s.recordMessageRole(info)
+		}
+	case eventSessionError:
+		var nativeError opencode.SessionError
+		if err := json.Unmarshal(event.Properties, &nativeError); err != nil {
+			return err
+		}
+		if nativeError.SessionID == s.idmap.NativeSessionID && nativeError.Error != nil {
+			return opencode.AssistantErrorFromNativeError(nativeError.Error)
 		}
 	case eventMessagePartUpdated, eventMessagePartCreated:
 		part, delta, ok := eventPartUpdate(event.Properties)

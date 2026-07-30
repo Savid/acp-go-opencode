@@ -477,6 +477,11 @@ type NativeError struct {
 	} `json:"data"`
 }
 
+type SessionError struct {
+	SessionID string       `json:"sessionID"`
+	Error     *NativeError `json:"error"`
+}
+
 // providerCode parses the native error's provider response body and returns the
 // provider error code, falling back to the provider error type. It is lenient:
 // a missing or malformed responseBody yields an empty string rather than an
@@ -1763,7 +1768,14 @@ func AssistantMessageError(message NativeMessage) error {
 		return &AssistantError{}
 	}
 
-	nerr := message.Info.Error
+	return AssistantErrorFromNativeError(message.Info.Error)
+}
+
+func AssistantErrorFromNativeError(nerr *NativeError) *AssistantError {
+	if nerr == nil {
+		return &AssistantError{}
+	}
+
 	detail := firstNonEmpty(
 		nerr.Message,
 		nerr.Data.Message,
