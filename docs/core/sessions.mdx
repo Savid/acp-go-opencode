@@ -22,10 +22,13 @@ inherited `PATH`. A process environment is fixed at exec, so an environment
 binds a runtime generation, not a session. The first session to reach the
 runtime latches it. A later session asking for the same environment reuses that
 generation; one asking for a different environment starts a fresh generation
-while no session is live, and is rejected with `runtime_env_conflict` while a
-live session still holds the running one. Merging is never an option: it would
-hand one session's environment to another. A recovering session rebinds to a
-runtime carrying the environment it was admitted under.
+while no session is live, and meets
+`{"error": "backpressure", "limit": "runtime_environment"}` while a live session
+still holds the running one. That hold is transient — the same request succeeds
+once the last holding session closes — so a client treats it as retry-later
+rather than as an unavailable agent. Merging is never an option: it would hand
+one session's environment to another. A recovering session rebinds to a runtime
+carrying the environment it was admitted under.
 
 ## Lifecycle
 

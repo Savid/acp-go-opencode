@@ -65,7 +65,6 @@ const (
 	validationRequired                 = "required"
 	validationDuplicate                = "duplicate"
 	errValueBackpressure               = "backpressure"
-	errValueRuntimeEnvConflict         = "runtime_env_conflict"
 	errValueAbsolutePathRequired       = "absolute_path_required"
 	errValueUnsupported                = "unsupported"
 	errValueNoTransport                = "no_transport"
@@ -80,8 +79,9 @@ const (
 	rawReasonOversize       = "oversize"
 	rawReasonUnserializable = "unserializable"
 
-	rawEventSource     = "opencode-serve"
-	limitSessionPrompt = "session_prompt"
+	rawEventSource          = "opencode-serve"
+	limitSessionPrompt      = "session_prompt"
+	limitRuntimeEnvironment = "runtime_environment"
 
 	runtimeEnvironmentChangedCause = "shared OpenCode runtime environment changed"
 )

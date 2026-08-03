@@ -106,8 +106,14 @@ func (a *Agent) sharedRuntimeBinding(
 				// A live session holds the running environment: replacing the
 				// process would take its native state with it, and merging two
 				// environments would hand one session's secrets to the other.
+				// The holder is transient, so this is backpressure on the one
+				// environment slot rather than a refusal of the request itself:
+				// the same request succeeds once the last holder closes.
 				if held > 0 {
-					return nil, 0, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueRuntimeEnvConflict})
+					return nil, 0, acp.NewInvalidRequest(map[string]any{
+						jsonFieldError: errValueBackpressure,
+						jsonFieldLimit: limitRuntimeEnvironment,
+					})
 				}
 
 				if retireErr := a.retireSharedRuntime(generation, runtimeEnvironmentChangedCause); retireErr != nil {

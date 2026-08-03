@@ -1296,10 +1296,25 @@ func TestSessionEnvironmentReachesTheNativeProcess(t *testing.T) {
 	require.NoError(t, agent.Close())
 }
 
+// requireRuntimeEnvironmentBackpressure pins the exact -32600 payload a client
+// tells the transient environment holder apart by. The hold ends when the last
+// holding session closes, so the same request retried later succeeds.
+func requireRuntimeEnvironmentBackpressure(t *testing.T, err error) {
+	t.Helper()
+
+	var reqErr *acp.RequestError
+	require.ErrorAs(t, err, &reqErr)
+	require.Equal(t, -32600, reqErr.Code)
+	require.Equal(t, map[string]any{
+		jsonFieldError: errValueBackpressure,
+		jsonFieldLimit: limitRuntimeEnvironment,
+	}, reqErr.Data)
+}
+
 // One native process serves every session, so the environment binds the
-// running generation: an identical request reuses it, a differing one is
-// refused while a session still holds it, and the next differing request after
-// that session closes starts a fresh generation.
+// running generation: an identical request reuses it, a differing one meets
+// backpressure while a session still holds it, and the next differing request
+// after that session closes starts a fresh generation.
 func TestSessionEnvironmentBindsTheSharedRuntimeGeneration(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
@@ -1334,7 +1349,13 @@ func TestSessionEnvironmentBindsTheSharedRuntimeGeneration(t *testing.T) {
 	require.EqualValues(t, 1, factoryCalls.Load())
 
 	_, err = agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "two"}))
-	require.ErrorContains(t, err, errValueRuntimeEnvConflict)
+	requireRuntimeEnvironmentBackpressure(t, err)
+	require.EqualValues(t, 1, factoryCalls.Load())
+
+	// Asking for no environment at all is the same hold: admitting it would put
+	// a session on a process whose environment still carries the holder's token.
+	_, err = agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	requireRuntimeEnvironmentBackpressure(t, err)
 	require.EqualValues(t, 1, factoryCalls.Load())
 
 	for id := range agent.sessions {

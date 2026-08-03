@@ -53,9 +53,10 @@ A process environment is fixed at exec and one native process serves every
 session of an Agent, so `options.env` and `options.extraPathDirs` bind the
 runtime generation rather than the session alone: an identical environment
 reuses the running generation, a differing one starts a fresh generation while
-no session is live, and a differing one is rejected with
-`{"error": "runtime_env_conflict"}` while a session still holds the running
-environment. `options.env` may not carry `PATH`, because its entries replace
+no session is live, and a differing one meets
+`{"error": "backpressure", "limit": "runtime_environment"}` while a session
+still holds the running environment — retry-later, not a rejected request.
+`options.env` may not carry `PATH`, because its entries replace
 whole values and dropping the inherited search path unresolves the native
 executable; `options.extraPathDirs` is the additive mechanism and rejects a
 relative entry with `{"error": "absolute_path_required"}`.
