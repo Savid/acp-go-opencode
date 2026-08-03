@@ -432,7 +432,22 @@ func (a *Agent) graphSecretNeedles(graph []*session) []string {
 		member.mu.Unlock()
 	}
 
-	for key, value := range a.options.Env {
+	needles = append(needles, sensitiveEnvNeedles(a.options.Env)...)
+
+	return needles
+}
+
+// sensitiveEnvNeedles names the process-environment values a stored snapshot
+// must never carry in clear text. The name decides: an environment map is
+// operator- or host-supplied and carries no per-key sensitivity marking.
+func sensitiveEnvNeedles(env map[string]string) []string {
+	var needles []string
+
+	for key, value := range env {
+		if value == "" {
+			continue
+		}
+
 		upper := strings.ToUpper(key)
 		if strings.Contains(upper, "TOKEN") || strings.Contains(upper, "KEY") || strings.Contains(upper, "SECRET") ||
 			strings.Contains(upper, "PASSWORD") || strings.Contains(upper, "AUTH") || strings.Contains(upper, "COOKIE") {

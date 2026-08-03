@@ -222,3 +222,36 @@ func (noopACPClient) ReleaseTerminal(context.Context, acp.ReleaseTerminalRequest
 func (noopACPClient) WaitForTerminalExit(context.Context, acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
 	return acp.WaitForTerminalExitResponse{}, nil
 }
+
+// The environment builders reach _meta unchanged and hand over copies, so a
+// caller mutating its own map after the call cannot rewrite the request.
+func TestOpenCodeEnvironmentBuilders(t *testing.T) {
+	env := map[string]string{"HOST_API_TOKEN": "secret"}
+	dirs := []string{"/session/bin"}
+	req := NewSessionRequest("/tmp/project", WithSessionOpenCodeOptions(NewOpenCodeOptions(
+		WithOpenCodeEnv(env),
+		WithOpenCodeExtraPathDirs(dirs...),
+	)))
+
+	env["HOST_API_TOKEN"] = "mutated"
+	dirs[0] = "/mutated"
+
+	meta, err := sessionMetaFromLifecycle(req.Meta)
+	if err != nil {
+		t.Fatalf("session meta from builder: %v", err)
+	}
+	if meta.Env["HOST_API_TOKEN"] != "secret" {
+		t.Fatalf("session env = %#v", meta.Env)
+	}
+	if len(meta.ExtraPathDirs) != 1 || meta.ExtraPathDirs[0] != "/session/bin" {
+		t.Fatalf("session extra path dirs = %#v", meta.ExtraPathDirs)
+	}
+
+	empty, ok := NewOpenCodeOptions().Meta()[opencodeMetaKey].(map[string]any)
+	if !ok {
+		t.Fatalf("empty options meta = %#v", empty)
+	}
+	if values, ok := empty[metaOptionsKey].(map[string]any); !ok || len(values) != 0 {
+		t.Fatalf("empty options meta values = %#v", values)
+	}
+}

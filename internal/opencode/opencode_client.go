@@ -187,8 +187,12 @@ type StartOptions struct {
 	// BrowserShim shadows every browser launcher on the child's PATH for the
 	// lifetime of a login leg. The caller owns the directory; leaving it nil
 	// leaves the child free to open the operator's desktop browser.
-	BrowserShim              *BrowserShim
-	Env                      map[string]string
+	BrowserShim *BrowserShim
+	Env         map[string]string
+	// ExtraPathDirs are absolute directories placed ahead of the inherited
+	// PATH, in order. Env cannot carry a search path: its entries replace whole
+	// values, so a PATH there would drop everything the child resolves against.
+	ExtraPathDirs            []string
 	Pure                     bool
 	QuestionTool             bool
 	LogLevel                 string
@@ -937,9 +941,10 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		env["OPENCODE_ENABLE_QUESTION_TOOL"] = "1"
 	}
 
-	nativeEnv := envMapToSlice(env)
-	// The shim has to reach the assembled slice rather than the map above: it
-	// prepends to the inherited PATH instead of replacing it.
+	// Both PATH mechanisms reach the assembled slice rather than the map above:
+	// they prepend to the inherited PATH instead of replacing it. The shim runs
+	// last so its shadowed launchers stay ahead of caller directories.
+	nativeEnv := prependPathDirs(envMapToSlice(env), options.ExtraPathDirs)
 	if options.BrowserShim != nil {
 		nativeEnv = options.BrowserShim.environ(nativeEnv)
 	}

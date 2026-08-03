@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -40,13 +41,45 @@ func fatalRuntimeCleanup(err error) bool {
 		errors.Is(err, errRuntimeScratchCleanup)
 }
 
+// runtimeEnvironment is the process environment one shared runtime generation
+// was started under. One native process serves every session of an Agent and a
+// process environment is fixed at exec, so a per-session environment is a
+// property of the generation rather than of the session that asked for it.
+type runtimeEnvironment struct {
+	Env           map[string]string
+	ExtraPathDirs []string
+}
+
+func (e runtimeEnvironment) equal(other runtimeEnvironment) bool {
+	return maps.Equal(e.Env, other.Env) && slices.Equal(e.ExtraPathDirs, other.ExtraPathDirs)
+}
+
+// sessionRuntimeEnvironment overlays what a session asked for on the
+// agent-wide environment. The session wins per key; the operator still owns
+// every key the session left alone.
+func (a *Agent) sessionRuntimeEnvironment(meta sessionMeta) runtimeEnvironment {
+	env := cloneStringMap(a.options.Env)
+	if env == nil {
+		env = map[string]string{}
+	}
+
+	for key, value := range meta.Env {
+		env[key] = value
+	}
+
+	return runtimeEnvironment{Env: env, ExtraPathDirs: append([]string(nil), meta.ExtraPathDirs...)}
+}
+
 func (a *Agent) sharedRuntime(ctx context.Context) (opencode.Client, error) {
-	runtime, _, err := a.sharedRuntimeBinding(ctx)
+	runtime, _, err := a.sharedRuntimeBinding(ctx, a.sessionRuntimeEnvironment(sessionMeta{}))
 
 	return runtime, err
 }
 
-func (a *Agent) sharedRuntimeBinding(ctx context.Context) (opencode.Client, uint64, error) {
+func (a *Agent) sharedRuntimeBinding(
+	ctx context.Context,
+	environment runtimeEnvironment,
+) (opencode.Client, uint64, error) {
 	for {
 		a.mu.Lock()
 		if a.closed {
@@ -65,6 +98,25 @@ func (a *Agent) sharedRuntimeBinding(ctx context.Context) (opencode.Client, uint
 		if a.runtime != nil {
 			runtime := a.runtime
 			generation := a.runtimeGeneration
+
+			if !a.runtimeEnv.equal(environment) {
+				held := len(a.sessions)
+				a.mu.Unlock()
+
+				// A live session holds the running environment: replacing the
+				// process would take its native state with it, and merging two
+				// environments would hand one session's secrets to the other.
+				if held > 0 {
+					return nil, 0, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueRuntimeEnvConflict})
+				}
+
+				if retireErr := a.retireSharedRuntime(generation, runtimeEnvironmentChangedCause); retireErr != nil {
+					return nil, 0, retireErr
+				}
+
+				continue
+			}
+
 			a.mu.Unlock()
 
 			exited := runtime.RuntimeExited()
@@ -98,13 +150,14 @@ func (a *Agent) sharedRuntimeBinding(ctx context.Context) (opencode.Client, uint
 		a.runtimeStarting = starting
 		a.mu.Unlock()
 
-		runtime, nativeRelease, xdgScratchRelease, err := a.startSharedRuntime(context.WithoutCancel(ctx))
+		runtime, nativeRelease, xdgScratchRelease, err := a.startSharedRuntime(context.WithoutCancel(ctx), environment)
 
 		a.mu.Lock()
 		if err == nil && !a.closed {
 			a.runtimeGeneration++
 			generation = a.runtimeGeneration
 			a.runtime = runtime
+			a.runtimeEnv = environment
 			a.runtimeNativeRelease = nativeRelease
 			a.runtimeXDGScratchRelease = xdgScratchRelease
 			a.runtimeStartErr = nil
@@ -391,7 +444,10 @@ func (a *Agent) closeFailedSession(session *session) error {
 	return closeErr
 }
 
-func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, func(), func(), error) {
+func (a *Agent) startSharedRuntime(
+	ctx context.Context,
+	environment runtimeEnvironment,
+) (opencode.Client, func(), func(), error) {
 	hooks := a.options.RuntimeResourceHooks
 
 	var xdgScratchRelease func()
@@ -438,7 +494,8 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, func()
 			)
 		},
 		ExecutablePath: a.options.ExecutablePath,
-		Env:            a.observe.InjectTraceEnv(ctx, cloneStringMap(a.options.Env)),
+		Env:            a.observe.InjectTraceEnv(ctx, cloneStringMap(environment.Env)),
+		ExtraPathDirs:  append([]string(nil), environment.ExtraPathDirs...),
 		Pure:           a.options.Pure, QuestionTool: a.options.QuestionTool,
 		LogLevel: a.options.LogLevel, MinVersion: minNativeVersion,
 		HealthTimeout: a.options.HealthCheckTimeout, Logger: a.log,

@@ -65,6 +65,8 @@ const (
 	validationRequired                 = "required"
 	validationDuplicate                = "duplicate"
 	errValueBackpressure               = "backpressure"
+	errValueRuntimeEnvConflict         = "runtime_env_conflict"
+	errValueAbsolutePathRequired       = "absolute_path_required"
 	errValueUnsupported                = "unsupported"
 	errValueNoTransport                = "no_transport"
 	errValueSessionUnknown             = "unknown session"
@@ -80,6 +82,8 @@ const (
 
 	rawEventSource     = "opencode-serve"
 	limitSessionPrompt = "session_prompt"
+
+	runtimeEnvironmentChangedCause = "shared OpenCode runtime environment changed"
 )
 
 type rawMessageConfig struct {

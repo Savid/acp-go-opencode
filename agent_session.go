@@ -52,7 +52,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 	mcpConfigs := nativeMCPServerConfigs(params.McpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, a.sessionRuntimeEnvironment(meta))
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -81,7 +81,8 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 	session := newSession(a, id, params.Cwd, params.AdditionalDirectories, native, client, meta, idmap)
 	session.directoryRelease = releaseDirectory
-	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
+
+	session.secretNeedles = append(mcpSecretNeedles(mcpConfigs), sensitiveEnvNeedles(meta.Env)...)
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
@@ -220,7 +221,7 @@ func (a *Agent) loadOrResumeSession(
 
 	mcpConfigs := nativeMCPServerConfigs(mcpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, cwd, mcpConfigs)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, cwd, mcpConfigs, a.sessionRuntimeEnvironment(meta))
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +244,8 @@ func (a *Agent) loadOrResumeSession(
 
 	session := newSession(a, id, cwd, additionalDirectories, native, client, meta, idmap)
 	session.directoryRelease = releaseDirectory
-	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
+
+	session.secretNeedles = append(mcpSecretNeedles(mcpConfigs), sensitiveEnvNeedles(meta.Env)...)
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
@@ -452,7 +454,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 	mcpConfigs := nativeMCPServerConfigsFromUnstable(params.McpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, a.sessionRuntimeEnvironment(meta))
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -480,7 +482,8 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 	session := newSession(a, id, params.Cwd, params.AdditionalDirectories, native, client, meta, idmap)
 	session.directoryRelease = releaseDirectory
-	session.secretNeedles = mcpSecretNeedles(mcpConfigs)
+
+	session.secretNeedles = append(mcpSecretNeedles(mcpConfigs), sensitiveEnvNeedles(meta.Env)...)
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
@@ -589,14 +592,20 @@ func httpHeaderMap(headers []acp.HttpHeader) map[string]string {
 	return values
 }
 
-func (a *Agent) newOpenCodeClient(ctx context.Context, id acp.SessionId, cwd string, mcpServers []opencode.MCPServerConfig) (opencode.Client, func(), uint64, error) {
+func (a *Agent) newOpenCodeClient(
+	ctx context.Context,
+	id acp.SessionId,
+	cwd string,
+	mcpServers []opencode.MCPServerConfig,
+	environment runtimeEnvironment,
+) (opencode.Client, func(), uint64, error) {
 	for {
 		releaseDirectory, err := a.bindDirectory(id, cwd, mcpServers)
 		if err != nil {
 			return nil, nil, 0, err
 		}
 
-		runtime, generation, err := a.sharedRuntimeBinding(ctx)
+		runtime, generation, err := a.sharedRuntimeBinding(ctx, environment)
 		if err != nil {
 			releaseDirectory()
 

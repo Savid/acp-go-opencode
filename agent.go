@@ -54,6 +54,7 @@ type Agent struct {
 	positionEncoding         acp.PositionEncodingKind
 	runtime                  opencode.Client
 	runtimeGeneration        uint64
+	runtimeEnv               runtimeEnvironment
 	runtimeStarting          chan struct{}
 	runtimeStartErr          error
 	runtimeFatalErr          error

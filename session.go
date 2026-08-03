@@ -35,6 +35,9 @@ type session struct {
 	secretNeedles         []string
 	outputSchema          map[string]any
 	rawMessages           rawMessageConfig
+	// runtimeEnv is the environment this session was admitted under. Recovery
+	// rebinds to a runtime carrying it, never to whichever one is running.
+	runtimeEnv runtimeEnvironment
 
 	client            opencode.Client
 	directoryRelease  func()
@@ -149,6 +152,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		permission:              normalizeOpenCodePermission(meta.Permission),
 		outputSchema:            cloneAnyMap(meta.OutputSchema),
 		rawMessages:             meta.RawMessages,
+		runtimeEnv:              agent.sessionRuntimeEnvironment(meta),
 		client:                  client,
 		emittedPartText:         map[string]string{},
 		emittedTools:            map[string]emittedToolState{},
@@ -1121,6 +1125,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 	cwd := s.cwd
 	model := joinModelValue(s.providerID, s.modelID)
 	mcpServers := cloneNativeMCPServerConfigs(s.mcpServers)
+	environment := s.runtimeEnv
 	s.mu.Unlock()
 
 	storeCtx, cancel := s.agent.sessionStoreContext(ctx)
@@ -1146,7 +1151,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 			return err
 		}
 
-		client, releaseDirectory, generation, err := s.agent.newOpenCodeClient(ctx, id, cwd, mcpServers)
+		client, releaseDirectory, generation, err := s.agent.newOpenCodeClient(ctx, id, cwd, mcpServers, environment)
 		if err != nil {
 			return err
 		}

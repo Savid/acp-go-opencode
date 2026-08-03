@@ -4,8 +4,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/coder/acp-go-sdk"
+)
+
+const (
+	envOptionPath           = "_meta.opencode.options." + metaEnvKey
+	extraPathDirsOptionPath = "_meta.opencode.options." + metaExtraPathDirsKey
 )
 
 type sessionMeta struct {
@@ -14,6 +21,8 @@ type sessionMeta struct {
 	Mode          string
 	Permission    string
 	PermissionSet bool
+	Env           map[string]string
+	ExtraPathDirs []string
 	RawMessages   rawMessageConfig
 }
 
@@ -35,6 +44,8 @@ func sessionMetaFromLifecycle(meta map[string]any) (sessionMeta, error) {
 		Mode:          options.Mode,
 		Permission:    normalizeOpenCodePermission(options.Permission),
 		PermissionSet: options.PermissionSet,
+		Env:           options.Env,
+		ExtraPathDirs: options.ExtraPathDirs,
 		RawMessages:   rawMessageConfigFromMeta(meta),
 	}, nil
 }
@@ -45,6 +56,8 @@ type opencodeMetaOptions struct {
 	Mode          string
 	Permission    string
 	PermissionSet bool
+	Env           map[string]string
+	ExtraPathDirs []string
 }
 
 func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
@@ -57,8 +70,22 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 
 	options := opencodeMetaOptions{}
 
-	if _, removed := optionsMap[metaEnvKey]; removed {
-		return opencodeMetaOptions{}, unsupportedField("_meta.opencode.options." + metaEnvKey)
+	if rawEnv, ok := optionsMap[metaEnvKey]; ok {
+		env, err := sessionEnvFromMeta(rawEnv)
+		if err != nil {
+			return opencodeMetaOptions{}, err
+		}
+
+		options.Env = env
+	}
+
+	if rawDirs, ok := optionsMap[metaExtraPathDirsKey]; ok {
+		dirs, err := extraPathDirsFromMeta(rawDirs)
+		if err != nil {
+			return opencodeMetaOptions{}, err
+		}
+
+		options.ExtraPathDirs = dirs
 	}
 
 	if rawModel, ok := optionsMap[metaModelKey]; ok {
@@ -104,6 +131,86 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 	return options, nil
 }
 
+// sessionEnvFromMeta reads the per-session process environment. A host may send
+// it as JSON or hand it over in process, so both shapes are accepted. PATH is
+// refused here rather than merged: these entries replace whole values, and the
+// additive mechanism is extraPathDirs.
+func sessionEnvFromMeta(value any) (map[string]string, error) {
+	var values map[string]any
+
+	switch typed := value.(type) {
+	case map[string]string:
+		values = make(map[string]any, len(typed))
+		for key, entry := range typed {
+			values[key] = entry
+		}
+	case map[string]any:
+		values = typed
+	default:
+		return nil, unsupportedField(envOptionPath)
+	}
+
+	env := make(map[string]string, len(values))
+
+	for key, raw := range values {
+		text, ok := raw.(string)
+		if !ok || !validEnvName(key) {
+			return nil, unsupportedField(envOptionPath + "." + key)
+		}
+
+		env[key] = text
+	}
+
+	return env, nil
+}
+
+// validEnvName refuses names a child process cannot carry, plus the one name
+// this option is not allowed to own.
+func validEnvName(key string) bool {
+	return key != "" && key != envPathKey && !strings.ContainsAny(key, "=\x00")
+}
+
+// extraPathDirsFromMeta reads the directories placed ahead of the inherited
+// PATH. Relative entries are refused: the native process resolves them against
+// its own working directory, not the session's.
+func extraPathDirsFromMeta(value any) ([]string, error) {
+	var raw []any
+
+	switch typed := value.(type) {
+	case []string:
+		raw = make([]any, 0, len(typed))
+		for _, entry := range typed {
+			raw = append(raw, entry)
+		}
+	case []any:
+		raw = typed
+	default:
+		return nil, unsupportedField(extraPathDirsOptionPath)
+	}
+
+	dirs := make([]string, 0, len(raw))
+
+	for index, entry := range raw {
+		field := fmt.Sprintf("%s[%d]", extraPathDirsOptionPath, index)
+
+		dir, ok := entry.(string)
+		if !ok {
+			return nil, unsupportedField(field)
+		}
+
+		if !filepath.IsAbs(dir) {
+			return nil, acp.NewInvalidParams(map[string]any{
+				jsonFieldError: errValueAbsolutePathRequired,
+				jsonFieldField: field,
+			})
+		}
+
+		dirs = append(dirs, dir)
+	}
+
+	return dirs, nil
+}
+
 func validateLifecycleMeta(meta map[string]any) error {
 	if len(meta) == 0 {
 		return nil
@@ -128,7 +235,7 @@ func validateLifecycleMeta(meta map[string]any) error {
 
 			for optionKey := range optionsMap {
 				switch optionKey {
-				case configModel, "outputSchema", configMode, metaPermissionKey:
+				case configModel, "outputSchema", configMode, metaPermissionKey, metaEnvKey, metaExtraPathDirsKey:
 				default:
 					return unsupportedField("_meta.opencode.options." + optionKey)
 				}

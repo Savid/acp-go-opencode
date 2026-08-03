@@ -33,7 +33,7 @@ runtime and its resources quarantined.
 | `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
 | `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant and numeric-PGID-reuse risks. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
-| `WithEnv` | Immutable environment overrides for the shared native process. |
+| `WithEnv` | Agent-wide environment overrides for the shared native process; a session may overlay them per key. |
 | `WithSeedFiles` | Immutable files written into the shared config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
@@ -140,8 +140,14 @@ Session-scoped request options include `WithSessionMCPServers`,
 
 `OpenCodeOptions` (built with `NewOpenCodeOptions` and `WithOpenCodeModel`,
 `WithOpenCodeOutputSchema`, `WithOpenCodeMode`,
-`WithOpenCodePermission`) render into `_meta.opencode.options` via its `Meta`
-method.
+`WithOpenCodePermission`, `WithOpenCodeEnv`, `WithOpenCodeExtraPathDirs`)
+render into `_meta.opencode.options` via its `Meta` method.
+
+`WithOpenCodeEnv` overlays `WithEnv` for the native process the session runs
+under, and `WithOpenCodeExtraPathDirs` places absolute directories ahead of
+that process's inherited `PATH`. See
+[Sessions](/docs/core/sessions) for how an environment binds a runtime
+generation.
 
 ## Session store
 

@@ -1251,3 +1251,158 @@ func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing
 	})
 	require.Len(t, configs, 1)
 }
+
+// A session environment reaches the native process it runs under: the
+// requested variables overlay the agent-wide ones and the requested
+// directories arrive as PATH entries the native launch prepends.
+func TestSessionEnvironmentReachesTheNativeProcess(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-env")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	var started []opencode.StartOptions
+
+	agent := NewAgent(
+		WithHome(t.TempDir()),
+		WithEnv(map[string]string{"SHARED": "agent", "OVERLAID": "agent"}),
+		func(options *Options) {
+			options.clientFactory = func(_ context.Context, start opencode.StartOptions) (opencode.Client, error) {
+				started = append(started, start)
+
+				return client, nil
+			}
+		},
+	)
+	agent.setAgentClient(newRecordingAgentClient())
+
+	_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
+		WithOpenCodeEnv(map[string]string{"OVERLAID": "session", "HOST_API_TOKEN": "secret", "EMPTY_TOKEN": ""}),
+		WithOpenCodeExtraPathDirs("/session/bin"),
+	))))
+	require.NoError(t, err)
+	require.Len(t, started, 1)
+	require.Equal(t, "agent", started[0].Env["SHARED"])
+	require.Equal(t, "session", started[0].Env["OVERLAID"])
+	require.Equal(t, "secret", started[0].Env["HOST_API_TOKEN"])
+	require.Equal(t, []string{"/session/bin"}, started[0].ExtraPathDirs)
+
+	require.Len(t, agent.sessions, 1)
+
+	for _, session := range agent.sessions {
+		require.Equal(t, []string{"secret"}, session.secretNeedles)
+	}
+
+	require.NoError(t, agent.Close())
+}
+
+// One native process serves every session, so the environment binds the
+// running generation: an identical request reuses it, a differing one is
+// refused while a session still holds it, and the next differing request after
+// that session closes starts a fresh generation.
+func TestSessionEnvironmentBindsTheSharedRuntimeGeneration(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+
+	var created atomic.Int64
+
+	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
+		return testNativeSession(fmt.Sprintf("native-%d", created.Add(1))), nil
+	}
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	var factoryCalls atomic.Int64
+
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			factoryCalls.Add(1)
+
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	session := func(env map[string]string) acp.NewSessionRequest {
+		return NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(env))))
+	}
+
+	_, err := agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "one"}))
+	require.NoError(t, err)
+
+	_, err = agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "one"}))
+	require.NoError(t, err)
+	require.EqualValues(t, 1, factoryCalls.Load())
+
+	_, err = agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "two"}))
+	require.ErrorContains(t, err, errValueRuntimeEnvConflict)
+	require.EqualValues(t, 1, factoryCalls.Load())
+
+	for id := range agent.sessions {
+		_, closeErr := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: id})
+		require.NoError(t, closeErr)
+	}
+
+	_, err = agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "two"}))
+	require.NoError(t, err)
+	require.EqualValues(t, 2, factoryCalls.Load())
+	require.EqualValues(t, 2, agent.runtimeGeneration)
+	require.NoError(t, agent.Close())
+}
+
+// Recovery rebinds a session to a runtime carrying the environment it was
+// admitted under, not to whatever the replacement generation would default to.
+func TestRecoveredSessionKeepsItsEnvironment(t *testing.T) {
+	ctx := context.Background()
+	first := newFakeOpenCodeClient()
+	first.createSession = testNativeSession("native-first")
+	first.agents = []opencode.NativeAgent{{Name: "build"}}
+	second := newFakeOpenCodeClient()
+	second.xdg = first.xdg
+	second.getSession = testNativeSession("native-first")
+	second.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	var (
+		factoryCalls atomic.Int64
+		startedMu    sync.Mutex
+		started      []opencode.StartOptions
+	)
+
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(_ context.Context, start opencode.StartOptions) (opencode.Client, error) {
+			startedMu.Lock()
+			started = append(started, start)
+			startedMu.Unlock()
+
+			if factoryCalls.Add(1) == 1 {
+				return first, nil
+			}
+
+			return second, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
+		WithOpenCodeEnv(map[string]string{"HOST_API_TOKEN": "secret"}),
+		WithOpenCodeExtraPathDirs("/session/bin"),
+	))))
+	require.NoError(t, err)
+	close(first.runtimeExited)
+	require.Eventually(t, func() bool {
+		agent.mu.Lock()
+		defer agent.mu.Unlock()
+
+		return agent.runtime == nil
+	}, time.Second, 10*time.Millisecond)
+
+	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "recovery-turn", "continue after restart"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+
+	startedMu.Lock()
+	defer startedMu.Unlock()
+	require.Len(t, started, 2)
+	require.Equal(t, "secret", started[1].Env["HOST_API_TOKEN"])
+	require.Equal(t, []string{"/session/bin"}, started[1].ExtraPathDirs)
+	require.NoError(t, agent.Close())
+}

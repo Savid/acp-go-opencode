@@ -124,7 +124,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		})
 		agent.runtime = exited
 		agent.runtimeGeneration = 1
-		got, generation, err := agent.sharedRuntimeBinding(context.Background())
+		got, generation, err := agent.sharedRuntimeBinding(context.Background(), runtimeEnvironment{})
 		require.NoError(t, err)
 		require.Same(t, replacement, got)
 		require.EqualValues(t, 2, generation)
@@ -173,7 +173,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent.runtimeGeneration = 1
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, _, _, err := agent.newOpenCodeClient(ctx, "session", t.TempDir(), nil)
+		_, _, _, err := agent.newOpenCodeClient(ctx, "session", t.TempDir(), nil, runtimeEnvironment{})
 		require.ErrorIs(t, err, context.Canceled)
 	})
 

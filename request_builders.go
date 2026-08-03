@@ -8,12 +8,18 @@ import (
 )
 
 const (
-	metaOptionsKey      = "options"
-	metaModelKey        = "model"
-	metaEnvKey          = "env"
-	metaOutputSchemaKey = "outputSchema"
-	metaModeKey         = "mode"
-	metaPermissionKey   = "permission"
+	metaOptionsKey       = "options"
+	metaModelKey         = "model"
+	metaEnvKey           = "env"
+	metaExtraPathDirsKey = "extraPathDirs"
+	metaOutputSchemaKey  = "outputSchema"
+	metaModeKey          = "mode"
+	metaPermissionKey    = "permission"
+
+	// envPathKey is the one environment name a session may not set: the map it
+	// would arrive in replaces whole values, and dropping the inherited search
+	// path unresolves the native executable and every program a tool runs.
+	envPathKey = "PATH"
 )
 
 // OpenCodeOptions is the stable OpenCode-specific subset accepted at
@@ -23,6 +29,12 @@ type OpenCodeOptions struct {
 	OutputSchema map[string]any `json:"outputSchema,omitempty"`
 	Mode         string         `json:"mode,omitempty"`
 	Permission   string         `json:"permission,omitempty"`
+	// Env overlays the agent-wide environment for the native process this
+	// session runs under. PATH belongs in ExtraPathDirs.
+	Env map[string]string `json:"env,omitempty"`
+	// ExtraPathDirs are absolute directories placed ahead of the inherited PATH
+	// of that process, in order.
+	ExtraPathDirs []string `json:"extraPathDirs,omitempty"`
 }
 
 // Meta returns an ACP _meta object for the supported OpenCode-specific options.
@@ -42,6 +54,14 @@ func (options OpenCodeOptions) Meta() map[string]any {
 
 	if options.Permission != "" {
 		values[metaPermissionKey] = options.Permission
+	}
+
+	if options.Env != nil {
+		values[metaEnvKey] = cloneStringMap(options.Env)
+	}
+
+	if options.ExtraPathDirs != nil {
+		values[metaExtraPathDirsKey] = append([]string(nil), options.ExtraPathDirs...)
 	}
 
 	return map[string]any{
@@ -303,6 +323,31 @@ func WithOpenCodePermission(permission string) OpenCodeOption {
 	}
 }
 
+// WithOpenCodeEnv sets the environment this session's native process runs
+// under, overlaying WithEnv. One native process serves every session of an
+// Agent, so a session asking for an environment the running process was not
+// started under is served by a fresh process, and is refused outright while
+// another session still holds the running one.
+func WithOpenCodeEnv(env map[string]string) OpenCodeOption {
+	cloned := cloneStringMap(env)
+
+	return func(options *OpenCodeOptions) {
+		options.Env = cloneStringMap(cloned)
+	}
+}
+
+// WithOpenCodeExtraPathDirs places absolute directories ahead of the inherited
+// PATH of that process, in the order given. It is the only way to extend the
+// search path: WithOpenCodeEnv rejects PATH because its entries replace whole
+// values.
+func WithOpenCodeExtraPathDirs(dirs ...string) OpenCodeOption {
+	cloned := append([]string(nil), dirs...)
+
+	return func(options *OpenCodeOptions) {
+		options.ExtraPathDirs = append([]string(nil), cloned...)
+	}
+}
+
 func newSessionRequestConfig(opts ...SessionRequestOption) sessionRequestConfig {
 	config := sessionRequestConfig{}
 	for _, opt := range opts {
@@ -325,12 +370,18 @@ func (config sessionRequestConfig) additionalDirectoriesClone() []string {
 }
 
 func cloneOpenCodeOptions(options OpenCodeOptions) OpenCodeOptions {
-	return OpenCodeOptions{
+	cloned := OpenCodeOptions{
 		Model:        options.Model,
 		OutputSchema: cloneAnyMap(options.OutputSchema),
 		Mode:         options.Mode,
 		Permission:   options.Permission,
+		Env:          cloneStringMap(options.Env),
 	}
+	if options.ExtraPathDirs != nil {
+		cloned.ExtraPathDirs = append([]string(nil), options.ExtraPathDirs...)
+	}
+
+	return cloned
 }
 
 func mergeAnyMap(base map[string]any, overlay map[string]any) map[string]any {

@@ -43,7 +43,7 @@ func validateRequiredAbsolutePath(field string, value string) error {
 	}
 
 	if !filepath.IsAbs(value) {
-		return acp.NewInvalidParams(map[string]any{jsonFieldError: "absolute_path_required", jsonFieldField: field})
+		return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueAbsolutePathRequired, jsonFieldField: field})
 	}
 
 	return nil

@@ -10,10 +10,7 @@ import (
 // parent.
 const browserShimPrefix = "acp-go-opencode-browser-shim-"
 
-const (
-	browserShimPathEnv    = "PATH"
-	browserShimBrowserEnv = "BROWSER"
-)
+const browserShimBrowserEnv = "BROWSER"
 
 // browserShimScript is what each shadowed launcher becomes: a program that
 // accepts any arguments, opens nothing, and reports success. Launchers walk a
@@ -77,7 +74,7 @@ func browserShimEnviron(env []string, dir string) []string {
 		}
 
 		switch key {
-		case browserShimPathEnv:
+		case pathEnv:
 			search = dir + string(os.PathListSeparator) + value
 		case browserShimBrowserEnv:
 		default:
@@ -86,7 +83,7 @@ func browserShimEnviron(env []string, dir string) []string {
 	}
 
 	return append(kept,
-		browserShimPathEnv+"="+search,
+		pathEnv+"="+search,
 		browserShimBrowserEnv+"="+browserShimCommand(dir),
 	)
 }
