@@ -38,31 +38,37 @@ type supervisorTestBuffer struct {
 	data []byte
 }
 
-const linuxNoNewPrivilegesProofEnv = "ACP_GO_OPENCODE_TEST_NO_NEW_PRIVILEGES_PROOF"
+const linuxSecurityLimitsProofEnv = "ACP_GO_OPENCODE_TEST_SECURITY_LIMITS_PROOF"
 
-func TestLinuxSupervisorChildInheritsNoNewPrivileges(t *testing.T) {
-	proofPath := os.Getenv(linuxNoNewPrivilegesProofEnv)
+func TestLinuxSupervisorChildInheritsSecurityLimits(t *testing.T) {
+	proofPath := os.Getenv(linuxSecurityLimitsProofEnv)
 	if proofPath != "" {
-		native := exec.Command("/bin/sh", "-c", `awk '$1 == "NoNewPrivs:" { print $2 }' /proc/self/status > "$1"`, "sh", proofPath)
-		require.NoError(t, startLinuxNoNewPrivileges(native.Start))
+		native := exec.Command("/bin/sh", "-c", `nnp=$(awk '$1 == "NoNewPrivs:" { print $2 }' /proc/self/status); printf '%s %s\n' "$nnp" "$(ulimit -c)" > "$1"`, "sh", proofPath)
+		require.NoError(t, startLinuxSecurityLimited(native.Start))
 		require.NoError(t, native.Wait())
 
 		return
 	}
 
-	proofPath = filepath.Join(t.TempDir(), "no-new-privileges")
-	helper := exec.Command(os.Args[0], "-test.run=^TestLinuxSupervisorChildInheritsNoNewPrivileges$")
-	helper.Env = append(os.Environ(), linuxNoNewPrivilegesProofEnv+"="+proofPath)
+	proofPath = filepath.Join(t.TempDir(), "security-limits")
+	helper := exec.Command(os.Args[0], "-test.run=^TestLinuxSupervisorChildInheritsSecurityLimits$")
+	helper.Env = append(os.Environ(), linuxSecurityLimitsProofEnv+"="+proofPath)
 	output, err := helper.CombinedOutput()
-	require.NoErrorf(t, err, "run no-new-privileges proof helper: %s", output)
+	require.NoErrorf(t, err, "run security-limits proof helper: %s", output)
 
 	proof, err := os.ReadFile(proofPath)
 	require.NoError(t, err)
-	require.Equal(t, "1", strings.TrimSpace(string(proof)))
+	require.Equal(t, "1 0", strings.TrimSpace(string(proof)))
 }
 
-func TestLinuxSupervisorLaunchesFailClosedWhenNoNewPrivilegesCannotBeSet(t *testing.T) {
+func TestLinuxSupervisorLaunchesFailClosedWhenSecurityLimitsCannotBeSet(t *testing.T) {
 	preservePlatformSupervisorGlobals(t)
+	supervisorLinuxCoreLimit = func() error { return errors.New("setrlimit failed") }
+
+	require.ErrorContains(t, startIndependentSupervisor(exec.Command("/bin/true")), "disable core dumps")
+	require.ErrorContains(t, (&livenessContainment{}).Start(exec.Command("/bin/true")), "disable core dumps")
+
+	supervisorLinuxCoreLimit = func() error { return nil }
 	supervisorLinuxNoNewPrivileges = func() error { return errors.New("prctl failed") }
 
 	require.ErrorContains(t, startIndependentSupervisor(exec.Command("/bin/true")), "disable privilege elevation")

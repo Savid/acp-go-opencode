@@ -31,6 +31,9 @@ var (
 	supervisorLinuxNoNewPrivileges = func() error {
 		return unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
 	}
+	supervisorLinuxCoreLimit = func() error {
+		return unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{})
+	}
 	supervisorLinuxPIDFDOpen       = unix.PidfdOpen
 	supervisorLinuxPIDFDSendSignal = unix.PidfdSendSignal
 	supervisorLinuxPoll            = unix.Poll
@@ -66,7 +69,7 @@ func openLivenessContainment(supervisorConfig) (*livenessContainment, error) {
 }
 
 func (containment *livenessContainment) Start(cmd *exec.Cmd) error {
-	if err := startLinuxNoNewPrivileges(func() error {
+	if err := startLinuxSecurityLimited(func() error {
 		configureOpenCodeProcess(cmd)
 
 		return cmd.Start()
@@ -117,13 +120,16 @@ func configureIndependentSupervisor(cmd *exec.Cmd) {
 }
 
 func startIndependentSupervisor(cmd *exec.Cmd) error {
-	return startLinuxNoNewPrivileges(cmd.Start)
+	return startLinuxSecurityLimited(cmd.Start)
 }
 
-func startLinuxNoNewPrivileges(start func() error) error {
+func startLinuxSecurityLimited(start func() error) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	if err := supervisorLinuxCoreLimit(); err != nil {
+		return fmt.Errorf("disable core dumps for Linux supervisor child: %w", err)
+	}
 	if err := supervisorLinuxNoNewPrivileges(); err != nil {
 		return fmt.Errorf("disable privilege elevation for Linux supervisor child: %w", err)
 	}

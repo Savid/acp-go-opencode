@@ -19,6 +19,7 @@ func preservePlatformSupervisorGlobals(t *testing.T) {
 	t.Helper()
 	oldPrctl := supervisorLinuxPrctl
 	oldNoNewPrivileges := supervisorLinuxNoNewPrivileges
+	oldCoreLimit := supervisorLinuxCoreLimit
 	oldPIDFDOpen := supervisorLinuxPIDFDOpen
 	oldPIDFDSendSignal := supervisorLinuxPIDFDSendSignal
 	oldPoll := supervisorLinuxPoll
@@ -30,6 +31,7 @@ func preservePlatformSupervisorGlobals(t *testing.T) {
 	t.Cleanup(func() {
 		supervisorLinuxPrctl = oldPrctl
 		supervisorLinuxNoNewPrivileges = oldNoNewPrivileges
+		supervisorLinuxCoreLimit = oldCoreLimit
 		supervisorLinuxPIDFDOpen = oldPIDFDOpen
 		supervisorLinuxPIDFDSendSignal = oldPIDFDSendSignal
 		supervisorLinuxPoll = oldPoll
