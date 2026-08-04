@@ -31,6 +31,8 @@ type supervisedNative struct {
 	proof       *supervisorProof
 	stderr      *supervisorTestBuffer
 	cancel      context.CancelFunc
+	attackPath  string
+	forgePath   string
 }
 
 type supervisorTestBuffer struct {
@@ -102,6 +104,55 @@ func TestSupervisorControlEOFKillsTreeBeforeUnlock(t *testing.T) {
 	assertHomeReacquires(t, runtime.home)
 }
 
+func TestTrustedSupervisorDeniesNativeAuthorityAttacks(t *testing.T) {
+	runtime := startSupervisedNative(t)
+	raw, err := os.ReadFile(runtime.attackPath)
+	require.NoError(t, err)
+	require.Equal(t, []string{"denied", "denied", "denied", "denied", "0", "65534", "65534", "0"}, strings.Fields(string(raw)))
+	require.NoFileExists(t, runtime.forgePath)
+
+	require.NoError(t, runtime.stdin.Close())
+	require.NoError(t, waitSupervisor(runtime, 10*time.Second))
+	assertProcessGone(t, runtime.rootPID)
+	assertProcessGone(t, runtime.descPID)
+}
+
+func TestLinuxAgentIdentityLockSerializesAndCancels(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires the trusted root supervisor identity")
+	}
+
+	uid := uint32(63000 + os.Getpid()%1000)
+	first, err := acquireLinuxAgentIdentityLock(uid, strings.NewReader(""))
+	require.NoError(t, err)
+	defer first.Close()
+
+	controlRead, controlWrite, err := os.Pipe()
+	require.NoError(t, err)
+	defer controlRead.Close()
+	result := make(chan error, 1)
+	go func() {
+		lock, lockErr := acquireLinuxAgentIdentityLock(uid, controlRead)
+		if lock != nil {
+			_ = lock.Close()
+		}
+		result <- lockErr
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("contending identity lock completed early: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
+	require.NoError(t, controlWrite.Close())
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	case <-time.After(time.Second):
+		t.Fatal("contending identity lock ignored closed control")
+	}
+}
+
 func TestSupervisorGuardianSIGKILLLeavesLivenessLockedUntilTreeExit(t *testing.T) {
 	runtime := startSupervisedNative(t)
 	require.NoError(t, syscall.Kill(-runtime.rootPID, syscall.SIGSTOP))
@@ -150,12 +201,18 @@ func TestTurnTimeoutShutdownContainsStubbornSetsidDescendant(t *testing.T) {
 
 func startSupervisedNative(t *testing.T) *supervisedNative {
 	t.Helper()
-	root := t.TempDir()
+	root, err := os.MkdirTemp("", "acp-go-opencode-authority-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(root)) })
+	require.NoError(t, os.Chmod(root, 0o777))
 	home := filepath.Join(root, "home")
 	scratch := filepath.Join(root, "scratch")
 	require.NoError(t, os.MkdirAll(scratch, 0o700))
 	rootPIDPath := filepath.Join(root, "root.pid")
 	descPIDPath := filepath.Join(root, "desc.pid")
+	attackPath := filepath.Join(root, "attacks")
+	forgePath := filepath.Join(linuxSupervisorProofNamespace, fmt.Sprintf("native-forge-%d", os.Getpid()))
+	_ = os.Remove(forgePath)
 	script := filepath.Join(root, "native.sh")
 	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
 if [ "$1" = "descendant" ]; then
@@ -165,20 +222,30 @@ if [ "$1" = "descendant" ]; then
 fi
 setsid "$0" descendant &
 echo "$$" > "$ROOT_PID_FILE"
+parent=$PPID
+stop=denied; kill -STOP "$parent" 2>/dev/null && stop=allowed
+kill_result=denied; kill -KILL "$parent" 2>/dev/null && kill_result=allowed
+forge=denied; : > "$FORGE_PATH" 2>/dev/null && forge=allowed
+config=denied; cat /proc/$parent/fd/3 >/dev/null 2>&1 && config=allowed
+printf '%s %s %s %s %s %s %s %s\n' "$stop" "$kill_result" "$forge" "$config" "$(awk '$1 == "Uid:" {print $2}' /proc/$parent/status)" "$(id -u)" "$(id -g)" "$(awk '$1 == "Groups:" {print NF-1}' /proc/self/status)" > "$ATTACK_PATH"
 trap '' TERM
 while IFS= read -r line; do printf '%s\n' "$line"; done
-`), 0o700))
+`), 0o755))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	nativeEnv := append(os.Environ(),
+		"ROOT_PID_FILE="+rootPIDPath,
+		"DESC_PID_FILE="+descPIDPath,
+		"ATTACK_PATH="+attackPath,
+		"FORGE_PATH="+forgePath,
+	)
 	cmd, proof, err := supervisorCommand(ctx, supervisorConfig{
 		NativePath: script,
 		NativeArgs: []string{"root"},
-		NativeEnv: append(os.Environ(),
-			"ROOT_PID_FILE="+rootPIDPath,
-			"DESC_PID_FILE="+descPIDPath,
-		),
-		Home:    home,
-		Scratch: scratch,
+		NativeEnv:  nativeEnv,
+		Home:       home,
+		Scratch:    scratch,
+		Isolation:  &ProcessIsolation{UID: 65534, GID: 65534, BaseEnvironment: environmentMap(nativeEnv)},
 	})
 	require.NoError(t, err)
 	stdin, err := cmd.StdinPipe()
@@ -188,14 +255,17 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	cmd.Stderr = stderr
 	configureOpenCodeProcess(cmd)
 	require.NoError(t, cmd.Start())
+	require.NoError(t, proof.closeInherited())
 
 	runtime := &supervisedNative{
-		cmd:    cmd,
-		stdin:  stdin,
-		home:   home,
-		stderr: stderr,
-		cancel: cancel,
-		proof:  proof,
+		cmd:        cmd,
+		stdin:      stdin,
+		home:       home,
+		stderr:     stderr,
+		cancel:     cancel,
+		proof:      proof,
+		attackPath: attackPath,
+		forgePath:  forgePath,
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -293,7 +363,10 @@ func waitSupervisor(runtime *supervisedNative, timeout time.Duration) error {
 	case err := <-done:
 		runtime.cancel()
 
-		return err
+		proofCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+
+		return errors.Join(err, runtime.proof.awaitCompletion(proofCtx))
 	case <-time.After(timeout):
 		return fmt.Errorf("supervisor did not exit; stderr=%s", runtime.stderr.String())
 	}
