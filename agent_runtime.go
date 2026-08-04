@@ -499,10 +499,11 @@ func (a *Agent) startSharedRuntime(
 				RuntimeResourceRuntime,
 			)
 		},
-		ExecutablePath: a.options.ExecutablePath,
-		Env:            a.observe.InjectTraceEnv(ctx, cloneStringMap(environment.Env)),
-		ExtraPathDirs:  append([]string(nil), environment.ExtraPathDirs...),
-		Pure:           a.options.Pure, QuestionTool: a.options.QuestionTool,
+		ExecutablePath:   a.options.ExecutablePath,
+		Env:              a.observe.InjectTraceEnv(ctx, cloneStringMap(environment.Env)),
+		ProcessIsolation: openCodeProcessIsolation(a.options.ProcessIsolation),
+		ExtraPathDirs:    append([]string(nil), environment.ExtraPathDirs...),
+		Pure:             a.options.Pure, QuestionTool: a.options.QuestionTool,
 		LogLevel: a.options.LogLevel, MinVersion: minNativeVersion,
 		HealthTimeout: a.options.HealthCheckTimeout, Logger: a.log,
 		ExistingXDG: xdg, SeedFiles: a.options.SeedFiles,
@@ -526,6 +527,16 @@ func (a *Agent) startSharedRuntime(
 	}
 
 	return runtime, nativeRelease, xdgScratchRelease, nil
+}
+
+func openCodeProcessIsolation(value *ProcessIsolation) *opencode.ProcessIsolation {
+	if value == nil {
+		return nil
+	}
+
+	return &opencode.ProcessIsolation{
+		UID: value.UID, GID: value.GID, BaseEnvironment: cloneStringMap(value.BaseEnvironment),
+	}
 }
 
 // cleanupRuntimeResources preserves permit ownership whenever the selected

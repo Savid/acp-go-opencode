@@ -187,8 +187,9 @@ type StartOptions struct {
 	// BrowserShim shadows every browser launcher on the child's PATH for the
 	// lifetime of a login leg. The caller owns the directory; leaving it nil
 	// leaves the child free to open the operator's desktop browser.
-	BrowserShim *BrowserShim
-	Env         map[string]string
+	BrowserShim      *BrowserShim
+	Env              map[string]string
+	ProcessIsolation *ProcessIsolation
 	// ExtraPathDirs are absolute directories placed ahead of the inherited
 	// PATH, in order. Env cannot carry a search path: its entries replace whole
 	// values, so a PATH there would drop everything the child resolves against.
@@ -885,7 +886,7 @@ func resolveRuntimeXDG(options StartOptions) (XDGDirs, error) {
 	return xdg, nil
 }
 
-func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) {
+func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) { //nolint:gocyclo // Startup owns the ordered resource-transfer rollback sequence.
 	options = normalizedStartOptions(options)
 
 	xdg, err := resolveRuntimeXDG(options)
@@ -913,11 +914,6 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	username := opencodeDefaultUsername
 
-	executable := options.ExecutablePath
-	if executable == "" {
-		executable = opencodeExecutableName
-	}
-
 	args := []string{opencodeServeCommand, "--hostname", "127.0.0.1", "--port", strconv.Itoa(port)}
 	if options.Pure {
 		args = append(args, "--pure")
@@ -927,7 +923,10 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		args = append(args, "--log-level", options.LogLevel)
 	}
 
-	env := mergeProcessEnv(options.Env)
+	env, err := buildProcessEnvironment(options.ProcessIsolation, options.Env)
+	if err != nil {
+		return nil, err
+	}
 
 	env["XDG_DATA_HOME"] = xdg.Data
 	env["XDG_CONFIG_HOME"] = xdg.Config
@@ -947,6 +946,16 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	nativeEnv := prependPathDirs(envMapToSlice(env), options.ExtraPathDirs)
 	if options.BrowserShim != nil {
 		nativeEnv = options.BrowserShim.environ(nativeEnv)
+	}
+
+	executable := options.ExecutablePath
+	if executable == "" {
+		executable = opencodeExecutableName
+	}
+
+	executable, err = resolveProcessExecutable(executable, nativeEnv)
+	if err != nil {
+		return nil, fmt.Errorf("find OpenCode executable: %w", err)
 	}
 
 	processCtx, cancel := context.WithCancel(context.Background())
@@ -977,6 +986,12 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		cmd = openCodeCommandContext(processCtx, executable, args...)
 		cmd.Env = nativeEnv
 		configureOpenCodeProcess(cmd)
+
+		if credentialErr := applyProcessCredential(cmd, options.ProcessIsolation); credentialErr != nil {
+			cancel()
+
+			return nil, credentialErr
+		}
 	} else {
 		supervisorScratch := filepath.Join(xdg.State, "runtime-supervisor")
 		if containmentGenerationRoot != "" {
@@ -993,6 +1008,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 			ScratchParent:    options.ContainmentScratchParent,
 			LifecycleKind:    darwinLifecycleRuntime,
 			DarwinBestEffort: options.DarwinBestEffort,
+			Isolation:        options.ProcessIsolation,
 		})
 		if err != nil {
 			cancel()
@@ -1035,6 +1051,8 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	spawnStarted := time.Now()
 
 	if startErr := cmd.Start(); startErr != nil {
+		_ = supervisor.closeInherited()
+
 		observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, startErr)
 
 		if supervisorControl != nil {
@@ -1044,6 +1062,15 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		cancel()
 
 		return nil, startErr
+	}
+
+	if closeErr := supervisor.closeInherited(); closeErr != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+
+		cancel()
+
+		return nil, fmt.Errorf("close inherited supervisor config: %w", closeErr)
 	}
 
 	process := cmd.Process
@@ -3079,27 +3106,6 @@ func randomPassword() (string, error) {
 	}
 
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
-}
-
-func mergeProcessEnv(overlays ...map[string]string) map[string]string {
-	env := map[string]string{}
-
-	for _, entry := range os.Environ() {
-		key, value, ok := strings.Cut(entry, "=")
-		if ok && key != "" {
-			env[key] = value
-		}
-	}
-
-	for _, overlay := range overlays {
-		for key, value := range overlay {
-			if key != "" {
-				env[key] = value
-			}
-		}
-	}
-
-	return env
 }
 
 func envMapToSlice(env map[string]string) []string {

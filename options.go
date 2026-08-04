@@ -65,6 +65,14 @@ type RuntimeResourceHooks struct {
 // Option configures the OpenCode ACP agent.
 type Option func(*Options)
 
+// ProcessIsolation defines the complete operating-system identity and base
+// environment inherited by every OpenCode process and adapter supervisor.
+type ProcessIsolation struct {
+	UID             uint32
+	GID             uint32
+	BaseEnvironment map[string]string
+}
+
 // ConcurrencyLimits bounds work accepted by one Agent.
 type ConcurrencyLimits struct {
 	MaxActiveSessions        int
@@ -98,6 +106,7 @@ type Options struct {
 	ProviderAuthDirectHome string
 	DefaultModel           string
 	Env                    map[string]string
+	ProcessIsolation       *ProcessIsolation
 
 	Logger            *slog.Logger
 	TracerProvider    trace.TracerProvider
@@ -165,6 +174,17 @@ func WithAgentVersion(version string) Option {
 func WithExecutablePath(path string) Option {
 	return func(options *Options) {
 		options.ExecutablePath = path
+	}
+}
+
+// WithProcessIsolation requires every native process and self-exec supervisor
+// to run as the supplied uid/gid with no supplementary groups. BaseEnvironment
+// is the complete environment base; the adapter never overlays os.Environ.
+func WithProcessIsolation(isolation ProcessIsolation) Option {
+	return func(options *Options) {
+		cloned := isolation
+		cloned.BaseEnvironment = cloneStringMap(isolation.BaseEnvironment)
+		options.ProcessIsolation = &cloned
 	}
 }
 

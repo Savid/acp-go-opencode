@@ -87,7 +87,7 @@ func validateModel(ctx context.Context, client opencode.Client, value string, fi
 
 func invalidModel(value string, field string) error {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: "invalid_model",
+		jsonFieldError: "invalid_model", //nolint:goconst // Wire error value is intentionally local to this response table.
 		jsonFieldField: field,
 		configModel:    value,
 	})

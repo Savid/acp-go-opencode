@@ -18,7 +18,7 @@ fingerprint is rejected as a principal conflict.
 `_meta.opencode.options.env` and `_meta.opencode.options.extraPathDirs` set the
 environment the native process serving a session runs under: `env` overlays
 `WithEnv` per key, and `extraPathDirs` places absolute directories ahead of the
-inherited `PATH`. A process environment is fixed at exec, so an environment
+isolation policy `PATH`. A process environment is fixed at exec, so an environment
 binds a runtime generation, not a session. The first session to reach the
 runtime latches it. A later session asking for the same environment reuses that
 generation; one asking for a different environment starts a fresh generation

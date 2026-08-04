@@ -87,16 +87,17 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 				RuntimeResourceDiscovery,
 			)
 		},
-		ExecutablePath:  agent.options.ExecutablePath,
-		LeaseDir:        home,
-		BrowserShim:     shim,
-		Env:             cloneStringMap(agent.options.Env),
-		Pure:            agent.options.Pure,
-		LogLevel:        agent.options.LogLevel,
-		HealthTimeout:   agent.options.HealthCheckTimeout,
-		Logger:          agent.log,
-		ExistingXDG:     xdg,
-		SkipVersionGate: true,
+		ExecutablePath:   agent.options.ExecutablePath,
+		LeaseDir:         home,
+		BrowserShim:      shim,
+		Env:              cloneStringMap(agent.options.Env),
+		ProcessIsolation: openCodeProcessIsolation(agent.options.ProcessIsolation),
+		Pure:             agent.options.Pure,
+		LogLevel:         agent.options.LogLevel,
+		HealthTimeout:    agent.options.HealthCheckTimeout,
+		Logger:           agent.log,
+		ExistingXDG:      xdg,
+		SkipVersionGate:  true,
 	})
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start provider auth broker: %w", err), shim.Remove(), brokerRemoveAll(home))

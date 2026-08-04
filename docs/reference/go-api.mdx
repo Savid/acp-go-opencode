@@ -29,11 +29,12 @@ runtime and its resources quarantined.
 | Option | Purpose |
 |---|---|
 | `WithExecutablePath` | Path to the `opencode` binary. |
+| `WithProcessIsolation` | Mandatory nonzero target UID/GID and complete replacement base environment for every native/helper process; supplementary groups are cleared. |
 | `WithScratchDir` | Parent for a materialized shared runtime root and transient adapter scratch; empty uses the system temp directory. |
 | `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
 | `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant and numeric-PGID-reuse risks. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
-| `WithEnv` | Agent-wide environment overrides for the shared native process; a session may overlay them per key. |
+| `WithEnv` | Agent-wide overrides on `ProcessIsolation.BaseEnvironment`; a session may overlay them per key. The adapter never inherits its own environment. |
 | `WithSeedFiles` | Immutable files written into the shared config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
@@ -145,7 +146,7 @@ render into `_meta.opencode.options` via its `Meta` method.
 
 `WithOpenCodeEnv` overlays `WithEnv` for the native process the session runs
 under, and `WithOpenCodeExtraPathDirs` places absolute directories ahead of
-that process's inherited `PATH`. See
+the isolation policy's `PATH`. See
 [Sessions](/docs/core/sessions) for how an environment binds a runtime
 generation.
 

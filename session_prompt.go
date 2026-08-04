@@ -1493,6 +1493,7 @@ func (s *session) handleEvent(ctx context.Context, event opencode.Event) error {
 		if err := json.Unmarshal(event.Properties, &nativeError); err != nil {
 			return err
 		}
+
 		if nativeError.SessionID == s.idmap.NativeSessionID && nativeError.Error != nil {
 			return opencode.AssistantErrorFromNativeError(nativeError.Error)
 		}

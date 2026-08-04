@@ -8,5 +8,9 @@ import (
 )
 
 func configureOpenCodeProcess(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	var credential *syscall.Credential
+	if cmd.SysProcAttr != nil {
+		credential = cmd.SysProcAttr.Credential
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, Credential: credential}
 }

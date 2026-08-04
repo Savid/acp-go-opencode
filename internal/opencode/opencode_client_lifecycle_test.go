@@ -1131,9 +1131,11 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	if err != nil || password == "" {
 		t.Fatalf("randomPassword = %q err=%v", password, err)
 	}
-	env := mergeProcessEnv(map[string]string{"": "skip", "A": "1"}, map[string]string{"A": "2", "B": "3"})
-	if env["A"] != "2" || env["B"] != "3" {
-		t.Fatalf("merged env = %#v", env)
+	env, err := buildProcessEnvironment(&ProcessIsolation{
+		UID: 1, GID: 2, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin"},
+	}, map[string]string{"": "skip", "A": "1"}, map[string]string{"A": "2", "B": "3"})
+	if err != nil || env["A"] != "2" || env["B"] != "3" {
+		t.Fatalf("merged env = %#v, err = %v", env, err)
 	}
 	drainProcessPipe(slog.New(slog.DiscardHandler), "test", strings.NewReader("one\ntwo\n"))
 	for _, value := range []any{float64(-1), int(-1), json.Number("bad")} {

@@ -41,7 +41,7 @@ Lifecycle requests accept:
 | `options.permission` | `ask`, `allow`, or `deny`; empty is treated as `ask`. |
 | `options.outputSchema` | JSON Schema object for native structured output. |
 | `options.env` | String map overlaid on `WithEnv` for the native process this session runs under. |
-| `options.extraPathDirs` | Absolute directories placed ahead of that process's inherited `PATH`, in order. |
+| `options.extraPathDirs` | Absolute directories placed ahead of the isolation policy's `PATH`, in order. |
 | `rawEvent.enabled` | Opt in to `_opencode/rawEvent` notifications. |
 
 `_meta.opencode.options.permission` becomes the native session's permission
@@ -57,7 +57,7 @@ no session is live, and a differing one meets
 `{"error": "backpressure", "limit": "runtime_environment"}` while a session
 still holds the running environment — retry-later, not a rejected request.
 `options.env` may not carry `PATH`, because its entries replace
-whole values and dropping the inherited search path unresolves the native
+whole values and dropping the policy search path unresolves the native
 executable; `options.extraPathDirs` is the additive mechanism and rejects a
 relative entry with `{"error": "absolute_path_required"}`.
 

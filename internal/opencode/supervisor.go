@@ -20,7 +20,6 @@ import (
 
 const (
 	supervisorModeEnv       = "ACP_GO_OPENCODE_INTERNAL_MODE"
-	supervisorConfigEnv     = "ACP_GO_OPENCODE_INTERNAL_HELPER"
 	supervisorModeGuardian  = "guardian"
 	supervisorModeLiveness  = "liveness"
 	supervisorReadyPrefix   = "acp-go-opencode supervisor-ready "
@@ -35,20 +34,23 @@ const (
 var ErrProcessContainmentIncomplete = errors.New("OpenCode process containment incomplete")
 
 type supervisorConfig struct {
-	NativePath        string   `json:"nativePath"`
-	NativeArgs        []string `json:"nativeArgs"`
-	NativeEnv         []string `json:"nativeEnv"`
-	NativeDir         string   `json:"nativeDir,omitempty"`
-	Home              string   `json:"home"`
-	Scratch           string   `json:"scratch"`
-	ScratchParent     string   `json:"scratchParent"`
-	LifecycleKind     string   `json:"lifecycleKind"`
-	DarwinBestEffort  bool     `json:"darwinBestEffort"`
-	JobName           string   `json:"jobName,omitempty"`
-	Started           string   `json:"started"`
-	Completion        string   `json:"completion"`
-	NativePIDFile     string   `json:"nativePidFile"`
-	InventoryIdentity string   `json:"inventoryIdentity"`
+	NativePath        string            `json:"nativePath"`
+	NativeArgs        []string          `json:"nativeArgs"`
+	NativeEnv         []string          `json:"nativeEnv"`
+	NativeDir         string            `json:"nativeDir,omitempty"`
+	Home              string            `json:"home"`
+	Scratch           string            `json:"scratch"`
+	ScratchParent     string            `json:"scratchParent"`
+	LifecycleKind     string            `json:"lifecycleKind"`
+	DarwinBestEffort  bool              `json:"darwinBestEffort"`
+	JobName           string            `json:"jobName,omitempty"`
+	Started           string            `json:"started"`
+	Completion        string            `json:"completion"`
+	NativePIDFile     string            `json:"nativePidFile"`
+	InventoryIdentity string            `json:"inventoryIdentity"`
+	IsolationUID      uint32            `json:"isolationUid"`
+	IsolationGID      uint32            `json:"isolationGid"`
+	Isolation         *ProcessIsolation `json:"-"`
 }
 
 type supervisorReady struct {
@@ -60,6 +62,8 @@ var supervisorExecCommand = exec.Command
 var supervisorRandRead = rand.Read
 var supervisorChmod = os.Chmod
 var supervisorOpenFile = os.OpenFile
+var supervisorCreateTemp = os.CreateTemp
+var supervisorInheritedFile = os.NewFile
 var supervisorEncodeConfig = func(writer io.Writer, config supervisorConfig) error {
 	return json.NewEncoder(writer).Encode(config)
 }
@@ -83,6 +87,22 @@ type supervisorProof struct {
 	started           string
 	completion        string
 	inventoryIdentity string
+	inherited         []*os.File
+}
+
+func (p *supervisorProof) closeInherited() error {
+	if p == nil {
+		return nil
+	}
+
+	var result error
+	for _, file := range p.inherited {
+		result = errors.Join(result, file.Close())
+	}
+
+	p.inherited = nil
+
+	return result
 }
 
 // init turns the embedding command itself into either member of the
@@ -98,7 +118,25 @@ func supervisorBootstrap() {
 		return
 	}
 
-	err := runSupervisor(mode, os.Getenv(supervisorConfigEnv))
+	err := verifySupervisorIdentity()
+
+	configFile := supervisorInheritedFile(3, "acp-go-opencode-supervisor-config")
+	if err == nil && configFile == nil {
+		err = errors.New("process supervisor inherited config descriptor is unavailable")
+	}
+
+	if err == nil {
+		err = closeInheritedOnExec(configFile)
+	}
+
+	if err == nil {
+		err = runSupervisor(mode, configFile)
+	}
+
+	if configFile != nil {
+		_ = configFile.Close()
+	}
+
 	if err != nil {
 		_, _ = fmt.Fprintln(supervisorError, "acp-go-opencode runtime supervisor:", err)
 
@@ -110,10 +148,15 @@ func supervisorBootstrap() {
 	supervisorExit(0)
 }
 
-func runSupervisor(mode string, configPath string) error {
-	config, err := readSupervisorConfig(configPath)
+func runSupervisor(mode string, configInput io.Reader) error {
+	config, err := readSupervisorConfig(configInput)
 	if err != nil {
 		return err
+	}
+
+	uid, gid, err := expectedSupervisorIdentity()
+	if err != nil || config.IsolationUID != uid || config.IsolationGID != gid {
+		return errors.Join(errors.New("private supervisor config identity does not match the verified process identity"), err)
 	}
 
 	switch mode {
@@ -126,68 +169,81 @@ func runSupervisor(mode string, configPath string) error {
 	}
 }
 
-func readSupervisorConfig(path string) (supervisorConfig, error) {
-	if path == "" {
-		return supervisorConfig{}, errors.New("missing private supervisor config")
+func readSupervisorConfig(reader io.Reader) (supervisorConfig, error) {
+	if reader == nil {
+		return supervisorConfig{}, errors.New("missing private supervisor config descriptor")
 	}
-
-	file, err := os.Open(path) //nolint:gosec // Path comes from the private environment entry written by this process.
-	if err != nil {
-		return supervisorConfig{}, fmt.Errorf("open private supervisor config: %w", err)
-	}
-	defer file.Close()
-	defer os.Remove(path)
 
 	var config supervisorConfig
-	if err := json.NewDecoder(io.LimitReader(file, 8<<20)).Decode(&config); err != nil {
+	if err := json.NewDecoder(io.LimitReader(reader, 8<<20)).Decode(&config); err != nil {
 		return supervisorConfig{}, fmt.Errorf("decode private supervisor config: %w", err)
 	}
 
-	if config.NativePath == "" || config.Home == "" || config.Scratch == "" {
+	if config.NativePath == "" || config.Home == "" || config.Scratch == "" || config.IsolationUID == 0 || config.IsolationGID == 0 {
 		return supervisorConfig{}, errors.New("private supervisor config is incomplete")
 	}
 
 	return config, nil
 }
 
-func writeSupervisorConfig(root string, config supervisorConfig) (string, error) {
+func writeSupervisorConfig(root string, config supervisorConfig) (*os.File, error) {
 	if root == "" {
-		return "", errors.New("private supervisor scratch root is required")
+		return nil, errors.New("private supervisor scratch root is required")
 	}
 
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", fmt.Errorf("create private supervisor scratch root: %w", err)
+		return nil, fmt.Errorf("create private supervisor scratch root: %w", err)
 	}
 
 	if err := supervisorChmod(root, 0o700); err != nil {
-		return "", fmt.Errorf("chmod private supervisor scratch root: %w", err)
+		return nil, fmt.Errorf("chmod private supervisor scratch root: %w", err)
 	}
 
-	var nonce [16]byte
-	if _, err := supervisorRandRead(nonce[:]); err != nil {
-		return "", fmt.Errorf("create private supervisor config nonce: %w", err)
-	}
-
-	path := filepath.Join(root, supervisorConfigPrefix+hex.EncodeToString(nonce[:])+".json")
-
-	file, err := supervisorOpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := supervisorCreateTemp(root, supervisorConfigPrefix+"*")
 	if err != nil {
-		return "", fmt.Errorf("create private supervisor config: %w", err)
+		return nil, fmt.Errorf("create private supervisor config: %w", err)
+	}
+
+	path := file.Name()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+
+		return nil, fmt.Errorf("secure private supervisor config: %w", err)
 	}
 
 	encodeErr := supervisorEncodeConfig(file, config)
-
-	closeErr := file.Close()
-	if err := errors.Join(encodeErr, closeErr); err != nil {
+	if encodeErr != nil {
+		_ = file.Close()
 		_ = os.Remove(path)
 
-		return "", fmt.Errorf("write private supervisor config: %w", err)
+		return nil, fmt.Errorf("write private supervisor config: %w", encodeErr)
 	}
 
-	return path, nil
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+
+		return nil, fmt.Errorf("rewind private supervisor config: %w", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		_ = file.Close()
+
+		return nil, fmt.Errorf("unlink private supervisor config: %w", err)
+	}
+
+	return file, nil
 }
 
 func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd, *supervisorProof, error) {
+	if err := validateProcessIsolation(config.Isolation); err != nil {
+		return nil, nil, err
+	}
+
+	config.IsolationUID = config.Isolation.UID
+
+	config.IsolationGID = config.Isolation.GID
 	if config.ScratchParent == "" && config.Scratch != "" {
 		config.ScratchParent = filepath.Dir(config.Scratch)
 	}
@@ -206,23 +262,40 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 	config.NativePIDFile = filepath.Join(config.Scratch, "supervisor-native-pid-"+markerNonce)
 	config.InventoryIdentity = filepath.Join(config.Scratch, "supervisor-inventory-"+markerNonce)
 
-	path, err := writeSupervisorConfig(config.Scratch, config)
+	configFile, err := writeSupervisorConfig(config.Scratch, config)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	executable, err := supervisorExecutable()
 	if err != nil {
-		_ = os.Remove(path)
+		_ = configFile.Close()
 
 		return nil, nil, fmt.Errorf("resolve embedded runtime supervisor: %w", err)
 	}
 
+	helperEnv := supervisorIdentityEnvironment(config.NativeEnv, supervisorModeGuardian, *config.Isolation)
+
+	executable, err = resolveProcessExecutable(executable, helperEnv)
+	if err != nil {
+		_ = configFile.Close()
+
+		return nil, nil, fmt.Errorf("resolve embedded runtime supervisor through process policy: %w", err)
+	}
+
 	cmd := openCodeCommandContext(ctx, executable)
-	cmd.Env = supervisorEnv(supervisorModeGuardian, path)
+	cmd.Env = helperEnv
+
+	cmd.ExtraFiles = []*os.File{configFile}
+	if err := applyProcessCredential(cmd, config.Isolation); err != nil {
+		_ = configFile.Close()
+
+		return nil, nil, err
+	}
 
 	return cmd, &supervisorProof{
 		started: config.Started, completion: config.Completion, inventoryIdentity: config.InventoryIdentity,
+		inherited: []*os.File{configFile},
 	}, nil
 }
 
@@ -278,19 +351,6 @@ func (p *supervisorProof) processSnapshot() (int, bool) {
 	return supervisorProcessSnapshot(p.inventoryIdentity)
 }
 
-func supervisorEnv(mode string, configPath string) []string {
-	env := make([]string, 0, len(os.Environ())+2)
-	for _, entry := range os.Environ() {
-		if strings.HasPrefix(entry, supervisorModeEnv+"=") || strings.HasPrefix(entry, supervisorConfigEnv+"=") {
-			continue
-		}
-
-		env = append(env, entry)
-	}
-
-	return append(env, supervisorModeEnv+"="+mode, supervisorConfigEnv+"="+configPath)
-}
-
 func runGuardian(config supervisorConfig) error {
 	input := supervisorInput
 	output := supervisorOutput
@@ -332,18 +392,26 @@ func runGuardian(config supervisorConfig) error {
 
 	executable, err := supervisorExecutable()
 	if err != nil {
-		_ = os.Remove(livenessConfig)
+		_ = livenessConfig.Close()
 
 		return fmt.Errorf("resolve liveness supervisor executable: %w", err)
 	}
 
+	executable, err = resolveProcessExecutable(executable, config.NativeEnv)
+	if err != nil {
+		_ = livenessConfig.Close()
+
+		return fmt.Errorf("resolve liveness supervisor executable through process policy: %w", err)
+	}
+
 	cmd := supervisorExecCommand(executable)
-	cmd.Env = supervisorEnv(supervisorModeLiveness, livenessConfig)
+	cmd.Env = supervisorIdentityEnvironment(config.NativeEnv, supervisorModeLiveness, ProcessIsolation{UID: config.IsolationUID, GID: config.IsolationGID})
+	cmd.ExtraFiles = []*os.File{livenessConfig}
 	configureIndependentSupervisor(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		_ = os.Remove(livenessConfig)
+		_ = livenessConfig.Close()
 
 		return fmt.Errorf("open liveness control input: %w", err)
 	}
@@ -351,7 +419,7 @@ func runGuardian(config supervisorConfig) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = stdin.Close()
-		_ = os.Remove(livenessConfig)
+		_ = livenessConfig.Close()
 
 		return fmt.Errorf("open liveness data output: %w", err)
 	}
@@ -360,7 +428,7 @@ func runGuardian(config supervisorConfig) error {
 	if err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
-		_ = os.Remove(livenessConfig)
+		_ = livenessConfig.Close()
 
 		return fmt.Errorf("open liveness control output: %w", err)
 	}
@@ -369,17 +437,18 @@ func runGuardian(config supervisorConfig) error {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
-		_ = os.Remove(livenessConfig)
+		_ = livenessConfig.Close()
 
 		return fmt.Errorf("start liveness supervisor: %w", err)
 	}
+
+	_ = livenessConfig.Close()
 
 	livenessWaiter := newSupervisorWaiter(cmd, true)
 	if _, err := supervisorReleaseIndependentWaiter(cmd, livenessWaiter); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
-		_ = os.Remove(livenessConfig)
 
 		return fmt.Errorf("capture liveness supervisor identity: %w", err)
 	}
