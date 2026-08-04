@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -43,6 +44,7 @@ func preserveSupervisorGlobals(t *testing.T) {
 	oldRandRead := supervisorRandRead
 	oldChmod := supervisorChmod
 	oldOpenFile := supervisorOpenFile
+	oldCreateTemp := supervisorCreateTemp
 	oldEncode := supervisorEncodeConfig
 	oldGuardianContainment := supervisorNewGuardianContainment
 	oldGuardianName := supervisorGuardianName
@@ -61,6 +63,7 @@ func preserveSupervisorGlobals(t *testing.T) {
 		supervisorRandRead = oldRandRead
 		supervisorChmod = oldChmod
 		supervisorOpenFile = oldOpenFile
+		supervisorCreateTemp = oldCreateTemp
 		supervisorEncodeConfig = oldEncode
 		supervisorNewGuardianContainment = oldGuardianContainment
 		supervisorGuardianName = oldGuardianName
@@ -113,12 +116,15 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 	preserveSupervisorGlobals(t)
 	root := t.TempDir()
 	supervisorExecutable = func() (string, error) { return "", errors.New("lookup failed") }
-	_, _, err := supervisorCommand(context.Background(), supervisorConfig{Scratch: root})
+	_, _, err := supervisorCommand(context.Background(), supervisorConfig{
+		Scratch: root, Isolation: testProcessIsolation(),
+	})
 	require.ErrorContains(t, err, "resolve embedded")
 
 	supervisorExecutable = os.Executable
 	cmd, proof, err := supervisorCommand(context.Background(), supervisorConfig{
 		NativePath: "/usr/bin/true", Home: filepath.Join(root, "home"), Scratch: root,
+		Isolation: testProcessIsolation(),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, cmd)
@@ -294,6 +300,7 @@ func TestRunLivenessPublishAndPIDFailures(t *testing.T) {
 }
 
 func TestRunGuardianHappyPathAndPreReadinessFailure(t *testing.T) {
+	skipUnprivilegedDarwinIsolation(t)
 	preserveSupervisorGlobals(t)
 	root := t.TempDir()
 	supervisorInput = strings.NewReader("payload\n")
@@ -323,8 +330,6 @@ func TestSupervisorBootstrapAndUnixContainmentBranches(t *testing.T) {
 	supervisorExit = func(int) {}
 	supervisorError = io.Discard
 	t.Setenv(supervisorModeEnv, "")
-	supervisorBootstrap()
-	t.Setenv(supervisorModeEnv, "bad")
 	supervisorBootstrap()
 
 	containmentConfig := supervisorConfig{
@@ -378,8 +383,12 @@ func TestSupervisorEntropyAndProofStatFailures(t *testing.T) {
 	supervisorRandRead = func([]byte) (int, error) { return 0, errors.New("entropy failed") }
 	_, err := supervisorNonce()
 	require.ErrorContains(t, err, "marker nonce")
-	_, err = writeSupervisorConfig(t.TempDir(), supervisorConfig{})
-	require.ErrorContains(t, err, "config nonce")
+	configFile, err := writeSupervisorConfig(t.TempDir(), supervisorConfig{})
+	require.NoError(t, err)
+	configPath := configFile.Name()
+	require.NoError(t, configFile.Close())
+	_, statErr := os.Stat(configPath)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
 
 	root := t.TempDir()
 	notDirectory := filepath.Join(root, "file")
@@ -431,7 +440,7 @@ func TestRunGuardianPipeAndStartFailures(t *testing.T) {
 		supervisorExecutable = func() (string, error) { return "/missing", nil }
 		supervisorExecCommand = func(string, ...string) *exec.Cmd { return exec.Command(filepath.Join(root, "missing")) }
 		err := runGuardian(supervisorConfig{Home: filepath.Join(root, "home"), Scratch: root})
-		require.ErrorContains(t, err, "start liveness supervisor")
+		require.ErrorContains(t, err, "resolve liveness supervisor executable through process policy")
 	})
 
 	t.Run("executable", func(t *testing.T) {
@@ -555,7 +564,7 @@ func TestSupervisorInjectedFilesystemAndContainmentFailures(t *testing.T) {
 
 	t.Run("open file", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
-		supervisorOpenFile = func(string, int, os.FileMode) (*os.File, error) { return nil, errors.New("open failed") }
+		supervisorCreateTemp = func(string, string) (*os.File, error) { return nil, errors.New("open failed") }
 		_, err := writeSupervisorConfig(t.TempDir(), supervisorConfig{})
 		require.ErrorContains(t, err, "create private supervisor config")
 	})
@@ -592,10 +601,14 @@ func TestSupervisorInjectedFilesystemAndContainmentFailures(t *testing.T) {
 
 func TestSupervisorDispatchBootstrapAndEarlyFailures(t *testing.T) {
 	preserveSupervisorGlobals(t)
+	isolation := testProcessIsolation()
+	t.Setenv(processIsolationUIDEnv, strconv.FormatUint(uint64(isolation.UID), 10))
+	t.Setenv(processIsolationGIDEnv, strconv.FormatUint(uint64(isolation.GID), 10))
 	root := t.TempDir()
 	config := supervisorConfig{
 		NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
+		IsolationUID: isolation.UID, IsolationGID: isolation.GID,
 	}
 	path, err := writeSupervisorConfig(root, config)
 	require.NoError(t, err)
@@ -611,7 +624,7 @@ func TestSupervisorDispatchBootstrapAndEarlyFailures(t *testing.T) {
 	config.Completion = filepath.Join(root, "complete")
 	config.NativePIDFile = filepath.Join(root, "pid")
 	supervisorRandRead = func([]byte) (int, error) { return 0, errors.New("entropy failed") }
-	_, _, err = supervisorCommand(context.Background(), supervisorConfig{Scratch: t.TempDir()})
+	_, _, err = supervisorCommand(context.Background(), supervisorConfig{Scratch: t.TempDir(), Isolation: isolation})
 	require.ErrorContains(t, err, "marker nonce")
 	supervisorRandRead = func(value []byte) (int, error) {
 		for index := range value {
@@ -620,7 +633,7 @@ func TestSupervisorDispatchBootstrapAndEarlyFailures(t *testing.T) {
 
 		return len(value), nil
 	}
-	_, _, err = supervisorCommand(context.Background(), supervisorConfig{Scratch: ""})
+	_, _, err = supervisorCommand(context.Background(), supervisorConfig{Scratch: "", Isolation: isolation})
 	require.ErrorContains(t, err, "scratch root")
 
 	root = t.TempDir()
@@ -802,6 +815,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 	})
 
 	t.Run("guardian dispatch", func(t *testing.T) {
+		skipUnprivilegedDarwinIsolation(t)
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()
 		supervisorInput = strings.NewReader("")

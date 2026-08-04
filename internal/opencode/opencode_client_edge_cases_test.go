@@ -30,7 +30,7 @@ func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 	restoreOpenCodeClientSeams(t)
 	preserveSupervisorGlobals(t)
 	supervisorExecutable = func() (string, error) { return "", errors.New("supervisor lookup failed") }
-	_, err = StartServer(context.Background(), StartOptions{Root: t.TempDir()})
+	_, err = StartServer(context.Background(), StartOptions{Root: t.TempDir(), ProcessIsolation: testProcessIsolation()})
 	require.ErrorContains(t, err, "supervisor lookup failed")
 
 	restoreOpenCodeClientSeams(t)
@@ -42,7 +42,7 @@ func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 
 		return command
 	}
-	_, err = StartServer(context.Background(), StartOptions{Root: root, SkipSupervisor: true})
+	_, err = StartServer(context.Background(), StartOptions{Root: root, SkipSupervisor: true, ProcessIsolation: testProcessIsolation()})
 	require.Error(t, err)
 
 	restoreOpenCodeClientSeams(t)
@@ -53,7 +53,7 @@ func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 
 		return command
 	}
-	_, err = StartServer(context.Background(), StartOptions{ScratchParent: t.TempDir(), SkipSupervisor: true})
+	_, err = StartServer(context.Background(), StartOptions{ScratchParent: t.TempDir(), SkipSupervisor: true, ProcessIsolation: testProcessIsolation()})
 	require.Error(t, err)
 }
 
@@ -64,7 +64,7 @@ func TestStartServerContainmentPreparationAndWaiterFailures(t *testing.T) {
 		openCodePrepareRuntimeGeneration = func(context.Context, StartOptions) (string, func() error, error) {
 			return "", nil, want
 		}
-		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t)})
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t), ProcessIsolation: testProcessIsolation()})
 		require.ErrorIs(t, err, want)
 	})
 
@@ -81,11 +81,12 @@ func TestStartServerContainmentPreparationAndWaiterFailures(t *testing.T) {
 
 			return want
 		}
-		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t)})
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t), ProcessIsolation: testProcessIsolation()})
 		require.ErrorIs(t, err, want)
 	})
 
 	t.Run("release runtime waiter", func(t *testing.T) {
+		skipUnprivilegedDarwinIsolation(t)
 		restoreOpenCodeClientSeams(t)
 		preserveSupervisorGlobals(t)
 		want := errors.New("release waiter failed")
@@ -95,11 +96,12 @@ func TestStartServerContainmentPreparationAndWaiterFailures(t *testing.T) {
 		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 30")
 		}
-		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t), SkipSupervisor: true})
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t), SkipSupervisor: true, ProcessIsolation: testProcessIsolation()})
 		require.ErrorIs(t, err, want)
 	})
 
 	t.Run("release supervised runtime waiter", func(t *testing.T) {
+		skipUnprivilegedDarwinIsolation(t)
 		restoreOpenCodeClientSeams(t)
 		preserveSupervisorGlobals(t)
 		want := errors.New("release supervised waiter failed")
@@ -110,7 +112,7 @@ func TestStartServerContainmentPreparationAndWaiterFailures(t *testing.T) {
 		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 30")
 		}
-		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t)})
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t), ProcessIsolation: testProcessIsolation()})
 		require.ErrorIs(t, err, want)
 	})
 }
@@ -129,6 +131,7 @@ func TestStartServerDarwinContainmentFailures(t *testing.T) {
 			DarwinBestEffort:          true,
 			ContainmentScratchParent:  parentFile,
 			ReserveContainmentScratch: testContainmentScratchReservation,
+			ProcessIsolation:          testProcessIsolation(),
 		})
 		require.ErrorContains(t, err, "scratch parent")
 	})
@@ -140,11 +143,12 @@ func TestStartServerDarwinContainmentFailures(t *testing.T) {
 		openCodeRemoveAll = func(string) error { return removeErr }
 		_, err := StartServer(context.Background(), StartOptions{
 			ExistingXDG:               testXDGDirs(t),
-			ExecutablePath:            filepath.Join(t.TempDir(), "missing-opencode"),
+			ExecutablePath:            "/usr/bin/false",
 			SkipSupervisor:            true,
 			DarwinBestEffort:          true,
 			ContainmentScratchParent:  parent,
 			ReserveContainmentScratch: testContainmentScratchReservation,
+			ProcessIsolation:          testProcessIsolation(),
 		})
 		require.ErrorIs(t, err, removeErr)
 		require.ErrorIs(t, err, ErrRuntimeScratchCleanup)

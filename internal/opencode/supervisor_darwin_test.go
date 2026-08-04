@@ -53,6 +53,7 @@ func darwinSupervisorTestConfig(t *testing.T) supervisorConfig {
 
 	return supervisorConfig{
 		ScratchParent: parent, Scratch: root, LifecycleKind: "runtime", DarwinBestEffort: true,
+		IsolationUID: testProcessIsolation().UID, IsolationGID: testProcessIsolation().GID, Isolation: testProcessIsolation(),
 	}
 }
 
@@ -564,6 +565,7 @@ func TestReleaseIndependentDarwinSupervisorWaiterBranches(t *testing.T) {
 }
 
 func TestStartServerDarwinDirectChildIdentityFailure(t *testing.T) {
+	skipUnprivilegedDarwinIsolation(t)
 	restoreOpenCodeClientSeams(t)
 	preserveSupervisorGlobals(t)
 	preserveDarwinSupervisorSeams(t)
@@ -593,6 +595,7 @@ func TestStartServerDarwinDirectChildIdentityFailure(t *testing.T) {
 	var reservations, releases int
 	_, err := StartServer(context.Background(), StartOptions{
 		ExistingXDG:              testXDGDirs(t),
+		ProcessIsolation:         testProcessIsolation(),
 		DarwinBestEffort:         true,
 		ContainmentScratchParent: parent,
 		ReserveContainmentScratch: func(context.Context) (func(), error) {

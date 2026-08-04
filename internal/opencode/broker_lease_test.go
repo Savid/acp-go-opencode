@@ -390,6 +390,7 @@ func absentProcessID(t *testing.T) int {
 // disk while no process exists to name, and a second write adopts that
 // process's PID once there is one.
 func TestStartServerWritesTheLeaseBeforeItSpawns(t *testing.T) {
+	skipUnprivilegedDarwinIsolation(t)
 	restoreLeaseHooks(t)
 
 	leaseDir := t.TempDir()

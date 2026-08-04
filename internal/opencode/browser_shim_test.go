@@ -74,6 +74,7 @@ func browserLaunchingOpenCodeExecutable(t *testing.T) string {
 }
 
 func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
+	skipUnprivilegedDarwinIsolation(t)
 	marker := filepath.Join(t.TempDir(), "launched")
 	probe := browserProbeDir(t, marker)
 

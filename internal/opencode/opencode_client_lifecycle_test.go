@@ -33,6 +33,7 @@ func testContainmentScratchReservation(context.Context) (func(), error) {
 
 func platformStartOptions(t *testing.T, options StartOptions) StartOptions {
 	t.Helper()
+	options = withTestProcessIsolation(options)
 
 	if runtime.GOOS == "darwin" {
 		options.DarwinBestEffort = true
@@ -472,6 +473,7 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 }
 
 func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
+	skipUnprivilegedDarwinIsolation(t)
 	helper := fakeOpenCodeExecutable(t)
 	root := t.TempDir()
 	logger := slog.New(slog.DiscardHandler)
@@ -587,11 +589,15 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 			return exec.CommandContext(ctx, filepath.Join(t.TempDir(), "missing-opencode"))
 		}
-		_, err := StartServer(ctx, StartOptions{ExistingXDG: xdg, SkipSupervisor: true})
+		_, err := StartServer(ctx, StartOptions{
+			ExistingXDG:      xdg,
+			SkipSupervisor:   true,
+			ProcessIsolation: testProcessIsolation(),
+		})
 		if err == nil {
 			t.Fatal("missing executable unexpectedly started")
 		}
-		if executable != "opencode" {
+		if filepath.Base(executable) != "opencode" {
 			t.Fatalf("default executable = %q", executable)
 		}
 	})
@@ -616,8 +622,9 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 	t.Run("runtime config failure", func(t *testing.T) {
 		_, err := StartServer(ctx, StartOptions{
-			ExistingXDG: testXDGDirs(t),
-			SeedFiles:   map[string]string{"../escape": "bad"},
+			ExistingXDG:      testXDGDirs(t),
+			SeedFiles:        map[string]string{"../escape": "bad"},
+			ProcessIsolation: testProcessIsolation(),
 		})
 		if err == nil {
 			t.Fatal("invalid permission unexpectedly started")
@@ -629,7 +636,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		openCodeListen = func(string, string) (net.Listener, error) {
 			return nil, errors.New("listen failed")
 		}
-		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
 			t.Fatal("listen error was ignored")
 		}
 	})
@@ -637,7 +644,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	t.Run("password entropy failure", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeRandReader = errorReader{err: errors.New("entropy failed")}
-		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
 			t.Fatal("entropy error was ignored")
 		}
 	})
@@ -650,7 +657,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 			return cmd
 		}
-		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
 			t.Fatal("stdout pipe error was ignored")
 		}
 	})
@@ -663,12 +670,13 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 			return cmd
 		}
-		if _, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)}); err == nil {
+		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
 			t.Fatal("stderr pipe error was ignored")
 		}
 	})
 
 	t.Run("readiness failure closes process", func(t *testing.T) {
+		skipUnprivilegedDarwinIsolation(t)
 		helper := fakeOpenCodeExecutable(t)
 		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
 			Root:            t.TempDir(),
@@ -1133,7 +1141,7 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	}
 	env, err := buildProcessEnvironment(&ProcessIsolation{
 		UID: 1, GID: 2, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin"},
-	}, map[string]string{"": "skip", "A": "1"}, map[string]string{"A": "2", "B": "3"})
+	}, map[string]string{"A": "1"}, map[string]string{"A": "2", "B": "3"})
 	if err != nil || env["A"] != "2" || env["B"] != "3" {
 		t.Fatalf("merged env = %#v, err = %v", env, err)
 	}
@@ -1899,6 +1907,7 @@ func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
 // version contract; this is not a physical OpenCode p95 claim.
 // With five samples, nearest-rank p95 is the slowest sample.
 func TestColdStartupReleaseGate(t *testing.T) {
+	skipUnprivilegedDarwinIsolation(t)
 	executable := fakeOpenCodeExecutable(t)
 	durations := make([]time.Duration, 0, releaseGateRepetitions)
 
