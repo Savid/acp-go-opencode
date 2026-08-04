@@ -40,6 +40,10 @@ func (*livenessContainment) Quiesce(int, time.Duration) error {
 	return unsupportedContainment()
 }
 func configureIndependentSupervisor(*exec.Cmd) {}
+
+func startIndependentSupervisor(cmd *exec.Cmd) error {
+	return cmd.Start()
+}
 func releaseIndependentSupervisorWaiter(_ *exec.Cmd, waiter *supervisorWaiter) (int, error) {
 	waiter.start()
 

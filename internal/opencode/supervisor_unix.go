@@ -54,6 +54,10 @@ func configureIndependentSupervisor(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+func startIndependentSupervisor(cmd *exec.Cmd) error {
+	return cmd.Start()
+}
+
 func releaseIndependentSupervisorWaiter(cmd *exec.Cmd, waiter *supervisorWaiter) (int, error) {
 	if cmd == nil || cmd.Process == nil || waiter == nil {
 		return 0, errors.Join(ErrProcessContainmentIncomplete, errors.New("direct-child waiter is unavailable"))

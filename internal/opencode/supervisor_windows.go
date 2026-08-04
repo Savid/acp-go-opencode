@@ -246,6 +246,10 @@ func configureIndependentSupervisor(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP}
 }
 
+func startIndependentSupervisor(cmd *exec.Cmd) error {
+	return cmd.Start()
+}
+
 func releaseIndependentSupervisorWaiter(cmd *exec.Cmd, waiter *supervisorWaiter) (int, error) {
 	if cmd == nil || cmd.Process == nil || waiter == nil {
 		return 0, errors.Join(ErrProcessContainmentIncomplete, errors.New("direct-child waiter is unavailable"))

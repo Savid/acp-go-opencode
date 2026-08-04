@@ -433,7 +433,7 @@ func runGuardian(config supervisorConfig) error {
 		return fmt.Errorf("open liveness control output: %w", err)
 	}
 
-	if err := cmd.Start(); err != nil {
+	if err := startIndependentSupervisor(cmd); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,6 +28,9 @@ type livenessContainment struct {
 
 var (
 	supervisorLinuxPrctl           = unix.Prctl
+	supervisorLinuxNoNewPrivileges = func() error {
+		return unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+	}
 	supervisorLinuxPIDFDOpen       = unix.PidfdOpen
 	supervisorLinuxPIDFDSendSignal = unix.PidfdSendSignal
 	supervisorLinuxPoll            = unix.Poll
@@ -62,9 +66,11 @@ func openLivenessContainment(supervisorConfig) (*livenessContainment, error) {
 }
 
 func (containment *livenessContainment) Start(cmd *exec.Cmd) error {
-	configureOpenCodeProcess(cmd)
+	if err := startLinuxNoNewPrivileges(func() error {
+		configureOpenCodeProcess(cmd)
 
-	if err := cmd.Start(); err != nil {
+		return cmd.Start()
+	}); err != nil {
 		return err
 	}
 
@@ -108,6 +114,21 @@ func enableLinuxSubreaper(_ string) error {
 
 func configureIndependentSupervisor(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func startIndependentSupervisor(cmd *exec.Cmd) error {
+	return startLinuxNoNewPrivileges(cmd.Start)
+}
+
+func startLinuxNoNewPrivileges(start func() error) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := supervisorLinuxNoNewPrivileges(); err != nil {
+		return fmt.Errorf("disable privilege elevation for Linux supervisor child: %w", err)
+	}
+
+	return start()
 }
 
 func releaseIndependentSupervisorWaiter(cmd *exec.Cmd, waiter *supervisorWaiter) (int, error) {

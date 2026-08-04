@@ -38,6 +38,37 @@ type supervisorTestBuffer struct {
 	data []byte
 }
 
+const linuxNoNewPrivilegesProofEnv = "ACP_GO_OPENCODE_TEST_NO_NEW_PRIVILEGES_PROOF"
+
+func TestLinuxSupervisorChildInheritsNoNewPrivileges(t *testing.T) {
+	proofPath := os.Getenv(linuxNoNewPrivilegesProofEnv)
+	if proofPath != "" {
+		native := exec.Command("/bin/sh", "-c", `awk '$1 == "NoNewPrivs:" { print $2 }' /proc/self/status > "$1"`, "sh", proofPath)
+		require.NoError(t, startLinuxNoNewPrivileges(native.Start))
+		require.NoError(t, native.Wait())
+
+		return
+	}
+
+	proofPath = filepath.Join(t.TempDir(), "no-new-privileges")
+	helper := exec.Command(os.Args[0], "-test.run=^TestLinuxSupervisorChildInheritsNoNewPrivileges$")
+	helper.Env = append(os.Environ(), linuxNoNewPrivilegesProofEnv+"="+proofPath)
+	output, err := helper.CombinedOutput()
+	require.NoErrorf(t, err, "run no-new-privileges proof helper: %s", output)
+
+	proof, err := os.ReadFile(proofPath)
+	require.NoError(t, err)
+	require.Equal(t, "1", strings.TrimSpace(string(proof)))
+}
+
+func TestLinuxSupervisorLaunchesFailClosedWhenNoNewPrivilegesCannotBeSet(t *testing.T) {
+	preservePlatformSupervisorGlobals(t)
+	supervisorLinuxNoNewPrivileges = func() error { return errors.New("prctl failed") }
+
+	require.ErrorContains(t, startIndependentSupervisor(exec.Command("/bin/true")), "disable privilege elevation")
+	require.ErrorContains(t, (&livenessContainment{}).Start(exec.Command("/bin/true")), "disable privilege elevation")
+}
+
 func (buffer *supervisorTestBuffer) Write(value []byte) (int, error) {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
