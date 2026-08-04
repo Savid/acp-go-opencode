@@ -11,7 +11,7 @@ import (
 
 func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	client.xdg.State = ""
+	client.xdg.Root = ""
 	snapshot := validSyncSnapshot("session", "native", "/source")
 	node := snapshot.Graph[0]
 	require.Error(t, recordSnapshotOwnership(client, snapshot))
@@ -19,7 +19,7 @@ func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
 	require.Error(t, verifyRestoreOwnership(client, snapshot, node))
 
 	state := t.TempDir()
-	client.xdg.State = state
+	client.xdg.Root = filepath.Join(state, "runtime")
 	registry, err := readRestoreOwnership(client)
 	require.NoError(t, err)
 	require.Empty(t, registry.Aggregates)
@@ -27,7 +27,7 @@ func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
 	require.NoError(t, claimRestoreOwnership(client, snapshot, nil))
 	require.NoError(t, verifyRestoreOwnership(client, snapshot, node))
 
-	path := filepath.Join(state, restoreOwnershipFileName)
+	path := filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName)
 	require.NoError(t, os.WriteFile(path, []byte(`{`), 0o600))
 	_, err = readRestoreOwnership(client)
 	require.ErrorContains(t, err, "decode restore ownership")
@@ -39,8 +39,8 @@ func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
 	_, err = readRestoreOwnership(client)
 	require.ErrorContains(t, err, "read restore ownership")
 
-	client.xdg.State = filepath.Join(t.TempDir(), "state-file")
-	require.NoError(t, os.WriteFile(client.xdg.State, []byte("x"), 0o600))
+	client.xdg.Root = filepath.Join(t.TempDir(), "runtime")
+	require.NoError(t, os.WriteFile(restoreOwnershipDirectory(client), []byte("x"), 0o600))
 	err = writeRestoreOwnership(client, restoreOwnershipFile{})
 	require.ErrorContains(t, err, "create restore ownership directory")
 }
@@ -75,7 +75,8 @@ func TestRestoreOwnershipRemainingPropagationConflictAndLossBranches(t *testing.
 	client := newFakeOpenCodeClient()
 	snapshot := validSyncSnapshot("session", "native", "/source")
 	node := snapshot.Graph[0]
-	path := filepath.Join(client.xdg.State, restoreOwnershipFileName)
+	path := filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 	require.NoError(t, os.WriteFile(path, []byte(`{`), 0o600))
 	require.Error(t, recordSnapshotOwnership(client, snapshot))
 	require.Error(t, claimRestoreOwnership(client, snapshot, nil))

@@ -4,7 +4,7 @@ package opencode
 
 import "testing"
 
-// Windows compile-checks the platform-native Job Object sources and the
+// Windows compile-checks the fail-closed platform sources and the
 // platform-independent shutdown coverage tests. The Unix supervisor branch
 // carries the behavioral helper tests that use these same seams.
 func preserveSupervisorGlobals(t *testing.T) {

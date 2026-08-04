@@ -10,11 +10,19 @@ the streams directly.
 
 ## Standalone
 
+Standalone native mode is Linux-only. The root supervisor must receive
+`-process-isolation-config=/absolute/path/process-isolation.json`; the strict
+file schema, account/home checks, closed environment, and explicit
+`inheritEnvironment` behavior are documented in the
+[CLI reference](/docs/reference/cli). `-version` and Darwin containment
+diagnostics do not require the policy. There is no Darwin or Windows
+standalone-launch fallback.
+
 `acp-go-opencode` is launched by an ACP client, which drives it over
 stdin/stdout. stdout carries ACP JSON-RPC only; diagnostics go to stderr.
 
 ```sh
-acp-go-opencode -path /usr/bin/opencode -scratch-dir /tmp/acp-opencode
+acp-go-opencode -process-isolation-config /etc/acp-go/opencode-isolation.json -path /usr/bin/opencode -scratch-dir /tmp/acp-opencode
 ```
 
 Use `-home` when the host assigns an exact exclusive runtime XDG root. Use
@@ -33,6 +41,7 @@ builds the same agent when you need to hold a reference before serving.
 ```go Serve
 err := opencodeacp.Serve(ctx, input, output,
 	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
+	opencodeacp.WithProcessIsolation(opencodeacp.ProcessIsolation{UID: 20001, GID: 20001, BaseEnvironment: isolationEnvironment}),
 	opencodeacp.WithScratchDir(scratchDir),
 )
 ```
@@ -40,6 +49,7 @@ err := opencodeacp.Serve(ctx, input, output,
 ```go NewAgent
 agent := opencodeacp.NewAgent(
 	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
+	opencodeacp.WithProcessIsolation(opencodeacp.ProcessIsolation{UID: 20001, GID: 20001, BaseEnvironment: isolationEnvironment}),
 	opencodeacp.WithScratchDir(scratchDir),
 )
 ```

@@ -7,6 +7,18 @@ The adapter advertises no ACP auth method of its own, and it brokers provider
 logins through a session-scoped extension surface when a host configures a
 durable ledger root and a durable home.
 
+## Standalone credential input
+
+The standalone root supervisor never forwards its ambient environment.
+To pass provider API-key variables, name each variable explicitly in the
+`inheritEnvironment` array of the root-owned
+`-process-isolation-config` policy. The value must be set in the supervisor
+environment or startup fails; identity, path, loader, XDG/native-home, and
+adapter-private variables cannot be inherited. File-backed or provider-broker
+credentials must live only in the explicit target-owned native home described
+by the adapter. No standalone path reads root `HOME`, root native config, or
+an unlisted root credential.
+
 ## No ACP auth methods
 
 The adapter advertises an empty `authMethods` list in its `initialize`
@@ -159,10 +171,11 @@ callback listens on this host, so a tab that reached it would complete a real
 grant unattended. The directory is removed with the broker home on every
 terminal transition.
 
-On Windows the shadowing is impossible — the system directory resolves ahead of
+Windows rejects every native OpenCode launch at the mandatory Unix UID/GID
+identity boundary, so the flow is unavailable there. Independently, browser
+shadowing is impossible on Windows: the system directory resolves ahead of
 every `PATH` entry and the `start` that opens a URL is a shell builtin with no
-image to shadow — so the flow refuses to start rather than opening a browser it
-cannot contain.
+image to shadow.
 
 ### What the ledger holds
 

@@ -46,6 +46,7 @@ type supervisorConfig struct {
 	JobName           string            `json:"jobName,omitempty"`
 	Started           string            `json:"started"`
 	Completion        string            `json:"completion"`
+	Quarantine        string            `json:"quarantine"`
 	NativePIDFile     string            `json:"nativePidFile"`
 	InventoryIdentity string            `json:"inventoryIdentity"`
 	IsolationUID      uint32            `json:"isolationUid"`
@@ -77,6 +78,8 @@ var supervisorOpenLivenessContainment = openLivenessContainment
 var supervisorLivenessQuiesce = func(containment *livenessContainment, nativePID int, timeout time.Duration) error {
 	return containment.Quiesce(nativePID, timeout)
 }
+var supervisorQuarantineRetry func(*livenessContainment) error
+var supervisorGuardianQuarantineRetry func(*guardianContainment) error
 var supervisorReleaseIndependentWaiter = releaseIndependentSupervisorWaiter
 var supervisorInput io.Reader = os.Stdin
 var supervisorOutput io.Writer = os.Stdout
@@ -104,6 +107,8 @@ func (noopSupervisorIdentityLock) InheritedFile() *os.File { return nil }
 type supervisorProof struct {
 	started           string
 	completion        string
+	quarantine        string
+	nativePIDFile     string
 	inventoryIdentity string
 	inherited         []*os.File
 }
@@ -258,6 +263,10 @@ func writeSupervisorConfig(root string, config supervisorConfig) (*os.File, erro
 }
 
 func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd, *supervisorProof, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
 	if err := validateProcessIsolation(config.Isolation); err != nil {
 		return nil, nil, err
 	}
@@ -289,6 +298,7 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 
 	config.Started = filepath.Join(markerRoot, "supervisor-started-"+markerNonce)
 	config.Completion = filepath.Join(markerRoot, "supervisor-complete-"+markerNonce)
+	config.Quarantine = filepath.Join(markerRoot, "supervisor-quarantine-"+markerNonce)
 	config.NativePIDFile = filepath.Join(markerRoot, "supervisor-native-pid-"+markerNonce)
 	config.InventoryIdentity = filepath.Join(markerRoot, "supervisor-inventory-"+markerNonce)
 
@@ -314,13 +324,16 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 	}
 
 	cmd := openCodeCommandContext(ctx, executable)
+	cmd.Cancel = nil
+	cmd.WaitDelay = 0
 	cmd.Env = helperEnv
 	cmd.Dir = "/"
 
 	cmd.ExtraFiles = []*os.File{configFile}
 
 	return cmd, &supervisorProof{
-		started: config.Started, completion: config.Completion, inventoryIdentity: config.InventoryIdentity,
+		started: config.Started, completion: config.Completion, quarantine: config.Quarantine,
+		nativePIDFile: config.NativePIDFile, inventoryIdentity: config.InventoryIdentity,
 		inherited: []*os.File{configFile},
 	}, nil
 }
@@ -343,9 +356,17 @@ func (p *supervisorProof) awaitCompletion(ctx context.Context) error {
 	}
 
 	if _, err := os.Stat(p.completion); err == nil {
+		p.removeTerminalMarkers()
+
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("stat liveness completion proof: %w", err))
+	}
+
+	if quarantined, err := supervisorMarkerExists(p.quarantine); err != nil {
+		return errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("stat liveness quarantine proof: %w", err))
+	} else if quarantined {
+		return errors.Join(ErrProcessContainmentIncomplete, errors.New("liveness supervisor retained the identity lock while quarantining descendants"))
 	}
 
 	if _, err := os.Stat(p.started); errors.Is(err, os.ErrNotExist) {
@@ -356,9 +377,17 @@ func (p *supervisorProof) awaitCompletion(ctx context.Context) error {
 
 	for {
 		if _, err := os.Stat(p.completion); err == nil {
+			p.removeTerminalMarkers()
+
 			return nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("stat liveness completion proof: %w", err))
+		}
+
+		if quarantined, err := supervisorMarkerExists(p.quarantine); err != nil {
+			return errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("stat liveness quarantine proof: %w", err))
+		} else if quarantined {
+			return errors.Join(ErrProcessContainmentIncomplete, errors.New("liveness supervisor retained the identity lock while quarantining descendants"))
 		}
 
 		select {
@@ -367,6 +396,22 @@ func (p *supervisorProof) awaitCompletion(ctx context.Context) error {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+func (p *supervisorProof) removeTerminalMarkers() {
+	if p == nil {
+		return
+	}
+
+	removeSupervisorMarkers(p.started, p.completion, p.quarantine, p.nativePIDFile, p.inventoryIdentity)
+}
+
+func (p *supervisorProof) quarantineDetected() (bool, error) {
+	if p == nil {
+		return false, nil
+	}
+
+	return supervisorMarkerExists(p.quarantine)
 }
 
 func (p *supervisorProof) processSnapshot() (int, bool) {
@@ -503,7 +548,15 @@ func runGuardian(config supervisorConfig) error {
 	ready, parseErr := parseSupervisorReady(readyLine)
 	if readyErr != nil || parseErr != nil {
 		_ = stdin.Close()
-		waitErr := <-livenessDone
+
+		waitErr, quarantined, terminalErr := awaitLivenessTerminal(livenessDone, config.Quarantine)
+		if quarantined || terminalErr != nil {
+			_ = stdout.Close()
+			_ = stderr.Close()
+
+			return errors.Join(terminalErr, finishQuarantinedLiveness(livenessDone, config))
+		}
+
 		_, _ = io.Copy(errorOutput, control)
 
 		var proofErr error
@@ -515,14 +568,16 @@ func runGuardian(config supervisorConfig) error {
 
 			if _, startedErr := os.Stat(config.Started); startedErr == nil {
 				nativePID, pidErr := readNativePID(config.NativePIDFile)
+				if markerErr := writeGuardianQuarantineMarker(config); markerErr != nil {
+					return errors.Join(waitErr, markerErr)
+				}
+
 				quiesceErr := awaitQuiescence(func() error {
 					return supervisorGuardianQuiesce(containment, nativePID, supervisorQuiesceWindow)
 				})
 
 				proofErr = errors.Join(pidErr, quiesceErr)
-				if proofErr == nil {
-					proofErr = writeSupervisorMarker(config.Completion)
-				}
+				proofErr = completeOrQuarantineGuardian(config, containment, proofErr)
 			} else if !errors.Is(startedErr, os.ErrNotExist) {
 				return errors.Join(waitErr, startedErr)
 			}
@@ -536,9 +591,20 @@ func runGuardian(config supervisorConfig) error {
 	go copySupervisorStream(output, stdout, copyDone)
 	go copySupervisorStream(errorOutput, control, copyDone)
 
-	waitErr := <-livenessDone
-	_ = stdin.Close()
+	waitErr, quarantined, terminalErr := awaitLivenessTerminal(livenessDone, config.Quarantine)
 
+	_ = stdin.Close()
+	if quarantined || terminalErr != nil {
+		_ = stdout.Close()
+		_ = stderr.Close()
+
+		return errors.Join(terminalErr, finishQuarantinedLiveness(livenessDone, config))
+	}
+
+	return finishGuardianLiveness(config, containment, ready.NativePID, waitErr)
+}
+
+func finishGuardianLiveness(config supervisorConfig, containment *guardianContainment, nativePID int, waitErr error) error {
 	var proofErr error
 
 	if _, completeErr := os.Stat(config.Completion); completeErr != nil {
@@ -546,12 +612,14 @@ func runGuardian(config supervisorConfig) error {
 			return errors.Join(waitErr, completeErr)
 		}
 
-		proofErr = awaitQuiescence(func() error {
-			return supervisorGuardianQuiesce(containment, ready.NativePID, supervisorQuiesceWindow)
-		})
-		if proofErr == nil {
-			proofErr = writeSupervisorMarker(config.Completion)
+		if markerErr := writeGuardianQuarantineMarker(config); markerErr != nil {
+			return errors.Join(waitErr, markerErr)
 		}
+
+		proofErr = awaitQuiescence(func() error {
+			return supervisorGuardianQuiesce(containment, nativePID, supervisorQuiesceWindow)
+		})
+		proofErr = completeOrQuarantineGuardian(config, containment, proofErr)
 	}
 
 	if proofErr != nil {
@@ -656,9 +724,7 @@ func runLiveness(config supervisorConfig) error {
 
 		<-waitDone
 
-		if proofErr == nil {
-			proofErr = writeSupervisorMarker(config.Completion)
-		}
+		proofErr = completeOrQuarantineLiveness(config, containment, proofErr)
 
 		return errors.Join(pidErr, proofErr)
 	}
@@ -673,9 +739,7 @@ func runLiveness(config supervisorConfig) error {
 
 		<-waitDone
 
-		if proofErr == nil {
-			proofErr = writeSupervisorMarker(config.Completion)
-		}
+		proofErr = completeOrQuarantineLiveness(config, containment, proofErr)
 
 		return errors.Join(fmt.Errorf("publish supervisor readiness: %w", err), proofErr)
 	}
@@ -698,10 +762,8 @@ func runLiveness(config supervisorConfig) error {
 			// captured original identity and must not rediscover a reused PID.
 			return supervisorLivenessQuiesce(containment, 0, supervisorQuiesceWindow)
 		})
-		if proofErr == nil {
-			proofErr = writeSupervisorMarker(config.Completion)
-		}
 
+		proofErr = completeOrQuarantineLiveness(config, containment, proofErr)
 		if proofErr != nil {
 			return errors.Join(waitErr, proofErr)
 		}
@@ -718,11 +780,119 @@ func runLiveness(config supervisorConfig) error {
 
 		<-waitDone
 
-		if proofErr == nil {
-			proofErr = writeSupervisorMarker(config.Completion)
-		}
+		proofErr = completeOrQuarantineLiveness(config, containment, proofErr)
 
 		return proofErr
+	}
+}
+
+func completeOrQuarantineLiveness(config supervisorConfig, containment *livenessContainment, proofErr error) error {
+	if proofErr == nil {
+		return writeSupervisorMarker(config.Completion)
+	}
+
+	if supervisorQuarantineRetry == nil || config.Quarantine == "" {
+		return proofErr
+	}
+
+	if err := writeSupervisorMarker(config.Quarantine); err != nil {
+		return errors.Join(proofErr, err)
+	}
+
+	closeSupervisorQuarantineStreams()
+
+	retryErr := supervisorQuarantineRetry(containment)
+
+	removeSupervisorMarkers(config.Started, config.Completion, config.NativePIDFile, config.InventoryIdentity)
+
+	return errors.Join(proofErr, retryErr)
+}
+
+func writeGuardianQuarantineMarker(config supervisorConfig) error {
+	if config.Quarantine == "" {
+		return nil
+	}
+
+	return writeSupervisorMarker(config.Quarantine)
+}
+
+func completeOrQuarantineGuardian(config supervisorConfig, containment *guardianContainment, proofErr error) error {
+	if proofErr == nil {
+		return writeSupervisorMarker(config.Completion)
+	}
+
+	if supervisorGuardianQuarantineRetry == nil || config.Quarantine == "" {
+		return proofErr
+	}
+
+	if err := writeSupervisorMarker(config.Quarantine); err != nil {
+		return errors.Join(proofErr, err)
+	}
+
+	closeSupervisorQuarantineStreams()
+
+	retryErr := supervisorGuardianQuarantineRetry(containment)
+
+	removeSupervisorMarkers(config.Started, config.Completion, config.Quarantine, config.NativePIDFile, config.InventoryIdentity)
+
+	return errors.Join(proofErr, retryErr)
+}
+
+func finishQuarantinedLiveness(done <-chan error, config supervisorConfig) error {
+	waitErr := <-done
+
+	removeSupervisorMarkers(config.Started, config.Completion, config.Quarantine, config.NativePIDFile, config.InventoryIdentity)
+
+	return errors.Join(waitErr, fmt.Errorf("%w: liveness supervisor completed containment quarantine", ErrProcessContainmentIncomplete))
+}
+
+func awaitLivenessTerminal(done <-chan error, quarantine string) (error, bool, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-done:
+			return err, false, nil
+		case <-ticker.C:
+			present, err := supervisorMarkerExists(quarantine)
+			if err != nil {
+				return nil, false, fmt.Errorf("stat liveness quarantine proof: %w", err)
+			}
+
+			if present {
+				return nil, true, nil
+			}
+		}
+	}
+}
+
+func supervisorMarkerExists(path string) (bool, error) {
+	if path == "" {
+		return false, nil
+	}
+
+	_, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
+	return err == nil, err
+}
+
+func removeSupervisorMarkers(paths ...string) {
+	for _, path := range paths {
+		if path != "" {
+			_ = os.Remove(path)
+		}
+	}
+}
+
+func closeSupervisorQuarantineStreams() {
+	for _, stream := range []any{supervisorInput, supervisorOutput, supervisorError} {
+		if file, ok := stream.(*os.File); ok {
+			_ = file.Close()
+		}
 	}
 }
 

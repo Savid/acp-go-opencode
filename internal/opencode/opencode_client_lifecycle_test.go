@@ -530,19 +530,14 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneContainmentResult(t *testing.T) {
 	restoreOpenCodeClientSeams(t)
 	openCodeTerminateProcess = func(*os.Process, int) error { return nil }
+	shutdownTimeout := make(chan time.Time)
 	openCodeAfter = func(time.Duration) <-chan time.Time {
-		ready := make(chan time.Time, 1)
-		ready <- time.Now()
-
-		return ready
+		return shutdownTimeout
 	}
 
 	var kills atomic.Int32
-	killed := make(chan struct{})
 	openCodeKillProcess = func(*os.Process, int) error {
-		if kills.Add(1) == 1 {
-			close(killed)
-		}
+		kills.Add(1)
 
 		return nil
 	}
@@ -567,13 +562,13 @@ func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneContainmentResult(t *testing.T)
 		cancel()
 		results <- base.Shutdown(cancelled)
 	}()
-	<-killed
+	shutdownTimeout <- time.Now()
 	base.waitDone <- nil
 	first := <-results
 	second := <-results
 	require.ErrorContains(t, first, "did not exit after shutdown")
 	require.True(t, first == second, "all shutdown callers must receive the exact memoized error")
-	require.EqualValues(t, 1, kills.Load())
+	require.Zero(t, kills.Load(), "caller timeout must not kill a trusted supervisor that can own quarantine")
 	require.True(t, first == base.Shutdown(context.Background()))
 }
 
@@ -591,7 +586,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		}
 		_, err := StartServer(ctx, StartOptions{
 			ExistingXDG:      xdg,
-			SkipSupervisor:   true,
+			skipSupervisor:   true,
 			ProcessIsolation: testProcessIsolation(),
 		})
 		if err == nil {

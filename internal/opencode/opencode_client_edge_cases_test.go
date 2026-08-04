@@ -42,7 +42,7 @@ func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 
 		return command
 	}
-	_, err = StartServer(context.Background(), StartOptions{Root: root, SkipSupervisor: true, ProcessIsolation: testProcessIsolation()})
+	_, err = StartServer(context.Background(), StartOptions{Root: root, skipSupervisor: true, ProcessIsolation: testProcessIsolation()})
 	require.Error(t, err)
 
 	restoreOpenCodeClientSeams(t)
@@ -53,7 +53,7 @@ func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 
 		return command
 	}
-	_, err = StartServer(context.Background(), StartOptions{ScratchParent: t.TempDir(), SkipSupervisor: true, ProcessIsolation: testProcessIsolation()})
+	_, err = StartServer(context.Background(), StartOptions{ScratchParent: t.TempDir(), skipSupervisor: true, ProcessIsolation: testProcessIsolation()})
 	require.Error(t, err)
 }
 
@@ -96,7 +96,7 @@ func TestStartServerContainmentPreparationAndWaiterFailures(t *testing.T) {
 		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 30")
 		}
-		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t), SkipSupervisor: true, ProcessIsolation: testProcessIsolation()})
+		_, err := StartServer(context.Background(), StartOptions{ExistingXDG: testXDGDirs(t), skipSupervisor: true, ProcessIsolation: testProcessIsolation()})
 		require.ErrorIs(t, err, want)
 	})
 
@@ -144,7 +144,7 @@ func TestStartServerDarwinContainmentFailures(t *testing.T) {
 		_, err := StartServer(context.Background(), StartOptions{
 			ExistingXDG:               testXDGDirs(t),
 			ExecutablePath:            "/usr/bin/false",
-			SkipSupervisor:            true,
+			skipSupervisor:            true,
 			DarwinBestEffort:          true,
 			ContainmentScratchParent:  parent,
 			ReserveContainmentScratch: testContainmentScratchReservation,

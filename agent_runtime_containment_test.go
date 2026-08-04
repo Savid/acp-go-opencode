@@ -26,7 +26,7 @@ func TestAgentContainmentModeAndObservation(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "linux", goos: platformLinux, want: RuntimeContainmentAuthoritative},
-		{name: "windows", goos: platformWindows, want: RuntimeContainmentAuthoritative},
+		{name: "windows", goos: platformWindows, want: RuntimeContainmentUnavailable},
 		{name: "darwin default", goos: platformDarwin, want: RuntimeContainmentUnavailable},
 		{name: "darwin opted", goos: platformDarwin, opted: true, want: RuntimeContainmentBestEffort},
 		{name: "unsupported", goos: "plan9", want: RuntimeContainmentUnavailable},

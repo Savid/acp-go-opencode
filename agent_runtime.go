@@ -455,7 +455,13 @@ func (a *Agent) startSharedRuntime(
 	environment runtimeEnvironment,
 ) (opencode.Client, func(), func(), error) {
 	hooks := a.options.RuntimeResourceHooks
+	if a.options.Home != "" && a.options.ProcessIsolation != nil {
+		if err := validateNativeOwnedDirectory(a.options.Home, a.options.ProcessIsolation); err != nil {
+			return nil, nil, nil, err
+		}
 
+		return nil, nil, nil, errors.New("durable OpenCode runtime home is unsupported with process isolation")
+	}
 	var xdgScratchRelease func()
 
 	if a.options.Home == "" {
@@ -489,7 +495,7 @@ func (a *Agent) startSharedRuntime(
 	a.observe.RecordOpenCodeProcessStart(ctx)
 
 	runtime, err := factory(ctx, opencode.StartOptions{
-		Root: a.homeRoot(), ScratchParent: scratchParent(a.options.ScratchDir),
+		Root: a.homeRoot(), ControlRoot: opencode.ControlRootForXDG(a.homeRoot()), ScratchParent: scratchParent(a.options.ScratchDir),
 		ContainmentScratchParent: scratchParent(a.options.ScratchDir),
 		DarwinBestEffort:         a.containmentMode == RuntimeContainmentBestEffort,
 		ReserveContainmentScratch: func(reservationCtx context.Context) (func(), error) {
@@ -506,7 +512,7 @@ func (a *Agent) startSharedRuntime(
 		Pure:             a.options.Pure, QuestionTool: a.options.QuestionTool,
 		LogLevel: a.options.LogLevel, MinVersion: minNativeVersion,
 		HealthTimeout: a.options.HealthCheckTimeout, Logger: a.log,
-		ExistingXDG: xdg, SeedFiles: a.options.SeedFiles,
+		ExistingXDG: xdg, HandoffXDG: a.options.Home == "", SeedFiles: a.options.SeedFiles,
 		ObserveProcess: func(processCtx context.Context, kind string, delta int64) {
 			observeRuntimeProcess(processCtx, hooks, RuntimeProcessKind(kind), delta)
 		},
@@ -554,7 +560,7 @@ func (a *Agent) cleanupRuntimeResources(shutdownErr error, nativeRelease, xdgScr
 	var cleanupErr error
 
 	if a.options.Home == "" {
-		if err := runtimeRemoveAll(a.homeRoot()); err != nil {
+		if err := errors.Join(runtimeRemoveAll(a.homeRoot()), runtimeRemoveAll(opencode.ControlRootForXDG(a.homeRoot()))); err != nil {
 			cleanupErr = errors.Join(
 				errRuntimeScratchCleanup,
 				fmt.Errorf("remove adapter-created OpenCode runtime scratch: %w", err),

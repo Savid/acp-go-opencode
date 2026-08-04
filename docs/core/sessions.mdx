@@ -63,11 +63,12 @@ stream/control failures use the same fence when native work may remain. All
 concurrent observers join one
 memoized base-runtime shutdown result. Retirement detaches every directory
 scope on that generation, completes the selected native containment boundary,
-and only then permits a replacement generation. Authoritative Linux and Windows
-boundaries prove their owned tree empty. Darwin best-effort completes only its
-captured original process-group boundary and direct-child reap; escaped
-descendants can survive. Session snapshots and lazy restore remain available
-after the selected boundary completes.
+and only then permits a replacement generation. The authoritative Linux
+boundary proves its owned tree empty. Windows native launch fails closed because
+the mandatory Unix UID/GID identity boundary is unavailable. Darwin best-effort
+completes only its captured original process-group boundary and direct-child
+reap; escaped descendants can survive. Session snapshots and lazy restore
+remain available after the selected boundary completes.
 
 Closing a session releases its canonical-directory principal only after the
 native directory scope confirms all MCP registrations are absent. If that

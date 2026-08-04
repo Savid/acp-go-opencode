@@ -7,8 +7,8 @@ import (
 )
 
 // supervisorWaiter designates one cmd.Wait owner immediately after Start.
-// Darwin keeps that owner paused until the original group and child identity
-// have been captured; other backends begin it immediately.
+// Linux keeps the creator thread alive while waiting for the safe release
+// point; Darwin waits until the original group and child identity are captured.
 type supervisorWaiter struct {
 	beginOnce sync.Once
 	begin     chan struct{}
@@ -30,6 +30,27 @@ func newSupervisorWaiterFunc(wait func() error, paused bool) *supervisorWaiter {
 			waiter.err = wait()
 		}
 
+		close(waiter.done)
+	}()
+
+	if !paused {
+		waiter.start()
+	}
+
+	return waiter
+}
+
+func newSupervisorWaiterResult(result <-chan error, release func(), paused bool) *supervisorWaiter {
+	waiter := &supervisorWaiter{begin: make(chan struct{}), done: make(chan struct{})}
+
+	go func() {
+		<-waiter.begin
+
+		if release != nil {
+			release()
+		}
+
+		waiter.err = <-result
 		close(waiter.done)
 	}()
 

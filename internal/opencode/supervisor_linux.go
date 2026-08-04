@@ -23,7 +23,7 @@ const linuxSupervisorTaskRoot = "/proc/self/task"
 type guardianContainment struct{}
 
 type livenessContainment struct {
-	waiter *supervisorWaiter
+	waitDone <-chan error
 }
 
 var (
@@ -69,21 +69,28 @@ func openLivenessContainment(supervisorConfig) (*livenessContainment, error) {
 }
 
 func (containment *livenessContainment) Start(cmd *exec.Cmd) error {
-	if err := startLinuxSecurityLimited(func() error {
-		configureOpenCodeProcess(cmd)
+	configureOpenCodeProcess(cmd)
+	waitDone, err := startCommandOnCreatorThread(func() error {
+		if err := supervisorLinuxCoreLimit(); err != nil {
+			return fmt.Errorf("disable core dumps for Linux supervisor child: %w", err)
+		}
+		if err := supervisorLinuxNoNewPrivileges(); err != nil {
+			return fmt.Errorf("disable privilege elevation for Linux supervisor child: %w", err)
+		}
 
 		return cmd.Start()
-	}); err != nil {
+	}, cmd.Wait)
+	if err != nil {
 		return err
 	}
 
-	containment.waiter = newSupervisorWaiter(cmd, false)
+	containment.waitDone = waitDone
 
 	return nil
 }
 
 func (containment *livenessContainment) Wait() <-chan error {
-	return containment.waiter.result()
+	return containment.waitDone
 }
 
 func (*livenessContainment) Close() error { return nil }
@@ -125,6 +132,7 @@ func startIndependentSupervisor(cmd *exec.Cmd) error {
 
 func startLinuxSecurityLimited(start func() error) error {
 	runtime.LockOSThread()
+
 	defer runtime.UnlockOSThread()
 
 	if err := supervisorLinuxCoreLimit(); err != nil {

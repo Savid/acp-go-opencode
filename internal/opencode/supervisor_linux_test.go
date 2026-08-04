@@ -13,16 +13,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/savid/acp-go-opencode/internal/homelock"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 type supervisedNative struct {
 	cmd         *exec.Cmd
+	waiter      *supervisorWaiter
 	stdin       io.WriteCloser
 	home        string
 	rootPID     int
@@ -92,6 +95,16 @@ func (buffer *supervisorTestBuffer) String() string {
 	return string(buffer.data)
 }
 
+func TestLinuxLivenessContainmentUsesCreatorThreadWait(t *testing.T) {
+	preservePlatformSupervisorGlobals(t)
+
+	command := exec.Command("/bin/sh", "-c", "exit 0")
+	containment := &livenessContainment{}
+	require.NoError(t, containment.Start(command))
+	require.NoError(t, <-containment.Wait())
+	require.NotNil(t, command.ProcessState)
+}
+
 func TestSupervisorControlEOFKillsTreeBeforeUnlock(t *testing.T) {
 	runtime := startSupervisedNative(t)
 	_, err := homelock.Acquire(runtime.home)
@@ -153,11 +166,154 @@ func TestLinuxAgentIdentityLockSerializesAndCancels(t *testing.T) {
 	}
 }
 
+func TestLinuxSupervisorConfigIsSealed(t *testing.T) {
+	file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativePath: "/bin/true"})
+	require.NoError(t, err)
+	defer file.Close()
+
+	seals, err := unix.FcntlInt(file.Fd(), unix.F_GET_SEALS, 0)
+	require.NoError(t, err)
+	require.Equal(t, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL, seals)
+	_, err = file.WriteAt([]byte("x"), 0)
+	require.Error(t, err)
+}
+
+func TestLinuxAgentIdentityLockRejectsWrongModeWithoutRepair(t *testing.T) {
+	trusted := unix.Stat_t{Uid: 0, Gid: 0, Mode: unix.S_IFREG | 0o600, Nlink: 1}
+	require.NoError(t, validateLinuxAgentIdentityLock(trusted))
+
+	wrongMode := trusted
+	wrongMode.Mode = unix.S_IFREG | 0o640
+	require.ErrorContains(t, validateLinuxAgentIdentityLock(wrongMode), "mode-0600")
+	require.Equal(t, uint32(unix.S_IFREG|0o640), wrongMode.Mode)
+}
+
+func TestPersistentProofFailureRetainsIdentityLockUntilRecovery(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	supervisorInput = strings.NewReader("")
+	supervisorOutput = io.Discard
+	supervisorError = io.Discard
+
+	lockPath := filepath.Join(t.TempDir(), "identity.lock")
+	guardianFile, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, unix.Flock(int(guardianFile.Fd()), unix.LOCK_EX|unix.LOCK_NB))
+
+	survivorFD, err := unix.Dup(int(guardianFile.Fd()))
+	require.NoError(t, err)
+	survivorFile := os.NewFile(uintptr(survivorFD), "surviving-identity-lock")
+	require.NotNil(t, survivorFile)
+	require.NoError(t, (&linuxAgentIdentityLock{file: guardianFile}).Close())
+
+	contender, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer contender.Close()
+	require.ErrorIs(t, unix.Flock(int(contender.Fd()), unix.LOCK_EX|unix.LOCK_NB), unix.EWOULDBLOCK)
+
+	recoverProof := make(chan struct{})
+	var attempts atomic.Int32
+	supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error {
+		attempts.Add(1)
+		select {
+		case <-recoverProof:
+			return nil
+		default:
+			return ErrProcessContainmentIncomplete
+		}
+	}
+	supervisorQuarantineRetry = retryLinuxLivenessContainment
+
+	root := t.TempDir()
+	config := supervisorConfig{
+		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
+		Quarantine: filepath.Join(root, "quarantine"), NativePIDFile: filepath.Join(root, "pid"),
+		InventoryIdentity: filepath.Join(root, "inventory"),
+	}
+	require.NoError(t, writeSupervisorMarker(config.Started))
+
+	livenessDone := make(chan error)
+	go func() {
+		livenessDone <- completeOrQuarantineLiveness(config, &livenessContainment{}, ErrProcessContainmentIncomplete)
+		_ = survivorFile.Close()
+	}()
+	guardianDone := make(chan error, 1)
+	go func() { guardianDone <- finishQuarantinedLiveness(livenessDone, config) }()
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(config.Quarantine)
+
+		return err == nil
+	}, time.Second, 10*time.Millisecond)
+
+	startedAt := time.Now()
+	proofCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	proofErr := (&supervisorProof{
+		started: config.Started, completion: config.Completion, quarantine: config.Quarantine,
+		nativePIDFile: config.NativePIDFile, inventoryIdentity: config.InventoryIdentity,
+	}).awaitCompletion(proofCtx)
+	require.ErrorIs(t, proofErr, ErrProcessContainmentIncomplete)
+	require.Less(t, time.Since(startedAt), time.Second)
+	require.FileExists(t, config.Quarantine)
+	require.FileExists(t, config.Started)
+	require.ErrorIs(t, unix.Flock(int(contender.Fd()), unix.LOCK_EX|unix.LOCK_NB), unix.EWOULDBLOCK)
+	require.GreaterOrEqual(t, attempts.Load(), int32(1))
+
+	close(recoverProof)
+	require.ErrorIs(t, <-guardianDone, ErrProcessContainmentIncomplete)
+	require.NoFileExists(t, config.Quarantine)
+	require.NoFileExists(t, config.Started)
+	require.Eventually(t, func() bool {
+		return unix.Flock(int(contender.Fd()), unix.LOCK_EX|unix.LOCK_NB) == nil
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestGuardianPersistentProofFailureQuarantinesUntilRecovery(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	supervisorInput = strings.NewReader("")
+	supervisorOutput = io.Discard
+	supervisorError = io.Discard
+
+	recoverProof := make(chan struct{})
+	supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error {
+		select {
+		case <-recoverProof:
+			return nil
+		default:
+			return ErrProcessContainmentIncomplete
+		}
+	}
+	supervisorGuardianQuarantineRetry = retryLinuxGuardianContainment
+
+	root := t.TempDir()
+	config := supervisorConfig{
+		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
+		Quarantine: filepath.Join(root, "quarantine"), NativePIDFile: filepath.Join(root, "pid"),
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- completeOrQuarantineGuardian(config, &guardianContainment{}, ErrProcessContainmentIncomplete)
+	}()
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(config.Quarantine)
+
+		return err == nil
+	}, time.Second, 10*time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("guardian quarantine returned before kernel recovery: %v", err)
+	default:
+	}
+
+	close(recoverProof)
+	require.ErrorIs(t, <-done, ErrProcessContainmentIncomplete)
+}
+
 func TestSupervisorGuardianSIGKILLLeavesLivenessLockedUntilTreeExit(t *testing.T) {
 	runtime := startSupervisedNative(t)
 	require.NoError(t, syscall.Kill(-runtime.rootPID, syscall.SIGSTOP))
 	require.NoError(t, runtime.cmd.Process.Kill())
-	_ = runtime.cmd.Wait()
+	runtime.waiter.start()
+	<-runtime.waiter.result()
 
 	claim, err := homelock.AcquireClaim(runtime.home)
 	require.NoError(t, err, "guardian death must release only claim")
@@ -253,12 +409,13 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	stderr := new(supervisorTestBuffer)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = stderr
-	configureOpenCodeProcess(cmd)
-	require.NoError(t, cmd.Start())
+	waiter, err := startOpenCodeProcess(cmd)
+	require.NoError(t, err)
 	require.NoError(t, proof.closeInherited())
 
 	runtime := &supervisedNative{
 		cmd:        cmd,
+		waiter:     waiter,
 		stdin:      stdin,
 		home:       home,
 		stderr:     stderr,
@@ -295,11 +452,10 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 
 func shutdownSupervisedRuntime(t *testing.T, runtime *supervisedNative, ctx context.Context) {
 	t.Helper()
-	waitDone := make(chan error, 1)
-	go func() { waitDone <- runtime.cmd.Wait() }()
+	runtime.waiter.start()
 	server := &openCodeServer{
 		cmd: runtime.cmd, supervisorControl: runtime.stdin, supervisor: runtime.proof,
-		waitDone: waitDone, runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
+		waitDone: runtime.waiter.result(), runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
 	}
 	require.NoError(t, server.Shutdown(ctx))
 	runtime.cancel()
@@ -357,10 +513,10 @@ func parentPID(t *testing.T, pid int) int {
 }
 
 func waitSupervisor(runtime *supervisedNative, timeout time.Duration) error {
-	done := make(chan error, 1)
-	go func() { done <- runtime.cmd.Wait() }()
+	runtime.waiter.start()
+
 	select {
-	case err := <-done:
+	case err := <-runtime.waiter.result():
 		runtime.cancel()
 
 		proofCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)

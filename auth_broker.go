@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -55,6 +56,9 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create provider auth broker home: %w", err)
 	}
+	if err := os.Chmod(home, 0o711); err != nil {
+		return nil, errors.Join(fmt.Errorf("protect provider auth broker home: %w", err), brokerRemoveAll(home))
+	}
 
 	// A login leg the operator's browser can reach is an uncontrolled grant, not
 	// noise: the native callback listens on this host. The shim shadows every
@@ -65,7 +69,8 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 		return nil, errors.Join(fmt.Errorf("neutralize provider auth broker browser launch: %w", err), brokerRemoveAll(home))
 	}
 
-	xdg, err := brokerCreateXDG(home)
+	nativeHome := filepath.Join(home, "native")
+	xdg, err := brokerCreateXDG(nativeHome)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("create provider auth broker root: %w", err), shim.Remove(), brokerRemoveAll(home))
 	}
@@ -76,7 +81,8 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 	}
 
 	client, err := factory(ctx, opencode.StartOptions{
-		Root:                     home,
+		Root:                     nativeHome,
+		ControlRoot:              home,
 		ScratchParent:            parent,
 		ContainmentScratchParent: parent,
 		DarwinBestEffort:         agent.containmentMode == RuntimeContainmentBestEffort,
@@ -97,6 +103,7 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 		HealthTimeout:    agent.options.HealthCheckTimeout,
 		Logger:           agent.log,
 		ExistingXDG:      xdg,
+		HandoffXDG:       true,
 		SkipVersionGate:  true,
 	})
 	if err != nil {

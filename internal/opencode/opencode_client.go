@@ -172,7 +172,8 @@ type SyncReplayEvent struct {
 }
 
 type StartOptions struct {
-	Root string
+	Root        string
+	ControlRoot string
 	// ScratchParent is the already-resolved parent directory for ephemeral
 	// on-disk materialization. The root package resolves it (system temp
 	// directory when unset); this package never consults the system temp
@@ -201,9 +202,10 @@ type StartOptions struct {
 	HealthTimeout            time.Duration
 	Logger                   *slog.Logger
 	ExistingXDG              XDGDirs
+	HandoffXDG               bool
 	SkipVersionGate          bool
 	SeedFiles                map[string]string
-	SkipSupervisor           bool
+	skipSupervisor           bool
 	DarwinBestEffort         bool
 	ContainmentScratchParent string
 	// ReserveContainmentScratch reserves one adapter-created Darwin generation
@@ -893,6 +895,16 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	if err != nil {
 		return nil, err
 	}
+	controlRoot := options.ControlRoot
+	if controlRoot == "" {
+		controlRoot = ControlRootForXDG(xdg.Root)
+	}
+	if err := os.MkdirAll(controlRoot, 0o700); err != nil {
+		return nil, fmt.Errorf("create OpenCode runtime control root: %w", err)
+	}
+	if err := os.Chmod(controlRoot, 0o700); err != nil {
+		return nil, fmt.Errorf("protect OpenCode runtime control root: %w", err)
+	}
 
 	configurationStarted := time.Now()
 	runtimeConfig, err := materializeOpenCodeRuntimeConfig(xdg, options.SeedFiles)
@@ -900,6 +912,16 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	if err != nil {
 		return nil, err
+	}
+	if options.HandoffXDG {
+		if err := handoffGeneratedNativeTree(xdg.Root, options.ProcessIsolation); err != nil {
+			return nil, err
+		}
+	}
+	if options.BrowserShim != nil {
+		if err := options.BrowserShim.Handoff(options.ProcessIsolation); err != nil {
+			return nil, err
+		}
 	}
 
 	port, err := allocatePort()
@@ -982,10 +1004,9 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	var supervisor *supervisorProof
 
-	if options.SkipSupervisor {
+	if options.skipSupervisor {
 		cmd = openCodeCommandContext(processCtx, executable, args...)
 		cmd.Env = nativeEnv
-		configureOpenCodeProcess(cmd)
 
 		if credentialErr := applyProcessCredential(cmd, options.ProcessIsolation); credentialErr != nil {
 			cancel()
@@ -993,7 +1014,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 			return nil, credentialErr
 		}
 	} else {
-		supervisorScratch := filepath.Join(xdg.State, "runtime-supervisor")
+		supervisorScratch := controlRoot
 		if containmentGenerationRoot != "" {
 			supervisorScratch = containmentGenerationRoot
 		}
@@ -1003,7 +1024,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 			NativeArgs:       args,
 			NativeEnv:        nativeEnv,
 			NativeDir:        "",
-			Home:             xdg.Root,
+			Home:             controlRoot,
 			Scratch:          supervisorScratch,
 			ScratchParent:    options.ContainmentScratchParent,
 			LifecycleKind:    darwinLifecycleRuntime,
@@ -1015,8 +1036,6 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 			return nil, err
 		}
-
-		configureOpenCodeProcess(cmd)
 	}
 
 	var supervisorControl io.WriteCloser
@@ -1050,7 +1069,8 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	spawnStarted := time.Now()
 
-	if startErr := cmd.Start(); startErr != nil {
+	runtimeWaiter, startErr := startOpenCodeProcess(cmd)
+	if startErr != nil {
 		_ = supervisor.closeInherited()
 
 		observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, startErr)
@@ -1066,7 +1086,9 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	if closeErr := supervisor.closeInherited(); closeErr != nil {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+
+		runtimeWaiter.start()
+		<-runtimeWaiter.result()
 
 		cancel()
 
@@ -1076,10 +1098,11 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	process := cmd.Process
 
 	if leaseErr := leaseStartedServer(options, lease, process, supervisorControl, cancel); leaseErr != nil {
+		runtimeWaiter.start()
+		<-runtimeWaiter.result()
+
 		return nil, leaseErr
 	}
-
-	runtimeWaiter := newSupervisorWaiterFunc(func() error { return openCodeWaitCommand(cmd) }, true)
 
 	originalProcessGroup, err := supervisorReleaseIndependentWaiter(cmd, runtimeWaiter)
 	if err != nil {
@@ -1088,6 +1111,11 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		if supervisorControl != nil {
 			_ = supervisorControl.Close()
 		}
+
+		_ = cmd.Process.Kill()
+
+		runtimeWaiter.start()
+		<-runtimeWaiter.result()
 
 		cancel()
 
@@ -1163,6 +1191,10 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	}
 
 	return server, nil
+}
+
+func ControlRootForXDG(root string) string {
+	return root + ".control"
 }
 
 func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context, options StartOptions) error {
@@ -1326,31 +1358,16 @@ func (s *openCodeServer) shutdownRuntime() error {
 			go func() { done <- waitCommand(s.cmd) }()
 		}
 
-		waited := false
-
-		select {
-		case waitErr := <-done:
-			waited = true
-
-			if waitErr != nil && s.log != nil {
-				s.log.DebugContext(proofCtx, "opencode exited during shutdown", slog.Any("error", waitErr))
-			}
-		case <-after(shutdownTimeout):
-			_ = killProcess(process, s.originalProcessGroup)
-			err = errors.New("opencode process did not exit after shutdown")
-		case <-proofCtx.Done():
-			_ = killProcess(process, s.originalProcessGroup)
-			err = errors.Join(ErrProcessContainmentIncomplete, proofCtx.Err())
-		}
-
-		if !waited {
-			select {
-			case <-done:
-				waited = true
-			case <-proofCtx.Done():
-				err = errors.Join(err, ErrProcessContainmentIncomplete, proofCtx.Err())
-			}
-		}
+		waited, _, waitErr := waitForOpenCodeRuntimeShutdown(
+			s,
+			process,
+			done,
+			proofCtx,
+			shutdownTimeout,
+			killProcess,
+			after,
+		)
+		err = errors.Join(err, waitErr)
 
 		if s.supervisor != nil {
 			proofErr := s.supervisor.awaitCompletion(proofCtx)
@@ -1373,6 +1390,70 @@ func (s *openCodeServer) shutdownRuntime() error {
 	}
 
 	return err
+}
+
+func waitForOpenCodeRuntimeShutdown(
+	server *openCodeServer,
+	process *os.Process,
+	done <-chan error,
+	proofCtx context.Context,
+	shutdownTimeout time.Duration,
+	killProcess func(*os.Process, int) error,
+	after func(time.Duration) <-chan time.Time,
+) (waited bool, quarantined bool, result error) {
+	var quarantinePoll <-chan time.Time
+
+	if server.supervisor != nil {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		quarantinePoll = ticker.C
+	}
+
+	shutdownDone := after(shutdownTimeout)
+
+	for {
+		select {
+		case waitErr := <-done:
+			if waitErr != nil && server.log != nil {
+				server.log.DebugContext(proofCtx, "opencode exited during shutdown", slog.Any("error", waitErr))
+			}
+
+			return true, false, nil
+		case <-shutdownDone:
+			if server.supervisor == nil {
+				_ = killProcess(process, server.originalProcessGroup)
+			}
+
+			result = errors.New("opencode process did not exit after shutdown")
+		case <-proofCtx.Done():
+			if server.supervisor == nil {
+				_ = killProcess(process, server.originalProcessGroup)
+			}
+
+			return false, false, errors.Join(ErrProcessContainmentIncomplete, proofCtx.Err())
+		case <-quarantinePoll:
+			present, quarantineErr := server.supervisor.quarantineDetected()
+			if quarantineErr != nil {
+				return false, true, errors.Join(ErrProcessContainmentIncomplete, quarantineErr)
+			}
+
+			if present {
+				return false, true, errors.Join(ErrProcessContainmentIncomplete, errors.New("OpenCode supervisor entered containment quarantine"))
+			}
+		}
+
+		if server.supervisor != nil {
+			return false, false, result
+		}
+
+		select {
+		case <-done:
+			return true, false, result
+		case <-proofCtx.Done():
+			return false, false, errors.Join(result, ErrProcessContainmentIncomplete, proofCtx.Err())
+		}
+	}
 }
 
 func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Client, error) {

@@ -29,7 +29,7 @@ runtime and its resources quarantined.
 | Option | Purpose |
 |---|---|
 | `WithExecutablePath` | Path to the `opencode` binary. |
-| `WithProcessIsolation` | Mandatory nonzero target UID/GID and complete replacement base environment for every native/helper process; supplementary groups are cleared. |
+| `WithProcessIsolation` | Mandatory nonzero target UID/GID and complete replacement environment for native OpenCode processes. On Linux the guardian/liveness supervisors stay trusted root; only `opencode serve` receives the configured identity, with supplementary groups cleared. |
 | `WithScratchDir` | Parent for a materialized shared runtime root and transient adapter scratch; empty uses the system temp directory. |
 | `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
 | `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant and numeric-PGID-reuse risks. |

@@ -1,4 +1,4 @@
-//go:build !linux && !darwin && !freebsd && !openbsd && !windows
+//go:build !linux && !darwin && !freebsd && !openbsd
 
 package opencode
 
@@ -41,9 +41,7 @@ func (*livenessContainment) Quiesce(int, time.Duration) error {
 }
 func configureIndependentSupervisor(*exec.Cmd) {}
 
-func startIndependentSupervisor(cmd *exec.Cmd) error {
-	return cmd.Start()
-}
+func startIndependentSupervisor(*exec.Cmd) error { return unsupportedContainment() }
 func releaseIndependentSupervisorWaiter(_ *exec.Cmd, waiter *supervisorWaiter) (int, error) {
 	waiter.start()
 

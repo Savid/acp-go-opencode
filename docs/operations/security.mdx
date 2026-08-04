@@ -7,6 +7,24 @@ The adapter's security posture rests on exclusive runtime ownership, exact
 session/turn routing, and keeping credentials out of anything it persists or
 streams. This page is the operator's view of those boundaries.
 
+## Standalone command boundary
+
+The standalone command launches native work only on Linux and requires the
+root-owned mode-`0600` `-process-isolation-config` policy. Resolution walks
+from an open `/` descriptor with `openat` and `O_NOFOLLOW`; every ancestor
+must be root-owned and not writable by group or other, and the final single-link
+policy inode is read through the descriptor that was validated. The configured
+account home is resolved the same way, must be a target-owned mode-`0700`
+directory beneath protected root-owned ancestry, and cannot be `/root` or
+`/nonexistent`.
+
+The adapter remains root, but its ambient environment is never copied wholesale
+to the child. Only the complete literal `baseEnvironment` plus names in
+`inheritEnvironment` reach native work. The CLI refuses Darwin, Windows, and
+other platforms; Darwin best-effort containment remains an explicit
+embedded-Go option only. `-version` and Darwin containment diagnostics launch
+no native worker and are exempt.
+
 ## Trust boundaries
 
 Each Agent owns one `opencode serve` process, and that process is the adapter's
@@ -23,9 +41,20 @@ only trusted peer:
   the native process group with `setsid` or `setpgid`. It accepts only the
   kernel's non-reaping `waitid(P_ALL, WNOWAIT)` `ECHILD` result as the final
   empty-tree proof; quiet `/proc` snapshots cannot close a fork/reparent race.
-  The embedding host is never made a subreaper. Windows uses a kill-on-close
-  Job Object. Platforms without one of these proof-capable containment backends
-  fail closed before native startup by default.
+  The embedding host is never made a subreaper. Windows fails closed before
+  native startup because its process API cannot apply the mandatory Unix
+  UID/GID identity boundary with empty supplementary groups. Cross-compiling
+  that refusal path proves only that it builds, not runtime support. Other
+  platforms without a selected containment backend also fail closed before
+  native startup by default.
+- The Linux guardian and liveness supervisors stay root and run from `/` with a
+  closed private environment. Private launch configuration carries the target
+  identity and native environment; only `opencode serve` receives the configured
+  UID/GID with no supplementary groups. The supervisors share the root-owned
+  `/run/acp-go/agent-identities/<uid>.lock` until the descendant wait queue is
+  empty. The native tree inherits no launch, control, proof, guardian, or lock
+  descriptor, so it cannot forge completion or overlap another provider tree
+  using the same host identity.
 - Darwin can be selected only through the explicit best-effort option. It
   captures the original native process group before releasing its sole paused
   waiter, sends SIGTERM, escalates to SIGKILL after 500ms, and stops after a
@@ -42,7 +71,7 @@ only trusted peer:
   local-filesystem allowlists; Windows admits fixed or RAM drives formatted as
   NTFS or ReFS. Network mounts, overlay filesystems, and unrecognized backends
   fail before native startup. Filesystem admission alone does not override the
-  selected containment requirement.
+  selected containment requirement or make Windows native launch supported.
 - Native session IDs, canonical directory scopes, and turn nonces bind every
   prompt, abort, permission, question, and event route.
 - Prompt images are read from a local path only when `WithInputHandoffRoot`

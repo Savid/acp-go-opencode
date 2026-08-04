@@ -75,7 +75,7 @@ func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {
 	var info map[string]any
 	require.NoError(t, json.Unmarshal(client.syncEvents[0].Data["info"], &info))
 	require.Equal(t, "/target", info["directory"])
-	_, err = os.Stat(filepath.Join(client.xdg.State, restoreOwnershipFileName))
+	_, err = os.Stat(filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName))
 	require.NoError(t, err)
 
 	// A complete retry is idempotent and verifies rather than duplicating.
@@ -371,7 +371,7 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	require.ErrorContains(t, current.snapshotToStore(context.Background()), "MCP credential")
 
 	current, client = newSnapshotSession()
-	client.xdg.State = ""
+	client.xdg.Root = ""
 	require.ErrorContains(t, current.snapshotToStore(context.Background()), "state directory is empty")
 }
 
@@ -417,7 +417,7 @@ func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranch
 		wrong := restoreOwnershipFile{Format: "opencode-restore-ownership-v1", Aggregates: map[string]restoreOwnership{}}
 		encoded, marshalErr := json.Marshal(wrong)
 		require.NoError(t, marshalErr)
-		require.NoError(t, os.WriteFile(filepath.Join(client.xdg.State, restoreOwnershipFileName), encoded, 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName), encoded, 0o600))
 
 		return expected, nil
 	}

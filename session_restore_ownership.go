@@ -41,7 +41,7 @@ type restoreOwnership struct {
 }
 
 func recordSnapshotOwnership(client opencode.Client, snapshot stateSnapshot) error {
-	if client.XDGDirs().State == "" {
+	if client.XDGDirs().Root == "" {
 		return fmt.Errorf("restore ownership state directory is empty")
 	}
 
@@ -58,7 +58,7 @@ func recordSnapshotOwnership(client opencode.Client, snapshot stateSnapshot) err
 }
 
 func claimRestoreOwnership(client opencode.Client, snapshot stateSnapshot, existing map[string][]opencode.SyncEvent) error {
-	if client.XDGDirs().State == "" {
+	if client.XDGDirs().Root == "" {
 		return fmt.Errorf("restore ownership state directory is empty")
 	}
 
@@ -97,7 +97,7 @@ func claimRestoreOwnership(client opencode.Client, snapshot stateSnapshot, exist
 }
 
 func verifyRestoreOwnership(client opencode.Client, snapshot stateSnapshot, node stateSnapshotNode) error {
-	if client.XDGDirs().State == "" {
+	if client.XDGDirs().Root == "" {
 		return fmt.Errorf("restore ownership state directory is empty")
 	}
 
@@ -121,7 +121,7 @@ func ownershipFor(snapshot stateSnapshot, node stateSnapshotNode) restoreOwnersh
 }
 
 func readRestoreOwnership(client opencode.Client) (restoreOwnershipFile, error) {
-	path := filepath.Join(client.XDGDirs().State, restoreOwnershipFileName)
+	path := filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName)
 
 	data, err := restoreReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -145,7 +145,7 @@ func readRestoreOwnership(client opencode.Client) (restoreOwnershipFile, error) 
 }
 
 func writeRestoreOwnership(client opencode.Client, registry restoreOwnershipFile) error {
-	directory := client.XDGDirs().State
+	directory := restoreOwnershipDirectory(client)
 	if err := restoreMkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("create restore ownership directory: %w", err)
 	}
@@ -204,4 +204,8 @@ func writeRestoreOwnership(client opencode.Client, registry restoreOwnershipFile
 	err = restoreSync(dir)
 
 	return errors.Join(err, restoreClose(dir))
+}
+
+func restoreOwnershipDirectory(client opencode.Client) string {
+	return opencode.ControlRootForXDG(client.XDGDirs().Root)
 }

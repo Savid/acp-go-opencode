@@ -50,6 +50,8 @@ func preserveSupervisorGlobals(t *testing.T) {
 	oldGuardianQuiesce := supervisorGuardianQuiesce
 	oldLivenessContainment := supervisorOpenLivenessContainment
 	oldLivenessQuiesce := supervisorLivenessQuiesce
+	oldQuarantineRetry := supervisorQuarantineRetry
+	oldGuardianQuarantineRetry := supervisorGuardianQuarantineRetry
 	oldReleaseWaiter := supervisorReleaseIndependentWaiter
 	oldInput := supervisorInput
 	oldOutput := supervisorOutput
@@ -69,6 +71,8 @@ func preserveSupervisorGlobals(t *testing.T) {
 		supervisorGuardianQuiesce = oldGuardianQuiesce
 		supervisorOpenLivenessContainment = oldLivenessContainment
 		supervisorLivenessQuiesce = oldLivenessQuiesce
+		supervisorQuarantineRetry = oldQuarantineRetry
+		supervisorGuardianQuarantineRetry = oldGuardianQuarantineRetry
 		supervisorReleaseIndependentWaiter = oldReleaseWaiter
 		supervisorInput = oldInput
 		supervisorOutput = oldOutput
@@ -125,6 +129,7 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, cmd)
+	require.Nil(t, cmd.Cancel, "trusted supervisor must outlive caller-context cancellation")
 	require.NotNil(t, proof)
 	require.NotEmpty(t, proof.inventoryIdentity)
 	require.Equal(t, []string{supervisorModeEnv + "=" + supervisorModeGuardian}, cmd.Env)
@@ -150,6 +155,8 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 		_ = writeSupervisorMarker(completed)
 	}()
 	require.NoError(t, (&supervisorProof{started: started, completion: completed}).awaitCompletion(context.Background()))
+	require.NoFileExists(t, started)
+	require.NoFileExists(t, completed)
 
 	count, available := (*supervisorProof)(nil).processSnapshot()
 	require.Zero(t, count)
@@ -162,6 +169,29 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 	count, available = proof.processSnapshot()
 	require.Equal(t, 3, count)
 	require.True(t, available)
+}
+
+func TestGuardianCleansQuarantineMarkersWithoutCaller(t *testing.T) {
+	root := t.TempDir()
+	config := supervisorConfig{
+		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
+		Quarantine: filepath.Join(root, "quarantine"), NativePIDFile: filepath.Join(root, "pid"),
+		InventoryIdentity: filepath.Join(root, "inventory"),
+	}
+	for _, path := range []string{config.Started, config.Quarantine, config.NativePIDFile, config.InventoryIdentity} {
+		require.NoError(t, writeSupervisorMarker(path))
+	}
+
+	livenessDone := make(chan error)
+	cleanupDone := make(chan error, 1)
+	go func() { cleanupDone <- finishQuarantinedLiveness(livenessDone, config) }()
+	require.FileExists(t, config.Quarantine)
+	livenessDone <- nil
+	require.ErrorIs(t, <-cleanupDone, ErrProcessContainmentIncomplete)
+
+	for _, path := range []string{config.Started, config.Completion, config.Quarantine, config.NativePIDFile, config.InventoryIdentity} {
+		require.NoFileExists(t, path)
+	}
 }
 
 func TestSupervisorMarkerPIDReadyAndCopyUtilities(t *testing.T) {

@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"testing"
 	"time"
@@ -41,5 +42,29 @@ func TestSupervisorWaiterPausedImmediateAndNilBranches(t *testing.T) {
 	}
 	if err := <-newSupervisorWaiter(immediateCommand, false).result(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSupervisorWaiterResultStaysPausedUntilRelease(t *testing.T) {
+	waitErr := errors.New("wait result")
+	source := make(chan error, 1)
+	released := make(chan struct{})
+	waiter := newSupervisorWaiterResult(source, func() { close(released) }, true)
+	result := waiter.result()
+	source <- waitErr
+
+	select {
+	case <-released:
+		t.Fatal("paused result released its creator-thread wait")
+	case err := <-result:
+		t.Fatalf("paused result completed before release: %v", err)
+	default:
+	}
+
+	waiter.start()
+	waiter.start()
+	<-released
+	if err := <-result; !errors.Is(err, waitErr) {
+		t.Fatalf("result = %v, want %v", err, waitErr)
 	}
 }

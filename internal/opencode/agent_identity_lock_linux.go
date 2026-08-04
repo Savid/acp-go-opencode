@@ -13,8 +13,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const linuxAgentIdentityNamespace = "/run/wagie/agent-identities"
-const linuxSupervisorProofNamespace = "/run/wagie/supervisor-proofs"
+const linuxAgentIdentityNamespace = "/run/acp-go/agent-identities"
+const linuxSupervisorProofNamespace = "/run/acp-go/supervisor-proofs"
 
 type linuxAgentIdentityLock struct {
 	file *os.File
@@ -26,19 +26,31 @@ func init() {
 	supervisorAcquireIdentityLock = acquireLinuxAgentIdentityLock
 	supervisorVerifyTrustedIdentity = verifyLinuxTrustedSupervisorIdentity
 	supervisorAdoptIdentityLock = adoptLinuxAgentIdentityLock
+	supervisorQuarantineRetry = retryLinuxLivenessContainment
+	supervisorGuardianQuarantineRetry = retryLinuxGuardianContainment
 }
 
 func writeLinuxSupervisorConfig(_ string, config supervisorConfig) (*os.File, error) {
-	fd, err := unix.MemfdCreate("acp-go-opencode-supervisor-config", unix.MFD_CLOEXEC)
+	fd, err := unix.MemfdCreate("acp-go-opencode-supervisor-config", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
 	if err != nil {
 		return nil, fmt.Errorf("create private supervisor config descriptor: %w", err)
 	}
 
 	file := os.NewFile(uintptr(fd), "acp-go-opencode-supervisor-config")
+	if err := unix.Fchmod(fd, 0o600); err != nil {
+		_ = file.Close()
+
+		return nil, fmt.Errorf("secure private supervisor config descriptor: %w", err)
+	}
 	if err := supervisorEncodeConfig(file, config); err != nil {
 		_ = file.Close()
 
 		return nil, fmt.Errorf("write private supervisor config descriptor: %w", err)
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); err != nil {
+		_ = file.Close()
+
+		return nil, fmt.Errorf("seal private supervisor config descriptor: %w", err)
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		_ = file.Close()
@@ -58,7 +70,7 @@ func verifyLinuxTrustedSupervisorIdentity(uid uint32) error {
 }
 
 func linuxSupervisorMarkerRoot(supervisorConfig) (string, error) {
-	fd, err := openLinuxWagieDirectory("supervisor-proofs")
+	fd, err := openLinuxACPGoDirectory("supervisor-proofs")
 	if err != nil {
 		return "", err
 	}
@@ -122,10 +134,10 @@ func adoptLinuxAgentIdentityLock() (io.Closer, error) {
 }
 
 func openLinuxAgentIdentityNamespace() (int, error) {
-	return openLinuxWagieDirectory("agent-identities")
+	return openLinuxACPGoDirectory("agent-identities")
 }
 
-func openLinuxWagieDirectory(name string) (int, error) {
+func openLinuxACPGoDirectory(name string) (int, error) {
 	if os.Geteuid() != 0 {
 		return -1, errors.New("agent identity namespace requires a trusted root supervisor")
 	}
@@ -136,13 +148,13 @@ func openLinuxWagieDirectory(name string) (int, error) {
 	}
 	defer unix.Close(runFD)
 
-	wagieFD, err := openLinuxAgentIdentityDirectory(runFD, "wagie", 0o700, true)
+	acpGoFD, err := openLinuxAgentIdentityDirectory(runFD, "acp-go", 0o700, true)
 	if err != nil {
 		return -1, err
 	}
-	defer unix.Close(wagieFD)
+	defer unix.Close(acpGoFD)
 
-	return openLinuxAgentIdentityDirectory(wagieFD, name, 0o700, true)
+	return openLinuxAgentIdentityDirectory(acpGoFD, name, 0o700, true)
 }
 
 func openLinuxAgentIdentityDirectory(parentFD int, name string, mode uint32, create bool) (int, error) {
@@ -178,11 +190,13 @@ func hardenLinuxAgentIdentityLock(fd int) error {
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return fmt.Errorf("stat agent identity lock: %w", err)
 	}
-	if stat.Uid != 0 || stat.Gid != 0 || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 {
-		return errors.New("agent identity lock is not a root-owned single-link regular file")
-	}
-	if err := unix.Fchmod(fd, 0o600); err != nil {
-		return fmt.Errorf("chmod agent identity lock: %w", err)
+
+	return validateLinuxAgentIdentityLock(stat)
+}
+
+func validateLinuxAgentIdentityLock(stat unix.Stat_t) error {
+	if stat.Uid != 0 || stat.Gid != 0 || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Mode&0o777 != 0o600 {
+		return errors.New("agent identity lock is not a root-owned mode-0600 single-link regular file")
 	}
 
 	return nil
@@ -206,7 +220,27 @@ func (lock *linuxAgentIdentityLock) Close() error {
 	file := lock.file
 	lock.file = nil
 
-	return errors.Join(unix.Flock(int(file.Fd()), unix.LOCK_UN), file.Close())
+	return file.Close()
+}
+
+func retryLinuxLivenessContainment(containment *livenessContainment) error {
+	for {
+		if err := supervisorLivenessQuiesce(containment, 0, supervisorQuiesceWindow); err == nil {
+			return nil
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func retryLinuxGuardianContainment(containment *guardianContainment) error {
+	for {
+		if err := supervisorGuardianQuiesce(containment, 0, supervisorQuiesceWindow); err == nil {
+			return nil
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (lock *linuxAgentIdentityLock) InheritedFile() *os.File {

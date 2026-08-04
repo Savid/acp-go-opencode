@@ -32,6 +32,7 @@ func TestRunVersionAndFlagError(t *testing.T) {
 }
 
 func TestRunServeSuccessAndError(t *testing.T) {
+	stubProcessIsolationConfig(t)
 	restore := replaceGlobals(t)
 	defer restore()
 	agentVersion = func() string { return "v-test" }
@@ -52,6 +53,7 @@ func TestRunServeSuccessAndError(t *testing.T) {
 		t.Fatalf("write seed host: %v", err)
 	}
 	if code := run(context.Background(), []string{
+		"-process-isolation-config", testProcessIsolationConfigPath,
 		"-path", "opencode",
 		"-home", "/tmp/home",
 		"-scratch-dir", "/tmp/scratch",
@@ -68,12 +70,19 @@ func TestRunServeSuccessAndError(t *testing.T) {
 	if len(gotOptions) == 0 {
 		t.Fatal("serve received no options")
 	}
+	var configured opencodeacp.Options
+	for _, option := range gotOptions {
+		option(&configured)
+	}
+	if configured.ProcessIsolation == nil || configured.ProcessIsolation.UID != 20001 {
+		t.Fatalf("process isolation = %#v", configured.ProcessIsolation)
+	}
 
 	serve = func(context.Context, io.Reader, io.Writer, ...opencodeacp.Option) error {
 		return errors.New("boom")
 	}
 	var stderr bytes.Buffer
-	if code := run(context.Background(), nil, strings.NewReader(""), io.Discard, &stderr); code != 1 {
+	if code := run(context.Background(), isolatedArgs(), strings.NewReader(""), io.Discard, &stderr); code != 1 {
 		t.Fatalf("serve error code = %d", code)
 	}
 	if !strings.Contains(stderr.String(), "boom") {
@@ -85,7 +94,7 @@ func TestRunServeSuccessAndError(t *testing.T) {
 	serve = func(context.Context, io.Reader, io.Writer, ...opencodeacp.Option) error {
 		return context.Canceled
 	}
-	if code := run(cancelled, nil, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
+	if code := run(cancelled, isolatedArgs(), strings.NewReader(""), io.Discard, io.Discard); code != 0 {
 		t.Fatalf("cancelled serve code = %d", code)
 	}
 
@@ -101,7 +110,7 @@ func TestRunServeSuccessAndError(t *testing.T) {
 
 		return ctx.Err()
 	}
-	if code := run(context.Background(), nil, strings.NewReader(""), io.Discard, io.Discard); code != 143 {
+	if code := run(context.Background(), isolatedArgs(), strings.NewReader(""), io.Discard, io.Discard); code != 143 {
 		t.Fatalf("signalled serve code = %d", code)
 	}
 }
@@ -155,6 +164,7 @@ func TestSignals(t *testing.T) {
 }
 
 func TestMainAndVersion(t *testing.T) {
+	stubProcessIsolationConfig(t)
 	restore := replaceGlobals(t)
 	defer restore()
 	oldArgs := os.Args
@@ -167,7 +177,7 @@ func TestMainAndVersion(t *testing.T) {
 	serve = func(context.Context, io.Reader, io.Writer, ...opencodeacp.Option) error {
 		return errors.New("main failed")
 	}
-	os.Args = []string{"acp-go-opencode"}
+	os.Args = []string{"acp-go-opencode", "-process-isolation-config", testProcessIsolationConfigPath}
 	exitCode := -1
 	exit = func(code int) { exitCode = code }
 	main()

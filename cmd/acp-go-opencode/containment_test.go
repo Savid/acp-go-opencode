@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	opencodeacp "github.com/savid/acp-go-opencode"
 	nativeopencode "github.com/savid/acp-go-opencode/internal/opencode"
 )
 
@@ -47,46 +45,15 @@ func TestRunContainmentUsage(t *testing.T) {
 	}
 }
 
-func TestRunContainmentDispatchAndOffDarwinFlag(t *testing.T) {
+func TestRunContainmentDispatchAndRemovedDarwinFlag(t *testing.T) {
 	var stderr bytes.Buffer
 	if code := run(t.Context(), []string{"containment"}, strings.NewReader(""), &bytes.Buffer{}, &stderr); code != 2 {
 		t.Fatalf("containment dispatch = %d, stderr=%q", code, stderr.String())
 	}
 
-	originalGOOS := runtimeGOOS
-	t.Cleanup(func() { runtimeGOOS = originalGOOS })
-	runtimeGOOS = "linux"
 	stderr.Reset()
-	if code := run(t.Context(), []string{"-darwin-best-effort-containment"}, strings.NewReader(""), &bytes.Buffer{}, &stderr); code != 2 || !strings.Contains(stderr.String(), "only on darwin") {
-		t.Fatalf("off-Darwin flag = %d, stderr=%q", code, stderr.String())
-	}
-}
-
-func TestRunDarwinBestEffortServeFlag(t *testing.T) {
-	originalGOOS := runtimeGOOS
-	originalServe := serve
-	originalShutdown := shutdownOpenTelemetry
-	t.Cleanup(func() {
-		runtimeGOOS = originalGOOS
-		serve = originalServe
-		shutdownOpenTelemetry = originalShutdown
-	})
-	runtimeGOOS = platformDarwin
-	shutdownOpenTelemetry = func(context.Context, func(context.Context) error) error { return nil }
-
-	selected := false
-	serve = func(_ context.Context, _ io.Reader, _ io.Writer, options ...opencodeacp.Option) error {
-		var configured opencodeacp.Options
-		for _, option := range options {
-			option(&configured)
-		}
-		selected = configured.DarwinBestEffortContainment
-
-		return nil
-	}
-	var stderr bytes.Buffer
-	if code := run(t.Context(), []string{"-darwin-best-effort-containment"}, strings.NewReader(""), &bytes.Buffer{}, &stderr); code != 0 || !selected || !strings.Contains(stderr.String(), "WARNING containment=best_effort") {
-		t.Fatalf("Darwin serve flag = %d, selected=%v stderr=%q", code, selected, stderr.String())
+	if code := run(t.Context(), []string{"-darwin-best-effort-containment"}, strings.NewReader(""), &bytes.Buffer{}, &stderr); code != 2 || !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("removed Darwin flag = %d, stderr=%q", code, stderr.String())
 	}
 }
 

@@ -10,16 +10,59 @@ acp-go-opencode [flags]
 The binary speaks ACP over stdin/stdout; stdout carries JSON-RPC only and
 diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 
+## Required standalone isolation policy
+
+Normal serve mode is Linux-only and requires
+`-process-isolation-config=/absolute/path/process-isolation.json`.
+`-version` and the Darwin containment diagnostic subcommands are exempt.
+The policy must be a root-owned, single-link regular file with mode `0600`.
+Every component is opened from `/` without following symlinks, and every
+ancestor must be root-owned and not writable by group or other. Unknown JSON
+fields and trailing JSON values are rejected.
+
+```json
+{
+  "uid": 20001,
+  "gid": 20001,
+  "baseEnvironment": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/var/lib/acp-go-opencode",
+    "USER": "acp-go-opencode",
+    "LOGNAME": "acp-go-opencode",
+    "LANG": "C.UTF-8"
+  },
+  "inheritEnvironment": []
+}
+```
+
+The supervisor must run as root. The UID/GID must name a nonroot account with
+that same-name private primary group, no supplementary groups, and a target-owned mode
+`0700` home matching `HOME`, reached without symlinks beneath protected
+root-owned ancestry; `/root` and `/nonexistent` are forbidden. `USER` and
+`LOGNAME` must match the account.
+`PATH` must contain existing canonical absolute directories. The child gets
+only `baseEnvironment` plus variables explicitly named in
+`inheritEnvironment`; identity, search-path, loader, interpreter, XDG/native
+home, and adapter-private variables cannot be inherited. Unset or duplicate
+inheritance entries fail startup. Darwin, Windows, and other platforms refuse
+standalone native mode rather than weakening this contract.
+
+Provision the target as a locked system account with a non-login shell, its
+same-name private group, and no sudo policy. Its UID and primary GID cannot be
+shared by another account. Password locking is not a substitute for disabling
+login paths, and a locked account still needs the validated private writable
+home for native tools.
+
 ## Flags
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `-path` | Path to the `opencode` CLI. | resolved from `PATH` |
+| `-process-isolation-config` | Required absolute path to the standalone Linux isolation policy described above. | — |
 | `-scratch-dir` | Parent for the shared runtime root and transient adapter scratch. | system temp directory |
 | `-home` | Exact exclusive shared OpenCode XDG root. | — |
 | `-provider-auth-root` | Durable host-owned root holding the provider-auth ledger. Empty leaves the provider-auth surface unadvertised. | — |
 | `-provider-auth-direct-home` | Canonical native home an account-level provider-auth leg may read or clear. Rejected by this adapter at session start. | — |
-| `-darwin-best-effort-containment` | Explicitly accept Darwin process-group containment, escaped-descendant risk, and numeric-PGID-reuse risk. | off |
 | `-model` | Default model as `provider/model`. | — |
 | `-debug` | Write debug logs to stderr. | off |
 | `-version` | Print the adapter version and exit. | — |
@@ -29,12 +72,9 @@ diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 | `-opencode-health-timeout` | OpenCode server readiness timeout. | `60s` |
 | `-seed-file <relpath>=<hostpath>` | Seed a file into the shared runtime config root (repeatable). | — |
 
-On Darwin, native startup fails closed unless
-`-darwin-best-effort-containment` is supplied. The command emits a warning to
-stderr when selected. This mode terminates and reaps the directly owned native
-root and its captured original process group, but descendants that call
-`setsid` or otherwise escape that group can survive. It never reports an
-authoritative provider-descendant inventory.
+The standalone command never launches native work on Darwin. The operational
+subcommands below remain available to inspect generations left by an embedded
+host using `WithDarwinBestEffortContainment`.
 
 Operators can inspect retained records without signalling processes:
 
