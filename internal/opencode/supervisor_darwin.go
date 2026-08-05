@@ -27,10 +27,11 @@ var (
 type guardianContainment struct{}
 
 type livenessContainment struct {
-	generation *DarwinGeneration
-	pgid       int
-	process    *os.Process
-	waiter     *supervisorWaiter
+	generation  *DarwinGeneration
+	pgid        int
+	process     *os.Process
+	waiter      *supervisorWaiter
+	beforeStart func() error
 
 	cleanupOnce sync.Once
 	cleanupErr  error
@@ -85,6 +86,12 @@ func (c *livenessContainment) Start(cmd *exec.Cmd) error {
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = supervisorQuiesceWindow
+
+	if c.beforeStart != nil {
+		if err := c.beforeStart(); err != nil {
+			return errors.Join(err, c.generation.finish(true))
+		}
+	}
 
 	if err := cmd.Start(); err != nil {
 		return errors.Join(err, c.generation.finish(true))

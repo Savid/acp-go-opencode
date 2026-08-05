@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestLinuxRuntimeStartRetainsCreatorThreadThroughWait(t *testing.T) {
+func TestProviderCreatorLinuxRuntimeStartRetainsCreatorThreadThroughWait(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", "while :; do sleep 1; done")
 	waiter, err := startOpenCodeProcess(cmd)
 	if err != nil {

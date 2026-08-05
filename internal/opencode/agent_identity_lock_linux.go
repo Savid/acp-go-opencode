@@ -5,245 +5,598 @@ package opencode
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-const linuxAgentIdentityNamespace = "/run/acp-go/agent-identities"
-const linuxSupervisorProofNamespace = "/run/acp-go/supervisor-proofs"
+var (
+	agentIdentityLockRunRoot    = "/var/lib"
+	agentIdentityLockTrustedUID = uint32(0)
+	agentIdentityLockTrustedGID = uint32(0)
+)
 
-type linuxAgentIdentityLock struct {
+type agentIdentityLock struct {
 	file *os.File
 }
 
-func init() {
-	supervisorWriteConfig = writeLinuxSupervisorConfig
-	supervisorMarkerRoot = linuxSupervisorMarkerRoot
-	supervisorAcquireIdentityLock = acquireLinuxAgentIdentityLock
-	supervisorVerifyTrustedIdentity = verifyLinuxTrustedSupervisorIdentity
-	supervisorAdoptIdentityLock = adoptLinuxAgentIdentityLock
-	supervisorQuarantineRetry = retryLinuxLivenessContainment
-	supervisorGuardianQuarantineRetry = retryLinuxGuardianContainment
+var agentIdentityLockFcntl = unix.FcntlInt
+var agentIdentityDirectoryMkdirat = unix.Mkdirat
+var agentIdentityDirectoryOpenat = unix.Openat
+var agentIdentityDirectoryFchown = unix.Fchown
+var agentIdentityDirectoryFchmod = unix.Fchmod
+var agentIdentityDirectoryFsync = unix.Fsync
+var agentIdentityDirectoryFstatat = unix.Fstatat
+var agentIdentityDirectoryClose = func(file *os.File) error { return file.Close() }
+var agentIdentityLockReadFile = os.ReadFile
+
+func bootstrapAgentIdentityLockDirectory(runRoot string, trustedUID, trustedGID uint32) (*os.File, error) {
+	run, err := openAgentIdentityRuntimeRoot(runRoot, trustedUID, trustedGID)
+	if err != nil {
+		return nil, err
+	}
+	acpGo, err := bootstrapAgentIdentityDirectory(run, "acp-go", trustedUID, trustedGID)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("bootstrap agent identity owner directory: %w", err), run.Close())
+	}
+	if err = run.Close(); err != nil {
+		return nil, errors.Join(err, acpGo.Close())
+	}
+	directory, err := bootstrapAgentIdentityDirectory(acpGo, "agent-identities", trustedUID, trustedGID)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("bootstrap agent identity lock directory: %w", err), acpGo.Close())
+	}
+	if err = acpGo.Close(); err != nil {
+		return nil, errors.Join(err, directory.Close())
+	}
+
+	return directory, nil
 }
 
-func writeLinuxSupervisorConfig(_ string, config supervisorConfig) (*os.File, error) {
-	fd, err := unix.MemfdCreate("acp-go-opencode-supervisor-config", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+func openAgentIdentityLockDirectory(runRoot string, trustedUID, trustedGID uint32) (*os.File, error) {
+	run, err := openAgentIdentityRuntimeRoot(runRoot, trustedUID, trustedGID)
 	if err != nil {
-		return nil, fmt.Errorf("create private supervisor config descriptor: %w", err)
+		return nil, err
+	}
+	acpGo, err := openExistingAgentIdentityDirectory(run, "acp-go", trustedUID, trustedGID)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("open existing agent identity owner directory: %w", err), run.Close())
+	}
+	if err = run.Close(); err != nil {
+		return nil, errors.Join(err, acpGo.Close())
+	}
+	directory, err := openExistingAgentIdentityDirectory(acpGo, "agent-identities", trustedUID, trustedGID)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("open existing agent identity lock directory: %w", err), acpGo.Close())
+	}
+	if err = acpGo.Close(); err != nil {
+		return nil, errors.Join(err, directory.Close())
 	}
 
-	file := os.NewFile(uintptr(fd), "acp-go-opencode-supervisor-config")
-	if err := unix.Fchmod(fd, 0o600); err != nil {
-		_ = file.Close()
+	return directory, nil
+}
 
-		return nil, fmt.Errorf("secure private supervisor config descriptor: %w", err)
+func openAgentIdentityRuntimeRoot(runRoot string, trustedUID, trustedGID uint32) (*os.File, error) {
+	fd, err := unix.Open(runRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open agent identity runtime root: %w", err)
 	}
-	if err := supervisorEncodeConfig(file, config); err != nil {
-		_ = file.Close()
-
-		return nil, fmt.Errorf("write private supervisor config descriptor: %w", err)
+	run := os.NewFile(uintptr(fd), runRoot)
+	if err := validateAgentIdentityDirectory(run, trustedUID, trustedGID, false); err != nil {
+		_ = run.Close()
+		return nil, fmt.Errorf("validate agent identity runtime root: %w", err)
 	}
-	if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); err != nil {
-		_ = file.Close()
 
-		return nil, fmt.Errorf("seal private supervisor config descriptor: %w", err)
+	return run, nil
+}
+
+func bootstrapAgentIdentityDirectory(
+	parent *os.File,
+	name string,
+	trustedUID uint32,
+	trustedGID uint32,
+) (*os.File, error) {
+	err := agentIdentityDirectoryMkdirat(int(parent.Fd()), name, 0o700)
+	if errors.Is(err, unix.EEXIST) {
+		return openExistingAgentIdentityDirectory(parent, name, trustedUID, trustedGID)
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		_ = file.Close()
+	if err != nil {
+		return nil, err
+	}
 
-		return nil, fmt.Errorf("rewind private supervisor config descriptor: %w", err)
+	fd, err := agentIdentityDirectoryOpenat(
+		int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	fail := func(cause error) (*os.File, error) {
+		return nil, errors.Join(cause, agentIdentityDirectoryClose(file))
+	}
+	if err = agentIdentityDirectoryFchown(fd, int(trustedUID), int(trustedGID)); err != nil {
+		return fail(fmt.Errorf("set agent identity directory owner: %w", err))
+	}
+	if err = agentIdentityDirectoryFchmod(fd, 0o700); err != nil {
+		return fail(fmt.Errorf("set agent identity directory mode: %w", err))
+	}
+	if err = agentIdentityDirectoryFsync(fd); err != nil {
+		return fail(fmt.Errorf("sync new agent identity directory: %w", err))
+	}
+	if err = agentIdentityDirectoryFsync(int(parent.Fd())); err != nil {
+		return fail(fmt.Errorf("sync agent identity parent directory: %w", err))
+	}
+	if err = agentIdentityDirectoryClose(file); err != nil {
+		return nil, fmt.Errorf("close new agent identity directory before reopen: %w", err)
+	}
+
+	return openExistingAgentIdentityDirectory(parent, name, trustedUID, trustedGID)
+}
+
+func openExistingAgentIdentityDirectory(
+	parent *os.File,
+	name string,
+	trustedUID uint32,
+	trustedGID uint32,
+) (*os.File, error) {
+	fd, err := agentIdentityDirectoryOpenat(
+		int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	fail := func(cause error) (*os.File, error) {
+		return nil, errors.Join(cause, file.Close())
+	}
+	if err = validateAgentIdentityDirectory(file, trustedUID, trustedGID, true); err != nil {
+		return fail(err)
+	}
+	var descriptor, named unix.Stat_t
+	if err = unix.Fstat(fd, &descriptor); err != nil {
+		return fail(err)
+	}
+	if err = agentIdentityDirectoryFstatat(
+		int(parent.Fd()), name, &named, unix.AT_SYMLINK_NOFOLLOW,
+	); err != nil || descriptor.Dev != named.Dev || descriptor.Ino != named.Ino {
+		return fail(errors.Join(errors.New("agent identity directory is not its permanent named inode"), err))
 	}
 
 	return file, nil
 }
 
-func verifyLinuxTrustedSupervisorIdentity(uid uint32) error {
-	if os.Geteuid() != 0 || uid == 0 || uint32(os.Geteuid()) == uid {
-		return errors.New("OpenCode liveness supervisor requires a distinct trusted root identity")
+func validateAgentIdentityDirectory(file *os.File, trustedUID, trustedGID uint32, exactMode bool) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != trustedUID || stat.Gid != trustedGID {
+		return errors.New("agent identity directory must be trusted-owned")
+	}
+	permissions := stat.Mode & 0o777
+	if exactMode && permissions != 0o700 {
+		return fmt.Errorf("agent identity directory mode is %#o, want 0700", permissions)
+	}
+	if !exactMode && permissions&0o022 != 0 {
+		return errors.New("agent identity runtime root must not be group- or world-writable")
 	}
 
 	return nil
 }
 
-func linuxSupervisorMarkerRoot(supervisorConfig) (string, error) {
-	fd, err := openLinuxACPGoDirectory("supervisor-proofs")
-	if err != nil {
-		return "", err
+func validateAgentIdentityLockFile(file *os.File, trustedUID, trustedGID uint32) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return err
 	}
-	if err := unix.Close(fd); err != nil {
-		return "", fmt.Errorf("close agent identity lock namespace: %w", err)
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != trustedUID || stat.Gid != trustedGID || stat.Nlink != 1 {
+		return errors.New("agent identity lock must be a trusted-owned regular file with one link")
+	}
+	if permissions := stat.Mode & 0o777; permissions != 0o600 {
+		return fmt.Errorf("agent identity lock mode is %#o, want 0600", permissions)
 	}
 
-	return linuxSupervisorProofNamespace, nil
+	return nil
 }
 
-func acquireLinuxAgentIdentityLock(uid uint32, control io.Reader) (supervisorIdentityLock, error) {
-	namespaceFD, err := openLinuxAgentIdentityNamespace()
+func duplicateAgentIdentityLock(file *os.File) (*os.File, error) {
+	if file == nil {
+		return nil, errors.New("agent identity lock descriptor is required")
+	}
+	fd, err := unix.FcntlInt(file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	name := strconv.FormatUint(uint64(uid), 10) + ".lock"
-	fd, err := unix.Openat(namespaceFD, name, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
-	_ = unix.Close(namespaceFD)
-	if err != nil {
-		return nil, fmt.Errorf("open agent identity lock %q: %w", name, err)
-	}
-	if err := hardenLinuxAgentIdentityLock(fd); err != nil {
-		_ = unix.Close(fd)
-
-		return nil, err
-	}
-
-	for {
-		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
-		if err == nil {
-			return &linuxAgentIdentityLock{file: os.NewFile(uintptr(fd), name)}, nil
-		}
-		if !errors.Is(err, unix.EWOULDBLOCK) {
-			_ = unix.Close(fd)
-
-			return nil, fmt.Errorf("acquire agent identity lock for uid %d: %w", uid, err)
-		}
-		if linuxSupervisorControlClosed(control) {
-			_ = unix.Close(fd)
-
-			return nil, fmt.Errorf("%w: control closed while waiting for agent identity uid %d", ErrProcessContainmentIncomplete, uid)
-		}
-
-		time.Sleep(10 * time.Millisecond)
-	}
+	return os.NewFile(uintptr(fd), "opencode-agent-identity-lock"), nil
 }
 
-func adoptLinuxAgentIdentityLock() (io.Closer, error) {
-	file := supervisorInheritedFile(4, "acp-go-opencode-agent-identity-lock")
+func adoptAgentIdentityLock(file *os.File, uid uint32, testOnly bool, testRoot string) (*agentIdentityLock, error) {
 	if file == nil {
 		return nil, errors.New("inherited agent identity lock descriptor is unavailable")
 	}
-	if err := closeInheritedOnExec(file); err != nil {
-		_ = file.Close()
-
-		return nil, err
+	fail := func(err error) (*agentIdentityLock, error) {
+		return nil, errors.Join(err, file.Close())
 	}
-
-	return file, nil
-}
-
-func openLinuxAgentIdentityNamespace() (int, error) {
-	return openLinuxACPGoDirectory("agent-identities")
-}
-
-func openLinuxACPGoDirectory(name string) (int, error) {
-	if os.Geteuid() != 0 {
-		return -1, errors.New("agent identity namespace requires a trusted root supervisor")
-	}
-
-	runFD, err := openLinuxAgentIdentityDirectory(unix.AT_FDCWD, "/run", 0o755, false)
-	if err != nil {
-		return -1, err
-	}
-	defer unix.Close(runFD)
-
-	acpGoFD, err := openLinuxAgentIdentityDirectory(runFD, "acp-go", 0o700, true)
-	if err != nil {
-		return -1, err
-	}
-	defer unix.Close(acpGoFD)
-
-	return openLinuxAgentIdentityDirectory(acpGoFD, name, 0o700, true)
-}
-
-func openLinuxAgentIdentityDirectory(parentFD int, name string, mode uint32, create bool) (int, error) {
-	if create {
-		err := unix.Mkdirat(parentFD, name, mode)
-		if err != nil && !errors.Is(err, unix.EEXIST) {
-			return -1, fmt.Errorf("create agent identity directory %q: %w", name, err)
+	runRoot := agentIdentityLockRunRoot
+	trustedUID := agentIdentityLockTrustedUID
+	trustedGID := agentIdentityLockTrustedGID
+	if testOnly {
+		if testRoot == "" {
+			return fail(errors.New("test agent identity lock root is required"))
 		}
+		runRoot = testRoot
+		trustedUID = uint32(os.Geteuid())
+		trustedGID = uint32(os.Getegid())
+	} else if testRoot != "" {
+		return fail(errors.New("test agent identity lock root is forbidden"))
 	}
-
-	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	directory, err := openAgentIdentityLockDirectory(runRoot, trustedUID, trustedGID)
 	if err != nil {
-		return -1, fmt.Errorf("open agent identity directory %q: %w", name, err)
+		return fail(err)
+	}
+	defer directory.Close()
+	if err = validateAgentIdentityLockFile(file, trustedUID, trustedGID); err != nil {
+		return fail(err)
+	}
+	var descriptor, named unix.Stat_t
+	if err = unix.Fstat(int(file.Fd()), &descriptor); err != nil {
+		return fail(err)
+	}
+	name := strconv.FormatUint(uint64(uid), 10) + ".lock"
+	if err = unix.Fstatat(int(directory.Fd()), name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fail(fmt.Errorf("inspect named agent identity lock %s: %w", name, err))
+	}
+	if descriptor.Dev != named.Dev || descriptor.Ino != named.Ino {
+		return fail(fmt.Errorf("inherited agent identity lock is not the trusted named lock %s", name))
+	}
+	if err = validateInheritedAgentIdentityFlock(file, descriptor, "WRITE"); err != nil {
+		return fail(err)
+	}
+	if err = proveInheritedAgentIdentityLock(file, directory, name, descriptor, trustedUID, trustedGID); err != nil {
+		return fail(err)
+	}
+	if err = setAgentIdentityLockCloseOnExec(file); err != nil {
+		return fail(err)
 	}
 
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		_ = unix.Close(fd)
-
-		return -1, fmt.Errorf("stat agent identity directory %q: %w", name, err)
-	}
-	if stat.Uid != 0 || stat.Gid != 0 || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 || create && stat.Mode&0o777 != 0o700 {
-		_ = unix.Close(fd)
-
-		return -1, fmt.Errorf("agent identity directory %q is not root-owned and protected", name)
-	}
-
-	return fd, nil
+	return &agentIdentityLock{file: file}, nil
 }
 
-func hardenLinuxAgentIdentityLock(fd int) error {
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return fmt.Errorf("stat agent identity lock: %w", err)
+func adoptAgentAuthorityDomain(file *os.File, testOnly bool, testRoot string) (*agentIdentityLock, error) {
+	if file == nil {
+		return nil, errors.New("inherited agent authority domain descriptor is unavailable")
 	}
-
-	return validateLinuxAgentIdentityLock(stat)
+	fail := func(err error) (*agentIdentityLock, error) {
+		return nil, errors.Join(err, file.Close())
+	}
+	runRoot := agentIdentityLockRunRoot
+	trustedUID := agentIdentityLockTrustedUID
+	trustedGID := agentIdentityLockTrustedGID
+	if testOnly {
+		if testRoot == "" {
+			return fail(errors.New("test agent identity lock root is required"))
+		}
+		runRoot = testRoot
+		trustedUID = uint32(os.Geteuid())
+		trustedGID = uint32(os.Getegid())
+	} else if testRoot != "" {
+		return fail(errors.New("test agent identity lock root is forbidden"))
+	}
+	directory, err := openAgentIdentityLockDirectory(runRoot, trustedUID, trustedGID)
+	if err != nil {
+		return fail(err)
+	}
+	defer directory.Close()
+	if err = validateAgentIdentityLockFile(file, trustedUID, trustedGID); err != nil {
+		return fail(err)
+	}
+	var descriptor, named unix.Stat_t
+	if err = unix.Fstat(int(file.Fd()), &descriptor); err != nil {
+		return fail(err)
+	}
+	const name = "domain.lock"
+	if err = unix.Fstatat(int(directory.Fd()), name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fail(fmt.Errorf("inspect named agent authority domain %s: %w", name, err))
+	}
+	if descriptor.Dev != named.Dev || descriptor.Ino != named.Ino {
+		return fail(errors.New("inherited agent authority domain is not the trusted named domain.lock"))
+	}
+	if err = validateInheritedAgentIdentityFlock(file, descriptor, "READ"); err != nil {
+		return fail(err)
+	}
+	contenderFD, err := unix.Openat(int(directory.Fd()), name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fail(err)
+	}
+	contenderErr := unix.Flock(contenderFD, unix.LOCK_EX|unix.LOCK_NB)
+	closeErr := unix.Close(contenderFD)
+	if contenderErr == nil {
+		return fail(errors.Join(errors.New("inherited agent authority domain was not locked before handoff"), closeErr))
+	}
+	if !errors.Is(contenderErr, unix.EWOULDBLOCK) && !errors.Is(contenderErr, unix.EAGAIN) {
+		return fail(errors.Join(fmt.Errorf("contend for inherited agent authority domain: %w", contenderErr), closeErr))
+	}
+	if closeErr != nil {
+		return fail(closeErr)
+	}
+	if err = validateAgentAuthorityDomainRecord(directory, trustedUID, trustedGID); err != nil {
+		return fail(err)
+	}
+	if err = setAgentIdentityLockCloseOnExec(file); err != nil {
+		return fail(err)
+	}
+	return &agentIdentityLock{file: file}, nil
 }
 
-func validateLinuxAgentIdentityLock(stat unix.Stat_t) error {
-	if stat.Uid != 0 || stat.Gid != 0 || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Mode&0o777 != 0o600 {
-		return errors.New("agent identity lock is not a root-owned mode-0600 single-link regular file")
+func validateLinuxSupervisorAdoptedAuthority(config supervisorConfig) error {
+	if config.StandaloneAuthority {
+		return validateAdoptedStandaloneAgentIdentityDisposition(
+			config.IsolationUID,
+			config.IsolationGID,
+			config.StandaloneOwnerID,
+			config.StandaloneStateRoot,
+			false,
+			"",
+		)
+	}
+
+	return validateBorrowedAgentIdentityDisposition(config.IsolationUID, config.IsolationGID, false, "")
+}
+
+func validateBorrowedAgentIdentityDisposition(uid, gid uint32, testOnly bool, testRoot string) error {
+	directory, trustedUID, trustedGID, err := openAgentIdentityDispositionRoot(testOnly, testRoot)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	if err = rejectAgentIdentityDispositionTemporaries(directory); err != nil {
+		return err
+	}
+	if err = auditAgentStandaloneAuthorityRoot(
+		directory,
+		trustedUID,
+		trustedGID,
+		false,
+		false,
+		true,
+		time.Now().Add(agentStandaloneClaimMax),
+		nil,
+		nil,
+	); err != nil {
+		return fmt.Errorf("audit borrowed agent identity authority: %w", err)
+	}
+	ownerName := strconv.FormatUint(uint64(uid), 10) + ".owner"
+	var owner unix.Stat_t
+	ownerErr := unix.Fstatat(int(directory.Fd()), ownerName, &owner, unix.AT_SYMLINK_NOFOLLOW)
+	if ownerErr == nil {
+		return fmt.Errorf("borrowed agent identity uid %d has a permanent owner binding", uid)
+	}
+	if !errors.Is(ownerErr, unix.ENOENT) {
+		return fmt.Errorf("inspect borrowed agent identity owner %s: %w", ownerName, ownerErr)
+	}
+	marker, err := loadAgentStandaloneMarker(directory, uid, trustedUID, trustedGID)
+	if err != nil {
+		return fmt.Errorf("load borrowed agent identity disposition: %w", err)
+	}
+	if marker.State != "active" || marker.GID != gid {
+		return fmt.Errorf("borrowed agent identity uid %d does not have its matching ownerless ACTIVE disposition", uid)
 	}
 
 	return nil
 }
 
-func linuxSupervisorControlClosed(control io.Reader) bool {
-	file, ok := control.(*os.File)
-	if !ok {
-		return false
+func validateAdoptedStandaloneAgentIdentityDisposition(
+	uid, gid uint32,
+	ownerID, stateRoot string,
+	testOnly bool,
+	testRoot string,
+) error {
+	boundRoot, err := bindAgentStandaloneStateRoot(stateRoot, uid, gid)
+	if err != nil {
+		return err
 	}
-	poll := []unix.PollFd{{Fd: int32(file.Fd()), Events: unix.POLLHUP | unix.POLLERR}} //nolint:gosec // inherited descriptors fit pollfd.
-	count, err := unix.Poll(poll, 0)
+	directory, trustedUID, trustedGID, err := openAgentIdentityDispositionRoot(testOnly, testRoot)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	if err = rejectAgentIdentityDispositionTemporaries(directory); err != nil {
+		return err
+	}
+	if err = auditAgentStandaloneAuthorityRoot(
+		directory,
+		trustedUID,
+		trustedGID,
+		false,
+		false,
+		false,
+		time.Now().Add(agentStandaloneClaimMax),
+		nil,
+		nil,
+	); err != nil {
+		return err
+	}
+	want := agentStandaloneOwner{
+		Version:   1,
+		UID:       uid,
+		GID:       gid,
+		Kind:      agentStandaloneOwnerKind,
+		Provider:  agentStandaloneOwnerID,
+		OwnerID:   ownerID,
+		StateRoot: boundRoot,
+	}
+	owner, err := loadAgentStandaloneOwner(directory, uid, trustedUID, trustedGID)
+	if err != nil {
+		return err
+	}
+	if owner != want {
+		return errors.New("OpenCode adopted standalone authority does not match its immutable owner binding")
+	}
 
-	return err == nil && count > 0 && poll[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0
+	return validateAgentStandalonePriorDisposition(directory, owner, trustedUID, trustedGID)
 }
 
-func (lock *linuxAgentIdentityLock) Close() error {
+func openAgentIdentityDispositionRoot(testOnly bool, testRoot string) (*os.File, uint32, uint32, error) {
+	runRoot := agentIdentityLockRunRoot
+	trustedUID := agentIdentityLockTrustedUID
+	trustedGID := agentIdentityLockTrustedGID
+	if testOnly {
+		if testRoot == "" {
+			return nil, 0, 0, errors.New("test agent identity lock root is required")
+		}
+		runRoot = testRoot
+		trustedUID = uint32(os.Geteuid())
+		trustedGID = uint32(os.Getegid())
+	} else if testRoot != "" {
+		return nil, 0, 0, errors.New("test agent identity lock root is forbidden")
+	}
+	directory, err := openAgentIdentityLockDirectory(runRoot, trustedUID, trustedGID)
+
+	return directory, trustedUID, trustedGID, err
+}
+
+func rejectAgentIdentityDispositionTemporaries(directory *os.File) error {
+	entries, err := agentStandaloneAuthorityEntries(directory)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "domain.json.next-") || strings.HasPrefix(name, ".authority-probe-") ||
+			strings.Contains(name, ".owner.next-") || strings.Contains(name, ".quarantine.next-") {
+			return fmt.Errorf("agent identity authority contains unresolved temporary %q", name)
+		}
+	}
+
+	return nil
+}
+
+func setAgentIdentityLockCloseOnExec(file *os.File) error {
+	flags, err := agentIdentityLockFcntl(file.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		return fmt.Errorf("read inherited agent identity lock descriptor flags: %w", err)
+	}
+	if _, err = agentIdentityLockFcntl(file.Fd(), unix.F_SETFD, flags|unix.FD_CLOEXEC); err != nil {
+		return fmt.Errorf("protect inherited agent identity lock from native exec: %w", err)
+	}
+
+	return nil
+}
+
+func proveInheritedAgentIdentityLock(
+	file *os.File,
+	directory *os.File,
+	name string,
+	descriptor unix.Stat_t,
+	trustedUID uint32,
+	trustedGID uint32,
+) (proofErr error) {
+	contenderFD, err := unix.Openat(
+		int(directory.Fd()), name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+	)
+	if err != nil {
+		return fmt.Errorf("open inherited agent identity lock %s ownership contender: %w", name, err)
+	}
+	contender := os.NewFile(uintptr(contenderFD), name+"-contender")
+	defer func() {
+		if closeErr := contender.Close(); closeErr != nil {
+			proofErr = errors.Join(proofErr, fmt.Errorf("close inherited agent identity lock %s ownership contender: %w", name, closeErr))
+		}
+	}()
+	if err = validateAgentIdentityLockFile(contender, trustedUID, trustedGID); err != nil {
+		return err
+	}
+	var contenderStat unix.Stat_t
+	if err = unix.Fstat(contenderFD, &contenderStat); err != nil {
+		return err
+	}
+	if contenderStat.Dev != descriptor.Dev || contenderStat.Ino != descriptor.Ino {
+		return fmt.Errorf("inherited agent identity lock ownership contender is not the trusted named lock %s", name)
+	}
+	contenderErr := unix.Flock(contenderFD, unix.LOCK_EX|unix.LOCK_NB)
+	if contenderErr == nil {
+		return fmt.Errorf("inherited agent identity lock %s was not locked before handoff", name)
+	}
+	if !errors.Is(contenderErr, unix.EWOULDBLOCK) && !errors.Is(contenderErr, unix.EAGAIN) {
+		return fmt.Errorf("contend for inherited agent identity lock %s: %w", name, contenderErr)
+	}
+	return nil
+}
+
+func validateInheritedAgentIdentityFlock(file *os.File, descriptor unix.Stat_t, wantMode string) error {
+	path := fmt.Sprintf("/proc/self/fdinfo/%d", file.Fd())
+	payload, err := agentIdentityLockReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read inherited agent identity flock state: %w", err)
+	}
+	lockLines := 0
+	for _, line := range strings.Split(string(payload), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "lock:" {
+			continue
+		}
+		lockLines++
+		if err = validateInheritedAgentIdentityFlockLine(fields, descriptor, wantMode); err != nil {
+			return err
+		}
+	}
+	if lockLines != 1 {
+		return fmt.Errorf("inherited agent identity descriptor has %d flock entries, want exactly one", lockLines)
+	}
+
+	return nil
+}
+
+func validateInheritedAgentIdentityFlockLine(fields []string, descriptor unix.Stat_t, wantMode string) error {
+	if len(fields) != 9 || !strings.HasSuffix(fields[1], ":") || fields[2] != "FLOCK" ||
+		fields[3] != "ADVISORY" || fields[4] != wantMode || fields[7] != "0" || fields[8] != "EOF" {
+		return errors.New("inherited agent identity descriptor has malformed or wrong-mode flock state")
+	}
+	if _, err := strconv.ParseUint(strings.TrimSuffix(fields[1], ":"), 10, 64); err != nil {
+		return errors.New("inherited agent identity descriptor has malformed flock sequence")
+	}
+	if pid, err := strconv.ParseInt(fields[5], 10, 64); err != nil || pid < 0 {
+		return errors.New("inherited agent identity descriptor has malformed flock owner")
+	}
+	identity := strings.Split(fields[6], ":")
+	if len(identity) != 3 {
+		return errors.New("inherited agent identity descriptor has malformed flock inode")
+	}
+	major, majorErr := strconv.ParseUint(identity[0], 16, 32)
+	minor, minorErr := strconv.ParseUint(identity[1], 16, 32)
+	inode, inodeErr := strconv.ParseUint(identity[2], 10, 64)
+	if majorErr != nil || minorErr != nil || inodeErr != nil ||
+		uint32(major) != unix.Major(uint64(descriptor.Dev)) ||
+		uint32(minor) != unix.Minor(uint64(descriptor.Dev)) || inode != descriptor.Ino {
+		return errors.New("inherited agent identity descriptor flock does not cover its exact inode")
+	}
+
+	return nil
+}
+
+func (lock *agentIdentityLock) Close() error {
 	if lock == nil || lock.file == nil {
 		return nil
 	}
-	file := lock.file
+	closeErr := lock.file.Close()
 	lock.file = nil
 
-	return file.Close()
+	return closeErr
 }
 
-func retryLinuxLivenessContainment(containment *livenessContainment) error {
-	for {
-		if err := supervisorLivenessQuiesce(containment, 0, supervisorQuiesceWindow); err == nil {
-			return nil
-		}
-
-		time.Sleep(100 * time.Millisecond)
+func (lock *agentIdentityLock) Duplicate() (*os.File, error) {
+	if lock == nil || lock.file == nil {
+		return nil, errors.New("agent identity lock is unavailable")
 	}
+
+	return duplicateAgentIdentityLock(lock.file)
 }
 
-func retryLinuxGuardianContainment(containment *guardianContainment) error {
-	for {
-		if err := supervisorGuardianQuiesce(containment, 0, supervisorQuiesceWindow); err == nil {
-			return nil
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (lock *linuxAgentIdentityLock) InheritedFile() *os.File {
+func (lock *agentIdentityLock) InheritedFile() *os.File {
 	if lock == nil {
 		return nil
 	}

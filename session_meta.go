@@ -167,7 +167,7 @@ func sessionEnvFromMeta(value any) (map[string]string, error) {
 // validEnvName refuses names a child process cannot carry, plus the one name
 // this option is not allowed to own.
 func validEnvName(key string) bool {
-	return key != "" && key != envPathKey && !strings.ContainsAny(key, "=\x00")
+	return key != "" && key != envPathKey && !reservedOpenCodeEnvKey(key) && !strings.ContainsAny(key, "=\x00")
 }
 
 // extraPathDirsFromMeta reads the directories placed ahead of the inherited

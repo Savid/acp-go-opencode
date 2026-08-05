@@ -68,3 +68,16 @@ func TestSupervisorWaiterResultStaysPausedUntilRelease(t *testing.T) {
 		t.Fatalf("result = %v, want %v", err, waitErr)
 	}
 }
+
+func TestSupervisorWaiterResultStartsImmediately(t *testing.T) {
+	source := make(chan error, 1)
+	source <- nil
+	released := false
+	waiter := newSupervisorWaiterResult(source, func() { released = true }, false)
+	if err := <-waiter.result(); err != nil {
+		t.Fatal(err)
+	}
+	if !released {
+		t.Fatal("release was not called")
+	}
+}

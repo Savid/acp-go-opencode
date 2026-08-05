@@ -24,18 +24,19 @@ import (
 )
 
 type supervisedNative struct {
-	cmd         *exec.Cmd
-	waiter      *supervisorWaiter
-	stdin       io.WriteCloser
-	home        string
-	rootPID     int
-	descPID     int
-	livenessPID int
-	proof       *supervisorProof
-	stderr      *supervisorTestBuffer
-	cancel      context.CancelFunc
-	attackPath  string
-	forgePath   string
+	cmd          *exec.Cmd
+	waiter       *supervisorWaiter
+	stdin        io.WriteCloser
+	home         string
+	rootPID      int
+	descPID      int
+	livenessPID  int
+	proof        *supervisorProof
+	stderr       *supervisorTestBuffer
+	cancel       context.CancelFunc
+	attackPath   string
+	forgePath    string
+	isolationUID uint32
 }
 
 type supervisorTestBuffer struct {
@@ -130,42 +131,6 @@ func TestTrustedSupervisorDeniesNativeAuthorityAttacks(t *testing.T) {
 	assertProcessGone(t, runtime.descPID)
 }
 
-func TestLinuxAgentIdentityLockSerializesAndCancels(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires the trusted root supervisor identity")
-	}
-
-	uid := uint32(63000 + os.Getpid()%1000)
-	first, err := acquireLinuxAgentIdentityLock(uid, strings.NewReader(""))
-	require.NoError(t, err)
-	defer first.Close()
-
-	controlRead, controlWrite, err := os.Pipe()
-	require.NoError(t, err)
-	defer controlRead.Close()
-	result := make(chan error, 1)
-	go func() {
-		lock, lockErr := acquireLinuxAgentIdentityLock(uid, controlRead)
-		if lock != nil {
-			_ = lock.Close()
-		}
-		result <- lockErr
-	}()
-
-	select {
-	case err := <-result:
-		t.Fatalf("contending identity lock completed early: %v", err)
-	case <-time.After(75 * time.Millisecond):
-	}
-	require.NoError(t, controlWrite.Close())
-	select {
-	case err := <-result:
-		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
-	case <-time.After(time.Second):
-		t.Fatal("contending identity lock ignored closed control")
-	}
-}
-
 func TestLinuxSupervisorConfigIsSealed(t *testing.T) {
 	file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativePath: "/bin/true"})
 	require.NoError(t, err)
@@ -176,16 +141,6 @@ func TestLinuxSupervisorConfigIsSealed(t *testing.T) {
 	require.Equal(t, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL, seals)
 	_, err = file.WriteAt([]byte("x"), 0)
 	require.Error(t, err)
-}
-
-func TestLinuxAgentIdentityLockRejectsWrongModeWithoutRepair(t *testing.T) {
-	trusted := unix.Stat_t{Uid: 0, Gid: 0, Mode: unix.S_IFREG | 0o600, Nlink: 1}
-	require.NoError(t, validateLinuxAgentIdentityLock(trusted))
-
-	wrongMode := trusted
-	wrongMode.Mode = unix.S_IFREG | 0o640
-	require.ErrorContains(t, validateLinuxAgentIdentityLock(wrongMode), "mode-0600")
-	require.Equal(t, uint32(unix.S_IFREG|0o640), wrongMode.Mode)
 }
 
 func TestPersistentProofFailureRetainsIdentityLockUntilRecovery(t *testing.T) {
@@ -203,7 +158,7 @@ func TestPersistentProofFailureRetainsIdentityLockUntilRecovery(t *testing.T) {
 	require.NoError(t, err)
 	survivorFile := os.NewFile(uintptr(survivorFD), "surviving-identity-lock")
 	require.NotNil(t, survivorFile)
-	require.NoError(t, (&linuxAgentIdentityLock{file: guardianFile}).Close())
+	require.NoError(t, (&agentIdentityLock{file: guardianFile}).Close())
 
 	contender, err := os.OpenFile(lockPath, os.O_RDWR, 0)
 	require.NoError(t, err)
@@ -311,6 +266,8 @@ func TestGuardianPersistentProofFailureQuarantinesUntilRecovery(t *testing.T) {
 func TestSupervisorGuardianSIGKILLLeavesLivenessLockedUntilTreeExit(t *testing.T) {
 	runtime := startSupervisedNative(t)
 	require.NoError(t, syscall.Kill(-runtime.rootPID, syscall.SIGSTOP))
+	require.NoError(t, syscall.Kill(runtime.livenessPID, syscall.SIGSTOP))
+	t.Cleanup(func() { _ = syscall.Kill(runtime.livenessPID, syscall.SIGCONT) })
 	require.NoError(t, runtime.cmd.Process.Kill())
 	runtime.waiter.start()
 	<-runtime.waiter.result()
@@ -320,25 +277,98 @@ func TestSupervisorGuardianSIGKILLLeavesLivenessLockedUntilTreeExit(t *testing.T
 	defer func() { require.NoError(t, claim.Release()) }()
 	_, err = homelock.AcquireLiveness(runtime.home)
 	require.Error(t, err, "surviving liveness supervisor must retain its lock")
+	require.NoError(t, syscall.Kill(runtime.descPID, 0), "setsid descendant must still be live during authority contention")
+	assertAgentIdentityAuthorityLocked(t, runtime.isolationUID)
+	require.NoError(t, syscall.Kill(runtime.livenessPID, syscall.SIGCONT))
 
 	liveness := acquireLivenessEventually(t, runtime.home)
 	require.NoError(t, liveness.Release())
 	assertProcessGone(t, runtime.rootPID)
 	assertProcessGone(t, runtime.descPID)
+	assertAgentIdentityAuthorityReacquires(t, runtime.isolationUID)
+}
+
+func TestSupervisorGuardianSIGKILLBeforeNativeLaunchRefusesStartAndCompletesAfterECHILD(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	preservePlatformSupervisorGlobals(t)
+
+	peerRead, peerWrite, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = peerWrite.Close()
+		_ = peerRead.Close()
+	})
+
+	oldValidator := supervisorValidateGuardianPeer
+	oldPeer := supervisorGuardianPeer
+	t.Cleanup(func() {
+		supervisorValidateGuardianPeer = oldValidator
+		supervisorGuardianPeer = oldPeer
+	})
+	supervisorGuardianPeer = peerRead
+	peerChecks := 0
+	supervisorValidateGuardianPeer = func(peer *os.File, done <-chan struct{}) error {
+		peerChecks++
+		peerErr := validateLinuxSupervisorGuardianPeer(peer, done)
+		if peerChecks == 1 && peerErr == nil {
+			if closeErr := peerWrite.Close(); closeErr != nil {
+				return closeErr
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				return errors.New("guardian peer did not close")
+			}
+		}
+
+		return peerErr
+	}
+
+	root := t.TempDir()
+	config := supervisorConfig{
+		NativePath:    "/bin/true",
+		NativeArgs:    []string{"true"},
+		NativeEnv:     os.Environ(),
+		Home:          filepath.Join(root, "home"),
+		Started:       filepath.Join(root, "started"),
+		Completion:    filepath.Join(root, "completion"),
+		Quarantine:    filepath.Join(root, "quarantine"),
+		NativePIDFile: filepath.Join(root, "native-pid"),
+	}
+	var native *exec.Cmd
+	supervisorExecCommand = func(string, ...string) *exec.Cmd {
+		native = exec.Command("/bin/true")
+
+		return native
+	}
+
+	err = runLiveness(config)
+	require.ErrorContains(t, err, "guardian exited before native launch")
+	require.Equal(t, 2, peerChecks, "guardian must be fenced again at the native Start boundary")
+	require.NotNil(t, native)
+	require.Nil(t, native.Process, "native command must not start after the guardian peer fence fails")
+	require.FileExists(t, config.Completion)
+	require.NoFileExists(t, config.NativePIDFile)
 }
 
 func TestSupervisorLivenessSIGKILLLeavesClaimLockedUntilTreeExit(t *testing.T) {
 	runtime := startSupervisedNative(t)
 	require.NoError(t, syscall.Kill(-runtime.rootPID, syscall.SIGSTOP))
+	require.NoError(t, syscall.Kill(runtime.cmd.Process.Pid, syscall.SIGSTOP))
+	t.Cleanup(func() { _ = syscall.Kill(runtime.cmd.Process.Pid, syscall.SIGCONT) })
 	require.NoError(t, syscall.Kill(runtime.livenessPID, syscall.SIGKILL))
 
 	_, err := homelock.AcquireClaim(runtime.home)
 	require.Error(t, err, "surviving guardian must retain claim while it kills the tree")
+	require.NoError(t, syscall.Kill(runtime.descPID, 0), "setsid descendant must still be live during authority contention")
+	assertAgentIdentityAuthorityLocked(t, runtime.isolationUID)
+	require.NoError(t, syscall.Kill(runtime.cmd.Process.Pid, syscall.SIGCONT))
 	require.Error(t, waitSupervisor(runtime, 10*time.Second), "guardian must report its killed liveness child")
 
 	assertProcessGone(t, runtime.rootPID)
 	assertProcessGone(t, runtime.descPID)
 	assertHomeReacquires(t, runtime.home)
+	assertAgentIdentityAuthorityReacquires(t, runtime.isolationUID)
 }
 
 func TestCancelledShutdownContainsStubbornSetsidDescendant(t *testing.T) {
@@ -357,6 +387,11 @@ func TestTurnTimeoutShutdownContainsStubbornSetsidDescendant(t *testing.T) {
 
 func startSupervisedNative(t *testing.T) *supervisedNative {
 	t.Helper()
+	const standaloneStateRoot = "/var/lib/acp-go-opencode-test"
+	require.NoError(t, os.MkdirAll(standaloneStateRoot, 0o700))
+	require.NoError(t, os.Chown(standaloneStateRoot, 65534, 65534))
+	require.NoError(t, os.Chmod(standaloneStateRoot, 0o700))
+
 	root, err := os.MkdirTemp("", "acp-go-opencode-authority-")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(root)) })
@@ -367,6 +402,7 @@ func startSupervisedNative(t *testing.T) *supervisedNative {
 	rootPIDPath := filepath.Join(root, "root.pid")
 	descPIDPath := filepath.Join(root, "desc.pid")
 	attackPath := filepath.Join(root, "attacks")
+	attackReadyPath := filepath.Join(root, "attacks.ready")
 	forgePath := filepath.Join(linuxSupervisorProofNamespace, fmt.Sprintf("native-forge-%d", os.Getpid()))
 	_ = os.Remove(forgePath)
 	script := filepath.Join(root, "native.sh")
@@ -381,9 +417,10 @@ echo "$$" > "$ROOT_PID_FILE"
 parent=$PPID
 stop=denied; kill -STOP "$parent" 2>/dev/null && stop=allowed
 kill_result=denied; kill -KILL "$parent" 2>/dev/null && kill_result=allowed
-forge=denied; : > "$FORGE_PATH" 2>/dev/null && forge=allowed
+forge=denied; touch "$FORGE_PATH" 2>/dev/null && forge=allowed
 config=denied; cat /proc/$parent/fd/3 >/dev/null 2>&1 && config=allowed
 printf '%s %s %s %s %s %s %s %s\n' "$stop" "$kill_result" "$forge" "$config" "$(awk '$1 == "Uid:" {print $2}' /proc/$parent/status)" "$(id -u)" "$(id -g)" "$(awk '$1 == "Groups:" {print NF-1}' /proc/self/status)" > "$ATTACK_PATH"
+touch "$ATTACK_READY_FILE"
 trap '' TERM
 while IFS= read -r line; do printf '%s\n' "$line"; done
 `), 0o755))
@@ -393,15 +430,20 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 		"ROOT_PID_FILE="+rootPIDPath,
 		"DESC_PID_FILE="+descPIDPath,
 		"ATTACK_PATH="+attackPath,
+		"ATTACK_READY_FILE="+attackReadyPath,
 		"FORGE_PATH="+forgePath,
 	)
+	const isolationUID = 65534
 	cmd, proof, err := supervisorCommand(ctx, supervisorConfig{
 		NativePath: script,
 		NativeArgs: []string{"root"},
 		NativeEnv:  nativeEnv,
 		Home:       home,
 		Scratch:    scratch,
-		Isolation:  &ProcessIsolation{UID: 65534, GID: 65534, BaseEnvironment: environmentMap(nativeEnv)},
+		Isolation: &ProcessIsolation{
+			UID: isolationUID, GID: 65534, BaseEnvironment: environmentMap(nativeEnv),
+			StandaloneOwnerID: "test-owner", StandaloneStateRoot: standaloneStateRoot,
+		},
 	})
 	require.NoError(t, err)
 	stdin, err := cmd.StdinPipe()
@@ -414,15 +456,16 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	require.NoError(t, proof.closeInherited())
 
 	runtime := &supervisedNative{
-		cmd:        cmd,
-		waiter:     waiter,
-		stdin:      stdin,
-		home:       home,
-		stderr:     stderr,
-		cancel:     cancel,
-		proof:      proof,
-		attackPath: attackPath,
-		forgePath:  forgePath,
+		cmd:          cmd,
+		waiter:       waiter,
+		stdin:        stdin,
+		home:         home,
+		stderr:       stderr,
+		cancel:       cancel,
+		proof:        proof,
+		attackPath:   attackPath,
+		forgePath:    forgePath,
+		isolationUID: isolationUID,
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -440,6 +483,7 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 
 	runtime.rootPID = waitPIDFile(t, rootPIDPath)
 	runtime.descPID = waitPIDFile(t, descPIDPath)
+	waitFile(t, attackReadyPath)
 	descendantSession, descendantGroup := processSessionAndGroup(t, runtime.descPID)
 	require.Equal(t, runtime.descPID, descendantSession, "descendant must escape into a new session")
 	require.Equal(t, runtime.descPID, descendantGroup, "descendant must escape into a new process group")
@@ -448,6 +492,36 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	require.Positive(t, runtime.livenessPID)
 
 	return runtime
+}
+
+func assertAgentIdentityAuthorityLocked(t *testing.T, uid uint32) {
+	t.Helper()
+	for _, name := range []string{strconv.FormatUint(uint64(uid), 10) + ".lock", "domain.lock"} {
+		fd, err := unix.Open(filepath.Join(linuxAgentIdentityNamespace, name), unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		require.NoError(t, err)
+		lockErr := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if lockErr == nil {
+			_ = unix.Close(fd)
+			t.Fatalf("authority lock %s became available before survivor containment", name)
+		}
+		require.True(t, errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN), "contend %s: %v", name, lockErr)
+		require.NoError(t, unix.Close(fd))
+	}
+}
+
+func assertAgentIdentityAuthorityReacquires(t *testing.T, uid uint32) {
+	t.Helper()
+	for _, name := range []string{strconv.FormatUint(uint64(uid), 10) + ".lock", "domain.lock"} {
+		require.Eventually(t, func() bool {
+			fd, err := unix.Open(filepath.Join(linuxAgentIdentityNamespace, name), unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+			if err != nil {
+				return false
+			}
+			defer unix.Close(fd)
+
+			return unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB) == nil
+		}, 5*time.Second, 10*time.Millisecond, "authority lock %s did not release after ECHILD", name)
+	}
 }
 
 func shutdownSupervisedRuntime(t *testing.T, runtime *supervisedNative, ctx context.Context) {
@@ -478,6 +552,15 @@ func processSessionAndGroup(t *testing.T, pid int) (int, int) {
 	require.NoError(t, err)
 
 	return session, group
+}
+
+func waitFile(t *testing.T, path string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		info, err := os.Stat(path)
+
+		return err == nil && info.Mode().IsRegular()
+	}, 5*time.Second, 10*time.Millisecond, "file %s was not published", path)
 }
 
 func waitPIDFile(t *testing.T, path string) int {

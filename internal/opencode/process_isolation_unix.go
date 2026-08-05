@@ -7,7 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
+
+var inheritedDescriptorFcntl = unix.FcntlInt
 
 func validateProcessIsolationPlatform() error { return nil }
 
@@ -30,7 +34,14 @@ func closeInheritedOnExec(file *os.File) error {
 		return fmt.Errorf("inherited config descriptor is unavailable")
 	}
 
-	syscall.CloseOnExec(int(file.Fd()))
+	flags, err := inheritedDescriptorFcntl(file.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		return fmt.Errorf("read inherited descriptor flags: %w", err)
+	}
+
+	if _, err = inheritedDescriptorFcntl(file.Fd(), unix.F_SETFD, flags|unix.FD_CLOEXEC); err != nil {
+		return fmt.Errorf("protect inherited descriptor from native exec: %w", err)
+	}
 
 	return nil
 }

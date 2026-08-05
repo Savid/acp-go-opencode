@@ -17,7 +17,7 @@ func TestOpenCodeNativeCannotMutateTrustedHomeLocks(t *testing.T) {
 		t.Skip("requires root")
 	}
 
-	parent, err := os.MkdirTemp("/tmp", "acp-go-opencode-ownership-")
+	parent, err := os.MkdirTemp("", "acp-go-opencode-ownership-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestOpenCodeNativeCannotMutateTrustedHomeLocks(t *testing.T) {
 	if err := lock.Release(); err != nil {
 		t.Fatal(err)
 	}
-	if err := handoffGeneratedNativeTree(xdg.Root, &ProcessIsolation{UID: 65534, GID: 65534, BaseEnvironment: map[string]string{}}); err != nil {
+	if err := handoffGeneratedNativeTree(xdg.Root, &ProcessIsolation{UID: 65534, GID: 65534, BaseEnvironment: map[string]string{}, StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test"}); err != nil {
 		t.Fatal(err)
 	}
 

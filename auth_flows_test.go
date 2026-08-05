@@ -1495,6 +1495,33 @@ func TestCloseSessionSkipsTerminalAndForeignFlows(t *testing.T) {
 	require.Equal(t, authStateSaved, record.state)
 }
 
+func TestWaitCompletionClaimAndOAuthInputFailures(t *testing.T) {
+	broker := &providerAuth{}
+	claimed := &authFlow{state: authStatePending, claimed: true}
+	broker.driveWaitCompletion(claimed, nil)
+	require.Nil(t, claimed.completionDone)
+
+	flow := &authFlow{presentation: authAuthorizeResult{CallbackInput: authCallbackInputCode}}
+	_, err := broker.completeOAuth(context.Background(), nil, flow, "")
+	require.Error(t, err)
+}
+
+func TestCloseSessionStopsWaitingWhenContextEnds(t *testing.T) {
+	sessionID := acp.SessionId("session")
+	key := authFlowKey{sessionID: sessionID, providerID: "provider"}
+	completion := make(chan struct{})
+	flow := &authFlow{id: "flow", sessionID: sessionID, providerID: "provider", state: authStatePending, completionDone: completion, disarm: make(chan struct{})}
+	broker := &providerAuth{
+		closedSessions: map[acp.SessionId]struct{}{},
+		flows:          map[authFlowKey]*authFlow{key: flow},
+		byID:           map[string]*authFlow{flow.id: flow},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	broker.closeSession(ctx, sessionID)
+	require.Equal(t, authStateCancelled, flow.state)
+}
+
 func TestExpireTerminalizesTheFlowOnTheDeadline(t *testing.T) {
 	fixture := newAuthFixture(t)
 

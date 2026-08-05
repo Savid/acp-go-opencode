@@ -1296,6 +1296,26 @@ func TestSessionEnvironmentReachesTheNativeProcess(t *testing.T) {
 	require.NoError(t, agent.Close())
 }
 
+func TestSessionManagedRootEnvironmentFailsBeforeNativeCreation(t *testing.T) {
+	launches := 0
+	agent := NewAgent(
+		WithHome(t.TempDir()),
+		func(options *Options) {
+			options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+				launches++
+
+				return newFakeOpenCodeClient(), nil
+			}
+		},
+	)
+
+	_, err := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
+		WithOpenCodeEnv(map[string]string{managedEnvXDGDataHome: t.TempDir()}),
+	))))
+	require.Error(t, err)
+	require.Zero(t, launches)
+}
+
 // requireRuntimeEnvironmentBackpressure pins the exact -32600 payload a client
 // tells the transient environment holder apart by. The hold ends when the last
 // holding session closes, so the same request retried later succeeds.

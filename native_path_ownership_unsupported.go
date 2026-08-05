@@ -9,7 +9,8 @@ import (
 )
 
 func handoffGeneratedNativeTreePlatform(_ string, uid uint32, gid uint32) error {
-	if uid == uint32(os.Geteuid()) && gid == uint32(os.Getegid()) {
+	if uid == uint32(os.Geteuid()) && //nolint:gosec // Effective Unix IDs fit the process-isolation wire width.
+		gid == uint32(os.Getegid()) { //nolint:gosec // Effective Unix IDs fit the process-isolation wire width.
 		return nil
 	}
 
@@ -17,7 +18,8 @@ func handoffGeneratedNativeTreePlatform(_ string, uid uint32, gid uint32) error 
 }
 
 func validateNativeOwnedDirectoryPlatform(_ string, uid uint32, gid uint32) error {
-	if uid == uint32(os.Geteuid()) && gid == uint32(os.Getegid()) {
+	if uid == uint32(os.Geteuid()) && //nolint:gosec // Effective Unix IDs fit the process-isolation wire width.
+		gid == uint32(os.Getegid()) { //nolint:gosec // Effective Unix IDs fit the process-isolation wire width.
 		return nil
 	}
 

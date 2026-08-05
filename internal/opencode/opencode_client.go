@@ -194,14 +194,17 @@ type StartOptions struct {
 	// ExtraPathDirs are absolute directories placed ahead of the inherited
 	// PATH, in order. Env cannot carry a search path: its entries replace whole
 	// values, so a PATH there would drop everything the child resolves against.
-	ExtraPathDirs            []string
-	Pure                     bool
-	QuestionTool             bool
-	LogLevel                 string
-	MinVersion               string
-	HealthTimeout            time.Duration
-	Logger                   *slog.Logger
-	ExistingXDG              XDGDirs
+	ExtraPathDirs []string
+	Pure          bool
+	QuestionTool  bool
+	LogLevel      string
+	MinVersion    string
+	HealthTimeout time.Duration
+	Logger        *slog.Logger
+	ExistingXDG   XDGDirs
+	// NativeOwnedXDG means the runtime identity owns Root. StartServer must not
+	// create, inspect, or write any path beneath it before launching OpenCode.
+	NativeOwnedXDG           bool
 	HandoffXDG               bool
 	SkipVersionGate          bool
 	SeedFiles                map[string]string
@@ -829,9 +832,15 @@ type ProviderModelInputCapabilities struct {
 
 var (
 	openCodeCommandContext                     = exec.CommandContext
+	openCodeStartProcess                       = startOpenCodeProcess
+	openCodeApplyCredential                    = applyProcessCredential
+	openCodeSupervisorCommand                  = supervisorCommand
+	openCodeHTTPClient                         = func() *http.Client { return &http.Client{Timeout: 30 * time.Second} }
 	openCodeListen                             = net.Listen
 	openCodeRandReader               io.Reader = rand.Reader
 	openCodeMarshalIndent                      = json.MarshalIndent
+	openCodeSeedMkdirAll                       = os.MkdirAll
+	openCodeSeedWriteFile                      = os.WriteFile
 	openCodeTerminateProcess                   = terminateOpenCodeProcess
 	openCodeKillProcess                        = killOpenCodeProcess
 	openCodeWaitCommand                        = func(cmd *exec.Cmd) error { return cmd.Wait() }
@@ -873,6 +882,10 @@ func resolveRuntimeXDG(options StartOptions) (XDGDirs, error) {
 			root = filepath.Join(options.ScratchParent, "acp-go-opencode")
 		}
 
+		if options.NativeOwnedXDG {
+			return RuntimeXDGDirs(root), nil
+		}
+
 		created, err := CreateRuntimeXDGDirs(root)
 		if err != nil {
 			return XDGDirs{}, err
@@ -881,11 +894,46 @@ func resolveRuntimeXDG(options StartOptions) (XDGDirs, error) {
 		xdg = created
 	}
 
-	if err := ensureXDGDirs(xdg); err != nil {
-		return XDGDirs{}, err
+	if !options.NativeOwnedXDG {
+		if err := ensureXDGDirs(xdg); err != nil {
+			return XDGDirs{}, err
+		}
+	}
+
+	if options.NativeOwnedXDG && !validRuntimeXDGDirs(xdg) {
+		return XDGDirs{}, errors.New("native-owned XDG directories must match their runtime root")
 	}
 
 	return xdg, nil
+}
+
+func validRuntimeXDGDirs(dirs XDGDirs) bool {
+	return dirs == RuntimeXDGDirs(dirs.Root)
+}
+
+func runtimeConfigContent(seedFiles map[string]string) (string, map[string][]byte, error) {
+	writes, seededConfig, err := planOpenCodeSeedWrites(seedFiles)
+	if err != nil {
+		return "", nil, err
+	}
+
+	for _, forbidden := range []string{fieldPermission, fieldMCP} {
+		if _, exists := seededConfig[forbidden]; exists {
+			return "", nil, fmt.Errorf("shared runtime seed must not contain session-scoped %q", forbidden)
+		}
+	}
+
+	config := deepMergeJSON(seededConfig, map[string]any{"$schema": "https://opencode.ai/config.json"})
+
+	data, err := openCodeMarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", nil, err
+	}
+
+	data = append(data, '\n')
+	writes[openCodeConfigFileName] = data
+
+	return string(data), writes, nil
 }
 
 func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) { //nolint:gocyclo // Startup owns the ordered resource-transfer rollback sequence.
@@ -895,32 +943,52 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	if err != nil {
 		return nil, err
 	}
+
 	controlRoot := options.ControlRoot
 	if controlRoot == "" {
 		controlRoot = ControlRootForXDG(xdg.Root)
 	}
-	if err := os.MkdirAll(controlRoot, 0o700); err != nil {
-		return nil, fmt.Errorf("create OpenCode runtime control root: %w", err)
-	}
-	if err := os.Chmod(controlRoot, 0o700); err != nil {
-		return nil, fmt.Errorf("protect OpenCode runtime control root: %w", err)
+
+	if controlErr := ensureRuntimeControlRoot(controlRoot); controlErr != nil {
+		return nil, controlErr
 	}
 
 	configurationStarted := time.Now()
-	runtimeConfig, err := materializeOpenCodeRuntimeConfig(xdg, options.SeedFiles)
+
+	var runtimeConfig string
+
+	if options.NativeOwnedXDG {
+		var writes map[string][]byte
+
+		runtimeConfig, writes, err = runtimeConfigContent(options.SeedFiles)
+		if err == nil {
+			delete(writes, openCodeConfigFileName)
+
+			for path := range writes {
+				err = fmt.Errorf("seed file %q is unsupported with native-owned XDG", path)
+
+				break
+			}
+		}
+	} else {
+		runtimeConfig, err = materializeOpenCodeRuntimeConfig(xdg, options.SeedFiles)
+	}
+
 	observeOpenCodeStartupStage(ctx, options, "runtime", "configuration", configurationStarted, err)
 
 	if err != nil {
 		return nil, err
 	}
+
 	if options.HandoffXDG {
-		if err := handoffGeneratedNativeTree(xdg.Root, options.ProcessIsolation); err != nil {
-			return nil, err
+		if handoffErr := handoffGeneratedNativeTree(xdg.Root, options.ProcessIsolation); handoffErr != nil {
+			return nil, handoffErr
 		}
 	}
+
 	if options.BrowserShim != nil {
-		if err := options.BrowserShim.Handoff(options.ProcessIsolation); err != nil {
-			return nil, err
+		if handoffErr := options.BrowserShim.Handoff(options.ProcessIsolation); handoffErr != nil {
+			return nil, handoffErr
 		}
 	}
 
@@ -945,7 +1013,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		args = append(args, "--log-level", options.LogLevel)
 	}
 
-	env, err := buildProcessEnvironment(options.ProcessIsolation, options.Env)
+	env, err := buildProcessEnvironment(options.ProcessIsolation, withoutManagedRootOverrides(options.Env))
 	if err != nil {
 		return nil, err
 	}
@@ -1008,7 +1076,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		cmd = openCodeCommandContext(processCtx, executable, args...)
 		cmd.Env = nativeEnv
 
-		if credentialErr := applyProcessCredential(cmd, options.ProcessIsolation); credentialErr != nil {
+		if credentialErr := openCodeApplyCredential(cmd, options.ProcessIsolation); credentialErr != nil {
 			cancel()
 
 			return nil, credentialErr
@@ -1019,7 +1087,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 			supervisorScratch = containmentGenerationRoot
 		}
 
-		cmd, supervisor, err = supervisorCommand(processCtx, supervisorConfig{
+		cmd, supervisor, err = openCodeSupervisorCommand(processCtx, supervisorConfig{
 			NativePath:       executable,
 			NativeArgs:       args,
 			NativeEnv:        nativeEnv,
@@ -1069,7 +1137,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	spawnStarted := time.Now()
 
-	runtimeWaiter, startErr := startOpenCodeProcess(cmd)
+	runtimeWaiter, startErr := openCodeStartProcess(cmd)
 	if startErr != nil {
 		_ = supervisor.closeInherited()
 
@@ -1147,7 +1215,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	go drainProcessPipe(options.Logger, "opencode stderr", stderr)
 
 	server := &openCodeServer{
-		httpClient:                   &http.Client{Timeout: 30 * time.Second},
+		httpClient:                   openCodeHTTPClient(),
 		baseURL:                      "http://127.0.0.1:" + strconv.Itoa(port),
 		username:                     username,
 		password:                     password,
@@ -2851,15 +2919,20 @@ func openAPIComponentSchema(doc map[string]any, ref string) (map[string]any, boo
 // CreateRuntimeXDGDirs materializes one shared runtime XDG root without a
 // session-derived path component.
 func CreateRuntimeXDGDirs(root string) (XDGDirs, error) {
-	dirs := XDGDirs{
+	dirs := RuntimeXDGDirs(root)
+
+	return dirs, ensureXDGDirs(dirs)
+}
+
+// RuntimeXDGDirs returns the XDG layout without touching the filesystem.
+func RuntimeXDGDirs(root string) XDGDirs {
+	return XDGDirs{
 		Root:   root,
 		Data:   filepath.Join(root, "data"),
 		Config: filepath.Join(root, "config"),
 		Cache:  filepath.Join(root, "cache"),
 		State:  filepath.Join(root, "state"),
 	}
-
-	return dirs, ensureXDGDirs(dirs)
 }
 
 func ensureXDGDirs(dirs XDGDirs) error {
@@ -2888,42 +2961,20 @@ const (
 // must never enter OPENCODE_CONFIG_CONTENT on a multiplexed runtime.
 func materializeOpenCodeRuntimeConfig(dirs XDGDirs, seedFiles map[string]string) (string, error) {
 	configDir := filepath.Join(dirs.Config, opencodeExecutableName)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
+	if err := openCodeSeedMkdirAll(configDir, 0o700); err != nil {
 		return "", err
 	}
 
-	writes, seededConfig, err := planOpenCodeSeedWrites(seedFiles)
+	content, writes, err := runtimeConfigContent(seedFiles)
 	if err != nil {
 		return "", err
 	}
-
-	for _, forbidden := range []string{fieldPermission, fieldMCP} {
-		if _, exists := seededConfig[forbidden]; exists {
-			return "", fmt.Errorf("shared runtime seed must not contain session-scoped %q", forbidden)
-		}
-	}
-
-	managed := map[string]any{"$schema": "https://opencode.ai/config.json"}
-
-	config := deepMergeJSON(seededConfig, managed)
-
-	data, err := openCodeMarshalIndent(config, "", "  ")
-	if err != nil {
-		return "", err
-	}
-
-	data = append(data, '\n')
-
-	// The merged opencode.json is itself a manifest-managed file: route the final
-	// bytes through the guard so the manifest owns it and prior operator content
-	// is backed up rather than clobbered.
-	writes[openCodeConfigFileName] = data
 
 	if err := applyOpenCodeSeedGuard(configDir, writes); err != nil {
 		return "", err
 	}
 
-	return string(data), nil
+	return content, nil
 }
 
 // openCodeMCPConfigBlock renders session MCP servers as the native opencode.json
@@ -3043,18 +3094,18 @@ func applyOpenCodeSeedGuard(configDir string, writes map[string][]byte) error {
 				continue
 			}
 			// #nosec G703 -- target is confined to configDir by validateOpenCodeSeedPath; the suffix is a constant.
-			if err := os.WriteFile(target+openCodeSeedBackupSuffix, existing, 0o600); err != nil {
+			if err := openCodeSeedWriteFile(target+openCodeSeedBackupSuffix, existing, 0o600); err != nil {
 				return err
 			}
 		case errors.Is(readErr, os.ErrNotExist):
-			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			if err := openCodeSeedMkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return err
 			}
 		default:
 			return readErr
 		}
 
-		if err := os.WriteFile(target, contents, 0o600); err != nil {
+		if err := openCodeSeedWriteFile(target, contents, 0o600); err != nil {
 			return err
 		}
 
@@ -3108,7 +3159,7 @@ func writeOpenCodeSeedManifest(configDir string, manifest []string) error {
 
 	data = append(data, '\n')
 
-	return os.WriteFile(filepath.Join(configDir, openCodeSeedManifestName), data, 0o600)
+	return openCodeSeedWriteFile(filepath.Join(configDir, openCodeSeedManifestName), data, 0o600)
 }
 
 // validateOpenCodeSeedPath confines a seeded relative path to the config root,

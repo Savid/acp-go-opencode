@@ -26,7 +26,9 @@ func TestProcessIsolationActualIdentityGroupsAndAmbientScrub(t *testing.T) {
 		t.Skip("actual credential-drop proof requires a privileged Linux test process")
 	}
 
-	root := t.TempDir()
+	root, err := os.MkdirTemp("/tmp", "acp-go-opencode-isolation-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(root)) })
 	require.NoError(t, os.Chmod(root, 0o755))
 	binary := filepath.Join(root, "isolation-helper")
 	data, err := os.ReadFile(os.Args[0])
@@ -38,7 +40,10 @@ func TestProcessIsolationActualIdentityGroupsAndAmbientScrub(t *testing.T) {
 	cmd := exec.Command(binary, "-test.run=^TestProcessIsolationActualIdentityGroupsAndAmbientScrub$")
 	cmd.Dir = "/"
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "ACP_PROCESS_ISOLATION_HELPER=1"}
-	require.NoError(t, applyProcessCredential(cmd, &ProcessIsolation{UID: target, GID: target, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin"}}))
+	require.NoError(t, applyProcessCredential(cmd, &ProcessIsolation{
+		UID: target, GID: target, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin"},
+		StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test",
+	}))
 	output, err := cmd.Output()
 	require.NoError(t, err)
 	require.Equal(t, "65534:65534:0:", strings.TrimSpace(string(output)))

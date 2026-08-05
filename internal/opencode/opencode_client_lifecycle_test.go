@@ -475,7 +475,7 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	skipUnprivilegedDarwinIsolation(t)
 	helper := fakeOpenCodeExecutable(t)
-	root := t.TempDir()
+	root := testGeneratedTempDir(t)
 	logger := slog.New(slog.DiscardHandler)
 	client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
 		Root:            root,
@@ -578,6 +578,11 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	t.Run("defaults and start error", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		xdg := testXDGDirs(t)
+		binaryDir := t.TempDir()
+		binary := filepath.Join(binaryDir, opencodeExecutableName)
+		require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0o700))
+		isolation := testProcessIsolation()
+		isolation.BaseEnvironment["PATH"] = binaryDir + string(os.PathListSeparator) + isolation.BaseEnvironment["PATH"]
 		var executable string
 		openCodeCommandContext = func(ctx context.Context, name string, _ ...string) *exec.Cmd {
 			executable = name
@@ -587,7 +592,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		_, err := StartServer(ctx, StartOptions{
 			ExistingXDG:      xdg,
 			skipSupervisor:   true,
-			ProcessIsolation: testProcessIsolation(),
+			ProcessIsolation: isolation,
 		})
 		if err == nil {
 			t.Fatal("missing executable unexpectedly started")
@@ -1136,6 +1141,7 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	}
 	env, err := buildProcessEnvironment(&ProcessIsolation{
 		UID: 1, GID: 2, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin"},
+		StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test",
 	}, map[string]string{"A": "1"}, map[string]string{"A": "2", "B": "3"})
 	if err != nil || env["A"] != "2" || env["B"] != "3" {
 		t.Fatalf("merged env = %#v, err = %v", env, err)
@@ -1480,37 +1486,44 @@ func TestOpenCodeSeedGuardWriteFaults(t *testing.T) {
 	})
 
 	t.Run("mkdir failure surfaces", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
 		xdg := testXDGDirs(t)
 		configDir := filepath.Join(xdg.Config, "opencode")
 		if err := os.MkdirAll(configDir, 0o700); err != nil {
 			t.Fatalf("prepare config dir: %v", err)
 		}
-		// A read-only intermediate dir makes MkdirAll for a nested seed target fail.
-		roDir := filepath.Join(configDir, "ro")
-		if err := os.Mkdir(roDir, 0o500); err != nil {
-			t.Fatalf("prepare read-only dir: %v", err)
+		mkdirFailure := errors.New("mkdir failed")
+		openCodeSeedMkdirAll = func(path string, mode os.FileMode) error {
+			if path == filepath.Join(configDir, "ro", "sub") {
+				return mkdirFailure
+			}
+
+			return os.MkdirAll(path, mode)
 		}
-		t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
 		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", map[string]string{
 			"ro/sub/child.json": "x",
-		}, nil); err == nil {
-			t.Fatal("mkdir failure was ignored")
+		}, nil); !errors.Is(err, mkdirFailure) {
+			t.Fatalf("mkdir failure = %v, want injected error", err)
 		}
 	})
 
 	t.Run("target write failure surfaces", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
 		xdg := testXDGDirs(t)
 		configDir := filepath.Join(xdg.Config, "opencode")
 		if err := os.MkdirAll(configDir, 0o700); err != nil {
 			t.Fatalf("prepare config dir: %v", err)
 		}
-		// A read-only config root makes the opencode.json write fail.
-		if err := os.Chmod(configDir, 0o500); err != nil {
-			t.Fatalf("chmod config dir: %v", err)
+		writeFailure := errors.New("write failed")
+		openCodeSeedWriteFile = func(path string, payload []byte, mode os.FileMode) error {
+			if path == filepath.Join(configDir, openCodeConfigFileName) {
+				return writeFailure
+			}
+
+			return os.WriteFile(path, payload, mode)
 		}
-		t.Cleanup(func() { _ = os.Chmod(configDir, 0o700) })
-		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", nil, nil); err == nil {
-			t.Fatal("target write failure was ignored")
+		if _, err := materializeOpenCodePermissionConfig(xdg, "ask", nil, nil); !errors.Is(err, writeFailure) {
+			t.Fatalf("target write failure = %v, want injected error", err)
 		}
 	})
 
@@ -1602,7 +1615,7 @@ func fakeOpenCodeExecutable(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("test executable: %v", err)
 	}
-	script := filepath.Join(t.TempDir(), "fake-opencode")
+	script := filepath.Join(testTraversableTempDir(t), "fake-opencode")
 	body := fmt.Sprintf("#!/bin/sh\nACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n", testBinary)
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write fake executable: %v", err)
@@ -1666,9 +1679,15 @@ func runFakeOpenCodeServerProcess() {
 func restoreOpenCodeClientSeams(t *testing.T) {
 	t.Helper()
 	commandContext := openCodeCommandContext
+	startProcess := openCodeStartProcess
+	applyCredential := openCodeApplyCredential
+	supervisorCommandFn := openCodeSupervisorCommand
+	httpClient := openCodeHTTPClient
 	listen := openCodeListen
 	randReader := openCodeRandReader
 	marshalIndent := openCodeMarshalIndent
+	seedMkdirAll := openCodeSeedMkdirAll
+	seedWriteFile := openCodeSeedWriteFile
 	terminateProcess := openCodeTerminateProcess
 	killProcess := openCodeKillProcess
 	waitCommand := openCodeWaitCommand
@@ -1681,9 +1700,15 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	containmentTimeout := openCodeContainmentTimeout
 	t.Cleanup(func() {
 		openCodeCommandContext = commandContext
+		openCodeStartProcess = startProcess
+		openCodeApplyCredential = applyCredential
+		openCodeSupervisorCommand = supervisorCommandFn
+		openCodeHTTPClient = httpClient
 		openCodeListen = listen
 		openCodeRandReader = randReader
 		openCodeMarshalIndent = marshalIndent
+		openCodeSeedMkdirAll = seedMkdirAll
+		openCodeSeedWriteFile = seedWriteFile
 		openCodeTerminateProcess = terminateProcess
 		openCodeKillProcess = killProcess
 		openCodeWaitCommand = waitCommand
@@ -1699,7 +1724,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 
 func testXDGDirs(t *testing.T) XDGDirs {
 	t.Helper()
-	root := t.TempDir()
+	root := testGeneratedTempDir(t)
 
 	return XDGDirs{
 		Root:   root,

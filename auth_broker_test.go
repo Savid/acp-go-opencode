@@ -23,6 +23,7 @@ func restoreBrokerSeams(t *testing.T) {
 	t.Cleanup(func() {
 		brokerReapHomes = opencode.ReapAbandonedHomes
 		brokerMkdirTemp = os.MkdirTemp
+		brokerChmod = os.Chmod
 		brokerCreateXDG = opencode.CreateRuntimeXDGDirs
 		brokerRemoveAll = os.RemoveAll
 		brokerNewBrowserShim = opencode.NewBrowserShim
@@ -116,6 +117,9 @@ func TestStartBrokerFailures(t *testing.T) {
 		}},
 		{name: "home creation", setup: func(_ *testing.T, _ *Agent) {
 			brokerMkdirTemp = func(string, string) (string, error) { return "", failure }
+		}},
+		{name: "home protection", setup: func(_ *testing.T, _ *Agent) {
+			brokerChmod = func(string, os.FileMode) error { return failure }
 		}},
 		{name: "xdg creation", setup: func(_ *testing.T, _ *Agent) {
 			brokerCreateXDG = func(string) (opencode.XDGDirs, error) { return opencode.XDGDirs{}, failure }
@@ -228,31 +232,33 @@ func TestDestroyToleratesANilBroker(t *testing.T) {
 	broker.destroy(context.Background())
 }
 
-func TestStartBrokerShadowsEveryBrowserLauncherTheBrokerCouldExec(t *testing.T) {
+func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testing.T) {
 	harness := newAuthAgent(t)
 	agent, broker := harness.agent, harness.broker
 	restoreBrokerSeams(t)
 
 	node := newFakeOpenCodeClient()
 
-	var handed *opencode.BrowserShim
+	var handed opencode.StartOptions
 
 	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		handed = options.BrowserShim
+		handed = options
 
 		return node, nil
 	}
 
 	created, err := broker.startBroker(context.Background())
 	require.NoError(t, err)
-	require.NotNil(t, handed)
-	require.Same(t, created.shim, handed)
-	require.Equal(t, agent.options.ScratchDir, filepath.Dir(handed.Dir()))
-	require.True(t, strings.HasPrefix(filepath.Base(handed.Dir()), "acp-go-opencode-browser-shim-"))
-	require.FileExists(t, filepath.Join(handed.Dir(), "open"))
+	require.NotNil(t, handed.BrowserShim)
+	require.Same(t, created.shim, handed.BrowserShim)
+	require.Equal(t, filepath.Join(created.home, "control"), handed.ControlRoot)
+	require.Equal(t, created.home, handed.LeaseDir)
+	require.Equal(t, agent.options.ScratchDir, filepath.Dir(handed.BrowserShim.Dir()))
+	require.True(t, strings.HasPrefix(filepath.Base(handed.BrowserShim.Dir()), "acp-go-opencode-browser-shim-"))
+	require.FileExists(t, filepath.Join(handed.BrowserShim.Dir(), "open"))
 
 	created.destroy(context.Background())
-	require.NoDirExists(t, handed.Dir())
+	require.NoDirExists(t, handed.BrowserShim.Dir())
 }
 
 func TestDestroyReportsBrowserShimRemovalFailure(t *testing.T) {

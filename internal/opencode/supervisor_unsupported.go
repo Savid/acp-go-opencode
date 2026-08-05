@@ -11,7 +11,9 @@ import (
 )
 
 type guardianContainment struct{}
-type livenessContainment struct{}
+type livenessContainment struct {
+	beforeStart func() error
+}
 
 func unsupportedContainment() error {
 	return errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("OpenCode runtime containment is unsupported on %s", runtime.GOOS))

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"golang.org/x/sys/unix"
 )
@@ -17,13 +18,14 @@ import (
 const maxProcessIsolationConfigSize = 1 << 20
 
 var (
-	processIsolationGeteuid       = os.Geteuid
-	processIsolationLookupEnv     = os.LookupEnv
-	processIsolationLookupUserID  = user.LookupId
-	processIsolationLookupGroupID = user.LookupGroupId
-	processIsolationGroupIDs      = func(account *user.User) ([]string, error) { return account.GroupIds() }
-	processIsolationValidateHome  = validateTargetHome
-	processIsolationValidatePath  = validatePath
+	processIsolationGeteuid           = os.Geteuid
+	processIsolationLookupEnv         = os.LookupEnv
+	processIsolationLookupUserID      = user.LookupId
+	processIsolationLookupGroupID     = user.LookupGroupId
+	processIsolationGroupIDs          = func(account *user.User) ([]string, error) { return account.GroupIds() }
+	processIsolationValidateHome      = validateTargetHome
+	processIsolationValidatePath      = validatePath
+	processIsolationValidateStateRoot = validateStandaloneStateRootPath
 )
 
 func loadProcessIsolationConfig(path string) (processIsolationConfig, error) {
@@ -83,6 +85,12 @@ func validateProcessIsolationConfig(config processIsolationConfig) (processIsola
 	if config.BaseEnvironment == nil {
 		return processIsolationConfig{}, fmt.Errorf("baseEnvironment must be a JSON object")
 	}
+	if err := validateStandaloneOwnerID(config.StandaloneOwnerID); err != nil {
+		return processIsolationConfig{}, err
+	}
+	if err := validateStandaloneStateRoot(config.StandaloneStateRoot); err != nil {
+		return processIsolationConfig{}, err
+	}
 
 	account, err := processIsolationLookupUserID(strconv.FormatUint(uint64(config.UID), 10))
 	if err != nil {
@@ -109,6 +117,9 @@ func validateProcessIsolationConfig(config processIsolationConfig) (processIsola
 		}
 	}
 	if err := processIsolationValidateAccountAuthority(account, config.UID, config.GID); err != nil {
+		return processIsolationConfig{}, err
+	}
+	if err := processIsolationValidateStateRoot(config.StandaloneStateRoot, config.UID, config.GID); err != nil {
 		return processIsolationConfig{}, err
 	}
 
@@ -165,6 +176,61 @@ func validateProcessIsolationConfig(config processIsolationConfig) (processIsola
 	config.InheritEnvironment = nil
 
 	return config, nil
+}
+
+func validateStandaloneOwnerID(value string) error {
+	if len(value) == 0 || len(value) > 256 || !isStandaloneOwnerIDFirst(value[0]) {
+		return fmt.Errorf("standaloneOwnerId must be 1 to 256 canonical ASCII bytes")
+	}
+	for index := 1; index < len(value); index++ {
+		if !isStandaloneOwnerIDByte(value[index]) {
+			return fmt.Errorf("standaloneOwnerId must be 1 to 256 canonical ASCII bytes")
+		}
+	}
+
+	return nil
+}
+
+func isStandaloneOwnerIDFirst(value byte) bool {
+	return value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
+}
+
+func isStandaloneOwnerIDByte(value byte) bool {
+	return isStandaloneOwnerIDFirst(value) || strings.ContainsRune("._:@/-", rune(value))
+}
+
+func validateStandaloneStateRoot(value string) error {
+	if len(value) == 0 || len(value) > 4096 || value == "/" || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+		return fmt.Errorf("standaloneStateRoot must be a canonical absolute path of at most 4096 bytes")
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return fmt.Errorf("standaloneStateRoot must not contain control characters")
+		}
+	}
+	relative, err := filepath.Rel("/var/lib/acp-go/agent-identities", value)
+	if err != nil {
+		return fmt.Errorf("compare standaloneStateRoot with authority root: %w", err)
+	}
+	if relative == "." || relative != ".." && !strings.HasPrefix(relative, "../") {
+		return fmt.Errorf("standaloneStateRoot must be outside the authority root")
+	}
+
+	return nil
+}
+
+func validateStandaloneStateRootPath(path string, uid uint32, gid uint32) error {
+	fd, stat, err := openProtectedAbsolutePath(path, unix.O_PATH|unix.O_DIRECTORY)
+	if err != nil {
+		return fmt.Errorf("open standaloneStateRoot %q: %w", path, err)
+	}
+	defer unix.Close(fd)
+
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o777 != 0o700 || stat.Uid != uid || stat.Gid != gid {
+		return fmt.Errorf("standaloneStateRoot %q must be a uid %d, gid %d directory with mode 0700 beneath protected root-owned ancestry", path, uid, gid)
+	}
+
+	return nil
 }
 
 func validateTargetHome(path string, uid uint32, gid uint32) error {

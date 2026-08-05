@@ -17,6 +17,7 @@ func TestValidateProcessIsolationConfigBuildsClosedEnvironment(t *testing.T) {
 	oldLookupEnv := processIsolationLookupEnv
 	oldValidateHome := processIsolationValidateHome
 	oldValidatePath := processIsolationValidatePath
+	oldValidateStateRoot := processIsolationValidateStateRoot
 	oldValidateAccount := processIsolationValidateAccountAuthority
 	t.Cleanup(func() {
 		processIsolationLookupUserID = oldLookupUser
@@ -25,6 +26,7 @@ func TestValidateProcessIsolationConfigBuildsClosedEnvironment(t *testing.T) {
 		processIsolationLookupEnv = oldLookupEnv
 		processIsolationValidateHome = oldValidateHome
 		processIsolationValidatePath = oldValidatePath
+		processIsolationValidateStateRoot = oldValidateStateRoot
 		processIsolationValidateAccountAuthority = oldValidateAccount
 	})
 
@@ -43,11 +45,21 @@ func TestValidateProcessIsolationConfigBuildsClosedEnvironment(t *testing.T) {
 	}
 	processIsolationValidateHome = func(string, uint32, uint32) error { return nil }
 	processIsolationValidatePath = func(string) error { return nil }
+	stateRootValidated := false
+	processIsolationValidateStateRoot = func(path string, uid uint32, gid uint32) error {
+		if path != "/var/lib/acp" || uid != 20001 || gid != 20002 {
+			t.Fatalf("state-root validation = %q, %d:%d", path, uid, gid)
+		}
+		stateRootValidated = true
+		return nil
+	}
 	processIsolationValidateAccountAuthority = func(*user.User, uint32, uint32) error { return nil }
 
 	config, err := validateProcessIsolationConfig(processIsolationConfig{
-		UID: 20001,
-		GID: 20002,
+		UID:                 20001,
+		GID:                 20002,
+		StandaloneOwnerID:   "test-owner",
+		StandaloneStateRoot: "/var/lib/acp",
 		BaseEnvironment: map[string]string{
 			"PATH": "/usr/bin", "HOME": "/var/lib/acp", "USER": "acp", "LOGNAME": "acp",
 		},
@@ -59,10 +71,22 @@ func TestValidateProcessIsolationConfigBuildsClosedEnvironment(t *testing.T) {
 	if config.BaseEnvironment["OPENAI_API_KEY"] != "explicit-secret" || config.InheritEnvironment != nil {
 		t.Fatalf("validated config = %#v", config)
 	}
+	if !stateRootValidated {
+		t.Fatal("standalone state root was not validated against the claimed identity")
+	}
 
 	for name, mutate := range map[string]func(*processIsolationConfig){
-		"root identity": func(value *processIsolationConfig) { value.UID = 0 },
-		"reserved base": func(value *processIsolationConfig) { value.BaseEnvironment["ACP_GO_TOKEN"] = "leak" },
+		"root identity":       func(value *processIsolationConfig) { value.UID = 0 },
+		"missing owner id":    func(value *processIsolationConfig) { value.StandaloneOwnerID = "" },
+		"invalid owner id":    func(value *processIsolationConfig) { value.StandaloneOwnerID = "not canonical" },
+		"relative state root": func(value *processIsolationConfig) { value.StandaloneStateRoot = "relative" },
+		"filesystem root":     func(value *processIsolationConfig) { value.StandaloneStateRoot = "/" },
+		"authority state root": func(value *processIsolationConfig) {
+			value.StandaloneStateRoot = "/var/lib/acp-go/agent-identities/provider"
+		},
+		"control state root": func(value *processIsolationConfig) { value.StandaloneStateRoot = "/var/lib/acp\n" },
+		"long state root":    func(value *processIsolationConfig) { value.StandaloneStateRoot = "/" + strings.Repeat("a", 4096) },
+		"reserved base":      func(value *processIsolationConfig) { value.BaseEnvironment["ACP_GO_TOKEN"] = "leak" },
 		"identity inheritance": func(value *processIsolationConfig) {
 			value.InheritEnvironment = []string{"HOME"}
 		},
@@ -73,8 +97,10 @@ func TestValidateProcessIsolationConfigBuildsClosedEnvironment(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			candidate := processIsolationConfig{
-				UID: 20001,
-				GID: 20002,
+				UID:                 20001,
+				GID:                 20002,
+				StandaloneOwnerID:   "test-owner",
+				StandaloneStateRoot: "/var/lib/acp",
 				BaseEnvironment: map[string]string{
 					"PATH": "/usr/bin", "HOME": "/var/lib/acp", "USER": "acp", "LOGNAME": "acp",
 				},
@@ -91,8 +117,10 @@ func TestValidateProcessIsolationConfigBuildsClosedEnvironment(t *testing.T) {
 		return &user.Group{Gid: "20002", Name: "shared"}, nil
 	}
 	if _, err := validateProcessIsolationConfig(processIsolationConfig{
-		UID: 20001,
-		GID: 20002,
+		UID:                 20001,
+		GID:                 20002,
+		StandaloneOwnerID:   "test-owner",
+		StandaloneStateRoot: "/var/lib/acp",
 		BaseEnvironment: map[string]string{
 			"PATH": "/usr/bin", "HOME": "/var/lib/acp", "USER": "acp", "LOGNAME": "acp",
 		},
@@ -138,6 +166,43 @@ func TestValidateTargetHomeRejectsSymlinkAndForbiddenHomes(t *testing.T) {
 		if err := validateTargetHome(path, 20001, 20001); err == nil {
 			t.Fatalf("forbidden HOME %q was accepted", path)
 		}
+	}
+}
+
+func TestValidateStandaloneStateRootPathRejectsUnprotectedOrMismatchedDirectory(t *testing.T) {
+	if err := validateStandaloneStateRootPath("/proc/self", 20001, 20002); err == nil {
+		t.Fatal("magic-link state root was accepted")
+	}
+	if err := validateStandaloneStateRootPath("/root", 20001, 20002); err == nil ||
+		!strings.Contains(err.Error(), "uid 20001, gid 20002 directory with mode 0700") {
+		t.Fatalf("mismatched state root error = %v", err)
+	}
+}
+
+func TestValidateStandaloneStateRootPathAcceptsProtectedTargetOwnedDirectory(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to provision the target identity")
+	}
+	parent, err := os.MkdirTemp("/var/lib", "acp-go-opencode-state-root-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(parent) })
+	stateRoot := filepath.Join(parent, "state")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(stateRoot, 20001, 20002); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStandaloneStateRootPath(stateRoot, 20001, 20002); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStandaloneStateRootPath(stateRoot, 20001, 20002); err == nil {
+		t.Fatal("state root beneath a writable ancestor was accepted")
 	}
 }
 

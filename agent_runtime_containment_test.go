@@ -46,8 +46,14 @@ func TestAgentContainmentModeAndObservation(t *testing.T) {
 	}
 
 	runtimeGOOS = platformDarwin
-	if err := validateContainmentOptions(Options{Env: map[string]string{"acp_go_opencode_internal_spoof": "1"}}); err == nil || !strings.Contains(err.Error(), privateAdapterEnvPrefix) {
-		t.Fatalf("reserved environment validation error = %v", err)
+	for _, key := range []string{
+		"acp_go_opencode_internal_spoof", "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+		managedEnvXDGDataHome, "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "OPENCODE_CONFIG",
+		"OPENCODE_CONFIG_CONTENT", managedEnvOpenCodeConfigDir, "OPENCODE_DB",
+	} {
+		if err := validateContainmentOptions(Options{Env: map[string]string{key: "1"}}); err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("reserved environment validation error for %q = %v", key, err)
+		}
 	}
 
 	var observed []RuntimeContainmentMode
@@ -88,5 +94,41 @@ func TestAgentContainmentModeAndObservation(t *testing.T) {
 	offDarwin := NewAgent(WithDarwinBestEffortContainment())
 	if _, err := offDarwin.Initialize(t.Context(), acp.InitializeRequest{}); err == nil || !strings.Contains(err.Error(), "supported only on darwin") {
 		t.Fatalf("off-Darwin opt-in initialization error = %v", err)
+	}
+}
+
+func TestStandaloneIsolationDefaultsAndFencesDurableHome(t *testing.T) {
+	const stateRoot = "/var/lib/acp-go-opencode"
+	isolation := ProcessIsolation{StandaloneOwnerID: "deployment-1", StandaloneStateRoot: stateRoot}
+
+	defaulted := NewAgent(WithProcessIsolation(isolation))
+	if defaulted.options.Home != stateRoot {
+		t.Fatalf("default home = %q, want %q", defaulted.options.Home, stateRoot)
+	}
+
+	explicit := NewAgent(WithHome(stateRoot), WithProcessIsolation(isolation))
+	if explicit.optionsErr != nil {
+		t.Fatalf("matching standalone home error = %v", explicit.optionsErr)
+	}
+
+	mismatched := NewAgent(WithHome("/var/lib/other"), WithProcessIsolation(isolation))
+	if _, err := mismatched.Initialize(t.Context(), acp.InitializeRequest{}); err == nil ||
+		!strings.Contains(err.Error(), "WithHome must equal ProcessIsolation.StandaloneStateRoot") {
+		t.Fatalf("mismatched standalone home error = %v", err)
+	}
+}
+
+func TestProcessIsolatedDurableHomeRequiresCanonicalPath(t *testing.T) {
+	for _, path := range []string{"relative", "/", "/var/lib/opencode/", "/var/lib/../opencode", "/var/lib/open\ncode", "/" + strings.Repeat("a", 4097)} {
+		t.Run(path, func(t *testing.T) {
+			agent := NewAgent(
+				WithHome(path),
+				WithProcessIsolation(ProcessIsolation{}),
+			)
+			_, err := agent.Initialize(t.Context(), acp.InitializeRequest{})
+			if err == nil || !strings.Contains(err.Error(), "OpenCode runtime home") {
+				t.Fatalf("home validation error = %v", err)
+			}
+		})
 	}
 }

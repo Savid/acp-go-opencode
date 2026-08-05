@@ -209,13 +209,8 @@ func integrationOpenCodePath(t *testing.T) string {
 }
 
 // agentCommand builds the wrapper invocation every integration launch goes
-// through. Darwin process containment fails closed unless the caller accepts
-// it, so the flag is prepended there; the command rejects it on every other
-// GOOS.
+// through.
 func agentCommand(ctx context.Context, args ...string) *exec.Cmd {
-	if runtime.GOOS == "darwin" {
-		args = append([]string{"-darwin-best-effort-containment"}, args...)
-	}
 	if binary := os.Getenv(envAgentBinary); binary != "" {
 		return exec.CommandContext(ctx, binary, args...) // #nosec G204,G702 -- opt-in integration test command.
 	}

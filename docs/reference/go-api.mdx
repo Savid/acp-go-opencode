@@ -31,10 +31,10 @@ runtime and its resources quarantined.
 | `WithExecutablePath` | Path to the `opencode` binary. |
 | `WithProcessIsolation` | Mandatory nonzero target UID/GID and complete replacement environment for native OpenCode processes. On Linux the guardian/liveness supervisors stay trusted root; only `opencode serve` receives the configured identity, with supplementary groups cleared. |
 | `WithScratchDir` | Parent for a materialized shared runtime root and transient adapter scratch; empty uses the system temp directory. |
-| `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
+| `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. Standalone isolation defaults it to `StandaloneStateRoot` and rejects any different explicit path. |
 | `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant and numeric-PGID-reuse risks. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
-| `WithEnv` | Agent-wide overrides on `ProcessIsolation.BaseEnvironment`; a session may overlay them per key. The adapter never inherits its own environment. |
+| `WithEnv` | Agent-wide ordinary-variable overrides on `ProcessIsolation.BaseEnvironment`; a session may overlay them per key. The adapter never inherits its own environment. `HOME`, XDG roots, and OpenCode config/database roots are reserved and rejected. |
 | `WithSeedFiles` | Immutable files written into the shared config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
@@ -48,6 +48,34 @@ runtime and its resources quarantined.
 | `WithAgentName` / `WithAgentTitle` / `WithAgentVersion` | Identity in the initialize response. |
 | `WithLogger` | `*slog.Logger` for adapter diagnostics. |
 | `WithTracerProvider` / `WithMeterProvider` / `WithTextMapPropagator` | OpenTelemetry wiring. |
+
+`ProcessIsolation.IdentityLock` and `ProcessIsolation.AuthorityDomain`
+optionally accept opaque host capabilities with `Duplicate() (*os.File, error)`
+for the already-held canonical UID lock and shared `domain.lock` lease. Each
+capability keeps ownership of its original descriptor; caller-owned duplicates
+reach only the trusted supervisor, which validates the named inodes, held locks,
+and strict matching domain record and protects them with checked `FD_CLOEXEC`.
+Set both fields together for
+host-borrowed authority or leave both nil for standalone domain, permanent
+provider-owner binding, retained `ACTIVE`, and UID-lock acquisition. A
+mixed nil/non-nil pair fails closed. Borrowed authority rejects owned UIDs. Native
+processes receive neither capability nor descriptor.
+
+`ProcessIsolation.StandaloneOwnerID` and
+`ProcessIsolation.StandaloneStateRoot` are required when both capabilities
+are nil and forbidden when both are set. The owner ID is the nonsecret
+case-sensitive deployment identity: 1--256 canonical ASCII bytes beginning
+alphanumeric, followed only by alphanumerics or `._:@/-`. The state root is
+the existing dedicated durable provider home, neither `/` nor equal to or
+beneath `/var/lib/acp-go/agent-identities`, expressed as a clean absolute UTF-8 path of
+at most 4096 bytes with no control character. Linux resolves it from `/`
+without symlinks or magic links, requires protected root-owned ancestry and an
+exact configured UID:GID mode-`0700` final directory, and binds the exact
+path, device, and inode. The protected path and metadata are revalidated
+immediately before `ACTIVE` publication and native launch. Standalone claims
+are permanent; changing either value does not migrate authority and fails
+closed. Standalone `WithHome` defaults to this exact state root and any
+different explicit home fails construction validation.
 
 `ImageLimits` has four decoded-byte fields: `MaxInputBytesPerImage` and
 `MaxInputBytesPerPrompt` bound prompt images before a turn starts;
@@ -109,6 +137,9 @@ OpenCode config root (`<XDG_CONFIG_HOME>/opencode/`) before the server starts.
 A seeded `opencode.json` must not contain `permission` or `mcp`; those values
 belong to native sessions and directory scopes. Every other seeded file is
 written verbatim. Absolute paths, `..` escapes, and empty keys are rejected.
+With a process-isolated durable home, only `opencode.json` is accepted and its
+merged content is delivered directly to the native process; the adapter never
+writes beneath the target-owned XDG root.
 See
 [Models and config](/docs/features/models-config) for a seeded `provider`
 example.
@@ -145,7 +176,9 @@ Session-scoped request options include `WithSessionMCPServers`,
 render into `_meta.opencode.options` via its `Meta` method.
 
 `WithOpenCodeEnv` overlays `WithEnv` for the native process the session runs
-under, and `WithOpenCodeExtraPathDirs` places absolute directories ahead of
+under. `HOME`, XDG roots, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`,
+`OPENCODE_CONFIG_CONTENT`, and `OPENCODE_DB` are reserved there too.
+`WithOpenCodeExtraPathDirs` places absolute directories ahead of
 the isolation policy's `PATH`. See
 [Sessions](/docs/core/sessions) for how an environment binds a runtime
 generation.

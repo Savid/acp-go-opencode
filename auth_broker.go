@@ -15,6 +15,7 @@ import (
 var (
 	brokerReapHomes      = opencode.ReapAbandonedHomes
 	brokerMkdirTemp      = os.MkdirTemp
+	brokerChmod          = os.Chmod
 	brokerCreateXDG      = opencode.CreateRuntimeXDGDirs
 	brokerRemoveAll      = os.RemoveAll
 	brokerNewBrowserShim = opencode.NewBrowserShim
@@ -56,8 +57,9 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create provider auth broker home: %w", err)
 	}
-	if err := os.Chmod(home, 0o711); err != nil {
-		return nil, errors.Join(fmt.Errorf("protect provider auth broker home: %w", err), brokerRemoveAll(home))
+
+	if chmodErr := brokerChmod(home, 0o711); chmodErr != nil {
+		return nil, errors.Join(fmt.Errorf("protect provider auth broker home: %w", chmodErr), brokerRemoveAll(home))
 	}
 
 	// A login leg the operator's browser can reach is an uncontrolled grant, not
@@ -70,6 +72,7 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 	}
 
 	nativeHome := filepath.Join(home, "native")
+
 	xdg, err := brokerCreateXDG(nativeHome)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("create provider auth broker root: %w", err), shim.Remove(), brokerRemoveAll(home))
@@ -80,9 +83,13 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 		factory = runtimeStartServer
 	}
 
+	// StartServer protects ControlRoot as 0700. Keep it below the 0711 broker
+	// home so isolation can still traverse to the handed-off XDG tree.
+	controlRoot := filepath.Join(home, "control")
+
 	client, err := factory(ctx, opencode.StartOptions{
 		Root:                     nativeHome,
-		ControlRoot:              home,
+		ControlRoot:              controlRoot,
 		ScratchParent:            parent,
 		ContainmentScratchParent: parent,
 		DarwinBestEffort:         agent.containmentMode == RuntimeContainmentBestEffort,

@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -67,10 +68,21 @@ type Option func(*Options)
 
 // ProcessIsolation defines the complete operating-system identity and base
 // environment inherited by every native OpenCode process.
+type ProcessIdentityLockCapability interface {
+	Duplicate() (*os.File, error)
+}
+
 type ProcessIsolation struct {
-	UID             uint32
-	GID             uint32
-	BaseEnvironment map[string]string
+	UID                 uint32
+	GID                 uint32
+	BaseEnvironment     map[string]string
+	StandaloneOwnerID   string
+	StandaloneStateRoot string
+	// IdentityLock is an optional trusted-supervisor descriptor for the
+	// host-global UID lock. Linux supervisors validate it and never expose it to
+	// the native OpenCode process. Standalone embeddings should leave it nil.
+	IdentityLock    ProcessIdentityLockCapability
+	AuthorityDomain ProcessIdentityLockCapability
 }
 
 // ConcurrencyLimits bounds work accepted by one Agent.
@@ -249,6 +261,9 @@ func WithDefaultModel(model string) Option {
 	}
 }
 
+// WithEnv adds ordinary variables to the shared native runtime environment.
+// Managed home, XDG, database, and config roots are rejected during agent
+// initialization.
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)
@@ -296,10 +311,12 @@ func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
 // WithSeedFiles writes immutable bootstrap files into the shared OpenCode
 // runtime config root before launching opencode serve. Keys are paths relative to
 // <XDG_CONFIG_HOME>/opencode/ directory mapped to file contents; absolute
-// paths, parent-directory escapes, and empty keys are rejected. A seeded
-// opencode.json must not contain permission or MCP policy because those values
-// are bound to native sessions and directory scopes respectively. The map is
-// cloned like WithEnv.
+// paths, parent-directory escapes, and empty keys are rejected. A native-owned
+// durable runtime home accepts only opencode.json, which is delivered through
+// the managed process environment without a privileged write beneath the home.
+// A seeded opencode.json must not contain permission or MCP policy because those
+// values are bound to native sessions and directory scopes respectively. The
+// map is cloned like WithEnv.
 func WithSeedFiles(files map[string]string) Option {
 	return func(options *Options) {
 		options.SeedFiles = cloneStringMap(files)

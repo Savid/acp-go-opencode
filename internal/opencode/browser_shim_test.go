@@ -34,7 +34,7 @@ func restoreBrowserShimSeams(t *testing.T) {
 func browserProbeDir(t *testing.T, marker string) string {
 	t.Helper()
 
-	probe := t.TempDir()
+	probe := testTraversableTempDir(t)
 	body := fmt.Sprintf("#!/bin/sh\necho \"$0 $*\" >> %q\nexit 0\n", marker)
 
 	for _, name := range browserLauncherNames {
@@ -67,7 +67,7 @@ func browserLaunchingOpenCodeExecutable(t *testing.T) string {
 		testBinary,
 	)
 
-	script := filepath.Join(t.TempDir(), "fake-opencode")
+	script := filepath.Join(testTraversableTempDir(t), "fake-opencode")
 	require.NoError(t, os.WriteFile(script, []byte(body.String()), 0o700))
 
 	return script
@@ -87,11 +87,11 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 	require.FileExists(t, marker, "the probe launchers never recorded a call, so a missing marker proves nothing")
 	require.NoError(t, os.Remove(marker))
 
-	shim, err := NewBrowserShim(t.TempDir())
+	shim, err := NewBrowserShim(testTraversableTempDir(t))
 	require.NoError(t, err)
 
 	client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
-		Root:            t.TempDir(),
+		Root:            testGeneratedTempDir(t),
 		ExecutablePath:  browserLaunchingOpenCodeExecutable(t),
 		BrowserShim:     shim,
 		HealthTimeout:   30 * time.Second,
@@ -144,6 +144,19 @@ func TestBrowserShimEnvironShadowsPathAndBrowser(t *testing.T) {
 			require.Equal(t, testCase.want, browserShimEnviron(testCase.env, dir))
 		})
 	}
+}
+
+func TestBrowserShimMethodsHandleNilAndConcreteReceivers(t *testing.T) {
+	var nilShim *BrowserShim
+	require.NoError(t, nilShim.Handoff(nil))
+	require.NoError(t, nilShim.Remove())
+
+	dir := t.TempDir()
+	shim := &BrowserShim{dir: dir}
+	require.Equal(t, browserShimEnviron([]string{"PATH=/usr/bin"}, dir), shim.environ([]string{"PATH=/usr/bin"}))
+	require.NoError(t, shim.Handoff(nil))
+	require.NoError(t, shim.Remove())
+	require.NoDirExists(t, dir)
 }
 
 func TestNewBrowserShimWritesAnExecutableNoOpPerLauncher(t *testing.T) {

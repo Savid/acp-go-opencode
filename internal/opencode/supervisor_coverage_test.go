@@ -5,6 +5,7 @@ package opencode
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -29,6 +30,20 @@ type supervisorCloseBuffer struct {
 	closed bool
 }
 
+type errorSupervisorIdentityLock struct{ err error }
+
+func (lock errorSupervisorIdentityLock) Close() error       { return lock.err }
+func (errorSupervisorIdentityLock) InheritedFile() *os.File { return nil }
+
+type duplicateSupervisorCapability struct {
+	file *os.File
+	err  error
+}
+
+func (capability duplicateSupervisorCapability) Duplicate() (*os.File, error) {
+	return capability.file, capability.err
+}
+
 func (buffer *supervisorCloseBuffer) Close() error {
 	buffer.closed = true
 
@@ -43,7 +58,10 @@ func preserveSupervisorGlobals(t *testing.T) {
 	oldRandRead := supervisorRandRead
 	oldChmod := supervisorChmod
 	oldOpenFile := supervisorOpenFile
+	oldPipe := supervisorPipe
 	oldCreateTemp := supervisorCreateTemp
+	oldRemove := supervisorRemove
+	oldOpen := supervisorOpen
 	oldEncode := supervisorEncodeConfig
 	oldGuardianContainment := supervisorNewGuardianContainment
 	oldGuardianName := supervisorGuardianName
@@ -53,18 +71,32 @@ func preserveSupervisorGlobals(t *testing.T) {
 	oldQuarantineRetry := supervisorQuarantineRetry
 	oldGuardianQuarantineRetry := supervisorGuardianQuarantineRetry
 	oldReleaseWaiter := supervisorReleaseIndependentWaiter
+	oldStartIndependent := supervisorStartIndependent
 	oldInput := supervisorInput
 	oldOutput := supervisorOutput
 	oldError := supervisorError
 	oldExit := supervisorExit
 	oldProcessSnapshot := supervisorProcessSnapshot
+	oldInheritedFile := supervisorInheritedFile
+	oldWriteConfig := supervisorWriteConfig
+	oldMarkerRoot := supervisorMarkerRoot
+	oldAcquireIdentityAuthority := supervisorAcquireIdentityAuthority
+	oldVerifyTrustedIdentity := supervisorVerifyTrustedIdentity
+	oldAdoptIdentityLock := supervisorAdoptIdentityLock
+	oldAdoptAuthorityDomain := supervisorAdoptAuthorityDomain
+	oldValidateAdoptedAuthority := supervisorValidateAdoptedAuthority
+	oldGuardianPeer := supervisorGuardianPeer
+	oldValidateGuardianPeer := supervisorValidateGuardianPeer
 	t.Cleanup(func() {
 		supervisorExecutable = oldExecutable
 		supervisorExecCommand = oldCommand
 		supervisorRandRead = oldRandRead
 		supervisorChmod = oldChmod
 		supervisorOpenFile = oldOpenFile
+		supervisorPipe = oldPipe
 		supervisorCreateTemp = oldCreateTemp
+		supervisorRemove = oldRemove
+		supervisorOpen = oldOpen
 		supervisorEncodeConfig = oldEncode
 		supervisorNewGuardianContainment = oldGuardianContainment
 		supervisorGuardianName = oldGuardianName
@@ -74,11 +106,22 @@ func preserveSupervisorGlobals(t *testing.T) {
 		supervisorQuarantineRetry = oldQuarantineRetry
 		supervisorGuardianQuarantineRetry = oldGuardianQuarantineRetry
 		supervisorReleaseIndependentWaiter = oldReleaseWaiter
+		supervisorStartIndependent = oldStartIndependent
 		supervisorInput = oldInput
 		supervisorOutput = oldOutput
 		supervisorError = oldError
 		supervisorExit = oldExit
 		supervisorProcessSnapshot = oldProcessSnapshot
+		supervisorInheritedFile = oldInheritedFile
+		supervisorWriteConfig = oldWriteConfig
+		supervisorMarkerRoot = oldMarkerRoot
+		supervisorAcquireIdentityAuthority = oldAcquireIdentityAuthority
+		supervisorVerifyTrustedIdentity = oldVerifyTrustedIdentity
+		supervisorAdoptIdentityLock = oldAdoptIdentityLock
+		supervisorAdoptAuthorityDomain = oldAdoptAuthorityDomain
+		supervisorValidateAdoptedAuthority = oldValidateAdoptedAuthority
+		supervisorGuardianPeer = oldGuardianPeer
+		supervisorValidateGuardianPeer = oldValidateGuardianPeer
 	})
 }
 
@@ -401,6 +444,536 @@ func TestSupervisorBootstrapAndUnixContainmentBranches(t *testing.T) {
 	_, err = processGroupAlive(123)
 	require.ErrorContains(t, err, "probe native process group")
 	require.Error(t, signalProcessGroup(123, syscall.SIGTERM))
+}
+
+func TestSupervisorBootstrapDispatchesMissingAndSuccessfulLiveness(t *testing.T) {
+	t.Run("missing config", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		t.Setenv(supervisorModeEnv, supervisorModeGuardian)
+		supervisorInheritedFile = func(uintptr, string) *os.File { return nil }
+		var exits []int
+		supervisorExit = func(code int) { exits = append(exits, code) }
+		supervisorError = io.Discard
+		supervisorBootstrap()
+		require.Equal(t, []int{1}, exits)
+	})
+
+	t.Run("missing guardian peer", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		t.Setenv(supervisorModeEnv, supervisorModeLiveness)
+		configFile, err := writeSupervisorConfig(t.TempDir(), supervisorConfig{})
+		require.NoError(t, err)
+		supervisorInheritedFile = func(fd uintptr, _ string) *os.File {
+			if fd == 3 {
+				return configFile
+			}
+
+			return nil
+		}
+		var exits []int
+		supervisorExit = func(code int) { exits = append(exits, code) }
+		supervisorError = io.Discard
+		supervisorBootstrap()
+		require.Equal(t, []int{1}, exits)
+	})
+
+	t.Run("liveness", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		t.Setenv(supervisorModeEnv, supervisorModeLiveness)
+		root := t.TempDir()
+		isolation := testProcessIsolation()
+		config := supervisorConfig{
+			NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.01"}, NativeEnv: os.Environ(),
+			Home: filepath.Join(root, "home"), Scratch: root, Started: filepath.Join(root, "started"),
+			Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
+			IsolationUID: isolation.UID, IsolationGID: isolation.GID,
+		}
+		configFile, err := writeSupervisorConfig(root, config)
+		require.NoError(t, err)
+		peer, err := os.CreateTemp(t.TempDir(), "peer")
+		require.NoError(t, err)
+		supervisorInheritedFile = func(fd uintptr, _ string) *os.File {
+			if fd == 3 {
+				return configFile
+			}
+
+			return peer
+		}
+		supervisorInput = strings.NewReader("")
+		supervisorOutput = io.Discard
+		supervisorError = io.Discard
+		var exits []int
+		supervisorExit = func(code int) { exits = append(exits, code) }
+		supervisorBootstrap()
+		require.Equal(t, []int{0}, exits)
+	})
+}
+
+func TestSupervisorDispatchIdentityAdoptionBranches(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	validateAdoptedAuthority := supervisorValidateAdoptedAuthority
+	valid := supervisorConfig{NativePath: "/bin/sh", NativeEnv: os.Environ(), Home: t.TempDir(), Scratch: t.TempDir(), IsolationUID: 1, IsolationGID: 2}
+	encoded := func(config supervisorConfig) io.Reader {
+		data, err := json.Marshal(config)
+		require.NoError(t, err)
+
+		return bytes.NewReader(data)
+	}
+	require.Error(t, runSupervisor(supervisorModeLiveness, strings.NewReader("{")))
+	guardian := valid
+	guardianRoot := t.TempDir()
+	guardianFile := filepath.Join(guardianRoot, "file")
+	require.NoError(t, os.WriteFile(guardianFile, []byte("x"), 0o600))
+	guardian.Home = filepath.Join(guardianFile, "home")
+	require.Error(t, runSupervisor(supervisorModeGuardian, encoded(guardian)))
+	bad := valid
+	bad.IdentityLock = true
+	require.ErrorContains(t, runSupervisor(supervisorModeLiveness, encoded(bad)), "inconsistent")
+	bad.AuthorityDomain = true
+	supervisorAdoptIdentityLock = func(uint32) (supervisorIdentityLock, error) { return nil, errors.New("identity") }
+	require.ErrorContains(t, runSupervisor(supervisorModeLiveness, encoded(bad)), "identity")
+	supervisorAdoptIdentityLock = func(uint32) (supervisorIdentityLock, error) { return errorSupervisorIdentityLock{}, nil }
+	supervisorAdoptAuthorityDomain = func(uint32) (supervisorIdentityLock, error) { return nil, errors.New("domain") }
+	require.ErrorContains(t, runSupervisor(supervisorModeLiveness, encoded(bad)), "domain")
+	supervisorAdoptAuthorityDomain = func(uint32) (supervisorIdentityLock, error) { return errorSupervisorIdentityLock{}, nil }
+	supervisorValidateAdoptedAuthority = func(supervisorConfig) error { return errors.New("disposition") }
+	require.ErrorContains(t, runSupervisor(supervisorModeLiveness, encoded(bad)), "disposition")
+	supervisorValidateAdoptedAuthority = validateAdoptedAuthority
+	supervisorAdoptIdentityLock = func(uint32) (supervisorIdentityLock, error) {
+		return errorSupervisorIdentityLock{err: errors.New("close identity")}, nil
+	}
+	supervisorAdoptAuthorityDomain = func(uint32) (supervisorIdentityLock, error) {
+		return errorSupervisorIdentityLock{err: errors.New("close domain")}, nil
+	}
+	err := runSupervisor(supervisorModeLiveness, encoded(bad))
+	require.ErrorContains(t, err, "close identity")
+	require.ErrorContains(t, err, "close domain")
+}
+
+func TestSupervisorQuarantineCompletionAndStreamBranches(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	root := t.TempDir()
+	completion := filepath.Join(root, "complete")
+	require.NoError(t, completeOrQuarantineLiveness(supervisorConfig{Completion: completion}, nil, nil))
+	require.FileExists(t, completion)
+	proof := errors.New("proof")
+	require.ErrorIs(t, completeOrQuarantineLiveness(supervisorConfig{}, nil, proof), proof)
+	require.NoError(t, writeGuardianQuarantineMarker(supervisorConfig{}))
+	guardianCompletion := filepath.Join(root, "guardian-complete")
+	require.NoError(t, completeOrQuarantineGuardian(supervisorConfig{Completion: guardianCompletion}, nil, nil))
+	require.FileExists(t, guardianCompletion)
+	require.ErrorIs(t, completeOrQuarantineGuardian(supervisorConfig{}, nil, proof), proof)
+
+	quarantine := filepath.Join(root, "quarantine")
+	supervisorQuarantineRetry = func(*livenessContainment) error { return errors.New("retry") }
+	supervisorInput, supervisorOutput, supervisorError = strings.NewReader(""), io.Discard, io.Discard
+	err := completeOrQuarantineLiveness(supervisorConfig{Quarantine: quarantine}, nil, proof)
+	require.ErrorContains(t, err, "retry")
+	require.FileExists(t, quarantine)
+
+	guardianQuarantine := filepath.Join(root, "guardian-quarantine")
+	supervisorGuardianQuarantineRetry = func(*guardianContainment) error { return errors.New("guardian retry") }
+	err = completeOrQuarantineGuardian(supervisorConfig{Quarantine: guardianQuarantine}, nil, proof)
+	require.ErrorContains(t, err, "guardian retry")
+
+	notDirectory := filepath.Join(root, "file")
+	require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
+	err = completeOrQuarantineLiveness(supervisorConfig{Quarantine: filepath.Join(notDirectory, "child")}, nil, proof)
+	require.Error(t, err)
+	err = completeOrQuarantineGuardian(supervisorConfig{Quarantine: filepath.Join(notDirectory, "child")}, nil, proof)
+	require.Error(t, err)
+
+	done := make(chan error, 1)
+	done <- nil
+	waitErr, quarantined, terminalErr := awaitLivenessTerminal(done, "")
+	require.NoError(t, waitErr)
+	require.False(t, quarantined)
+	require.NoError(t, terminalErr)
+	present := filepath.Join(root, "present")
+	require.NoError(t, os.WriteFile(present, []byte("x"), 0o600))
+	waitErr, quarantined, terminalErr = awaitLivenessTerminal(make(chan error), present)
+	require.NoError(t, waitErr)
+	require.True(t, quarantined)
+	require.NoError(t, terminalErr)
+	waitErr, quarantined, terminalErr = awaitLivenessTerminal(make(chan error), filepath.Join(notDirectory, "child"))
+	require.NoError(t, waitErr)
+	require.False(t, quarantined)
+	require.Error(t, terminalErr)
+
+	input, err := os.CreateTemp(t.TempDir(), "input")
+	require.NoError(t, err)
+	output, err := os.CreateTemp(t.TempDir(), "output")
+	require.NoError(t, err)
+	errorFile, err := os.CreateTemp(t.TempDir(), "error")
+	require.NoError(t, err)
+	supervisorInput, supervisorOutput, supervisorError = input, output, errorFile
+	closeSupervisorQuarantineStreams()
+	require.Error(t, input.Close())
+	require.Error(t, output.Close())
+	require.Error(t, errorFile.Close())
+}
+
+func TestSupervisorDefaultHooksAndConfigWriteFailures(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	lock, domain, err := supervisorAcquireIdentityAuthority(1, 2, "owner", "/state", strings.NewReader(""))
+	require.NoError(t, err)
+	require.NoError(t, lock.Close())
+	require.NoError(t, domain.Close())
+	require.NoError(t, supervisorVerifyTrustedIdentity(1))
+	lock, err = supervisorAdoptIdentityLock(1)
+	require.NoError(t, err)
+	require.NoError(t, lock.Close())
+	domain, err = supervisorAdoptAuthorityDomain(1)
+	require.NoError(t, err)
+	require.NoError(t, domain.Close())
+
+	want := errors.New("filesystem")
+	supervisorChmod = func(string, os.FileMode) error { return want }
+	_, err = writeSupervisorConfig(t.TempDir(), supervisorConfig{})
+	require.ErrorIs(t, err, want)
+	supervisorChmod = os.Chmod
+
+	supervisorCreateTemp = func(string, string) (*os.File, error) { return nil, want }
+	_, err = writeSupervisorConfig(t.TempDir(), supervisorConfig{})
+	require.ErrorIs(t, err, want)
+	supervisorCreateTemp = os.CreateTemp
+
+	closed, err := os.CreateTemp(t.TempDir(), "closed")
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	supervisorCreateTemp = func(string, string) (*os.File, error) { return closed, nil }
+	_, err = writeSupervisorConfig(t.TempDir(), supervisorConfig{})
+	require.ErrorContains(t, err, "secure private")
+	supervisorCreateTemp = os.CreateTemp
+
+	supervisorEncodeConfig = func(writer io.Writer, _ supervisorConfig) error {
+		file, ok := writer.(*os.File)
+		require.True(t, ok)
+		require.NoError(t, file.Close())
+
+		return nil
+	}
+	_, err = writeSupervisorConfig(t.TempDir(), supervisorConfig{})
+	require.ErrorContains(t, err, "rewind")
+	supervisorEncodeConfig = func(writer io.Writer, config supervisorConfig) error {
+		return json.NewEncoder(writer).Encode(config)
+	}
+
+	supervisorRemove = func(string) error { return want }
+	_, err = writeSupervisorConfig(t.TempDir(), supervisorConfig{})
+	require.ErrorContains(t, err, "unlink")
+}
+
+func TestSupervisorCommandValidationAndCapabilityFailures(t *testing.T) {
+	valid := func(t *testing.T) supervisorConfig {
+		t.Helper()
+
+		return supervisorConfig{Scratch: t.TempDir(), Isolation: testProcessIsolation()}
+	}
+
+	t.Run("context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, _, err := supervisorCommand(ctx, valid(t))
+		require.ErrorIs(t, err, context.Canceled)
+	})
+	t.Run("isolation", func(t *testing.T) {
+		_, _, err := supervisorCommand(context.Background(), supervisorConfig{})
+		require.Error(t, err)
+	})
+	t.Run("mixed capabilities", func(t *testing.T) {
+		config := valid(t)
+		config.Isolation.IdentityLock = duplicateSupervisorCapability{}
+		_, _, err := supervisorCommand(context.Background(), config)
+		require.ErrorContains(t, err, "together")
+	})
+	t.Run("trusted identity", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("identity")
+		supervisorVerifyTrustedIdentity = func(uint32) error { return want }
+		_, _, err := supervisorCommand(context.Background(), valid(t))
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("marker root", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("marker")
+		supervisorMarkerRoot = func(supervisorConfig) (string, error) { return "", want }
+		_, _, err := supervisorCommand(context.Background(), valid(t))
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("config write", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("config")
+		supervisorWriteConfig = func(string, supervisorConfig) (*os.File, error) { return nil, want }
+		_, _, err := supervisorCommand(context.Background(), valid(t))
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("executable", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("executable")
+		supervisorExecutable = func() (string, error) { return "", want }
+		_, _, err := supervisorCommand(context.Background(), valid(t))
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("executable policy", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		supervisorExecutable = func() (string, error) { return "relative", nil }
+		_, _, err := supervisorCommand(context.Background(), valid(t))
+		require.ErrorContains(t, err, "through process policy")
+	})
+	t.Run("identity duplicate", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		config := valid(t)
+		want := errors.New("duplicate")
+		config.Isolation.IdentityLock = duplicateSupervisorCapability{err: want}
+		config.Isolation.AuthorityDomain = duplicateSupervisorCapability{}
+		_, _, err := supervisorCommand(context.Background(), config)
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("domain duplicate", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		config := valid(t)
+		file, err := os.CreateTemp(t.TempDir(), "identity")
+		require.NoError(t, err)
+		want := errors.New("duplicate")
+		config.Isolation.IdentityLock = duplicateSupervisorCapability{file: file}
+		config.Isolation.AuthorityDomain = duplicateSupervisorCapability{err: want}
+		_, _, err = supervisorCommand(context.Background(), config)
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("borrowed capabilities", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		config := valid(t)
+		identity, err := os.CreateTemp(t.TempDir(), "identity")
+		require.NoError(t, err)
+		domain, err := os.CreateTemp(t.TempDir(), "domain")
+		require.NoError(t, err)
+		config.Isolation.IdentityLock = duplicateSupervisorCapability{file: identity}
+		config.Isolation.AuthorityDomain = duplicateSupervisorCapability{file: domain}
+		_, proof, err := supervisorCommand(context.Background(), config)
+		require.NoError(t, err)
+		require.Len(t, proof.inherited, 3)
+		require.NoError(t, proof.closeInherited())
+	})
+}
+
+func TestSupervisorProofAndIdentityAuthorityRemainingBranches(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	root := t.TempDir()
+	notDirectory := filepath.Join(root, "file")
+	require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
+	proof := &supervisorProof{completion: filepath.Join(root, "missing"), quarantine: filepath.Join(notDirectory, "child"), started: filepath.Join(root, "started")}
+	require.ErrorContains(t, proof.awaitCompletion(context.Background()), "quarantine proof")
+	quarantined := filepath.Join(root, "quarantined")
+	require.NoError(t, os.WriteFile(quarantined, []byte("x"), 0o600))
+	require.ErrorContains(t, (&supervisorProof{completion: filepath.Join(root, "missing-completion"), quarantine: quarantined}).awaitCompletion(context.Background()), "quarantining")
+	require.False(t, func() bool {
+		present, _ := (*supervisorProof)(nil).quarantineDetected()
+
+		return present
+	}())
+	(*supervisorProof)(nil).removeTerminalMarkers()
+
+	require.NoError(t, writeSupervisorMarker(proof.started))
+	proof.quarantine = filepath.Join(root, "quarantine")
+	go func() {
+		time.Sleep(15 * time.Millisecond)
+		_ = os.WriteFile(proof.quarantine, []byte("x"), 0o600)
+	}()
+	require.ErrorContains(t, proof.awaitCompletion(context.Background()), "quarantining")
+
+	lock, domain, err := acquireGuardianIdentityAuthority(supervisorConfig{}, strings.NewReader(""))
+	require.NoError(t, err)
+	require.NoError(t, lock.Close())
+	require.NoError(t, domain.Close())
+	want := errors.New("verify")
+	supervisorVerifyTrustedIdentity = func(uint32) error { return want }
+	_, _, err = acquireGuardianIdentityAuthority(supervisorConfig{IsolationUID: 1}, strings.NewReader(""))
+	require.ErrorIs(t, err, want)
+	supervisorVerifyTrustedIdentity = func(uint32) error { return nil }
+	supervisorAcquireIdentityAuthority = func(uint32, uint32, string, string, io.Reader) (supervisorIdentityLock, supervisorIdentityLock, error) {
+		return nil, nil, want
+	}
+	_, _, err = acquireGuardianIdentityAuthority(supervisorConfig{IsolationUID: 1}, strings.NewReader(""))
+	require.ErrorIs(t, err, want)
+}
+
+func TestGuardianAndLivenessEarlyFailureBranches(t *testing.T) {
+	t.Run("guardian adopted identity", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("identity")
+		supervisorAdoptIdentityLock = func(uint32) (supervisorIdentityLock, error) { return nil, want }
+		err := runGuardian(supervisorConfig{IdentityLock: true, IsolationUID: 1})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("guardian adopted domain", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("domain")
+		supervisorAdoptIdentityLock = func(uint32) (supervisorIdentityLock, error) { return errorSupervisorIdentityLock{}, nil }
+		supervisorAdoptAuthorityDomain = func(uint32) (supervisorIdentityLock, error) { return nil, want }
+		err := runGuardian(supervisorConfig{IdentityLock: true, IsolationUID: 1})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("guardian adopted authority", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("disposition")
+		supervisorAdoptIdentityLock = func(uint32) (supervisorIdentityLock, error) { return errorSupervisorIdentityLock{}, nil }
+		supervisorAdoptAuthorityDomain = func(uint32) (supervisorIdentityLock, error) { return errorSupervisorIdentityLock{}, nil }
+		supervisorValidateAdoptedAuthority = func(supervisorConfig) error { return want }
+		err := runGuardian(supervisorConfig{IdentityLock: true, IsolationUID: 1})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("guardian authority", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("authority")
+		supervisorVerifyTrustedIdentity = func(uint32) error { return want }
+		err := runGuardian(supervisorConfig{IsolationUID: 1})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("guardian claim", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		file := filepath.Join(root, "file")
+		require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+		err := runGuardian(supervisorConfig{Home: filepath.Join(file, "home")})
+		require.Error(t, err)
+	})
+	t.Run("guardian containment", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("containment")
+		supervisorNewGuardianContainment = func(supervisorConfig) (*guardianContainment, error) { return nil, want }
+		err := runGuardian(supervisorConfig{Home: filepath.Join(t.TempDir(), "home")})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("guardian pipe", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("pipe")
+		supervisorNewGuardianContainment = func(supervisorConfig) (*guardianContainment, error) { return &guardianContainment{}, nil }
+		supervisorPipe = func() (*os.File, *os.File, error) { return nil, nil, want }
+		err := runGuardian(supervisorConfig{Home: filepath.Join(t.TempDir(), "home")})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("guardian identity placeholder", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("open")
+		supervisorNewGuardianContainment = func(supervisorConfig) (*guardianContainment, error) { return &guardianContainment{}, nil }
+		supervisorOpen = func(string) (*os.File, error) { return nil, want }
+		err := runGuardian(supervisorConfig{Home: filepath.Join(t.TempDir(), "home")})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("guardian authority placeholder", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("open")
+		supervisorNewGuardianContainment = func(supervisorConfig) (*guardianContainment, error) { return &guardianContainment{}, nil }
+		calls := 0
+		supervisorOpen = func(string) (*os.File, error) {
+			calls++
+			if calls == 2 {
+				return nil, want
+			}
+
+			return os.Open("/dev/null")
+		}
+		err := runGuardian(supervisorConfig{Home: filepath.Join(t.TempDir(), "home")})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("guardian start", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("start")
+		supervisorNewGuardianContainment = func(supervisorConfig) (*guardianContainment, error) { return &guardianContainment{}, nil }
+		supervisorExecutable = func() (string, error) { return "/usr/bin/true", nil }
+		supervisorStartIndependent = func(*exec.Cmd) error { return want }
+		err := runGuardian(supervisorConfig{Home: filepath.Join(t.TempDir(), "home"), Scratch: t.TempDir(), NativeEnv: []string{"PATH=/usr/bin"}})
+		require.ErrorIs(t, err, want)
+	})
+
+	t.Run("liveness trusted identity", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("identity")
+		supervisorVerifyTrustedIdentity = func(uint32) error { return want }
+		err := runLiveness(supervisorConfig{IsolationUID: 1})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("liveness marker", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		file := filepath.Join(root, "file")
+		require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+		err := runLiveness(supervisorConfig{Started: filepath.Join(file, "started")})
+		require.Error(t, err)
+	})
+	t.Run("liveness containment", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		want := errors.New("containment")
+		supervisorOpenLivenessContainment = func(supervisorConfig) (*livenessContainment, error) { return nil, want }
+		root := t.TempDir()
+		err := runLiveness(supervisorConfig{Home: filepath.Join(root, "home"), Started: filepath.Join(root, "started")})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("liveness credential", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		generation := filepath.Join(root, "generation")
+		require.NoError(t, os.Mkdir(generation, 0o700))
+		err := runLiveness(supervisorConfig{
+			Home: filepath.Join(root, "home"), Started: filepath.Join(root, "started"), NativePath: "/usr/bin/true",
+			IsolationUID: 1, IsolationGID: 0, NativeEnv: []string{"PATH=/usr/bin"}, DarwinBestEffort: true,
+			ScratchParent: root, Scratch: generation, LifecycleKind: darwinLifecycleRuntime,
+		})
+		require.ErrorContains(t, err, "apply supervised")
+	})
+	t.Run("liveness guardian peer", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		generation := filepath.Join(root, "generation")
+		require.NoError(t, os.Mkdir(generation, 0o700))
+		want := errors.New("guardian peer")
+		supervisorValidateGuardianPeer = func(*os.File, <-chan struct{}) error { return want }
+		supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error { return nil }
+		err := runLiveness(supervisorConfig{
+			Home: filepath.Join(root, "home"), Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
+			NativePath: "/usr/bin/true", NativeEnv: []string{"PATH=/usr/bin"}, DarwinBestEffort: true,
+			ScratchParent: root, Scratch: generation, LifecycleKind: darwinLifecycleRuntime,
+		})
+		require.ErrorIs(t, err, want)
+	})
+	t.Run("liveness final guardian peer", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		generation := filepath.Join(root, "generation")
+		require.NoError(t, os.Mkdir(generation, 0o700))
+		want := errors.New("guardian peer")
+		calls := 0
+		supervisorValidateGuardianPeer = func(*os.File, <-chan struct{}) error {
+			calls++
+			if calls == 2 {
+				return want
+			}
+
+			return nil
+		}
+		supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error { return nil }
+		err := runLiveness(supervisorConfig{
+			Home: filepath.Join(root, "home"), Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
+			NativePath: "/usr/bin/true", NativeEnv: []string{"PATH=/usr/bin"}, DarwinBestEffort: true,
+			ScratchParent: root, Scratch: generation, LifecycleKind: darwinLifecycleRuntime,
+		})
+		require.ErrorIs(t, err, want)
+	})
+}
+
+func TestFinishGuardianLivenessRemainingBranches(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	root := t.TempDir()
+	notDirectory := filepath.Join(root, "file")
+	require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
+	err := finishGuardianLiveness(supervisorConfig{Completion: filepath.Join(notDirectory, "complete")}, nil, 0, errors.New("wait"))
+	require.Error(t, err)
+	err = finishGuardianLiveness(supervisorConfig{Completion: filepath.Join(root, "missing"), Quarantine: filepath.Join(notDirectory, "quarantine")}, nil, 0, errors.New("wait"))
+	require.Error(t, err)
+	supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error { return nil }
+	err = finishGuardianLiveness(supervisorConfig{Completion: filepath.Join(root, "completion")}, nil, 0, errors.New("wait"))
+	require.ErrorContains(t, err, "liveness supervisor exited")
 }
 
 func TestSupervisorEntropyAndProofStatFailures(t *testing.T) {
@@ -819,6 +1392,75 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		require.ErrorContains(t, err, want.Error())
 	})
 
+	t.Run("guardian pre-readiness quarantine", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		liveness := filepath.Join(root, "liveness")
+		require.NoError(t, os.WriteFile(liveness, []byte("#!/bin/sh\nprintf 'invalid\\n' >&2\nsleep 0.05\n"), 0o700))
+		supervisorExecutable = func() (string, error) { return liveness, nil }
+		supervisorInput = strings.NewReader("")
+		supervisorOutput = io.Discard
+		supervisorError = io.Discard
+		quarantine := filepath.Join(root, "quarantine")
+		require.NoError(t, writeSupervisorMarker(quarantine))
+		err := runGuardian(supervisorConfig{
+			Home: filepath.Join(root, "home"), Scratch: root,
+			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
+			Quarantine: quarantine, NativePIDFile: filepath.Join(root, "pid"),
+		})
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	})
+
+	t.Run("guardian pre-readiness quarantine marker failure", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		started := filepath.Join(root, "started")
+		require.NoError(t, writeSupervisorMarker(started))
+		quarantineParent := filepath.Join(root, "quarantine-parent")
+		require.NoError(t, os.Mkdir(quarantineParent, 0o700))
+		pidFIFO := filepath.Join(root, "native-pid")
+		require.NoError(t, syscall.Mkfifo(pidFIFO, 0o600))
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			_ = os.Remove(quarantineParent)
+			_ = os.WriteFile(quarantineParent, []byte("x"), 0o600)
+			writer, openErr := os.OpenFile(pidFIFO, os.O_WRONLY, 0)
+			if openErr == nil {
+				_, _ = io.WriteString(writer, "99999999\n")
+				_ = writer.Close()
+			}
+		}()
+		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+		supervisorInput = strings.NewReader("")
+		supervisorOutput = io.Discard
+		supervisorError = io.Discard
+		err := runGuardian(supervisorConfig{
+			Home: filepath.Join(root, "home"), Scratch: root, Started: started,
+			Completion: filepath.Join(root, "complete"), Quarantine: filepath.Join(quarantineParent, "marker"),
+			NativePIDFile: pidFIFO,
+		})
+		require.ErrorContains(t, err, "quarantine")
+	})
+
+	t.Run("guardian post-readiness quarantine", func(t *testing.T) {
+		preserveSupervisorGlobals(t)
+		root := t.TempDir()
+		liveness := filepath.Join(root, "liveness")
+		require.NoError(t, os.WriteFile(liveness, []byte("#!/bin/sh\nprintf '%s\\n' '"+supervisorReadyPrefix+`{"nativePid":99999999}`+"' >&2\nsleep 0.05\n"), 0o700))
+		supervisorExecutable = func() (string, error) { return liveness, nil }
+		supervisorInput = strings.NewReader("")
+		supervisorOutput = io.Discard
+		supervisorError = io.Discard
+		quarantine := filepath.Join(root, "quarantine")
+		require.NoError(t, writeSupervisorMarker(quarantine))
+		err := runGuardian(supervisorConfig{
+			Home: filepath.Join(root, "home"), Scratch: root,
+			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
+			Quarantine: quarantine, NativePIDFile: filepath.Join(root, "pid"),
+		})
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	})
+
 	t.Run("liveness post-exit proof failure", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()
@@ -920,6 +1562,25 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		}()
 		err := (&supervisorProof{started: started, completion: completion}).awaitCompletion(context.Background())
 		require.ErrorContains(t, err, "stat liveness completion")
+		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	})
+
+	t.Run("proof second quarantine stat", func(t *testing.T) {
+		root := t.TempDir()
+		started := filepath.Join(root, "started")
+		require.NoError(t, writeSupervisorMarker(started))
+		quarantineParent := filepath.Join(root, "quarantine-parent")
+		require.NoError(t, os.Mkdir(quarantineParent, 0o700))
+		go func() {
+			time.Sleep(5 * time.Millisecond)
+			_ = os.Remove(quarantineParent)
+			_ = os.WriteFile(quarantineParent, []byte("x"), 0o600)
+		}()
+		err := (&supervisorProof{
+			started: started, completion: filepath.Join(root, "missing"),
+			quarantine: filepath.Join(quarantineParent, "marker"),
+		}).awaitCompletion(context.Background())
+		require.ErrorContains(t, err, "stat liveness quarantine")
 		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	})
 }

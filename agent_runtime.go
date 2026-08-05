@@ -455,13 +455,20 @@ func (a *Agent) startSharedRuntime(
 	environment runtimeEnvironment,
 ) (opencode.Client, func(), func(), error) {
 	hooks := a.options.RuntimeResourceHooks
-	if a.options.Home != "" && a.options.ProcessIsolation != nil {
+
+	nativeOwnedXDG := a.options.Home != "" && a.options.ProcessIsolation != nil
+	if nativeOwnedXDG {
 		if err := validateNativeOwnedDirectory(a.options.Home, a.options.ProcessIsolation); err != nil {
 			return nil, nil, nil, err
 		}
 
-		return nil, nil, nil, errors.New("durable OpenCode runtime home is unsupported with process isolation")
+		for path := range a.options.SeedFiles {
+			if path != "opencode.json" {
+				return nil, nil, nil, fmt.Errorf("seed file %q is unsupported with a native-owned OpenCode runtime home", path)
+			}
+		}
 	}
+
 	var xdgScratchRelease func()
 
 	if a.options.Home == "" {
@@ -480,11 +487,14 @@ func (a *Agent) startSharedRuntime(
 		return nil, nil, nil, err
 	}
 
-	xdg, err := opencode.CreateRuntimeXDGDirs(a.homeRoot())
-	if err != nil {
-		err = errors.Join(err, a.cleanupRuntimeResources(nil, nativeRelease, xdgScratchRelease))
+	xdg := opencode.RuntimeXDGDirs(a.homeRoot())
+	if !nativeOwnedXDG {
+		xdg, err = opencode.CreateRuntimeXDGDirs(a.homeRoot())
+		if err != nil {
+			err = errors.Join(err, a.cleanupRuntimeResources(nil, nativeRelease, xdgScratchRelease))
 
-		return nil, nil, nil, err
+			return nil, nil, nil, err
+		}
 	}
 
 	factory := a.options.clientFactory
@@ -512,7 +522,8 @@ func (a *Agent) startSharedRuntime(
 		Pure:             a.options.Pure, QuestionTool: a.options.QuestionTool,
 		LogLevel: a.options.LogLevel, MinVersion: minNativeVersion,
 		HealthTimeout: a.options.HealthCheckTimeout, Logger: a.log,
-		ExistingXDG: xdg, HandoffXDG: a.options.Home == "", SeedFiles: a.options.SeedFiles,
+		ExistingXDG: xdg, NativeOwnedXDG: nativeOwnedXDG,
+		HandoffXDG: a.options.Home == "", SeedFiles: a.options.SeedFiles,
 		ObserveProcess: func(processCtx context.Context, kind string, delta int64) {
 			observeRuntimeProcess(processCtx, hooks, RuntimeProcessKind(kind), delta)
 		},
@@ -542,6 +553,8 @@ func openCodeProcessIsolation(value *ProcessIsolation) *opencode.ProcessIsolatio
 
 	return &opencode.ProcessIsolation{
 		UID: value.UID, GID: value.GID, BaseEnvironment: cloneStringMap(value.BaseEnvironment),
+		StandaloneOwnerID: value.StandaloneOwnerID, StandaloneStateRoot: value.StandaloneStateRoot,
+		IdentityLock: value.IdentityLock, AuthorityDomain: value.AuthorityDomain,
 	}
 }
 

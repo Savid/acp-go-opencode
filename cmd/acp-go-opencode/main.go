@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 
 	opencodeacp "github.com/savid/acp-go-opencode"
@@ -76,6 +77,17 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		return 1
 	}
 
+	if *opencodeHome == "" {
+		*opencodeHome = isolation.StandaloneStateRoot
+	}
+
+	if !filepath.IsAbs(*opencodeHome) || filepath.Clean(*opencodeHome) != *opencodeHome ||
+		*opencodeHome != isolation.StandaloneStateRoot {
+		_, _ = fmt.Fprintf(stderr, "acp-go-opencode: -home must equal standaloneStateRoot %q\n", isolation.StandaloneStateRoot)
+
+		return 1
+	}
+
 	logger := slog.New(slog.DiscardHandler)
 	if *debug {
 		logger = slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -117,9 +129,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		opencodeacp.WithOpenCodeLogLevel(*logLevel),
 		opencodeacp.WithOpenCodeHealthCheckTimeout(*healthTimeout),
 		opencodeacp.WithProcessIsolation(opencodeacp.ProcessIsolation{
-			UID:             isolation.UID,
-			GID:             isolation.GID,
-			BaseEnvironment: isolation.BaseEnvironment,
+			UID:                 isolation.UID,
+			GID:                 isolation.GID,
+			BaseEnvironment:     isolation.BaseEnvironment,
+			StandaloneOwnerID:   isolation.StandaloneOwnerID,
+			StandaloneStateRoot: isolation.StandaloneStateRoot,
 		}),
 	)
 

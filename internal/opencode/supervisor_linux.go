@@ -23,7 +23,8 @@ const linuxSupervisorTaskRoot = "/proc/self/task"
 type guardianContainment struct{}
 
 type livenessContainment struct {
-	waitDone <-chan error
+	waitDone    <-chan error
+	beforeStart func() error
 }
 
 var (
@@ -76,6 +77,11 @@ func (containment *livenessContainment) Start(cmd *exec.Cmd) error {
 		}
 		if err := supervisorLinuxNoNewPrivileges(); err != nil {
 			return fmt.Errorf("disable privilege elevation for Linux supervisor child: %w", err)
+		}
+		if containment.beforeStart != nil {
+			if err := containment.beforeStart(); err != nil {
+				return err
+			}
 		}
 
 		return cmd.Start()

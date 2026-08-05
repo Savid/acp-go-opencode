@@ -5,7 +5,7 @@
 GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
-.PHONY: audit build clean coverage-check docs-audit fmt fmt-check help lint modernize-check test test-cross-compile test-integration-attended test-integration-cover test-integration-keystore test-integration-live test-integration-smoke tidy vuln
+.PHONY: audit build clean coverage-check docs-audit fmt fmt-check help lint modernize-check test test-cross-compile test-integration-attended test-integration-cover test-integration-keystore test-integration-live test-integration-native-browser test-integration-smoke tidy vuln
 
 REMOVED_PUBLIC_TERMS = opencode\x20acp|pro\x78y|compatibilit\x79|deprecat\x65d|legac\x79|migratio\x6e|session/imp\x6frt|sdkMessag\x65|emitRawSDKMessag\x65s|setGoa\x6c|goa\x6cs|\x4e\x45\x53|SSE\x20MCP|mcpCapabilities\x2eacp|ExportSessio\x6e|ImportSessio\x6e|DeleteSessio\x6e|ParseConfi\x67|OpenCodeSessio\x6e|(^|[^.])WithVersio\x6e|opencode-versio\x6e
 
@@ -21,7 +21,37 @@ test:
 test-trusted-supervisor:
 	@test "$$(uname -s)" = Linux
 	@test "$$(id -u)" -eq 0
-	go test -race -count=1 -v -run '^(Test.*(ProcessIsolationActual|TrustedSupervisor|AgentIdentityLock|PersistentProof|SupervisorConfigIsSealed).*)$$' ./...
+	@for directory in /var/lib/acp-go /var/lib/acp-go/agent-identities; do if [ ! -e "$$directory" ] && [ ! -L "$$directory" ]; then install -d -o root -g root -m 0700 "$$directory"; fi; [ "$$(stat -c '%F %u %g %a' -- "$$directory")" = 'directory 0 0 700' ] || { echo "unsafe trusted-supervisor authority directory $$directory" >&2; exit 1; }; done
+	@selector='^(Test.*(ProcessIsolationActual|TrustedSupervisor|SupervisorGuardianSIGKILL|SupervisorLivenessSIGKILL|GeneratedNative|BorrowedIdentityAdoption|BorrowedDomainAdoption|BorrowedDisposition|AgentIdentityLock|AgentStandalone|AuthorityDomain|IdentityDisposition|PersistentProof|SupervisorConfigIsSealed|CommandCreatorThread|ProviderCreator|SecurityLimits).*)$$'; listing=$$(mktemp); log=$$(mktemp); rc=$$(mktemp); module=$$(go list -m); status=$$?; \
+	[ "$$status" -eq 0 ] || { rm -f "$$listing" "$$log" "$$rc"; exit "$$status"; }; \
+	go test -list "$$selector" ./... >"$$listing"; status=$$?; \
+	[ "$$status" -eq 0 ] || { rm -f "$$listing" "$$log" "$$rc"; exit "$$status"; }; \
+	required='TrustedSupervisor SupervisorGuardianSIGKILL SupervisorGuardianSIGKILLBeforeNativeLaunchRefusesStartAndCompletesAfterECHILD SupervisorLivenessSIGKILL GeneratedNative BorrowedIdentityAdoption BorrowedDomainAdoption BorrowedDisposition AgentIdentityLock AgentStandalone AuthorityDomain IdentityDisposition CommandCreatorThread SecurityLimits ProcessIsolationActual'; case "$$module" in github.com/savid/acp-go-amp|github.com/savid/acp-go-claude|github.com/savid/acp-go-hermes|github.com/savid/acp-go-pi) ;; github.com/savid/acp-go-codex|github.com/savid/acp-go-opencode) required="$$required PersistentProof SupervisorConfigIsSealed ProviderCreator" ;; *) rm -f "$$listing" "$$log" "$$rc"; echo "unrecognized trusted-supervisor module $$module"; exit 1 ;; esac; \
+	for class in $$required; do grep -Eq "^Test.*$${class}" "$$listing" || { rm -f "$$listing" "$$log" "$$rc"; echo "trusted-supervisor selector discovered no $${class} tests"; exit 1; }; done; \
+	expected=$$(grep -Ec '^Test' "$$listing" || true); rm -f "$$listing"; \
+	[ "$$expected" -gt 0 ] || { rm -f "$$log" "$$rc"; echo 'trusted-supervisor selector discovered no tests'; exit 1; }; \
+	{ go test -race -count=1 -json -run "$$selector" ./...; echo $$? >"$$rc"; } | tee "$$log"; \
+	status=$$(cat "$$rc"); passed=$$(grep -Ec '"Action":"pass","Package":"[^"]+","Test":"Test[^/"]+"' "$$log" || true); skipped=$$(grep -Ec '"Action":"skip","Package":"[^"]+","Test":"Test[^"]+"' "$$log" || true); \
+	rm -f "$$log" "$$rc"; \
+	[ "$$status" -eq 0 ] || exit "$$status"; \
+	[ "$$passed" -eq "$$expected" ] || { echo "trusted-supervisor pass count $$passed, want $$expected"; exit 1; }; \
+	[ "$$skipped" -eq 0 ] || { echo "trusted-supervisor skip count $$skipped, want 0"; exit 1; }
+
+## test-integration-native-browser: run current OpenCode login offline and trace every browser launcher
+test-integration-native-browser:
+	@log=$$(mktemp); rc=$$(mktemp); \
+	{ (set -eu; export ACP_GO_OPENCODE_RUN_INTEGRATION=1; case "$$(uname -m)" in x86_64) goarch=amd64; platform=linux/amd64 ;; arm64|aarch64) goarch=arm64; platform=linux/arm64 ;; *) echo "unsupported native-browser architecture: $$(uname -m)" >&2; exit 1 ;; esac; \
+	integration/browser_canary/prepare.sh; \
+	CGO_ENABLED=0 GOOS=linux GOARCH="$$goarch" go test -c -tags=integration,browsercanary -o .tmp/browser-canary/browser-canary.test .; \
+	docker build --platform "$$platform" --tag acp-go-opencode-browser-canary --file integration/browser_canary/Dockerfile .; \
+	authority_volume=$$(docker volume create); trap 'docker volume rm "$$authority_volume" >/dev/null' EXIT HUP INT TERM; \
+	docker run --rm --platform "$$platform" --network none --pid=host --env ACP_GO_OPENCODE_RUN_INTEGRATION=1 --cap-add SYS_PTRACE --security-opt seccomp=unconfined --tmpfs /tmp:rw,exec,size=256m --tmpfs /home/canary:rw,exec,uid=4242,gid=4242,mode=0700,size=128m --tmpfs /canary/scratch:rw,exec,mode=0711,size=128m --mount "type=volume,source=$$authority_volume,target=/var/lib/acp-go/agent-identities" acp-go-opencode-browser-canary); echo $$? >"$$rc"; } 2>&1 | tee "$$log"; \
+	status=$$(cat "$$rc"); passed=$$(grep -Ec '^--- PASS: TestRealNativeBrowserContainment ' "$$log" || true); skipped=$$(grep -Ec '^[[:space:]]*--- SKIP: TestRealNativeBrowserContainment(/| )' "$$log" || true); empty=$$(grep -Ec 'no tests to run' "$$log" || true); \
+	rm -f "$$log" "$$rc"; \
+	[ "$$status" -eq 0 ] || exit "$$status"; \
+	[ "$$passed" -eq 1 ] || { echo "native browser pass count $$passed, want exactly 1"; exit 1; }; \
+	[ "$$skipped" -eq 0 ] || { echo 'required native browser canary skipped'; exit 1; }; \
+	[ "$$empty" -eq 0 ] || { echo 'required native browser selector ran no tests'; exit 1; }
 
 ## test-cross-compile: compile-check platform branches for other GOOS targets
 test-cross-compile:
@@ -42,6 +72,7 @@ test-cross-compile:
 ## coverage-check: require 100% statement coverage with race instrumentation
 coverage-check:
 	go test -race -coverprofile=coverage.out -covermode=atomic ./...
+	@awk 'NR > 1 && $$(NF - 1) > 0 && $$NF == 0 { print "uncovered statement block: " $$0; missed = 1 } END { if (missed) exit 1 }' coverage.out
 	@go tool cover -func=coverage.out | awk 'BEGIN { found = 0 } /^total:/ { found = 1; if ($$3 != "100.0%") { printf "total coverage %s, want 100.0%%\n", $$3; exit 1 } printf "total coverage %s\n", $$3 } END { if (!found) { print "missing total coverage line"; exit 1 } }'
 
 ## test-integration-smoke: run live integration tests that do not spend model tokens
@@ -102,7 +133,7 @@ modernize-check:
 ## docs-audit: check required docs files, CLI flag docs, and removed public terms
 docs-audit:
 	@missing=0; for file in README.md doc.go docs.json example_test.go AGENTS.md docs/overview.mdx docs/core/sessions.mdx docs/core/prompt-streaming.mdx docs/features/authentication.mdx docs/features/elicitation.mdx docs/features/mcp.mdx docs/features/models-config.mdx docs/features/permissions.mdx docs/features/raw-events.mdx docs/features/session-store.mdx docs/get-started/examples.mdx docs/get-started/install.mdx docs/get-started/quickstart.mdx docs/get-started/run-modes.mdx docs/operations/observability.mdx docs/operations/security.mdx docs/operations/troubleshooting.mdx docs/reference/acp-methods.mdx docs/reference/cli.mdx docs/reference/go-api.mdx docs/reference/meta.mdx docs/reference/updates.mdx examples/minimal-client/main.go examples/resume-from-file/main.go examples/interactive-chat/main.go; do if [ ! -f "$$file" ]; then echo "missing required docs file: $$file"; missing=1; fi; done; exit $$missing
-	@for flag in -path -home -scratch-dir -provider-auth-root -provider-auth-direct-home -darwin-best-effort-containment -model -debug -version -seed-file -opencode-pure -opencode-question-tool -opencode-log-level -opencode-health-timeout; do rg -q -- "$$flag" docs/reference/cli.mdx cmd/acp-go-opencode/main.go || { echo "missing CLI flag in docs/code: $$flag"; exit 1; }; done
+	@for flag in -path -home -scratch-dir -provider-auth-root -provider-auth-direct-home -model -debug -version -seed-file -opencode-pure -opencode-question-tool -opencode-log-level -opencode-health-timeout; do rg -q -- "$$flag" docs/reference/cli.mdx cmd/acp-go-opencode/main.go || { echo "missing CLI flag in docs/code: $$flag"; exit 1; }; done
 	@pattern=$$(printf '%b' '$(REMOVED_PUBLIC_TERMS)'); ! rg -n -- "$$pattern" README.md doc.go docs.json docs examples cmd/acp-go-opencode/*.go AGENTS.md
 
 ## audit: run repository checks

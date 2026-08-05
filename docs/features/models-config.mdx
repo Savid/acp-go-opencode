@@ -64,6 +64,9 @@ the seed is deep-merged with the wrapper's `$schema`. The seed must not contain
 `permission` or `mcp`; permission rides the native session and MCP rides the
 directory scope. Keep secrets in the process environment (`WithEnv`) and
 reference them from the seed with OpenCode's `{env:...}` indirection.
+The process-isolated standalone command accepts only this `opencode.json` seed;
+it passes the merged JSON in memory and performs no privileged write beneath
+the durable native XDG root.
 
 The example below registers an OpenAI-style provider served by a self-hosted
 LiteLLM gateway. `options.baseURL` ends in `/v1`, and `apiKey` reads

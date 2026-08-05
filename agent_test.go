@@ -228,3 +228,22 @@ func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
 
 	require.Equal(t, map[string]string{"key": "value"}, cloneAny(map[string]string{"key": "value"}))
 }
+
+func TestOpenCodeProcessIsolationClonesStandaloneBinding(t *testing.T) {
+	base := map[string]string{"CANARY": "base"}
+	policy := &ProcessIsolation{
+		UID: 12, GID: 34, BaseEnvironment: base,
+		StandaloneOwnerID: "deployment-1", StandaloneStateRoot: "/var/lib/opencode",
+	}
+
+	converted := openCodeProcessIsolation(policy)
+	base["CANARY"] = "mutated"
+
+	if converted.UID != 12 || converted.GID != 34 || converted.BaseEnvironment["CANARY"] != "base" ||
+		converted.StandaloneOwnerID != "deployment-1" || converted.StandaloneStateRoot != "/var/lib/opencode" {
+		t.Fatalf("converted isolation = %#v", converted)
+	}
+	if openCodeProcessIsolation(nil) != nil {
+		t.Fatal("nil isolation did not remain nil")
+	}
+}

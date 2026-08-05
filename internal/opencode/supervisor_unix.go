@@ -13,7 +13,9 @@ import (
 
 type guardianContainment struct{}
 
-type livenessContainment struct{}
+type livenessContainment struct {
+	beforeStart func() error
+}
 
 func newGuardianContainment(supervisorConfig) (*guardianContainment, error) {
 	return nil, errors.Join(ErrProcessContainmentIncomplete, fmt.Errorf("proof-capable OpenCode runtime containment is unavailable on %s", runtime.GOOS))

@@ -743,6 +743,78 @@ func TestDarwinBestEffortScratchReservationCardinality(t *testing.T) {
 	})
 }
 
+func TestNativeOwnedDurableRuntimeHomeIsNeverMaterializedByTheAdapter(t *testing.T) {
+	home := t.TempDir()
+	client := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithProcessIsolation(ProcessIsolation{
+			UID:                 uint32(os.Geteuid()),
+			GID:                 uint32(os.Getegid()),
+			StandaloneOwnerID:   "runtime-owner",
+			StandaloneStateRoot: home,
+		}),
+	)
+	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		require.True(t, options.NativeOwnedXDG)
+		require.Equal(t, opencode.RuntimeXDGDirs(home), options.ExistingXDG)
+		entries, err := os.ReadDir(home)
+		require.NoError(t, err)
+		require.Empty(t, entries)
+
+		return client, nil
+	}
+
+	runtime, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	require.NoError(t, err)
+	require.Same(t, client, runtime)
+	require.NotNil(t, nativeRelease)
+	require.Nil(t, scratchRelease)
+	nativeRelease()
+}
+
+func TestNativeOwnedDurableRuntimeHomeRejectsSeedFilesBeforeLaunch(t *testing.T) {
+	home := t.TempDir()
+	agent := NewAgent(
+		WithProcessIsolation(ProcessIsolation{
+			UID:                 uint32(os.Geteuid()),
+			GID:                 uint32(os.Getegid()),
+			StandaloneOwnerID:   "runtime-owner",
+			StandaloneStateRoot: home,
+		}),
+		WithSeedFiles(map[string]string{"provider.json": `{}`}),
+	)
+	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+		t.Fatal("native runtime started")
+
+		return nil, errors.New("unreachable native runtime start")
+	}
+
+	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	require.ErrorContains(t, err, "seed file \"provider.json\" is unsupported")
+	require.Nil(t, client)
+	require.Nil(t, nativeRelease)
+	require.Nil(t, scratchRelease)
+}
+
+func TestNativeOwnedDurableRuntimeHomeRejectsWrongOwnerBeforeLaunch(t *testing.T) {
+	home := t.TempDir()
+	agent := NewAgent(
+		WithHome(home),
+		WithProcessIsolation(ProcessIsolation{UID: uint32(os.Geteuid()) + 1, GID: uint32(os.Getegid())}),
+	)
+	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+		t.Fatal("native runtime started")
+
+		return nil, errors.New("unreachable native runtime start")
+	}
+
+	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	require.ErrorContains(t, err, "ownership validation is unsupported")
+	require.Nil(t, client)
+	require.Nil(t, nativeRelease)
+	require.Nil(t, scratchRelease)
+}
+
 func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
 	base := newFakeOpenCodeClient()
 	client := &proofFailureRuntimeClient{

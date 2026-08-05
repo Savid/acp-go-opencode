@@ -6,11 +6,20 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type recordingCloser struct{ closed bool }
+
+func (closer *recordingCloser) Close() error {
+	closer.closed = true
+
+	return nil
+}
 
 // restoreLeaseHooks restores every injectable lease seam when the test ends.
 func restoreLeaseHooks(t *testing.T) {
@@ -110,6 +119,41 @@ func TestBrokerLeaseLandsBeforeTheServerAndAdoptsItsPID(t *testing.T) {
 	adopted, _ := readBrokerLease(home)
 	if adopted.PID != os.Getpid() || adopted.ProcessStart == "" {
 		t.Fatalf("adopted lease = %+v", adopted)
+	}
+}
+
+func TestLeaseStartedServerFastPathsAndAdoptionFailureCleanup(t *testing.T) {
+	if err := leaseStartedServer(StartOptions{}, BrokerLease{}, nil, nil, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	lease := newBrokerLease(1234, "identity")
+	if err := writeBrokerLease(home, lease); err != nil {
+		t.Fatal(err)
+	}
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if startErr := leaseStartedServer(StartOptions{LeaseDir: home}, lease, process, nil, func() {}); startErr != nil {
+		t.Fatal(startErr)
+	}
+
+	restoreLeaseHooks(t)
+	leaseWriteFile = func(string, []byte, os.FileMode) error { return errors.New("write") }
+	command := exec.Command("/bin/sleep", "30")
+	if startErr := command.Start(); startErr != nil {
+		t.Fatal(startErr)
+	}
+	t.Cleanup(func() { _ = command.Process.Kill(); _, _ = command.Process.Wait() })
+	closer := &recordingCloser{}
+	cancelled := false
+	err = leaseStartedServer(StartOptions{LeaseDir: t.TempDir()}, BrokerLease{}, command.Process, closer, func() { cancelled = true })
+	if err == nil || !strings.Contains(err.Error(), "write") {
+		t.Fatalf("lease adoption error = %v", err)
+	}
+	if !closer.closed || !cancelled {
+		t.Fatalf("cleanup = closer:%v cancel:%v", closer.closed, cancelled)
 	}
 }
 
@@ -410,7 +454,7 @@ func TestStartServerWritesTheLeaseBeforeItSpawns(t *testing.T) {
 	}
 
 	client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
-		Root:            t.TempDir(),
+		Root:            testGeneratedTempDir(t),
 		LeaseDir:        leaseDir,
 		ExecutablePath:  fakeOpenCodeExecutable(t),
 		HealthTimeout:   5 * time.Second,

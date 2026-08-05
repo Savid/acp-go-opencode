@@ -181,6 +181,21 @@ func TestDarwinFastExitFallbackBranches(t *testing.T) {
 }
 
 func TestDarwinStartValidationFailureBranches(t *testing.T) {
+	t.Run("before start", func(t *testing.T) {
+		preserveDarwinSupervisorSeams(t)
+		config := darwinSupervisorTestConfig(t)
+		liveness, err := openLivenessContainment(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := errors.New("before start")
+		liveness.beforeStart = func() error { return want }
+		err = liveness.Start(exec.Command("/usr/bin/true"))
+		if !errors.Is(err, want) {
+			t.Fatalf("before-start error = %v", err)
+		}
+	})
+
 	for _, test := range []struct {
 		name     string
 		getpgid  func(int) (int, error)

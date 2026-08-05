@@ -3758,6 +3758,52 @@ func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 	}
 }
 
+func TestPromptCancellationWinsSessionErrorEvent(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	started := make(chan struct{})
+	client.sendMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		close(started)
+		<-ctx.Done()
+
+		return opencode.NativeMessage{}, ctx.Err()
+	}
+	session := testSession(NewAgent(), client)
+	done := make(chan struct {
+		response acp.PromptResponse
+		err      error
+	}, 1)
+	go func() {
+		response, err := session.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: session.id,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("hi")},
+		})
+		done <- struct {
+			response acp.PromptResponse
+			err      error
+		}{response: response, err: err}
+	}()
+	<-started
+	session.mu.Lock()
+	session.cancelled = true
+	session.mu.Unlock()
+	client.events <- opencode.Event{
+		Type: eventSessionError,
+		Properties: mustJSON(t, opencode.SessionError{
+			SessionID: session.idmap.NativeSessionID,
+			Error:     providerNativeError("cancelled provider error", 400, "cancelled"),
+		}),
+	}
+	result := <-done
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonCancelled, result.response.StopReason)
+}
+
+func TestSessionErrorEventRejectsMalformedProperties(t *testing.T) {
+	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	err := session.handleEvent(context.Background(), opencode.Event{Type: eventSessionError, Properties: json.RawMessage(`{`)})
+	require.Error(t, err)
+}
+
 // T5 — a native error observed while the turn is cancelled maps to StopReason
 // cancelled with a nil error: the cancel guard runs before failure mapping.
 func TestPromptCancelSuppressesNativeError(t *testing.T) {

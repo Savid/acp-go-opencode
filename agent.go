@@ -81,7 +81,9 @@ var (
 
 func NewAgent(opts ...Option) *Agent {
 	options := applyOptions(opts)
+	homeErr := normalizeStandaloneHome(&options)
 	limits, optionsErr := normalizeConcurrencyLimits(options.ConcurrencyLimits)
+	optionsErr = errors.Join(optionsErr, homeErr)
 	optionsErr = errors.Join(optionsErr, validateContainmentOptions(options))
 
 	options.ConcurrencyLimits = limits
