@@ -282,8 +282,8 @@ func TestGuardianPersistentProofFailureQuarantinesUntilRecovery(t *testing.T) {
 
 func TestSupervisorGuardianSIGKILLLeavesLivenessLockedUntilTreeExit(t *testing.T) {
 	runtime := startSupervisedNative(t)
-	require.NoError(t, syscall.Kill(-runtime.rootPID, syscall.SIGSTOP))
-	require.NoError(t, syscall.Kill(runtime.livenessPID, syscall.SIGSTOP))
+	stopSupervisedGroup(t, runtime.rootPID)
+	stopSupervisedProcess(t, runtime.livenessPID)
 	t.Cleanup(func() { _ = syscall.Kill(runtime.livenessPID, syscall.SIGCONT) })
 	require.NoError(t, runtime.cmd.Process.Kill())
 	runtime.waiter.start()
@@ -370,8 +370,8 @@ func TestSupervisorGuardianSIGKILLBeforeNativeLaunchRefusesStartAndCompletesAfte
 
 func TestSupervisorLivenessSIGKILLLeavesClaimLockedUntilTreeExit(t *testing.T) {
 	runtime := startSupervisedNative(t)
-	require.NoError(t, syscall.Kill(-runtime.rootPID, syscall.SIGSTOP))
-	require.NoError(t, syscall.Kill(runtime.cmd.Process.Pid, syscall.SIGSTOP))
+	stopSupervisedGroup(t, runtime.rootPID)
+	stopSupervisedProcess(t, runtime.cmd.Process.Pid)
 	t.Cleanup(func() { _ = syscall.Kill(runtime.cmd.Process.Pid, syscall.SIGCONT) })
 	require.NoError(t, syscall.Kill(runtime.livenessPID, syscall.SIGKILL))
 
@@ -404,6 +404,16 @@ func TestTurnTimeoutShutdownContainsStubbornSetsidDescendant(t *testing.T) {
 
 func startSupervisedNative(t *testing.T) *supervisedNative {
 	t.Helper()
+	// Adopt the supervisor pair's orphans. Without this the kernel reparents a
+	// killed guardian's liveness supervisor to init, which orphans the process
+	// group configureIndependentSupervisor gave it; POSIX then resumes an
+	// orphaned group that holds stopped jobs with SIGHUP and SIGCONT, so a
+	// frozen survivor thaws before the test can observe it. The runner reaches
+	// this only when the test's session differs from init's, which is why it
+	// reproduces on a hosted VM and not under a container whose PID 1 shares
+	// the session.
+	require.NoError(t, unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0))
+
 	const standaloneStateRoot = "/var/lib/acp-go-opencode-test"
 	require.NoError(t, os.MkdirAll(standaloneStateRoot, 0o700))
 	require.NoError(t, os.Chown(standaloneStateRoot, 65534, 65534))
@@ -487,12 +497,11 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	t.Cleanup(func() {
 		cancel()
 		_ = stdin.Close()
-		if runtime.rootPID > 0 {
-			_ = syscall.Kill(-runtime.rootPID, syscall.SIGKILL)
-		}
-		if runtime.descPID > 0 {
-			_ = syscall.Kill(runtime.descPID, syscall.SIGKILL)
-		}
+		// The setsid descendant leads its own group and forks its own children,
+		// so signalling its PID alone strands them under the agent identity
+		// every test here shares.
+		killSupervisedGroup(runtime.rootPID)
+		killSupervisedGroup(runtime.descPID)
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
@@ -557,11 +566,8 @@ func shutdownSupervisedRuntime(t *testing.T, runtime *supervisedNative, ctx cont
 
 func processSessionAndGroup(t *testing.T, pid int) (int, int) {
 	t.Helper()
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	fields, err := processStatFields(pid)
 	require.NoError(t, err)
-	closeParen := strings.LastIndexByte(string(raw), ')')
-	require.Greater(t, closeParen, 0)
-	fields := strings.Fields(string(raw[closeParen+1:]))
 	require.GreaterOrEqual(t, len(fields), 4)
 	group, err := strconv.Atoi(fields[2])
 	require.NoError(t, err)
@@ -569,6 +575,73 @@ func processSessionAndGroup(t *testing.T, pid int) (int, int) {
 	require.NoError(t, err)
 
 	return session, group
+}
+
+// taskStatFields returns the stat fields that follow the comm field, so a
+// process name containing spaces or parentheses cannot shift the offsets.
+func taskStatFields(path string) ([]string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	closeParen := strings.LastIndexByte(string(raw), ')')
+	if closeParen <= 0 {
+		return nil, fmt.Errorf("%s has no comm field", path)
+	}
+
+	return strings.Fields(string(raw[closeParen+1:])), nil
+}
+
+func processStatFields(pid int) ([]string, error) {
+	return taskStatFields(fmt.Sprintf("/proc/%d/stat", pid))
+}
+
+func stopSupervisedProcess(t *testing.T, pid int) {
+	t.Helper()
+	require.NoError(t, syscall.Kill(pid, syscall.SIGSTOP))
+	awaitSupervisedProcessStopped(t, pid)
+}
+
+// stopSupervisedGroup stops the process group pid leads. Only the leader has to
+// latch: the supervised tree keeps every other member in its own group.
+func stopSupervisedGroup(t *testing.T, pid int) {
+	t.Helper()
+	require.NoError(t, syscall.Kill(-pid, syscall.SIGSTOP))
+	awaitSupervisedProcessStopped(t, pid)
+}
+
+// awaitSupervisedProcessStopped blocks until every task of the process has
+// entered the group stop. kill returns once the signal is queued, not once the
+// target has acted on it, and a supervisor is a multi-threaded Go process whose
+// thread group leader can read as stopped while another task still runs. A
+// supervisor that is only nominally frozen still observes its peer's death,
+// releases its runtime lock and quiesces the tree, which is precisely the
+// behaviour these tests freeze it to exclude.
+func awaitSupervisedProcessStopped(t *testing.T, pid int) {
+	t.Helper()
+	taskRoot := fmt.Sprintf("/proc/%d/task", pid)
+	require.Eventually(t, func() bool {
+		tasks, err := os.ReadDir(taskRoot)
+		if err != nil || len(tasks) == 0 {
+			return false
+		}
+
+		for _, task := range tasks {
+			fields, statErr := taskStatFields(filepath.Join(taskRoot, task.Name(), "stat"))
+			if statErr != nil || len(fields) == 0 || fields[0] != "T" {
+				return false
+			}
+		}
+
+		return true
+	}, 5*time.Second, 5*time.Millisecond, "process %d did not enter the stopped state", pid)
+}
+
+func killSupervisedGroup(pid int) {
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
 }
 
 func waitFile(t *testing.T, path string) {
@@ -600,11 +673,8 @@ func waitPIDFile(t *testing.T, path string, stderr *supervisorTestBuffer) int {
 
 func parentPID(t *testing.T, pid int) int {
 	t.Helper()
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	fields, err := processStatFields(pid)
 	require.NoError(t, err)
-	closeParen := strings.LastIndexByte(string(raw), ')')
-	require.Greater(t, closeParen, 0)
-	fields := strings.Fields(string(raw[closeParen+1:]))
 	require.GreaterOrEqual(t, len(fields), 2)
 	parent, err := strconv.Atoi(fields[1])
 	require.NoError(t, err)
