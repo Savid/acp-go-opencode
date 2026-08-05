@@ -51,7 +51,6 @@ func TestRealNativeBrowserContainment(t *testing.T) {
 		require.NoError(t, os.Chown(dir, browserCanaryUID, browserCanaryGID))
 	}
 
-	home := browserCanaryOwnedDir(t, "/home/canary/.opencode-browser-canary", 0o700, true)
 	authRoot := browserCanaryOwnedDir(t, filepath.Join(browserCanaryScratch, "auth-ledger"), 0o700, false)
 	stateRoot := browserCanaryOwnedDir(t, browserCanaryState, 0o700, true)
 	isolation := ProcessIsolation{
@@ -75,7 +74,7 @@ func TestRealNativeBrowserContainment(t *testing.T) {
 
 	agent := NewAgent(
 		WithExecutablePath(browserCanaryNative),
-		WithHome(home),
+		WithHome(stateRoot),
 		WithScratchDir(browserCanaryScratch),
 		WithProviderAuthRoot(authRoot),
 		WithOpenCodePure(true),
