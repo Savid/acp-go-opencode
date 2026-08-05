@@ -67,6 +67,23 @@ func TestLinuxSupervisorChildInheritsSecurityLimits(t *testing.T) {
 	require.Equal(t, "1 0", strings.TrimSpace(string(proof)))
 }
 
+func TestSupervisedNativeIsolationDropsStandaloneFieldsAfterAuthorityAdoption(t *testing.T) {
+	config := supervisorConfig{
+		IsolationUID: 123, IsolationGID: 456,
+		NativeEnv:           []string{"PATH=/usr/bin:/bin"},
+		IdentityLock:        true,
+		AuthorityDomain:     true,
+		StandaloneOwnerID:   "standalone-owner",
+		StandaloneStateRoot: "/var/lib/standalone-owner",
+	}
+
+	isolation := supervisedNativeIsolation(config)
+	require.True(t, isolation.identityAuthorityAdopted)
+	require.Empty(t, isolation.StandaloneOwnerID)
+	require.Empty(t, isolation.StandaloneStateRoot)
+	require.NoError(t, validateProcessIsolation(isolation))
+}
+
 func TestLinuxSupervisorLaunchesFailClosedWhenSecurityLimitsCannotBeSet(t *testing.T) {
 	preservePlatformSupervisorGlobals(t)
 	supervisorLinuxCoreLimit = func() error { return errors.New("setrlimit failed") }
@@ -481,8 +498,8 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 		}
 	})
 
-	runtime.rootPID = waitPIDFile(t, rootPIDPath)
-	runtime.descPID = waitPIDFile(t, descPIDPath)
+	runtime.rootPID = waitPIDFile(t, rootPIDPath, stderr)
+	runtime.descPID = waitPIDFile(t, descPIDPath, stderr)
 	waitFile(t, attackReadyPath)
 	descendantSession, descendantGroup := processSessionAndGroup(t, runtime.descPID)
 	require.Equal(t, runtime.descPID, descendantSession, "descendant must escape into a new session")
@@ -563,7 +580,7 @@ func waitFile(t *testing.T, path string) {
 	}, 5*time.Second, 10*time.Millisecond, "file %s was not published", path)
 }
 
-func waitPIDFile(t *testing.T, path string) int {
+func waitPIDFile(t *testing.T, path string, stderr *supervisorTestBuffer) int {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -576,7 +593,7 @@ func waitPIDFile(t *testing.T, path string) int {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("PID file %s was not published", path)
+	t.Fatalf("PID file %s was not published; supervisor stderr: %s", path, stderr.String())
 
 	return 0
 }

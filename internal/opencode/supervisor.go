@@ -818,13 +818,7 @@ func runLiveness(config supervisorConfig) error {
 	cmd.Dir = config.NativeDir
 
 	if config.IsolationUID != 0 || config.IsolationGID != 0 {
-		if credentialErr := applyProcessCredential(cmd, &ProcessIsolation{
-			UID: config.IsolationUID, GID: config.IsolationGID,
-			BaseEnvironment:          environmentMap(config.NativeEnv),
-			StandaloneOwnerID:        config.StandaloneOwnerID,
-			StandaloneStateRoot:      config.StandaloneStateRoot,
-			identityAuthorityAdopted: config.IdentityLock && config.AuthorityDomain,
-		}); credentialErr != nil {
+		if credentialErr := applyProcessCredential(cmd, supervisedNativeIsolation(config)); credentialErr != nil {
 			return fmt.Errorf("apply supervised OpenCode native identity: %w", credentialErr)
 		}
 	}
@@ -956,6 +950,24 @@ func runLiveness(config supervisorConfig) error {
 
 		return proofErr
 	}
+}
+
+func supervisedNativeIsolation(config supervisorConfig) *ProcessIsolation {
+	isolation := &ProcessIsolation{
+		UID:             config.IsolationUID,
+		GID:             config.IsolationGID,
+		BaseEnvironment: environmentMap(config.NativeEnv),
+	}
+	if config.IdentityLock && config.AuthorityDomain {
+		isolation.identityAuthorityAdopted = true
+
+		return isolation
+	}
+
+	isolation.StandaloneOwnerID = config.StandaloneOwnerID
+	isolation.StandaloneStateRoot = config.StandaloneStateRoot
+
+	return isolation
 }
 
 func completeOrQuarantineLiveness(config supervisorConfig, containment *livenessContainment, proofErr error) error {
