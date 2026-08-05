@@ -74,7 +74,7 @@ func TestOpenCodeACPAgentFakeExecutableSharedRuntimeLayout(t *testing.T) {
 		t.Fatalf("logical session ids were reused: %q", first.SessionId)
 	}
 
-	runtimeRoot := filepath.Join(home, "acp-go-opencode", "runtime")
+	runtimeRoot := filepath.Join(home, "acp-go-opencode")
 	for _, name := range []string{"data", "config", "cache", "state"} {
 		info, statErr := os.Stat(filepath.Join(runtimeRoot, name))
 		if statErr != nil || !info.IsDir() {

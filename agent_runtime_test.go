@@ -40,6 +40,13 @@ func (*panickingRuntimeShutdownClient) Shutdown(context.Context) error {
 	panic("runtime shutdown panic")
 }
 
+func TestImplicitRuntimeHomeIsDirectChildOfScratch(t *testing.T) {
+	scratch := t.TempDir()
+	agent := NewAgent(WithScratchDir(scratch))
+
+	require.Equal(t, filepath.Join(scratch, defaultAgentName), agent.homeRoot())
+}
+
 func (client *proofFailureRuntimeClient) Shutdown(context.Context) error {
 	if client.calls.Add(1) == 1 {
 		close(client.entered)

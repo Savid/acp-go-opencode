@@ -683,7 +683,7 @@ func (a *Agent) homeRoot() string {
 		return a.options.Home
 	}
 
-	return filepath.Join(scratchParent(a.options.ScratchDir), defaultAgentName, "runtime")
+	return filepath.Join(scratchParent(a.options.ScratchDir), defaultAgentName)
 }
 
 func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 func TestGeneratedNativeTreeDistinctIdentityTraversal(t *testing.T) {
@@ -73,6 +75,51 @@ if cat "$2/secret" >/dev/null 2>&1; then exit 42; fi`,
 	}
 	if contents, err := os.ReadFile(filepath.Join(control, "secret")); err != nil || string(contents) != "root" {
 		t.Fatalf("trusted control changed: %q, %v", contents, err)
+	}
+}
+
+func TestImplicitRuntimeHomeCanBeHandedToDistinctIdentity(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	parent, err := os.MkdirTemp("/tmp", "acp-go-opencode-runtime-home-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(parent) })
+	if err := os.Chmod(parent, 0o711); err != nil {
+		t.Fatal(err)
+	}
+
+	agent := NewAgent(WithScratchDir(parent))
+	runtimeHome := agent.homeRoot()
+	if filepath.Dir(runtimeHome) != parent {
+		t.Fatalf("implicit runtime home %q has an intermediate ancestor beneath scratch %q", runtimeHome, parent)
+	}
+	if _, err := opencode.CreateRuntimeXDGDirs(runtimeHome); err != nil {
+		t.Fatal(err)
+	}
+
+	isolation := &ProcessIsolation{UID: 65534, GID: 65534, BaseEnvironment: map[string]string{}}
+	if err := handoffGeneratedNativeTree(runtimeHome, isolation); err != nil {
+		t.Fatal(err)
+	}
+
+	output := filepath.Join(runtimeHome, "state", "identity-proof")
+	command := exec.Command("/bin/sh", "-c", `printf native >"$1"`, "sh", output)
+	command.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: isolation.UID, Gid: isolation.GID, Groups: []uint32{}},
+	}
+	if commandOutput, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("dropped-identity runtime write: %v: %s", err, commandOutput)
+	}
+	contents, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "native" {
+		t.Fatalf("runtime output = %q", contents)
 	}
 }
 
