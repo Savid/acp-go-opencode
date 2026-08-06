@@ -339,6 +339,14 @@ func chownAndVerifyNativeInode(fd int, kind uint32, uid uint32, gid uint32, sing
 	return nil
 }
 
+// Seams for the fail-closed guards below. Linux cannot produce a uid or gid
+// outside the 32 bits it stores them in, so the guards are unreachable through
+// the real syscalls; tests swap these to reach them.
+var (
+	effectiveUIDSource = os.Geteuid
+	effectiveGIDSource = os.Getegid
+)
+
 // effectiveUID reports the caller's effective UID. Linux stores UIDs in 32
 // bits, so the int os.Geteuid returns always fits and the guard below never
 // fires; it is here because every caller compares this value against an inode
@@ -346,7 +354,7 @@ func chownAndVerifyNativeInode(fd int, kind uint32, uid uint32, gid uint32, sing
 // withholding it. The unrepresentable case therefore fails closed on an ID no
 // inode can carry.
 func effectiveUID() uint32 {
-	uid := os.Geteuid()
+	uid := effectiveUIDSource()
 	if uid < 0 || uid > math.MaxUint32 {
 		return math.MaxUint32
 	}
@@ -357,7 +365,7 @@ func effectiveUID() uint32 {
 // effectiveGID reports the caller's effective GID under the same contract as
 // effectiveUID.
 func effectiveGID() uint32 {
-	gid := os.Getegid()
+	gid := effectiveGIDSource()
 	if gid < 0 || gid > math.MaxUint32 {
 		return math.MaxUint32
 	}
