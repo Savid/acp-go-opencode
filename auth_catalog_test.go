@@ -488,8 +488,8 @@ func TestAuthLoopbackHostDetection(t *testing.T) {
 		{name: "localhost subdomain", url: "https://app.localhost/authorize", want: true},
 		{name: "loopback redirect", url: "https://accounts.x.ai/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb", want: true},
 		{name: "hosted redirect", url: "https://accounts.x.ai/authorize?redirect_uri=https%3A%2F%2Fx.ai%2Fcb"},
-		{name: "unparseable", url: "://"},
-		{name: "unparseable redirect", url: "https://accounts.x.ai/authorize?redirect_uri=%3A%2F%2F"},
+		{name: "unparsable", url: "://"},
+		{name: "unparsable redirect", url: "https://accounts.x.ai/authorize?redirect_uri=%3A%2F%2F"},
 	}
 
 	for _, testCase := range cases {

@@ -1143,18 +1143,18 @@ func TestCheckMinVersion(t *testing.T) {
 		minimum   string
 		wantErr   string
 	}{
-		"equal":               {installed: "1.18.3", minimum: "1.18.3"},
-		"newer patch":         {installed: "1.18.4", minimum: "1.18.3"},
-		"newer minor":         {installed: "1.19.0", minimum: "1.18.3"},
-		"newer major":         {installed: "2.0.0", minimum: "1.18.3"},
-		"v prefix":            {installed: "v1.18.4", minimum: "1.18.3"},
-		"shorter equal":       {installed: "1.18", minimum: "1.18.0"},
-		"older patch":         {installed: "1.18.2", minimum: "1.18.3", wantErr: "below minimum supported"},
-		"older minor":         {installed: "1.17.9", minimum: "1.18.3", wantErr: "below minimum supported"},
-		"unparseable":         {installed: "1.19.0-beta", minimum: "1.18.3", wantErr: "unparseable"},
-		"empty installed":     {installed: "", minimum: "1.18.3", wantErr: "unparseable"},
-		"negative segment":    {installed: "1.-2.0", minimum: "1.18.3", wantErr: "unparseable"},
-		"unparseable minimum": {installed: "1.18.3", minimum: "not-a-version", wantErr: "unparseable"},
+		"equal":              {installed: "1.18.3", minimum: "1.18.3"},
+		"newer patch":        {installed: "1.18.4", minimum: "1.18.3"},
+		"newer minor":        {installed: "1.19.0", minimum: "1.18.3"},
+		"newer major":        {installed: "2.0.0", minimum: "1.18.3"},
+		"v prefix":           {installed: "v1.18.4", minimum: "1.18.3"},
+		"shorter equal":      {installed: "1.18", minimum: "1.18.0"},
+		"older patch":        {installed: "1.18.2", minimum: "1.18.3", wantErr: "below minimum supported"},
+		"older minor":        {installed: "1.17.9", minimum: "1.18.3", wantErr: "below minimum supported"},
+		"unparsable":         {installed: "1.19.0-beta", minimum: "1.18.3", wantErr: "unparsable"},
+		"empty installed":    {installed: "", minimum: "1.18.3", wantErr: "unparsable"},
+		"negative segment":   {installed: "1.-2.0", minimum: "1.18.3", wantErr: "unparsable"},
+		"unparsable minimum": {installed: "1.18.3", minimum: "not-a-version", wantErr: "unparsable"},
 	}
 
 	for name, test := range tests {

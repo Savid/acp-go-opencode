@@ -1730,7 +1730,7 @@ func parseVersion(version string) ([]int, error) {
 	for _, segment := range segments {
 		value, err := strconv.Atoi(segment)
 		if err != nil || value < 0 {
-			return nil, fmt.Errorf("unparseable opencode version %q", version)
+			return nil, fmt.Errorf("unparsable opencode version %q", version)
 		}
 
 		parsed = append(parsed, value)

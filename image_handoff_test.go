@@ -274,7 +274,7 @@ func TestHandoffFormRejectsMalformedBlocks(t *testing.T) {
 			message: handoffCauseURI,
 		},
 		{
-			name:    "uri unparseable",
+			name:    "uri unparsable",
 			block:   imageBlockWithURI(mimePNG, "file://%zz", handoffEnvelope(decoded)),
 			message: handoffCauseURI,
 		},
@@ -731,7 +731,7 @@ func TestHandoffFormSelection(t *testing.T) {
 		})
 	})
 
-	t.Run("an unparseable uri without data is missing data", func(t *testing.T) {
+	t.Run("an unparsable uri without data is missing data", func(t *testing.T) {
 		broken := "file://%zz"
 		session := handoffSession(t, root)
 		requireInvalidParamsData(t, validatePromptMediaError(session,
