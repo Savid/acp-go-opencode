@@ -185,7 +185,9 @@ func TestPersistentProofFailureRetainsIdentityLockUntilRecovery(t *testing.T) {
 	recoverProof := make(chan struct{})
 	var attempts atomic.Int32
 	supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error {
-		attempts.Add(1)
+		if attempts.Add(1) == 1 {
+			return ErrProcessContainmentIncomplete
+		}
 		select {
 		case <-recoverProof:
 			return nil
@@ -246,7 +248,11 @@ func TestGuardianPersistentProofFailureQuarantinesUntilRecovery(t *testing.T) {
 	supervisorError = io.Discard
 
 	recoverProof := make(chan struct{})
+	var guardianAttempts atomic.Int32
 	supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error {
+		if guardianAttempts.Add(1) == 1 {
+			return ErrProcessContainmentIncomplete
+		}
 		select {
 		case <-recoverProof:
 			return nil
