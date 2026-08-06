@@ -11,6 +11,13 @@ import (
 
 var leaseProcReadFile = os.ReadFile
 
+// errMalformedProcStat is why a /proc stat line cannot identify a process: it
+// does not carry the fields the start time is read from. Both refusals share one
+// identity so a caller can tell an unparseable entry from an unreadable one,
+// which is the difference between a PID that answered with nonsense and a PID
+// that is simply gone.
+var errMalformedProcStat = errors.New("malformed proc stat")
+
 // processStartTime reads field 22 of /proc/<pid>/stat, the process's start time
 // in clock ticks since boot. It is what separates the process a lease named
 // from an unrelated one that reused its PID, which liveness alone cannot tell
@@ -30,7 +37,7 @@ func processStartTime(pid int) (string, error) {
 
 	closing := strings.LastIndex(stat, ")")
 	if closing < 0 {
-		return "", errors.New("malformed proc stat")
+		return "", errMalformedProcStat
 	}
 
 	fields := strings.Fields(stat[closing+1:])
@@ -40,7 +47,7 @@ func processStartTime(pid int) (string, error) {
 	const startTimeOffset = 19
 
 	if len(fields) <= startTimeOffset {
-		return "", errors.New("malformed proc stat")
+		return "", errMalformedProcStat
 	}
 
 	return fields[startTimeOffset], nil
