@@ -106,7 +106,7 @@ func validateProcessIsolationConfig(config processIsolationConfig) (processIsola
 	}
 
 	accountGID, err := strconv.ParseUint(account.Gid, 10, 32)
-	if err != nil || uint32(accountGID) != config.GID {
+	if err != nil || accountGID != uint64(config.GID) {
 		return processIsolationConfig{}, fmt.Errorf("gid %d is not uid %d's primary group", config.GID, config.UID)
 	}
 
@@ -205,7 +205,7 @@ func validateProcessIsolationConfig(config processIsolationConfig) (processIsola
 }
 
 func validateStandaloneOwnerID(value string) error {
-	if len(value) == 0 || len(value) > 256 || !isStandaloneOwnerIDFirst(value[0]) {
+	if value == "" || len(value) > 256 || !isStandaloneOwnerIDFirst(value[0]) {
 		return fmt.Errorf("standaloneOwnerId must be 1 to 256 canonical ASCII bytes")
 	}
 
@@ -227,7 +227,7 @@ func isStandaloneOwnerIDByte(value byte) bool {
 }
 
 func validateStandaloneStateRoot(value string) error {
-	if len(value) == 0 || len(value) > 4096 || value == "/" || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+	if value == "" || len(value) > 4096 || value == "/" || !filepath.IsAbs(value) || filepath.Clean(value) != value {
 		return fmt.Errorf("standaloneStateRoot must be a canonical absolute path of at most 4096 bytes")
 	}
 
