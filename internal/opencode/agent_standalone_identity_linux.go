@@ -2658,6 +2658,25 @@ func loadAgentStandaloneMarker(directory *os.File, uid, ownerUID, ownerGID uint3
 		return agentStandaloneMarker{}, unmarshalErr
 	}
 
+	marker, decodeErr := decodeAgentStandaloneMarker(payload, uid)
+	if decodeErr != nil {
+		return agentStandaloneMarker{}, decodeErr
+	}
+
+	if stateErr := validateAgentStandaloneMarkerState(marker, raw); stateErr != nil {
+		return agentStandaloneMarker{}, stateErr
+	}
+
+	if pathsErr := validateAgentStandaloneMarkerPaths(marker, raw); pathsErr != nil {
+		return agentStandaloneMarker{}, pathsErr
+	}
+
+	return marker, nil
+}
+
+// decodeAgentStandaloneMarker decodes the marker bytes and holds the result to
+// the identity the caller asked for.
+func decodeAgentStandaloneMarker(payload []byte, uid uint32) (agentStandaloneMarker, error) {
 	var marker agentStandaloneMarker
 
 	decoder := json.NewDecoder(bytes.NewReader(payload))
@@ -2667,7 +2686,7 @@ func loadAgentStandaloneMarker(directory *os.File, uid, ownerUID, ownerGID uint3
 		return agentStandaloneMarker{}, decodeErr
 	}
 
-	if err = decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	if trailingErr := decoder.Decode(&struct{}{}); !errors.Is(trailingErr, io.EOF) {
 		return agentStandaloneMarker{}, errors.New("agent identity marker contains trailing data")
 	}
 
@@ -2676,31 +2695,43 @@ func loadAgentStandaloneMarker(directory *os.File, uid, ownerUID, ownerGID uint3
 		return agentStandaloneMarker{}, errors.New("agent identity marker is incomplete")
 	}
 
+	return marker, nil
+}
+
+// validateAgentStandaloneMarkerState holds each marker state to the exact field
+// set that state is allowed to carry.
+func validateAgentStandaloneMarkerState(marker agentStandaloneMarker, raw map[string]json.RawMessage) error {
 	switch marker.State {
 	case agentStandaloneActive:
 		if len(raw) != 7 || raw["leaseId"] == nil || raw["paths"] == nil || len(marker.LeaseID) != 32 || marker.Paths == nil {
-			return agentStandaloneMarker{}, errors.New("ACTIVE marker lacks exact v2 fields")
+			return errors.New("ACTIVE marker lacks exact v2 fields")
 		}
 
-		if _, err = hex.DecodeString(marker.LeaseID); err != nil || marker.LeaseID != strings.ToLower(marker.LeaseID) {
-			return agentStandaloneMarker{}, errors.New("ACTIVE marker lease id is invalid")
+		if _, hexErr := hex.DecodeString(marker.LeaseID); hexErr != nil || marker.LeaseID != strings.ToLower(marker.LeaseID) {
+			return errors.New("ACTIVE marker lease id is invalid")
 		}
 	case "clean-ready":
 		if len(raw) != 5 || raw["leaseId"] != nil || raw["paths"] != nil {
-			return agentStandaloneMarker{}, errors.New("CLEAN marker has forbidden fields")
+			return errors.New("CLEAN marker has forbidden fields")
 		}
 	default:
-		return agentStandaloneMarker{}, errors.New("agent identity marker state is invalid")
+		return errors.New("agent identity marker state is invalid")
 	}
 
 	if len(marker.Paths) > 128 {
-		return agentStandaloneMarker{}, errors.New("agent identity marker has too many paths")
+		return errors.New("agent identity marker has too many paths")
 	}
 
+	return nil
+}
+
+// validateAgentStandaloneMarkerPaths proves every manifest path carries its
+// exact schema and that no two of them collide or straddle a removal.
+func validateAgentStandaloneMarkerPaths(marker agentStandaloneMarker, raw map[string]json.RawMessage) error {
 	var rawPaths []json.RawMessage
 	if marker.State == agentStandaloneActive {
-		if err = json.Unmarshal(raw["paths"], &rawPaths); err != nil || len(rawPaths) != len(marker.Paths) {
-			return agentStandaloneMarker{}, errors.Join(errors.New("ACTIVE marker paths are invalid"), err)
+		if pathsErr := json.Unmarshal(raw["paths"], &rawPaths); pathsErr != nil || len(rawPaths) != len(marker.Paths) {
+			return errors.Join(errors.New("ACTIVE marker paths are invalid"), pathsErr)
 		}
 	}
 
@@ -2709,30 +2740,30 @@ func loadAgentStandaloneMarker(directory *os.File, uid, ownerUID, ownerGID uint3
 		if _, fieldsErr := exactAgentAuthorityFields(
 			rawPaths[index], "base", "segments", "action", "rootDev", "rootIno",
 		); fieldsErr != nil {
-			return agentStandaloneMarker{}, fmt.Errorf("invalid marker path %d schema: %w", index, fieldsErr)
+			return fmt.Errorf("invalid marker path %d schema: %w", index, fieldsErr)
 		}
 
-		if err = validateAgentStandaloneManifestPath(path); err != nil {
-			return agentStandaloneMarker{}, fmt.Errorf("invalid marker path %d: %w", index, err)
+		if manifestErr := validateAgentStandaloneManifestPath(path); manifestErr != nil {
+			return fmt.Errorf("invalid marker path %d: %w", index, manifestErr)
 		}
 
 		identity := filepath.Join(append([]string{path.Base}, path.Segments...)...)
 		if prior, duplicate := seenPaths[identity]; duplicate {
-			return agentStandaloneMarker{}, fmt.Errorf("marker path %q is duplicated with actions %q and %q", identity, prior, path.Action)
+			return fmt.Errorf("marker path %q is duplicated with actions %q and %q", identity, prior, path.Action)
 		}
 
 		for priorPath, priorAction := range seenPaths {
 			overlaps := strings.HasPrefix(identity, priorPath+string(filepath.Separator)) ||
 				strings.HasPrefix(priorPath, identity+string(filepath.Separator))
 			if overlaps && (path.Action == agentStandaloneRemovePath || priorAction == agentStandaloneRemovePath) {
-				return agentStandaloneMarker{}, fmt.Errorf("marker removal path %q conflicts with %q", identity, priorPath)
+				return fmt.Errorf("marker removal path %q conflicts with %q", identity, priorPath)
 			}
 		}
 
 		seenPaths[identity] = path.Action
 	}
 
-	return marker, nil
+	return nil
 }
 
 func validAgentStandaloneSessionKey(key string) bool {
