@@ -27,16 +27,19 @@ func writeLinuxSupervisorConfig(_ string, config supervisorConfig) (*os.File, er
 
 		return nil, fmt.Errorf("secure private supervisor config descriptor: %w", err)
 	}
+
 	if err := supervisorEncodeConfig(file, config); err != nil {
 		_ = file.Close()
 
 		return nil, fmt.Errorf("write private supervisor config descriptor: %w", err)
 	}
+
 	if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); err != nil {
 		_ = file.Close()
 
 		return nil, fmt.Errorf("seal private supervisor config descriptor: %w", err)
 	}
+
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		_ = file.Close()
 
@@ -92,18 +95,22 @@ func linuxSupervisorControlCancellation(control io.Reader) (<-chan struct{}, fun
 
 	canceled := make(chan struct{})
 	stop := make(chan struct{})
+
 	go func() {
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
+
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
 				poll := []unix.PollFd{{Fd: int32(file.Fd()), Events: unix.POLLHUP | unix.POLLERR}}
+
 				count, pollErr := unix.Poll(poll, 0)
 				if pollErr == nil && count > 0 && poll[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0 {
 					close(canceled)
+
 					return
 				}
 			}
@@ -117,6 +124,7 @@ func validateLinuxSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) er
 	if peer == nil {
 		return nil
 	}
+
 	select {
 	case <-done:
 		return errors.New("OpenCode guardian exited before native launch")
@@ -127,10 +135,12 @@ func validateLinuxSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) er
 		Fd:     int32(peer.Fd()),
 		Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR,
 	}}
+
 	ready, err := unix.Poll(poll, 0)
 	if err != nil {
 		return fmt.Errorf("poll OpenCode guardian before native launch: %w", err)
 	}
+
 	if ready != 0 || poll[0].Revents != 0 {
 		return errors.New("OpenCode guardian exited before native launch")
 	}
@@ -143,6 +153,7 @@ func linuxSupervisorMarkerRoot(supervisorConfig) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	if err := unix.Close(fd); err != nil {
 		return "", fmt.Errorf("close supervisor proof namespace: %w", err)
 	}
@@ -189,6 +200,7 @@ func openLinuxSupervisorProofComponent(parentFD int, name string, mode uint32, c
 
 		return -1, fmt.Errorf("stat supervisor proof directory %q: %w", name, err)
 	}
+
 	if stat.Uid != 0 || stat.Gid != 0 || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 || create && stat.Mode&0o777 != 0o700 {
 		_ = unix.Close(fd)
 

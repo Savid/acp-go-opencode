@@ -721,6 +721,7 @@ func configureAgentIdentityLockTestRoot(t *testing.T) string {
 	agentIdentityLockRunRoot = root
 	agentIdentityLockTrustedUID = uint32(os.Geteuid())
 	agentIdentityLockTrustedGID = uint32(os.Getegid())
+
 	return root
 }
 

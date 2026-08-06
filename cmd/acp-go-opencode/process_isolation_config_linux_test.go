@@ -41,6 +41,7 @@ func TestValidateProcessIsolationConfigBuildsClosedEnvironment(t *testing.T) {
 		if name == "OPENAI_API_KEY" {
 			return "explicit-secret", true
 		}
+
 		return "", false
 	}
 	processIsolationValidateHome = func(string, uint32, uint32) error { return nil }
@@ -51,6 +52,7 @@ func TestValidateProcessIsolationConfigBuildsClosedEnvironment(t *testing.T) {
 			t.Fatalf("state-root validation = %q, %d:%d", path, uid, gid)
 		}
 		stateRootValidated = true
+
 		return nil
 	}
 	processIsolationValidateAccountAuthority = func(*user.User, uint32, uint32) error { return nil }

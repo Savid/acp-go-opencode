@@ -14,6 +14,7 @@ func startOpenCodeProcess(cmd *exec.Cmd) (*supervisorWaiter, error) {
 	waitCommand := openCodeWaitCommand
 
 	beginWait := make(chan struct{})
+
 	waitDone, err := startCommandOnCreatorThread(cmd.Start, func() error {
 		<-beginWait
 
