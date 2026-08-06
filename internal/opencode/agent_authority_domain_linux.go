@@ -83,12 +83,12 @@ func loadAgentAuthorityDomainRecord(directory *os.File, ownerUID, ownerGID uint3
 	defer file.Close()
 
 	var descriptor, named unix.Stat_t
-	if err = unix.Fstat(fd, &descriptor); err != nil {
-		return agentAuthorityDomainRecord{}, err
+	if fstatErr := unix.Fstat(fd, &descriptor); fstatErr != nil {
+		return agentAuthorityDomainRecord{}, fstatErr
 	}
 
-	if err = unix.Fstatat(int(directory.Fd()), agentAuthorityDomainRecordName, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return agentAuthorityDomainRecord{}, err
+	if fstatatErr := unix.Fstatat(int(directory.Fd()), agentAuthorityDomainRecordName, &named, unix.AT_SYMLINK_NOFOLLOW); fstatatErr != nil {
+		return agentAuthorityDomainRecord{}, fstatatErr
 	}
 
 	if descriptor.Dev != named.Dev || descriptor.Ino != named.Ino ||
@@ -106,8 +106,8 @@ func loadAgentAuthorityDomainRecord(directory *os.File, ownerUID, ownerGID uint3
 		return agentAuthorityDomainRecord{}, errors.New("agent authority domain record is not valid UTF-8")
 	}
 
-	if err = rejectAgentAuthorityDuplicateJSONKeys(payload); err != nil {
-		return agentAuthorityDomainRecord{}, err
+	if rejectErr := rejectAgentAuthorityDuplicateJSONKeys(payload); rejectErr != nil {
+		return agentAuthorityDomainRecord{}, rejectErr
 	}
 
 	fields, err := exactAgentAuthorityFields(payload,
@@ -152,8 +152,8 @@ func loadAgentAuthorityDomainRecord(directory *os.File, ownerUID, ownerGID uint3
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 
-	if err = decoder.Decode(&record); err != nil {
-		return agentAuthorityDomainRecord{}, err
+	if decodeErr := decoder.Decode(&record); decodeErr != nil {
+		return agentAuthorityDomainRecord{}, decodeErr
 	}
 
 	if err = decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
@@ -326,8 +326,8 @@ func canonicalAgentAuthorityIDMap(path string) ([]agentAuthorityDomainExtent, er
 		extents = append(extents, agentAuthorityDomainExtent{Inside: values[0], Outside: values[1], Length: values[2]})
 	}
 
-	if err = validateAgentAuthorityExtents(extents); err != nil {
-		return nil, err
+	if validateErr := validateAgentAuthorityExtents(extents); validateErr != nil {
+		return nil, validateErr
 	}
 
 	return extents, nil
@@ -473,8 +473,8 @@ func rejectAgentAuthorityDuplicateJSONKeys(payload []byte) error {
 
 				seen[key] = struct{}{}
 
-				if err = visit(); err != nil {
-					return err
+				if visitErr := visit(); visitErr != nil {
+					return visitErr
 				}
 			}
 
@@ -483,8 +483,8 @@ func rejectAgentAuthorityDuplicateJSONKeys(payload []byte) error {
 			return err
 		case '[':
 			for decoder.More() {
-				if err = visit(); err != nil {
-					return err
+				if visitErr := visit(); visitErr != nil {
+					return visitErr
 				}
 			}
 

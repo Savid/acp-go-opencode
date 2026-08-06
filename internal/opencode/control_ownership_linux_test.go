@@ -22,8 +22,8 @@ func TestOpenCodeNativeCannotMutateTrustedHomeLocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(parent) })
-	if err := os.Chmod(parent, 0o711); err != nil {
-		t.Fatal(err)
+	if chmodErr := os.Chmod(parent, 0o711); chmodErr != nil {
+		t.Fatal(chmodErr)
 	}
 	xdg, err := CreateRuntimeXDGDirs(filepath.Join(parent, "native"))
 	if err != nil {
