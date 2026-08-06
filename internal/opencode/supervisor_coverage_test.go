@@ -1707,6 +1707,21 @@ func borrowedTestIsolation(isolation *ProcessIsolation) *ProcessIsolation {
 // supervised-native cases in supervisor_linux_test.go.
 func withNeutralSupervisorIdentityHooks(t *testing.T) {
 	t.Helper()
+
+	acquire := supervisorAcquireIdentityAuthority
+	verify := supervisorVerifyTrustedIdentity
+	adoptLock := supervisorAdoptIdentityLock
+	adoptDomain := supervisorAdoptAuthorityDomain
+	validateAdopted := supervisorValidateAdoptedAuthority
+
+	t.Cleanup(func() {
+		supervisorAcquireIdentityAuthority = acquire
+		supervisorVerifyTrustedIdentity = verify
+		supervisorAdoptIdentityLock = adoptLock
+		supervisorAdoptAuthorityDomain = adoptDomain
+		supervisorValidateAdoptedAuthority = validateAdopted
+	})
+
 	supervisorAcquireIdentityAuthority = func(
 		uint32, uint32, string, string, io.Reader,
 	) (supervisorIdentityLock, supervisorIdentityLock, error) {
