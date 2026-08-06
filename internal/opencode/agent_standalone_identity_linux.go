@@ -182,13 +182,13 @@ type agentStandaloneStateRoot struct {
 }
 
 type agentStandaloneMarker struct {
-	Version    int                           `json:"version"`
-	UID        uint32                        `json:"uid"`
-	GID        uint32                        `json:"gid"`
-	SessionKey string                        `json:"sessionKey"`
-	State      string                        `json:"state"`
-	LeaseID    string                        `json:"leaseId,omitempty"`
-	Paths      []agentStandaloneManifestPath `json:"paths"`
+	Version     int                           `json:"version"`
+	UID         uint32                        `json:"uid"`
+	GID         uint32                        `json:"gid"`
+	OwnerDigest string                        `json:"ownerDigest"`
+	State       string                        `json:"state"`
+	LeaseID     string                        `json:"leaseId,omitempty"`
+	Paths       []agentStandaloneManifestPath `json:"paths"`
 }
 
 type agentStandaloneManifestPath struct {
@@ -228,8 +228,8 @@ func acquireAgentStandaloneIdentity(
 	authorityTest := testRoot != ""
 	if authorityTest {
 		runRoot = testRoot
-		ownerUID = uint32(os.Geteuid())
-		ownerGID = uint32(os.Getegid())
+		ownerUID = effectiveUID()
+		ownerGID = effectiveGID()
 	} else if testOnly {
 		return nil, errors.New("test agent identity lock root is required")
 	}
@@ -1522,7 +1522,7 @@ func validateAgentStandaloneSameBootRebind(
 		return failIdentity(err)
 	}
 
-	if marker.State != agentStandaloneActive || marker.GID != owner.GID || marker.SessionKey != sessionKey || len(marker.Paths) != 0 {
+	if marker.State != agentStandaloneActive || marker.GID != owner.GID || marker.OwnerDigest != sessionKey || len(marker.Paths) != 0 {
 		return failIdentity(errors.New("same-boot authority rebind requires the exact retained standalone ACTIVE marker"))
 	}
 
@@ -1805,14 +1805,14 @@ func auditAgentStandaloneAuthorityRoot(
 				return keyErr
 			}
 
-			if marker.State != agentStandaloneActive || marker.GID != owner.GID || marker.SessionKey != sessionKey || len(marker.Paths) != 0 {
+			if marker.State != agentStandaloneActive || marker.GID != owner.GID || marker.OwnerDigest != sessionKey || len(marker.Paths) != 0 {
 				return fmt.Errorf("standalone owner uid %d has an incompatible retained marker", uid)
 			}
 
 			continue
 		}
 
-		affinityName := agentStandaloneAffinityLockName(marker.SessionKey)
+		affinityName := agentStandaloneAffinityLockName(marker.OwnerDigest)
 		if _, present := affinityLocks[affinityName]; !present {
 			return fmt.Errorf("ownerless durable marker uid %d exists without permanent affinity lock %q", uid, affinityName)
 		}
@@ -2471,7 +2471,7 @@ func validateAgentStandalonePriorDisposition(directory *os.File, owner agentStan
 		return keyErr
 	}
 
-	if marker.State != agentStandaloneActive || marker.GID != owner.GID || marker.SessionKey != sessionKey || len(marker.Paths) != 0 {
+	if marker.State != agentStandaloneActive || marker.GID != owner.GID || marker.OwnerDigest != sessionKey || len(marker.Paths) != 0 {
 		return errors.New("standalone owner has an incompatible retained ACTIVE marker")
 	}
 
@@ -2622,7 +2622,7 @@ func publishAgentStandaloneActive(
 	}
 
 	marker := agentStandaloneMarker{
-		Version: 2, UID: uid, GID: gid, SessionKey: key, State: agentStandaloneActive,
+		Version: 2, UID: uid, GID: gid, OwnerDigest: key, State: agentStandaloneActive,
 		LeaseID: hex.EncodeToString(lease[:]), Paths: make([]agentStandaloneManifestPath, 0),
 	}
 
@@ -2672,7 +2672,7 @@ func loadAgentStandaloneMarker(directory *os.File, uid, ownerUID, ownerGID uint3
 	}
 
 	if marker.Version != 2 || marker.UID != uid || marker.UID == 0 || marker.GID == 0 ||
-		!validAgentStandaloneSessionKey(marker.SessionKey) {
+		!validAgentStandaloneSessionKey(marker.OwnerDigest) {
 		return agentStandaloneMarker{}, errors.New("agent identity marker is incomplete")
 	}
 

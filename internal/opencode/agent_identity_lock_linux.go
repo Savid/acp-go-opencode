@@ -259,8 +259,8 @@ func adoptAgentIdentityLock(file *os.File, uid uint32, testOnly bool, testRoot s
 		}
 
 		runRoot = testRoot
-		trustedUID = uint32(os.Geteuid())
-		trustedGID = uint32(os.Getegid())
+		trustedUID = effectiveUID()
+		trustedGID = effectiveGID()
 	} else if testRoot != "" {
 		return fail(errors.New("test agent identity lock root is forbidden"))
 	}
@@ -322,8 +322,8 @@ func adoptAgentAuthorityDomain(file *os.File, testOnly bool, testRoot string) (*
 		}
 
 		runRoot = testRoot
-		trustedUID = uint32(os.Geteuid())
-		trustedGID = uint32(os.Getegid())
+		trustedUID = effectiveUID()
+		trustedGID = effectiveGID()
 	} else if testRoot != "" {
 		return fail(errors.New("test agent identity lock root is forbidden"))
 	}
@@ -520,8 +520,8 @@ func openAgentIdentityDispositionRoot(testOnly bool, testRoot string) (*os.File,
 		}
 
 		runRoot = testRoot
-		trustedUID = uint32(os.Geteuid())
-		trustedGID = uint32(os.Getegid())
+		trustedUID = effectiveUID()
+		trustedGID = effectiveGID()
 	} else if testRoot != "" {
 		return nil, 0, 0, errors.New("test agent identity lock root is forbidden")
 	}

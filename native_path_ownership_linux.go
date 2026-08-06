@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,8 +15,8 @@ import (
 )
 
 func handoffGeneratedNativeTreePlatform(root string, uid uint32, gid uint32) error {
-	trustedUID := uint32(os.Geteuid())
-	trustedGID := uint32(os.Getegid())
+	trustedUID := effectiveUID()
+	trustedGID := effectiveGID()
 
 	directory, err := openNativeOwnershipDirectory(root, func(stat unix.Stat_t, final bool) error {
 		return validateGeneratedNativeAncestor(stat, final, trustedUID, trustedGID, uid, gid)
@@ -33,8 +34,8 @@ func handoffGeneratedNativeTreePlatform(root string, uid uint32, gid uint32) err
 }
 
 func validateNativeOwnedDirectoryPlatform(root string, uid uint32, gid uint32) error {
-	trustedUID := uint32(os.Geteuid())
-	trustedGID := uint32(os.Getegid())
+	trustedUID := effectiveUID()
+	trustedGID := effectiveGID()
 
 	directory, err := openNativeOwnershipDirectory(root, func(stat unix.Stat_t, final bool) error {
 		return validateDurableNativeAncestor(stat, final, trustedUID, trustedGID, uid, gid)
@@ -336,4 +337,30 @@ func chownAndVerifyNativeInode(fd int, kind uint32, uid uint32, gid uint32, sing
 	}
 
 	return nil
+}
+
+// effectiveUID reports the caller's effective UID. Linux stores UIDs in 32
+// bits, so the int os.Geteuid returns always fits and the guard below never
+// fires; it is here because every caller compares this value against an inode
+// owner, where a silently truncated match would grant trust instead of
+// withholding it. The unrepresentable case therefore fails closed on an ID no
+// inode can carry.
+func effectiveUID() uint32 {
+	uid := os.Geteuid()
+	if uid < 0 || uid > math.MaxUint32 {
+		return math.MaxUint32
+	}
+
+	return uint32(uid)
+}
+
+// effectiveGID reports the caller's effective GID under the same contract as
+// effectiveUID.
+func effectiveGID() uint32 {
+	gid := os.Getegid()
+	if gid < 0 || gid > math.MaxUint32 {
+		return math.MaxUint32
+	}
+
+	return uint32(gid)
 }

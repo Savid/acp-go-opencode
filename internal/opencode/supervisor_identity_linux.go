@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -50,7 +51,7 @@ func writeLinuxSupervisorConfig(_ string, config supervisorConfig) (*os.File, er
 }
 
 func verifyLinuxTrustedSupervisorIdentity(uid uint32) error {
-	if os.Geteuid() != 0 || uid == 0 || uint32(os.Geteuid()) == uid {
+	if os.Geteuid() != 0 || uid == 0 || effectiveUID() == uid {
 		return errors.New("OpenCode liveness supervisor requires a distinct trusted root identity")
 	}
 
@@ -105,7 +106,7 @@ func linuxSupervisorControlCancellation(control io.Reader) (<-chan struct{}, fun
 			case <-stop:
 				return
 			case <-ticker.C:
-				poll := []unix.PollFd{{Fd: int32(file.Fd()), Events: unix.POLLHUP | unix.POLLERR}}
+				poll := []unix.PollFd{{Fd: pollFD(file), Events: unix.POLLHUP | unix.POLLERR}}
 
 				count, pollErr := unix.Poll(poll, 0)
 				if pollErr == nil && count > 0 && poll[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0 {
@@ -132,7 +133,7 @@ func validateLinuxSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) er
 	}
 
 	poll := []unix.PollFd{{
-		Fd:     int32(peer.Fd()),
+		Fd:     pollFD(peer),
 		Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR,
 	}}
 
@@ -228,4 +229,17 @@ func retryLinuxGuardianContainment(containment *guardianContainment) error {
 
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// pollFD narrows a descriptor to the int32 unix.PollFd carries. Linux hands out
+// small non-negative descriptors, so the guard never fires; when the value
+// cannot be represented it yields -1, which poll reports as EBADF rather than
+// aliasing onto a live descriptor.
+func pollFD(file *os.File) int32 {
+	fd := file.Fd()
+	if fd > math.MaxInt32 {
+		return -1
+	}
+
+	return int32(fd)
 }
