@@ -36,6 +36,21 @@ type authBroker struct {
 	shim   *opencode.BrowserShim
 	client opencode.Client
 	log    *slog.Logger
+
+	// removeShim replaces shim deletion. Destruction must report a shim it
+	// failed to delete, and no directory permission denies a privileged
+	// identity that deletion, so the failure is injected per broker. A
+	// package-level seam would race with the flow goroutines that call destroy.
+	removeShim func() error
+}
+
+// removeBrowserShim deletes the shim through the broker's own seam.
+func (b *authBroker) removeBrowserShim() error {
+	if b.removeShim != nil {
+		return b.removeShim()
+	}
+
+	return b.shim.Remove()
 }
 
 // startBroker creates the broker home under the adapter-supplied scratch
@@ -146,7 +161,7 @@ func (b *authBroker) destroy(ctx context.Context) {
 	}
 
 	// The shim outlives the process it shadows, so it goes last.
-	if err := b.shim.Remove(); err != nil {
+	if err := b.removeBrowserShim(); err != nil {
 		b.log.WarnContext(ctx, "remove provider auth broker browser shim failed", loggableError(err))
 	}
 }

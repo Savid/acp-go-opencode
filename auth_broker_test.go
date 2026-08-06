@@ -264,15 +264,15 @@ func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testi
 func TestDestroyReportsBrowserShimRemovalFailure(t *testing.T) {
 	restoreBrokerSeams(t)
 
-	parent := t.TempDir()
-
-	shim, err := opencode.NewBrowserShim(parent)
+	shim, err := opencode.NewBrowserShim(t.TempDir())
 	require.NoError(t, err)
-	require.NoError(t, os.Chmod(parent, 0o500))
 
-	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
-
-	broker := &authBroker{home: t.TempDir(), shim: shim, client: newFakeOpenCodeClient(), log: slog.New(slog.DiscardHandler)}
+	// A 0500 parent does not deny a privileged identity, so the removal failure
+	// is injected instead of provoked, and the shim survives destruction.
+	broker := &authBroker{
+		home: t.TempDir(), shim: shim, client: newFakeOpenCodeClient(), log: slog.New(slog.DiscardHandler),
+		removeShim: func() error { return errors.New("remove shim") },
+	}
 	broker.destroy(context.Background())
 
 	require.DirExists(t, shim.Dir())
