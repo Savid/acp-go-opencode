@@ -297,11 +297,16 @@ func testProviders() opencode.ProvidersResponse {
 	}}}
 }
 
+// Close records the close and signals it under the same mutex that guards the
+// signal, because withBrokerFactory replaces closeSignal and closeOnce when it
+// hands the same fake back for a second broker start. Signalling outside the
+// mutex read both of them while that replacement was writing them.
 func (c *fakeOpenCodeClient) Close(context.Context) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.closed = true
 	c.closeCalls++
-	c.mu.Unlock()
 	c.closeOnce.Do(func() {
 		close(c.closeSignal)
 	})
