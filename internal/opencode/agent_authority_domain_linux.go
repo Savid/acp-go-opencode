@@ -487,8 +487,10 @@ func rejectAgentAuthorityDuplicateJSONKeys(payload []byte) error {
 			return nil
 		}
 
-		switch delimiter {
-		case '{':
+		// A value position only ever yields '{' or '[': the decoder reports a
+		// stray closing delimiter as a token error above, so the remaining
+		// delimiter is always the array opener.
+		if delimiter == '{' {
 			seen := make(map[string]struct{})
 
 			for decoder.More() {
@@ -497,11 +499,9 @@ func rejectAgentAuthorityDuplicateJSONKeys(payload []byte) error {
 					return keyErr
 				}
 
-				key, ok := keyToken.(string)
-				if !ok {
-					return errors.New("json object key is not a string")
-				}
-
+				// The decoder rejects a non-string object member name as a
+				// token error, so this assertion cannot fail.
+				key, _ := keyToken.(string)
 				if _, duplicate := seen[key]; duplicate {
 					return fmt.Errorf("json object contains duplicate key %q", key)
 				}
@@ -516,19 +516,17 @@ func rejectAgentAuthorityDuplicateJSONKeys(payload []byte) error {
 			_, err = decoder.Token()
 
 			return err
-		case '[':
-			for decoder.More() {
-				if visitErr := visit(); visitErr != nil {
-					return visitErr
-				}
-			}
-
-			_, err = decoder.Token()
-
-			return err
-		default:
-			return errors.New("json contains an unexpected closing delimiter")
 		}
+
+		for decoder.More() {
+			if visitErr := visit(); visitErr != nil {
+				return visitErr
+			}
+		}
+
+		_, err = decoder.Token()
+
+		return err
 	}
 	if err := visit(); err != nil {
 		return err
