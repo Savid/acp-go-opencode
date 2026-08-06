@@ -50,8 +50,7 @@ func browserProbeDir(t *testing.T, marker string) string {
 func browserLaunchingOpenCodeExecutable(t *testing.T) string {
 	t.Helper()
 
-	testBinary, err := os.Executable()
-	require.NoError(t, err)
+	directory := testTraversableTempDir(t)
 
 	var body strings.Builder
 
@@ -64,11 +63,11 @@ func browserLaunchingOpenCodeExecutable(t *testing.T) string {
 	fmt.Fprintf(
 		&body,
 		"ACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n",
-		testBinary,
+		reachableTestBinary(t, directory),
 	)
 
-	script := filepath.Join(testTraversableTempDir(t), "fake-opencode")
-	require.NoError(t, os.WriteFile(script, []byte(body.String()), 0o700))
+	script := filepath.Join(directory, "fake-opencode")
+	require.NoError(t, os.WriteFile(script, []byte(body.String()), 0o755))
 
 	return script
 }

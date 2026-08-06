@@ -370,16 +370,17 @@ func TestRunLivenessPublishAndPIDFailures(t *testing.T) {
 func TestRunGuardianHappyPathAndPreReadinessFailure(t *testing.T) {
 	skipUnprivilegedDarwinIsolation(t)
 	preserveSupervisorGlobals(t)
+	withNeutralSupervisorIdentityHooks(t)
 	root := t.TempDir()
 	supervisorInput = strings.NewReader("payload\n")
 	supervisorOutput = io.Discard
 	supervisorError = io.Discard
-	config := supervisorConfig{
+	config := withTestSupervisorIdentity(supervisorConfig{
 		NativePath: "/bin/sh", NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
 		Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
 		NativePIDFile: filepath.Join(root, "native.pid"),
-	}
+	})
 	require.NoError(t, runGuardian(config))
 
 	root = t.TempDir()
@@ -479,15 +480,14 @@ func TestSupervisorBootstrapDispatchesMissingAndSuccessfulLiveness(t *testing.T)
 
 	t.Run("liveness", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
+		withNeutralSupervisorIdentityHooks(t)
 		t.Setenv(supervisorModeEnv, supervisorModeLiveness)
 		root := t.TempDir()
-		isolation := testProcessIsolation()
-		config := supervisorConfig{
+		config := withTestSupervisorIdentity(supervisorConfig{
 			NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.01"}, NativeEnv: os.Environ(),
 			Home: filepath.Join(root, "home"), Scratch: root, Started: filepath.Join(root, "started"),
 			Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
-			IsolationUID: isolation.UID, IsolationGID: isolation.GID,
-		}
+		})
 		configFile, err := writeSupervisorConfig(root, config)
 		require.NoError(t, err)
 		peer, err := os.CreateTemp(t.TempDir(), "peer")
@@ -499,6 +499,10 @@ func TestSupervisorBootstrapDispatchesMissingAndSuccessfulLiveness(t *testing.T)
 
 			return peer
 		}
+		// The peer is a plain file here. Linux requires a live guardian pipe,
+		// which only a real supervised launch provides and which the
+		// supervised-native cases in supervisor_linux_test.go prove.
+		supervisorValidateGuardianPeer = func(*os.File, <-chan struct{}) error { return nil }
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
@@ -615,15 +619,19 @@ func TestSupervisorQuarantineCompletionAndStreamBranches(t *testing.T) {
 
 func TestSupervisorDefaultHooksAndConfigWriteFailures(t *testing.T) {
 	preserveSupervisorGlobals(t)
-	lock, domain, err := supervisorAcquireIdentityAuthority(1, 2, "owner", "/state", strings.NewReader(""))
+	withNeutralSupervisorIdentityHooks(t)
+	isolation := testProcessIsolation()
+	lock, domain, err := supervisorAcquireIdentityAuthority(
+		isolation.UID, isolation.GID, isolation.StandaloneOwnerID, isolation.StandaloneStateRoot, strings.NewReader(""),
+	)
 	require.NoError(t, err)
 	require.NoError(t, lock.Close())
 	require.NoError(t, domain.Close())
-	require.NoError(t, supervisorVerifyTrustedIdentity(1))
-	lock, err = supervisorAdoptIdentityLock(1)
+	require.NoError(t, supervisorVerifyTrustedIdentity(isolation.UID))
+	lock, err = supervisorAdoptIdentityLock(isolation.UID)
 	require.NoError(t, err)
 	require.NoError(t, lock.Close())
-	domain, err = supervisorAdoptAuthorityDomain(1)
+	domain, err = supervisorAdoptAuthorityDomain(isolation.UID)
 	require.NoError(t, err)
 	require.NoError(t, domain.Close())
 
@@ -724,6 +732,7 @@ func TestSupervisorCommandValidationAndCapabilityFailures(t *testing.T) {
 	t.Run("identity duplicate", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		config := valid(t)
+		borrowedTestIsolation(config.Isolation)
 		want := errors.New("duplicate")
 		config.Isolation.IdentityLock = duplicateSupervisorCapability{err: want}
 		config.Isolation.AuthorityDomain = duplicateSupervisorCapability{}
@@ -733,6 +742,7 @@ func TestSupervisorCommandValidationAndCapabilityFailures(t *testing.T) {
 	t.Run("domain duplicate", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		config := valid(t)
+		borrowedTestIsolation(config.Isolation)
 		file, err := os.CreateTemp(t.TempDir(), "identity")
 		require.NoError(t, err)
 		want := errors.New("duplicate")
@@ -744,6 +754,7 @@ func TestSupervisorCommandValidationAndCapabilityFailures(t *testing.T) {
 	t.Run("borrowed capabilities", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		config := valid(t)
+		borrowedTestIsolation(config.Isolation)
 		identity, err := os.CreateTemp(t.TempDir(), "identity")
 		require.NoError(t, err)
 		domain, err := os.CreateTemp(t.TempDir(), "domain")
@@ -1199,13 +1210,13 @@ func TestSupervisorInjectedFilesystemAndContainmentFailures(t *testing.T) {
 
 func TestSupervisorDispatchBootstrapAndEarlyFailures(t *testing.T) {
 	preserveSupervisorGlobals(t)
+	withNeutralSupervisorIdentityHooks(t)
 	isolation := testProcessIsolation()
 	root := t.TempDir()
-	config := supervisorConfig{
+	config := withTestSupervisorIdentity(supervisorConfig{
 		NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.1"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
-		IsolationUID: isolation.UID, IsolationGID: isolation.GID,
-	}
+	})
 	path, err := writeSupervisorConfig(root, config)
 	require.NoError(t, err)
 	supervisorInput = strings.NewReader("")
@@ -1229,8 +1240,7 @@ func TestSupervisorDispatchBootstrapAndEarlyFailures(t *testing.T) {
 
 		return len(value), nil
 	}
-	_, _, err = supervisorCommand(context.Background(), supervisorConfig{Scratch: "", Isolation: isolation})
-	require.ErrorContains(t, err, "scratch root")
+	requireSupervisorCommandWithoutScratchRoot(t, isolation)
 
 	root = t.TempDir()
 	claim, err := homelock.AcquireClaim(filepath.Join(root, "home"))
@@ -1482,14 +1492,15 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 	t.Run("guardian dispatch", func(t *testing.T) {
 		skipUnprivilegedDarwinIsolation(t)
 		preserveSupervisorGlobals(t)
+		withNeutralSupervisorIdentityHooks(t)
 		root := t.TempDir()
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
-		config := supervisorConfig{
+		config := withTestSupervisorIdentity(supervisorConfig{
 			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
-		}
+		})
 		path, err := writeSupervisorConfig(root, config)
 		require.NoError(t, err)
 		require.NoError(t, runSupervisor(supervisorModeGuardian, path))
@@ -1497,8 +1508,9 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 
 	t.Run("guardian config", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
-		err := runGuardian(supervisorConfig{Home: t.TempDir(), Scratch: ""})
-		require.ErrorContains(t, err, "scratch root")
+		withNeutralSupervisorIdentityHooks(t)
+		err := runGuardian(withTestSupervisorIdentity(supervisorConfig{Home: t.TempDir(), Scratch: ""}))
+		require.ErrorContains(t, err, guardianWithoutScratchRootRefusal)
 	})
 
 	t.Run("guardian completion publish", func(t *testing.T) {
@@ -1656,4 +1668,56 @@ func TestRunGuardianWritesCompletionProofWhenLivenessLeftNone(t *testing.T) {
 		NativePIDFile: filepath.Join(root, "native.pid"),
 	}))
 	require.FileExists(t, completion)
+}
+
+// withTestSupervisorIdentity fills the identity a private supervisor config
+// must carry. readSupervisorConfig rejects a config whose isolation IDs are
+// zero, and on Linux the guardian binds the standalone owner and state root
+// before it dispatches, so a config naming neither never reaches the branch the
+// case is about. Every fixture claims the one package identity: the authority
+// binds a UID to a single owner and state root permanently.
+func withTestSupervisorIdentity(config supervisorConfig) supervisorConfig {
+	isolation := testProcessIsolation()
+	config.IsolationUID = isolation.UID
+	config.IsolationGID = isolation.GID
+	config.StandaloneOwnerID = isolation.StandaloneOwnerID
+	config.StandaloneStateRoot = isolation.StandaloneStateRoot
+	config.Isolation = isolation
+
+	return config
+}
+
+// borrowedTestIsolation drops the standalone owner fields a borrowed process
+// identity must not carry: the policy refuses a config that claims capabilities
+// and owner fields at once.
+func borrowedTestIsolation(isolation *ProcessIsolation) *ProcessIsolation {
+	isolation.StandaloneOwnerID = ""
+	isolation.StandaloneStateRoot = ""
+
+	return isolation
+}
+
+// withNeutralSupervisorIdentityHooks installs the platform-neutral identity
+// hooks for cases that exercise supervisor dispatch rather than the authority
+// itself. Linux replaces these at init with the real agent authority, which
+// claims one identity exclusively and hands the claim down an inherited
+// descriptor: a single test process cannot establish and release that claim
+// repeatedly, so an in-process dispatch case dies on the authority long before
+// the branch it names. The authority itself is proven end to end by the
+// supervised-native cases in supervisor_linux_test.go.
+func withNeutralSupervisorIdentityHooks(t *testing.T) {
+	t.Helper()
+	supervisorAcquireIdentityAuthority = func(
+		uint32, uint32, string, string, io.Reader,
+	) (supervisorIdentityLock, supervisorIdentityLock, error) {
+		return noopSupervisorIdentityLock{}, noopSupervisorIdentityLock{}, nil
+	}
+	supervisorVerifyTrustedIdentity = func(uint32) error { return nil }
+	supervisorAdoptIdentityLock = func(uint32) (supervisorIdentityLock, error) {
+		return noopSupervisorIdentityLock{}, nil
+	}
+	supervisorAdoptAuthorityDomain = func(uint32) (supervisorIdentityLock, error) {
+		return noopSupervisorIdentityLock{}, nil
+	}
+	supervisorValidateAdoptedAuthority = func(supervisorConfig) error { return nil }
 }

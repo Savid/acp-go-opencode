@@ -414,10 +414,9 @@ func startSupervisedNative(t *testing.T) *supervisedNative {
 	// the session.
 	require.NoError(t, unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0))
 
-	const standaloneStateRoot = "/var/lib/acp-go-opencode-test"
-	require.NoError(t, os.MkdirAll(standaloneStateRoot, 0o700))
-	require.NoError(t, os.Chown(standaloneStateRoot, 65534, 65534))
-	require.NoError(t, os.Chmod(standaloneStateRoot, 0o700))
+	// One state root for the whole package: the authority permanently binds a
+	// UID to a single owner and state root.
+	standaloneStateRoot := testStandaloneStateRoot()
 
 	root, err := os.MkdirTemp("", "acp-go-opencode-authority-")
 	require.NoError(t, err)

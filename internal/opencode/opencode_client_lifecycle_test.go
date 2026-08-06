@@ -499,8 +499,11 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	if server.xdg.Root != root {
 		t.Fatalf("xdg dirs = %#v", server.xdg)
 	}
+	// The supervisor holds both locks in the control root beside the XDG root,
+	// which is the home it was handed.
+	controlRoot := ControlRootForXDG(server.xdg.Root)
 	for _, name := range []string{homelock.ClaimFileName, homelock.LivenessFileName} {
-		if _, statErr := os.Stat(filepath.Join(server.xdg.Root, name)); statErr != nil {
+		if _, statErr := os.Stat(filepath.Join(controlRoot, name)); statErr != nil {
 			t.Fatalf("runtime lock %s was not retained: %v", name, statErr)
 		}
 	}
@@ -521,7 +524,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		t.Fatalf("second Close: %v", err)
 	}
 	for _, name := range []string{homelock.ClaimFileName, homelock.LivenessFileName} {
-		if _, err := os.Stat(filepath.Join(server.xdg.Root, name)); err != nil {
+		if _, err := os.Stat(filepath.Join(controlRoot, name)); err != nil {
 			t.Fatalf("runtime lock file %s was unlinked: %v", name, err)
 		}
 	}
@@ -1611,17 +1614,40 @@ func TestFakeOpenCodeServerProcessHelper(t *testing.T) {
 
 func fakeOpenCodeExecutable(t *testing.T) string {
 	t.Helper()
-	testBinary, err := os.Executable()
-	if err != nil {
-		t.Fatalf("test executable: %v", err)
-	}
-	script := filepath.Join(testTraversableTempDir(t), "fake-opencode")
-	body := fmt.Sprintf("#!/bin/sh\nACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n", testBinary)
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	directory := testTraversableTempDir(t)
+	script := filepath.Join(directory, "fake-opencode")
+	body := fmt.Sprintf(
+		"#!/bin/sh\nACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n",
+		reachableTestBinary(t, directory),
+	)
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake executable: %v", err)
 	}
 
 	return script
+}
+
+// reachableTestBinary copies the test binary somewhere the isolated native
+// identity can reach it. The product launches the fake executable as that
+// identity, and the binary the go tool builds is a 0700 root-owned file inside
+// a 0700 build directory, so exec'ing it in place fails for anyone but the
+// runner and the launch dies before the server ever listens.
+func reachableTestBinary(t *testing.T, directory string) string {
+	t.Helper()
+	source, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test executable: %v", err)
+	}
+	payload, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read test executable: %v", err)
+	}
+	reachable := filepath.Join(directory, "fake-opencode-helper")
+	if err = os.WriteFile(reachable, payload, 0o755); err != nil {
+		t.Fatalf("publish test executable: %v", err)
+	}
+
+	return reachable
 }
 
 func runFakeOpenCodeServerProcess() {
@@ -1934,7 +1960,7 @@ func TestColdStartupReleaseGate(t *testing.T) {
 	for range releaseGateRepetitions {
 		started := time.Now()
 		client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
-			Root:            t.TempDir(),
+			Root:            testGeneratedTempDir(t),
 			ExecutablePath:  executable,
 			MinVersion:      "1.18.3",
 			HealthTimeout:   5 * time.Second,
