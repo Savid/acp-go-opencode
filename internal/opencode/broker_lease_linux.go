@@ -13,7 +13,7 @@ var leaseProcReadFile = os.ReadFile
 
 // errMalformedProcStat is why a /proc stat line cannot identify a process: it
 // does not carry the fields the start time is read from. Both refusals share one
-// identity so a caller can tell an unparseable entry from an unreadable one,
+// identity so a caller can tell an unparsable entry from an unreadable one,
 // which is the difference between a PID that answered with nonsense and a PID
 // that is simply gone.
 var errMalformedProcStat = errors.New("malformed proc stat")
