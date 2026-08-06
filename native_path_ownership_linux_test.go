@@ -1011,6 +1011,30 @@ func TestNativeOwnershipTrustsNothingOnAnUnrepresentableEffectiveIdentity(t *tes
 			},
 			guarded: effectiveGID,
 		},
+		{
+			name: "uid above the 32-bit range",
+			fault: func(t *testing.T) {
+				t.Helper()
+
+				previous := effectiveUIDSource
+				effectiveUIDSource = func() int { return math.MaxUint32 + 1 }
+
+				t.Cleanup(func() { effectiveUIDSource = previous })
+			},
+			guarded: effectiveUID,
+		},
+		{
+			name: "gid above the 32-bit range",
+			fault: func(t *testing.T) {
+				t.Helper()
+
+				previous := effectiveGIDSource
+				effectiveGIDSource = func() int { return math.MaxUint32 + 1 }
+
+				t.Cleanup(func() { effectiveGIDSource = previous })
+			},
+			guarded: effectiveGID,
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			native := nativeOwnershipGeneratedRoot(t)

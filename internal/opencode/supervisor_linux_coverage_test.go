@@ -4,6 +4,7 @@ package opencode
 
 import (
 	"errors"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -348,4 +349,14 @@ func configureLinuxChildrenFixture(t *testing.T, children string) {
 	require.NoError(t, os.Mkdir(filepath.Join(root, "task"), 0o700))
 	supervisorLinuxReadDir = func(string) ([]os.DirEntry, error) { return os.ReadDir(root) }
 	supervisorLinuxReadFile = func(string) ([]byte, error) { return []byte(children), nil }
+}
+
+// TestReaperPollDescriptorFailsClosed proves the reaper's pidfd poll narrows a
+// descriptor it cannot represent to -1 rather than to a number that could name
+// a live descriptor: poll never reports a negative entry ready, so the walk
+// cannot conclude an adopted descendant is alive off a truncated value.
+func TestReaperPollDescriptorFailsClosed(t *testing.T) {
+	require.Equal(t, int32(-1), reaperPollFD(-1))
+	require.Equal(t, int32(-1), reaperPollFD(math.MaxInt32+1))
+	require.Equal(t, int32(7), reaperPollFD(7))
 }

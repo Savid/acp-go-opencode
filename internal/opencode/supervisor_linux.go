@@ -5,6 +5,7 @@ package opencode
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -250,6 +251,18 @@ func linuxReaperNoChildren() (bool, error) {
 	}
 }
 
+// reaperPollFD narrows a pidfd to the int32 unix.PollFd carries. Linux hands
+// out small non-negative descriptors, so the guard never fires; an
+// unrepresentable value yields -1, which poll reports as EBADF rather than
+// aliasing onto a live descriptor.
+func reaperPollFD(fd int) int32 {
+	if fd < 0 || fd > math.MaxInt32 {
+		return -1
+	}
+
+	return int32(fd)
+}
+
 func signalLinuxReaperChildren(waitOwnedPID int, signal unix.Signal) (int, error) {
 	children, err := linuxReaperChildren()
 	if err != nil {
@@ -275,7 +288,7 @@ func signalLinuxReaperChildren(waitOwnedPID int, signal unix.Signal) (int, error
 			return 0, fmt.Errorf("signal adopted native descendant %d: %w", pid, signalErr)
 		}
 
-		poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}} //nolint:gosec // Linux file descriptors fit pollfd's signed 32-bit field.
+		poll := []unix.PollFd{{Fd: reaperPollFD(fd), Events: unix.POLLIN}}
 		_, pollErr := supervisorLinuxPoll(poll, 0)
 		closeErr := supervisorLinuxClose(fd)
 
