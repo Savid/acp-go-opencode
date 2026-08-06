@@ -22,6 +22,11 @@ const (
 	processIsolationUserEnv       = "USER"
 	processIsolationLogNameEnv    = "LOGNAME"
 	processIsolationPathEnv       = "PATH"
+	// processIsolationAuthorityRoot is the trusted agent-identity authority
+	// tree. A standalone state root may never live inside it: the supervisor
+	// owns that tree outright, and a state root nested there would put
+	// agent-writable state under the authority the supervisor proves against.
+	processIsolationAuthorityRoot = "/var/lib/acp-go/agent-identities"
 )
 
 var (
@@ -58,11 +63,6 @@ func loadProcessIsolationConfig(path string) (processIsolationConfig, error) {
 	}
 
 	file := os.NewFile(uintptr(fd), path)
-	if file == nil {
-		_ = unix.Close(fd)
-
-		return processIsolationConfig{}, fmt.Errorf("open -%s: invalid file descriptor", processIsolationConfigFlag)
-	}
 	defer file.Close()
 
 	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o777 != 0o600 || stat.Uid != 0 || stat.Nlink != 1 {
@@ -268,12 +268,11 @@ func validateStandaloneStateRoot(value string) error {
 		}
 	}
 
-	relative, err := filepath.Rel("/var/lib/acp-go/agent-identities", value)
-	if err != nil {
-		return fmt.Errorf("compare standaloneStateRoot with authority root: %w", err)
-	}
-
-	if relative == "." || relative != ".." && !strings.HasPrefix(relative, "../") {
+	// value is already proven absolute and canonical, so containment is an
+	// exact prefix question. filepath.Rel would answer it too, but only ever
+	// with a nil error for two absolute paths, leaving a branch no input can
+	// drive.
+	if value == processIsolationAuthorityRoot || strings.HasPrefix(value, processIsolationAuthorityRoot+"/") {
 		return fmt.Errorf("standaloneStateRoot must be outside the authority root")
 	}
 
@@ -341,17 +340,11 @@ func openProtectedAbsolutePath(path string, finalFlags int) (int, *unix.Stat_t, 
 		return -1, nil, err
 	}
 
-	for index, component := range components {
-		last := index == len(components)-1
-
-		flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
-		if last {
-			flags |= finalFlags
-		} else {
-			flags |= unix.O_DIRECTORY
-		}
-
-		childFD, openErr := unix.Openat(parentFD, component, flags, 0)
+	final := len(components) - 1
+	for _, component := range components[:final] {
+		childFD, openErr := unix.Openat(
+			parentFD, component, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0,
+		)
 		if openErr != nil {
 			return -1, nil, fmt.Errorf("open component %q: %w", component, openErr)
 		}
@@ -361,10 +354,6 @@ func openProtectedAbsolutePath(path string, finalFlags int) (int, *unix.Stat_t, 
 			_ = unix.Close(childFD)
 
 			return -1, nil, fmt.Errorf("stat component %q: %w", component, statErr)
-		}
-
-		if last {
-			return childFD, &stat, nil
 		}
 
 		if err := validateProtectedAncestorStat(&stat, component); err != nil {
@@ -377,7 +366,23 @@ func openProtectedAbsolutePath(path string, finalFlags int) (int, *unix.Stat_t, 
 		parentFD = childFD
 	}
 
-	return -1, nil, fmt.Errorf("path has no final component")
+	leaf := components[final]
+
+	leafFD, openErr := unix.Openat(
+		parentFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|finalFlags, 0,
+	)
+	if openErr != nil {
+		return -1, nil, fmt.Errorf("open component %q: %w", leaf, openErr)
+	}
+
+	var stat unix.Stat_t
+	if statErr := unix.Fstat(leafFD, &stat); statErr != nil {
+		_ = unix.Close(leafFD)
+
+		return -1, nil, fmt.Errorf("stat component %q: %w", leaf, statErr)
+	}
+
+	return leafFD, &stat, nil
 }
 
 func validateProtectedAncestor(fd int, component string) error {
