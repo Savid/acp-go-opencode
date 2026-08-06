@@ -16,8 +16,16 @@ import (
 const linuxAgentIdentityNamespace = "/var/lib/acp-go/agent-identities"
 const linuxSupervisorProofNamespace = "/run/acp-go/supervisor-proofs"
 
+// Seams for the private supervisor config descriptor. The anonymous memory the
+// kernel just handed back always accepts a mode change and always rewinds, so
+// the fail-closed guards around those steps cannot be reached through the real
+// primitives; tests swap these to prove the guards abort and leave no
+// descriptor behind.
+var linuxSupervisorMemfdCreate = unix.MemfdCreate
+var linuxSupervisorSeek = (*os.File).Seek
+
 func writeLinuxSupervisorConfig(_ string, config supervisorConfig) (*os.File, error) {
-	fd, err := unix.MemfdCreate("acp-go-opencode-supervisor-config", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	fd, err := linuxSupervisorMemfdCreate("acp-go-opencode-supervisor-config", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
 	if err != nil {
 		return nil, fmt.Errorf("create private supervisor config descriptor: %w", err)
 	}
@@ -41,7 +49,7 @@ func writeLinuxSupervisorConfig(_ string, config supervisorConfig) (*os.File, er
 		return nil, fmt.Errorf("seal private supervisor config descriptor: %w", err)
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	if _, err := linuxSupervisorSeek(file, 0, io.SeekStart); err != nil {
 		_ = file.Close()
 
 		return nil, fmt.Errorf("rewind private supervisor config descriptor: %w", err)
@@ -137,7 +145,7 @@ func validateLinuxSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) er
 		Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR,
 	}}
 
-	ready, err := unix.Poll(poll, 0)
+	ready, err := supervisorLinuxPoll(poll, 0)
 	if err != nil {
 		return fmt.Errorf("poll OpenCode guardian before native launch: %w", err)
 	}
@@ -155,7 +163,7 @@ func linuxSupervisorMarkerRoot(supervisorConfig) (string, error) {
 		return "", err
 	}
 
-	if err := unix.Close(fd); err != nil {
+	if err := supervisorLinuxClose(fd); err != nil {
 		return "", fmt.Errorf("close supervisor proof namespace: %w", err)
 	}
 
@@ -163,7 +171,7 @@ func linuxSupervisorMarkerRoot(supervisorConfig) (string, error) {
 }
 
 func openLinuxSupervisorProofDirectory() (int, error) {
-	if os.Geteuid() != 0 {
+	if effectiveUIDSource() != 0 {
 		return -1, errors.New("supervisor proof namespace requires a trusted root supervisor")
 	}
 
@@ -182,6 +190,13 @@ func openLinuxSupervisorProofDirectory() (int, error) {
 	return openLinuxSupervisorProofComponent(acpGoFD, "supervisor-proofs", 0o700, true)
 }
 
+// Seam for the fail-closed guard over a proof component's own stat. A directory
+// descriptor openat has just returned always stats, so the guard cannot be
+// reached through the real syscall; tests swap this to prove that a component
+// the kernel stops answering for aborts the whole namespace open and leaks no
+// descriptor.
+var linuxSupervisorProofFstat = unix.Fstat
+
 func openLinuxSupervisorProofComponent(parentFD int, name string, mode uint32, create bool) (int, error) {
 	if create {
 		err := unix.Mkdirat(parentFD, name, mode)
@@ -196,7 +211,7 @@ func openLinuxSupervisorProofComponent(parentFD int, name string, mode uint32, c
 	}
 
 	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
+	if err := linuxSupervisorProofFstat(fd, &stat); err != nil {
 		_ = unix.Close(fd)
 
 		return -1, fmt.Errorf("stat supervisor proof directory %q: %w", name, err)
