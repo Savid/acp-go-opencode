@@ -89,7 +89,7 @@ Both input bounds are advertised at initialize, so a host can pre-check a prompt
 against the exact numbers the gates enforce.
 
 `WithInputHandoffRoot` enables the handoff input form described in
-[Prompt Streaming](/core/prompt-streaming). It is a read root: the adapter
+[Prompt Streaming](/docs/core/prompt-streaming). It is a read root: the adapter
 resolves a prompt image's `file://` URI beneath it, verifies the declared
 digest, and reads the bytes, and it never writes, moves, or deletes anything
 there. It materializes nothing and therefore carries no scratch semantics, and
