@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -29,6 +30,36 @@ func testProcessIsolation() *ProcessIsolation {
 	return &ProcessIsolation{
 		UID: uint32(uid), GID: uint32(gid), BaseEnvironment: environment,
 		StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test",
+	}
+}
+
+// testForeignProcessIsolation names an identity the current process is not.
+// Both IDs stay nonzero so the policy is admissible and the refusal under test
+// is the ownership handoff, not the identity validation that precedes it.
+func testForeignProcessIsolation() *ProcessIsolation {
+	isolation := testProcessIsolation()
+	isolation.UID++
+	isolation.GID++
+
+	return isolation
+}
+
+// testUnhandoffableXDGDirs builds runtime XDG dirs beneath an ancestry the
+// trusted identity keeps to itself, so a handoff to any foreign identity is
+// refused on every platform.
+func testUnhandoffableXDGDirs(t *testing.T) XDGDirs {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "runtime")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("create unhandoffable test directory: %v", err)
+	}
+
+	return XDGDirs{
+		Root:   root,
+		Data:   filepath.Join(root, "data"),
+		Config: filepath.Join(root, "config"),
+		Cache:  filepath.Join(root, "cache"),
+		State:  filepath.Join(root, "state"),
 	}
 }
 

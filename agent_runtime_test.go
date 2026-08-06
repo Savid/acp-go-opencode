@@ -751,7 +751,7 @@ func TestDarwinBestEffortScratchReservationCardinality(t *testing.T) {
 }
 
 func TestNativeOwnedDurableRuntimeHomeIsNeverMaterializedByTheAdapter(t *testing.T) {
-	home := t.TempDir()
+	home := testNativeOwnedHome(t)
 	client := newFakeOpenCodeClient()
 	agent := NewAgent(
 		WithProcessIsolation(ProcessIsolation{
@@ -780,7 +780,7 @@ func TestNativeOwnedDurableRuntimeHomeIsNeverMaterializedByTheAdapter(t *testing
 }
 
 func TestNativeOwnedDurableRuntimeHomeRejectsSeedFilesBeforeLaunch(t *testing.T) {
-	home := t.TempDir()
+	home := testNativeOwnedHome(t)
 	agent := NewAgent(
 		WithProcessIsolation(ProcessIsolation{
 			UID:                 uint32(os.Geteuid()),
@@ -804,10 +804,10 @@ func TestNativeOwnedDurableRuntimeHomeRejectsSeedFilesBeforeLaunch(t *testing.T)
 }
 
 func TestNativeOwnedDurableRuntimeHomeRejectsWrongOwnerBeforeLaunch(t *testing.T) {
-	home := t.TempDir()
+	home := testNativeOwnedHome(t)
 	agent := NewAgent(
 		WithHome(home),
-		WithProcessIsolation(ProcessIsolation{UID: uint32(os.Geteuid()) + 1, GID: uint32(os.Getegid())}),
+		WithProcessIsolation(ProcessIsolation{UID: uint32(os.Geteuid()) + 1, GID: uint32(os.Getegid()) + 1}),
 	)
 	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 		t.Fatal("native runtime started")
@@ -816,7 +816,7 @@ func TestNativeOwnedDurableRuntimeHomeRejectsWrongOwnerBeforeLaunch(t *testing.T
 	}
 
 	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
-	require.ErrorContains(t, err, "ownership validation is unsupported")
+	require.ErrorContains(t, err, nativeOwnedHomeRefusal)
 	require.Nil(t, client)
 	require.Nil(t, nativeRelease)
 	require.Nil(t, scratchRelease)

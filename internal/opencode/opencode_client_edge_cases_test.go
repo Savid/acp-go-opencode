@@ -68,11 +68,11 @@ func TestStartServerHappyPathWithoutPrivilegedProcessLaunch(t *testing.T) {
 		})}
 	}
 
-	shim, err := NewBrowserShim(t.TempDir())
+	shim, err := NewBrowserShim(testTraversableTempDir(t))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = shim.Remove() })
 	client, err := StartServer(context.Background(), StartOptions{
-		Root:             t.TempDir(),
+		Root:             testGeneratedTempDir(t),
 		ExecutablePath:   "/usr/bin/true",
 		ProcessIsolation: testProcessIsolation(),
 		skipSupervisor:   true,
@@ -114,9 +114,10 @@ func TestStartServerEarlyContainmentAndCredentialFailures(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		options := base(t)
 		options.HandoffXDG = true
-		options.ProcessIsolation = &ProcessIsolation{UID: uint32(os.Geteuid()) + 1, GID: uint32(os.Getegid()), BaseEnvironment: map[string]string{}}
+		options.ExistingXDG = testUnhandoffableXDGDirs(t)
+		options.ProcessIsolation = testForeignProcessIsolation()
 		_, err := StartServer(context.Background(), options)
-		require.ErrorContains(t, err, "ownership handoff is unsupported")
+		require.ErrorContains(t, err, generatedTreeHandoffRefusal)
 	})
 
 	t.Run("browser handoff", func(t *testing.T) {
@@ -125,9 +126,9 @@ func TestStartServerEarlyContainmentAndCredentialFailures(t *testing.T) {
 		shim, err := NewBrowserShim(t.TempDir())
 		require.NoError(t, err)
 		options.BrowserShim = shim
-		options.ProcessIsolation = &ProcessIsolation{UID: uint32(os.Geteuid()) + 1, GID: uint32(os.Getegid()), BaseEnvironment: map[string]string{}}
+		options.ProcessIsolation = testForeignProcessIsolation()
 		_, err = StartServer(context.Background(), options)
-		require.ErrorContains(t, err, "ownership handoff is unsupported")
+		require.ErrorContains(t, err, generatedTreeHandoffRefusal)
 	})
 
 	t.Run("credential", func(t *testing.T) {
