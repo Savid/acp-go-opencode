@@ -227,7 +227,7 @@ func handoffNativeOwnershipDirectory(
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == "." || name == ".." || strings.ContainsRune(name, '/') {
+		if name == "." || name == parentPathSegment || strings.ContainsRune(name, '/') {
 			return fmt.Errorf("invalid generated native entry %q", name)
 		}
 

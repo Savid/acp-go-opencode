@@ -502,7 +502,7 @@ func pathWithinRoot(root, path string) bool {
 		return false
 	}
 
-	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+	return relative != parentPathSegment && !strings.HasPrefix(relative, parentPathSegment+string(filepath.Separator)) && !filepath.IsAbs(relative)
 }
 
 // toolContentSnapshot maps a completed tool state's attachments and merges

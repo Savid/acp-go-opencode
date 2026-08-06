@@ -29,6 +29,8 @@ const (
 	syncTypeSessionCreated  = "session.created.1"
 	syncFieldPart           = "part"
 	syncFieldDirectory      = "directory"
+	syncFieldRoot           = "root"
+	parentPathSegment       = ".."
 )
 
 // A native write that lands between the two /sync/history reads invalidates the
@@ -748,7 +750,7 @@ func rebasePathValues(value any, field, sourceCwd, targetCwd string) (any, error
 
 		return typed, nil
 	case string:
-		if field != syncFieldDirectory && field != "cwd" && field != "root" && field != jsonFieldPath {
+		if field != syncFieldDirectory && field != "cwd" && field != syncFieldRoot && field != jsonFieldPath {
 			return typed, nil
 		}
 
@@ -757,7 +759,7 @@ func rebasePathValues(value any, field, sourceCwd, targetCwd string) (any, error
 		}
 
 		relative, err := filepath.Rel(sourceCwd, typed)
-		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		if err != nil || relative == parentPathSegment || strings.HasPrefix(relative, parentPathSegment+string(filepath.Separator)) || filepath.IsAbs(relative) {
 			return nil, fmt.Errorf("absolute %s %q escapes source cwd %q", field, typed, sourceCwd)
 		}
 

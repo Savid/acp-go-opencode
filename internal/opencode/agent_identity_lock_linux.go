@@ -343,7 +343,7 @@ func adoptAgentAuthorityDomain(file *os.File, testOnly bool, testRoot string) (*
 		return fail(err)
 	}
 
-	const name = "domain.lock"
+	name := agentAuthorityDomainLockName
 	if err = unix.Fstatat(int(directory.Fd()), name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fail(fmt.Errorf("inspect named agent authority domain %s: %w", name, err))
 	}
