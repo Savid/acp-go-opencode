@@ -27,6 +27,12 @@ const (
 	agentAuthorityDomainMaxExtents = 340
 )
 
+// The agentAuthorityDomain* seams stand in for the kernel answers this file
+// depends on. They always hold their production syscall, and exist so a test
+// can prove the domain proof aborts when the kernel stops answering for a
+// /proc fact it has already accepted.
+var agentAuthorityDomainStat = unix.Stat
+
 type agentAuthorityDomainRecord struct {
 	Version       int                          `json:"version"`
 	AuthorityID   string                       `json:"authorityId"`
@@ -325,7 +331,7 @@ func validateAgentAuthorityPIDVisibility() (agentAuthorityDomainInode, error) {
 
 func agentAuthorityNamespaceIdentity(path string) (agentAuthorityDomainInode, error) {
 	var stat unix.Stat_t
-	if err := unix.Stat(path, &stat); err != nil {
+	if err := agentAuthorityDomainStat(path, &stat); err != nil {
 		return agentAuthorityDomainInode{}, err
 	}
 
