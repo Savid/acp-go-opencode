@@ -85,13 +85,13 @@ func acquireLinuxAgentIdentityAuthority(
 }
 
 func adoptLinuxAgentIdentityLock(uid uint32) (supervisorIdentityLock, error) {
-	file := supervisorInheritedFile(4, "acp-go-opencode-agent-identity-lock")
+	file := supervisorInheritedFile(4, "opencode-agent-identity-lock")
 
 	return adoptAgentIdentityLock(file, uid, false, "")
 }
 
 func adoptLinuxAgentAuthorityDomain(uint32) (supervisorIdentityLock, error) {
-	file := supervisorInheritedFile(5, "acp-go-opencode-agent-authority-domain")
+	file := supervisorInheritedFile(5, "opencode-agent-authority-domain")
 
 	return adoptAgentAuthorityDomain(file, false, "")
 }

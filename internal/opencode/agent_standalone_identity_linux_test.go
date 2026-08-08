@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestAgentStandaloneOwnerSessionKeyExactVector(t *testing.T) {
+func TestAgentStandaloneOwnerDigestExactVector(t *testing.T) {
 	owner := agentStandaloneOwner{
 		Version:  1,
 		UID:      62001,
@@ -31,7 +31,7 @@ func TestAgentStandaloneOwnerSessionKeyExactVector(t *testing.T) {
 		},
 	}
 
-	key := agentStandaloneSessionKey(owner)
+	key := agentStandaloneOwnerDigest(owner)
 	require.Equal(t, "standalone:cd18f39f1ee5195751bdda1384dcee144a39878c923f2f498afa2470619df977", key)
 }
 
@@ -797,7 +797,7 @@ func TestAgentStandaloneDomainAuditCleansBoundMarkerTemporaryWithoutDispositionM
 		StateRoot: agentStandaloneStateRoot{Path: "/srv/opencode/bound-marker-temp", Dev: 31, Ino: 32},
 	}
 	require.NoError(t, createAgentStandaloneOwner(directory, owner, ownerUID, ownerGID))
-	key := agentStandaloneSessionKey(owner)
+	key := agentStandaloneOwnerDigest(owner)
 	require.NoError(t, publishAgentStandaloneActive(
 		directory, owner.UID, owner.GID, ownerUID, ownerGID, key,
 		time.Now().Add(time.Second), nil, nil,
@@ -864,7 +864,7 @@ func TestAgentStandaloneSameBootRebindRejectsSecondOwner(t *testing.T) {
 	uidLock := createAgentStandaloneTestLock(t, directory, "62061.lock", ownerUID, ownerGID)
 	require.NoError(t, uidLock.Close())
 	require.NoError(t, createAgentStandaloneOwner(directory, owner, ownerUID, ownerGID))
-	key := agentStandaloneSessionKey(owner)
+	key := agentStandaloneOwnerDigest(owner)
 	require.NoError(t, publishAgentStandaloneActive(
 		directory, owner.UID, owner.GID, ownerUID, ownerGID, key,
 		time.Now().Add(time.Second), nil, nil,
@@ -897,7 +897,7 @@ func TestAgentStandaloneSameBootRebindRejectsMatchingTask(t *testing.T) {
 	uidLock := createAgentStandaloneTestLock(t, directory, "62071.lock", ownerUID, ownerGID)
 	require.NoError(t, uidLock.Close())
 	require.NoError(t, createAgentStandaloneOwner(directory, owner, ownerUID, ownerGID))
-	key := agentStandaloneSessionKey(owner)
+	key := agentStandaloneOwnerDigest(owner)
 	require.NoError(t, publishAgentStandaloneActive(
 		directory, owner.UID, owner.GID, ownerUID, ownerGID, key,
 		time.Now().Add(time.Second), nil, nil,
@@ -946,7 +946,7 @@ func TestAgentStandaloneSameBootRebindRetainsUIDLockThroughDomainPublication(t *
 	uidLock := createAgentStandaloneTestLock(t, directory, "62073.lock", ownerUID, ownerGID)
 	require.NoError(t, uidLock.Close())
 	require.NoError(t, createAgentStandaloneOwner(directory, owner, ownerUID, ownerGID))
-	key := agentStandaloneSessionKey(owner)
+	key := agentStandaloneOwnerDigest(owner)
 	require.NoError(t, publishAgentStandaloneActive(
 		directory, owner.UID, owner.GID, ownerUID, ownerGID, key,
 		time.Now().Add(time.Second), nil, nil,

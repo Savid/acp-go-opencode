@@ -387,7 +387,7 @@ func TestAgentStandaloneResBinderRefusesEveryProcfsDisagreement(t *testing.T) {
 		}
 
 		require.ErrorContains(t, validateAgentStandaloneBinder(),
-			"requires canonical procfs self identity",
+			fmt.Sprintf("procfs self PID anchor is %q, want %q", other, strconv.Itoa(os.Getpid())),
 			"a /proc/self naming another process must refuse, not bind that process's namespace",
 		)
 	})
