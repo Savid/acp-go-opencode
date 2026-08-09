@@ -27,6 +27,13 @@ func TestVerifyLinuxTrustedSupervisorIdentityRequiresADistinctRootSupervisor(t *
 	linuxSupervisorIdentitySeams(t)
 	const distinct = uint32(65534)
 
+	// The trusted-root assertion reads its own seam, so the isolated rule stays
+	// reachable from an unprivileged runner. The shared arm is selected through
+	// a different one and stays out of it: the native identity named here is
+	// never the identity running the case.
+	supervisorTrustedEffectiveUID = func() int { return 0 }
+	effectiveUIDSource = func() int { return 0 }
+
 	require.NoError(t, verifyLinuxTrustedSupervisorIdentity(distinct))
 
 	require.EqualError(t, verifyLinuxTrustedSupervisorIdentity(0),

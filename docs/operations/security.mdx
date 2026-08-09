@@ -68,6 +68,23 @@ only trusted peer:
   completion and the managed-root permit wait for that proof. The native tree
   inherits no launch, control, proof, guardian, or lock descriptor, so it cannot
   forge completion or overlap another provider tree using the same host identity.
+- When the configured Linux identity is the identity the adapter already runs
+  as, there is no privilege boundary to descend and the supervisor says so:
+  `ContainmentMode` reports `shared_identity`, the launch requests no credential
+  change, no host-global UID lock or durable identity record is claimed, and the
+  containment proofs live in the adapter-owned mode-`0700` scratch root instead
+  of the root-owned proof namespace. Everything the lifecycle boundary rests on
+  is unchanged — both subreapers, no-new-privs, core-dump suppression,
+  descendant adoption and reaping to kernel `ECHILD`, the process-group
+  teardown, the sealed launch configuration, and the readiness handshake — so
+  the tree is still contained. What is absent is separation: concurrent sessions
+  share one identity and can read each other's home, XDG roots, credentials, and
+  journals; nothing excludes a second runner or a hand-run CLI under the same
+  account; a crashed session leaves no durable record to recover from; and the
+  agent is not credential-fenced from the supervisor. Run the adapter as root
+  for that separation. The decision is derived from the identity independently
+  by every process in the tree and is refused whenever the launch configuration
+  and the running identity disagree.
 - A dedicated guardian peer-liveness descriptor is fenced immediately before
   native start. Guardian death before readiness refuses native launch and lets
   liveness publish completion or quarantine only after kernel `ECHILD`.

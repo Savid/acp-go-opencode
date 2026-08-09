@@ -38,6 +38,13 @@ const (
 	RuntimeContainmentAuthoritative RuntimeContainmentMode = "authoritative"
 	// RuntimeContainmentBestEffort identifies explicitly accepted Darwin process-group containment.
 	RuntimeContainmentBestEffort RuntimeContainmentMode = "best_effort"
+	// RuntimeContainmentSharedIdentity is the boundary a supervisor proves when
+	// the native identity is the identity it already runs as. The subreaper
+	// tree, the descendant reaping and the process-group teardown are the
+	// authoritative ones, so whole-tree lifecycle is still proven; what is
+	// absent is the credential separation between the supervisor and the agent,
+	// and the host-global record of who holds the identity.
+	RuntimeContainmentSharedIdentity RuntimeContainmentMode = "shared_identity"
 	// RuntimeContainmentUnavailable identifies a platform with no selected boundary.
 	RuntimeContainmentUnavailable RuntimeContainmentMode = "unavailable"
 )

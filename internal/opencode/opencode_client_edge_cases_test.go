@@ -74,7 +74,7 @@ func TestStartServerHappyPathWithoutPrivilegedProcessLaunch(t *testing.T) {
 	client, err := StartServer(context.Background(), StartOptions{
 		Root:             testGeneratedTempDir(t),
 		ExecutablePath:   "/usr/bin/true",
-		ProcessIsolation: testProcessIsolation(),
+		ProcessIsolation: testHandoffProcessIsolation(),
 		skipSupervisor:   true,
 		HandoffXDG:       true,
 		BrowserShim:      shim,

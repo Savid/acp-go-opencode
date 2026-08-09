@@ -22,12 +22,14 @@ func linuxSupervisorIdentitySeams(t *testing.T) {
 	seek := linuxSupervisorSeek
 	proofFstat := linuxSupervisorProofFstat
 	effectiveUID := effectiveUIDSource
+	trustedUID := supervisorTrustedEffectiveUID
 	pollSource := pollFDSource
 	t.Cleanup(func() {
 		linuxSupervisorMemfdCreate = memfdCreate
 		linuxSupervisorSeek = seek
 		linuxSupervisorProofFstat = proofFstat
 		effectiveUIDSource = effectiveUID
+		supervisorTrustedEffectiveUID = trustedUID
 		pollFDSource = pollSource
 	})
 }

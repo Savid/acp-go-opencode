@@ -108,7 +108,11 @@ does.
 
 `RuntimeResourceHooks` also carries `ObserveProcess`,
 `ObserveProcessSnapshot`, `ObserveStartupStage`, and `ObserveContainment`.
-`Agent.ContainmentMode` returns `authoritative`, `best_effort`, or `unavailable`.
+`Agent.ContainmentMode` returns `authoritative`, `shared_identity`,
+`best_effort`, or `unavailable`. `shared_identity` names a Linux launch whose
+configured native identity is the identity the adapter already runs as; the
+lifecycle boundary is the authoritative one and the credential separation
+between adapter and agent is what is absent.
 OpenCode reports its two
 actual home-lock supervisors only after native readiness and removes them when
 the supervisor waiter observes exit; it never derives that count from root

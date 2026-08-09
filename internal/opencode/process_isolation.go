@@ -29,6 +29,8 @@ type ProcessIsolation struct {
 	identityAuthorityAdopted bool
 }
 
+const processIsolationLinux = "linux"
+
 var processIsolationGOOS = runtime.GOOS
 
 func validateProcessIsolation(isolation *ProcessIsolation) error {
@@ -48,7 +50,7 @@ func validateProcessIsolation(isolation *ProcessIsolation) error {
 		return fmt.Errorf("validate process isolation base environment: %w", err)
 	}
 
-	if processIsolationGOOS == "linux" {
+	if processIsolationGOOS == processIsolationLinux {
 		if err := validateStandaloneIdentityDisposition(isolation); err != nil {
 			return err
 		}
@@ -56,6 +58,14 @@ func validateProcessIsolation(isolation *ProcessIsolation) error {
 
 	return validateProcessIsolationPlatform()
 }
+
+// sharedIdentitySupervisorRemedy states what an operator can change when the
+// supervisor was asked to launch the native process under the very identity it
+// already runs as and the shape it was handed describes something else. There
+// is no privilege boundary to cross in that deployment, so the two answers are
+// to give the supervisor one, or to describe the launch as what it is.
+const sharedIdentitySupervisorRemedy = "run the supervisor as root to isolate the agent identity, " +
+	"or launch the agent under the identity the supervisor already holds"
 
 func validateStandaloneIdentityDisposition(isolation *ProcessIsolation) error {
 	identityLock, authorityDomain := isolation.IdentityLock != nil, isolation.AuthorityDomain != nil
@@ -76,6 +86,19 @@ func validateStandaloneIdentityDisposition(isolation *ProcessIsolation) error {
 	if identityLock {
 		if isolation.StandaloneOwnerID != "" || isolation.StandaloneStateRoot != "" {
 			return errors.New("borrowed process identity forbids standalone owner fields")
+		}
+
+		return nil
+	}
+
+	// A native identity that is already the supervisor's own identity cannot be
+	// recorded as a standalone one: the durable record proves an identity no
+	// live task holds, and the supervisor asking for it is such a task. The
+	// canonical shape is therefore no capabilities and no standalone fields.
+	if sharedProcessIdentity(isolation) {
+		if isolation.StandaloneOwnerID != "" || isolation.StandaloneStateRoot != "" {
+			return errors.New("standalone owner fields describe an identity the supervisor already holds; " +
+				sharedIdentitySupervisorRemedy)
 		}
 
 		return nil

@@ -58,8 +58,23 @@ func writeLinuxSupervisorConfig(_ string, config supervisorConfig) (*os.File, er
 	return file, nil
 }
 
+// supervisorTrustedEffectiveUID is the seam the trusted-root assertion reads.
+// It is deliberately not the seam the shared arm is selected through: a case
+// that pins the isolated refusals has to be able to place this process at the
+// trusted identity without also moving the identity the arm compares the native
+// uid against, or the isolated arm becomes unreachable off root.
+var supervisorTrustedEffectiveUID = os.Geteuid
+
 func verifyLinuxTrustedSupervisorIdentity(uid uint32) error {
-	if os.Geteuid() != 0 || uid == 0 || effectiveUID() == uid {
+	// The supervisor drops privilege to reach the native identity, so it has to
+	// hold a higher one first. When the native identity is the one it already
+	// runs as there is no descent to make, and demanding root would refuse the
+	// only launch such a deployment can perform.
+	if sharedNativeIdentity(uid) {
+		return nil
+	}
+
+	if supervisorTrustedEffectiveUID() != 0 || uid == 0 || effectiveUID() == uid {
 		return errors.New("OpenCode liveness supervisor requires a distinct trusted root identity")
 	}
 
@@ -157,7 +172,16 @@ func validateLinuxSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) er
 	return nil
 }
 
-func linuxSupervisorMarkerRoot(supervisorConfig) (string, error) {
+func linuxSupervisorMarkerRoot(config supervisorConfig) (string, error) {
+	// The proof namespace under /run is root-owned and root-created, and it
+	// exists to keep the markers out of reach of the identity the native process
+	// runs as. A shared identity is that identity, so the namespace would prove
+	// nothing it does not already hold; the markers stay in the adapter-owned
+	// scratch root the launch created for itself.
+	if config.SharedIdentity {
+		return config.Scratch, nil
+	}
+
 	fd, err := openLinuxSupervisorProofDirectory()
 	if err != nil {
 		return "", err

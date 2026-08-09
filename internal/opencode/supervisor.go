@@ -65,6 +65,7 @@ type supervisorConfig struct {
 	IdentityLock        bool              `json:"identityLock"`
 	AuthorityDomain     bool              `json:"authorityDomain"`
 	StandaloneAuthority bool              `json:"standaloneAuthority"`
+	SharedIdentity      bool              `json:"sharedIdentity"`
 	Isolation           *ProcessIsolation `json:"-"`
 }
 
@@ -215,6 +216,20 @@ func runSupervisor(mode string, configInput io.Reader) (runErr error) {
 		return errors.New("supervisor UID lock and authority domain are inconsistent")
 	}
 
+	// Every process in the tree derives the arm from its own identity, and a
+	// child that disagrees with the config it was handed refuses rather than
+	// following it: the stamp decides which steps run, so a stamp that does not
+	// describe the process running them can only be wrong.
+	if config.SharedIdentity != sharedNativeIdentity(config.IsolationUID) {
+		return errors.New("supervisor identity disposition does not match the identity it runs as")
+	}
+
+	if config.SharedIdentity &&
+		(config.IdentityLock || config.StandaloneAuthority ||
+			config.StandaloneOwnerID != "" || config.StandaloneStateRoot != "") {
+		return errors.New("shared supervisor identity disposition is invalid")
+	}
+
 	if mode == supervisorModeLiveness && config.IdentityLock {
 		lock, lockErr := supervisorAdoptIdentityLock(config.IsolationUID)
 		if lockErr != nil {
@@ -335,7 +350,12 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 	config.StandaloneStateRoot = config.Isolation.StandaloneStateRoot
 	config.IdentityLock = config.Isolation.IdentityLock != nil
 	config.AuthorityDomain = config.Isolation.AuthorityDomain != nil
-	config.StandaloneAuthority = config.Isolation.IdentityLock == nil
+	// The decision travels in the sealed config so the guardian and the liveness
+	// child inherit the one the parent made. Each of them re-derives it from its
+	// own identity and refuses a config that disagrees, so the stamp can direct
+	// the launch without being trusted on its own.
+	config.SharedIdentity = sharedProcessIdentity(config.Isolation)
+	config.StandaloneAuthority = config.Isolation.IdentityLock == nil && !config.SharedIdentity
 
 	if config.ScratchParent == "" && config.Scratch != "" {
 		config.ScratchParent = filepath.Dir(config.Scratch)
@@ -770,6 +790,13 @@ func acquireGuardianIdentityAuthority(
 	control io.Reader,
 ) (supervisorIdentityLock, supervisorIdentityLock, error) {
 	if config.IsolationUID == 0 {
+		return noopSupervisorIdentityLock{}, noopSupervisorIdentityLock{}, nil
+	}
+
+	// A shared identity carries no authority. The durable registry records who
+	// may enter an identity nobody is in, and the supervisor is already in this
+	// one, so there is nothing to claim, adopt, publish or release.
+	if config.SharedIdentity {
 		return noopSupervisorIdentityLock{}, noopSupervisorIdentityLock{}, nil
 	}
 
