@@ -22,6 +22,9 @@ const (
 	nativeOwnershipUnprovenHandoff   = "generated native inode ownership handoff could not be proven"
 	nativeOwnershipEntryOpenRefusal  = "open generated native entry"
 	nativeOwnershipInodeTypeRefusal  = "generated native inode type changed"
+	nativeOwnershipSharedAncestor    = "generated native path ancestor is uid=%d gid=%d"
+	nativeOwnershipSharedRemedy      = "run the supervisor as root to isolate the agent identity, " +
+		"or place the native directory under a path the agent identity owns"
 )
 
 // nativeOwnershipTarget is the dropped identity every case hands a tree to. It
@@ -373,6 +376,137 @@ func TestGeneratedNativeAncestorStatesEachRefusal(t *testing.T) {
 			accepted.stat, accepted.final, 0, 0, nativeOwnershipTargetUID, nativeOwnershipTargetGID,
 		))
 	}
+}
+
+// TestGeneratedNativeAncestorUnderASharedIdentityAcceptsOnlyRootAncestors
+// proves how far the ancestry rule relaxes when the trusted identity is also the
+// target identity. Nothing separates the runtime from the identity it hands the
+// tree to in that shape, so the root-owned directories every path is reached
+// through are acceptable ancestors — and nothing else is: a third identity's
+// ancestor, an ancestor root left writable without sticky protection, one the
+// identity cannot enter, and a generated root root still owns are all refused.
+// The last case proves the relaxation never reaches the isolated shape, where
+// the refusal keeps its original wording.
+func TestGeneratedNativeAncestorUnderASharedIdentityAcceptsOnlyRootAncestors(t *testing.T) {
+	const (
+		sharedUID = uint32(1000)
+		sharedGID = uint32(1000)
+	)
+
+	directory := func(mode uint32, uid uint32, gid uint32) unix.Stat_t {
+		return unix.Stat_t{Mode: unix.S_IFDIR | mode, Uid: uid, Gid: gid}
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		stat  unix.Stat_t
+		final bool
+		want  string
+	}{
+		{
+			name: "not a directory",
+			stat: unix.Stat_t{Mode: unix.S_IFREG | 0o700},
+			want: nativeOwnershipUntrustedAncestry,
+		},
+		{
+			name: "ancestor owned by a third identity",
+			stat: directory(0o755, 4242, 4242),
+			want: fmt.Sprintf(nativeOwnershipSharedAncestor, 4242, 4242) + "; " + nativeOwnershipSharedRemedy,
+		},
+		{
+			name: "ancestor owned by root with a foreign group",
+			stat: directory(0o755, 0, 4242),
+			want: fmt.Sprintf(nativeOwnershipSharedAncestor, 0, 4242),
+		},
+		{
+			name: "world-writable root-owned ancestor without sticky protection",
+			stat: directory(0o777, 0, 0),
+			want: nativeOwnershipWritableAncestor,
+		},
+		{
+			name: "root-owned ancestor the shared identity cannot traverse",
+			stat: directory(0o700, 0, 0),
+			want: generatedTreeHandoffRefusal,
+		},
+		{
+			name:  "generated root still owned by root",
+			stat:  directory(0o700, 0, 0),
+			final: true,
+			want:  nativeOwnershipUntrustedAncestry,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateGeneratedNativeAncestor(
+				testCase.stat, testCase.final, sharedUID, sharedGID, sharedUID, sharedGID,
+			)
+			require.ErrorContains(t, err, testCase.want)
+		})
+	}
+
+	for _, accepted := range []struct {
+		stat  unix.Stat_t
+		final bool
+	}{
+		{stat: directory(0o755, 0, 0)},
+		{stat: directory(0o1777, 0, 0)},
+		{stat: directory(0o711, sharedUID, sharedGID)},
+		{stat: directory(0o700, sharedUID, sharedGID), final: true},
+	} {
+		require.NoError(t, validateGeneratedNativeAncestor(
+			accepted.stat, accepted.final, sharedUID, sharedGID, sharedUID, sharedGID,
+		), "the root-owned ancestry every home directory is reached through was refused")
+	}
+
+	require.EqualError(t, validateGeneratedNativeAncestor(
+		directory(0o755, 0, 0), false, sharedUID, sharedGID,
+		nativeOwnershipTargetUID, nativeOwnershipTargetGID,
+	), nativeOwnershipUntrustedAncestry)
+}
+
+// TestNativeOwnershipWalkAcceptsARootOwnedAncestryUnderASharedIdentity proves
+// the whole walk accepts the shape a runtime that never dropped privilege
+// presents: its own identity is the isolated identity, and the generated tree
+// hangs from a root-owned directory it will never own. The effective identity is
+// staged through its seams so the proof does not depend on which identity runs
+// the tests, and the filesystem root is substituted through its seam so the
+// fixture's own ancestry cannot decide the outcome. The chowns behind the handoff
+// still need the root the rest of this file requires.
+func TestNativeOwnershipWalkAcceptsARootOwnedAncestryUnderASharedIdentity(t *testing.T) {
+	nativeOwnershipRequireRoot(t)
+
+	base := testTraversableTempDir(t)
+	native := filepath.Join(base, "native")
+	require.NoError(t, os.Mkdir(native, 0o700))
+
+	seed := filepath.Join(native, "input")
+	require.NoError(t, os.WriteFile(seed, []byte("seeded"), 0o600))
+	require.NoError(t, os.Chown(seed, int(nativeOwnershipTargetUID), int(nativeOwnershipTargetGID)))
+	require.NoError(t, os.Chown(native, int(nativeOwnershipTargetUID), int(nativeOwnershipTargetGID)))
+
+	previousRoot := nativeOwnershipOpenFilesystemRoot
+	nativeOwnershipOpenFilesystemRoot = func() (int, error) {
+		return unix.Open(base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	}
+
+	t.Cleanup(func() { nativeOwnershipOpenFilesystemRoot = previousRoot })
+
+	previousUID, previousGID := effectiveUIDSource, effectiveGIDSource
+	effectiveUIDSource = func() int { return int(nativeOwnershipTargetUID) }
+	effectiveGIDSource = func() int { return int(nativeOwnershipTargetGID) }
+
+	t.Cleanup(func() { effectiveUIDSource, effectiveGIDSource = previousUID, previousGID })
+
+	require.NoError(t, handoffGeneratedNativeTree("/native", nativeOwnershipIsolation()))
+
+	uid, gid := nativeOwnershipOwner(t, seed)
+	require.Equal(t, nativeOwnershipTargetUID, uid, "the tree the shared identity already owned was not handed over")
+	require.Equal(t, nativeOwnershipTargetGID, gid)
+
+	require.NoError(t, os.Chown(base, 4242, 4242))
+
+	err := handoffGeneratedNativeTree("/native", nativeOwnershipIsolation())
+	require.ErrorContains(t, err, fmt.Sprintf(nativeOwnershipSharedAncestor, 4242, 4242))
+	require.ErrorContains(t, err, nativeOwnershipSharedRemedy)
 }
 
 // TestNativeIdentityTraversalUsesTheApplicableModeClass proves traversability is
