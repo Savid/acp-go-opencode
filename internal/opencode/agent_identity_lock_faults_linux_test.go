@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -797,7 +798,102 @@ func TestBorrowedAgentIdentityDispositionRefusesUnprovenModes(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.NoError(t, directory.Close())
-		require.ErrorIs(t, rejectAgentIdentityDispositionTemporaries(directory), unix.EBADF)
+		require.ErrorIs(t, rejectAgentIdentityDispositionTemporaries(directory, uid), unix.EBADF)
+	})
+}
+
+// TestRejectAgentIdentityDispositionTemporariesScopesByUID proves the
+// disposition scan refuses only the temporaries that are the scanning uid's own
+// fault. A uid-scoped temporary named for another participant is that
+// participant's in-flight atomic write and must be tolerated; the scanning uid's
+// own unresolved temporary of each class still refuses; a malformed name is
+// fatal; and a domain-global temporary is transient by construction, so it is
+// absorbed by a bounded re-read and refused only once it persists.
+func TestRejectAgentIdentityDispositionTemporariesScopesByUID(t *testing.T) {
+	const (
+		owner     = uint32(63700)
+		bystander = uint32(995)
+		suffix    = "0123456789abcdef01234567"
+	)
+
+	directory, root := agentIdentityLockCovAuthority(t)
+	authority := filepath.Join(root, "acp-go", "agent-identities")
+
+	stage := func(t *testing.T, name string) string {
+		t.Helper()
+
+		path := filepath.Join(authority, name)
+		require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o600))
+		t.Cleanup(func() {
+			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, unix.ENOENT) {
+				t.Errorf("remove staged temporary %q: %v", name, removeErr)
+			}
+		})
+
+		return name
+	}
+
+	for _, name := range []string{
+		strconv.FormatUint(uint64(bystander), 10) + ".quarantine.next-" + suffix,
+		strconv.FormatUint(uint64(bystander), 10) + ".owner.next-" + suffix,
+	} {
+		t.Run("tolerates bystander "+name, func(t *testing.T) {
+			staged := stage(t, name)
+			require.NoErrorf(t, rejectAgentIdentityDispositionTemporaries(directory, owner),
+				"bystander temporary %q refused, want tolerated", staged,
+			)
+		})
+	}
+
+	for _, name := range []string{
+		strconv.FormatUint(uint64(owner), 10) + ".quarantine.next-" + suffix,
+		strconv.FormatUint(uint64(owner), 10) + ".owner.next-" + suffix,
+	} {
+		t.Run("refuses own "+name, func(t *testing.T) {
+			staged := stage(t, name)
+			require.ErrorContains(t, rejectAgentIdentityDispositionTemporaries(directory, owner),
+				"unresolved temporary",
+			)
+			require.ErrorContains(t, rejectAgentIdentityDispositionTemporaries(directory, owner), staged)
+		})
+	}
+
+	for _, name := range []string{
+		"bad.quarantine.next-" + suffix,
+		"bad.owner.next-" + suffix,
+	} {
+		t.Run("refuses malformed "+name, func(t *testing.T) {
+			staged := stage(t, name)
+			require.Errorf(t, rejectAgentIdentityDispositionTemporaries(directory, owner),
+				"malformed temporary %q was tolerated", staged,
+			)
+		})
+	}
+
+	for _, name := range []string{
+		"domain.json.next-" + suffix,
+		".authority-probe-" + suffix,
+	} {
+		t.Run("refuses persistent domain-global "+name, func(t *testing.T) {
+			staged := stage(t, name)
+			started := time.Now()
+			require.ErrorContains(t, rejectAgentIdentityDispositionTemporaries(directory, owner),
+				"unresolved temporary",
+			)
+			require.ErrorContains(t, rejectAgentIdentityDispositionTemporaries(directory, owner), staged)
+			require.GreaterOrEqualf(t, time.Since(started), agentIdentityDispositionTemporaryReadDelay,
+				"domain-global refusal skipped the bounded re-read",
+			)
+		})
+	}
+
+	t.Run("absorbs a domain-global rename in flight", func(t *testing.T) {
+		staged := stage(t, "domain.json.next-"+suffix)
+		go func() {
+			time.Sleep(agentIdentityDispositionTemporaryReadDelay)
+			_ = os.Remove(filepath.Join(authority, staged))
+		}()
+		require.NoError(t, rejectAgentIdentityDispositionTemporaries(directory, owner))
 	})
 }
 
