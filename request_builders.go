@@ -18,7 +18,8 @@ const (
 
 	// envPathKey is the one environment name a session may not set: the map it
 	// would arrive in replaces whole values, and dropping the inherited search
-	// path unresolves the native executable and every program a tool runs.
+	// path unresolves every program a tool runs. ExtraPathDirs is the additive
+	// mechanism that owns the search path instead.
 	envPathKey = "PATH"
 )
 
@@ -29,11 +30,14 @@ type OpenCodeOptions struct {
 	OutputSchema map[string]any `json:"outputSchema,omitempty"`
 	Mode         string         `json:"mode,omitempty"`
 	Permission   string         `json:"permission,omitempty"`
-	// Env overlays the agent-wide environment for the native process this
-	// session runs under. PATH belongs in ExtraPathDirs.
+	// Env is the environment this session's shell tools run under. It is
+	// carried on the addressed native session, not on the shared runtime
+	// process, so two sessions of one Agent hold different values at the same
+	// time and a later session never inherits an earlier one's. PATH belongs in
+	// ExtraPathDirs.
 	Env map[string]string `json:"env,omitempty"`
 	// ExtraPathDirs are absolute directories placed ahead of the inherited PATH
-	// of that process, in order.
+	// for this native session's shell tools, in order.
 	ExtraPathDirs []string `json:"extraPathDirs,omitempty"`
 }
 
@@ -61,7 +65,7 @@ func (options OpenCodeOptions) Meta() map[string]any {
 	}
 
 	if options.ExtraPathDirs != nil {
-		values[metaExtraPathDirsKey] = append([]string(nil), options.ExtraPathDirs...)
+		values[metaExtraPathDirsKey] = append([]string{}, options.ExtraPathDirs...)
 	}
 
 	return map[string]any{
@@ -323,11 +327,10 @@ func WithOpenCodePermission(permission string) OpenCodeOption {
 	}
 }
 
-// WithOpenCodeEnv sets the environment this session's native process runs
-// under, overlaying WithEnv. One native process serves every session of an
-// Agent, so a session asking for an environment the running process was not
-// started under is served by a fresh process, and is refused outright while
-// another session still holds the running one.
+// WithOpenCodeEnv sets the environment this session's shell tools run under.
+// The values reach the addressed native session, so a concurrent session of the
+// same Agent keeps its own and a rotated value replaces the old one on the next
+// command. PATH is refused: use WithOpenCodeExtraPathDirs.
 func WithOpenCodeEnv(env map[string]string) OpenCodeOption {
 	cloned := cloneStringMap(env)
 
@@ -337,14 +340,12 @@ func WithOpenCodeEnv(env map[string]string) OpenCodeOption {
 }
 
 // WithOpenCodeExtraPathDirs places absolute directories ahead of the inherited
-// PATH of that process, in the order given. It is the only way to extend the
-// search path: WithOpenCodeEnv rejects PATH because its entries replace whole
-// values.
+// PATH of this native session's shell tools, in the order given.
 func WithOpenCodeExtraPathDirs(dirs ...string) OpenCodeOption {
-	cloned := append([]string(nil), dirs...)
+	cloned := append([]string{}, dirs...)
 
 	return func(options *OpenCodeOptions) {
-		options.ExtraPathDirs = append([]string(nil), cloned...)
+		options.ExtraPathDirs = append([]string{}, cloned...)
 	}
 }
 
@@ -378,7 +379,7 @@ func cloneOpenCodeOptions(options OpenCodeOptions) OpenCodeOptions {
 		Env:          cloneStringMap(options.Env),
 	}
 	if options.ExtraPathDirs != nil {
-		cloned.ExtraPathDirs = append([]string(nil), options.ExtraPathDirs...)
+		cloned.ExtraPathDirs = append([]string{}, options.ExtraPathDirs...)
 	}
 
 	return cloned

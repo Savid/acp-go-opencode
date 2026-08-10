@@ -13,7 +13,19 @@ import (
 
 const (
 	SessionStoreMainSubpath = ""
-	SessionStoreFormat      = "opencode-sync-events-v1"
+
+	// SessionStoreFormat is the one bundle shape this adapter reads and writes.
+	//
+	// The addressed-session carrier made `session.extraPathDirs` a required
+	// member of that shape rather than an optional one, and the version stays
+	// `v1`: a bundle written before the carrier existed is refused rather than
+	// defaulted. That is a ratified hard cut for a pre-release format. A cold
+	// load has to rebind the native session to the directories the session was
+	// captured with, and a bundle that cannot say what they were is a bundle
+	// whose shell operations would silently resolve against the reloading
+	// host's search path. Neither a compatibility decoder nor a migrating
+	// default is acceptable there, so there is none.
+	SessionStoreFormat = "opencode-sync-events-v1"
 )
 
 type SessionStoreEntry = json.RawMessage

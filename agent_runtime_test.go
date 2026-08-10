@@ -425,7 +425,7 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 
 		return observedClient, nil
 	}
-	runtime, nativeRelease, scratchRelease, err := observed.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	runtime, nativeRelease, scratchRelease, err := observed.startSharedRuntime(context.Background())
 	require.NoError(t, err)
 	require.Same(t, observedClient, runtime)
 	require.NotNil(t, nativeRelease)
@@ -443,7 +443,7 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 			return nil, errors.New("scratch denied")
 		},
 	}))
-	runtime, nativeRelease, scratchRelease, err = scratchFailure.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	runtime, nativeRelease, scratchRelease, err = scratchFailure.startSharedRuntime(context.Background())
 	require.ErrorContains(t, err, "scratch denied")
 	require.Nil(t, runtime)
 	require.Nil(t, nativeRelease)
@@ -458,7 +458,7 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 			return nil, errors.New("native denied")
 		},
 	}))
-	runtime, nativeRelease, scratchRelease, err = nativeFailure.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	runtime, nativeRelease, scratchRelease, err = nativeFailure.startSharedRuntime(context.Background())
 	require.ErrorContains(t, err, "native denied")
 	require.Nil(t, runtime)
 	require.Nil(t, nativeRelease)
@@ -474,7 +474,7 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 			return func() { nativeReleased.Store(true) }, nil
 		},
 	}))
-	runtime, nativeRelease, scratchRelease, err = xdgFailure.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	runtime, nativeRelease, scratchRelease, err = xdgFailure.startSharedRuntime(context.Background())
 	require.Error(t, err)
 	require.Nil(t, runtime)
 	require.Nil(t, nativeRelease)
@@ -488,7 +488,7 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	t.Cleanup(func() { runtimeStartServer = originalStart })
 	defaultFactory := NewAgent(WithHome(t.TempDir()))
 	defaultFactory.options.clientFactory = nil
-	runtime, nativeRelease, scratchRelease, err = defaultFactory.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	runtime, nativeRelease, scratchRelease, err = defaultFactory.startSharedRuntime(context.Background())
 	require.ErrorContains(t, err, "default factory failed")
 	require.Nil(t, runtime)
 	require.Nil(t, nativeRelease)
@@ -542,13 +542,13 @@ func TestScopeCleanupFailureRetainsDirectoryPrincipal(t *testing.T) {
 	agent := NewAgent()
 	agent.runtime = client
 
-	scoped, release, generation, err := agent.newOpenCodeClient(context.Background(), "session", cwd, []opencode.MCPServerConfig{{Name: "tools"}}, runtimeEnvironment{})
+	scoped, release, generation, err := agent.newOpenCodeClient(context.Background(), "session", cwd, []opencode.MCPServerConfig{{Name: "tools"}}, sessionCarrier{})
 	require.ErrorIs(t, err, opencode.ErrMCPDisconnectUnproven)
 	require.Nil(t, scoped)
 	require.Nil(t, release)
 	require.Zero(t, generation)
 	require.Len(t, agent.directories, 1, "unproven native cleanup must retain directory ownership")
-	scoped, release, generation, err = agent.newOpenCodeClient(context.Background(), "session", cwd, []opencode.MCPServerConfig{{Name: "tools"}}, runtimeEnvironment{})
+	scoped, release, generation, err = agent.newOpenCodeClient(context.Background(), "session", cwd, []opencode.MCPServerConfig{{Name: "tools"}}, sessionCarrier{})
 	require.ErrorIs(t, err, opencode.ErrMCPDisconnectUnproven)
 	require.Nil(t, scoped)
 	require.Nil(t, release)
@@ -741,7 +741,7 @@ func TestDarwinBestEffortScratchReservationCardinality(t *testing.T) {
 			return client, nil
 		}
 
-		runtime, nativeRelease, xdgRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
+		runtime, nativeRelease, xdgRelease, err := agent.startSharedRuntime(context.Background())
 		require.NoError(t, err)
 		require.Same(t, client, runtime)
 		require.NotNil(t, xdgRelease)
@@ -785,7 +785,7 @@ func TestDarwinBestEffortScratchReservationCardinality(t *testing.T) {
 			return client, nil
 		}
 
-		runtime, nativeRelease, xdgRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
+		runtime, nativeRelease, xdgRelease, err := agent.startSharedRuntime(context.Background())
 		require.NoError(t, err)
 		require.Same(t, client, runtime)
 		require.Nil(t, xdgRelease)
@@ -822,7 +822,7 @@ func TestNativeOwnedDurableRuntimeHomeIsNeverMaterializedByTheAdapter(t *testing
 		return client, nil
 	}
 
-	runtime, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	runtime, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
 	require.NoError(t, err)
 	require.Same(t, client, runtime)
 	require.NotNil(t, nativeRelease)
@@ -847,7 +847,7 @@ func TestNativeOwnedDurableRuntimeHomeRejectsSeedFilesBeforeLaunch(t *testing.T)
 		return nil, errors.New("unreachable native runtime start")
 	}
 
-	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
 	require.ErrorContains(t, err, "seed file \"provider.json\" is unsupported")
 	require.Nil(t, client)
 	require.Nil(t, nativeRelease)
@@ -866,7 +866,7 @@ func TestNativeOwnedDurableRuntimeHomeRejectsWrongOwnerBeforeLaunch(t *testing.T
 		return nil, errors.New("unreachable native runtime start")
 	}
 
-	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background(), runtimeEnvironment{})
+	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
 	require.ErrorContains(t, err, nativeOwnedHomeRefusal)
 	require.Nil(t, client)
 	require.Nil(t, nativeRelease)
@@ -1093,20 +1093,4 @@ func TestReadySharedRuntimeSessionReleaseGate(t *testing.T) {
 	p95 := durations[len(durations)-1]
 	t.Logf("ready-session deterministic adapter gate: repetitions=%d p95=%s", repetitions, p95)
 	require.Less(t, p95, 500*time.Millisecond)
-}
-
-// A rebind for a changed environment inherits the containment fence: when
-// retiring the running generation cannot be proven, the request that asked for
-// the new environment fails with that proof failure rather than starting a
-// second native process beside it.
-func TestRuntimeEnvironmentRebindFailsOnUnprovenRetirement(t *testing.T) {
-	agent := NewAgent(WithHome(t.TempDir()))
-	agent.runtime = &panickingRuntimeShutdownClient{fakeOpenCodeClient: newFakeOpenCodeClient()}
-	agent.runtimeGeneration = 1
-
-	_, _, err := agent.sharedRuntimeBinding(context.Background(), runtimeEnvironment{
-		Env: map[string]string{"HOST_API_TOKEN": "secret"},
-	})
-	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
-	require.Nil(t, agent.runtime)
 }

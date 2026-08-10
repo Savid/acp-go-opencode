@@ -119,7 +119,7 @@ func validSyncSnapshot(sessionID, nativeID, cwd string) stateSnapshot {
 	return stateSnapshot{
 		Format: SessionStoreFormat, AdapterVersion: "test", NativeVersion: minNativeVersion,
 		EventSchemaVersion: syncEventSchemaVersion, RestoreGeneration: "generation",
-		Session: stateSnapshotSession{SessionID: sessionID, NativeSessionID: nativeID, Cwd: cwd},
+		Session: stateSnapshotSession{SessionID: sessionID, NativeSessionID: nativeID, Cwd: cwd, ExtraPathDirs: []string{}},
 		Graph:   []stateSnapshotNode{{SessionID: sessionID, NativeSessionID: nativeID, SourceCwd: cwd, Permission: "ask"}},
 		Events:  map[string][]opencode.SyncEvent{nativeID: {event}},
 	}
@@ -129,13 +129,15 @@ func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
 	require.NoError(t, validateSyncSnapshot("session", base))
 
 	tests := map[string]func(*stateSnapshot){
-		"format":              func(value *stateSnapshot) { value.Format = "old" },
-		"event schema":        func(value *stateSnapshot) { value.EventSchemaVersion = "old" },
-		"session identity":    func(value *stateSnapshot) { value.Session.SessionID = "other" },
-		"native identity":     func(value *stateSnapshot) { value.Session.NativeSessionID = "" },
-		"generation":          func(value *stateSnapshot) { value.RestoreGeneration = "" },
-		"invalid node":        func(value *stateSnapshot) { value.Graph[0].SourceCwd = "" },
-		"duplicate aggregate": func(value *stateSnapshot) { value.Graph = append(value.Graph, value.Graph[0]) },
+		"format":               func(value *stateSnapshot) { value.Format = "old" },
+		"event schema":         func(value *stateSnapshot) { value.EventSchemaVersion = "old" },
+		"session identity":     func(value *stateSnapshot) { value.Session.SessionID = "other" },
+		"native identity":      func(value *stateSnapshot) { value.Session.NativeSessionID = "" },
+		"generation":           func(value *stateSnapshot) { value.RestoreGeneration = "" },
+		"missing path carrier": func(value *stateSnapshot) { value.Session.ExtraPathDirs = nil },
+		"invalid path carrier": func(value *stateSnapshot) { value.Session.ExtraPathDirs = []string{"relative"} },
+		"invalid node":         func(value *stateSnapshot) { value.Graph[0].SourceCwd = "" },
+		"duplicate aggregate":  func(value *stateSnapshot) { value.Graph = append(value.Graph, value.Graph[0]) },
 		"selected absent": func(value *stateSnapshot) {
 			value.Graph[0].NativeSessionID = "other"
 			value.Events = map[string][]opencode.SyncEvent{"other": value.Events["native"]}
@@ -279,7 +281,7 @@ func TestHydrateRebaseAndSyncComparisonBranches(t *testing.T) {
 
 func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 	agent := NewAgent(WithEnv(map[string]string{
-		"API_TOKEN": "token", "PASSWORD": "password", "COOKIE": "cookie", "NORMAL": "ignored",
+		"API_TOKEN": "token", "PASSWORD": "password", "COOKIE": "cookie", "EMPTY_TOKEN": "", "NORMAL": "ignored",
 	}))
 	client := newFakeOpenCodeClient()
 	current := testSession(agent, client)

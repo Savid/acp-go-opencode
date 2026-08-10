@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"testing"
 
@@ -46,17 +47,11 @@ func assertSessionMetaAndSchemaHelpers(t *testing.T) {
 	if err != nil || meta.Permission != "ask" {
 		t.Fatalf("default permission meta = %#v err=%v", meta, err)
 	}
-	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: "bad"}}}); err == nil {
-		t.Fatal("non-object per-session env meta accepted")
-	}
 	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: 1}}}); err == nil {
 		t.Fatal("non-string permission meta accepted")
 	}
 	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "maybe"}}}); err == nil {
 		t.Fatal("unsupported permission meta accepted")
-	}
-	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: "bad"}}}); err == nil {
-		t.Fatal("bad env lifecycle meta accepted")
 	}
 	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"bad": func() {}}}}}); err == nil {
 		t.Fatal("non-json output schema accepted")
@@ -134,28 +129,22 @@ func TestLifecycleMetaErrorsAreInvalidParams(t *testing.T) {
 	}
 }
 
-// Per-session environment and search-path directories are parsed from either
-// the JSON shape a stdio host sends or the Go shape an in-process host hands
-// over, and every value a native process could not carry is refused.
-func TestSessionEnvironmentMeta(t *testing.T) {
+func TestSessionExtraPathDirsMeta(t *testing.T) {
 	options := func(values map[string]any) map[string]any {
 		return map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: values}}
 	}
 
 	meta, err := sessionMetaFromLifecycle(options(map[string]any{
-		metaEnvKey:           map[string]any{"HOST_API_URL": "http://127.0.0.1:9", "EMPTY": ""},
 		metaExtraPathDirsKey: []any{"/session/bin", "/tools/bin"},
 	}))
 	require.NoError(t, err)
-	require.Equal(t, map[string]string{"HOST_API_URL": "http://127.0.0.1:9", "EMPTY": ""}, meta.Env)
 	require.Equal(t, []string{"/session/bin", "/tools/bin"}, meta.ExtraPathDirs)
+	require.True(t, meta.ExtraPathDirsSet)
 
 	meta, err = sessionMetaFromLifecycle(options(map[string]any{
-		metaEnvKey:           map[string]string{"HOST_API_TOKEN": "secret"},
 		metaExtraPathDirsKey: []string{"/session/bin"},
 	}))
 	require.NoError(t, err)
-	require.Equal(t, map[string]string{"HOST_API_TOKEN": "secret"}, meta.Env)
 	require.Equal(t, []string{"/session/bin"}, meta.ExtraPathDirs)
 
 	rejected := []struct {
@@ -163,14 +152,6 @@ func TestSessionEnvironmentMeta(t *testing.T) {
 		values map[string]any
 		field  string
 	}{
-		{"env is not an object", map[string]any{metaEnvKey: []any{"A=1"}}, envOptionPath},
-		{"env value is not a string", map[string]any{metaEnvKey: map[string]any{"A": 1}}, envOptionPath + ".A"},
-		{"env carries a search path", map[string]any{metaEnvKey: map[string]any{envPathKey: "/session/bin"}}, envOptionPath + ".PATH"},
-		{"env carries a managed data root", map[string]any{metaEnvKey: map[string]any{managedEnvXDGDataHome: "/hostile"}}, envOptionPath + "." + managedEnvXDGDataHome},
-		{"env carries a custom config root", map[string]any{metaEnvKey: map[string]any{managedEnvOpenCodeConfigDir: "/hostile"}}, envOptionPath + "." + managedEnvOpenCodeConfigDir},
-		{"env carries a private adapter key", map[string]any{metaEnvKey: map[string]any{"ACP_GO_OPENCODE_INTERNAL_HELPER": "1"}}, envOptionPath + ".ACP_GO_OPENCODE_INTERNAL_HELPER"},
-		{"env name is empty", map[string]any{metaEnvKey: map[string]any{"": "1"}}, envOptionPath + "."},
-		{"env name carries a separator", map[string]any{metaEnvKey: map[string]any{"A=B": "1"}}, envOptionPath + ".A=B"},
 		{"extra path dirs is not an array", map[string]any{metaExtraPathDirsKey: "/session/bin"}, extraPathDirsOptionPath},
 		{"extra path dir is not a string", map[string]any{metaExtraPathDirsKey: []any{1}}, extraPathDirsOptionPath + "[0]"},
 	}
@@ -189,4 +170,12 @@ func TestSessionEnvironmentMeta(t *testing.T) {
 		jsonFieldError: errValueAbsolutePathRequired,
 		jsonFieldField: extraPathDirsOptionPath + "[1]",
 	}), err)
+
+	for _, value := range []string{"", "/session/bin" + string(os.PathListSeparator) + "/tools/bin"} {
+		_, err = sessionMetaFromLifecycle(options(map[string]any{metaExtraPathDirsKey: []any{value}}))
+		require.Equal(t, acp.NewInvalidParams(map[string]any{
+			jsonFieldError: errValueAbsolutePathRequired,
+			jsonFieldField: extraPathDirsOptionPath + "[0]",
+		}), err)
+	}
 }

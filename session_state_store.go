@@ -114,6 +114,15 @@ type stateSnapshotSession struct {
 	Cwd                   string             `json:"cwd"`
 	Title                 string             `json:"title"`
 	Model                 stateSnapshotModel `json:"model"`
+	// ExtraPathDirs is the durable half of the addressed-session carrier: a
+	// cold load rebinds the native session to these directories rather than to
+	// whatever the reloading host happens to hold.
+	//
+	// The carrier environment is deliberately absent. It is where an operation
+	// bearer lives, this bundle is scanned for exactly that material before it
+	// is written, and a rotated bearer must come from the request that reloads
+	// the session rather than from a value frozen at capture time.
+	ExtraPathDirs []string `json:"extraPathDirs"`
 }
 
 type stateSnapshotModel struct {
@@ -226,7 +235,8 @@ func (s *session) captureStateSnapshot(
 				ParentSessionID:       memberSnapshot.idmap.ParentSessionID,
 				NativeParentSessionID: memberSnapshot.idmap.NativeParentSessionID,
 				Cwd:                   memberSnapshot.cwd, Title: memberSnapshot.title,
-				Model: stateSnapshotModel{ProviderID: memberSnapshot.providerID, ModelID: memberSnapshot.modelID, Agent: memberSnapshot.mode},
+				Model:         stateSnapshotModel{ProviderID: memberSnapshot.providerID, ModelID: memberSnapshot.modelID, Agent: memberSnapshot.mode},
+				ExtraPathDirs: append([]string{}, memberSnapshot.carrier.ExtraPathDirs...),
 			},
 			Graph: nodes, Events: events,
 		}
@@ -431,6 +441,10 @@ func (a *Agent) graphSecretNeedles(graph []*session) []string {
 	for _, member := range graph {
 		member.mu.Lock()
 		needles = append(needles, member.secretNeedles...)
+		// The carrier is the one environment a stored snapshot writes out, so
+		// its bearer values are redacted from the same pass that redacts the
+		// agent-wide ones.
+		needles = append(needles, sensitiveEnvNeedles(member.carrier.Env)...)
 		member.mu.Unlock()
 	}
 
@@ -586,6 +600,14 @@ func validateSyncSnapshot(sessionID string, snapshot stateSnapshot) error {
 
 	if snapshot.Session.SessionID != sessionID || snapshot.Session.NativeSessionID == "" || snapshot.RestoreGeneration == "" {
 		return fmt.Errorf("opencode sync manifest identity mismatch")
+	}
+
+	if snapshot.Session.ExtraPathDirs == nil {
+		return fmt.Errorf("opencode sync manifest is missing extraPathDirs")
+	}
+
+	if _, err := extraPathDirsFromMeta(snapshot.Session.ExtraPathDirs); err != nil {
+		return fmt.Errorf("opencode sync manifest extraPathDirs: %w", err)
 	}
 
 	seen := make(map[string]stateSnapshotNode, len(snapshot.Graph))

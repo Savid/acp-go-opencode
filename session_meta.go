@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -16,14 +17,16 @@ const (
 )
 
 type sessionMeta struct {
-	Model         string
-	OutputSchema  map[string]any
-	Mode          string
-	Permission    string
-	PermissionSet bool
-	Env           map[string]string
-	ExtraPathDirs []string
-	RawMessages   rawMessageConfig
+	Model            string
+	OutputSchema     map[string]any
+	Mode             string
+	Permission       string
+	PermissionSet    bool
+	Env              map[string]string
+	EnvSet           bool
+	ExtraPathDirs    []string
+	ExtraPathDirsSet bool
+	RawMessages      rawMessageConfig
 }
 
 func sessionMetaFromLifecycle(meta map[string]any) (sessionMeta, error) {
@@ -39,25 +42,29 @@ func sessionMetaFromLifecycle(meta map[string]any) (sessionMeta, error) {
 	outputSchema, _ := options.OutputSchema.(map[string]any)
 
 	return sessionMeta{
-		Model:         options.Model,
-		OutputSchema:  outputSchema,
-		Mode:          options.Mode,
-		Permission:    normalizeOpenCodePermission(options.Permission),
-		PermissionSet: options.PermissionSet,
-		Env:           options.Env,
-		ExtraPathDirs: options.ExtraPathDirs,
-		RawMessages:   rawMessageConfigFromMeta(meta),
+		Model:            options.Model,
+		OutputSchema:     outputSchema,
+		Mode:             options.Mode,
+		Permission:       normalizeOpenCodePermission(options.Permission),
+		PermissionSet:    options.PermissionSet,
+		Env:              cloneStringMap(options.Env),
+		EnvSet:           options.EnvSet,
+		ExtraPathDirs:    append([]string(nil), options.ExtraPathDirs...),
+		ExtraPathDirsSet: options.ExtraPathDirsSet,
+		RawMessages:      rawMessageConfigFromMeta(meta),
 	}, nil
 }
 
 type opencodeMetaOptions struct {
-	Model         string
-	OutputSchema  any
-	Mode          string
-	Permission    string
-	PermissionSet bool
-	Env           map[string]string
-	ExtraPathDirs []string
+	Model            string
+	OutputSchema     any
+	Mode             string
+	Permission       string
+	PermissionSet    bool
+	Env              map[string]string
+	EnvSet           bool
+	ExtraPathDirs    []string
+	ExtraPathDirsSet bool
 }
 
 func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
@@ -77,6 +84,7 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 		}
 
 		options.Env = env
+		options.EnvSet = true
 	}
 
 	if rawDirs, ok := optionsMap[metaExtraPathDirsKey]; ok {
@@ -86,6 +94,7 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 		}
 
 		options.ExtraPathDirs = dirs
+		options.ExtraPathDirsSet = true
 	}
 
 	if rawModel, ok := optionsMap[metaModelKey]; ok {
@@ -131,10 +140,11 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 	return options, nil
 }
 
-// sessionEnvFromMeta reads the per-session process environment. A host may send
-// it as JSON or hand it over in process, so both shapes are accepted. PATH is
-// refused here rather than merged: these entries replace whole values, and the
-// additive mechanism is extraPathDirs.
+// sessionEnvFromMeta reads the environment carried on the addressed native
+// session. A host may send it as JSON or hand it over in process, so both
+// shapes are accepted. Values are preserved exactly, including empty strings:
+// an operation that clears a variable is asking for the empty value, not for
+// the key to be dropped.
 func sessionEnvFromMeta(value any) (map[string]string, error) {
 	var values map[string]any
 
@@ -164,10 +174,17 @@ func sessionEnvFromMeta(value any) (map[string]string, error) {
 	return env, nil
 }
 
-// validEnvName refuses names a child process cannot carry, plus the one name
-// this option is not allowed to own.
+// validEnvName refuses names a child process cannot carry, the roots the
+// adapter manages on OpenCode's behalf, and the one name this option is not
+// allowed to own. PATH is compared without regard to case on every platform:
+// the refusal is a property of the protocol field rather than of the host that
+// happens to decode it, and a Windows child resolves PATH and Path to the same
+// variable.
 func validEnvName(key string) bool {
-	return key != "" && key != envPathKey && !reservedOpenCodeEnvKey(key) && !strings.ContainsAny(key, "=\x00")
+	return key != "" &&
+		!strings.EqualFold(key, envPathKey) &&
+		!reservedOpenCodeEnvKey(key) &&
+		!strings.ContainsAny(key, "=\x00")
 }
 
 // extraPathDirsFromMeta reads the directories placed ahead of the inherited
@@ -198,7 +215,7 @@ func extraPathDirsFromMeta(value any) ([]string, error) {
 			return nil, unsupportedField(field)
 		}
 
-		if !filepath.IsAbs(dir) {
+		if dir == "" || !filepath.IsAbs(dir) || strings.ContainsRune(dir, os.PathListSeparator) {
 			return nil, acp.NewInvalidParams(map[string]any{
 				jsonFieldError: errValueAbsolutePathRequired,
 				jsonFieldField: field,

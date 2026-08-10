@@ -179,16 +179,19 @@ Session-scoped request options include `WithSessionMCPServers`,
 
 `OpenCodeOptions` (built with `NewOpenCodeOptions` and `WithOpenCodeModel`,
 `WithOpenCodeOutputSchema`, `WithOpenCodeMode`,
-`WithOpenCodePermission`, `WithOpenCodeEnv`, `WithOpenCodeExtraPathDirs`)
+`WithOpenCodePermission`, `WithOpenCodeEnv`, and `WithOpenCodeExtraPathDirs`)
 render into `_meta.opencode.options` via its `Meta` method.
 
-`WithOpenCodeEnv` overlays `WithEnv` for the native process the session runs
-under. `HOME`, XDG roots, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`,
-`OPENCODE_CONFIG_CONTENT`, and `OPENCODE_DB` are reserved there too.
-`WithOpenCodeExtraPathDirs` places absolute directories ahead of
-the isolation policy's `PATH`. See
-[Sessions](/docs/core/sessions) for how an environment binds a runtime
-generation.
+`WithOpenCodeEnv` sets the environment that native session's shell tools run
+under, and `WithOpenCodeExtraPathDirs` places absolute directories ahead of the
+`PATH` those tools resolve against. Both are session-local: two live sessions of
+one Agent hold different values, and a restored session rebinds to the values
+its request supplies. The directories remain ordered and durable across load,
+resume, recovery, and fork; the environment follows the same rules except that
+it is not written to the session store, so a reloaded session supplies it again.
+`WithOpenCodeEnv` refuses `PATH` in any casing along with managed OpenCode and
+XDG roots. Use `WithEnv` for static environment configuration shared by the
+Agent's native server.
 
 ## Session store
 

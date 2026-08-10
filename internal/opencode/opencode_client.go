@@ -48,6 +48,7 @@ const (
 // Native OpenCode REST routes used by the client and required by the /doc
 // contract validation.
 const (
+	routeConfig               = "/config"
 	routeConfigProviders      = "/config/providers"
 	routeDoc                  = "/doc"
 	routeGlobalHealth         = "/global/health"
@@ -77,15 +78,20 @@ const (
 // Native OpenCode wire-field spellings shared between request bodies and the
 // /doc schema validation.
 const (
-	fieldAction     = "action"
-	fieldAnswers    = "answers"
-	fieldID         = "id"
-	fieldMCP        = "mcp"
-	fieldPermission = "permission"
-	fieldQuestions  = "questions"
-	fieldReply      = "reply"
-	fieldRequestID  = "requestID"
-	fieldSessionID  = "sessionID"
+	fieldAction               = "action"
+	fieldAnswers              = "answers"
+	fieldDirectory            = "directory"
+	fieldID                   = "id"
+	fieldMCP                  = "mcp"
+	fieldMetadata             = "metadata"
+	sessionCarrierMetadataKey = "acp-go-opencode"
+	sessionCarrierEnvKey      = "env"
+	sessionCarrierPathKey     = "extraPathDirs"
+	fieldPermission           = "permission"
+	fieldQuestions            = "questions"
+	fieldReply                = "reply"
+	fieldRequestID            = "requestID"
+	fieldSessionID            = "sessionID"
 )
 
 // openAPITypeArray is the OpenAPI schema "type" value for arrays.
@@ -149,6 +155,12 @@ type Client interface {
 type ScopeOptions struct {
 	Directory  string
 	MCPServers []MCPServerConfig
+	// Env and ExtraPathDirs are the addressed-session carrier. They are written
+	// onto the native session this scope creates or adopts and reach only that
+	// session's shell boundary; the shared runtime process environment is fixed
+	// at exec and is never republished from here.
+	Env           map[string]string
+	ExtraPathDirs []string
 }
 
 type PermissionRule struct {
@@ -194,17 +206,13 @@ type StartOptions struct {
 	Env                 map[string]string
 	ImplicitEnvironment map[string]string
 	ProcessIsolation    *ProcessIsolation
-	// ExtraPathDirs are absolute directories placed ahead of the inherited
-	// PATH, in order. Env cannot carry a search path: its entries replace whole
-	// values, so a PATH there would drop everything the child resolves against.
-	ExtraPathDirs []string
-	Pure          bool
-	QuestionTool  bool
-	LogLevel      string
-	MinVersion    string
-	HealthTimeout time.Duration
-	Logger        *slog.Logger
-	ExistingXDG   XDGDirs
+	Pure                bool
+	QuestionTool        bool
+	LogLevel            string
+	MinVersion          string
+	HealthTimeout       time.Duration
+	Logger              *slog.Logger
+	ExistingXDG         XDGDirs
 	// NativeOwnedXDG means the runtime identity owns Root. StartServer must not
 	// create, inspect, or write any path beneath it before launching OpenCode.
 	NativeOwnedXDG           bool
@@ -410,6 +418,8 @@ type openCodeServer struct {
 	errs                         chan error
 	closed                       chan struct{}
 	directory                    string
+	sessionEnv                   map[string]string
+	extraPathDirs                []string
 	scopeCancel                  context.CancelFunc
 	runtimeShutdown              *runtimeShutdownState
 	runtimeClosed                chan struct{}
@@ -423,6 +433,8 @@ type openCodeServer struct {
 	processObservation           *runtimeProcessObservation
 	waitDone                     chan error
 	containmentGenerationCleanup func() error
+	sessionCarrierCleanup        func() error
+	pure                         bool
 
 	streamMu    sync.Mutex
 	streamEpoch uint64
@@ -440,10 +452,11 @@ func newRuntimeShutdownState() *runtimeShutdownState {
 }
 
 type NativeSession struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Directory string `json:"directory"`
-	Agent     string `json:"agent"`
+	ID        string         `json:"id"`
+	Title     string         `json:"title"`
+	Directory string         `json:"directory"`
+	Agent     string         `json:"agent"`
+	Metadata  map[string]any `json:"metadata"`
 	Model     struct {
 		ID         string `json:"id"`
 		ModelID    string `json:"modelID"`
@@ -850,6 +863,7 @@ var (
 	openCodeKillProcess                        = killOpenCodeProcess
 	openCodeWaitCommand                        = func(cmd *exec.Cmd) error { return cmd.Wait() }
 	openCodeRemoveAll                          = os.RemoveAll
+	openCodeReadFile                           = os.ReadFile
 	openCodePrepareRuntimeGeneration           = prepareDarwinRuntimeGeneration
 	openCodeAfter                              = time.After
 	openCodeReadyPollInterval                  = 100 * time.Millisecond
@@ -862,7 +876,7 @@ var (
 const HealthCheckTimeout = 60 * time.Second
 
 func normalizedStartOptions(options StartOptions) StartOptions {
-	options.ImplicitEnvironment = cloneEnvironment(options.ImplicitEnvironment)
+	options.ImplicitEnvironment = maps.Clone(options.ImplicitEnvironment)
 	if options.ProcessIsolation == nil && options.ImplicitEnvironment == nil {
 		options.ImplicitEnvironment = captureProcessEnvironment()
 	}
@@ -921,16 +935,35 @@ func validRuntimeXDGDirs(dirs XDGDirs) bool {
 	return dirs == RuntimeXDGDirs(dirs.Root)
 }
 
-func runtimeConfigContent(seedFiles map[string]string) (string, map[string][]byte, error) {
+func runtimeConfigContent(seedFiles map[string]string, sessionCarrierPlugin string) (string, map[string][]byte, error) {
 	writes, seededConfig, err := planOpenCodeSeedWrites(seedFiles)
 	if err != nil {
 		return "", nil, err
+	}
+
+	if seededConfig == nil {
+		seededConfig = map[string]any{}
 	}
 
 	for _, forbidden := range []string{fieldPermission, fieldMCP} {
 		if _, exists := seededConfig[forbidden]; exists {
 			return "", nil, fmt.Errorf("shared runtime seed must not contain session-scoped %q", forbidden)
 		}
+	}
+
+	if sessionCarrierPlugin != "" {
+		plugins := make([]any, 0, 1)
+
+		if value, exists := seededConfig["plugin"]; exists {
+			var ok bool
+
+			plugins, ok = value.([]any)
+			if !ok {
+				return "", nil, errors.New("seeded opencode.json plugin must be an array")
+			}
+		}
+
+		seededConfig["plugin"] = append(plugins, sessionCarrierPlugin)
 	}
 
 	config := deepMergeJSON(seededConfig, map[string]any{"$schema": "https://opencode.ai/config.json"})
@@ -969,6 +1002,23 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		return nil, err
 	}
 
+	var (
+		sessionCarrier        sessionCarrierPlugin
+		sessionCarrierCleanup func() error
+	)
+
+	if !options.Pure {
+		sessionCarrier, sessionCarrierCleanup, err = materializeSessionCarrierPlugin(xdg.Root, options.ProcessIsolation)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if sessionCarrierCleanup != nil {
+				resultErr = errors.Join(resultErr, sessionCarrierCleanup())
+			}
+		}()
+	}
+
 	controlRoot := options.ControlRoot
 	if controlRoot == "" {
 		controlRoot = ControlRootForXDG(xdg.Root)
@@ -985,7 +1035,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	if options.NativeOwnedXDG {
 		var writes map[string][]byte
 
-		runtimeConfig, writes, err = runtimeConfigContent(options.SeedFiles)
+		runtimeConfig, writes, err = runtimeConfigContent(options.SeedFiles, sessionCarrier.URL)
 		if err == nil {
 			delete(writes, openCodeConfigFileName)
 
@@ -996,7 +1046,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 			}
 		}
 	} else {
-		runtimeConfig, err = materializeOpenCodeRuntimeConfig(xdg, options.SeedFiles)
+		runtimeConfig, err = materializeOpenCodeRuntimeConfig(xdg, options.SeedFiles, sessionCarrier.URL)
 	}
 
 	observeOpenCodeStartupStage(ctx, options, "runtime", "configuration", configurationStarted, err)
@@ -1059,10 +1109,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		env["OPENCODE_ENABLE_QUESTION_TOOL"] = "1"
 	}
 
-	// Both PATH mechanisms reach the assembled slice rather than the map above:
-	// they prepend to the inherited PATH instead of replacing it. The shim runs
-	// last so its shadowed launchers stay ahead of caller directories.
-	nativeEnv := prependPathDirs(envMapToSlice(env), options.ExtraPathDirs)
+	nativeEnv := envMapToSlice(env)
 	if options.BrowserShim != nil {
 		nativeEnv = options.BrowserShim.environ(nativeEnv)
 	}
@@ -1287,7 +1334,10 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		processObservation:           processObservation,
 		waitDone:                     waitDone,
 		containmentGenerationCleanup: releaseContainmentGeneration,
+		sessionCarrierCleanup:        sessionCarrierCleanup,
+		pure:                         options.Pure,
 	}
+	sessionCarrierCleanup = nil
 	containmentGenerationTransferred = true
 
 	readyCtx, readyCancel := context.WithTimeout(ctx, options.HealthTimeout)
@@ -1304,6 +1354,22 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, nil)
 
+	// A runtime that cannot prove its carrier plugin is live is a runtime whose
+	// every shell operation would run with no bearer, no operation directories
+	// and no error. It never reaches a session.
+	if sessionCarrier.URL != "" {
+		carrierStarted := time.Now()
+		carrierCtx, carrierCancel := context.WithTimeout(ctx, options.HealthTimeout)
+		carrierErr := server.proveSessionCarrierLoaded(carrierCtx, sessionCarrier.Proof)
+
+		carrierCancel()
+		observeOpenCodeStartupStage(ctx, options, "runtime", "carrier", carrierStarted, carrierErr)
+
+		if carrierErr != nil {
+			return nil, errors.Join(carrierErr, server.Shutdown(ctx))
+		}
+	}
+
 	if supervisor != nil {
 		processObservation.markSupervisorsReady(ctx)
 		processObservation.markDescendantsReady(ctx, supervisor.processSnapshot)
@@ -1314,6 +1380,35 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 func ControlRootForXDG(root string) string {
 	return root + ".control"
+}
+
+// proveSessionCarrierLoaded requires the generated plugin to be live before the
+// runtime is handed to any session.
+//
+// OpenCode instantiates a plugin lazily, with the first directory-scoped
+// request rather than at listen time, and it treats a plugin it cannot load as
+// non-fatal: the server reaches readiness, shell operations succeed, and the
+// carrier is simply absent. The scoped request below is what forces the load,
+// and the marker the plugin writes as it is instantiated is what distinguishes
+// "the hooks are installed" from "the hooks were never registered".
+func (s *openCodeServer) proveSessionCarrierLoaded(ctx context.Context, proof sessionCarrierProof) error {
+	var ignored map[string]any
+
+	if err := s.getJSON(ctx, routeConfig, url.Values{fieldDirectory: {proof.Directory}}, &ignored); err != nil {
+		return fmt.Errorf("drive the OpenCode session carrier plugin: %w", err)
+	}
+
+	for {
+		if content, err := openCodeReadFile(proof.Path); err == nil && string(content) == proof.Token {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return errors.New("opencode session carrier plugin did not load; refusing a runtime whose shell operations would carry no session")
+		case <-openCodeAfter(openCodeReadyPollInterval):
+		}
+	}
 }
 
 func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context, options StartOptions) error {
@@ -1505,6 +1600,10 @@ func (s *openCodeServer) shutdownRuntime() error {
 	}
 
 	err = errors.Join(err, s.ordinaryHomeLock.Release())
+	if s.sessionCarrierCleanup != nil && !errors.Is(err, ErrProcessContainmentIncomplete) {
+		err = errors.Join(err, s.sessionCarrierCleanup())
+		s.sessionCarrierCleanup = nil
+	}
 
 	if s.containmentGenerationCleanup != nil && !errors.Is(err, ErrProcessContainmentIncomplete) {
 		err = errors.Join(err, s.containmentGenerationCleanup())
@@ -1582,6 +1681,13 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		return nil, fmt.Errorf("opencode scope directory is required")
 	}
 
+	// Pure mode omits the carrier plugin, so nothing would apply either half of
+	// the carrier. Refusing here keeps the failure at admission rather than
+	// letting a session believe it holds an environment it never receives.
+	if s.pure && (len(options.ExtraPathDirs) > 0 || len(options.Env) > 0) {
+		return nil, errors.New("opencode pure mode does not support the addressed session carrier")
+	}
+
 	scopeCtx, cancel := context.WithCancel(context.Background())
 	scope := &openCodeServer{
 		httpClient: s.httpClient, baseURL: s.baseURL, username: s.username,
@@ -1593,6 +1699,9 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		closed: make(chan struct{}), directory: options.Directory,
 		scopeCancel: cancel, runtimeShutdown: s.runtimeShutdown, runtimeClosed: s.runtimeClosed,
 		runtimeExited: s.runtimeExited,
+		sessionEnv:    maps.Clone(options.Env),
+		extraPathDirs: append([]string(nil), options.ExtraPathDirs...),
+		pure:          s.pure,
 	}
 
 	if err := scope.registerMCP(ctx, options.MCPServers); err != nil {
@@ -1806,11 +1915,56 @@ func (s *openCodeServer) CreateSessionWithPolicy(ctx context.Context, title stri
 		body[fieldPermission] = permission
 	}
 
+	if s.carriesSession() {
+		body[fieldMetadata] = s.sessionCarrierMetadata(nil)
+	}
+
 	var out NativeSession
 
 	err := s.doJSON(ctx, http.MethodPost, routeSession, nil, body, &out)
 
 	return out, err
+}
+
+// carriesSession reports whether this scope owns an addressed native session.
+// Only a directory-scoped client does; the shared runtime handle itself never
+// writes a carrier.
+func (s *openCodeServer) carriesSession() bool {
+	return s.directory != "" && !s.pure
+}
+
+// sessionCarrierMetadata replaces the adapter's namespace on a native session's
+// metadata and leaves every other namespace alone. Replacement rather than
+// merge is what makes a rebind authoritative: a value the session no longer
+// holds must not survive in the environment its next command runs under.
+func (s *openCodeServer) sessionCarrierMetadata(metadata map[string]any) map[string]any {
+	result := maps.Clone(metadata)
+	if result == nil {
+		result = map[string]any{}
+	}
+
+	env := make(map[string]any, len(s.sessionEnv))
+	for key, value := range s.sessionEnv {
+		env[key] = value
+	}
+
+	result[sessionCarrierMetadataKey] = map[string]any{
+		sessionCarrierEnvKey:  env,
+		sessionCarrierPathKey: append([]string{}, s.extraPathDirs...),
+	}
+
+	return result
+}
+
+func (s *openCodeServer) setSessionCarrier(ctx context.Context, native *NativeSession) error {
+	var ignored NativeSession
+
+	metadata := s.sessionCarrierMetadata(native.Metadata)
+	native.Metadata = metadata
+
+	return s.doJSON(ctx, http.MethodPatch, routeSession+"/"+url.PathEscape(native.ID), nil, map[string]any{
+		fieldMetadata: metadata,
+	}, &ignored)
 }
 
 func (s *openCodeServer) SyncHistory(ctx context.Context, cursors map[string]int64) ([]SyncEvent, error) {
@@ -1831,8 +1985,8 @@ func (s *openCodeServer) SyncReplay(ctx context.Context, directory string, event
 	}
 
 	return s.doJSON(ctx, http.MethodPost, "/sync/replay", nil, map[string]any{
-		"directory": directory,
-		"events":    events,
+		fieldDirectory: directory,
+		"events":       events,
 	}, nil)
 }
 
@@ -1840,6 +1994,9 @@ func (s *openCodeServer) GetSession(ctx context.Context, id string) (NativeSessi
 	var out NativeSession
 
 	err := s.getJSON(ctx, "/session/"+url.PathEscape(id), nil, &out)
+	if err == nil && s.carriesSession() {
+		err = s.setSessionCarrier(ctx, &out)
+	}
 
 	return out, err
 }
@@ -1847,7 +2004,7 @@ func (s *openCodeServer) GetSession(ctx context.Context, id string) (NativeSessi
 func (s *openCodeServer) ListSessions(ctx context.Context, cwd string) ([]NativeSession, error) {
 	query := url.Values{}
 	if cwd != "" {
-		query.Set("directory", cwd)
+		query.Set(fieldDirectory, cwd)
 	}
 
 	var out []NativeSession
@@ -2065,6 +2222,9 @@ func (s *openCodeServer) Fork(ctx context.Context, id string, messageID string) 
 	var out NativeSession
 
 	err := s.doJSON(ctx, http.MethodPost, "/session/"+url.PathEscape(id)+"/fork", nil, body, &out)
+	if err == nil && s.carriesSession() {
+		err = s.setSessionCarrier(ctx, &out)
+	}
 
 	return out, err
 }
@@ -2241,8 +2401,8 @@ func (s *openCodeServer) doJSONWithClient(
 			query = maps.Clone(query)
 		}
 
-		if query.Get("directory") == "" {
-			query.Set("directory", s.directory)
+		if query.Get(fieldDirectory) == "" {
+			query.Set(fieldDirectory, s.directory)
 		}
 	}
 
@@ -2395,7 +2555,7 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 
 	eventURL := s.baseURL + routeEvent
 	if s.directory != "" {
-		eventURL += "?" + url.Values{"directory": []string{s.directory}}.Encode()
+		eventURL += "?" + url.Values{fieldDirectory: []string{s.directory}}.Encode()
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, eventURL, http.NoBody)
@@ -2500,6 +2660,7 @@ func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 	rawPaths, _ := doc["paths"].(map[string]any)
 
 	required := []string{
+		routeConfig,
 		routeConfigProviders,
 		routeCommand,
 		routeEvent,
@@ -3012,13 +3173,13 @@ const (
 // materializeOpenCodeRuntimeConfig writes only immutable process-level seed
 // configuration. Permission and MCP state are session/directory scoped and
 // must never enter OPENCODE_CONFIG_CONTENT on a multiplexed runtime.
-func materializeOpenCodeRuntimeConfig(dirs XDGDirs, seedFiles map[string]string) (string, error) {
+func materializeOpenCodeRuntimeConfig(dirs XDGDirs, seedFiles map[string]string, sessionCarrierPlugin string) (string, error) {
 	configDir := filepath.Join(dirs.Config, opencodeExecutableName)
 	if err := openCodeSeedMkdirAll(configDir, 0o700); err != nil {
 		return "", err
 	}
 
-	content, writes, err := runtimeConfigContent(seedFiles)
+	content, writes, err := runtimeConfigContent(seedFiles, sessionCarrierPlugin)
 	if err != nil {
 		return "", err
 	}
@@ -3294,6 +3455,8 @@ func randomPassword() (string, error) {
 }
 
 func envMapToSlice(env map[string]string) []string {
+	env = composeEnvironment(env)
+
 	keys := make([]string, 0, len(env))
 	for key := range env {
 		keys = append(keys, key)

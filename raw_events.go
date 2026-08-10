@@ -79,11 +79,8 @@ const (
 	rawReasonOversize       = "oversize"
 	rawReasonUnserializable = "unserializable"
 
-	rawEventSource          = "opencode-serve"
-	limitSessionPrompt      = "session_prompt"
-	limitRuntimeEnvironment = "runtime_environment"
-
-	runtimeEnvironmentChangedCause = "shared OpenCode runtime environment changed"
+	rawEventSource     = "opencode-serve"
+	limitSessionPrompt = "session_prompt"
 )
 
 type rawMessageConfig struct {

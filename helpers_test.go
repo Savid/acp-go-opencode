@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -202,6 +203,7 @@ type fakeOpenCodeClient struct {
 	syncReplayErr  error
 	refreshMCPErr  error
 	syncEvents     []opencode.SyncEvent
+	scopeOptions   []opencode.ScopeOptions
 
 	providerCatalog        []opencode.ProviderCatalogEntry
 	providerCatalogErr     error
@@ -316,8 +318,23 @@ func (c *fakeOpenCodeClient) Close(context.Context) error {
 
 func (c *fakeOpenCodeClient) Shutdown(ctx context.Context) error { return c.Close(ctx) }
 
-func (c *fakeOpenCodeClient) Scope(context.Context, opencode.ScopeOptions) (opencode.Client, error) {
+func (c *fakeOpenCodeClient) Scope(_ context.Context, options opencode.ScopeOptions) (opencode.Client, error) {
+	c.mu.Lock()
+	c.scopeOptions = append(c.scopeOptions, opencode.ScopeOptions{
+		Directory: options.Directory, MCPServers: cloneNativeMCPServerConfigs(options.MCPServers),
+		Env:           cloneStringMap(options.Env),
+		ExtraPathDirs: append([]string(nil), options.ExtraPathDirs...),
+	})
+	c.mu.Unlock()
+
 	return c, c.scopeErr
+}
+
+func (c *fakeOpenCodeClient) scopes() []opencode.ScopeOptions {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return append([]opencode.ScopeOptions(nil), c.scopeOptions...)
 }
 
 func (c *fakeOpenCodeClient) RefreshMCP(ctx context.Context, servers []opencode.MCPServerConfig) error {
@@ -727,6 +744,15 @@ func signalTestHook(ch chan struct{}) {
 	select {
 	case ch <- struct{}{}:
 	default:
+	}
+}
+
+func requireSignal(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for test signal")
 	}
 }
 

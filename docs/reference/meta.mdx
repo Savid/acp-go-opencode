@@ -23,7 +23,7 @@ Lifecycle requests accept:
         "mode": "build",
         "permission": "ask",
         "outputSchema": {},
-        "env": {"NAME": "value"},
+        "env": {"SERVICE_API_TOKEN": "..."},
         "extraPathDirs": ["/absolute/bin"]
       },
       "rawEvent": {
@@ -40,8 +40,8 @@ Lifecycle requests accept:
 | `options.mode` | An enumerable OpenCode agent name. |
 | `options.permission` | `ask`, `allow`, or `deny`; empty is treated as `ask`. |
 | `options.outputSchema` | JSON Schema object for native structured output. |
-| `options.env` | String map overlaid on `WithEnv` for the native process this session runs under. |
-| `options.extraPathDirs` | Absolute directories placed ahead of the isolation policy's `PATH`, in order. |
+| `options.env` | Environment the addressed native session's shell tools run under. `PATH` is refused without regard to case. |
+| `options.extraPathDirs` | Absolute directories placed ahead of the addressed native session's shell-tool `PATH`, in order. |
 | `rawEvent.enabled` | Opt in to `_opencode/rawEvent` notifications. |
 
 `_meta.opencode.options.permission` becomes the native session's permission
@@ -49,19 +49,21 @@ rule list at creation. Model selection is fixed by the logical session but is
 sent on each native message or command request, not in the native creation
 body.
 
-A process environment is fixed at exec and one native process serves every
-session of an Agent, so `options.env` and `options.extraPathDirs` bind the
-runtime generation rather than the session alone: an identical environment
-reuses the running generation, a differing one starts a fresh generation while
-no session is live, and a differing one meets
-`{"error": "backpressure", "limit": "runtime_environment"}` while a session
-still holds the running environment — retry-later, not a rejected request.
-`options.env` may not carry `PATH`, `HOME`, XDG roots, OpenCode config roots,
-inline OpenCode config, or `OPENCODE_DB`. Those values select native identity,
-credential, config, or database authorities and remain owned by `WithHome`,
-seed files, and the trusted process-isolation base environment.
-`options.extraPathDirs` is the additive PATH mechanism and rejects a relative
-entry with `{"error": "absolute_path_required"}`.
+`options.env` and `options.extraPathDirs` are carried on the addressed native
+session rather than on the shared `opencode serve` process. Concurrent sessions
+may therefore hold distinct environments and ordered directory lists without
+sharing them or restarting the server. Both are stored with the logical session
+and follow load, resume, recovery, and fork; supplying a half while restoring a
+session replaces the stored half outright. The durable snapshot records
+`extraPathDirs` only, so a reloaded session receives its environment from the
+reloading request rather than from stored bearer material.
+
+A relative, empty, or path-list `extraPathDirs` entry is rejected before a
+native session is created. Inside `options.env`, a non-string value, an empty
+name, a name containing `=` or NUL, a managed OpenCode or XDG root, and `PATH`
+in any casing are each rejected at the indexed field that owns them — a raw
+search path fails at `_meta.opencode.options.env.PATH`. Empty string values are
+preserved: clearing a variable is expressed by its empty value.
 
 `session/prompt` and an active `session/cancel` require a top-level
 `_meta["acp-go.dev/route"]` object containing exactly `version: 1` and a

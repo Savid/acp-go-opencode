@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -156,12 +157,15 @@ func validateEnvironmentMap(environment map[string]string) error {
 	return nil
 }
 
+// pathEnv names the search path a child resolves every executable against.
+const pathEnv = "PATH"
+
 func environmentMap(entries []string) map[string]string {
 	values := make(map[string]string, len(entries))
 	for _, entry := range entries {
 		key, value, ok := strings.Cut(entry, "=")
 		if ok && key != "" {
-			values[key] = value
+			values[canonicalEnvironmentKey(key)] = value
 		}
 	}
 
@@ -188,16 +192,14 @@ func buildProcessEnvironmentFrom(
 		base = captureProcessEnvironment()
 	}
 
-	values := withoutAdapterOwnedState(cloneEnvironment(base))
+	values := composeEnvironment(withoutAdapterOwnedState(base))
 
 	for _, overlay := range overlays {
 		if err := validateEnvironmentMap(overlay); err != nil {
 			return nil, err
 		}
 
-		for key, value := range withoutAdapterOwnedState(overlay) {
-			values[key] = value
-		}
+		values = composeEnvironment(values, withoutAdapterOwnedState(overlay))
 	}
 
 	// Only a complete explicit policy carries the absolute-entry PATH rule.
@@ -205,12 +207,56 @@ func buildProcessEnvironmentFrom(
 	// perfectly ordinary shell PATH must not turn policy omission into a
 	// startup refusal.
 	if isolation != nil {
-		if err := validateProcessSearchPath(values[pathEnv]); err != nil {
+		if err := validateProcessSearchPath(environmentMapValue(values, pathEnv)); err != nil {
 			return nil, err
 		}
 	}
 
 	return values, nil
+}
+
+// composeEnvironment folds ordered phases into one environment keyed by the
+// platform's canonical spelling: later phases replace earlier ones, which is
+// what makes a caller overlay beat the ambient base.
+//
+// Within a single phase there is no order to inherit — a Go map has none — so
+// the rule is stated rather than discovered: keys are sorted and written in
+// that order, so when several spellings of one Windows variable share a phase
+// the lexicographically last spelling wins ("Path" over "PATH", "PathExt" over
+// "PATHEXT"). The value is arbitrary but the choice is not: one phase always
+// produces the same environment, which is the property a launch depends on.
+func composeEnvironment(phases ...map[string]string) map[string]string {
+	values := map[string]string{}
+
+	for _, phase := range phases {
+		keys := make([]string, 0, len(phase))
+		for key := range phase {
+			keys = append(keys, key)
+		}
+
+		slices.Sort(keys)
+
+		for _, key := range keys {
+			values[canonicalEnvironmentKey(key)] = phase[key]
+		}
+	}
+
+	return values
+}
+
+func environmentMapValue(environment map[string]string, name string) string {
+	return environment[canonicalEnvironmentKey(name)]
+}
+
+func environmentValue(environment []string, name string) string {
+	for index := len(environment) - 1; index >= 0; index-- {
+		key, value, ok := strings.Cut(environment[index], "=")
+		if ok && environmentKeyEqual(key, name) {
+			return value
+		}
+	}
+
+	return ""
 }
 
 // withoutAdapterOwnedState drops every key the adapter owns rather than
@@ -263,19 +309,6 @@ func managedRuntimeRootEnvKey(key string) bool {
 
 func captureProcessEnvironment() map[string]string {
 	return environmentMap(processEnviron())
-}
-
-func cloneEnvironment(environment map[string]string) map[string]string {
-	if environment == nil {
-		return nil
-	}
-
-	cloned := make(map[string]string, len(environment))
-	for key, value := range environment {
-		cloned[key] = value
-	}
-
-	return cloned
 }
 
 // ordinaryDirectExecution reports whether an omitted policy runs the native
@@ -370,8 +403,12 @@ func resolveProcessExecutable(path string, env []string, strict bool) (string, e
 		return "", errors.New("executable path is empty")
 	}
 
+	if !strict {
+		return resolveOrdinaryProcessExecutable(path, env)
+	}
+
 	if strings.ContainsRune(path, filepath.Separator) {
-		if strict && !filepath.IsAbs(path) {
+		if !filepath.IsAbs(path) {
 			return "", fmt.Errorf("executable path %q is not absolute", path)
 		}
 
@@ -387,15 +424,13 @@ func resolveProcessExecutable(path string, env []string, strict bool) (string, e
 		return path, nil
 	}
 
-	search := environmentMap(env)[pathEnv]
+	search := environmentValue(env, pathEnv)
 	if search == "" {
-		return "", fmt.Errorf("find %s: %s is empty", path, processSearchPathName(strict))
+		return "", fmt.Errorf("find %s: process isolation %s is empty", path, pathEnv)
 	}
 
-	if strict {
-		if err := validateProcessSearchPath(search); err != nil {
-			return "", fmt.Errorf("find %s: %w", path, err)
-		}
+	if err := validateProcessSearchPath(search); err != nil {
+		return "", fmt.Errorf("find %s: %w", path, err)
 	}
 
 	for _, directory := range filepath.SplitList(search) {
@@ -407,17 +442,9 @@ func resolveProcessExecutable(path string, env []string, strict bool) (string, e
 		}
 
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("find %s in %s: %w", path, processSearchPathName(strict), err)
+			return "", fmt.Errorf("find %s in process isolation %s: %w", path, pathEnv, err)
 		}
 	}
 
-	return "", fmt.Errorf("find %s in %s: %w", path, processSearchPathName(strict), exec.ErrNotFound)
-}
-
-func processSearchPathName(strict bool) string {
-	if strict {
-		return "process isolation " + pathEnv
-	}
-
-	return pathEnv
+	return "", fmt.Errorf("find %s in process isolation %s: %w", path, pathEnv, exec.ErrNotFound)
 }

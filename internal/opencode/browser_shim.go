@@ -74,26 +74,29 @@ func browserShimEnviron(env []string, dir string) []string {
 	kept := make([]string, 0, len(env)+2)
 	search := dir
 
+	if base := environmentValue(env, pathEnv); base != "" {
+		search += string(os.PathListSeparator) + base
+	}
+
 	for _, entry := range env {
-		key, value, ok := strings.Cut(entry, "=")
+		key, _, ok := strings.Cut(entry, "=")
 		if !ok {
 			kept = append(kept, entry)
 
 			continue
 		}
 
-		switch key {
-		case pathEnv:
-			search = dir + string(os.PathListSeparator) + value
-		case browserShimBrowserEnv:
+		switch {
+		case environmentKeyEqual(key, pathEnv):
+		case environmentKeyEqual(key, browserShimBrowserEnv):
 		default:
 			kept = append(kept, entry)
 		}
 	}
 
 	return append(kept,
-		pathEnv+"="+search,
-		browserShimBrowserEnv+"="+browserShimCommand(dir),
+		canonicalEnvironmentKey(pathEnv)+"="+search,
+		canonicalEnvironmentKey(browserShimBrowserEnv)+"="+browserShimCommand(dir),
 	)
 }
 

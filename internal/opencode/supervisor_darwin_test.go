@@ -735,13 +735,8 @@ func TestDarwinSupervisorProofFailureBranches(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		preserveDarwinSupervisorSeams(t)
 		root := t.TempDir()
-		helper := filepath.Join(root, "liveness")
-		data := []byte("#!/bin/sh\nprintf '%s\\n' '" + supervisorReadyPrefix + "{\"nativePid\":123}' >&2\nexit 0\n")
-		if err := os.WriteFile(helper, data, 0o700); err != nil {
-			t.Fatal(err)
-		}
 		completion := filepath.Join(root, "complete")
-		supervisorExecutable = func() (string, error) { return helper, nil }
+		supervisorExecutable = fixedSupervisorExecutable(readyLivenessSupervisor(t, root, 123, 1))
 		supervisorInput = io.NopCloser(&emptyReader{})
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
@@ -764,7 +759,7 @@ func TestDarwinSupervisorProofFailureBranches(t *testing.T) {
 		preserveDarwinSupervisorSeams(t)
 		config := darwinSupervisorTestConfig(t)
 		config.NativePath = "/bin/sh"
-		config.NativeArgs = []string{"-c", "sleep 0.05"}
+		config.NativeArgs = []string{"-c", "sleep 0.5"}
 		config.NativeEnv = os.Environ()
 		config.Home = filepath.Join(config.Scratch, "home")
 		config.Started = filepath.Join(config.Scratch, "started")

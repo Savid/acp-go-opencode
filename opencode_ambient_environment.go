@@ -20,7 +20,7 @@ func captureAmbientEnvironment() map[string]string {
 			continue
 		}
 
-		environment[key] = value
+		environment[canonicalAmbientEnvironmentKey(key)] = value
 	}
 
 	return environment

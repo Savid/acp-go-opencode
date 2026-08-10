@@ -35,9 +35,10 @@ type session struct {
 	secretNeedles         []string
 	outputSchema          map[string]any
 	rawMessages           rawMessageConfig
-	// runtimeEnv is the environment this session was admitted under. Recovery
-	// rebinds to a runtime carrying it, never to whichever one is running.
-	runtimeEnv runtimeEnvironment
+	// carrier is the environment and search-path prefix this session was
+	// admitted under. Recovery rebinds the native session to these values
+	// rather than to whatever the runtime last carried.
+	carrier sessionCarrier
 
 	client            opencode.Client
 	directoryRelease  func()
@@ -98,6 +99,7 @@ type sessionSnapshot struct {
 	mode                  string
 	permission            string
 	rawMessages           rawMessageConfig
+	carrier               sessionCarrier
 	client                opencode.Client
 }
 
@@ -152,7 +154,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		permission:              normalizeOpenCodePermission(meta.Permission),
 		outputSchema:            cloneAnyMap(meta.OutputSchema),
 		rawMessages:             meta.RawMessages,
-		runtimeEnv:              agent.sessionRuntimeEnvironment(meta),
+		carrier:                 newSessionCarrier(meta.Env, meta.ExtraPathDirs),
 		client:                  client,
 		emittedPartText:         map[string]string{},
 		emittedTools:            map[string]emittedToolState{},
@@ -812,6 +814,7 @@ func (s *session) snapshot() sessionSnapshot {
 		mode:                  s.mode,
 		permission:            s.permission,
 		rawMessages:           s.rawMessages,
+		carrier:               s.carrier.clone(),
 		client:                s.client,
 	}
 }
@@ -1125,7 +1128,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 	cwd := s.cwd
 	model := joinModelValue(s.providerID, s.modelID)
 	mcpServers := cloneNativeMCPServerConfigs(s.mcpServers)
-	environment := s.runtimeEnv
+	carrier := s.carrier.clone()
 	s.mu.Unlock()
 
 	storeCtx, cancel := s.agent.sessionStoreContext(ctx)
@@ -1151,7 +1154,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 			return err
 		}
 
-		client, releaseDirectory, generation, err := s.agent.newOpenCodeClient(ctx, id, cwd, mcpServers, environment)
+		client, releaseDirectory, generation, err := s.agent.newOpenCodeClient(ctx, id, cwd, mcpServers, carrier)
 		if err != nil {
 			return err
 		}

@@ -52,7 +52,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 	mcpConfigs := nativeMCPServerConfigs(params.McpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, a.sessionRuntimeEnvironment(meta))
+	carrier := newSessionCarrier(meta.Env, meta.ExtraPathDirs)
+
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, carrier)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -214,6 +216,9 @@ func (a *Agent) loadOrResumeSession(
 		meta.Mode = snapshot.Session.Model.Agent
 	}
 
+	carrier := carrierFromMeta(meta, newSessionCarrier(nil, snapshot.Session.ExtraPathDirs))
+	meta.Env, meta.ExtraPathDirs = carrier.Env, carrier.ExtraPathDirs
+
 	artifacts, artifactsErr := a.loadAndRehydrateArtifacts(ctx, string(id), snapshot.Events)
 	if artifactsErr != nil {
 		return nil, artifactsErr
@@ -221,7 +226,7 @@ func (a *Agent) loadOrResumeSession(
 
 	mcpConfigs := nativeMCPServerConfigs(mcpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, cwd, mcpConfigs, a.sessionRuntimeEnvironment(meta))
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, cwd, mcpConfigs, carrier)
 	if err != nil {
 		return nil, err
 	}
@@ -432,6 +437,9 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 	meta.Permission = parentSnapshot.permission
 
+	carrier := carrierFromMeta(meta, parentSnapshot.carrier)
+	meta.Env, meta.ExtraPathDirs = carrier.Env, carrier.ExtraPathDirs
+
 	nativeChild, err := parentSnapshot.client.Fork(ctx, parentSnapshot.idmap.NativeSessionID, "")
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
@@ -454,7 +462,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 	mcpConfigs := nativeMCPServerConfigsFromUnstable(params.McpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, a.sessionRuntimeEnvironment(meta))
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, carrier)
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -597,7 +605,7 @@ func (a *Agent) newOpenCodeClient(
 	id acp.SessionId,
 	cwd string,
 	mcpServers []opencode.MCPServerConfig,
-	environment runtimeEnvironment,
+	carrier sessionCarrier,
 ) (opencode.Client, func(), uint64, error) {
 	for {
 		releaseDirectory, err := a.bindDirectory(id, cwd, mcpServers)
@@ -605,7 +613,7 @@ func (a *Agent) newOpenCodeClient(
 			return nil, nil, 0, err
 		}
 
-		runtime, generation, err := a.sharedRuntimeBinding(ctx, environment)
+		runtime, generation, err := a.sharedRuntimeBinding(ctx)
 		if err != nil {
 			releaseDirectory()
 
@@ -613,7 +621,7 @@ func (a *Agent) newOpenCodeClient(
 		}
 
 		configurationStarted := time.Now()
-		client, err := runtime.Scope(ctx, opencode.ScopeOptions{Directory: cwd, MCPServers: mcpServers})
+		client, err := runtime.Scope(ctx, carrier.scopeOptions(cwd, mcpServers))
 		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, err)
 
 		if err == nil {

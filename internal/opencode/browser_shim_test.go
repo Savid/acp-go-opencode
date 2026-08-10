@@ -213,3 +213,13 @@ func TestBrowserShimRemoveToleratesANilShim(t *testing.T) {
 
 	require.NoError(t, shim.Remove())
 }
+
+// TestBrowserShimOutranksTheInheritedSearchPath pins the launcher shadow ahead
+// of everything the process inherited: a shadowed launcher the host also ships
+// must still resolve to the no-op.
+func TestBrowserShimOutranksTheInheritedSearchPath(t *testing.T) {
+	env := browserShimEnviron([]string{"PATH=/session/bin" + string(os.PathListSeparator) + "/usr/bin"}, "/shim")
+
+	require.Contains(t, env, "PATH=/shim"+string(os.PathListSeparator)+
+		"/session/bin"+string(os.PathListSeparator)+"/usr/bin")
+}

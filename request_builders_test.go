@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"strings"
 	"testing"
 
@@ -223,28 +224,33 @@ func (noopACPClient) WaitForTerminalExit(context.Context, acp.WaitForTerminalExi
 	return acp.WaitForTerminalExitResponse{}, nil
 }
 
-// The environment builders reach _meta unchanged and hand over copies, so a
-// caller mutating its own map after the call cannot rewrite the request.
-func TestOpenCodeEnvironmentBuilders(t *testing.T) {
-	env := map[string]string{"HOST_API_TOKEN": "secret"}
+func TestOpenCodeExtraPathDirsBuilderClones(t *testing.T) {
 	dirs := []string{"/session/bin"}
 	req := NewSessionRequest("/tmp/project", WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeEnv(env),
 		WithOpenCodeExtraPathDirs(dirs...),
 	)))
 
-	env["HOST_API_TOKEN"] = "mutated"
 	dirs[0] = "/mutated"
 
 	meta, err := sessionMetaFromLifecycle(req.Meta)
 	if err != nil {
 		t.Fatalf("session meta from builder: %v", err)
 	}
-	if meta.Env["HOST_API_TOKEN"] != "secret" {
-		t.Fatalf("session env = %#v", meta.Env)
-	}
 	if len(meta.ExtraPathDirs) != 1 || meta.ExtraPathDirs[0] != "/session/bin" {
 		t.Fatalf("session extra path dirs = %#v", meta.ExtraPathDirs)
+	}
+
+	clearMeta := NewOpenCodeOptions(WithOpenCodeExtraPathDirs()).Meta()
+	clearNamespace, ok := clearMeta[opencodeMetaKey].(map[string]any)
+	if !ok {
+		t.Fatalf("cleared options namespace = %#v", clearMeta[opencodeMetaKey])
+	}
+	clearValues, ok := clearNamespace[metaOptionsKey].(map[string]any)
+	if !ok {
+		t.Fatalf("cleared options values = %#v", clearNamespace[metaOptionsKey])
+	}
+	if cleared, clearedOK := clearValues[metaExtraPathDirsKey].([]string); !clearedOK || cleared == nil || len(cleared) != 0 {
+		t.Fatalf("cleared extra path dirs = %#v", clearValues[metaExtraPathDirsKey])
 	}
 
 	empty, ok := NewOpenCodeOptions().Meta()[opencodeMetaKey].(map[string]any)
@@ -253,5 +259,39 @@ func TestOpenCodeEnvironmentBuilders(t *testing.T) {
 	}
 	if values, ok := empty[metaOptionsKey].(map[string]any); !ok || len(values) != 0 {
 		t.Fatalf("empty options meta values = %#v", values)
+	}
+}
+
+func TestOpenCodeEnvBuilderClones(t *testing.T) {
+	env := map[string]string{"WAGIE_API_TOKEN": "bearer", "CLEARED": ""}
+	req := NewSessionRequest("/tmp/project", WithSessionOpenCodeOptions(NewOpenCodeOptions(
+		WithOpenCodeEnv(env),
+	)))
+
+	env["WAGIE_API_TOKEN"] = "mutated"
+	delete(env, "CLEARED")
+
+	meta, err := sessionMetaFromLifecycle(req.Meta)
+	if err != nil {
+		t.Fatalf("session meta from builder: %v", err)
+	}
+
+	want := map[string]string{"WAGIE_API_TOKEN": "bearer", "CLEARED": ""}
+	if !maps.Equal(meta.Env, want) {
+		t.Fatalf("session env = %#v, want %#v", meta.Env, want)
+	}
+
+	// An empty map is a value the request carries, not an omission.
+	cleared := NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{})).Meta()
+	namespace, ok := cleared[opencodeMetaKey].(map[string]any)
+	if !ok {
+		t.Fatalf("cleared options namespace = %#v", cleared[opencodeMetaKey])
+	}
+	values, ok := namespace[metaOptionsKey].(map[string]any)
+	if !ok {
+		t.Fatalf("cleared options values = %#v", namespace[metaOptionsKey])
+	}
+	if _, present := values[metaEnvKey]; !present {
+		t.Fatalf("cleared options omit %q: %#v", metaEnvKey, values)
 	}
 }

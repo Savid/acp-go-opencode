@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -48,6 +49,50 @@ func (buffer *supervisorCloseBuffer) Close() error {
 	buffer.closed = true
 
 	return nil
+}
+
+// livenessSupervisorFixture writes a stand-in liveness supervisor that emits
+// one control line, lingers, and then waits for its own input to close.
+//
+// Both halves of that shape are load-bearing. The guardian captures the child's
+// process-group identity immediately after starting it, so a stand-in that
+// exits first — /usr/bin/false, or a script whose last statement is exit — can
+// lose that race and fail the launch with a containment error before the
+// sequence under test ever runs; the linger keeps the child alive across the
+// capture and across the guardian's first quarantine poll. Waiting on input is
+// what ends it: the guardian closes the child's input on both the readiness
+// path and the failure path, so the child exits promptly rather than on a timer
+// long enough to be safe.
+func livenessSupervisorFixture(t *testing.T, dir string, control string, exitCode int) string {
+	t.Helper()
+
+	path := filepath.Join(dir, "liveness")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '%s' >&2\nsleep 0.05\nread ignored\nexit %d\n", control, exitCode)
+	require.NoError(t, os.WriteFile(path, []byte(script), 0o700))
+
+	return path
+}
+
+// refusingLivenessSupervisor is the stand-in for a supervisor that never
+// reaches readiness: it answers the control channel with a frame the guardian
+// cannot parse.
+func refusingLivenessSupervisor(t *testing.T, dir string) string {
+	t.Helper()
+
+	return livenessSupervisorFixture(t, dir, "invalid", 1)
+}
+
+// readyLivenessSupervisor is the stand-in for a supervisor that does reach
+// readiness and names the given native process.
+func readyLivenessSupervisor(t *testing.T, dir string, nativePID int, exitCode int) string {
+	t.Helper()
+
+	return livenessSupervisorFixture(t, dir,
+		supervisorReadyPrefix+fmt.Sprintf(`{"nativePid":%d}`, nativePID), exitCode)
+}
+
+func fixedSupervisorExecutable(path string) func() (string, error) {
+	return func() (string, error) { return path, nil }
 }
 
 func preserveSupervisorGlobals(t *testing.T) {
@@ -385,7 +430,7 @@ func TestRunGuardianHappyPathAndPreReadinessFailure(t *testing.T) {
 	require.NoError(t, runGuardian(config))
 
 	root = t.TempDir()
-	supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+	supervisorExecutable = fixedSupervisorExecutable(refusingLivenessSupervisor(t, root))
 	config.Home = filepath.Join(root, "home")
 	config.Scratch = root
 	config.Started = filepath.Join(root, "started")
@@ -485,7 +530,7 @@ func TestSupervisorBootstrapDispatchesMissingAndSuccessfulLiveness(t *testing.T)
 		t.Setenv(supervisorModeEnv, supervisorModeLiveness)
 		root := t.TempDir()
 		config := withTestSupervisorIdentity(supervisorConfig{
-			NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.01"}, NativeEnv: os.Environ(),
+			NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.5"}, NativeEnv: os.Environ(),
 			Home: filepath.Join(root, "home"), Scratch: root, Started: filepath.Join(root, "started"),
 			Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
@@ -1300,7 +1345,11 @@ func TestUnixQuiescenceSignalEscalationAndTimeout(t *testing.T) {
 
 	liveness, err := openLivenessContainment(containmentConfig)
 	require.NoError(t, err)
-	command := exec.Command("/usr/bin/true")
+	// Every native child in these fixtures has to outlive containment identity
+	// capture, which happens immediately after it starts. A child that exits at
+	// once — or after a window a loaded machine can miss — loses that race and
+	// fails a start these fixtures require to succeed.
+	command := exec.Command("/bin/sh", "-c", "sleep 0.5")
 	require.NoError(t, liveness.Start(command))
 	require.NoError(t, <-liveness.Wait())
 	openCodeSyscallKill = func(int, syscall.Signal) error { return syscall.ESRCH }
@@ -1366,7 +1415,7 @@ func TestSupervisorDispatchBootstrapAndEarlyFailures(t *testing.T) {
 	isolation := testProcessIsolation()
 	root := t.TempDir()
 	config := withTestSupervisorIdentity(supervisorConfig{
-		NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.1"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+		NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.5"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 	})
 	path, err := writeSupervisorConfig(root, config)
@@ -1423,7 +1472,7 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		root := t.TempDir()
 		notDirectory := filepath.Join(root, "file")
 		require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
-		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+		supervisorExecutable = fixedSupervisorExecutable(refusingLivenessSupervisor(t, root))
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root, Completion: filepath.Join(notDirectory, "child"),
 		})
@@ -1435,7 +1484,7 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		root := t.TempDir()
 		notDirectory := filepath.Join(root, "file")
 		require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
-		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+		supervisorExecutable = fixedSupervisorExecutable(refusingLivenessSupervisor(t, root))
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(notDirectory, "child"), Completion: filepath.Join(root, "missing"),
@@ -1450,12 +1499,15 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		pid := filepath.Join(root, "pid")
 		require.NoError(t, writeSupervisorMarker(started))
 		require.NoError(t, writeNativePID(pid, 99999999))
-		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+		supervisorExecutable = fixedSupervisorExecutable(refusingLivenessSupervisor(t, root))
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root, Started: started,
 			Completion: filepath.Join(root, "complete"), NativePIDFile: pid,
 		})
-		require.Error(t, err)
+		// The recovery sequence under test only runs for a guardian that got as
+		// far as starting its liveness supervisor, so an earlier failure is a
+		// different fixture rather than this one.
+		require.ErrorContains(t, err, "liveness supervisor failed before readiness")
 		_, statErr := os.Stat(filepath.Join(root, "complete"))
 		if runtime.GOOS == "darwin" {
 			require.ErrorIs(t, statErr, os.ErrNotExist)
@@ -1472,15 +1524,14 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		pid := filepath.Join(root, "pid")
 		require.NoError(t, writeSupervisorMarker(started))
 		require.NoError(t, writeNativePID(pid, 99999999))
-		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+		supervisorExecutable = fixedSupervisorExecutable(refusingLivenessSupervisor(t, root))
 		supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error { return nil }
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root, Started: started,
 			Completion: completion, NativePIDFile: pid,
 		})
-		require.Error(t, err)
-		_, statErr := os.Stat(completion)
-		require.NoError(t, statErr)
+		require.ErrorContains(t, err, "liveness supervisor failed before readiness")
+		require.FileExists(t, completion, "a quiesced platform publishes its containment proof")
 	})
 
 	t.Run("completion appears while pid absent", func(t *testing.T) {
@@ -1489,7 +1540,7 @@ func TestGuardianPreReadinessRecoveryProofBranches(t *testing.T) {
 		started := filepath.Join(root, "started")
 		completion := filepath.Join(root, "complete")
 		require.NoError(t, writeSupervisorMarker(started))
-		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+		supervisorExecutable = fixedSupervisorExecutable(refusingLivenessSupervisor(t, root))
 		go func() {
 			time.Sleep(20 * time.Millisecond)
 			_ = writeSupervisorMarker(completion)
@@ -1538,9 +1589,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 	t.Run("guardian post-readiness proof failure", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()
-		liveness := filepath.Join(root, "liveness")
-		require.NoError(t, os.WriteFile(liveness, []byte("#!/bin/sh\nprintf '%s\\n' '"+supervisorReadyPrefix+`{"nativePid":99999999}`+"' >&2\nexit 0\n"), 0o700))
-		supervisorExecutable = func() (string, error) { return liveness, nil }
+		supervisorExecutable = fixedSupervisorExecutable(readyLivenessSupervisor(t, root, 99999999, 1))
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
@@ -1557,9 +1606,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 	t.Run("guardian pre-readiness quarantine", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()
-		liveness := filepath.Join(root, "liveness")
-		require.NoError(t, os.WriteFile(liveness, []byte("#!/bin/sh\nprintf 'invalid\\n' >&2\nsleep 0.05\n"), 0o700))
-		supervisorExecutable = func() (string, error) { return liveness, nil }
+		supervisorExecutable = fixedSupervisorExecutable(refusingLivenessSupervisor(t, root))
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
@@ -1580,26 +1627,20 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		require.NoError(t, writeSupervisorMarker(started))
 		quarantineParent := filepath.Join(root, "quarantine-parent")
 		require.NoError(t, os.Mkdir(quarantineParent, 0o700))
-		pidFIFO := filepath.Join(root, "native-pid")
-		require.NoError(t, syscall.Mkfifo(pidFIFO, 0o600))
-		go func() {
-			time.Sleep(20 * time.Millisecond)
-			_ = os.Remove(quarantineParent)
-			_ = os.WriteFile(quarantineParent, []byte("x"), 0o600)
-			writer, openErr := os.OpenFile(pidFIFO, os.O_WRONLY, 0)
-			if openErr == nil {
-				_, _ = io.WriteString(writer, "99999999\n")
-				_ = writer.Close()
-			}
-		}()
-		supervisorExecutable = func() (string, error) { return "/usr/bin/false", nil }
+		require.NoError(t, os.Remove(quarantineParent))
+		require.NoError(t, os.WriteFile(quarantineParent, []byte("x"), 0o600))
+		nativePID := filepath.Join(root, "native-pid")
+		require.NoError(t, os.WriteFile(nativePID, []byte("99999999\n"), 0o600))
+		liveness := filepath.Join(root, "liveness")
+		require.NoError(t, os.WriteFile(liveness, []byte("#!/bin/sh\nprintf 'invalid\\n' >&2\ncat >/dev/null\nexit 1\n"), 0o700))
+		supervisorExecutable = func() (string, error) { return liveness, nil }
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		err := runGuardian(supervisorConfig{
 			Home: filepath.Join(root, "home"), Scratch: root, Started: started,
 			Completion: filepath.Join(root, "complete"), Quarantine: filepath.Join(quarantineParent, "marker"),
-			NativePIDFile: pidFIFO,
+			NativePIDFile: nativePID,
 		})
 		require.ErrorContains(t, err, "quarantine")
 	})
@@ -1607,9 +1648,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 	t.Run("guardian post-readiness quarantine", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()
-		liveness := filepath.Join(root, "liveness")
-		require.NoError(t, os.WriteFile(liveness, []byte("#!/bin/sh\nprintf '%s\\n' '"+supervisorReadyPrefix+`{"nativePid":99999999}`+"' >&2\nsleep 0.05\n"), 0o700))
-		supervisorExecutable = func() (string, error) { return liveness, nil }
+		supervisorExecutable = fixedSupervisorExecutable(readyLivenessSupervisor(t, root, 99999999, 1))
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
@@ -1627,14 +1666,18 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()
 		input, writer := io.Pipe()
-		t.Cleanup(func() { _ = writer.Close() })
+		t.Cleanup(func() {
+			_ = input.Close()
+			_ = writer.Close()
+		})
+		go func() { _, _ = io.WriteString(writer, "release\n") }()
 		supervisorInput = input
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		want := errors.New("proof failed")
 		supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error { return want }
 		err := runLiveness(supervisorConfig{
-			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativePath: "/bin/sh", NativeArgs: []string{"-c", "IFS= read -r _"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
@@ -1684,9 +1727,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 	t.Run("guardian reports post-readiness liveness failure", func(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()
-		liveness := filepath.Join(root, "liveness")
-		require.NoError(t, os.WriteFile(liveness, []byte("#!/bin/sh\nprintf '%s\\n' '"+supervisorReadyPrefix+`{"nativePid":99999999}`+"' >&2\nexit 7\n"), 0o700))
-		supervisorExecutable = func() (string, error) { return liveness, nil }
+		supervisorExecutable = fixedSupervisorExecutable(readyLivenessSupervisor(t, root, 99999999, 7))
 		supervisorInput = strings.NewReader("")
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
@@ -1703,12 +1744,16 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		root := t.TempDir()
 		input, writer := io.Pipe()
-		t.Cleanup(func() { _ = writer.Close() })
+		t.Cleanup(func() {
+			_ = input.Close()
+			_ = writer.Close()
+		})
+		go func() { _, _ = io.WriteString(writer, "release\n") }()
 		supervisorInput = input
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		err := runLiveness(supervisorConfig{
-			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativePath: "/bin/sh", NativeArgs: []string{"-c", "IFS= read -r _"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.NoError(t, err)
@@ -1801,15 +1846,12 @@ func TestRunGuardianWritesCompletionProofWhenLivenessLeftNone(t *testing.T) {
 	preserveSupervisorGlobals(t)
 
 	root := t.TempDir()
-	script := filepath.Join(root, "liveness.sh")
-	require.NoError(t, os.WriteFile(script, []byte(
-		"#!/bin/sh\nprintf '"+supervisorReadyPrefix+"{\"nativePid\":4242}\\n' >&2\n",
-	), 0o700))
+	script := readyLivenessSupervisor(t, root, 4242, 0)
 
 	supervisorInput = strings.NewReader("")
 	supervisorOutput = io.Discard
 	supervisorError = io.Discard
-	supervisorExecutable = func() (string, error) { return script, nil }
+	supervisorExecutable = fixedSupervisorExecutable(script)
 	supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error { return nil }
 
 	completion := filepath.Join(root, "complete")

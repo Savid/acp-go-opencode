@@ -160,11 +160,11 @@ func TestAuthorizeMintsADeviceFlow(t *testing.T) {
 
 func TestAuthorizeDrivesWaitCompletionExactlyOnce(t *testing.T) {
 	fixture := newAuthFixture(t)
-	started := make(chan struct{})
+	started := make(chan struct{}, 1)
 	fixture.brokerNode.authCallbackStarted = started
 
 	flow := fixture.authorize(t, nil)
-	<-started
+	requireSignal(t, started)
 
 	fixture.brokerNode.mu.Lock()
 	fixture.brokerNode.storedAuth = map[string]opencode.ProviderAuthCredential{
@@ -195,12 +195,12 @@ func TestAuthorizeDrivesWaitCompletionExactlyOnce(t *testing.T) {
 
 func TestWaitCompletionRecordsNativeRefusal(t *testing.T) {
 	fixture := newAuthFixture(t)
-	started := make(chan struct{})
+	started := make(chan struct{}, 1)
 	fixture.brokerNode.authCallbackStarted = started
 	fixture.brokerNode.authCallbackErr = &opencode.HTTPError{StatusCode: http.StatusBadRequest}
 
 	flow := fixture.authorize(t, nil)
-	<-started
+	requireSignal(t, started)
 	fixture.releaseCallback()
 
 	require.Eventually(t, func() bool {
@@ -220,11 +220,11 @@ func TestWaitCompletionRecordsNativeRefusal(t *testing.T) {
 
 func TestCancelStopsWaitCompletionWithoutInstalling(t *testing.T) {
 	fixture := newAuthFixture(t)
-	started := make(chan struct{})
+	started := make(chan struct{}, 1)
 	fixture.brokerNode.authCallbackStarted = started
 
 	flow := fixture.authorize(t, nil)
-	<-started
+	requireSignal(t, started)
 
 	_, err := fixture.broker.cancel(context.Background(), mustJSON(t, map[string]any{
 		authFieldSessionID:  string(fixture.session.id),
@@ -247,11 +247,11 @@ func TestCancelStopsWaitCompletionWithoutInstalling(t *testing.T) {
 
 func TestWaitFlowRejectsASecondCompletionDriver(t *testing.T) {
 	fixture := newAuthFixture(t)
-	started := make(chan struct{})
+	started := make(chan struct{}, 1)
 	fixture.brokerNode.authCallbackStarted = started
 
 	flow := fixture.authorize(t, nil)
-	<-started
+	requireSignal(t, started)
 
 	_, err := fixture.callback(t, flow.FlowID, "0", "")
 	requireAuthFailure(t, err, authCauseFlowState)

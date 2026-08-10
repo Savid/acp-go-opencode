@@ -703,7 +703,7 @@ func TestAgentStandaloneAuthorityPathRejectsDeletedDescriptor(t *testing.T) {
 	require.ErrorContains(t, err, "deleted directory")
 }
 
-func TestAgentStandaloneOwnerlessMarkerRequiresLegacyAffinityLock(t *testing.T) {
+func TestAgentStandaloneOwnerlessMarkerRequiresRetainedAffinityLock(t *testing.T) {
 	directory := openAgentStandaloneTestDirectory(t)
 	ownerUID, ownerGID := agentStandaloneTestAuthorityIDs()
 	owners := createAgentStandaloneTestLock(t, directory, "owners.lock", ownerUID, ownerGID)

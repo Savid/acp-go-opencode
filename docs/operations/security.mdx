@@ -55,7 +55,7 @@ only trusted peer:
 - The Agent exclusively owns the shared XDG root. Never-unlinked claim and
   liveness locks plus the native supervisor prevent a second writer and retain
   the resource permit until the selected native containment boundary completes.
-- Public and session environment overlays cannot replace `HOME`, XDG roots,
+- Public environment overlays cannot replace `HOME`, XDG roots,
   `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, inline OpenCode config, or
   `OPENCODE_DB`; the managed XDG credential/database root and trusted identity
   environment remain authoritative.

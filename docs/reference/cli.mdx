@@ -12,8 +12,9 @@ diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 
 ## Optional standalone isolation policy
 
-Omitting `-process-isolation-config` selects ordinary current-identity mode on
-every supported platform, with no privileged setup and no policy load. The
+`-process-isolation-config` is optional. Omitting it selects ordinary
+current-identity mode on every supported platform, with no privileged setup and
+no policy load. The
 command runs OpenCode as its own root or non-root identity, applies no UID/GID
 or supplementary-group change, keeps the portable writable-home claim and
 liveness, and reports the non-authoritative `shared_identity`.
@@ -22,7 +23,8 @@ Supplying `-process-isolation-config=/absolute/path/process-isolation.json`
 explicitly selects the hardened Linux policy and binds `-home` to
 `standaloneStateRoot`. It is Linux-only; every loader, decode, validation,
 authority, and unsupported-platform failure exits before ACP serving or native
-spawn, with no ordinary-mode retry.
+spawn, with no ordinary-mode retry. Explicit process isolation is fail closed
+without fallback: it never degrades to ordinary execution.
 The policy must be a root-owned, single-link regular file with mode `0600`.
 Every component is opened from `/` without following symlinks, and every
 ancestor must be root-owned and not writable by group or other. Unknown JSON

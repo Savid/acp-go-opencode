@@ -13,22 +13,46 @@ admits only one live session principal for a canonical working directory. A
 second live session in that directory is rejected, and a changed MCP
 fingerprint is rejected as a principal conflict.
 
-## Session environment
+## Session environment and tool paths
 
-`_meta.opencode.options.env` and `_meta.opencode.options.extraPathDirs` set the
-environment the native process serving a session runs under: `env` overlays
-`WithEnv` per key, and `extraPathDirs` places absolute directories ahead of the
-isolation policy `PATH`. A process environment is fixed at exec, so an environment
-binds a runtime generation, not a session. The first session to reach the
-runtime latches it. A later session asking for the same environment reuses that
-generation; one asking for a different environment starts a fresh generation
-while no session is live, and meets
-`{"error": "backpressure", "limit": "runtime_environment"}` while a live session
-still holds the running one. That hold is transient — the same request succeeds
-once the last holding session closes — so a client treats it as retry-later
-rather than as an unavailable agent. Merging is never an option: it would hand
-one session's environment to another. A recovering session rebinds to a runtime
-carrying the environment it was admitted under.
+`_meta.opencode.options.env` and `_meta.opencode.options.extraPathDirs` are the
+addressed session carrier. `env` is the environment that session's shell tools
+run under; `extraPathDirs` prepends ordered absolute directories to their
+`PATH`. The adapter writes both onto native session metadata, and its installed
+OpenCode plugin applies them only when that session invokes a shell tool. Neither
+changes the shared server process environment, so concurrent sessions hold
+distinct values — including distinct bearer tokens — without backpressure or
+runtime replacement.
+
+The search path is applied after the native shell has finished its own startup.
+OpenCode starts `bash` and `zsh` as login shells, which lets a user startup file
+rewrite `PATH` after the environment has been handed over. The adapter therefore
+also installs a shell wrapper that reproduces that startup sequence and then puts
+the session's directories in front, so the order the command resolves against is
+the order the session asked for. Without a carrier the wrapper runs exactly what
+OpenCode would have run.
+
+OpenCode configuration is directory scoped, so one shared server can serve two
+workspaces that configure two different login shells. The wrapper is told which
+shell to stand in for with each operation, by the workspace scope that operation
+belongs to, and it holds nothing between operations. That address is counted
+rather than delimited, so every executable path OpenCode itself accepts survives
+it — including one whose directories contain the search-path separator. A
+workspace that configures a shell OpenCode runs without a login sequence is left
+to OpenCode untouched, and an operation that reaches the wrapper without naming
+a readable shell address fails rather than choosing one.
+
+Both halves are stored with the logical session. Load, resume, recovery, and
+fork retain a half the request omits; an explicitly supplied half replaces it
+outright, and an empty value is a replacement rather than an omission. The
+durable snapshot carries `extraPathDirs` only: `env` is where an operation
+bearer lives, so a reloaded session takes its environment from the request that
+reloads it rather than from a value frozen at capture time.
+
+`PATH` is refused inside `env`, without regard to case, because the map replaces
+whole values. `extraPathDirs` is the additive mechanism that owns the search
+path. Static environment values configured with `WithEnv` remain shared by the
+Agent's native server and never carry session values.
 
 ## Lifecycle
 

@@ -718,6 +718,7 @@ func cloneOpenCodeDoc(t *testing.T, doc map[string]any) map[string]any {
 func fullOpenCodeDoc() map[string]any {
 	paths := map[string]any{}
 	for _, path := range []string{
+		"/config",
 		"/config/providers",
 		"/command",
 		"/event",

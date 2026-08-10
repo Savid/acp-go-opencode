@@ -695,10 +695,16 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(cwd,
 		WithSessionMCPServers(HTTPMCPServer("remote", "https://mcp.test", map[string]string{"Authorization": "secret"})),
-		WithSessionOpenCodeOptions(OpenCodeOptions{Model: "openai/gpt-test", Mode: "build", Permission: "allow"}),
+		WithSessionOpenCodeOptions(OpenCodeOptions{
+			Model: "openai/gpt-test", Mode: "build", Permission: "allow",
+			Env:           map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""},
+			ExtraPathDirs: []string{"/original/bin"},
+		}),
 	))
 	require.NoError(t, err)
 	require.NotEmpty(t, created.SessionId)
+	require.Equal(t, []string{"/original/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""}, client.scopes()[0].Env)
 
 	listed, err := agent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
 	require.NoError(t, err)
@@ -710,12 +716,24 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	loaded, err := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
 	require.NoError(t, err)
 	require.NotNil(t, loaded.Meta)
+	// A cold load keeps the durable directories and starts from no environment:
+	// an operation bearer is never frozen into the store, so the loading request
+	// owns it.
+	require.Equal(t, []string{"/original/bin"}, client.scopes()[1].ExtraPathDirs)
+	require.Empty(t, client.scopes()[1].Env)
 	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
 	require.NoError(t, err)
 
-	resumed, err := agent.ResumeSession(ctx, ResumeSessionRequest(created.SessionId, cwd))
+	resumed, err := agent.ResumeSession(ctx, ResumeSessionRequest(created.SessionId, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeExtraPathDirs("/replacement/bin"),
+			WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "rotated"}),
+		)),
+	))
 	require.NoError(t, err)
 	require.NotNil(t, resumed.Meta)
+	require.Equal(t, []string{"/replacement/bin"}, client.scopes()[2].ExtraPathDirs)
+	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "rotated"}, client.scopes()[2].Env)
 
 	_, err = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
 	require.NoError(t, err)
@@ -1121,6 +1139,47 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
+	newForkAgent := func() (*Agent, *fakeOpenCodeClient, *session) {
+		client := newFakeOpenCodeClient()
+		client.forkSession = testNativeSession("native-child")
+		client.getSession = testNativeSession("native-child")
+		client.ensureSyncAggregate("native-child")
+		agent := NewAgent()
+		agent.runtime = client
+		parent := testSession(agent, client)
+		parent.carrier = newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "parent-token"}, []string{"/parent/bin"})
+		agent.sessions[parent.id] = parent
+
+		return agent, client, parent
+	}
+
+	agent, client, parent := newForkAgent()
+	_, err := agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir()))
+	require.NoError(t, err)
+	require.Equal(t, []string{"/parent/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "parent-token"}, client.scopes()[0].Env)
+
+	agent, client, parent = newForkAgent()
+	_, err = agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir(),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeExtraPathDirs("/child/bin"))),
+	))
+	require.NoError(t, err)
+	require.Equal(t, []string{"/child/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "parent-token"}, client.scopes()[0].Env,
+		"replacing one half of the carrier must leave the other half alone")
+
+	// A child that names an environment replaces the parent's outright, and an
+	// empty map is a replacement rather than an omission.
+	agent, client, parent = newForkAgent()
+	_, err = agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir(),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{}))),
+	))
+	require.NoError(t, err)
+	require.Equal(t, []string{"/parent/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Empty(t, client.scopes()[0].Env)
+}
+
 type summaryCoverageStore struct {
 	*InMemorySessionStore
 	summaries []SessionSummary
@@ -1252,23 +1311,19 @@ func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing
 	require.Len(t, configs, 1)
 }
 
-// A session environment reaches the native process it runs under: the
-// requested variables overlay the agent-wide ones and the requested
-// directories arrive as PATH entries the native launch prepends.
-func TestSessionEnvironmentReachesTheNativeProcess(t *testing.T) {
+func TestSessionCarrierReachesTheAddressedNativeScopeOnly(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	client.createSession = testNativeSession("native-env")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
-
-	var started []opencode.StartOptions
+	var started opencode.StartOptions
 
 	agent := NewAgent(
 		WithHome(t.TempDir()),
-		WithEnv(map[string]string{"SHARED": "agent", "OVERLAID": "agent"}),
+		WithEnv(map[string]string{"PATH": "/static/bin"}),
 		func(options *Options) {
-			options.clientFactory = func(_ context.Context, start opencode.StartOptions) (opencode.Client, error) {
-				started = append(started, start)
+			options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+				started = options
 
 				return client, nil
 			}
@@ -1277,26 +1332,23 @@ func TestSessionEnvironmentReachesTheNativeProcess(t *testing.T) {
 	agent.setAgentClient(newRecordingAgentClient())
 
 	_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeEnv(map[string]string{"OVERLAID": "session", "HOST_API_TOKEN": "secret", "EMPTY_TOKEN": ""}),
 		WithOpenCodeExtraPathDirs("/session/bin"),
+		WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "session-token"}),
 	))))
 	require.NoError(t, err)
-	require.Len(t, started, 1)
-	require.Equal(t, "agent", started[0].Env["SHARED"])
-	require.Equal(t, "session", started[0].Env["OVERLAID"])
-	require.Equal(t, "secret", started[0].Env["HOST_API_TOKEN"])
-	require.Equal(t, []string{"/session/bin"}, started[0].ExtraPathDirs)
+	require.Equal(t, []string{"/session/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "session-token"}, client.scopes()[0].Env)
 
-	require.Len(t, agent.sessions, 1)
-
-	for _, session := range agent.sessions {
-		require.Equal(t, []string{"secret"}, session.secretNeedles)
-	}
+	// The shared process is started under the operator's environment only. A
+	// session value there would be the same value for every session of the
+	// Agent and would outlive the session that asked for it.
+	require.Equal(t, "/static/bin", started.Env["PATH"])
+	require.NotContains(t, started.Env, "WAGIE_API_TOKEN")
 
 	require.NoError(t, agent.Close())
 }
 
-func TestSessionManagedRootEnvironmentFailsBeforeNativeCreation(t *testing.T) {
+func TestSessionExtraPathDirsFailBeforeNativeCreation(t *testing.T) {
 	launches := 0
 	agent := NewAgent(
 		WithHome(t.TempDir()),
@@ -1310,32 +1362,13 @@ func TestSessionManagedRootEnvironmentFailsBeforeNativeCreation(t *testing.T) {
 	)
 
 	_, err := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeEnv(map[string]string{managedEnvXDGDataHome: t.TempDir()}),
+		WithOpenCodeExtraPathDirs("relative/bin"),
 	))))
 	require.Error(t, err)
 	require.Zero(t, launches)
 }
 
-// requireRuntimeEnvironmentBackpressure pins the exact -32600 payload a client
-// tells the transient environment holder apart by. The hold ends when the last
-// holding session closes, so the same request retried later succeeds.
-func requireRuntimeEnvironmentBackpressure(t *testing.T, err error) {
-	t.Helper()
-
-	var reqErr *acp.RequestError
-	require.ErrorAs(t, err, &reqErr)
-	require.Equal(t, -32600, reqErr.Code)
-	require.Equal(t, map[string]any{
-		jsonFieldError: errValueBackpressure,
-		jsonFieldLimit: limitRuntimeEnvironment,
-	}, reqErr.Data)
-}
-
-// One native process serves every session, so the environment binds the
-// running generation: an identical request reuses it, a differing one meets
-// backpressure while a session still holds it, and the next differing request
-// after that session closes starts a fresh generation.
-func TestSessionEnvironmentBindsTheSharedRuntimeGeneration(t *testing.T) {
+func TestConcurrentSessionsCarryDistinctOrderedPathDirs(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 
@@ -1357,42 +1390,24 @@ func TestSessionEnvironmentBindsTheSharedRuntimeGeneration(t *testing.T) {
 	})
 	agent.setAgentClient(newRecordingAgentClient())
 
-	session := func(env map[string]string) acp.NewSessionRequest {
-		return NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(env))))
+	session := func(dirs ...string) acp.NewSessionRequest {
+		return NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeExtraPathDirs(dirs...),
+		)))
 	}
 
-	_, err := agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "one"}))
+	_, err := agent.NewSession(ctx, session("/one", "/shared", "/one"))
 	require.NoError(t, err)
 
-	_, err = agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "one"}))
+	_, err = agent.NewSession(ctx, session("/two", "/shared"))
 	require.NoError(t, err)
 	require.EqualValues(t, 1, factoryCalls.Load())
-
-	_, err = agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "two"}))
-	requireRuntimeEnvironmentBackpressure(t, err)
-	require.EqualValues(t, 1, factoryCalls.Load())
-
-	// Asking for no environment at all is the same hold: admitting it would put
-	// a session on a process whose environment still carries the holder's token.
-	_, err = agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
-	requireRuntimeEnvironmentBackpressure(t, err)
-	require.EqualValues(t, 1, factoryCalls.Load())
-
-	for id := range agent.sessions {
-		_, closeErr := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: id})
-		require.NoError(t, closeErr)
-	}
-
-	_, err = agent.NewSession(ctx, session(map[string]string{"HOST_API_TOKEN": "two"}))
-	require.NoError(t, err)
-	require.EqualValues(t, 2, factoryCalls.Load())
-	require.EqualValues(t, 2, agent.runtimeGeneration)
+	require.Equal(t, []string{"/one", "/shared", "/one"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{"/two", "/shared"}, client.scopes()[1].ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }
 
-// Recovery rebinds a session to a runtime carrying the environment it was
-// admitted under, not to whatever the replacement generation would default to.
-func TestRecoveredSessionKeepsItsEnvironment(t *testing.T) {
+func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	ctx := context.Background()
 	first := newFakeOpenCodeClient()
 	first.createSession = testNativeSession("native-first")
@@ -1424,7 +1439,6 @@ func TestRecoveredSessionKeepsItsEnvironment(t *testing.T) {
 	agent.setAgentClient(newRecordingAgentClient())
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeEnv(map[string]string{"HOST_API_TOKEN": "secret"}),
 		WithOpenCodeExtraPathDirs("/session/bin"),
 	))))
 	require.NoError(t, err)
@@ -1441,9 +1455,8 @@ func TestRecoveredSessionKeepsItsEnvironment(t *testing.T) {
 	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
 
 	startedMu.Lock()
-	defer startedMu.Unlock()
 	require.Len(t, started, 2)
-	require.Equal(t, "secret", started[1].Env["HOST_API_TOKEN"])
-	require.Equal(t, []string{"/session/bin"}, started[1].ExtraPathDirs)
+	startedMu.Unlock()
+	require.Equal(t, []string{"/session/bin"}, second.scopes()[0].ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }

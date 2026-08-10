@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +57,7 @@ type openCodeMethodsRecorder struct {
 	commandBody CommandRequest
 	forkBody    map[string]any
 	createBody  map[string]any
+	carrierBody []map[string]any
 	promptAsync bool
 }
 
@@ -77,7 +79,19 @@ func openCodeMethodsRoutes(t *testing.T, rec *openCodeMethodsRecorder) map[strin
 			writeJSON(t, w, []map[string]any{{"id": "listed"}})
 		},
 		"GET /session/s%2F1": func(w http.ResponseWriter, _ *http.Request) {
-			writeJSON(t, w, map[string]any{"id": "s/1", "title": "Loaded"})
+			writeJSON(t, w, map[string]any{"id": "s/1", "title": "Loaded", "metadata": map[string]any{"native": "kept"}})
+		},
+		"PATCH /session/s%2F1": func(w http.ResponseWriter, r *http.Request) {
+			body := map[string]any{}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			rec.carrierBody = append(rec.carrierBody, body)
+			writeJSON(t, w, map[string]any{"id": "s/1"})
+		},
+		"PATCH /session/forked": func(w http.ResponseWriter, r *http.Request) {
+			body := map[string]any{}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			rec.carrierBody = append(rec.carrierBody, body)
+			writeJSON(t, w, map[string]any{"id": "forked"})
 		},
 		"DELETE /session/s%2F1": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, map[string]any{"ok": true})
@@ -141,7 +155,7 @@ func openCodeMethodsRoutes(t *testing.T, rec *openCodeMethodsRecorder) map[strin
 			if err := json.NewDecoder(r.Body).Decode(&rec.forkBody); err != nil {
 				t.Errorf("decode fork body: %v", err)
 			}
-			writeJSON(t, w, map[string]any{"id": "forked"})
+			writeJSON(t, w, map[string]any{"id": "forked", "metadata": map[string]any{"native": "kept"}})
 		},
 		"GET /session/s%2F1/todo": func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(t, w, []map[string]any{{"id": "todo", "content": "Do it"}})
@@ -225,6 +239,37 @@ func TestOpenCodeServerSessionMethods(t *testing.T) {
 	}
 	if !containsString(rec.seen, "GET /session?directory=%2Frepo") {
 		t.Fatalf("seen paths = %#v", rec.seen)
+	}
+}
+
+func TestOpenCodeServerCarriesSessionCarrierOnAddressedSessions(t *testing.T) {
+	ctx := context.Background()
+	client, rec := newOpenCodeMethodsClient(t)
+	client.directory = "/repo"
+	client.sessionEnv = map[string]string{"WAGIE_API_TOKEN": "token-a", "EMPTY": ""}
+	client.extraPathDirs = []string{"/first", "/second", "/first"}
+
+	_, err := client.CreateSession(ctx, "Created")
+	require.NoError(t, err)
+	want := client.sessionCarrierMetadata(nil)
+	wantJSON, err := json.Marshal(want)
+	require.NoError(t, err)
+	actualJSON, err := json.Marshal(rec.createBody["metadata"])
+	require.NoError(t, err)
+	require.JSONEq(t, string(wantJSON), string(actualJSON))
+
+	_, err = client.GetSession(ctx, "s/1")
+	require.NoError(t, err)
+	_, err = client.Fork(ctx, "s/1", "")
+	require.NoError(t, err)
+	want = client.sessionCarrierMetadata(map[string]any{"native": "kept"})
+	wantJSON, err = json.Marshal(want)
+	require.NoError(t, err)
+	require.Len(t, rec.carrierBody, 2)
+	for _, body := range rec.carrierBody {
+		actualJSON, err = json.Marshal(body["metadata"])
+		require.NoError(t, err)
+		require.JSONEq(t, string(wantJSON), string(actualJSON))
 	}
 }
 
@@ -650,9 +695,17 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		}
 	})
 
-	t.Run("password entropy failure", func(t *testing.T) {
+	t.Run("carrier proof entropy failure", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeRandReader = errorReader{err: errors.New("entropy failed")}
+		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
+			t.Fatal("entropy error was ignored")
+		}
+	})
+
+	t.Run("password entropy failure", func(t *testing.T) {
+		restoreOpenCodeClientSeams(t)
+		openCodeRandReader = &budgetReader{budget: 32, err: errors.New("entropy failed")}
 		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
 			t.Fatal("entropy error was ignored")
 		}
@@ -1115,7 +1168,7 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	if ensureErr := ensureXDGDirs(XDGDirs{Root: "", Data: "x", Config: "x", Cache: "x", State: "x"}); ensureErr == nil {
 		t.Fatal("ensureXDGDirs accepted empty root")
 	}
-	permissionConfig, err := materializeOpenCodeRuntimeConfig(xdg, nil)
+	permissionConfig, err := materializeOpenCodeRuntimeConfig(xdg, nil, "")
 	if err != nil || strings.Contains(permissionConfig, `"permission"`) {
 		t.Fatalf("runtime config = %q err=%v", permissionConfig, err)
 	}
@@ -1172,7 +1225,7 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 // focused on filesystem behavior; permission/MCP assertions have dedicated
 // multiplexing tests.
 func materializeOpenCodePermissionConfig(dirs XDGDirs, _ string, seeds map[string]string, _ []MCPServerConfig) (string, error) {
-	return materializeOpenCodeRuntimeConfig(dirs, seeds)
+	return materializeOpenCodeRuntimeConfig(dirs, seeds, "")
 }
 
 func TestOpenCodeSeedFilesMergeAndConfinement(t *testing.T) {
@@ -1687,6 +1740,9 @@ func runFakeOpenCodeServerProcess() {
 
 			return
 		}
+		if r.URL.Query().Get("directory") != "" {
+			instantiateFakeSessionCarrierPlugin()
+		}
 		switch r.URL.Path {
 		case "/global/health":
 			writeJSONNoTest(w, map[string]any{"healthy": true, "version": "1.18.3"})
@@ -1707,6 +1763,94 @@ func runFakeOpenCodeServerProcess() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// recordedSessionCarrierPlugin holds the plugin module the product last wrote,
+// so an in-process native fake can instantiate the real generated source rather
+// than a hand-written stand-in.
+var recordedSessionCarrierPlugin atomic.Pointer[string]
+
+// recordSessionCarrierPluginForFakeNative lets a fake that answers the native
+// routes in-process behave the way a real OpenCode does: the plugin is loaded
+// by the first directory-scoped request, and loading it publishes the marker
+// the runtime demands before it serves a session.
+func recordSessionCarrierPluginForFakeNative(t *testing.T) {
+	t.Helper()
+	write := sessionCarrierWriteFile
+	t.Cleanup(func() {
+		sessionCarrierWriteFile = write
+
+		recordedSessionCarrierPlugin.Store(nil)
+	})
+	sessionCarrierWriteFile = func(path string, data []byte, mode os.FileMode) error {
+		if filepath.Base(path) == sessionCarrierPluginFileName {
+			source := string(data)
+			recordedSessionCarrierPlugin.Store(&source)
+		}
+
+		return write(path, data, mode)
+	}
+}
+
+func instantiateRecordedSessionCarrierPlugin(request *http.Request) {
+	source := recordedSessionCarrierPlugin.Load()
+	if source == nil || request.URL.Query().Get("directory") == "" {
+		return
+	}
+
+	publishFakeSessionCarrierProof(*source)
+}
+
+func publishFakeSessionCarrierProof(source string) {
+	path, pathOK := fakePluginConstant(source, "PROOF_PATH")
+	token, tokenOK := fakePluginConstant(source, "PROOF_TOKEN")
+
+	if pathOK && tokenOK {
+		_ = os.WriteFile(path, []byte(token), 0o600)
+	}
+}
+
+// instantiateFakeSessionCarrierPlugin does for the fake native process what a
+// real OpenCode does when a directory-scoped request first reaches it: it loads
+// the generated plugin module, which publishes the marker the runtime demands
+// before it will serve a session. The fake reads the module the product
+// actually wrote, so a plugin the runtime never registered stays unproven here
+// exactly as it would natively.
+func instantiateFakeSessionCarrierPlugin() {
+	var config struct {
+		Plugin []string `json:"plugin"`
+	}
+	if json.Unmarshal([]byte(os.Getenv("OPENCODE_CONFIG_CONTENT")), &config) != nil {
+		return
+	}
+	for _, plugin := range config.Plugin {
+		parsed, err := url.Parse(plugin)
+		if err != nil || parsed.Scheme != "file" {
+			continue
+		}
+		source, err := os.ReadFile(parsed.Path)
+		if err != nil {
+			continue
+		}
+		publishFakeSessionCarrierProof(string(source))
+	}
+}
+
+func fakePluginConstant(source string, name string) (string, bool) {
+	_, rest, ok := strings.Cut(source, "const "+name+" = ")
+	if !ok {
+		return "", false
+	}
+	literal, _, ok := strings.Cut(rest, "\n")
+	if !ok {
+		return "", false
+	}
+	var value string
+	if json.Unmarshal([]byte(literal), &value) != nil {
+		return "", false
+	}
+
+	return value, true
 }
 
 func restoreOpenCodeClientSeams(t *testing.T) {
@@ -1777,6 +1921,29 @@ type errorReader struct {
 
 func (r errorReader) Read([]byte) (int, error) {
 	return 0, r.err
+}
+
+// budgetReader serves a fixed number of bytes and then fails. The carrier
+// plugin draws its startup proof before the runtime draws its server password,
+// so exhausting the budget between the two is the only way to reach the
+// password's own entropy failure.
+type budgetReader struct {
+	budget int
+	err    error
+}
+
+func (r *budgetReader) Read(p []byte) (int, error) {
+	if r.budget <= 0 {
+		return 0, r.err
+	}
+
+	if len(p) > r.budget {
+		p = p[:r.budget]
+	}
+
+	r.budget -= len(p)
+
+	return len(p), nil
 }
 
 type errorReadCloser struct {

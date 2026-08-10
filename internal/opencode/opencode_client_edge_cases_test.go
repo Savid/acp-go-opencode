@@ -81,7 +81,6 @@ func TestStartServerHappyPathWithoutPrivilegedProcessLaunch(t *testing.T) {
 		Pure:           true,
 		QuestionTool:   true,
 		LogLevel:       "DEBUG",
-		ExtraPathDirs:  []string{"/usr/bin"},
 		Logger:         slog.New(slog.DiscardHandler),
 		MinVersion:     "1.18.3",
 	})
@@ -127,8 +126,11 @@ func TestOrdinaryDirectLaunchKeepsThePortableHomeLock(t *testing.T) {
 
 		return cmd.Process.Pid, nil
 	}
+	recordSessionCarrierPluginForFakeNative(t)
 	openCodeHTTPClient = func() *http.Client {
 		return &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			instantiateRecordedSessionCarrierPlugin(request)
+
 			switch request.URL.Path {
 			case routeGlobalHealth:
 				return performanceJSONResponse(map[string]any{"healthy": true, "version": "1.18.3"}), nil
@@ -699,7 +701,7 @@ func TestRuntimeConfigForbiddenSeedsAndDeepMerge(t *testing.T) {
 			require.NoError(t, err)
 			_, err = materializeOpenCodeRuntimeConfig(dirs, map[string]string{
 				openCodeConfigFileName: `{"` + field + `":{}}`,
-			})
+			}, "")
 			require.ErrorContains(t, err, "session-scoped")
 		})
 	}
@@ -838,8 +840,11 @@ func TestStartServerSupervisedReadinessSuccess(t *testing.T) {
 
 		return cmd.Process.Pid, nil
 	}
+	recordSessionCarrierPluginForFakeNative(t)
 	openCodeHTTPClient = func() *http.Client {
 		return &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			instantiateRecordedSessionCarrierPlugin(request)
+
 			switch request.URL.Path {
 			case routeGlobalHealth:
 				return performanceJSONResponse(map[string]any{"healthy": true, "version": "1.18.3"}), nil

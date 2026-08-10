@@ -83,7 +83,7 @@ coverage-check:
 
 ## test-integration-smoke: run live integration tests that do not spend model tokens
 test-integration-smoke:
-	ACP_GO_OPENCODE_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=240s -v ./integration/...
+	ACP_GO_OPENCODE_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=600s -v ./integration/... ./internal/opencode/...
 
 ## test-integration-live: run live integration tests that spend model tokens
 test-integration-live:
