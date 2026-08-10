@@ -9,17 +9,15 @@ import (
 	"testing"
 )
 
-// TestMain pins the platform the explicit-policy fixtures describe. The
-// hardened identity boundary exists on Linux and nowhere else, so every case
-// that builds a ProcessIsolation is a Linux case whatever host runs the suite;
-// without this pin a developer machine would exercise the platform refusal in
-// place of the behavior each case names. The refusal itself is asserted
-// directly, from every non-Linux platform, in TestExplicitProcessIsolationIsLinuxOnly.
-// Cases that mean another platform still set the seam themselves and restore it.
-func TestMain(m *testing.M) {
+// withLinuxProcessIsolation places explicit-policy cases on the only platform
+// that can honor one, then restores the real platform when the case ends. The
+// platform verdict is asserted separately; these fixtures exercise Linux
+// policy shape and launch behavior without changing the whole test process.
+func withLinuxProcessIsolation(t *testing.T) {
+	t.Helper()
+	original := processIsolationGOOS
 	processIsolationGOOS = processIsolationLinux
-
-	os.Exit(m.Run())
+	t.Cleanup(func() { processIsolationGOOS = original })
 }
 
 // testIsolationIdentity is the identity every fixture isolates to. Root cannot

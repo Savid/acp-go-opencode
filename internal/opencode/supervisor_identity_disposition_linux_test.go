@@ -12,24 +12,10 @@ import (
 )
 
 // TestSupervisorRefusesAHalfProvidedCapabilityPairPlatformValidationDoesNot
-// proves the supervisor makes its own check that the UID lock and the authority
-// domain arrive together, independently of the isolation policy.
-//
-// On Linux validateProcessIsolation already refuses a half-provided pair through
-// validateStandaloneIdentityDisposition, which runs only when the isolation
-// policy's platform is Linux; everywhere else nothing upstream of
-// supervisorCommand looks at the pair at all. Its own check is therefore the
-// only thing standing between a caller and a supervisor started with a lock but
-// no domain — one that would go on to record IdentityLock without
-// AuthorityDomain and be refused much later, inside the child, by
-// runSupervisor's consistency check.
-//
-// The case puts the isolation policy on a platform whose validator does not look
-// at the pair, hands the supervisor each half in turn, and requires the
-// supervisor's own refusal by its exact text, so a refusal that came from the
-// isolation policy instead could not be mistaken for it. Nothing may be built
-// before that refusal: no config descriptor is written, and no command comes
-// back.
+// proves Linux refuses either incomplete borrowed-authority shape before the
+// supervisor builds anything. The policy validator is the one canonical gate:
+// supervisorCommand must return its exact verdict without writing a config or
+// constructing a command.
 func TestSupervisorRefusesAHalfProvidedCapabilityPairPlatformValidationDoesNot(t *testing.T) {
 	for _, testCase := range []struct {
 		name  string
@@ -46,14 +32,13 @@ func TestSupervisorRefusesAHalfProvidedCapabilityPairPlatformValidationDoesNot(t
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			preserveSupervisorGlobals(t)
-			platform := processIsolationGOOS
-			processIsolationGOOS = "darwin"
-			t.Cleanup(func() { processIsolationGOOS = platform })
+			require.Equal(t, processIsolationLinux, processIsolationGOOS,
+				"the Linux-only fixture must exercise the real Linux policy validator")
 
 			config := supervisorConfig{Scratch: t.TempDir(), Isolation: borrowedTestIsolation(testProcessIsolation())}
 			testCase.apply(config.Isolation)
-			require.NoError(t, validateProcessIsolation(config.Isolation),
-				"the fixture must be one this platform's isolation policy accepts")
+			require.EqualError(t, validateProcessIsolation(config.Isolation),
+				"process identity lock and authority domain must be provided together")
 
 			written := 0
 			supervisorWriteConfig = func(string, supervisorConfig) (*os.File, error) {
@@ -63,7 +48,7 @@ func TestSupervisorRefusesAHalfProvidedCapabilityPairPlatformValidationDoesNot(t
 			}
 
 			cmd, proof, err := supervisorCommand(context.Background(), config)
-			require.EqualError(t, err, "OpenCode supervisor requires the UID lock and authority domain together")
+			require.EqualError(t, err, "process identity lock and authority domain must be provided together")
 			require.Nil(t, cmd)
 			require.Nil(t, proof)
 			require.Zero(t, written, "a half-provided capability pair must be refused before anything is built")

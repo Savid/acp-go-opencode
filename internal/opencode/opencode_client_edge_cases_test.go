@@ -267,6 +267,7 @@ func TestStartServerRootAndSupervisorSetupFailures(t *testing.T) {
 }
 
 func TestNativeOwnedXDGIsNeverTouchedBeforeNativeLaunch(t *testing.T) {
+	withLinuxProcessIsolation(t)
 	root := t.TempDir()
 	control := t.TempDir()
 	require.NoError(t, os.Chmod(control, 0o700))

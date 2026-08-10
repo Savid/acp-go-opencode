@@ -19,17 +19,6 @@ func (testProcessIdentityCapability) Duplicate() (*os.File, error) {
 	return nil, errors.New("test capability is not duplicable")
 }
 
-// withLinuxProcessIsolation places the explicit-policy cases on the only
-// platform that can honor one. The platform verdict is asserted on its own in
-// TestExplicitProcessIsolationIsLinuxOnly; every other case is about the shape
-// of a policy, which is a Linux question by construction.
-func withLinuxProcessIsolation(t *testing.T) {
-	t.Helper()
-	original := processIsolationGOOS
-	processIsolationGOOS = processIsolationLinux
-	t.Cleanup(func() { processIsolationGOOS = original })
-}
-
 func TestProcessIdentityDispositionValidation(t *testing.T) {
 	capability := testProcessIdentityCapability{}
 	validStandalone := ProcessIsolation{StandaloneOwnerID: "deployment-1", StandaloneStateRoot: "/var/lib/acp-go-opencode"}

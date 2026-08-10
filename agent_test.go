@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -279,10 +280,13 @@ func requireExplicitPolicyReachesTheRuntime(t *testing.T, policy ProcessIsolatio
 	t.Helper()
 
 	runtimeGOOS = platformLinux
+	home := testNativeOwnedHome(t)
+	require.NoError(t, os.Chown(home, int(policy.UID), int(policy.GID)))
+	policy.StandaloneStateRoot = home
 
 	var launched *opencode.ProcessIsolation
 
-	honored := NewAgent(WithHome("/var/lib/opencode"), WithProcessIsolation(policy), WithScratchDir(t.TempDir()))
+	honored := NewAgent(WithHome(home), WithProcessIsolation(policy), WithScratchDir(t.TempDir()))
 	honored.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
 		launched = options.ProcessIsolation
 
@@ -293,4 +297,5 @@ func requireExplicitPolicyReachesTheRuntime(t *testing.T, policy ProcessIsolatio
 	require.NotNil(t, launched, "an honored policy must reach the runtime")
 	require.Equal(t, uint32(65534), launched.UID)
 	require.Equal(t, "deployment-1", launched.StandaloneOwnerID)
+	require.Equal(t, home, launched.StandaloneStateRoot)
 }

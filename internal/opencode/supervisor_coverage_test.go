@@ -52,6 +52,7 @@ func (buffer *supervisorCloseBuffer) Close() error {
 
 func preserveSupervisorGlobals(t *testing.T) {
 	t.Helper()
+	withLinuxProcessIsolation(t)
 	preservePlatformSupervisorGlobals(t)
 	oldExecutable := supervisorExecutable
 	oldCommand := supervisorExecCommand
@@ -673,6 +674,7 @@ func TestSupervisorDefaultHooksAndConfigWriteFailures(t *testing.T) {
 }
 
 func TestSupervisorCommandValidationAndCapabilityFailures(t *testing.T) {
+	withLinuxProcessIsolation(t)
 	valid := func(t *testing.T) supervisorConfig {
 		t.Helper()
 
@@ -1893,6 +1895,7 @@ func withNeutralSupervisorIdentityHooks(t *testing.T) {
 // carries no standalone owner fields; a standalone launch carries exactly the
 // owner binding the parent recorded.
 func TestSupervisedNativeIsolationCarriesTheAuthorityItWasHandedDown(t *testing.T) {
+	withLinuxProcessIsolation(t)
 	borrowed := supervisedNativeIsolation(supervisorConfig{
 		IsolationUID: 65534, IsolationGID: 65534, NativeEnv: []string{"PATH=/usr/bin:/bin"},
 		IdentityLock: true, AuthorityDomain: true,

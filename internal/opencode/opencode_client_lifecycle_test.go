@@ -1103,6 +1103,7 @@ func TestOpenCodeServerCloseTimeoutAndContext(t *testing.T) {
 }
 
 func TestXDGEnvAndPipeHelpers(t *testing.T) {
+	withLinuxProcessIsolation(t)
 	root := t.TempDir()
 	xdg, err := CreateRuntimeXDGDirs(root)
 	if err != nil {
@@ -1710,6 +1711,7 @@ func runFakeOpenCodeServerProcess() {
 
 func restoreOpenCodeClientSeams(t *testing.T) {
 	t.Helper()
+	withLinuxProcessIsolation(t)
 	commandContext := openCodeCommandContext
 	startProcess := openCodeStartProcess
 	applyCredential := openCodeApplyCredential

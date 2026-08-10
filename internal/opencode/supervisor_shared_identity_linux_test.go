@@ -410,7 +410,7 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	require.NoError(t, err)
 	require.NoError(t, proof.closeInherited())
 
-	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid()) //nolint:gosec // Kernel IDs fit the wire width.
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid()) // Kernel IDs fit the wire width.
 	supervised := &supervisedNative{
 		cmd: cmd, waiter: waiter, stdin: stdin, home: home,
 		stderr: stderr, cancel: cancel, proof: proof, isolationUID: uid,
