@@ -29,7 +29,7 @@ cat "$result_log"
 [ "$status" -eq 0 ] || exit "$status"
 
 passed="$(grep -Ec '"Action":"pass","Package":"[^"]+","Test":"Test[^/"]*"' "$result_log" || true)"
-skipped="$(grep -Ec '"Action":"skip","Package":"[^"]+","Test":"Test[^/"]*"' "$result_log" || true)"
+skipped="$(grep -Ec '"Action":"skip","Package":"[^"]+","Test":"Test[^"]+"' "$result_log" || true)"
 [ "$passed" -eq "$expected" ] || {
   printf '%s: selected tests passed %s of %s\n' "$provider" "$passed" "$expected" >&2
   exit 1

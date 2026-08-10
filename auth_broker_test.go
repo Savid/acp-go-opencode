@@ -270,14 +270,17 @@ func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testi
 // already scrubbed. The broker is the second consumer of that snapshot, so a
 // scrub that only happened at the session launch would leak here.
 func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testing.T) {
-	const privateCanary = "ACP_GO_OPENCODE_INTERNAL_SPOOF"
+	const (
+		ambientCanary = "ACP_GO_OPENCODE_TEST_ACTUAL_AMBIENT"
+		privateCanary = privateAdapterEnvPrefix + "SPOOF"
+	)
 
 	t.Setenv(privateCanary, "leaked")
 	t.Setenv(opencode.DarwinRuntimeIDEnv, "leaked")
 	t.Setenv(opencode.DarwinScratchRootEnv, "/leaked")
 	t.Setenv("OPENCODE_DB", "/leaked/opencode.db")
 	t.Setenv("OPENCODE_CONFIG_DIR", "/leaked/config")
-	t.Setenv("ACP_GO_OPENCODE_AMBIENT_CANARY", "kept")
+	t.Setenv(ambientCanary, "kept")
 
 	harness := newAuthAgent(t)
 	agent, broker := harness.agent, harness.broker
@@ -300,7 +303,7 @@ func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testi
 	require.NotContains(t, handed.ImplicitEnvironment, strings.ToLower(privateCanary))
 	require.NotContains(t, handed.ImplicitEnvironment, opencode.DarwinRuntimeIDEnv)
 	require.NotContains(t, handed.ImplicitEnvironment, opencode.DarwinScratchRootEnv)
-	require.Equal(t, "kept", handed.ImplicitEnvironment["ACP_GO_OPENCODE_AMBIENT_CANARY"],
+	require.Equal(t, "kept", handed.ImplicitEnvironment[ambientCanary],
 		"only the private namespace is dropped, not the whole prefix")
 
 	// The managed OpenCode roots are dropped where the native environment is

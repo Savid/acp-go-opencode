@@ -43,8 +43,8 @@ type panickingRuntimeShutdownClient struct {
 // TestProcessIsolationOmissionAllowsRoot and its ordinary-user peer.
 func TestAgentSessionDefaultsToOrdinaryExecution(t *testing.T) {
 	const (
-		canary        = "ACP_GO_OPENCODE_IMPLICIT_ENV_TEST"
-		privateCanary = "ACP_GO_OPENCODE_INTERNAL_SPOOF"
+		canary        = "ACP_GO_OPENCODE_TEST_ACTUAL_AMBIENT"
+		privateCanary = privateAdapterEnvPrefix + "SPOOF"
 	)
 
 	t.Setenv(canary, "captured")

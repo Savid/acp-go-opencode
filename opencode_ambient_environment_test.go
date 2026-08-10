@@ -18,8 +18,8 @@ import (
 // is the same leak as the canonical one.
 func TestCaptureAmbientEnvironmentDropsAdapterPrivateCarriers(t *testing.T) {
 	const (
-		privateCanary = "ACP_GO_OPENCODE_INTERNAL_SPOOF"
-		keptCanary    = "ACP_GO_OPENCODE_AMBIENT_CANARY"
+		privateCanary = privateAdapterEnvPrefix + "SPOOF"
+		keptCanary    = "ACP_GO_OPENCODE_TEST_ACTUAL_AMBIENT"
 	)
 
 	t.Setenv(privateCanary, "leaked")
