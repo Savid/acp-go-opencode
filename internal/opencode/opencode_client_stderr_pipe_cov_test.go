@@ -31,7 +31,7 @@ func TestStartServerAbortsWhenTheRuntimeStderrPipeCannotBeOpened(t *testing.T) {
 	}
 
 	client, err := StartServer(context.Background(), StartOptions{
-		Root:             t.TempDir(),
+		Root:             testGeneratedTempDir(t),
 		ExecutablePath:   "/usr/bin/true",
 		skipSupervisor:   true,
 		ProcessIsolation: testProcessIsolation(),

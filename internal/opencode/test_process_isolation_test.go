@@ -141,6 +141,11 @@ func testTraversableTempDir(t *testing.T) string {
 
 func testGeneratedTempDir(t *testing.T) string {
 	t.Helper()
+	// Keep the generated root directly beneath the process temp root. Linux
+	// isolation creates the native session carrier beside this root, and the
+	// dropped identity must be able to traverse every one of its ancestors.
+	// testing.T.TempDir adds a private 0700 test directory in between, which is
+	// intentionally not a valid two-principal launch fixture.
 	directory, err := os.MkdirTemp("", "acp-go-opencode-runtime-")
 	if err != nil {
 		t.Fatalf("create generated test directory: %v", err)

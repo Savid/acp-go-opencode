@@ -741,7 +741,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		skipUnprivilegedDarwinIsolation(t)
 		helper := fakeOpenCodeExecutable(t)
 		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
-			Root:            t.TempDir(),
+			Root:            testGeneratedTempDir(t),
 			ExecutablePath:  helper,
 			MinVersion:      "99.0.0",
 			HealthTimeout:   5 * time.Second,
