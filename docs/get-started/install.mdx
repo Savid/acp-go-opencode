@@ -46,9 +46,10 @@ opencode --version
 Integration smoke tests that do not spend model tokens run under
 `make test-integration-smoke`.
 
-## Provision Linux identity authority
+## Provision explicit Linux identity authority
 
-Linux installations must persist the shared identity-lock root:
+Installations that supply a Linux process-isolation policy must persist the
+shared identity-lock root:
 
 ```sh
 sudo install -d -o root -g root -m 0700 \

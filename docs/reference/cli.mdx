@@ -10,11 +10,19 @@ acp-go-opencode [flags]
 The binary speaks ACP over stdin/stdout; stdout carries JSON-RPC only and
 diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 
-## Required standalone isolation policy
+## Optional standalone isolation policy
 
-Normal serve mode is Linux-only and requires
-`-process-isolation-config=/absolute/path/process-isolation.json`.
-`-version` and the Darwin containment diagnostic subcommands are exempt.
+Omitting `-process-isolation-config` selects ordinary current-identity mode on
+every supported platform, with no privileged setup and no policy load. The
+command runs OpenCode as its own root or non-root identity, applies no UID/GID
+or supplementary-group change, keeps the portable writable-home claim and
+liveness, and reports the non-authoritative `shared_identity`.
+
+Supplying `-process-isolation-config=/absolute/path/process-isolation.json`
+explicitly selects the hardened Linux policy and binds `-home` to
+`standaloneStateRoot`. It is Linux-only; every loader, decode, validation,
+authority, and unsupported-platform failure exits before ACP serving or native
+spawn, with no ordinary-mode retry.
 The policy must be a root-owned, single-link regular file with mode `0600`.
 Every component is opened from `/` without following symlinks, and every
 ancestor must be root-owned and not writable by group or other. Unknown JSON
@@ -58,7 +66,7 @@ only `baseEnvironment` plus variables explicitly named in
 `inheritEnvironment`; identity, search-path, loader, interpreter, XDG/native
 home, and adapter-private variables cannot be inherited. Unset or duplicate
 inheritance entries fail startup. Darwin, Windows, and other platforms refuse
-standalone native mode rather than weakening this contract.
+this explicit Linux policy rather than weakening its contract.
 
 Provision the target as a locked system account with a non-login shell, its
 same-name private group, and no sudo policy. Its UID and primary GID cannot be
@@ -71,9 +79,9 @@ home for native tools.
 | Flag | Meaning | Default |
 |---|---|---|
 | `-path` | Path to the `opencode` CLI. | resolved from `PATH` |
-| `-process-isolation-config` | Required absolute path to the standalone Linux isolation policy described above. | — |
+| `-process-isolation-config` | Optional absolute path to the explicit standalone Linux isolation policy described above. | — |
 | `-scratch-dir` | Parent for the shared runtime root and transient adapter scratch. | system temp directory |
-| `-home` | Exact exclusive shared OpenCode XDG root; defaults to and, when set, must equal `standaloneStateRoot`. | policy value |
+| `-home` | Exact exclusive shared OpenCode XDG root; only an explicit isolation policy binds it to `standaloneStateRoot`. | generated root, or policy value |
 | `-provider-auth-root` | Durable host-owned root holding the provider-auth ledger. Empty leaves the provider-auth surface unadvertised. | — |
 | `-provider-auth-direct-home` | Canonical native home an account-level provider-auth leg may read or clear. Rejected by this adapter at session start. | — |
 | `-model` | Default model as `provider/model`. | — |
@@ -85,9 +93,9 @@ home for native tools.
 | `-opencode-health-timeout` | OpenCode server readiness timeout. | `60s` |
 | `-seed-file <relpath>=<hostpath>` | Seed a file into the shared runtime config root (repeatable). | — |
 
-The standalone command never launches native work on Darwin. The operational
-subcommands below remain available to inspect generations left by an embedded
-host using `WithDarwinBestEffortContainment`.
+Ordinary launches claim no containment boundary on any platform. The operational
+subcommands below inspect generations left by an embedded host using
+`WithDarwinBestEffortContainment`.
 
 Operators can inspect retained records without signalling processes:
 

@@ -685,9 +685,11 @@ func TestSupervisorCommandValidationAndCapabilityFailures(t *testing.T) {
 		_, _, err := supervisorCommand(ctx, valid(t))
 		require.ErrorIs(t, err, context.Canceled)
 	})
-	t.Run("isolation", func(t *testing.T) {
-		_, _, err := supervisorCommand(context.Background(), supervisorConfig{})
-		require.Error(t, err)
+	t.Run("explicit isolation", func(t *testing.T) {
+		_, _, err := supervisorCommand(context.Background(), supervisorConfig{
+			Isolation: &ProcessIsolation{UID: 1, GID: 2},
+		})
+		require.ErrorContains(t, err, "base environment is required")
 	})
 	t.Run("mixed capabilities", func(t *testing.T) {
 		config := valid(t)
@@ -766,6 +768,154 @@ func TestSupervisorCommandValidationAndCapabilityFailures(t *testing.T) {
 		require.Len(t, proof.inherited, 3)
 		require.NoError(t, proof.closeInherited())
 	})
+}
+
+// TestExplicitProcessIsolationNeverFallsBackToOrdinaryBackend drives a
+// structurally valid explicit policy into a failure at each boundary the launch
+// actually crosses — the platform verdict, the capability pairing, the
+// trusted-root admission, the marker namespace, and the native launch itself —
+// and proves every one of them refuses. No case reaches the ordinary direct
+// backend or the ordinary supervisor stamp, so no caller can ask for isolation
+// and receive the adapter's own identity instead.
+func TestExplicitProcessIsolationNeverFallsBackToOrdinaryBackend(t *testing.T) {
+	valid := func(t *testing.T) supervisorConfig {
+		t.Helper()
+		scratch := t.TempDir()
+
+		return supervisorConfig{
+			NativePath: "/usr/bin/true",
+			NativeEnv:  []string{"PATH=/usr/bin:/bin"},
+			Home:       filepath.Join(scratch, "home"),
+			Scratch:    scratch,
+			Isolation:  testProcessIsolation(),
+		}
+	}
+
+	for name, testCase := range map[string]struct {
+		arrange func(*testing.T, *supervisorConfig)
+		message string
+	}{
+		"platform": {
+			arrange: func(t *testing.T, _ *supervisorConfig) {
+				t.Helper()
+				original := processIsolationGOOS
+				processIsolationGOOS = "darwin"
+				t.Cleanup(func() { processIsolationGOOS = original })
+			},
+			message: errExplicitProcessIsolationPlatform,
+		},
+		"mixed capabilities": {
+			arrange: func(_ *testing.T, config *supervisorConfig) {
+				config.Isolation.IdentityLock = testProcessIdentityCapability{}
+			},
+			message: "must be provided together",
+		},
+		"trusted root": {
+			arrange: func(t *testing.T, _ *supervisorConfig) {
+				t.Helper()
+				supervisorVerifyTrustedIdentity = func(uint32) error {
+					return errors.New("requires a distinct trusted root identity")
+				}
+			},
+			message: "requires a distinct trusted root identity",
+		},
+		"marker namespace": {
+			arrange: func(t *testing.T, _ *supervisorConfig) {
+				t.Helper()
+				supervisorVerifyTrustedIdentity = func(uint32) error { return nil }
+				supervisorMarkerRoot = func(supervisorConfig) (string, error) {
+					return "", errors.New("proof namespace requires a trusted root supervisor")
+				}
+			},
+			message: "proof namespace requires a trusted root supervisor",
+		},
+		"launch": {
+			arrange: func(t *testing.T, _ *supervisorConfig) {
+				t.Helper()
+				supervisorVerifyTrustedIdentity = func(uint32) error { return nil }
+				supervisorMarkerRoot = func(config supervisorConfig) (string, error) { return config.Scratch, nil }
+				supervisorExecutable = func() (string, error) { return "", errors.New("supervisor lookup failed") }
+			},
+			message: "supervisor lookup failed",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			preserveSupervisorGlobals(t)
+
+			originalCommand := openCodeCommandContext
+			t.Cleanup(func() { openCodeCommandContext = originalCommand })
+
+			ordinaryLaunches := 0
+			openCodeCommandContext = func(ctx context.Context, path string, args ...string) *exec.Cmd {
+				if path == "/usr/bin/true" {
+					ordinaryLaunches++
+				}
+
+				return originalCommand(ctx, path, args...)
+			}
+
+			sealed := captureSealedSupervisorConfig(t)
+
+			config := valid(t)
+			testCase.arrange(t, &config)
+
+			cmd, proof, err := supervisorCommand(context.Background(), config)
+			require.ErrorContains(t, err, testCase.message)
+			require.Nil(t, cmd)
+			require.Nil(t, proof)
+			require.Zero(t, ordinaryLaunches, "a refused explicit policy must not spawn the native process directly")
+			require.False(t, sealed().OrdinaryExecution, "a refused explicit policy must not be stamped as ordinary")
+			require.False(t, sealed().SharedIdentity)
+		})
+	}
+}
+
+// captureSealedSupervisorConfig records the config a launch sealed without
+// preventing it, so a refusal case can prove nothing ordinary was ever written.
+func captureSealedSupervisorConfig(t *testing.T) func() supervisorConfig {
+	t.Helper()
+
+	var captured supervisorConfig
+
+	original := supervisorWriteConfig
+	supervisorWriteConfig = func(root string, config supervisorConfig) (*os.File, error) {
+		captured = config
+
+		return original(root, config)
+	}
+
+	return func() supervisorConfig { return captured }
+}
+
+func TestOrdinaryNonLinuxSupervisorUsesDirectBackend(t *testing.T) {
+	originalGOOS := processIsolationGOOS
+	originalCommand := openCodeCommandContext
+	t.Cleanup(func() {
+		processIsolationGOOS = originalGOOS
+		openCodeCommandContext = originalCommand
+	})
+
+	processIsolationGOOS = "darwin"
+	called := false
+	openCodeCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		called = true
+
+		return originalCommand(ctx, name, args...)
+	}
+
+	cmd, proof, err := supervisorCommand(context.Background(), supervisorConfig{
+		NativePath: "/usr/bin/true",
+		NativeArgs: []string{"--version"},
+		NativeEnv:  []string{"PATH=/usr/bin:/bin", "CANARY=present"},
+		NativeDir:  "/tmp",
+	})
+	require.NoError(t, err)
+	require.True(t, called)
+	require.Nil(t, proof)
+	require.Equal(t, "/usr/bin/true", cmd.Path)
+	require.Equal(t, []string{"/usr/bin/true", "--version"}, cmd.Args)
+	require.Equal(t, []string{"PATH=/usr/bin:/bin", "CANARY=present"}, cmd.Env)
+	require.Equal(t, "/tmp", cmd.Dir)
 }
 
 func TestSupervisorProofAndIdentityAuthorityRemainingBranches(t *testing.T) {
@@ -1735,4 +1885,30 @@ func withNeutralSupervisorIdentityHooks(t *testing.T) {
 		return noopSupervisorIdentityLock{}, nil
 	}
 	supervisorValidateAdoptedAuthority = func(supervisorConfig) error { return nil }
+}
+
+// TestSupervisedNativeIsolationCarriesTheAuthorityItWasHandedDown proves the
+// liveness child rebuilds the credential from its sealed config the way the
+// parent sealed it. A borrowed pair arrives as already-adopted authority and
+// carries no standalone owner fields; a standalone launch carries exactly the
+// owner binding the parent recorded.
+func TestSupervisedNativeIsolationCarriesTheAuthorityItWasHandedDown(t *testing.T) {
+	borrowed := supervisedNativeIsolation(supervisorConfig{
+		IsolationUID: 65534, IsolationGID: 65534, NativeEnv: []string{"PATH=/usr/bin:/bin"},
+		IdentityLock: true, AuthorityDomain: true,
+		StandaloneOwnerID: "test-owner", StandaloneStateRoot: testStandaloneStateRootPath,
+	})
+	require.True(t, borrowed.identityAuthorityAdopted)
+	require.Empty(t, borrowed.StandaloneOwnerID)
+	require.Empty(t, borrowed.StandaloneStateRoot)
+	require.NoError(t, validateProcessIsolation(borrowed))
+
+	standalone := supervisedNativeIsolation(supervisorConfig{
+		IsolationUID: 65534, IsolationGID: 65534, NativeEnv: []string{"PATH=/usr/bin:/bin"},
+		StandaloneOwnerID: "test-owner", StandaloneStateRoot: testStandaloneStateRootPath,
+	})
+	require.False(t, standalone.identityAuthorityAdopted)
+	require.Equal(t, "test-owner", standalone.StandaloneOwnerID)
+	require.Equal(t, testStandaloneStateRootPath, standalone.StandaloneStateRoot)
+	require.NoError(t, validateProcessIsolation(standalone))
 }

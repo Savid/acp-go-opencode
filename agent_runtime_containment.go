@@ -2,11 +2,12 @@ package opencodeacp
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"unicode"
+
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const (
@@ -21,49 +22,45 @@ const (
 
 var runtimeGOOS = runtime.GOOS
 
-// containmentEffectiveUID is the seam the shared-identity report is derived
-// through. The mode is selected from a faked GOOS in tests, so the identity it
-// is compared against has to be selectable there too.
-var containmentEffectiveUID = os.Geteuid
-
-// sharedProcessIdentity reports whether the configured native identity is the
-// identity this process already runs as. Root never qualifies: a zero effective
-// uid is the trusted supervisor identity, and the native uid is required to be
-// nonzero.
-func sharedProcessIdentity(isolation *ProcessIsolation) bool {
-	if isolation == nil {
-		return false
-	}
-
-	effectiveUID := containmentEffectiveUID()
-
-	return effectiveUID > 0 && uint64(isolation.UID) == uint64(effectiveUID)
-}
-
+// containmentMode reports the boundary a launch built from these options
+// actually reaches. Omitting the policy is ordinary same-identity execution:
+// it needs no privilege, works wherever the native launch itself works, and is
+// therefore reported on every platform rather than only on the one that can
+// harden. An explicit policy is the hardened Linux boundary and nothing else,
+// so it is unavailable everywhere the hardening cannot be honored.
 func containmentMode(options Options) RuntimeContainmentMode {
 	if options.DarwinBestEffortContainment && runtimeGOOS != platformDarwin {
 		return RuntimeContainmentUnavailable
 	}
 
-	switch runtimeGOOS {
-	case platformLinux:
-		if sharedProcessIdentity(options.ProcessIsolation) {
-			return RuntimeContainmentSharedIdentity
+	if options.ProcessIsolation != nil {
+		if runtimeGOOS != platformLinux || options.DarwinBestEffortContainment {
+			return RuntimeContainmentUnavailable
 		}
 
 		return RuntimeContainmentAuthoritative
-	case platformDarwin:
-		if options.DarwinBestEffortContainment {
-			return RuntimeContainmentBestEffort
-		}
 	}
 
-	return RuntimeContainmentUnavailable
+	if runtimeGOOS == platformDarwin && options.DarwinBestEffortContainment {
+		return RuntimeContainmentBestEffort
+	}
+
+	return RuntimeContainmentSharedIdentity
 }
 
 func validateContainmentOptions(options Options) error {
 	if options.DarwinBestEffortContainment && runtimeGOOS != platformDarwin {
 		return errors.New("darwin best-effort containment is supported only on darwin")
+	}
+
+	if options.ProcessIsolation != nil {
+		if options.DarwinBestEffortContainment {
+			return errors.New("explicit process isolation cannot be combined with darwin best-effort containment")
+		}
+
+		if runtimeGOOS != platformLinux {
+			return errors.New("explicit process isolation is supported only on linux")
+		}
 	}
 
 	for key := range options.Env {
@@ -98,7 +95,20 @@ func validateDurableHomePath(path string) error {
 func reservedOpenCodeEnvKey(key string) bool {
 	upper := strings.ToUpper(key)
 
-	return strings.HasPrefix(upper, privateAdapterEnvPrefix) || managedOpenCodeRootEnvKey(upper)
+	return adapterPrivateEnvKey(upper) || managedOpenCodeRootEnvKey(upper)
+}
+
+// adapterPrivateEnvKey names the carriers that belong to the adapter and to
+// nothing downstream: the private supervisor namespace and the Darwin
+// runtime/scratch markers a contained generation stamps onto its own child.
+// The comparison is case-insensitive because the ambient environment is not
+// case-normalized on every platform, and a variant spelling that survives the
+// scrub is the same leak as the canonical one.
+func adapterPrivateEnvKey(key string) bool {
+	upper := strings.ToUpper(key)
+
+	return strings.HasPrefix(upper, privateAdapterEnvPrefix) ||
+		upper == opencode.DarwinRuntimeIDEnv || upper == opencode.DarwinScratchRootEnv
 }
 
 func managedOpenCodeRootEnvKey(key string) bool {

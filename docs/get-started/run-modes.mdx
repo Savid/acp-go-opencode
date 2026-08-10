@@ -10,13 +10,19 @@ the streams directly.
 
 ## Standalone
 
-Standalone native mode is Linux-only. The root supervisor must receive
-`-process-isolation-config=/absolute/path/process-isolation.json`; the strict
-file schema, account/home checks, closed environment, and explicit
-`inheritEnvironment` behavior are documented in the
-[CLI reference](/docs/reference/cli). `-version` and Darwin containment
-diagnostics do not require the policy. There is no Darwin or Windows
-standalone-launch fallback.
+With no isolation flag, the command launches OpenCode as its own current root
+or non-root identity, needs no privileged setup, and reports the
+non-authoritative `shared_identity`. Linux and an opted-in Darwin route that
+ordinary mode through the guardian/liveness supervisor pair; every other
+platform runs the native process directly and keeps the portable writable-home
+claim and liveness instead. Neither arm publishes a provider-descendant
+inventory or a whole-tree quiescence claim.
+
+Add `-process-isolation-config=/absolute/path/process-isolation.json` on Linux
+for the explicit hardened identity, environment, ownership, and containment
+contract documented in the [CLI reference](/docs/reference/cli). That policy is
+Linux-only and fail-closed: a loader, validation, authority, or platform failure
+refuses the launch and never retries in ordinary mode.
 
 `acp-go-opencode` is launched by an ACP client, which drives it over
 stdin/stdout. stdout carries ACP JSON-RPC only; diagnostics go to stderr.
@@ -41,7 +47,6 @@ builds the same agent when you need to hold a reference before serving.
 ```go Serve
 err := opencodeacp.Serve(ctx, input, output,
 	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
-	opencodeacp.WithProcessIsolation(opencodeacp.ProcessIsolation{UID: 20001, GID: 20001, BaseEnvironment: isolationEnvironment}),
 	opencodeacp.WithScratchDir(scratchDir),
 )
 ```
@@ -49,7 +54,6 @@ err := opencodeacp.Serve(ctx, input, output,
 ```go NewAgent
 agent := opencodeacp.NewAgent(
 	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
-	opencodeacp.WithProcessIsolation(opencodeacp.ProcessIsolation{UID: 20001, GID: 20001, BaseEnvironment: isolationEnvironment}),
 	opencodeacp.WithScratchDir(scratchDir),
 )
 ```
@@ -58,3 +62,8 @@ agent := opencodeacp.NewAgent(
 
 Both entry points accept the same `Option` values. See the
 [Go API reference](/docs/reference/go-api) for the full catalog.
+Append `WithProcessIsolation(...)` only when the host explicitly selects the
+hardened Linux policy. It never combines with
+`WithDarwinBestEffortContainment`, and an invalid, unavailable, or
+unsupported-platform policy fails before native spawn and is never retried in
+ordinary mode.

@@ -29,12 +29,12 @@ runtime and its resources quarantined.
 | Option | Purpose |
 |---|---|
 | `WithExecutablePath` | Path to the `opencode` binary. |
-| `WithProcessIsolation` | Mandatory nonzero target UID/GID and complete replacement environment for native OpenCode processes. On Linux the guardian/liveness supervisors stay trusted root; only `opencode serve` receives the configured identity, with supplementary groups cleared. |
+| `WithProcessIsolation` | Explicit hardened Linux boundary: nonzero target UID/GID distinct from a trusted root supervisor, empty supplementary groups, and a complete replacement environment. Strict and fail-closed on every platform, authority, and launch failure, and never combined with `WithDarwinBestEffortContainment`. Omit it for ordinary current-identity execution, which is the default and never a configuration error. |
 | `WithScratchDir` | Parent for a materialized shared runtime root and transient adapter scratch; empty uses the system temp directory. |
 | `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. Standalone isolation defaults it to `StandaloneStateRoot` and rejects any different explicit path. |
 | `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant and numeric-PGID-reuse risks. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
-| `WithEnv` | Agent-wide ordinary-variable overrides on `ProcessIsolation.BaseEnvironment`; a session may overlay them per key. The adapter never inherits its own environment. `HOME`, XDG roots, and OpenCode config/database roots are reserved and rejected. |
+| `WithEnv` | Agent-wide ordinary-variable overrides. With explicit isolation they overlay `ProcessIsolation.BaseEnvironment`; otherwise they overlay the environment captured when the agent was constructed. Managed XDG/config/database roots retain adapter precedence. |
 | `WithSeedFiles` | Immutable files written into the shared config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
@@ -61,7 +61,7 @@ provider-owner binding, retained `ACTIVE`, and UID-lock acquisition. A
 mixed nil/non-nil pair fails closed. Borrowed authority rejects owned UIDs. Native
 processes receive neither capability nor descriptor.
 
-`ProcessIsolation.StandaloneOwnerID` and
+For an explicit policy, `ProcessIsolation.StandaloneOwnerID` and
 `ProcessIsolation.StandaloneStateRoot` are required when both capabilities
 are nil and forbidden when both are set. The owner ID is the nonsecret
 case-sensitive deployment identity: 1--256 canonical ASCII bytes beginning
@@ -109,10 +109,13 @@ does.
 `RuntimeResourceHooks` also carries `ObserveProcess`,
 `ObserveProcessSnapshot`, `ObserveStartupStage`, and `ObserveContainment`.
 `Agent.ContainmentMode` returns `authoritative`, `shared_identity`,
-`best_effort`, or `unavailable`. `shared_identity` names a Linux launch whose
-configured native identity is the identity the adapter already runs as; the
-lifecycle boundary is the authoritative one and the credential separation
-between adapter and agent is what is absent.
+`best_effort`, or `unavailable`. Omission reports `shared_identity` on every
+platform where the native launch works, root or not; it is a posture rather
+than an achievement, so no provider-descendant inventory and no whole-tree
+quiescence are published for it. `ObserveProcessSnapshot` is withheld for the
+whole Agent lifetime in every mode except `authoritative`, terminal zero
+included. An explicit policy reports `authoritative` on Linux and `unavailable`
+wherever it cannot be honored; it never reports `shared_identity`.
 OpenCode reports its two
 actual home-lock supervisors only after native readiness and removes them when
 the supervisor waiter observes exit; it never derives that count from root

@@ -104,12 +104,14 @@ OpenTelemetry providers.
 - Cancel and timeout send native abort only as an advisory hint, then await one
   memoized containment result for the exact runtime generation. Fenced
   stream/control failures use the same path. Linux helper-owned subreapers catch
-  `setsid` escapees. Windows native launch fails closed because its process API
-  cannot apply the mandatory Unix UID/GID identity boundary with empty
-  supplementary groups; cross-compilation proves only that this refusal path
-  builds, not runtime support. The standalone command is Linux-only; embedded
-  Darwin hosts may explicitly select best-effort process-group containment
-  with `WithDarwinBestEffortContainment`.
+  `setsid` escapees. Omitting `WithProcessIsolation` is the ordinary default on
+  every supported platform: native work runs as the adapter's current root or
+  non-root identity, keeps the portable writable-home claim and liveness, and
+  reports the non-authoritative `shared_identity` with no provider-descendant
+  inventory and no whole-tree quiescence claim. Supplying it explicitly selects
+  the hardened Linux identity boundary, which is strict, fail-closed, and never
+  falls back. Embedded Darwin hosts may instead select best-effort
+  process-group containment with `WithDarwinBestEffortContainment`.
 - A native-server crash fails the active turn, retains loaded logical
   sessions, and reconstructs a session from its last committed sync-event
   generation before a following prompt can reach the replacement runtime.

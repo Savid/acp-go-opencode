@@ -65,15 +65,12 @@ func writeLinuxSupervisorConfig(_ string, config supervisorConfig) (*os.File, er
 // uid against, or the isolated arm becomes unreachable off root.
 var supervisorTrustedEffectiveUID = os.Geteuid
 
+// verifyLinuxTrustedSupervisorIdentity is the explicit policy's admission gate
+// and has no exception. The supervisor drops privilege to reach the native
+// identity, so it must hold a higher one first; a deployment that cannot supply
+// one has asked for a boundary it cannot get, and the answer is a refusal
+// rather than a launch under the adapter's own credentials.
 func verifyLinuxTrustedSupervisorIdentity(uid uint32) error {
-	// The supervisor drops privilege to reach the native identity, so it has to
-	// hold a higher one first. When the native identity is the one it already
-	// runs as there is no descent to make, and demanding root would refuse the
-	// only launch such a deployment can perform.
-	if sharedNativeIdentity(uid) {
-		return nil
-	}
-
 	if supervisorTrustedEffectiveUID() != 0 || uid == 0 || effectiveUID() == uid {
 		return errors.New("OpenCode liveness supervisor requires a distinct trusted root identity")
 	}
@@ -175,10 +172,11 @@ func validateLinuxSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) er
 func linuxSupervisorMarkerRoot(config supervisorConfig) (string, error) {
 	// The proof namespace under /run is root-owned and root-created, and it
 	// exists to keep the markers out of reach of the identity the native process
-	// runs as. A shared identity is that identity, so the namespace would prove
-	// nothing it does not already hold; the markers stay in the adapter-owned
-	// scratch root the launch created for itself.
-	if config.SharedIdentity {
+	// runs as. Ordinary execution is that identity, so the namespace would prove
+	// nothing it does not already hold — and an unprivileged ordinary launch
+	// could not create it at all; the markers stay in the adapter-owned scratch
+	// root the launch created for itself.
+	if config.OrdinaryExecution {
 		return config.Scratch, nil
 	}
 

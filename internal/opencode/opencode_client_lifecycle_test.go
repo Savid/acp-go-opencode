@@ -31,17 +31,23 @@ func testContainmentScratchReservation(context.Context) (func(), error) {
 	return func() {}, nil
 }
 
+// platformStartOptions gives a launch the boundary its platform can actually
+// select. Darwin gets ordinary execution plus the explicit best-effort opt-in,
+// because a hardened identity policy cannot be downgraded to a process-group
+// boundary and the two together are refused. Elsewhere the fixture keeps the
+// hardened policy.
 func platformStartOptions(t *testing.T, options StartOptions) StartOptions {
 	t.Helper()
-	options = withTestProcessIsolation(options)
 
 	if runtime.GOOS == "darwin" {
 		options.DarwinBestEffort = true
 		options.ContainmentScratchParent = t.TempDir()
 		options.ReserveContainmentScratch = testContainmentScratchReservation
+
+		return options
 	}
 
-	return options
+	return withTestProcessIsolation(options)
 }
 
 type openCodeMethodsRecorder struct {
@@ -1708,6 +1714,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	startProcess := openCodeStartProcess
 	applyCredential := openCodeApplyCredential
 	supervisorCommandFn := openCodeSupervisorCommand
+	acquireHomeLock := openCodeAcquireHomeLock
 	httpClient := openCodeHTTPClient
 	listen := openCodeListen
 	randReader := openCodeRandReader
@@ -1729,6 +1736,7 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodeStartProcess = startProcess
 		openCodeApplyCredential = applyCredential
 		openCodeSupervisorCommand = supervisorCommandFn
+		openCodeAcquireHomeLock = acquireHomeLock
 		openCodeHTTPClient = httpClient
 		openCodeListen = listen
 		openCodeRandReader = randReader

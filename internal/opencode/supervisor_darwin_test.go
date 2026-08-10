@@ -51,9 +51,13 @@ func darwinSupervisorTestConfig(t *testing.T) supervisorConfig {
 		t.Fatal(err)
 	}
 
+	isolation := testProcessIsolation()
+
 	return supervisorConfig{
 		ScratchParent: parent, Scratch: root, LifecycleKind: "runtime", DarwinBestEffort: true,
-		IsolationUID: testProcessIsolation().UID, IsolationGID: testProcessIsolation().GID, Isolation: testProcessIsolation(),
+		IsolationUID: isolation.UID, IsolationGID: isolation.GID, Isolation: isolation,
+		StandaloneOwnerID: isolation.StandaloneOwnerID, StandaloneStateRoot: isolation.StandaloneStateRoot,
+		StandaloneAuthority: true,
 	}
 }
 

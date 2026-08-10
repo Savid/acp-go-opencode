@@ -13,36 +13,23 @@ import (
 
 var inheritedDescriptorFcntl = unix.FcntlInt
 
-// Seams for the identity this process is actually running as. The shared arm is
-// selected through them and nothing else, so a case can place the launch on
-// either arm without the account the suite happens to run under deciding for
-// it. They are deliberately not the seams the trusted-root assertion reads.
+// Seams for the identity this process is actually running as. Ordinary
+// execution is stamped from them, so a case can place the launch at root or at
+// an unprivileged account without the account the suite happens to run under
+// deciding for it. They are deliberately not the seams the trusted-root
+// assertion reads.
 var (
 	processEffectiveUID = os.Geteuid
 	processEffectiveGID = os.Getegid
 )
 
-func validateProcessIsolationPlatform() error { return nil }
-
-// sharedNativeIdentity reports whether the native identity is the identity the
-// supervisor already runs as. Nothing separates the two ends of the launch in
-// that shape, so every step that exists to cross the boundary has nothing to
-// cross. A zero effective uid never qualifies: the supervisor holds the trusted
-// identity there, and a nonzero native uid is required everywhere, so the two
-// can never name the same identity. Only the Linux backend recognises the
-// shape; the Darwin backend states its own boundary and is left as it is.
-func sharedNativeIdentity(uid uint32) bool {
-	if processIsolationGOOS != processIsolationLinux {
-		return false
+func currentProcessIdentity() (uint32, uint32, error) {
+	uid, gid := processEffectiveUID(), processEffectiveGID()
+	if uid < 0 || gid < 0 {
+		return 0, 0, fmt.Errorf("current process identity is unavailable")
 	}
 
-	effective := processEffectiveUID()
-
-	return effective > 0 && uint64(uid) == uint64(effective)
-}
-
-func sharedProcessIdentity(isolation *ProcessIsolation) bool {
-	return isolation != nil && sharedNativeIdentity(isolation.UID)
+	return uint32(uid), uint32(gid), nil //nolint:gosec // Kernel IDs fit the process-isolation wire width.
 }
 
 func applyProcessCredential(cmd *exec.Cmd, isolation *ProcessIsolation) error {
@@ -50,26 +37,18 @@ func applyProcessCredential(cmd *exec.Cmd, isolation *ProcessIsolation) error {
 		return err
 	}
 
+	if isolation == nil {
+		return nil
+	}
+
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 
-	// Requesting no credential change at all is the only honest instruction
-	// when the native identity is already the running one. The supplementary
-	// groups belong to the account the supervisor was started under, and an
-	// unprivileged process can neither shed them nor re-enter them.
-	if sharedProcessIdentity(isolation) {
-		effectiveGID := processEffectiveGID()
-		if effectiveGID < 0 || uint64(isolation.GID) != uint64(effectiveGID) {
-			return fmt.Errorf(
-				"native group %d cannot be entered from group %d; %s",
-				isolation.GID, effectiveGID, sharedIdentitySupervisorRemedy,
-			)
-		}
-
-		return nil
-	}
-
+	// An explicit policy always drops to the configured credential with an
+	// empty supplementary set. There is no arm that applies no credential:
+	// that shape was the one a caller could ask for isolation and receive the
+	// adapter's own identity instead.
 	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: isolation.UID, Gid: isolation.GID, Groups: []uint32{}, NoSetGroups: false}
 
 	return nil

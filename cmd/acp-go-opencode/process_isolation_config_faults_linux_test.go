@@ -303,8 +303,8 @@ func TestLoadProcessIsolationConfigAcceptsOnlyABoundedTrustedPolicy(t *testing.T
 	}
 
 	if _, err = loadProcessIsolationConfig(""); err == nil ||
-		!strings.Contains(err.Error(), "-"+processIsolationConfigFlag+" is required") {
-		t.Fatalf("missing policy path error = %v", err)
+		!strings.Contains(err.Error(), "must be a nonempty absolute path when supplied") {
+		t.Fatalf("empty supplied policy path error = %v", err)
 	}
 
 	if _, err = loadProcessIsolationConfig("/var/lib/../var/lib/acp-cov.json"); err == nil ||
@@ -355,7 +355,7 @@ func TestLoadProcessIsolationConfigAcceptsOnlyABoundedTrustedPolicy(t *testing.T
 
 	processIsolationGeteuid = func() int { return 1000 }
 	if _, err = loadProcessIsolationConfig(isolationCovPolicy(t, isolationCovPolicyJSON)); err == nil ||
-		!strings.Contains(err.Error(), "standalone native mode requires a root supervisor") {
+		!strings.Contains(err.Error(), "explicit process isolation requires a root supervisor") {
 		t.Fatalf("unprivileged supervisor error = %v", err)
 	}
 }

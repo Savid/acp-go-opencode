@@ -253,12 +253,61 @@ func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testi
 	require.Same(t, created.shim, handed.BrowserShim)
 	require.Equal(t, filepath.Join(created.home, "control"), handed.ControlRoot)
 	require.Equal(t, created.home, handed.LeaseDir)
+	require.Nil(t, handed.ProcessIsolation)
+	require.NotNil(t, handed.ImplicitEnvironment)
 	require.Equal(t, agent.options.ScratchDir, filepath.Dir(handed.BrowserShim.Dir()))
 	require.True(t, strings.HasPrefix(filepath.Base(handed.BrowserShim.Dir()), "acp-go-opencode-browser-shim-"))
 	require.FileExists(t, filepath.Join(handed.BrowserShim.Dir(), "open"))
 
 	created.destroy(context.Background())
 	require.NoDirExists(t, handed.BrowserShim.Dir())
+}
+
+// TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment proves the
+// login runtime is built the same way the session runtime is: ordinary
+// execution with no policy, from the ambient snapshot the Agent captured once,
+// with the adapter-private carriers and every adapter-managed OpenCode root
+// already scrubbed. The broker is the second consumer of that snapshot, so a
+// scrub that only happened at the session launch would leak here.
+func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testing.T) {
+	const privateCanary = "ACP_GO_OPENCODE_INTERNAL_SPOOF"
+
+	t.Setenv(privateCanary, "leaked")
+	t.Setenv(opencode.DarwinRuntimeIDEnv, "leaked")
+	t.Setenv(opencode.DarwinScratchRootEnv, "/leaked")
+	t.Setenv("OPENCODE_DB", "/leaked/opencode.db")
+	t.Setenv("OPENCODE_CONFIG_DIR", "/leaked/config")
+	t.Setenv("ACP_GO_OPENCODE_AMBIENT_CANARY", "kept")
+
+	harness := newAuthAgent(t)
+	agent, broker := harness.agent, harness.broker
+	restoreBrokerSeams(t)
+
+	var handed opencode.StartOptions
+
+	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		handed = options
+
+		return newFakeOpenCodeClient(), nil
+	}
+
+	created, err := broker.startBroker(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { created.destroy(context.Background()) })
+
+	require.Nil(t, handed.ProcessIsolation, "the broker runtime is ordinary execution, never a manufactured policy")
+	require.NotContains(t, handed.ImplicitEnvironment, privateCanary)
+	require.NotContains(t, handed.ImplicitEnvironment, strings.ToLower(privateCanary))
+	require.NotContains(t, handed.ImplicitEnvironment, opencode.DarwinRuntimeIDEnv)
+	require.NotContains(t, handed.ImplicitEnvironment, opencode.DarwinScratchRootEnv)
+	require.Equal(t, "kept", handed.ImplicitEnvironment["ACP_GO_OPENCODE_AMBIENT_CANARY"],
+		"only the private namespace is dropped, not the whole prefix")
+
+	// The managed OpenCode roots are dropped where the native environment is
+	// assembled, so the snapshot may still carry them; what must never happen
+	// is the broker inheriting a caller override of one.
+	require.NotContains(t, handed.Env, "OPENCODE_DB")
+	require.NotContains(t, handed.Env, "OPENCODE_CONFIG_DIR")
 }
 
 func TestDestroyReportsBrowserShimRemovalFailure(t *testing.T) {

@@ -9,6 +9,19 @@ import (
 	"testing"
 )
 
+// TestMain pins the platform the explicit-policy fixtures describe. The
+// hardened identity boundary exists on Linux and nowhere else, so every case
+// that builds a ProcessIsolation is a Linux case whatever host runs the suite;
+// without this pin a developer machine would exercise the platform refusal in
+// place of the behavior each case names. The refusal itself is asserted
+// directly, from every non-Linux platform, in TestExplicitProcessIsolationIsLinuxOnly.
+// Cases that mean another platform still set the seam themselves and restore it.
+func TestMain(m *testing.M) {
+	processIsolationGOOS = processIsolationLinux
+
+	os.Exit(m.Run())
+}
+
 // testIsolationIdentity is the identity every fixture isolates to. Root cannot
 // isolate to itself — the policy forbids UID or GID zero — and uid 1 is the
 // system daemon account, which the standalone claim finds live on any host the
@@ -16,9 +29,9 @@ import (
 // occupied. 65534 is the fleet-wide unprivileged stand-in, and the privileged
 // lock serializes it across repos.
 //
-// The identity the fixture must not name is the one running the suite: that
-// shape is the shared-identity launch, which has its own cases, and every
-// fixture here describes the isolated launch that still has a privilege
+// The identity the fixture must not name is the one running the suite: an
+// explicit policy naming the adapter's own identity is refused outright, and
+// every fixture here describes the hardened launch that still has a privilege
 // boundary to cross. Under root that is the pre-existing zero test and the
 // identity is unchanged.
 func testIsolationIdentity() (uint32, uint32) {
@@ -73,25 +86,6 @@ func testProcessIsolation() *ProcessIsolation {
 		UID: uid, GID: gid, BaseEnvironment: environment,
 		StandaloneOwnerID: "test-owner", StandaloneStateRoot: testStandaloneStateRoot(),
 	}
-}
-
-// testHandoffProcessIsolation names the identity this process can genuinely
-// hand a directory tree to. Root can chown a tree to the unprivileged stand-in
-// and keeps the isolated fixture unchanged; an unprivileged runner can only
-// hand a tree to itself, which is the shared-identity shape and carries no
-// standalone owner fields. Cases that perform a real ownership handoff need
-// that identity, not the isolated fixture, which deliberately names an identity
-// this process is not.
-func testHandoffProcessIsolation() *ProcessIsolation {
-	isolation := testProcessIsolation()
-	if os.Geteuid() == 0 {
-		return isolation
-	}
-
-	isolation.UID, isolation.GID = uint32(os.Geteuid()), uint32(os.Getegid())
-	isolation.StandaloneOwnerID, isolation.StandaloneStateRoot = "", ""
-
-	return isolation
 }
 
 // testForeignProcessIsolation names an identity the current process is not.

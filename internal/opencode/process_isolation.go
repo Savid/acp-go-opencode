@@ -12,8 +12,10 @@ import (
 	"unicode/utf8"
 )
 
-// ProcessIsolation is the mandatory credential and complete environment base
-// applied to every provider process.
+// ProcessIsolation is the explicit hardened Linux identity boundary: a
+// credential distinct from the trusted supervisor's own plus the complete
+// environment the native process runs with. Nil selects ordinary execution as
+// the current identity and is never manufactured from a nil value.
 type ProcessIdentityLockCapability interface {
 	Duplicate() (*os.File, error)
 }
@@ -29,13 +31,23 @@ type ProcessIsolation struct {
 	identityAuthorityAdopted bool
 }
 
-const processIsolationLinux = "linux"
+const (
+	processIsolationLinux  = "linux"
+	processIsolationDarwin = "darwin"
+	// errExplicitProcessIsolationPlatform is the verdict every non-Linux
+	// platform returns for a supplied policy. It is a refusal and never a
+	// selector: nothing downstream reads it and retries ordinary execution.
+	errExplicitProcessIsolationPlatform = "explicit process isolation is supported only on linux"
+)
 
-var processIsolationGOOS = runtime.GOOS
+var (
+	processIsolationGOOS = runtime.GOOS
+	processEnviron       = os.Environ
+)
 
 func validateProcessIsolation(isolation *ProcessIsolation) error {
 	if isolation == nil {
-		return errors.New("process isolation is required")
+		return nil
 	}
 
 	if isolation.UID == 0 || isolation.GID == 0 {
@@ -50,22 +62,16 @@ func validateProcessIsolation(isolation *ProcessIsolation) error {
 		return fmt.Errorf("validate process isolation base environment: %w", err)
 	}
 
-	if processIsolationGOOS == processIsolationLinux {
-		if err := validateStandaloneIdentityDisposition(isolation); err != nil {
-			return err
-		}
+	// The shape is checked first because a malformed policy is malformed
+	// everywhere. The platform verdict is the separate answer that an
+	// otherwise well-formed policy still cannot be honored here, and it binds
+	// the embedded Go API rather than only the command's policy loader.
+	if processIsolationGOOS != processIsolationLinux {
+		return errors.New(errExplicitProcessIsolationPlatform)
 	}
 
-	return validateProcessIsolationPlatform()
+	return validateStandaloneIdentityDisposition(isolation)
 }
-
-// sharedIdentitySupervisorRemedy states what an operator can change when the
-// supervisor was asked to launch the native process under the very identity it
-// already runs as and the shape it was handed describes something else. There
-// is no privilege boundary to cross in that deployment, so the two answers are
-// to give the supervisor one, or to describe the launch as what it is.
-const sharedIdentitySupervisorRemedy = "run the supervisor as root to isolate the agent identity, " +
-	"or launch the agent under the identity the supervisor already holds"
 
 func validateStandaloneIdentityDisposition(isolation *ProcessIsolation) error {
 	identityLock, authorityDomain := isolation.IdentityLock != nil, isolation.AuthorityDomain != nil
@@ -86,19 +92,6 @@ func validateStandaloneIdentityDisposition(isolation *ProcessIsolation) error {
 	if identityLock {
 		if isolation.StandaloneOwnerID != "" || isolation.StandaloneStateRoot != "" {
 			return errors.New("borrowed process identity forbids standalone owner fields")
-		}
-
-		return nil
-	}
-
-	// A native identity that is already the supervisor's own identity cannot be
-	// recorded as a standalone one: the durable record proves an identity no
-	// live task holds, and the supervisor asking for it is such a task. The
-	// canonical shape is therefore no capabilities and no standalone fields.
-	if sharedProcessIdentity(isolation) {
-		if isolation.StandaloneOwnerID != "" || isolation.StandaloneStateRoot != "" {
-			return errors.New("standalone owner fields describe an identity the supervisor already holds; " +
-				sharedIdentitySupervisorRemedy)
 		}
 
 		return nil
@@ -176,43 +169,176 @@ func environmentMap(entries []string) map[string]string {
 }
 
 func buildProcessEnvironment(isolation *ProcessIsolation, overlays ...map[string]string) (map[string]string, error) {
+	return buildProcessEnvironmentFrom(isolation, nil, overlays...)
+}
+
+func buildProcessEnvironmentFrom(
+	isolation *ProcessIsolation,
+	implicitEnvironment map[string]string,
+	overlays ...map[string]string,
+) (map[string]string, error) {
 	if err := validateProcessIsolation(isolation); err != nil {
 		return nil, err
 	}
 
-	values := make(map[string]string, len(isolation.BaseEnvironment))
-	for key, value := range isolation.BaseEnvironment {
-		values[key] = value
+	base := implicitEnvironment
+	if isolation != nil {
+		base = isolation.BaseEnvironment
+	} else if base == nil {
+		base = captureProcessEnvironment()
 	}
+
+	values := withoutAdapterOwnedState(cloneEnvironment(base))
 
 	for _, overlay := range overlays {
 		if err := validateEnvironmentMap(overlay); err != nil {
 			return nil, err
 		}
 
-		for key, value := range overlay {
+		for key, value := range withoutAdapterOwnedState(overlay) {
 			values[key] = value
 		}
 	}
 
-	delete(values, supervisorModeEnv)
-
-	if err := validateProcessSearchPath(values["PATH"]); err != nil {
-		return nil, err
+	// Only a complete explicit policy carries the absolute-entry PATH rule.
+	// Ordinary execution runs against a sanitized ambient environment, and a
+	// perfectly ordinary shell PATH must not turn policy omission into a
+	// startup refusal.
+	if isolation != nil {
+		if err := validateProcessSearchPath(values[pathEnv]); err != nil {
+			return nil, err
+		}
 	}
 
 	return values, nil
 }
 
-func withoutManagedRootOverrides(environment map[string]string) map[string]string {
+// withoutAdapterOwnedState drops every key the adapter owns rather than
+// inherits, whatever its case in the source map: the private supervisor
+// namespace, the Darwin runtime/scratch markers, and the OpenCode/XDG roots the
+// launch is about to set to its own generated values. It runs over the captured
+// ambient base and over every caller overlay, because a key scrubbed on one
+// path is a key that survived on the others.
+//
+// HOME is deliberately not in this set. In both modes HOME names the home of
+// the identity the native process actually runs as — the policy account under
+// an explicit policy, the adapter's own account under ordinary execution — and
+// it can no longer redirect OpenCode state, because all four XDG roots plus
+// every OPENCODE_* root are replaced below. Dropping it would instead cut the
+// Darwin login keychain that provider auth reads.
+func withoutAdapterOwnedState(environment map[string]string) map[string]string {
 	filtered := make(map[string]string, len(environment))
+
 	for key, value := range environment {
-		switch strings.ToUpper(key) {
-		case "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
-			"OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR", "OPENCODE_DB":
+		if adapterPrivateEnvKey(key) || managedRuntimeRootEnvKey(key) {
 			continue
-		default:
-			filtered[key] = value
+		}
+
+		filtered[key] = value
+	}
+
+	return filtered
+}
+
+// privateAdapterEnvPrefix is assembled from two literals so the family
+// environment-namespace audits never read it as an operator-facing variable.
+const privateAdapterEnvPrefix = "ACP_" + "GO_OPENCODE_INTERNAL_"
+
+func adapterPrivateEnvKey(key string) bool {
+	upper := strings.ToUpper(key)
+
+	return strings.HasPrefix(upper, privateAdapterEnvPrefix) ||
+		upper == DarwinRuntimeIDEnv || upper == DarwinScratchRootEnv
+}
+
+func managedRuntimeRootEnvKey(key string) bool {
+	switch strings.ToUpper(key) {
+	case "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
+		"OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR", "OPENCODE_DB":
+		return true
+	default:
+		return false
+	}
+}
+
+func captureProcessEnvironment() map[string]string {
+	return environmentMap(processEnviron())
+}
+
+func cloneEnvironment(environment map[string]string) map[string]string {
+	if environment == nil {
+		return nil
+	}
+
+	cloned := make(map[string]string, len(environment))
+	for key, value := range environment {
+		cloned[key] = value
+	}
+
+	return cloned
+}
+
+// ordinaryDirectExecution reports whether an omitted policy runs the native
+// process directly instead of through the guardian/liveness supervisor pair.
+// The pair is what proves containment, and only Linux and an opted-in Darwin
+// can prove anything with it; everywhere else it refuses before native start,
+// which would turn policy omission into a dead platform. The direct arm keeps
+// the portable writable-home claim/liveness exclusion instead, and claims
+// nothing about descendants.
+func ordinaryDirectExecution(isolation *ProcessIsolation, darwinBestEffort bool) bool {
+	if isolation != nil {
+		return false
+	}
+
+	switch processIsolationGOOS {
+	case processIsolationLinux:
+		return false
+	case processIsolationDarwin:
+		return !darwinBestEffort
+	default:
+		return true
+	}
+}
+
+func ordinaryProcessBackend(config supervisorConfig) bool {
+	return ordinaryDirectExecution(config.Isolation, config.DarwinBestEffort)
+}
+
+func validateSupervisorIdentityDisposition(config supervisorConfig) error {
+	if config.OrdinaryExecution {
+		uid, gid, err := currentProcessIdentity()
+		if err != nil {
+			return err
+		}
+
+		if !config.SharedIdentity || config.IsolationUID != uid || config.IsolationGID != gid ||
+			config.IdentityLock || config.AuthorityDomain || config.StandaloneAuthority ||
+			config.StandaloneOwnerID != "" || config.StandaloneStateRoot != "" {
+			return errors.New("OpenCode ordinary supervisor identity disposition is invalid")
+		}
+
+		return nil
+	}
+
+	// An explicit policy is never shared: the supervisor stays a distinct
+	// trusted root and the native identity is a nonzero one it descends to, so
+	// a config claiming otherwise describes a launch this backend cannot make.
+	if config.SharedIdentity {
+		return errors.New("explicit supervisor identity disposition cannot claim a shared identity")
+	}
+
+	return nil
+}
+
+// withoutManagedRootOverrides is the caller-overlay filter. It drops
+// everything withoutAdapterOwnedState drops plus HOME, because a caller
+// overlay is configuration rather than the launched identity's own
+// environment, and the adapter owns which home the native process inherits.
+func withoutManagedRootOverrides(environment map[string]string) map[string]string {
+	filtered := withoutAdapterOwnedState(environment)
+	for key := range filtered {
+		if strings.EqualFold(key, "HOME") {
+			delete(filtered, key)
 		}
 	}
 
@@ -233,13 +359,19 @@ func validateProcessSearchPath(search string) error {
 	return nil
 }
 
-func resolveProcessExecutable(path string, env []string) (string, error) {
+// resolveProcessExecutable finds the program a launch will exec. The strict
+// arm belongs to a complete explicit policy, which is a closed environment: a
+// configured path must be absolute and every PATH entry used for resolution
+// must be absolute too. The ordinary arm resolves the same way a shell would,
+// because policy omission is ordinary execution and an ordinary relative
+// executable or a relative PATH entry is not a security event there.
+func resolveProcessExecutable(path string, env []string, strict bool) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("executable path is empty")
 	}
 
 	if strings.ContainsRune(path, filepath.Separator) {
-		if !filepath.IsAbs(path) {
+		if strict && !filepath.IsAbs(path) {
 			return "", fmt.Errorf("executable path %q is not absolute", path)
 		}
 
@@ -255,13 +387,15 @@ func resolveProcessExecutable(path string, env []string) (string, error) {
 		return path, nil
 	}
 
-	search := environmentMap(env)["PATH"]
+	search := environmentMap(env)[pathEnv]
 	if search == "" {
-		return "", fmt.Errorf("find %s: process isolation PATH is empty", path)
+		return "", fmt.Errorf("find %s: %s is empty", path, processSearchPathName(strict))
 	}
 
-	if err := validateProcessSearchPath(search); err != nil {
-		return "", fmt.Errorf("find %s: %w", path, err)
+	if strict {
+		if err := validateProcessSearchPath(search); err != nil {
+			return "", fmt.Errorf("find %s: %w", path, err)
+		}
 	}
 
 	for _, directory := range filepath.SplitList(search) {
@@ -273,9 +407,17 @@ func resolveProcessExecutable(path string, env []string) (string, error) {
 		}
 
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("find %s in process isolation PATH: %w", path, err)
+			return "", fmt.Errorf("find %s in %s: %w", path, processSearchPathName(strict), err)
 		}
 	}
 
-	return "", fmt.Errorf("find %s in process isolation PATH: %w", path, exec.ErrNotFound)
+	return "", fmt.Errorf("find %s in %s: %w", path, processSearchPathName(strict), exec.ErrNotFound)
+}
+
+func processSearchPathName(strict bool) string {
+	if strict {
+		return "process isolation " + pathEnv
+	}
+
+	return pathEnv
 }

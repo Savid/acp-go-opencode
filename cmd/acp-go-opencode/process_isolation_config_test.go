@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
+
+	opencodeacp "github.com/savid/acp-go-opencode"
 )
 
 const testProcessIsolationConfigPath = "/test/process-isolation.json"
@@ -72,17 +76,43 @@ func TestDuplicateKeyScannerReportsTruncatedObjectKey(t *testing.T) {
 	}
 }
 
-func TestRunRequiresProcessIsolationConfig(t *testing.T) {
+func TestRunWithoutProcessIsolationConfigUsesOrdinaryMode(t *testing.T) {
+	restore := replaceGlobals(t)
+	defer restore()
+
+	originalLoader := processIsolationConfigLoader
+	processIsolationConfigLoader = func(string) (processIsolationConfig, error) {
+		return processIsolationConfig{}, errors.New("loader must not be called")
+	}
+	t.Cleanup(func() { processIsolationConfigLoader = originalLoader })
+
+	var configured opencodeacp.Options
+	serve = func(_ context.Context, _ io.Reader, _ io.Writer, options ...opencodeacp.Option) error {
+		for _, option := range options {
+			option(&configured)
+		}
+
+		return nil
+	}
+
 	var stderr strings.Builder
-	if code := run(t.Context(), nil, strings.NewReader(""), &strings.Builder{}, &stderr); code != 2 {
+	if code := run(t.Context(), nil, strings.NewReader(""), &strings.Builder{}, &stderr); code != 0 {
 		t.Fatalf("run code = %d, stderr = %q", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "-"+processIsolationConfigFlag+" is required") {
-		t.Fatalf("stderr = %q", stderr.String())
+	if configured.ProcessIsolation != nil || configured.Home != "" {
+		t.Fatalf("ordinary options = %#v", configured)
 	}
 }
 
-func TestRunReportsProcessIsolationConfigFailure(t *testing.T) {
+func TestRunWithExplicitProcessIsolationConfigIsFailClosed(t *testing.T) {
+	restore := replaceGlobals(t)
+	defer restore()
+	serve = func(context.Context, io.Reader, io.Writer, ...opencodeacp.Option) error {
+		t.Fatal("Serve called after explicit process-isolation validation failed")
+
+		return nil
+	}
+
 	original := processIsolationConfigLoader
 	processIsolationConfigLoader = func(string) (processIsolationConfig, error) {
 		return processIsolationConfig{}, errors.New("policy unavailable")

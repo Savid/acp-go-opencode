@@ -32,6 +32,56 @@ type panickingRuntimeShutdownClient struct {
 	*fakeOpenCodeClient
 }
 
+// TestAgentSessionDefaultsToOrdinaryExecution proves an Agent built with no
+// process options at all reaches a real session and a native launch as the
+// current identity. Nothing is manufactured on the way: the runtime is handed a
+// nil policy, the ambient snapshot taken at construction rather than whatever
+// os.Environ drifted to since, and the adapter-private carriers already
+// scrubbed. The Agent reports the non-authoritative shared identity and
+// publishes no provider-descendant inventory. The executed root and non-root
+// halves of this launch live beside the supervisor, in
+// TestProcessIsolationOmissionAllowsRoot and its ordinary-user peer.
+func TestAgentSessionDefaultsToOrdinaryExecution(t *testing.T) {
+	const (
+		canary        = "ACP_GO_OPENCODE_IMPLICIT_ENV_TEST"
+		privateCanary = "ACP_GO_OPENCODE_INTERNAL_SPOOF"
+	)
+
+	t.Setenv(canary, "captured")
+	t.Setenv(privateCanary, "leaked")
+
+	var launched opencode.StartOptions
+
+	client := newFakeOpenCodeClient()
+	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
+		return testNativeSession("ordinary-native-session"), nil
+	}
+
+	snapshots := 0
+	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
+		ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) { snapshots++ },
+	}))
+	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		launched = options
+
+		return client, nil
+	}
+	t.Cleanup(func() { require.NoError(t, agent.Close()) })
+	t.Setenv(canary, "mutated")
+
+	require.Equal(t, RuntimeContainmentSharedIdentity, agent.ContainmentMode())
+
+	_, err := agent.NewSession(t.Context(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	require.NoError(t, err)
+	require.Nil(t, launched.ProcessIsolation, "omission must never manufacture a policy")
+	require.Equal(t, "captured", launched.ImplicitEnvironment[canary])
+	require.NotContains(t, launched.ImplicitEnvironment, privateCanary)
+	require.Equal(t, 0, snapshots, "ordinary execution publishes no provider-descendant inventory")
+
+	launched.ImplicitEnvironment[canary] = "caller mutation"
+	require.Equal(t, "captured", agent.options.implicitEnvironment[canary])
+}
+
 func (*panickingRuntimeExitClient) RuntimeExited() <-chan struct{} {
 	panic("runtime exit channel panic")
 }
@@ -382,7 +432,8 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	require.Nil(t, scratchRelease)
 	require.Equal(t, RuntimeProcessHomeLockSupervisor, observedProcess)
 	require.EqualValues(t, 2, observedDelta)
-	require.Equal(t, 3, observedSnapshot)
+	require.Equal(t, 0, observedSnapshot,
+		"ordinary execution reports its own supervisors and never a provider-descendant inventory")
 	require.Equal(t, RuntimeResourceRuntime, observedLifecycle)
 	require.Equal(t, RuntimeStartupReadiness, observedStage)
 	nativeRelease()

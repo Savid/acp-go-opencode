@@ -38,12 +38,11 @@ const (
 	RuntimeContainmentAuthoritative RuntimeContainmentMode = "authoritative"
 	// RuntimeContainmentBestEffort identifies explicitly accepted Darwin process-group containment.
 	RuntimeContainmentBestEffort RuntimeContainmentMode = "best_effort"
-	// RuntimeContainmentSharedIdentity is the boundary a supervisor proves when
-	// the native identity is the identity it already runs as. The subreaper
-	// tree, the descendant reaping and the process-group teardown are the
-	// authoritative ones, so whole-tree lifecycle is still proven; what is
-	// absent is the credential separation between the supervisor and the agent,
-	// and the host-global record of who holds the identity.
+	// RuntimeContainmentSharedIdentity is the ordinary default: native work runs
+	// as the adapter's own current identity, root or not. It is a posture rather
+	// than an achievement. No provider-descendant inventory is published, no
+	// whole-tree quiescence is claimed, and no credential separation exists
+	// between the adapter and the native process.
 	RuntimeContainmentSharedIdentity RuntimeContainmentMode = "shared_identity"
 	// RuntimeContainmentUnavailable identifies a platform with no selected boundary.
 	RuntimeContainmentUnavailable RuntimeContainmentMode = "unavailable"
@@ -73,8 +72,8 @@ type RuntimeResourceHooks struct {
 // Option configures the OpenCode ACP agent.
 type Option func(*Options)
 
-// ProcessIsolation defines the complete operating-system identity and base
-// environment inherited by every native OpenCode process.
+// ProcessIsolation defines an explicit operating-system identity and complete
+// base environment for every native OpenCode process.
 type ProcessIdentityLockCapability interface {
 	Duplicate() (*os.File, error)
 }
@@ -125,7 +124,9 @@ type Options struct {
 	ProviderAuthDirectHome string
 	DefaultModel           string
 	Env                    map[string]string
-	ProcessIsolation       *ProcessIsolation
+	// ProcessIsolation is an optional hardening boundary for native launches.
+	// Nil runs OpenCode as the adapter's current identity.
+	ProcessIsolation *ProcessIsolation
 
 	Logger            *slog.Logger
 	TracerProvider    trace.TracerProvider
@@ -146,7 +147,8 @@ type Options struct {
 	RuntimeResourceHooks        RuntimeResourceHooks
 	DarwinBestEffortContainment bool
 
-	clientFactory func(context.Context, opencode.StartOptions) (opencode.Client, error)
+	clientFactory       func(context.Context, opencode.StartOptions) (opencode.Client, error)
+	implicitEnvironment map[string]string
 }
 
 func applyOptions(opts []Option) Options {
@@ -158,6 +160,7 @@ func applyOptions(opts []Option) Options {
 		HealthCheckTimeout:      opencode.HealthCheckTimeout,
 		ImageLimits:             defaultImageLimits(),
 		clientFactory:           opencode.StartServer,
+		implicitEnvironment:     captureAmbientEnvironment(),
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -196,9 +199,20 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
-// WithProcessIsolation requires every native process to run as the supplied
-// uid/gid with no supplementary groups. BaseEnvironment is the complete native
-// environment base; the adapter never overlays os.Environ.
+// WithProcessIsolation explicitly selects the hardened Linux identity
+// boundary for every native process: the supplied nonzero uid/gid, no
+// supplementary groups, and BaseEnvironment as the complete native environment
+// base rather than an overlay on the adapter's ambient environment.
+//
+// The option is strict and fail-closed. It is honored only on Linux, only from
+// a distinct trusted root supervisor, and only with either a complete borrowed
+// capability pair or a complete standalone owner binding. An invalid,
+// unavailable, or incomplete policy refuses the launch; it never falls back to
+// ordinary same-identity execution and never combines with Darwin best effort.
+//
+// Omitting the option is the ordinary default and is not a configuration
+// error: native work then runs as the adapter's current identity, root or not,
+// with no privileged setup, and reports RuntimeContainmentSharedIdentity.
 func WithProcessIsolation(isolation ProcessIsolation) Option {
 	return func(options *Options) {
 		cloned := isolation

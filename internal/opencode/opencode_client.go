@@ -25,6 +25,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/savid/acp-go-opencode/internal/homelock"
 )
 
 const (
@@ -188,9 +190,10 @@ type StartOptions struct {
 	// BrowserShim shadows every browser launcher on the child's PATH for the
 	// lifetime of a login leg. The caller owns the directory; leaving it nil
 	// leaves the child free to open the operator's desktop browser.
-	BrowserShim      *BrowserShim
-	Env              map[string]string
-	ProcessIsolation *ProcessIsolation
+	BrowserShim         *BrowserShim
+	Env                 map[string]string
+	ImplicitEnvironment map[string]string
+	ProcessIsolation    *ProcessIsolation
 	// ExtraPathDirs are absolute directories placed ahead of the inherited
 	// PATH, in order. Env cannot carry a search path: its entries replace whole
 	// values, so a PATH there would drop everything the child resolves against.
@@ -416,6 +419,7 @@ type openCodeServer struct {
 	scopeClosed                  bool
 	supervisorControl            io.WriteCloser
 	supervisor                   *supervisorProof
+	ordinaryHomeLock             *homelock.Lock
 	processObservation           *runtimeProcessObservation
 	waitDone                     chan error
 	containmentGenerationCleanup func() error
@@ -835,6 +839,7 @@ var (
 	openCodeStartProcess                       = startOpenCodeProcess
 	openCodeApplyCredential                    = applyProcessCredential
 	openCodeSupervisorCommand                  = supervisorCommand
+	openCodeAcquireHomeLock                    = homelock.Acquire
 	openCodeHTTPClient                         = func() *http.Client { return &http.Client{Timeout: 30 * time.Second} }
 	openCodeListen                             = net.Listen
 	openCodeRandReader               io.Reader = rand.Reader
@@ -857,6 +862,11 @@ var (
 const HealthCheckTimeout = 60 * time.Second
 
 func normalizedStartOptions(options StartOptions) StartOptions {
+	options.ImplicitEnvironment = cloneEnvironment(options.ImplicitEnvironment)
+	if options.ProcessIsolation == nil && options.ImplicitEnvironment == nil {
+		options.ImplicitEnvironment = captureProcessEnvironment()
+	}
+
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
@@ -939,6 +949,21 @@ func runtimeConfigContent(seedFiles map[string]string) (string, map[string][]byt
 func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) { //nolint:gocyclo // Startup owns the ordered resource-transfer rollback sequence.
 	options = normalizedStartOptions(options)
 
+	// An explicit policy is checked before the launch touches anything. A
+	// policy this platform or this shape cannot honor refuses here, with no
+	// runtime root created, no ownership handed off, and no second attempt
+	// under ordinary execution.
+	if err := validateProcessIsolation(options.ProcessIsolation); err != nil {
+		return nil, err
+	}
+
+	// A hardened identity policy cannot be downgraded to a process-group
+	// boundary, so the combination is invalid rather than one of the two
+	// silently winning.
+	if options.ProcessIsolation != nil && options.DarwinBestEffort {
+		return nil, errors.New("explicit process isolation cannot be combined with darwin best-effort containment")
+	}
+
 	xdg, err := resolveRuntimeXDG(options)
 	if err != nil {
 		return nil, err
@@ -1013,7 +1038,11 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		args = append(args, "--log-level", options.LogLevel)
 	}
 
-	env, err := buildProcessEnvironment(options.ProcessIsolation, withoutManagedRootOverrides(options.Env))
+	env, err := buildProcessEnvironmentFrom(
+		options.ProcessIsolation,
+		options.ImplicitEnvironment,
+		withoutManagedRootOverrides(options.Env),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1043,7 +1072,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		executable = opencodeExecutableName
 	}
 
-	executable, err = resolveProcessExecutable(executable, nativeEnv)
+	executable, err = resolveProcessExecutable(executable, nativeEnv, options.ProcessIsolation != nil)
 	if err != nil {
 		return nil, fmt.Errorf("find OpenCode executable: %w", err)
 	}
@@ -1071,6 +1100,27 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	var cmd *exec.Cmd
 
 	var supervisor *supervisorProof
+
+	// An ordinary launch that cannot reach the guardian/liveness pair keeps the
+	// portable writable-home exclusion here instead. The shared XDG root is
+	// still single-writer across processes; what this arm does not carry is any
+	// descendant inventory or whole-tree claim.
+	var ordinaryHomeLock *homelock.Lock
+
+	if !options.skipSupervisor && ordinaryDirectExecution(options.ProcessIsolation, options.DarwinBestEffort) {
+		ordinaryHomeLock, err = openCodeAcquireHomeLock(controlRoot)
+		if err != nil {
+			cancel()
+
+			return nil, err
+		}
+
+		defer func() {
+			if resultErr != nil {
+				resultErr = errors.Join(resultErr, ordinaryHomeLock.Release())
+			}
+		}()
+	}
 
 	if options.skipSupervisor {
 		cmd = openCodeCommandContext(processCtx, executable, args...)
@@ -1233,6 +1283,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		runtimeExited:                runtimeExited,
 		supervisorControl:            supervisorControl,
 		supervisor:                   supervisor,
+		ordinaryHomeLock:             ordinaryHomeLock,
 		processObservation:           processObservation,
 		waitDone:                     waitDone,
 		containmentGenerationCleanup: releaseContainmentGeneration,
@@ -1452,6 +1503,8 @@ func (s *openCodeServer) shutdownRuntime() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	err = errors.Join(err, s.ordinaryHomeLock.Release())
 
 	if s.containmentGenerationCleanup != nil && !errors.Is(err, ErrProcessContainmentIncomplete) {
 		err = errors.Join(err, s.containmentGenerationCleanup())

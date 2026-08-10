@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -229,21 +230,67 @@ func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
 	require.Equal(t, map[string]string{"key": "value"}, cloneAny(map[string]string{"key": "value"}))
 }
 
-func TestOpenCodeProcessIsolationClonesStandaloneBinding(t *testing.T) {
-	base := map[string]string{"CANARY": "base"}
-	policy := &ProcessIsolation{
-		UID: 12, GID: 34, BaseEnvironment: base,
+// TestExplicitProcessIsolationPreservesPolicy proves a supplied policy reaches
+// the runtime exactly as written — no field dropped, no shared base map a later
+// caller could mutate — and that a policy this platform cannot honor refuses
+// the session instead of starting a runtime without it. The second half is the
+// no-fallback rule: the launch seam is failed if it is ever reached.
+func TestExplicitProcessIsolationPreservesPolicy(t *testing.T) {
+	base := map[string]string{"CANARY": "base", "PATH": "/usr/bin:/bin"}
+	policy := ProcessIsolation{
+		UID: 65534, GID: 65534, BaseEnvironment: base,
 		StandaloneOwnerID: "deployment-1", StandaloneStateRoot: "/var/lib/opencode",
 	}
 
-	converted := openCodeProcessIsolation(policy)
+	converted := openCodeProcessIsolation(&policy)
 	base["CANARY"] = "mutated"
 
-	if converted.UID != 12 || converted.GID != 34 || converted.BaseEnvironment["CANARY"] != "base" ||
-		converted.StandaloneOwnerID != "deployment-1" || converted.StandaloneStateRoot != "/var/lib/opencode" {
-		t.Fatalf("converted isolation = %#v", converted)
+	require.NotNil(t, converted)
+	require.Equal(t, uint32(65534), converted.UID)
+	require.Equal(t, uint32(65534), converted.GID)
+	require.Equal(t, "base", converted.BaseEnvironment["CANARY"])
+	require.Equal(t, "deployment-1", converted.StandaloneOwnerID)
+	require.Equal(t, "/var/lib/opencode", converted.StandaloneStateRoot)
+	require.Nil(t, openCodeProcessIsolation(nil), "nil isolation did not remain nil")
+
+	originalGOOS := runtimeGOOS
+	t.Cleanup(func() { runtimeGOOS = originalGOOS })
+
+	// The honored half needs the real platform, not a faked one: adapter-owned
+	// native state is handed to the configured identity through a build-tagged
+	// ownership boundary that a GOOS variable cannot move.
+	if runtime.GOOS == platformLinux {
+		requireExplicitPolicyReachesTheRuntime(t, policy)
 	}
-	if openCodeProcessIsolation(nil) != nil {
-		t.Fatal("nil isolation did not remain nil")
+
+	runtimeGOOS = platformDarwin
+
+	refused := NewAgent(WithHome("/var/lib/opencode"), WithProcessIsolation(policy), WithScratchDir(t.TempDir()))
+	refused.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+		t.Fatal("an unavailable explicit policy must never start a runtime without it")
+
+		return nil, errors.New("unreachable")
 	}
+	_, err := refused.NewSession(t.Context(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	require.ErrorContains(t, err, "explicit process isolation is supported only on linux")
+}
+
+func requireExplicitPolicyReachesTheRuntime(t *testing.T, policy ProcessIsolation) {
+	t.Helper()
+
+	runtimeGOOS = platformLinux
+
+	var launched *opencode.ProcessIsolation
+
+	honored := NewAgent(WithHome("/var/lib/opencode"), WithProcessIsolation(policy), WithScratchDir(t.TempDir()))
+	honored.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		launched = options.ProcessIsolation
+
+		return nil, errors.New("native launch refused by the fixture")
+	}
+	_, err := honored.NewSession(t.Context(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	require.ErrorContains(t, err, "native launch refused by the fixture")
+	require.NotNil(t, launched, "an honored policy must reach the runtime")
+	require.Equal(t, uint32(65534), launched.UID)
+	require.Equal(t, "deployment-1", launched.StandaloneOwnerID)
 }

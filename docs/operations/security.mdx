@@ -9,8 +9,19 @@ streams. This page is the operator's view of those boundaries.
 
 ## Standalone command boundary
 
-The standalone command launches native work only on Linux and requires the
-root-owned mode-`0600` `-process-isolation-config` policy. Resolution walks
+Omitting `-process-isolation-config` launches native work as the command's own
+current root or non-root identity on every supported platform. Linux and an
+opted-in Darwin still use the guardian/liveness supervisor pair, but take no UID
+lock, authority domain, standalone disposition, trusted-root check, or
+credential change, and keep their proofs in the adapter-owned scratch root
+rather than the root-owned `/run` namespace. Every other platform runs the
+native process directly and holds the portable writable-home claim and liveness
+in the adapter itself, so the shared XDG root stays single-writer across
+processes. Neither arm claims an authoritative boundary or publishes a
+provider-descendant inventory.
+
+Supplying the flag selects the explicit Linux hardening contract and requires a
+root-owned mode-`0600` policy. Resolution walks
 from an open `/` descriptor with `openat` and `O_NOFOLLOW`; every ancestor
 must be root-owned and not writable by group or other, and the final single-link
 policy inode is read through the descriptor that was validated. The configured
@@ -18,12 +29,20 @@ account home is resolved the same way, must be a target-owned mode-`0700`
 directory beneath protected root-owned ancestry, and cannot be `/root` or
 `/nonexistent`.
 
-The adapter remains root, but its ambient environment is never copied wholesale
+Under explicit isolation the adapter remains root, but its ambient environment is never copied wholesale
 to the child. Only the complete literal `baseEnvironment` plus names in
-`inheritEnvironment` reach native work. The CLI refuses Darwin, Windows, and
-other platforms; Darwin best-effort containment remains an explicit
-embedded-Go option only. `-version` and Darwin containment diagnostics launch
-no native worker and are exempt.
+`inheritEnvironment` reach native work. The policy is Linux-only in the embedded
+Go API as well as in the command loader, requires a distinct trusted root
+supervisor and a nonzero native identity, and never combines with Darwin
+best-effort containment. An invalid, unavailable, or unsupported policy is
+rejected before any runtime root is created and is never retried using the
+ordinary backend.
+
+In both modes the environment handed to native work is scrubbed of every
+adapter-private carrier (the private supervisor namespace and the Darwin
+runtime/scratch markers, matched without regard to case) and of every
+adapter-managed OpenCode/XDG root, in the base and in every caller overlay
+alike, before the launch sets its own generated values.
 
 ## Trust boundaries
 
@@ -50,12 +69,10 @@ only trusted peer:
   the native process group with `setsid` or `setpgid`. It accepts only the
   kernel's non-reaping `waitid(P_ALL, WNOWAIT)` `ECHILD` result as the final
   empty-tree proof; quiet `/proc` snapshots cannot close a fork/reparent race.
-  The embedding host is never made a subreaper. Windows fails closed before
-  native startup because its process API cannot apply the mandatory Unix
-  UID/GID identity boundary with empty supplementary groups. Cross-compiling
-  that refusal path proves only that it builds, not runtime support. Other
-  platforms without a selected containment backend also fail closed before
-  native startup by default.
+  The embedding host is never made a subreaper. Platforms with no proof-capable
+  containment backend still run ordinary current-identity execution; they report
+  `shared_identity` and claim no containment. Cross-compiling proves only that
+  those paths build, not runtime support.
 - The Linux guardian and liveness supervisors stay root and run from `/` with a
   closed private environment. Private launch configuration carries the target
   identity and native environment; only `opencode serve` receives the configured
@@ -68,23 +85,26 @@ only trusted peer:
   completion and the managed-root permit wait for that proof. The native tree
   inherits no launch, control, proof, guardian, or lock descriptor, so it cannot
   forge completion or overlap another provider tree using the same host identity.
-- When the configured Linux identity is the identity the adapter already runs
-  as, there is no privilege boundary to descend and the supervisor says so:
+- When isolation is omitted there is no privilege boundary to descend and the
+  supervisor says so:
   `ContainmentMode` reports `shared_identity`, the launch requests no credential
   change, no host-global UID lock or durable identity record is claimed, and the
   containment proofs live in the adapter-owned mode-`0700` scratch root instead
-  of the root-owned proof namespace. Everything the lifecycle boundary rests on
-  is unchanged — both subreapers, no-new-privs, core-dump suppression,
-  descendant adoption and reaping to kernel `ECHILD`, the process-group
-  teardown, the sealed launch configuration, and the readiness handshake — so
-  the tree is still contained. What is absent is separation: concurrent sessions
-  share one identity and can read each other's home, XDG roots, credentials, and
-  journals; nothing excludes a second runner or a hand-run CLI under the same
-  account; a crashed session leaves no durable record to recover from; and the
-  agent is not credential-fenced from the supervisor. Run the adapter as root
-  for that separation. The decision is derived from the identity independently
-  by every process in the tree and is refused whenever the launch configuration
-  and the running identity disagree.
+  of the root-owned proof namespace. Where the platform has a proof-capable
+  backend the lifecycle machinery still runs — both subreapers, no-new-privs,
+  core-dump suppression, descendant adoption and reaping, the process-group
+  teardown, the sealed launch configuration, and the readiness handshake — but
+  the mode makes no claim on that basis: `shared_identity` is a posture, not an
+  achievement, and no provider-descendant inventory or whole-tree quiescence is
+  published for it. What is absent is separation: concurrent sessions share one
+  identity and can read each other's home, XDG roots, credentials, and
+  journals; nothing beyond the portable writable-home claim excludes a hand-run
+  CLI under the same account; a crashed session leaves no durable identity
+  record to recover from; and the agent is not credential-fenced from the
+  supervisor. Select the explicit Linux policy from a trusted root supervisor
+  for that separation. The ordinary disposition is re-derived independently by
+  every process in the tree and is refused whenever the launch configuration and
+  the running identity disagree.
 - A dedicated guardian peer-liveness descriptor is fenced immediately before
   native start. Guardian death before readiness refuses native launch and lets
   liveness publish completion or quarantine only after kernel `ECHILD`.
@@ -219,7 +239,8 @@ skips owners and may wait for UID with cancellation. The permanent owner kind is
   local-filesystem allowlists; Windows admits fixed or RAM drives formatted as
   NTFS or ReFS. Network mounts, overlay filesystems, and unrecognized backends
   fail before native startup. Filesystem admission alone does not override the
-  selected containment requirement or make Windows native launch supported.
+  selected containment boundary or upgrade an ordinary launch into a contained
+  one.
 - Native session IDs, canonical directory scopes, and turn nonces bind every
   prompt, abort, permission, question, and event route.
 - Prompt images are read from a local path only when `WithInputHandoffRoot`

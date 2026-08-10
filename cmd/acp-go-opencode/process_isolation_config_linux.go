@@ -44,7 +44,7 @@ var (
 
 func loadProcessIsolationConfig(path string) (processIsolationConfig, error) {
 	if path == "" {
-		return processIsolationConfig{}, fmt.Errorf("-%s is required", processIsolationConfigFlag)
+		return processIsolationConfig{}, fmt.Errorf("-%s must be a nonempty absolute path when supplied", processIsolationConfigFlag)
 	}
 
 	if !filepath.IsAbs(path) {
@@ -56,7 +56,7 @@ func loadProcessIsolationConfig(path string) (processIsolationConfig, error) {
 	}
 
 	if processIsolationGeteuid() != 0 {
-		return processIsolationConfig{}, fmt.Errorf("standalone native mode requires a root supervisor")
+		return processIsolationConfig{}, fmt.Errorf("explicit process isolation requires a root supervisor")
 	}
 
 	fd, stat, err := openProtectedAbsolutePath(path, unix.O_RDONLY)

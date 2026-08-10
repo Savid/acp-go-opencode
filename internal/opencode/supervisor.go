@@ -66,6 +66,7 @@ type supervisorConfig struct {
 	AuthorityDomain     bool              `json:"authorityDomain"`
 	StandaloneAuthority bool              `json:"standaloneAuthority"`
 	SharedIdentity      bool              `json:"sharedIdentity"`
+	OrdinaryExecution   bool              `json:"ordinaryExecution"`
 	Isolation           *ProcessIsolation `json:"-"`
 }
 
@@ -216,18 +217,8 @@ func runSupervisor(mode string, configInput io.Reader) (runErr error) {
 		return errors.New("supervisor UID lock and authority domain are inconsistent")
 	}
 
-	// Every process in the tree derives the arm from its own identity, and a
-	// child that disagrees with the config it was handed refuses rather than
-	// following it: the stamp decides which steps run, so a stamp that does not
-	// describe the process running them can only be wrong.
-	if config.SharedIdentity != sharedNativeIdentity(config.IsolationUID) {
-		return errors.New("supervisor identity disposition does not match the identity it runs as")
-	}
-
-	if config.SharedIdentity &&
-		(config.IdentityLock || config.StandaloneAuthority ||
-			config.StandaloneOwnerID != "" || config.StandaloneStateRoot != "") {
-		return errors.New("shared supervisor identity disposition is invalid")
+	if err := validateSupervisorIdentityDisposition(config); err != nil {
+		return err
 	}
 
 	if mode == supervisorModeLiveness && config.IdentityLock {
@@ -270,7 +261,8 @@ func readSupervisorConfig(reader io.Reader) (supervisorConfig, error) {
 		return supervisorConfig{}, fmt.Errorf("decode private supervisor config: %w", err)
 	}
 
-	if config.NativePath == "" || config.Home == "" || config.Scratch == "" || config.IsolationUID == 0 || config.IsolationGID == 0 {
+	if config.NativePath == "" || config.Home == "" || config.Scratch == "" ||
+		(!config.OrdinaryExecution && (config.IsolationUID == 0 || config.IsolationGID == 0)) {
 		return supervisorConfig{}, errors.New("private supervisor config is incomplete")
 	}
 
@@ -332,30 +324,43 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 		return nil, nil, err
 	}
 
-	if err := validateProcessIsolation(config.Isolation); err != nil {
-		return nil, nil, err
+	if ordinaryProcessBackend(config) {
+		cmd := openCodeCommandContext(ctx, config.NativePath, config.NativeArgs...)
+		cmd.Env = append([]string(nil), config.NativeEnv...)
+		cmd.Dir = config.NativeDir
+
+		return cmd, nil, nil
 	}
 
-	if (config.Isolation.IdentityLock == nil) != (config.Isolation.AuthorityDomain == nil) {
-		return nil, nil, errors.New("OpenCode supervisor requires the UID lock and authority domain together")
-	}
+	if config.Isolation == nil {
+		uid, gid, err := currentProcessIdentity()
+		if err != nil {
+			return nil, nil, err
+		}
 
-	if err := supervisorVerifyTrustedIdentity(config.Isolation.UID); err != nil {
-		return nil, nil, err
-	}
+		config.IsolationUID = uid
+		config.IsolationGID = gid
+		config.SharedIdentity = true
+		config.OrdinaryExecution = true
+	} else {
+		if err := validateProcessIsolation(config.Isolation); err != nil {
+			return nil, nil, err
+		}
 
-	config.IsolationUID = config.Isolation.UID
-	config.IsolationGID = config.Isolation.GID
-	config.StandaloneOwnerID = config.Isolation.StandaloneOwnerID
-	config.StandaloneStateRoot = config.Isolation.StandaloneStateRoot
-	config.IdentityLock = config.Isolation.IdentityLock != nil
-	config.AuthorityDomain = config.Isolation.AuthorityDomain != nil
-	// The decision travels in the sealed config so the guardian and the liveness
-	// child inherit the one the parent made. Each of them re-derives it from its
-	// own identity and refuses a config that disagrees, so the stamp can direct
-	// the launch without being trusted on its own.
-	config.SharedIdentity = sharedProcessIdentity(config.Isolation)
-	config.StandaloneAuthority = config.Isolation.IdentityLock == nil && !config.SharedIdentity
+		// The capability pairing is already part of the policy validation above,
+		// so there is no second, weaker answer to it here.
+		if err := supervisorVerifyTrustedIdentity(config.Isolation.UID); err != nil {
+			return nil, nil, err
+		}
+
+		config.IsolationUID = config.Isolation.UID
+		config.IsolationGID = config.Isolation.GID
+		config.StandaloneOwnerID = config.Isolation.StandaloneOwnerID
+		config.StandaloneStateRoot = config.Isolation.StandaloneStateRoot
+		config.IdentityLock = config.Isolation.IdentityLock != nil
+		config.AuthorityDomain = config.Isolation.AuthorityDomain != nil
+		config.StandaloneAuthority = config.Isolation.IdentityLock == nil
+	}
 
 	if config.ScratchParent == "" && config.Scratch != "" {
 		config.ScratchParent = filepath.Dir(config.Scratch)
@@ -395,7 +400,7 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 
 	helperEnv := []string{supervisorModeEnv + "=" + supervisorModeGuardian}
 
-	executable, err = resolveProcessExecutable(executable, helperEnv)
+	executable, err = resolveProcessExecutable(executable, helperEnv, config.Isolation != nil)
 	if err != nil {
 		_ = configFile.Close()
 
@@ -411,7 +416,7 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 	cmd.ExtraFiles = []*os.File{configFile}
 	inherited := []*os.File{configFile}
 
-	if config.Isolation.IdentityLock != nil {
+	if config.Isolation != nil && config.Isolation.IdentityLock != nil {
 		identityLock, duplicateErr := config.Isolation.IdentityLock.Duplicate()
 		if duplicateErr != nil {
 			_ = configFile.Close()
@@ -633,7 +638,7 @@ func runGuardian(config supervisorConfig) (runErr error) { //nolint:gocyclo // G
 		return fmt.Errorf("resolve liveness supervisor executable: %w", err)
 	}
 
-	executable, err = resolveProcessExecutable(executable, config.NativeEnv)
+	executable, err = resolveProcessExecutable(executable, config.NativeEnv, !config.OrdinaryExecution)
 	if err != nil {
 		_ = livenessConfig.Close()
 
@@ -789,14 +794,10 @@ func acquireGuardianIdentityAuthority(
 	config supervisorConfig,
 	control io.Reader,
 ) (supervisorIdentityLock, supervisorIdentityLock, error) {
-	if config.IsolationUID == 0 {
-		return noopSupervisorIdentityLock{}, noopSupervisorIdentityLock{}, nil
-	}
-
-	// A shared identity carries no authority. The durable registry records who
-	// may enter an identity nobody is in, and the supervisor is already in this
-	// one, so there is nothing to claim, adopt, publish or release.
-	if config.SharedIdentity {
+	// Ordinary execution claims no agent identity. The durable registry records
+	// who may enter an identity nobody is in, and this launch enters the one it
+	// already holds, so there is nothing to claim, adopt, publish or release.
+	if config.OrdinaryExecution || config.IsolationUID == 0 {
 		return noopSupervisorIdentityLock{}, noopSupervisorIdentityLock{}, nil
 	}
 
@@ -818,7 +819,7 @@ func runLiveness(config supervisorConfig) error {
 	output := supervisorOutput
 	errorOutput := supervisorError
 
-	if config.IsolationUID != 0 {
+	if !config.OrdinaryExecution && config.IsolationUID != 0 {
 		if verifyErr := supervisorVerifyTrustedIdentity(config.IsolationUID); verifyErr != nil {
 			return verifyErr
 		}
@@ -854,7 +855,7 @@ func runLiveness(config supervisorConfig) error {
 	cmd.Env = config.NativeEnv
 	cmd.Dir = config.NativeDir
 
-	if config.IsolationUID != 0 || config.IsolationGID != 0 {
+	if !config.OrdinaryExecution && (config.IsolationUID != 0 || config.IsolationGID != 0) {
 		if credentialErr := applyProcessCredential(cmd, supervisedNativeIsolation(config)); credentialErr != nil {
 			return fmt.Errorf("apply supervised OpenCode native identity: %w", credentialErr)
 		}

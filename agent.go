@@ -122,7 +122,12 @@ func NewAgent(opts ...Option) *Agent {
 		options.RuntimeResourceHooks.ObserveContainment(context.Background(), mode)
 	}
 
-	if mode == RuntimeContainmentBestEffort {
+	// Only the authoritative backend can enumerate the provider descendants it
+	// contains. Ordinary same-identity execution and Darwin best effort both
+	// know the count they would report is not the count that exists, and a
+	// terminal zero from either would read as a quiescence proof neither one
+	// performed, so the snapshot hook is withheld for the Agent's whole life.
+	if mode != RuntimeContainmentAuthoritative {
 		options.RuntimeResourceHooks.ObserveProcessSnapshot = nil
 	}
 

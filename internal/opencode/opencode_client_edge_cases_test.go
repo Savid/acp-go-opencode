@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/savid/acp-go-opencode/internal/homelock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,18 +73,17 @@ func TestStartServerHappyPathWithoutPrivilegedProcessLaunch(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = shim.Remove() })
 	client, err := StartServer(context.Background(), StartOptions{
-		Root:             testGeneratedTempDir(t),
-		ExecutablePath:   "/usr/bin/true",
-		ProcessIsolation: testHandoffProcessIsolation(),
-		skipSupervisor:   true,
-		HandoffXDG:       true,
-		BrowserShim:      shim,
-		Pure:             true,
-		QuestionTool:     true,
-		LogLevel:         "DEBUG",
-		ExtraPathDirs:    []string{"/usr/bin"},
-		Logger:           slog.New(slog.DiscardHandler),
-		MinVersion:       "1.18.3",
+		Root:           testGeneratedTempDir(t),
+		ExecutablePath: "/usr/bin/true",
+		skipSupervisor: true,
+		HandoffXDG:     true,
+		BrowserShim:    shim,
+		Pure:           true,
+		QuestionTool:   true,
+		LogLevel:       "DEBUG",
+		ExtraPathDirs:  []string{"/usr/bin"},
+		Logger:         slog.New(slog.DiscardHandler),
+		MinVersion:     "1.18.3",
 	})
 	require.NoError(t, err)
 	server, ok := client.(*openCodeServer)
@@ -92,6 +92,91 @@ func TestStartServerHappyPathWithoutPrivilegedProcessLaunch(t *testing.T) {
 	require.NotNil(t, server.EventErrors())
 	require.Equal(t, server.xdg, server.XDGDirs())
 	require.NoError(t, server.Shutdown(context.Background()))
+}
+
+// TestOrdinaryDirectLaunchKeepsThePortableHomeLock covers the ordinary arm on
+// a platform whose guardian/liveness pair cannot prove containment. The launch
+// still runs — omission is not a dead platform — and it still holds the
+// portable writable-home claim and liveness, so a second runtime against the
+// same root is refused while this one lives and admitted after it closes. It
+// asks the kernel for no credential change, and the environment it builds
+// carries neither the adapter-private carriers nor an ambient OpenCode root.
+func TestOrdinaryDirectLaunchKeepsThePortableHomeLock(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+	preserveSupervisorGlobals(t)
+
+	originalGOOS := processIsolationGOOS
+	processIsolationGOOS = processIsolationDarwin
+	t.Cleanup(func() { processIsolationGOOS = originalGOOS })
+
+	t.Setenv(privateAdapterEnvPrefix+"SPOOF", "leaked")
+	t.Setenv(DarwinScratchRootEnv, "/leaked")
+	t.Setenv("OPENCODE_CONFIG_DIR", "/leaked/config")
+
+	var launched *exec.Cmd
+
+	openCodeListen = func(string, string) (net.Listener, error) { return fixedTCPListener{port: 32127}, nil }
+	openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		launched = exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 30")
+
+		return launched
+	}
+	openCodeStartProcess = startOpenCodeProcess
+	supervisorReleaseIndependentWaiter = func(cmd *exec.Cmd, waiter *supervisorWaiter) (int, error) {
+		waiter.start()
+
+		return cmd.Process.Pid, nil
+	}
+	openCodeHTTPClient = func() *http.Client {
+		return &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			switch request.URL.Path {
+			case routeGlobalHealth:
+				return performanceJSONResponse(map[string]any{"healthy": true, "version": "1.18.3"}), nil
+			case routeDoc:
+				return performanceJSONResponse(fullOpenCodeDoc()), nil
+			case routeEvent:
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"server.connected\",\"properties\":{}}\n\n")),
+				}, nil
+			default:
+				return &http.Response{StatusCode: http.StatusNoContent, Status: "204 No Content", Header: make(http.Header), Body: http.NoBody}, nil
+			}
+		})}
+	}
+
+	root := testGeneratedTempDir(t)
+	client, err := StartServer(context.Background(), StartOptions{
+		Root:           root,
+		ExecutablePath: "/usr/bin/true",
+		Logger:         slog.New(slog.DiscardHandler),
+		MinVersion:     "1.18.3",
+	})
+	require.NoError(t, err)
+
+	server, ok := client.(*openCodeServer)
+	require.True(t, ok)
+	require.Nil(t, server.supervisor, "the direct arm publishes no containment proof")
+	require.NotNil(t, server.ordinaryHomeLock, "the direct arm still holds the portable home lock")
+	requireNoProcessCredential(t, launched)
+
+	environment := environmentMap(launched.Env)
+	require.NotContains(t, environment, privateAdapterEnvPrefix+"SPOOF")
+	require.NotContains(t, environment, DarwinScratchRootEnv)
+	require.Equal(t, server.xdg.Config, environment["XDG_CONFIG_HOME"])
+	require.NotContains(t, environment, "OPENCODE_CONFIG_DIR")
+
+	controlRoot := ControlRootForXDG(server.xdg.Root)
+	_, err = homelock.Acquire(controlRoot)
+	require.Error(t, err, "a second runtime must not claim a live writable home")
+
+	require.NoError(t, server.Shutdown(context.Background()))
+
+	reacquired, err := homelock.Acquire(controlRoot)
+	require.NoError(t, err, "the writable home must be claimable once the runtime closes")
+	require.NoError(t, reacquired.Release())
 }
 
 func TestStartServerEarlyContainmentAndCredentialFailures(t *testing.T) {
@@ -386,7 +471,6 @@ func TestStartServerDarwinContainmentFailures(t *testing.T) {
 			DarwinBestEffort:          true,
 			ContainmentScratchParent:  parentFile,
 			ReserveContainmentScratch: testContainmentScratchReservation,
-			ProcessIsolation:          testProcessIsolation(),
 		})
 		require.ErrorContains(t, err, "scratch parent")
 	})
@@ -396,6 +480,12 @@ func TestStartServerDarwinContainmentFailures(t *testing.T) {
 		parent := t.TempDir()
 		removeErr := errors.New("remove failed")
 		openCodeRemoveAll = func(string) error { return removeErr }
+		// Ordinary execution asks for no credential, so the fixture binary would
+		// otherwise start; the spawn seam supplies the failure this case is
+		// about without waiting on readiness.
+		openCodeStartProcess = func(*exec.Cmd) (*supervisorWaiter, error) {
+			return nil, errors.New("native spawn refused")
+		}
 		_, err := StartServer(context.Background(), StartOptions{
 			ExistingXDG:               testXDGDirs(t),
 			ExecutablePath:            "/usr/bin/false",
@@ -403,7 +493,6 @@ func TestStartServerDarwinContainmentFailures(t *testing.T) {
 			DarwinBestEffort:          true,
 			ContainmentScratchParent:  parent,
 			ReserveContainmentScratch: testContainmentScratchReservation,
-			ProcessIsolation:          testProcessIsolation(),
 		})
 		require.ErrorIs(t, err, removeErr)
 		require.ErrorIs(t, err, ErrRuntimeScratchCleanup)
@@ -795,4 +884,114 @@ func TestSendMessagePollContextCancellation(t *testing.T) {
 	defer cancel()
 	_, err := client.SendMessage(ctx, "s", MessageRequest{})
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// TestStartServerRefusesAnExplicitPolicyBeforeAnySideEffect proves the launch
+// checks a supplied policy before it creates a runtime root, hands any tree to
+// another identity, or resolves an executable — and never continues under
+// ordinary execution once it has refused.
+func TestStartServerRefusesAnExplicitPolicyBeforeAnySideEffect(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+
+	original := processIsolationGOOS
+	processIsolationGOOS = processIsolationDarwin
+	t.Cleanup(func() { processIsolationGOOS = original })
+
+	openCodeCommandContext = func(context.Context, string, ...string) *exec.Cmd {
+		t.Fatal("a refused explicit policy must not build a native command")
+
+		return nil
+	}
+
+	root := filepath.Join(t.TempDir(), "runtime")
+	_, err := StartServer(context.Background(), StartOptions{
+		Root:             root,
+		ExecutablePath:   "/usr/bin/true",
+		ProcessIsolation: testProcessIsolation(),
+		Logger:           slog.New(slog.DiscardHandler),
+	})
+	require.EqualError(t, err, errExplicitProcessIsolationPlatform)
+	require.NoDirExists(t, root)
+
+	processIsolationGOOS = processIsolationLinux
+	_, err = StartServer(context.Background(), StartOptions{
+		Root:             root,
+		ExecutablePath:   "/usr/bin/true",
+		ProcessIsolation: testProcessIsolation(),
+		DarwinBestEffort: true,
+		Logger:           slog.New(slog.DiscardHandler),
+	})
+	require.EqualError(t, err, "explicit process isolation cannot be combined with darwin best-effort containment")
+	require.NoDirExists(t, root)
+}
+
+// TestStartServerOrdinaryHomeLockFailures covers the two ends of the portable
+// writable-home exclusion the direct arm holds: a claim that cannot be taken
+// refuses the launch, and a launch that fails after taking it hands the claim
+// back rather than stranding the shared root.
+func TestStartServerOrdinaryHomeLockFailures(t *testing.T) {
+	base := func(t *testing.T) StartOptions {
+		t.Helper()
+		restoreOpenCodeClientSeams(t)
+		preserveSupervisorGlobals(t)
+
+		original := processIsolationGOOS
+		processIsolationGOOS = processIsolationDarwin
+		t.Cleanup(func() { processIsolationGOOS = original })
+
+		openCodeListen = func(string, string) (net.Listener, error) { return fixedTCPListener{port: 32129}, nil }
+
+		return StartOptions{
+			Root:           testGeneratedTempDir(t),
+			ExecutablePath: "/usr/bin/true",
+			Logger:         slog.New(slog.DiscardHandler),
+		}
+	}
+
+	t.Run("claim refused", func(t *testing.T) {
+		options := base(t)
+		openCodeAcquireHomeLock = func(string) (*homelock.Lock, error) {
+			return nil, errors.New("writable home is already claimed")
+		}
+
+		_, err := StartServer(context.Background(), options)
+		require.ErrorContains(t, err, "writable home is already claimed")
+	})
+
+	t.Run("claim released after a failed launch", func(t *testing.T) {
+		options := base(t)
+
+		var claimed string
+
+		openCodeAcquireHomeLock = func(home string) (*homelock.Lock, error) {
+			claimed = home
+
+			return homelock.Acquire(home)
+		}
+		openCodeStartProcess = func(*exec.Cmd) (*supervisorWaiter, error) {
+			return nil, errors.New("native spawn refused")
+		}
+
+		_, err := StartServer(context.Background(), options)
+		require.ErrorContains(t, err, "native spawn refused")
+		require.NotEmpty(t, claimed)
+
+		reacquired, lockErr := homelock.Acquire(claimed)
+		require.NoError(t, lockErr, "a failed launch must not strand the writable-home claim")
+		require.NoError(t, reacquired.Release())
+	})
+}
+
+// TestStartServerRejectsAnUnbuildableNativeEnvironment proves the ordinary
+// environment build still fails closed on a malformed caller overlay.
+func TestStartServerRejectsAnUnbuildableNativeEnvironment(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+
+	_, err := StartServer(context.Background(), StartOptions{
+		Root:           testGeneratedTempDir(t),
+		ExecutablePath: "/usr/bin/true",
+		Env:            map[string]string{"BAD=KEY": "x"},
+		Logger:         slog.New(slog.DiscardHandler),
+	})
+	require.ErrorContains(t, err, "invalid environment entry")
 }

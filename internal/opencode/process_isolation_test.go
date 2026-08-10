@@ -19,6 +19,17 @@ func (testProcessIdentityCapability) Duplicate() (*os.File, error) {
 	return nil, errors.New("test capability is not duplicable")
 }
 
+// withLinuxProcessIsolation places the explicit-policy cases on the only
+// platform that can honor one. The platform verdict is asserted on its own in
+// TestExplicitProcessIsolationIsLinuxOnly; every other case is about the shape
+// of a policy, which is a Linux question by construction.
+func withLinuxProcessIsolation(t *testing.T) {
+	t.Helper()
+	original := processIsolationGOOS
+	processIsolationGOOS = processIsolationLinux
+	t.Cleanup(func() { processIsolationGOOS = original })
+}
+
 func TestProcessIdentityDispositionValidation(t *testing.T) {
 	capability := testProcessIdentityCapability{}
 	validStandalone := ProcessIsolation{StandaloneOwnerID: "deployment-1", StandaloneStateRoot: "/var/lib/acp-go-opencode"}
@@ -52,6 +63,7 @@ func TestProcessIdentityDispositionValidation(t *testing.T) {
 }
 
 func TestProcessIsolationEnvironmentIsReplacementAndOverlay(t *testing.T) {
+	withLinuxProcessIsolation(t)
 	t.Setenv("ACP_PROCESS_AMBIENT_CANARY", "must-not-leak")
 	policy := &ProcessIsolation{UID: 123, GID: 456, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin", "BASE": "yes", "OVERLAY": "base"}, StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test"}
 	env, err := buildProcessEnvironment(policy, map[string]string{"OVERLAY": "option", "ONLY_OPTION": "yes"})
@@ -76,9 +88,8 @@ func TestManagedRuntimeRootsCannotBeOverlaid(t *testing.T) {
 }
 
 func TestProcessIsolationFailsClosedAndClearsGroups(t *testing.T) {
-	_, err := buildProcessEnvironment(nil)
-	require.ErrorContains(t, err, "required")
-	_, err = buildProcessEnvironment(&ProcessIsolation{UID: 0, GID: 2, BaseEnvironment: map[string]string{}})
+	withLinuxProcessIsolation(t)
+	_, err := buildProcessEnvironment(&ProcessIsolation{UID: 0, GID: 2, BaseEnvironment: map[string]string{}})
 	require.ErrorContains(t, err, "nonzero")
 	_, err = buildProcessEnvironment(&ProcessIsolation{UID: 1, GID: 2, BaseEnvironment: map[string]string{"PATH": "relative"}, StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test"})
 	require.ErrorContains(t, err, "non-absolute")
@@ -90,7 +101,21 @@ func TestProcessIsolationFailsClosedAndClearsGroups(t *testing.T) {
 	require.Empty(t, cmd.SysProcAttr.Credential.Groups)
 }
 
+func TestImplicitProcessEnvironmentIsCapturedAndScrubbed(t *testing.T) {
+	original := processEnviron
+	t.Cleanup(func() { processEnviron = original })
+	processEnviron = func() []string {
+		return []string{"PATH=/usr/bin:/bin", "AMBIENT=present", supervisorModeEnv + "=" + supervisorModeGuardian}
+	}
+
+	env, err := buildProcessEnvironment(nil)
+	require.NoError(t, err)
+	require.Equal(t, "present", env["AMBIENT"])
+	require.NotContains(t, env, supervisorModeEnv)
+}
+
 func TestProcessIsolationValidationAndExecutableResolutionBranches(t *testing.T) {
+	withLinuxProcessIsolation(t)
 	valid := &ProcessIsolation{UID: 123, GID: 456, BaseEnvironment: map[string]string{}, StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test"}
 	require.ErrorContains(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 2}), "base environment")
 	require.Error(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 2, BaseEnvironment: map[string]string{"BAD=KEY": "x"}}))
@@ -99,50 +124,156 @@ func TestProcessIsolationValidationAndExecutableResolutionBranches(t *testing.T)
 	require.Error(t, err)
 	require.NoError(t, validateProcessSearchPath(""))
 
-	_, err = resolveProcessExecutable(" ", nil)
+	_, err = resolveProcessExecutable(" ", nil, true)
 	require.ErrorContains(t, err, "empty")
-	_, err = resolveProcessExecutable("relative/tool", nil)
+	_, err = resolveProcessExecutable("relative/tool", nil, true)
 	require.ErrorContains(t, err, "not absolute")
 	missing := filepath.Join(t.TempDir(), "missing")
-	_, err = resolveProcessExecutable(missing, nil)
+	_, err = resolveProcessExecutable(missing, nil, true)
 	require.ErrorContains(t, err, "stat executable")
-	_, err = resolveProcessExecutable(t.TempDir(), nil)
+	_, err = resolveProcessExecutable(t.TempDir(), nil, true)
 	require.ErrorContains(t, err, "not executable")
 	nonExecutable := filepath.Join(t.TempDir(), "tool")
 	require.NoError(t, os.WriteFile(nonExecutable, []byte("tool"), 0o600))
-	_, err = resolveProcessExecutable(nonExecutable, nil)
+	_, err = resolveProcessExecutable(nonExecutable, nil, true)
 	require.ErrorContains(t, err, "not executable")
 	executable := filepath.Join(t.TempDir(), "tool")
 	require.NoError(t, os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700))
-	resolved, err := resolveProcessExecutable(executable, nil)
+	resolved, err := resolveProcessExecutable(executable, nil, true)
 	require.NoError(t, err)
 	require.Equal(t, executable, resolved)
-	_, err = resolveProcessExecutable("tool", []string{"HOME=/tmp"})
-	require.ErrorContains(t, err, "PATH is empty")
-	_, err = resolveProcessExecutable("tool", []string{"PATH=relative"})
+	_, err = resolveProcessExecutable("tool", []string{"HOME=/tmp"}, true)
+	require.ErrorContains(t, err, "process isolation PATH is empty")
+	_, err = resolveProcessExecutable("tool", []string{"PATH=relative"}, true)
 	require.ErrorContains(t, err, "non-absolute")
 	blocked := filepath.Join(t.TempDir(), "blocked")
 	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
-	_, err = resolveProcessExecutable("child", []string{"PATH=" + blocked})
+	_, err = resolveProcessExecutable("child", []string{"PATH=" + blocked}, true)
 	require.Error(t, err)
-	_, err = resolveProcessExecutable("missing", []string{"PATH=" + t.TempDir()})
+	_, err = resolveProcessExecutable("missing", []string{"PATH=" + t.TempDir()}, true)
 	require.ErrorIs(t, err, exec.ErrNotFound)
 }
 
-func TestProcessIsolationValidatesLinuxIdentityDisposition(t *testing.T) {
+// TestOrdinaryExecutableResolutionDoesNotInheritPolicyPathRules proves policy
+// omission is not a startup blocker. A relative configured executable and a
+// relative PATH entry are ordinary shell shapes, and the absolute-entry rule
+// belongs to the closed explicit policy alone. The strict arm keeps refusing
+// both, so the split is a split rather than a relaxation.
+func TestOrdinaryExecutableResolutionDoesNotInheritPolicyPathRules(t *testing.T) {
+	directory := t.TempDir()
+	tool := filepath.Join(directory, "opencode")
+	require.NoError(t, os.WriteFile(tool, []byte("#!/bin/sh\n"), 0o700))
+
+	relativeDirectory, err := filepath.Rel(t.TempDir(), directory)
+	require.NoError(t, err)
+
+	resolved, err := resolveProcessExecutable("opencode", []string{"PATH=" + relativeDirectory + ":" + directory}, false)
+	require.NoError(t, err)
+	require.Equal(t, tool, resolved)
+
+	_, err = resolveProcessExecutable("opencode", []string{"PATH=" + relativeDirectory + ":" + directory}, true)
+	require.ErrorContains(t, err, "process isolation PATH contains non-absolute entry")
+
+	relativeTool, err := filepath.Rel(mustGetwd(t), tool)
+	require.NoError(t, err)
+	ordinary, err := resolveProcessExecutable(relativeTool, nil, false)
+	require.NoError(t, err)
+	require.Equal(t, relativeTool, ordinary)
+
+	_, err = resolveProcessExecutable(relativeTool, nil, true)
+	require.ErrorContains(t, err, "not absolute")
+
+	_, err = resolveProcessExecutable("opencode", []string{"HOME=/tmp"}, false)
+	require.ErrorContains(t, err, "find opencode: PATH is empty")
+	_, err = resolveProcessExecutable("opencode", []string{"PATH=" + t.TempDir()}, false)
+	require.ErrorContains(t, err, "find opencode in PATH")
+
+	// An ordinary environment carrying a relative PATH entry still builds.
+	values, err := buildProcessEnvironmentFrom(nil, map[string]string{"PATH": "bin:/usr/bin"})
+	require.NoError(t, err)
+	require.Equal(t, "bin:/usr/bin", values["PATH"])
+}
+
+func mustGetwd(t *testing.T) string {
+	t.Helper()
+	working, err := os.Getwd()
+	require.NoError(t, err)
+
+	return working
+}
+
+// TestExplicitProcessIsolationIsLinuxOnly proves the embedded Go API refuses an
+// explicit policy off Linux rather than only the command's policy loader
+// refusing it. Nothing downstream reads the verdict and retries ordinary
+// execution, and omission stays supported on the same platform.
+func TestExplicitProcessIsolationIsLinuxOnly(t *testing.T) {
 	original := processIsolationGOOS
-	processIsolationGOOS = "linux"
 	t.Cleanup(func() { processIsolationGOOS = original })
+
+	for _, platform := range []string{"darwin", "freebsd", "windows", "openbsd"} {
+		processIsolationGOOS = platform
+		require.EqualError(t, validateProcessIsolation(&ProcessIsolation{
+			UID: 65534, GID: 65534, BaseEnvironment: map[string]string{},
+			StandaloneOwnerID: "test-owner", StandaloneStateRoot: testStandaloneStateRootPath,
+		}), errExplicitProcessIsolationPlatform)
+		require.NoError(t, validateProcessIsolation(nil), "omission stays supported on "+platform)
+	}
+}
+
+func TestProcessIsolationValidatesLinuxIdentityDisposition(t *testing.T) {
+	withLinuxProcessIsolation(t)
 	require.ErrorContains(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 2, BaseEnvironment: map[string]string{}}), "standalone owner")
 }
 
+// TestAdapterOwnedStateNeverReachesANativeEnvironment proves the private and
+// managed carriers are scrubbed from the base and from every overlay alike,
+// whatever their case. HOME is deliberately retained: it names the home of the
+// identity the native process actually runs as, and every root OpenCode could
+// redirect state through is replaced by the launch.
+func TestAdapterOwnedStateNeverReachesANativeEnvironment(t *testing.T) {
+	original := processEnviron
+	t.Cleanup(func() { processEnviron = original })
+	processEnviron = func() []string {
+		return []string{
+			"PATH=/usr/bin:/bin",
+			"HOME=/home/operator",
+			"AMBIENT=present",
+			privateAdapterEnvPrefix + "SPOOF=leaked",
+			strings.ToLower(privateAdapterEnvPrefix) + "spoof=leaked",
+			supervisorModeEnv + "=" + supervisorModeGuardian,
+			DarwinRuntimeIDEnv + "=leaked",
+			DarwinScratchRootEnv + "=/leaked",
+			"OPENCODE_DB=/leaked/opencode.db",
+			"OPENCODE_CONFIG_DIR=/leaked/config",
+			"XDG_RUNTIME_DIR=/leaked/run",
+		}
+	}
+
+	env, err := buildProcessEnvironment(nil, map[string]string{
+		"OVERLAY":                             "kept",
+		privateAdapterEnvPrefix + "OVERLAY":   "leaked",
+		"opencode_db":                         "/leaked/overlay.db",
+		strings.ToLower(DarwinScratchRootEnv): "/leaked/overlay",
+	})
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
+		"PATH":    "/usr/bin:/bin",
+		"HOME":    "/home/operator",
+		"AMBIENT": "present",
+		"OVERLAY": "kept",
+	}, env)
+}
+
 func TestAdoptedIdentityDispositionAndInheritedDescriptorFailures(t *testing.T) {
+	withLinuxProcessIsolation(t)
 	adopted := &ProcessIsolation{identityAuthorityAdopted: true}
 	require.NoError(t, validateStandaloneIdentityDisposition(adopted))
 	adopted.IdentityLock = testProcessIdentityCapability{}
 	require.ErrorContains(t, validateStandaloneIdentityDisposition(adopted), "cannot carry")
 
-	require.Error(t, applyProcessCredential(exec.Command("/usr/bin/true"), nil))
+	ordinary := exec.Command("/usr/bin/true")
+	require.NoError(t, applyProcessCredential(ordinary, nil))
+	require.Nil(t, ordinary.SysProcAttr)
 	require.Error(t, closeInheritedOnExec(nil))
 	file, err := os.CreateTemp(t.TempDir(), "descriptor")
 	require.NoError(t, err)
@@ -174,4 +305,82 @@ func TestSupervisorConfigIsInheritedUnlinkedDescriptor(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 	_, err = readSupervisorConfig(file)
 	require.NoError(t, err)
+}
+
+// requireNoProcessCredential asserts a command asks the kernel for no identity
+// change. Process-group hygiene may still be configured; what must be absent is
+// a credential, which only an explicit policy ever sets.
+func requireNoProcessCredential(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	require.True(t, cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential == nil,
+		"ordinary execution requests no credential change")
+}
+
+// TestOrdinaryDirectExecutionSelectsThePortableArm pins which platforms run an
+// omitted policy through the guardian/liveness pair and which run it directly.
+// Only Linux and an opted-in Darwin can prove anything with the pair; every
+// other platform would refuse before native start, which is why omission takes
+// the direct arm there rather than becoming a dead platform. An explicit policy
+// never reaches either question.
+func TestOrdinaryDirectExecutionSelectsThePortableArm(t *testing.T) {
+	original := processIsolationGOOS
+	t.Cleanup(func() { processIsolationGOOS = original })
+
+	for _, testCase := range []struct {
+		goos       string
+		bestEffort bool
+		want       bool
+	}{
+		{goos: processIsolationLinux, want: false},
+		{goos: processIsolationLinux, bestEffort: true, want: false},
+		{goos: processIsolationDarwin, want: true},
+		{goos: processIsolationDarwin, bestEffort: true, want: false},
+		{goos: "windows", want: true},
+		{goos: "freebsd", want: true},
+	} {
+		t.Run(testCase.goos, func(t *testing.T) {
+			processIsolationGOOS = testCase.goos
+			require.Equal(t, testCase.want, ordinaryDirectExecution(nil, testCase.bestEffort))
+			require.Equal(t, testCase.want, ordinaryProcessBackend(supervisorConfig{
+				DarwinBestEffort: testCase.bestEffort,
+			}))
+			require.False(t, ordinaryDirectExecution(testProcessIsolation(), testCase.bestEffort),
+				"an explicit policy never selects an ordinary backend")
+		})
+	}
+}
+
+// TestSupervisorIdentityDispositionSeparatesOrdinaryFromExplicit proves each
+// process in the tree re-derives the arm from the identity it actually runs as.
+// An ordinary stamp is checked against that identity and against the emptiness
+// of every authority field; an explicit stamp is refused outright if it claims
+// the shared identity, because the hardened backend has no such launch to make.
+func TestSupervisorIdentityDispositionSeparatesOrdinaryFromExplicit(t *testing.T) {
+	withLinuxProcessIsolation(t)
+
+	uid, gid, err := currentProcessIdentity()
+	require.NoError(t, err)
+
+	ordinary := supervisorConfig{
+		OrdinaryExecution: true, SharedIdentity: true,
+		IsolationUID: uid, IsolationGID: gid,
+	}
+	require.NoError(t, validateSupervisorIdentityDisposition(ordinary))
+
+	foreign := ordinary
+	foreign.IsolationUID = uid + 1
+	require.ErrorContains(t, validateSupervisorIdentityDisposition(foreign),
+		"ordinary supervisor identity disposition is invalid")
+
+	authoritative := ordinary
+	authoritative.StandaloneAuthority = true
+	require.ErrorContains(t, validateSupervisorIdentityDisposition(authoritative),
+		"ordinary supervisor identity disposition is invalid")
+
+	require.NoError(t, validateSupervisorIdentityDisposition(supervisorConfig{
+		IsolationUID: 65534, IsolationGID: 65534, StandaloneAuthority: true,
+	}))
+	require.ErrorContains(t, validateSupervisorIdentityDisposition(supervisorConfig{
+		IsolationUID: 65534, IsolationGID: 65534, SharedIdentity: true,
+	}), "explicit supervisor identity disposition cannot claim a shared identity")
 }
