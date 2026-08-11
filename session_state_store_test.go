@@ -88,6 +88,67 @@ func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {
 	require.ErrorContains(t, err, "owned by another restore")
 }
 
+func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	snapshot := validSyncSnapshot("s", "native", "/source")
+
+	nativeEvent := cloneSyncEvent(snapshot.Events["native"][0])
+	nativeEvent.Data[syncFieldInfo] = json.RawMessage(`{
+		"id":"native",
+		"directory":"/source",
+		"metadata":{
+			"native":{"kept":true},
+			"acp-go-opencode":{"env":{"WAGIE_API_TOKEN":"expired"},"extraPathDirs":["/old/bin"]}
+		}
+	}`)
+	portable, err := portableSyncEvents([]opencode.SyncEvent{nativeEvent})
+	require.NoError(t, err)
+	snapshot.Events["native"] = portable
+	require.NoError(t, recordSnapshotOwnership(client, snapshot))
+	client.syncEvents = []opencode.SyncEvent{nativeEvent}
+
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/source")
+	require.NoError(t, err)
+	require.Len(t, client.syncEvents, 1, "matching native history must be verified, not replayed")
+	require.Contains(t, string(client.syncEvents[0].Data[syncFieldInfo]), "expired",
+		"portable comparison must not mutate the live native event")
+}
+
+func TestRestoreRejectsMalformedCarrierInExistingAndVerifiedNativeHistory(t *testing.T) {
+	t.Run("existing", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		snapshot := validSyncSnapshot("s", "native", "/source")
+		require.NoError(t, recordSnapshotOwnership(client, snapshot))
+		malformed := cloneSyncEvent(snapshot.Events["native"][0])
+		malformed.Data[syncFieldInfo] = json.RawMessage(`{"metadata":"not-an-object"}`)
+		client.syncEvents = []opencode.SyncEvent{malformed}
+
+		_, err := restoreSyncState(context.Background(), client, snapshot, "native", "/source")
+		require.ErrorContains(t, err, "sanitize sync event")
+	})
+
+	t.Run("verified after replay", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		snapshot := validSyncSnapshot("s", "native", "/source")
+		historyCalls := 0
+		client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
+			historyCalls++
+			if historyCalls == 1 {
+				return nil, nil
+			}
+
+			malformed := cloneSyncEvent(snapshot.Events["native"][0])
+			malformed.Data[syncFieldInfo] = json.RawMessage(`{"metadata":"not-an-object"}`)
+
+			return []opencode.SyncEvent{malformed}, nil
+		}
+
+		_, err := restoreSyncState(context.Background(), client, snapshot, "native", "/source")
+		require.ErrorContains(t, err, "sanitize sync event")
+	})
+}
+
 func TestRestoreRejectsExistingAggregateWithoutDurableOwner(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.syncEvents = []opencode.SyncEvent{syncTestEvent("native", 0, "session.created.1", nil)}
@@ -111,6 +172,42 @@ func TestBundleCredentialScan(t *testing.T) {
 	require.NoError(t, scanSyncBundle([]byte(`{"text":"ordinary"}`), nil))
 	require.ErrorContains(t, scanSyncBundle([]byte(`{"authorization":"Bearer secret"}`), nil), "forbidden")
 	require.ErrorContains(t, scanSyncBundle([]byte(`{"text":"Bearer exact"}`), []string{"Bearer exact"}), "MCP credential")
+}
+
+func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierBeforeSecretScan(t *testing.T) {
+	agent := NewAgent()
+	client := newFakeOpenCodeClient()
+	current := testSession(agent, client)
+	agent.sessions[current.id] = current
+	current.secretNeedles = []string{"operation-capability"}
+	client.syncEvents[0].Data[syncFieldInfo] = json.RawMessage(`{
+		"id":"native-1",
+		"directory":"/source",
+		"metadata":{
+			"native":{"kept":true},
+			"acp-go-opencode":{
+				"env":{"WAGIE_API_TOKEN":"operation-capability"},
+				"extraPathDirs":["/session/bin"]
+			}
+		}
+	}`)
+
+	events, err := current.readSyncGeneration(
+		context.Background(),
+		map[string]stateSnapshotNode{"native-1": {
+			SessionID: string(current.id), NativeSessionID: "native-1", SourceCwd: "/source",
+		}},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, events["native-1"], 1)
+	require.NotContains(t, string(events["native-1"][0].Data[syncFieldInfo]), "operation-capability")
+	require.NotContains(t, string(events["native-1"][0].Data[syncFieldInfo]), "acp-go-opencode")
+	require.Contains(t, string(events["native-1"][0].Data[syncFieldInfo]), `"native":{"kept":true}`)
+
+	bundle, err := json.Marshal(events)
+	require.NoError(t, err)
+	require.NoError(t, scanSyncBundle(bundle, current.secretNeedles))
 }
 
 func validSyncSnapshot(sessionID, nativeID, cwd string) stateSnapshot {
@@ -364,7 +461,13 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	t.Cleanup(func() { restoreRandRead = originalRead })
 
 	current, client = newSnapshotSession()
-	client.syncEvents[0].Data["info"] = json.RawMessage(`{`)
+	client.syncEvents[0].Data["info"] = json.RawMessage(`{"metadata":"not-an-object"}`)
+	require.ErrorContains(t, current.snapshotToStore(context.Background()), "sanitize sync event")
+
+	current, client = newSnapshotSession()
+	client.syncEvents[0].Type = "message.part.updated.1"
+	delete(client.syncEvents[0].Data, "info")
+	client.syncEvents[0].Data["part"] = json.RawMessage(`{`)
 	require.Error(t, current.snapshotToStore(context.Background()))
 
 	current, client = newSnapshotSession()

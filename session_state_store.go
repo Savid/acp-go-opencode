@@ -339,6 +339,13 @@ func (s *session) readSyncGeneration(
 		return nil, err
 	}
 
+	for aggregateID, nativeEvents := range events {
+		events[aggregateID], err = portableSyncEvents(nativeEvents)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	sanitizeSyncEventImages(events, artifacts)
 
 	second, err := s.client.SyncHistory(ctx, cursors)
@@ -568,6 +575,18 @@ func cloneSyncEvent(event opencode.SyncEvent) opencode.SyncEvent {
 	return cloned
 }
 
+func portableSyncEvents(events []opencode.SyncEvent) ([]opencode.SyncEvent, error) {
+	portable := make([]opencode.SyncEvent, len(events))
+	for index, event := range events {
+		portable[index] = cloneSyncEvent(event)
+		if err := opencode.StripSessionCarrierFromSyncEvent(&portable[index]); err != nil {
+			return nil, fmt.Errorf("sanitize sync event %q session carrier: %w", event.ID, err)
+		}
+	}
+
+	return portable, nil
+}
+
 func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID string) (idmapRecord, stateSnapshot, bool, error) {
 	entries, err := store.Load(ctx, SessionKey{SessionID: sessionID, Subpath: SessionStoreMainSubpath})
 	if err != nil || len(entries) == 0 {
@@ -672,7 +691,12 @@ func restoreSyncState(ctx context.Context, client opencode.Client, snapshot stat
 			return opencode.NativeSession{}, err
 		}
 
-		if current := existing[node.NativeSessionID]; len(current) > 0 && !syncEventPrefix(current, expected) {
+		current, err := portableSyncEvents(existing[node.NativeSessionID])
+		if err != nil {
+			return opencode.NativeSession{}, err
+		}
+
+		if len(current) > 0 && !syncEventPrefix(current, expected) {
 			return opencode.NativeSession{}, fmt.Errorf("destination aggregate %q is owned by another restore", node.NativeSessionID)
 		}
 
@@ -699,6 +723,11 @@ func restoreSyncState(ctx context.Context, client opencode.Client, snapshot stat
 			if event.AggregateID == node.NativeSessionID {
 				actual = append(actual, event)
 			}
+		}
+
+		actual, err = portableSyncEvents(actual)
+		if err != nil {
+			return opencode.NativeSession{}, err
 		}
 
 		if !syncEventsEqual(actual, expected) {
