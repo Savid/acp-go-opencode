@@ -46,6 +46,13 @@ type supervisorTestBuffer struct {
 
 const linuxSecurityLimitsProofEnv = "ACP_GO_OPENCODE_TEST_SECURITY_LIMITS_PROOF"
 
+// The first native PID publication sits behind the standalone authority claim.
+// That claim may spend its whole budget proving the identity vacant across the
+// initial PID namespace, so the fixture must not impose the shorter post-claim
+// containment window on startup. Keep a window after the claim for the
+// guardian/liveness handoff and native script publication.
+const supervisedNativePIDWait = agentStandaloneClaimMax + supervisorQuiesceWindow
+
 func TestLinuxSupervisorChildInheritsSecurityLimits(t *testing.T) {
 	proofPath := os.Getenv(linuxSecurityLimitsProofEnv)
 	if proofPath != "" {
@@ -660,7 +667,7 @@ func waitFile(t *testing.T, path string) {
 
 func waitPIDFile(t *testing.T, path string, stderr *supervisorTestBuffer) int {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(supervisedNativePIDWait)
 	for time.Now().Before(deadline) {
 		raw, err := os.ReadFile(path)
 		if err == nil {
