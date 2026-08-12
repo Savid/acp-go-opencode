@@ -719,9 +719,13 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 			return cmd
 		}
-		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
-			t.Fatal("stdout pipe error was ignored")
-		}
+		_, err := StartServer(ctx, StartOptions{
+			ExistingXDG:    testXDGDirs(t),
+			ExecutablePath: "/usr/bin/true",
+			Pure:           true,
+			skipSupervisor: true,
+		})
+		require.ErrorContains(t, err, "Stdout already set")
 	})
 
 	t.Run("stderr pipe failure", func(t *testing.T) {

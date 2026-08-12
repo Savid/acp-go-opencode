@@ -201,6 +201,7 @@ func TestStartServerEarlyContainmentAndCredentialFailures(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		options := base(t)
 		options.HandoffXDG = true
+		options.Pure = true
 		options.ExistingXDG = testUnhandoffableXDGDirs(t)
 		options.ProcessIsolation = testForeignProcessIsolation()
 		_, err := StartServer(context.Background(), options)

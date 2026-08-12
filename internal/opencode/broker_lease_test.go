@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 type recordingCloser struct{ closed bool }
@@ -524,17 +526,18 @@ func TestStartServerFailsClosedWhenTheLeaseCannotBeWritten(t *testing.T) {
 				return realWrite(path, contents, mode)
 			}
 
-			_, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
+			_, err := StartServer(context.Background(), StartOptions{
 				Root:            t.TempDir(),
 				LeaseDir:        t.TempDir(),
 				ExecutablePath:  fakeOpenCodeExecutable(t),
 				HealthTimeout:   5 * time.Second,
 				SkipVersionGate: true,
 				Logger:          slog.New(slog.DiscardHandler),
-			}))
-			if err == nil {
-				t.Fatal("a server started under a home no lease names")
-			}
+				Pure:            true,
+				skipSupervisor:  true,
+			})
+			require.ErrorContains(t, err, "lease write refused")
+			require.Equal(t, failOn, writes)
 		})
 	}
 }
