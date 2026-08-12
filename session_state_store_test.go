@@ -99,7 +99,7 @@ func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testin
 		"directory":"/source",
 		"metadata":{
 			"native":{"kept":true},
-			"acp-go-opencode":{"env":{"WAGIE_API_TOKEN":"expired"},"extraPathDirs":["/old/bin"]}
+			"acp-go-opencode":{"ref":"stale-reference"}
 		}
 	}`)
 	portable, err := portableSyncEvents([]opencode.SyncEvent{nativeEvent})
@@ -111,7 +111,7 @@ func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testin
 	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/source")
 	require.NoError(t, err)
 	require.Len(t, client.syncEvents, 1, "matching native history must be verified, not replayed")
-	require.Contains(t, string(client.syncEvents[0].Data[syncFieldInfo]), "expired",
+	require.Contains(t, string(client.syncEvents[0].Data[syncFieldInfo]), "stale-reference",
 		"portable comparison must not mutate the live native event")
 }
 
@@ -174,21 +174,17 @@ func TestBundleCredentialScan(t *testing.T) {
 	require.ErrorContains(t, scanSyncBundle([]byte(`{"text":"Bearer exact"}`), []string{"Bearer exact"}), "MCP credential")
 }
 
-func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierBeforeSecretScan(t *testing.T) {
+func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierReference(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
 	current := testSession(agent, client)
 	agent.sessions[current.id] = current
-	current.secretNeedles = []string{"operation-capability"}
 	client.syncEvents[0].Data[syncFieldInfo] = json.RawMessage(`{
 		"id":"native-1",
 		"directory":"/source",
 		"metadata":{
 			"native":{"kept":true},
-			"acp-go-opencode":{
-				"env":{"WAGIE_API_TOKEN":"operation-capability"},
-				"extraPathDirs":["/session/bin"]
-			}
+			"acp-go-opencode":{"ref":"opaque-operation-reference"}
 		}
 	}`)
 
@@ -201,7 +197,7 @@ func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierBeforeSecretScan(t *te
 	)
 	require.NoError(t, err)
 	require.Len(t, events["native-1"], 1)
-	require.NotContains(t, string(events["native-1"][0].Data[syncFieldInfo]), "operation-capability")
+	require.NotContains(t, string(events["native-1"][0].Data[syncFieldInfo]), "opaque-operation-reference")
 	require.NotContains(t, string(events["native-1"][0].Data[syncFieldInfo]), "acp-go-opencode")
 	require.Contains(t, string(events["native-1"][0].Data[syncFieldInfo]), `"native":{"kept":true}`)
 

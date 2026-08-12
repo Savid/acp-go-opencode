@@ -11,8 +11,8 @@ import (
 // holds. It travels with the session rather than with the runtime: one native
 // process serves every session of an Agent, so anything pinned to the process
 // would be the same value for all of them, and a rotated bearer would reach the
-// wrong operation. Both halves are written onto the addressed native session
-// and reach only that session's shell boundary.
+// wrong operation. The native session holds only an opaque reference; both
+// halves remain in adapter memory and reach only that session's shell boundary.
 type sessionCarrier struct {
 	Env           map[string]string
 	ExtraPathDirs []string

@@ -246,8 +246,7 @@ func TestOpenCodeServerCarriesSessionCarrierOnAddressedSessions(t *testing.T) {
 	ctx := context.Background()
 	client, rec := newOpenCodeMethodsClient(t)
 	client.directory = "/repo"
-	client.sessionEnv = map[string]string{"WAGIE_API_TOKEN": "token-a", "EMPTY": ""}
-	client.extraPathDirs = []string{"/first", "/second", "/first"}
+	client.sessionCarrierReference = "opaque-reference"
 
 	_, err := client.CreateSession(ctx, "Created")
 	require.NoError(t, err)
@@ -257,6 +256,8 @@ func TestOpenCodeServerCarriesSessionCarrierOnAddressedSessions(t *testing.T) {
 	actualJSON, err := json.Marshal(rec.createBody["metadata"])
 	require.NoError(t, err)
 	require.JSONEq(t, string(wantJSON), string(actualJSON))
+	require.NotContains(t, string(actualJSON), "env")
+	require.NotContains(t, string(actualJSON), "extraPathDirs")
 
 	_, err = client.GetSession(ctx, "s/1")
 	require.NoError(t, err)
@@ -705,7 +706,7 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 
 	t.Run("password entropy failure", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
-		openCodeRandReader = &budgetReader{budget: 32, err: errors.New("entropy failed")}
+		openCodeRandReader = &budgetReader{budget: 64, err: errors.New("entropy failed")}
 		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
 			t.Fatal("entropy error was ignored")
 		}

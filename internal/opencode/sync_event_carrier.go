@@ -12,12 +12,11 @@ const (
 	syncEventFieldMetadata      = "metadata"
 )
 
-// StripSessionCarrierFromSyncEvent removes the adapter-owned runtime carrier
-// from native session events before they enter portable storage. The carrier's
-// environment holds operation credentials and is never durable authority; its
-// path directories are stored separately by the adapter. A restored session
-// receives the current operation's complete carrier only after exact replay
-// verification.
+// StripSessionCarrierFromSyncEvent removes the adapter-owned carrier reference
+// from native session events before they enter portable storage. The referenced
+// environment is in-memory runtime state, and the path directories are stored
+// separately by the adapter. A restored session receives the current
+// operation's reference only after exact replay verification.
 func StripSessionCarrierFromSyncEvent(event *SyncEvent) error {
 	if event.Type != syncEventTypeSessionCreated && event.Type != syncEventTypeSessionUpdated {
 		return nil

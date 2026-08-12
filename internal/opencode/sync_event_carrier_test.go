@@ -17,7 +17,7 @@ func TestStripSessionCarrierFromSyncEvent(t *testing.T) {
 						"id":"native",
 						"metadata":{
 							"native":{"kept":true},
-							"acp-go-opencode":{"env":{"WAGIE_API_TOKEN":"secret"},"extraPathDirs":["/session/bin"]}
+							"acp-go-opencode":{"ref":"opaque-reference"}
 						}
 					}`),
 				},

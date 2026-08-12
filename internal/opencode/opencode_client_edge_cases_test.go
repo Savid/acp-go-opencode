@@ -93,6 +93,57 @@ func TestStartServerHappyPathWithoutPrivilegedProcessLaunch(t *testing.T) {
 	require.NoError(t, server.Shutdown(context.Background()))
 }
 
+func TestStartServerFailsWhenCarrierBootstrapCannotBeErased(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+	preserveSupervisorGlobals(t)
+	preserveSessionCarrierSeams(t)
+	recordSessionCarrierPluginForFakeNative(t)
+
+	openCodeListen = func(string, string) (net.Listener, error) { return fixedTCPListener{port: 32129}, nil }
+	openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 30")
+	}
+	openCodeStartProcess = startOpenCodeProcess
+	supervisorReleaseIndependentWaiter = func(cmd *exec.Cmd, waiter *supervisorWaiter) (int, error) {
+		waiter.start()
+
+		return cmd.Process.Pid, nil
+	}
+	openCodeHTTPClient = func() *http.Client {
+		return &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			instantiateRecordedSessionCarrierPlugin(request)
+
+			switch request.URL.Path {
+			case routeGlobalHealth:
+				return performanceJSONResponse(map[string]any{"healthy": true, "version": "1.18.3"}), nil
+			case routeDoc:
+				return performanceJSONResponse(fullOpenCodeDoc()), nil
+			case routeEvent:
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"server.connected\",\"properties\":{}}\n\n")),
+				}, nil
+			default:
+				return &http.Response{StatusCode: http.StatusNoContent, Status: "204 No Content", Header: make(http.Header), Body: http.NoBody}, nil
+			}
+		})}
+	}
+
+	want := errors.New("erase bootstrap failed")
+	sessionCarrierRemove = func(string) error { return want }
+
+	client, err := StartServer(context.Background(), StartOptions{
+		Root:           testGeneratedTempDir(t),
+		ExecutablePath: "/usr/bin/true",
+		skipSupervisor: true,
+		MinVersion:     "1.18.3",
+	})
+	require.Nil(t, client)
+	require.ErrorIs(t, err, want)
+}
+
 // TestOrdinaryDirectLaunchKeepsThePortableHomeLock covers the ordinary arm on
 // a platform whose guardian/liveness pair cannot prove containment. The launch
 // still runs — omission is not a dead platform — and it still holds the
@@ -641,7 +692,10 @@ func TestScopeRegisterFailureCreatePolicyAndDirectoryQueryClone(t *testing.T) {
 		}
 	}))
 	t.Cleanup(server.Close)
-	client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL, closed: make(chan struct{}), directory: "/scope"}
+	client := &openCodeServer{
+		httpClient: server.Client(), baseURL: server.URL, closed: make(chan struct{}), directory: "/scope",
+		sessionCarrierBroker: testSessionCarrierBroker(),
+	}
 	_, err := client.Scope(context.Background(), ScopeOptions{Directory: "/scope", MCPServers: []MCPServerConfig{{Name: "bad", URL: "https://bad"}}})
 	require.ErrorContains(t, err, "register directory MCP")
 

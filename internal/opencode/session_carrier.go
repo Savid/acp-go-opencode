@@ -10,9 +10,9 @@ import (
 
 const (
 	// sessionCarrierPluginFileName is the native plugin module the runtime
-	// registers. One module serves every addressed session: it reads the
-	// carrier off the session the shell boundary names rather than off any
-	// process-wide state.
+	// registers. One module serves every addressed session: it reads an opaque
+	// reference off the session the shell boundary names, then resolves the
+	// carrier from the adapter's in-memory broker.
 	sessionCarrierPluginFileName = "session-carrier.mjs"
 
 	// sessionCarrierProofFileName is the marker the plugin writes as OpenCode
@@ -64,34 +64,43 @@ type sessionCarrierProof struct {
 // sessionCarrierPlugin is the generated native plugin the runtime registers
 // together with the proof the runtime requires before it hands a session out.
 type sessionCarrierPlugin struct {
-	URL   string
-	Proof sessionCarrierProof
+	URL    string
+	Path   string
+	Proof  sessionCarrierProof
+	Broker *sessionCarrierBroker
 }
 
 // sessionCarrierPluginSource renders the native plugin that carries one
 // addressed session's environment, search-path directories, and login shell to
 // the shell boundary.
 //
-// The plugin reads the session OpenCode itself names, so two sessions of the
-// same runtime never see each other's values and a rebind takes effect on the
-// next command. Every native read error, missing carrier namespace, and
-// malformed carrier throws: the shell operation fails rather than degrading to
-// the shared process environment.
+// The plugin reads the session OpenCode itself names and resolves its opaque
+// reference through the adapter, so native persistence receives none of the
+// carrier values. Two sessions of the same runtime never see each other's
+// values and a rebind takes effect on the next command. Every native or broker
+// read error and every malformed carrier throws: the shell operation fails
+// rather than degrading to the shared process environment.
 //
 // shellWrapper is the wrapper the config hook substitutes for a login shell. It
 // is empty where no wrapper was materialized, in which case the environment the
 // hook returns is already the environment the command runs under. pathMark is
 // the generated search-path component that separates the operation's own
 // directories from the login shell and the runtime's path.
-func sessionCarrierPluginSource(shellWrapper string, pathMark string, proof sessionCarrierProof) string {
+func sessionCarrierPluginSource(
+	shellWrapper string,
+	pathMark string,
+	proof sessionCarrierProof,
+	broker *sessionCarrierBroker,
+) string {
 	return fmt.Sprintf(sessionCarrierPluginTemplate,
 		jsStringLiteral(shellWrapper),
 		jsStringLiteral(pathMark),
 		jsStringLiteral(proof.Path),
 		jsStringLiteral(proof.Token),
+		jsStringLiteral(broker.endpoint),
+		jsStringLiteral(broker.token),
 		jsStringLiteral(sessionCarrierMetadataKey),
-		jsStringLiteral(sessionCarrierEnvKey),
-		jsStringLiteral(sessionCarrierPathKey),
+		jsStringLiteral(sessionCarrierRefKey),
 	)
 }
 
@@ -110,9 +119,26 @@ const SHELL_WRAPPER = %s
 const PATH_MARK = %s
 const PROOF_PATH = %s
 const PROOF_TOKEN = %s
+const BROKER_ENDPOINT = %s
+const BROKER_TOKEN = %s
 const NAMESPACE = %s
-const ENV_KEY = %s
-const DIRS_KEY = %s
+const REF_KEY = %s
+
+const PRIVATE_RUNTIME_ENV_KEYS = [
+  "OPENCODE_CONFIG",
+  "OPENCODE_CONFIG_CONTENT",
+  "OPENCODE_CONFIG_DIR",
+  "OPENCODE_DB",
+  "OPENCODE_ENABLE_QUESTION_TOOL",
+  "OPENCODE_PID",
+  "OPENCODE_SERVER_PASSWORD",
+  "OPENCODE_SERVER_USERNAME",
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_RUNTIME_DIR",
+  "XDG_STATE_HOME",
+]
 
 // OpenCode starts exactly these shells as login shells, which is what lets a
 // user startup file rewrite the search path after the environment hook has run.
@@ -120,6 +146,8 @@ const LOGIN_SHELLS = new Set(["bash", "zsh"])
 
 // The shell OpenCode itself starts when nothing it can resolve is configured.
 const OPENCODE_DEFAULT_SHELL = "/bin/zsh"
+
+let proofPending = true
 
 const separator = () => (process.platform === "win32" ? ";" : ":")
 
@@ -165,7 +193,10 @@ export const AcpGoOpenCodeSessionCarrier = async ({ client, directory }) => {
   // OpenCode logs a plugin it cannot load and serves every shell operation
   // anyway, so nothing below runs unless this module was really instantiated.
   // The adapter refuses to start a runtime that cannot show this marker.
-  writeFileSync(PROOF_PATH, PROOF_TOKEN)
+  if (proofPending) {
+    writeFileSync(PROOF_PATH, PROOF_TOKEN)
+    proofPending = false
+  }
 
   // The login shell of this workspace scope, and of no other. OpenCode builds
   // one plugin instance per scope and runs its config hook against that scope's
@@ -183,6 +214,8 @@ export const AcpGoOpenCodeSessionCarrier = async ({ client, directory }) => {
       config.shell = SHELL_WRAPPER
     },
     "shell.env": async (input, output) => {
+      for (const key of PRIVATE_RUNTIME_ENV_KEYS) output.env[key] = ""
+
       // A pseudo-terminal environment carries no session, and there is no
       // addressed session to read a carrier from.
       if (!input.sessionID) return
@@ -196,16 +229,30 @@ export const AcpGoOpenCodeSessionCarrier = async ({ client, directory }) => {
       const carrier = response.data.metadata?.[NAMESPACE]
       if (!carrier || typeof carrier !== "object" || Array.isArray(carrier)) fail("addressed session carrier is missing")
 
-      const env = carrier[ENV_KEY]
+      const reference = carrier[REF_KEY]
+      if (typeof reference !== "string" || reference.length === 0) fail("addressed session carrier reference is malformed")
+
+      const carrierResponse = await fetch(BROKER_ENDPOINT + "/carrier/" + encodeURIComponent(reference), {
+        cache: "no-store",
+        headers: { Authorization: "Bearer " + BROKER_TOKEN },
+      })
+      if (!carrierResponse.ok) fail("addressed session carrier read failed")
+
+      const payload = await carrierResponse.json()
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) fail("addressed session carrier payload is malformed")
+
+      const env = payload.env
       if (!env || typeof env !== "object" || Array.isArray(env)) fail("addressed session carrier environment is malformed")
 
-      const dirs = carrier[DIRS_KEY]
+      const dirs = payload.extraPathDirs
       if (!Array.isArray(dirs)) fail("addressed session carrier path directories are malformed")
 
       for (const [key, value] of Object.entries(env)) {
         if (typeof value !== "string") fail("addressed session carrier environment is malformed")
         output.env[key] = value
       }
+
+      for (const key of PRIVATE_RUNTIME_ENV_KEYS) output.env[key] = ""
 
       for (const dir of dirs) {
         if (typeof dir !== "string" || dir.length === 0) fail("addressed session carrier path directories are malformed")
@@ -253,8 +300,16 @@ var (
 	sessionCarrierMkdirTemp = os.MkdirTemp
 	sessionCarrierMkdirAll  = os.MkdirAll
 	sessionCarrierWriteFile = os.WriteFile
+	sessionCarrierRemove    = os.Remove
 	sessionCarrierHandoff   = handoffSessionCarrierGeneratedTree
 )
+
+func eraseSessionCarrierBootstrap(plugin sessionCarrierPlugin) error {
+	return errors.Join(
+		sessionCarrierRemove(plugin.Path),
+		sessionCarrierRemove(plugin.Proof.Path),
+	)
+}
 
 func materializeSessionCarrierPlugin(runtimeRoot string, isolation *ProcessIsolation) (sessionCarrierPlugin, func() error, error) {
 	parent := filepath.Dir(runtimeRoot)
@@ -264,7 +319,11 @@ func materializeSessionCarrierPlugin(runtimeRoot string, isolation *ProcessIsola
 		return sessionCarrierPlugin{}, nil, fmt.Errorf("create OpenCode session carrier root: %w", err)
 	}
 
-	cleanup := func() error { return openCodeRemoveAll(root) }
+	var broker *sessionCarrierBroker
+
+	cleanup := func() error {
+		return errors.Join(broker.Close(), openCodeRemoveAll(root))
+	}
 
 	token, err := randomPassword()
 	if err != nil {
@@ -275,6 +334,11 @@ func materializeSessionCarrierPlugin(runtimeRoot string, isolation *ProcessIsola
 		Path:      filepath.Join(root, sessionCarrierProofFileName),
 		Token:     token,
 		Directory: filepath.Join(root, sessionCarrierProbeDirName),
+	}
+
+	broker, err = startSessionCarrierBroker()
+	if err != nil {
+		return sessionCarrierPlugin{}, nil, errors.Join(err, cleanup())
 	}
 
 	if err := sessionCarrierMkdirAll(proof.Directory, 0o700); err != nil {
@@ -292,7 +356,7 @@ func materializeSessionCarrierPlugin(runtimeRoot string, isolation *ProcessIsola
 	}
 
 	path := filepath.Join(root, sessionCarrierPluginFileName)
-	if err := sessionCarrierWriteFile(path, []byte(sessionCarrierPluginSource(wrapper, mark, proof)), 0o600); err != nil {
+	if err := sessionCarrierWriteFile(path, []byte(sessionCarrierPluginSource(wrapper, mark, proof, broker)), 0o600); err != nil {
 		return sessionCarrierPlugin{}, nil, errors.Join(fmt.Errorf("write OpenCode session carrier: %w", err), cleanup())
 	}
 
@@ -300,5 +364,5 @@ func materializeSessionCarrierPlugin(runtimeRoot string, isolation *ProcessIsola
 		return sessionCarrierPlugin{}, nil, errors.Join(fmt.Errorf("handoff OpenCode session carrier: %w", err), cleanup())
 	}
 
-	return sessionCarrierPlugin{URL: sessionCarrierFileURL(path), Proof: proof}, cleanup, nil
+	return sessionCarrierPlugin{URL: sessionCarrierFileURL(path), Path: path, Proof: proof, Broker: broker}, cleanup, nil
 }

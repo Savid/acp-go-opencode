@@ -85,8 +85,7 @@ const (
 	fieldMCP                  = "mcp"
 	fieldMetadata             = "metadata"
 	sessionCarrierMetadataKey = "acp-go-opencode"
-	sessionCarrierEnvKey      = "env"
-	sessionCarrierPathKey     = "extraPathDirs"
+	sessionCarrierRefKey      = "ref"
 	fieldPermission           = "permission"
 	fieldQuestions            = "questions"
 	fieldReply                = "reply"
@@ -155,10 +154,10 @@ type Client interface {
 type ScopeOptions struct {
 	Directory  string
 	MCPServers []MCPServerConfig
-	// Env and ExtraPathDirs are the addressed-session carrier. They are written
-	// onto the native session this scope creates or adopts and reach only that
-	// session's shell boundary; the shared runtime process environment is fixed
-	// at exec and is never republished from here.
+	// Env and ExtraPathDirs are the addressed-session carrier. They stay in the
+	// adapter's in-memory broker while an opaque reference is written onto the
+	// native session this scope creates or adopts. The shared runtime process
+	// environment is fixed at exec and is never republished from here.
 	Env           map[string]string
 	ExtraPathDirs []string
 }
@@ -418,8 +417,6 @@ type openCodeServer struct {
 	errs                         chan error
 	closed                       chan struct{}
 	directory                    string
-	sessionEnv                   map[string]string
-	extraPathDirs                []string
 	scopeCancel                  context.CancelFunc
 	runtimeShutdown              *runtimeShutdownState
 	runtimeClosed                chan struct{}
@@ -434,6 +431,8 @@ type openCodeServer struct {
 	waitDone                     chan error
 	containmentGenerationCleanup func() error
 	sessionCarrierCleanup        func() error
+	sessionCarrierBroker         *sessionCarrierBroker
+	sessionCarrierReference      string
 	pure                         bool
 
 	streamMu    sync.Mutex
@@ -1335,6 +1334,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		waitDone:                     waitDone,
 		containmentGenerationCleanup: releaseContainmentGeneration,
 		sessionCarrierCleanup:        sessionCarrierCleanup,
+		sessionCarrierBroker:         sessionCarrier.Broker,
 		pure:                         options.Pure,
 	}
 	sessionCarrierCleanup = nil
@@ -1367,6 +1367,10 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 		if carrierErr != nil {
 			return nil, errors.Join(carrierErr, server.Shutdown(ctx))
+		}
+
+		if eraseErr := eraseSessionCarrierBootstrap(sessionCarrier); eraseErr != nil {
+			return nil, errors.Join(eraseErr, server.Shutdown(ctx))
 		}
 	}
 
@@ -1498,6 +1502,8 @@ func (s *openCodeServer) Close(ctx context.Context) error {
 		return nil
 	}
 
+	s.releaseSessionCarrier()
+
 	if err := s.disconnectMCP(ctx); err != nil {
 		return err
 	}
@@ -1507,6 +1513,10 @@ func (s *openCodeServer) Close(ctx context.Context) error {
 	s.scopeClosed = true
 
 	return nil
+}
+
+func (s *openCodeServer) releaseSessionCarrier() {
+	s.sessionCarrierBroker.remove(s.sessionCarrierReference)
 }
 
 func (s *openCodeServer) Shutdown(context.Context) error {
@@ -1553,6 +1563,9 @@ func (s *openCodeServer) shutdownRuntime() error {
 	}
 
 	var err error
+	if s.sessionCarrierBroker != nil {
+		err = errors.Join(err, s.sessionCarrierBroker.Close())
+	}
 
 	if s.cmd != nil && s.cmd.Process != nil {
 		process := s.process
@@ -1688,6 +1701,24 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		return nil, errors.New("opencode pure mode does not support the addressed session carrier")
 	}
 
+	carrierReference := ""
+
+	if !s.pure {
+		if s.sessionCarrierBroker == nil {
+			return nil, errors.New("opencode session carrier broker is unavailable")
+		}
+
+		var err error
+
+		carrierReference, err = s.sessionCarrierBroker.put(sessionCarrierPayload{
+			Env:           options.Env,
+			ExtraPathDirs: options.ExtraPathDirs,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("register OpenCode session carrier: %w", err)
+		}
+	}
+
 	scopeCtx, cancel := context.WithCancel(context.Background())
 	scope := &openCodeServer{
 		httpClient: s.httpClient, baseURL: s.baseURL, username: s.username,
@@ -1698,14 +1729,15 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		events:                     make(chan Event, 256), errs: make(chan error, 8),
 		closed: make(chan struct{}), directory: options.Directory,
 		scopeCancel: cancel, runtimeShutdown: s.runtimeShutdown, runtimeClosed: s.runtimeClosed,
-		runtimeExited: s.runtimeExited,
-		sessionEnv:    maps.Clone(options.Env),
-		extraPathDirs: append([]string(nil), options.ExtraPathDirs...),
-		pure:          s.pure,
+		runtimeExited:           s.runtimeExited,
+		sessionCarrierBroker:    s.sessionCarrierBroker,
+		sessionCarrierReference: carrierReference,
+		pure:                    s.pure,
 	}
 
 	if err := scope.registerMCP(ctx, options.MCPServers); err != nil {
 		cancel()
+		scope.releaseSessionCarrier()
 
 		return nil, err
 	}
@@ -1943,14 +1975,8 @@ func (s *openCodeServer) sessionCarrierMetadata(metadata map[string]any) map[str
 		result = map[string]any{}
 	}
 
-	env := make(map[string]any, len(s.sessionEnv))
-	for key, value := range s.sessionEnv {
-		env[key] = value
-	}
-
 	result[sessionCarrierMetadataKey] = map[string]any{
-		sessionCarrierEnvKey:  env,
-		sessionCarrierPathKey: append([]string{}, s.extraPathDirs...),
+		sessionCarrierRefKey: s.sessionCarrierReference,
 	}
 
 	return result

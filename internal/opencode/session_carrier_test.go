@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -26,10 +27,13 @@ import (
 func preserveSessionCarrierSeams(t *testing.T) {
 	t.Helper()
 	mkdirTemp, mkdirAll := sessionCarrierMkdirTemp, sessionCarrierMkdirAll
-	writeFile, handoff, randReader := sessionCarrierWriteFile, sessionCarrierHandoff, openCodeRandReader
+	writeFile, remove, handoff, randReader := sessionCarrierWriteFile, sessionCarrierRemove, sessionCarrierHandoff, openCodeRandReader
+	listen := sessionCarrierListen
 	t.Cleanup(func() {
 		sessionCarrierMkdirTemp, sessionCarrierMkdirAll = mkdirTemp, mkdirAll
 		sessionCarrierWriteFile, sessionCarrierHandoff, openCodeRandReader = writeFile, handoff, randReader
+		sessionCarrierRemove = remove
+		sessionCarrierListen = listen
 	})
 }
 
@@ -198,6 +202,12 @@ func TestMaterializeSessionCarrierPluginReportsEveryFailure(t *testing.T) {
 	require.ErrorContains(t, err, "generate OpenCode session carrier proof")
 	openCodeRandReader = randReader
 
+	sessionCarrierListen = func(string, string) (net.Listener, error) { return nil, want }
+	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
+	require.ErrorIs(t, err, want)
+	require.ErrorContains(t, err, "listen for OpenCode session carrier")
+	sessionCarrierListen = net.Listen
+
 	sessionCarrierMkdirAll = func(string, os.FileMode) error { return want }
 	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
 	require.ErrorIs(t, err, want)
@@ -229,18 +239,39 @@ func TestMaterializeSessionCarrierPluginReportsEveryFailure(t *testing.T) {
 	require.ErrorIs(t, err, want)
 }
 
+func TestSessionCarrierBootstrapUsesSeparateAuthorizationAndErasesIt(t *testing.T) {
+	preserveSessionCarrierSeams(t)
+	plugin, cleanup, err := materializeSessionCarrierPlugin(filepath.Join(t.TempDir(), "runtime"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, cleanup()) })
+	require.NotEqual(t, plugin.Proof.Token, plugin.Broker.token)
+
+	require.NoError(t, os.WriteFile(plugin.Proof.Path, []byte(plugin.Proof.Token), 0o600))
+	require.NoError(t, eraseSessionCarrierBootstrap(plugin))
+	require.NoFileExists(t, plugin.Path)
+	require.NoFileExists(t, plugin.Proof.Path)
+}
+
 func TestSessionCarrierPluginSourceRendersConstants(t *testing.T) {
 	source := sessionCarrierPluginSource(`/carrier/"quoted"/shell`, `/carrier/"quoted"/mark`,
 		sessionCarrierProof{
 			Path: `/carrier/"quoted"/loaded`, Token: "proof-token",
-		})
+		}, &sessionCarrierBroker{endpoint: "http://127.0.0.1:1234", token: "broker-token"})
 	require.Contains(t, source, `const SHELL_WRAPPER = "/carrier/\"quoted\"/shell"`)
 	require.Contains(t, source, `const PATH_MARK = "/carrier/\"quoted\"/mark"`)
 	require.Contains(t, source, `const PROOF_PATH = "/carrier/\"quoted\"/loaded"`)
 	require.Contains(t, source, `const PROOF_TOKEN = "proof-token"`)
+	require.Contains(t, source, `const BROKER_ENDPOINT = "http://127.0.0.1:1234"`)
+	require.Contains(t, source, `const BROKER_TOKEN = "broker-token"`)
 	require.Contains(t, source, `const NAMESPACE = "acp-go-opencode"`)
-	require.Contains(t, source, `const ENV_KEY = "env"`)
-	require.Contains(t, source, `const DIRS_KEY = "extraPathDirs"`)
+	require.Contains(t, source, `const REF_KEY = "ref"`)
+	require.Contains(t, source, `let proofPending = true`)
+	require.Contains(t, source, `if (proofPending) {`)
+	require.Contains(t, source, `proofPending = false`)
+	require.Contains(t, source, `"OPENCODE_SERVER_PASSWORD"`)
+	require.Contains(t, source, `"OPENCODE_CONFIG_CONTENT"`)
+	require.Contains(t, source, `"XDG_DATA_HOME"`)
+	require.Contains(t, source, `output.env[key] = ""`)
 
 	// The adapter owns no environment variable of its own at this boundary:
 	// both halves of what the wrapper needs travel as generated paths.
@@ -418,33 +449,29 @@ func TestPureScopeRejectsSessionCarrier(t *testing.T) {
 
 func TestSessionCarrierMetadataReplacesOnlyTheAdapterNamespace(t *testing.T) {
 	scope := &openCodeServer{
-		directory:     "/repo",
-		sessionEnv:    map[string]string{"WAGIE_API_TOKEN": "token-a", "EMPTY": ""},
-		extraPathDirs: []string{"/first", "/second", "/first"},
+		directory:               "/repo",
+		sessionCarrierReference: "current-reference",
 	}
 
 	metadata := scope.sessionCarrierMetadata(map[string]any{
 		"native":              "kept",
 		"acp-go-opencode-old": "kept too",
 		sessionCarrierMetadataKey: map[string]any{
-			sessionCarrierEnvKey:  map[string]any{"WAGIE_API_TOKEN": "stale"},
-			sessionCarrierPathKey: []any{"/stale"},
+			sessionCarrierRefKey: "stale-reference",
 		},
 	})
 
 	require.Equal(t, "kept", metadata["native"])
 	require.Equal(t, "kept too", metadata["acp-go-opencode-old"])
 	require.Equal(t, map[string]any{
-		sessionCarrierEnvKey:  map[string]any{"WAGIE_API_TOKEN": "token-a", "EMPTY": ""},
-		sessionCarrierPathKey: []string{"/first", "/second", "/first"},
+		sessionCarrierRefKey: "current-reference",
 	}, metadata[sessionCarrierMetadataKey])
 
-	// An empty carrier still publishes both halves, so a rebind that clears an
-	// operation cannot be read as a session that never had one.
+	// An empty reference still publishes the namespace, so a session without a
+	// registered carrier fails closed in the plugin.
 	empty := (&openCodeServer{directory: "/repo"}).sessionCarrierMetadata(nil)
 	require.Equal(t, map[string]any{
-		sessionCarrierEnvKey:  map[string]any{},
-		sessionCarrierPathKey: []string{},
+		sessionCarrierRefKey: "",
 	}, empty[sessionCarrierMetadataKey])
 }
 

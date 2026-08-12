@@ -49,6 +49,7 @@ func TestScopedRuntimeMCPAndSyncMethods(t *testing.T) {
 	client := &openCodeServer{
 		httpClient: server.Client(), baseURL: server.URL, events: make(chan Event, 1), errs: make(chan error, 1),
 		closed: make(chan struct{}), runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}), runtimeExited: runtimeExited,
+		sessionCarrierBroker: testSessionCarrierBroker(),
 	}
 	require.Equal(t, (<-chan struct{})(runtimeExited), client.RuntimeExited())
 	require.NoError(t, client.Close(context.Background()), "root Close is intentionally a no-op")
@@ -213,7 +214,11 @@ func TestScopeAndMCPFailureShapes(t *testing.T) {
 			writer.WriteHeader(http.StatusNoContent)
 		}))
 		t.Cleanup(server.Close)
-		client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL, runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{})}
+		client := &openCodeServer{
+			httpClient: server.Client(), baseURL: server.URL,
+			runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
+			sessionCarrierBroker: testSessionCarrierBroker(),
+		}
 		_, err := client.Scope(context.Background(), ScopeOptions{Directory: "/repo"})
 		require.ErrorContains(t, err, "first directory-scoped event")
 	})
@@ -224,6 +229,7 @@ func TestScopeAndMCPFailureShapes(t *testing.T) {
 				return nil, errors.New("dial failed")
 			})},
 			baseURL: "http://opencode.test", runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
+			sessionCarrierBroker: testSessionCarrierBroker(),
 		}
 		_, err := client.Scope(context.Background(), ScopeOptions{Directory: "/repo"})
 		require.ErrorContains(t, err, "directory event stream failed")
@@ -239,6 +245,7 @@ func TestScopeAndMCPFailureShapes(t *testing.T) {
 				return nil, request.Context().Err()
 			})},
 			baseURL: "http://opencode.test", runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
+			sessionCarrierBroker: testSessionCarrierBroker(),
 		}
 		_, err := client.Scope(ctx, ScopeOptions{Directory: "/repo"})
 		require.ErrorIs(t, err, context.Canceled)

@@ -134,6 +134,7 @@ printf 'RESOLVED=%s\n' "$(command -v ` + carrierProbeTool + `)"
 type nativeCarrierProbe struct {
 	runtime    Client
 	executable string
+	root       string
 	work       string
 	shadow     string
 	first      string
@@ -153,6 +154,7 @@ func startNativeCarrierRuntime(t *testing.T) nativeCarrierProbe {
 
 	probe := nativeCarrierProbe{
 		executable: executable,
+		root:       root,
 		work:       filepath.Join(root, "work"),
 		shadow:     filepath.Join(home, "shadow"),
 		first:      filepath.Join(root, "first"),
@@ -192,6 +194,86 @@ func startNativeCarrierRuntime(t *testing.T) nativeCarrierProbe {
 	probe.runtime = runtime
 
 	return probe
+}
+
+func TestNativeCarrierDoesNotPersistOperationEnvironment(t *testing.T) {
+	probe := startNativeCarrierRuntime(t)
+	const operationValue = "operation-capability-must-not-persist"
+	brokerAuthorization := probe.runtime.(*openCodeServer).sessionCarrierBroker.token
+
+	scope, sessionID := probe.session(t, map[string]string{
+		"WAGIE_API_TOKEN":          operationValue,
+		"SECOND_SECRET":            "second-operation-value-must-not-persist",
+		"OPENCODE_SERVER_PASSWORD": "carrier-must-not-restore-private-runtime-env",
+	})
+	scopedServer := scope.(*openCodeServer)
+	require.NotEmpty(t, scopedServer.sessionCarrierReference)
+
+	output, err := runNativeShell(t.Context(), t, scope, sessionID,
+		`test -n "$WAGIE_API_TOKEN" && test -n "$SECOND_SECRET" && `+
+			`test -z "${OPENCODE_CONFIG_CONTENT:-}" && test -z "${OPENCODE_PID:-}" && `+
+			`test -z "${OPENCODE_SERVER_PASSWORD:-}" && test -z "${OPENCODE_SERVER_USERNAME:-}" && `+
+			`test -z "${XDG_CONFIG_HOME:-}" && test -z "${XDG_DATA_HOME:-}" && printf 'CARRIER=present\n'`)
+	require.NoError(t, err)
+	require.Equal(t, "present", carrierProbeField(t, output, "CARRIER"))
+	require.NoError(t, scope.Close(t.Context()))
+	require.NoError(t, probe.runtime.Shutdown(t.Context()))
+
+	nativeLog, err := os.ReadFile(filepath.Join(scopedServer.xdg.Data, "opencode", "log", "opencode.log"))
+	require.NoError(t, err)
+	require.NotContains(t, string(nativeLog), operationValue)
+	require.NotContains(t, string(nativeLog), "second-operation-value-must-not-persist")
+
+	require.NoError(t, filepath.WalkDir(probe.root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+
+		require.NotContains(t, string(content), operationValue, "operation environment persisted in %s", path)
+		require.NotContains(t, string(content), "second-operation-value-must-not-persist",
+			"operation environment persisted in %s", path)
+		require.NotContains(t, string(content), brokerAuthorization,
+			"broker authorization persisted in %s", path)
+
+		return nil
+	}))
+}
+
+func TestNativeCarrierCannotDrivePeerShellOrReadPeerBroker(t *testing.T) {
+	probe := startNativeCarrierRuntime(t)
+	firstScope, firstID := probe.session(t, map[string]string{"WAGIE_API_TOKEN": "first-bearer"})
+	secondScope, secondID := probe.session(t, map[string]string{"WAGIE_API_TOKEN": "peer-bearer"})
+	peer := secondScope.(*openCodeServer)
+	root := probe.runtime.(*openCodeServer)
+	peerResponse := filepath.Join(probe.root, "peer-shell-response")
+	brokerResponse := filepath.Join(probe.root, "peer-broker-response")
+	command := "peer_status=$(/usr/bin/curl -sS -o " + nativeShellWord(peerResponse) +
+		" -w '%{http_code}' -u \"${OPENCODE_SERVER_USERNAME:-}:${OPENCODE_SERVER_PASSWORD:-}\"" +
+		" -H 'Content-Type: application/json' --data '{\"command\":\"printf PEER_SHELL_REACHED\",\"agent\":\"build\"}' " +
+		nativeShellWord(root.baseURL+"/session/"+url.PathEscape(secondID)+"/shell") + "); " +
+		"broker_status=$(/usr/bin/curl -sS -o " + nativeShellWord(brokerResponse) +
+		" -w '%{http_code}' -H 'Authorization: Bearer proof-token-cannot-authorize' " +
+		nativeShellWord(root.sessionCarrierBroker.endpoint+sessionCarrierRoute+peer.sessionCarrierReference) + "); " +
+		"test \"$peer_status\" = 401 && test \"$broker_status\" = 401 && " +
+		"! grep -q PEER_SHELL_REACHED " + nativeShellWord(peerResponse) + " && " +
+		"! grep -q peer-bearer " + nativeShellWord(brokerResponse) + " && printf 'DENIED=yes\\n'"
+
+	output, err := runNativeShell(t.Context(), t, firstScope, firstID, command)
+	require.NoError(t, err)
+	require.Equal(t, "yes", carrierProbeField(t, output, "DENIED"))
+	requireNoRuntimeWideCarrierShellState(t, probe.runtime)
+}
+
+func nativeShellWord(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func (p nativeCarrierProbe) session(t *testing.T, env map[string]string, dirs ...string) (Client, string) {
@@ -923,9 +1005,9 @@ func TestNativeCarrierKeepsTwoWorkspaceScopesApartUnderLoad(t *testing.T) {
 }
 
 // requireNoRuntimeWideCarrierShellState walks the carrier's own generated tree
-// and requires it to hold only the module, the probe directory, and the
-// wrapper. Any other file there would be a runtime-wide value that the next
-// workspace scope to resolve its configuration could overwrite.
+// and requires it to hold only the probe directory and wrapper. The bootstrap
+// module and proof are erased after load so no live broker authorization stays
+// on disk.
 func requireNoRuntimeWideCarrierShellState(t *testing.T, runtime Client) {
 	t.Helper()
 
@@ -955,10 +1037,9 @@ func requireNoRuntimeWideCarrierShellState(t *testing.T, runtime Client) {
 	}))
 
 	require.ElementsMatch(t,
-		[]string{".", sessionCarrierPluginFileName, sessionCarrierProofFileName,
-			sessionCarrierProbeDirName, sessionCarrierShellName},
+		[]string{".", sessionCarrierProbeDirName, sessionCarrierShellName},
 		found,
-		"the carrier tree must hold no runtime-wide shell state")
+		"the loaded runtime must retain neither broker authorization nor bootstrap proof")
 }
 
 // TestNativeRuntimeRefusesACarrierPluginItCannotLoad is the acceptance proof for
