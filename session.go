@@ -1163,7 +1163,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 			return s.agent.closeDirectoryScope(client, releaseDirectory, generation)
 		}
 
-		if validateErr := validateModel(ctx, client, model, modelFieldSessionMeta); validateErr != nil {
+		if validateErr := validateStartupModel(ctx, client, model, modelFieldSessionMeta); validateErr != nil {
 			current := s.agent.runtimeGenerationIsCurrent(generation)
 
 			closeErr := releaseCandidate()

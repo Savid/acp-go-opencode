@@ -54,6 +54,7 @@ const (
 	RuntimeStartupSpawn         RuntimeStartupStage = "spawn"
 	RuntimeStartupReadiness     RuntimeStartupStage = "readiness"
 	RuntimeStartupConfiguration RuntimeStartupStage = "configuration"
+	RuntimeStartupCarrier       RuntimeStartupStage = "carrier"
 	RuntimeStartupSession       RuntimeStartupStage = "session"
 )
 

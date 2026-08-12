@@ -294,7 +294,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 	opencodeMeta := map[string]any{
 		"fork": map[string]any{
 			"unstable":       true,
-			"method":         ForkSessionMethod,
+			jsonFieldMethod:  ForkSessionMethod,
 			jsonFieldRequest: "acp.UnstableForkSessionRequest JSON payload only",
 			"response":       "acp.UnstableForkSessionResponse JSON payload only",
 		},
@@ -304,7 +304,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 			"tracks":       "in-progress ACP elicitation RFD",
 		},
 		rawEventCapabilityKey: map[string]any{
-			"method":         RawEventMethod,
+			jsonFieldMethod:  RawEventMethod,
 			"enabledBy":      rawEventEnabledByPath,
 			"maxBytes":       rawEventMaxBytes,
 			"defaultEnabled": false,

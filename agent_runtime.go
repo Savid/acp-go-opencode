@@ -399,6 +399,11 @@ func (a *Agent) startSharedRuntime(
 ) (opencode.Client, func(), func(), error) {
 	hooks := a.options.RuntimeResourceHooks
 
+	var (
+		startupFailureMu    sync.Mutex
+		startupFailureStage = SessionStartupRuntimeStart
+	)
+
 	nativeOwnedXDG := a.options.Home != "" && a.options.ProcessIsolation != nil
 	if nativeOwnedXDG {
 		if err := validateNativeOwnedDirectory(a.options.Home, a.options.ProcessIsolation); err != nil {
@@ -474,6 +479,12 @@ func (a *Agent) startSharedRuntime(
 			observeRuntimeProcessSnapshot(processCtx, hooks, RuntimeProcessKind(kind), count)
 		},
 		ObserveStartupStage: func(stageCtx context.Context, lifecycle, stage string, elapsed time.Duration, stageErr error) {
+			if RuntimeStartupStage(stage) == RuntimeStartupCarrier && stageErr != nil {
+				startupFailureMu.Lock()
+				startupFailureStage = SessionStartupCarrierProof
+				startupFailureMu.Unlock()
+			}
+
 			observe := hooks.ObserveStartupStage
 			if observe != nil {
 				observe(stageCtx, RuntimeResourceKind(lifecycle), RuntimeStartupStage(stage), elapsed, stageErr)
@@ -483,7 +494,11 @@ func (a *Agent) startSharedRuntime(
 	if err != nil {
 		err = a.cleanupRuntimeResources(err, nativeRelease, xdgScratchRelease)
 
-		return nil, nil, nil, err
+		startupFailureMu.Lock()
+		stage := startupFailureStage
+		startupFailureMu.Unlock()
+
+		return nil, nil, nil, wrapSessionStartupError(stage, err)
 	}
 
 	return runtime, nativeRelease, xdgScratchRelease, nil

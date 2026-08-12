@@ -269,6 +269,10 @@ func requestError(err error) *acp.RequestError {
 		return acp.NewRequestCancelled(map[string]any{jsonFieldError: err.Error()})
 	}
 
+	if data, ok := sessionStartupErrorData(err); ok {
+		return acp.NewInternalError(data)
+	}
+
 	return acp.NewInternalError(map[string]any{jsonFieldError: err.Error()})
 }
 

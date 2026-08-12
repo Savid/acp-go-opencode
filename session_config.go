@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 
@@ -83,6 +84,20 @@ func validateModel(ctx context.Context, client opencode.Client, value string, fi
 	}
 
 	return invalidModel(value, field)
+}
+
+func validateStartupModel(ctx context.Context, client opencode.Client, value string, field string) error {
+	err := validateModel(ctx, client, value, field)
+	if err == nil {
+		return nil
+	}
+
+	var requestErr *acp.RequestError
+	if errors.As(err, &requestErr) {
+		return err
+	}
+
+	return wrapSessionStartupError(SessionStartupCatalog, err)
 }
 
 func invalidModel(value string, field string) error {

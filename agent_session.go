@@ -59,7 +59,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
-	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
+	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
 		return acp.NewSessionResponse{}, errors.Join(validateErr, closeErr)
@@ -72,7 +72,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	if err != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
+		return acp.NewSessionResponse{}, errors.Join(wrapSessionStartupError(SessionStartupNativeSessionCreate, err), closeErr)
 	}
 
 	idmap := idmapRecord{
@@ -231,7 +231,7 @@ func (a *Agent) loadOrResumeSession(
 		return nil, err
 	}
 
-	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
+	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
 		return nil, errors.Join(validateErr, closeErr)
@@ -467,7 +467,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		return acp.UnstableForkSessionResponse{}, err
 	}
 
-	if validateErr := validateModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
+	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
 		return acp.UnstableForkSessionResponse{}, errors.Join(validateErr, closeErr)
@@ -617,7 +617,7 @@ func (a *Agent) newOpenCodeClient(
 		if err != nil {
 			releaseDirectory()
 
-			return nil, nil, 0, err
+			return nil, nil, 0, wrapSessionStartupError(SessionStartupRuntimeStart, err)
 		}
 
 		configurationStarted := time.Now()
@@ -628,15 +628,17 @@ func (a *Agent) newOpenCodeClient(
 			return client, releaseDirectory, generation, nil
 		}
 
+		startupErr := wrapSessionStartupError(SessionStartupScope, err)
+
 		current := a.runtimeGenerationIsCurrent(generation)
 		if !current || !errors.Is(err, opencode.ErrMCPDisconnectUnproven) {
 			releaseDirectory()
 		} else {
-			a.quarantineRuntimeConfiguration(generation, err)
+			a.quarantineRuntimeConfiguration(generation, startupErr)
 		}
 
 		if current {
-			return nil, nil, 0, err
+			return nil, nil, 0, startupErr
 		}
 
 		if err := ctx.Err(); err != nil {
