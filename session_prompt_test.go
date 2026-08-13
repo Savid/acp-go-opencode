@@ -1108,7 +1108,7 @@ func TestPromptServerReconnectReconcilesPendingPermissionAndQuestion(t *testing.
 	conn := newRecordingAgentClient()
 	agent := NewAgent()
 	agent.setAgentClient(conn)
-	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 	session := testSession(agent, client)
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -1201,7 +1201,7 @@ func TestPromptServerReconnectReconcileFailures(t *testing.T) {
 		{
 			name: "question error",
 			setup: func(conn *recordingAgentClient, agent *Agent) chan struct{} {
-				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 				conn.elicitErr = errors.New("elicitation failed")
 
 				return nil
@@ -1222,7 +1222,7 @@ func TestPromptServerReconnectReconcileFailures(t *testing.T) {
 		{
 			name: "question cancelled",
 			setup: func(conn *recordingAgentClient, agent *Agent) chan struct{} {
-				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 				conn.elicitationStarted = make(chan struct{}, 1)
 				conn.elicitationRelease = make(chan struct{})
 
@@ -1340,7 +1340,7 @@ func TestPromptCancelDuringInFlightPermissionAndQuestion(t *testing.T) {
 		{
 			name: "question",
 			setup: func(agent *Agent) {
-				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 			},
 			sendEvent: func(client *fakeOpenCodeClient) {
 				client.events <- opencode.Event{
@@ -1494,7 +1494,7 @@ func TestPromptReconcileCancelledBeforeSend(t *testing.T) {
 				client.pendingQuestions = []opencode.QuestionRequest{{ID: "question", SessionID: "native-1"}}
 				conn.elicitationStarted = make(chan struct{}, 1)
 				conn.elicitationRelease = make(chan struct{})
-				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+				agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 			},
 			waitStart: func(ctx context.Context, t *testing.T, conn *recordingAgentClient) {
 				t.Helper()
@@ -1715,7 +1715,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		conn := newRecordingAgentClient()
 		conn.elicitErr = context.Canceled
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1737,7 +1737,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		conn := newRecordingAgentClient()
 		conn.elicitation = acp.NewUnstableCreateElicitationResponseDecline()
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		if err := session.handleQuestion(context.Background(), opencode.QuestionRequest{ID: "question", SessionID: "native-1"}); err == nil {
@@ -1750,7 +1750,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		conn := newRecordingAgentClient()
 		conn.elicitation = acp.NewUnstableCreateElicitationResponseDecline()
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1771,7 +1771,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		conn.elicitationRelease = make(chan struct{})
 		conn.elicitationIgnoreContext = true
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		turnCtx := session.beginTurn(context.Background())
@@ -1797,7 +1797,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		conn := newRecordingAgentClient()
 		conn.elicitErr = errors.New("elicitation failed")
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		err := session.handleQuestion(context.Background(), opencode.QuestionRequest{ID: "question", SessionID: "native-1", ReplyRoute: opencode.QuestionRouteAPI})
@@ -1815,7 +1815,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		conn := newRecordingAgentClient()
 		conn.elicitErr = errors.New("elicitation failed")
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		err := session.handleQuestion(context.Background(), opencode.QuestionRequest{ID: "question", SessionID: "native-1"})
@@ -1828,7 +1828,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		conn := newRecordingAgentClient()
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1849,7 +1849,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		client.replyErr = errors.New("reject failed")
 		conn := newRecordingAgentClient()
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1868,7 +1868,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		conn.elicitationRelease = make(chan struct{})
 		conn.elicitationIgnoreContext = true
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		turnCtx := session.beginTurn(context.Background())
@@ -1897,7 +1897,7 @@ func TestQuestionCancelledReplyBranches(t *testing.T) {
 		conn.elicitationRelease = make(chan struct{})
 		conn.elicitationIgnoreContext = true
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
 		session := testSession(agent, client)
 		turnCtx := session.beginTurn(context.Background())
@@ -4008,7 +4008,7 @@ func TestPromptCancelAndLoadRejectRemainingRouteAndMCPBranches(t *testing.T) {
 
 func TestPromptBacklogQuestionFailsClosedBeforeNativeTurn(t *testing.T) {
 	agent := NewAgent()
-	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
 	client := newFakeOpenCodeClient()
@@ -4028,7 +4028,7 @@ func TestPromptBacklogQuestionFailsClosedBeforeNativeTurn(t *testing.T) {
 func TestRunPromptTurnEveryCancellationFenceFailureReturn(t *testing.T) {
 	t.Run("cancelled reconciliation", func(t *testing.T) {
 		agent := NewAgent()
-		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{}
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		connection := newRecordingAgentClient()
 		connection.elicitErr = errors.New("client stopped")
 		agent.setAgentClient(connection)

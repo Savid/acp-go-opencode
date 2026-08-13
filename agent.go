@@ -301,7 +301,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		"elicitation": map[string]any{
 			"unstable":     true,
 			jsonFieldScope: string(RuntimeResourceSession),
-			"tracks":       "in-progress ACP elicitation RFD",
+			"tracks":       "ACP v1 elicitation",
 		},
 		rawEventCapabilityKey: map[string]any{
 			jsonFieldMethod:  RawEventMethod,
@@ -561,7 +561,7 @@ func (a *Agent) clientSupportsFormElicitation() bool {
 		return false
 	}
 
-	return caps.Form != nil || caps.Url == nil
+	return caps.Form != nil
 }
 
 func selectPositionEncoding(values []acp.PositionEncodingKind) acp.PositionEncodingKind {

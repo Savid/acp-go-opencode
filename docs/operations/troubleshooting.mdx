@@ -81,9 +81,10 @@ The minimum is an adapter constant and is not configurable.
 
 The native server raises a `question.asked` event for each elicitation-style
 prompt a tool run needs answered. The adapter forwards it as an ACP
-elicitation only when the client advertised elicitation form support at
-`initialize` and the question names the tool call the active turn just
-started; it rejects the native question outright in either failing case,
+elicitation only when the client explicitly advertised a non-null `form` mode
+at `initialize` and the question names the tool call the active turn just
+started; an omitted, `null`, or empty `elicitation: {}` capability supports no
+mode. The adapter rejects the native question outright in either failing case,
 without waiting on any client answer.
 
 A client that never advertised the elicitation form capability never sees a

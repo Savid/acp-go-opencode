@@ -13,20 +13,22 @@ Native questions are opt-in. Enable the mapping with the
 `-opencode-question-tool` flag (or `WithOpenCodeQuestionTool(true)`), which
 turns on OpenCode's native question tool. When `opencode serve` then emits a
 question request, the adapter maps it to an ACP `elicitation/create` call using
-the unstable form-elicitation shape.
+the stable ACP v1 form-elicitation shape.
 
 ## Capability gating
 
 The adapter records the client's capabilities during `initialize` and only sends
-an elicitation request when the client advertised form-elicitation support. The
-native question is rejected deterministically when:
+an elicitation request when the client explicitly advertised a non-null `form`
+mode. An omitted or `null` top-level elicitation capability and an empty
+`elicitation: {}` object advertise no modes. The native question is rejected
+deterministically when:
 
 - the client did not advertise form elicitation, or
 - the client declines or cancels the request.
 
 <Note>
-Form elicitation is an unstable ACP surface, advertised under
-`_meta.opencode.elicitation` in the initialize response. A client that does not
-support it never receives an elicitation request; the native question simply
-fails closed.
+Form elicitation is stable ACP v1. The separate
+`_meta.opencode.elicitation` discovery descriptor in the initialize response is
+private and unstable. A client that does not explicitly advertise form support
+never receives an elicitation request; the native question simply fails closed.
 </Note>

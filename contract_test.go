@@ -38,6 +38,10 @@ func TestInitializeCapabilitiesHardCutover(t *testing.T) {
 		t.Fatal("embedded context capability missing")
 	}
 	meta, _ := resp.AgentCapabilities.Meta[opencodeMetaKey].(map[string]any)
+	elicitation, _ := meta["elicitation"].(map[string]any)
+	if elicitation["unstable"] != true || elicitation["tracks"] != "ACP v1 elicitation" {
+		t.Fatalf("elicitation meta = %#v", elicitation)
+	}
 	structured, _ := meta["structuredOutput"].(map[string]any)
 	if structured["config"] != "_meta.opencode.options.outputSchema" ||
 		structured["result"] != "_meta.opencode.structuredOutput" ||
@@ -46,6 +50,34 @@ func TestInitializeCapabilitiesHardCutover(t *testing.T) {
 	}
 	if store, _ := meta["sessionStore"].(map[string]any); store["format"] != SessionStoreFormat {
 		t.Fatalf("sessionStore meta = %#v", store)
+	}
+}
+
+func TestClientElicitationCapabilityGating(t *testing.T) {
+	t.Parallel()
+
+	var explicitNull acp.ElicitationCapabilities
+	require.NoError(t, json.Unmarshal([]byte(`{"form":null,"url":null}`), &explicitNull))
+
+	for _, test := range []struct {
+		name     string
+		caps     *acp.ElicitationCapabilities
+		wantForm bool
+	}{
+		{name: "nil or omitted top level", caps: nil, wantForm: false},
+		{name: "empty object", caps: &acp.ElicitationCapabilities{}, wantForm: false},
+		{name: "both modes explicit null", caps: &explicitNull, wantForm: false},
+		{name: "url only", caps: &acp.ElicitationCapabilities{Url: &acp.ElicitationUrlCapabilities{}}, wantForm: false},
+		{name: "form only", caps: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}, wantForm: true},
+		{name: "form and url", caps: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}, Url: &acp.ElicitationUrlCapabilities{}}, wantForm: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := NewAgent()
+			agent.clientCapabilities.Elicitation = test.caps
+			require.Equal(t, test.wantForm, agent.clientSupportsFormElicitation())
+		})
 	}
 }
 
