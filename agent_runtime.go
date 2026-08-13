@@ -400,19 +400,26 @@ func (a *Agent) startSharedRuntime(
 	hooks := a.options.RuntimeResourceHooks
 
 	var (
-		startupFailureMu    sync.Mutex
-		startupFailureStage = SessionStartupRuntimeStart
+		startupFailureMu           sync.Mutex
+		startupFailureStage        = SessionStartupRuntimeStart
+		startupFailureRuntimePhase = SessionStartupRuntimePhaseResources
 	)
+
+	wrapRuntimeResourceError := func(err error) error {
+		return wrapSessionRuntimeStartupError(SessionStartupRuntimePhaseResources, err)
+	}
 
 	nativeOwnedXDG := a.options.Home != "" && a.options.ProcessIsolation != nil
 	if nativeOwnedXDG {
 		if err := validateNativeOwnedDirectory(a.options.Home, a.options.ProcessIsolation); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, wrapRuntimeResourceError(err)
 		}
 
 		for path := range a.options.SeedFiles {
 			if path != "opencode.json" {
-				return nil, nil, nil, fmt.Errorf("seed file %q is unsupported with a native-owned OpenCode runtime home", path)
+				return nil, nil, nil, wrapRuntimeResourceError(
+					fmt.Errorf("seed file %q is unsupported with a native-owned OpenCode runtime home", path),
+				)
 			}
 		}
 	}
@@ -424,7 +431,7 @@ func (a *Agent) startSharedRuntime(
 
 		xdgScratchRelease, err = acquireRuntimeResource(ctx, hooks.ReserveScratchRoot, RuntimeResourceRuntime)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, wrapRuntimeResourceError(err)
 		}
 	}
 
@@ -432,7 +439,7 @@ func (a *Agent) startSharedRuntime(
 	if err != nil {
 		err = errors.Join(err, a.cleanupRuntimeResources(nil, nil, xdgScratchRelease))
 
-		return nil, nil, nil, err
+		return nil, nil, nil, wrapRuntimeResourceError(err)
 	}
 
 	xdg := opencode.RuntimeXDGDirs(a.homeRoot())
@@ -441,7 +448,7 @@ func (a *Agent) startSharedRuntime(
 		if err != nil {
 			err = errors.Join(err, a.cleanupRuntimeResources(nil, nativeRelease, xdgScratchRelease))
 
-			return nil, nil, nil, err
+			return nil, nil, nil, wrapRuntimeResourceError(err)
 		}
 	}
 
@@ -451,6 +458,8 @@ func (a *Agent) startSharedRuntime(
 	}
 
 	a.observe.RecordOpenCodeProcessStart(ctx)
+
+	startupFailureRuntimePhase = SessionStartupRuntimePhaseConfiguration
 
 	runtime, err := factory(ctx, opencode.StartOptions{
 		Root: a.homeRoot(), ControlRoot: opencode.ControlRootForXDG(a.homeRoot()), ScratchParent: scratchParent(a.options.ScratchDir),
@@ -479,11 +488,24 @@ func (a *Agent) startSharedRuntime(
 			observeRuntimeProcessSnapshot(processCtx, hooks, RuntimeProcessKind(kind), count)
 		},
 		ObserveStartupStage: func(stageCtx context.Context, lifecycle, stage string, elapsed time.Duration, stageErr error) {
-			if RuntimeStartupStage(stage) == RuntimeStartupCarrier && stageErr != nil {
-				startupFailureMu.Lock()
+			startupFailureMu.Lock()
+			switch RuntimeStartupStage(stage) {
+			case RuntimeStartupConfiguration:
+				startupFailureRuntimePhase = SessionStartupRuntimePhaseConfiguration
+				if stageErr == nil {
+					startupFailureRuntimePhase = SessionStartupRuntimePhaseSpawn
+				}
+			case RuntimeStartupSpawn:
+				startupFailureRuntimePhase = SessionStartupRuntimePhaseSpawn
+				if stageErr == nil {
+					startupFailureRuntimePhase = SessionStartupRuntimePhaseReadiness
+				}
+			case RuntimeStartupReadiness:
+				startupFailureRuntimePhase = SessionStartupRuntimePhaseReadiness
+			case RuntimeStartupCarrier:
 				startupFailureStage = SessionStartupCarrierProof
-				startupFailureMu.Unlock()
 			}
+			startupFailureMu.Unlock()
 
 			observe := hooks.ObserveStartupStage
 			if observe != nil {
@@ -496,9 +518,14 @@ func (a *Agent) startSharedRuntime(
 
 		startupFailureMu.Lock()
 		stage := startupFailureStage
+		runtimePhase := startupFailureRuntimePhase
 		startupFailureMu.Unlock()
 
-		return nil, nil, nil, wrapSessionStartupError(stage, err)
+		if stage == SessionStartupCarrierProof {
+			return nil, nil, nil, wrapSessionStartupError(stage, err)
+		}
+
+		return nil, nil, nil, wrapSessionRuntimeStartupError(runtimePhase, err)
 	}
 
 	return runtime, nativeRelease, xdgScratchRelease, nil

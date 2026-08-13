@@ -167,7 +167,7 @@ vocabulary already populated:
 | `CancelRequest` | `session/cancel` for the same required turn nonce. |
 | `SetConfigOptionRequest` / `SetModelRequest` | `session/set_config_option`. |
 | `StdioMCPServer` / `HTTPMCPServer` | MCP server definitions. |
-| `SessionStartupFailureFromError` | Read the values-free startup stage and optional allowlisted loopback HTTP metadata from an in-process or ACP error. |
+| `SessionStartupFailureFromError` | Read the values-free startup stage, required runtime phase for `runtime_start`, and optional allowlisted loopback HTTP metadata from an in-process or ACP error. |
 
 `PromptRequest`, `TextPromptRequest`, and `CancelRequest` stamp route metadata
 only for a non-empty `turnNonce` of at most 4096 bytes. An invalid nonce leaves

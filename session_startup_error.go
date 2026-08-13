@@ -14,6 +14,7 @@ const (
 	sessionStartupErrorTag              = "opencode_session_start_failed"
 	jsonFieldHTTP                       = "http"
 	jsonFieldPathClass                  = "pathClass"
+	jsonFieldRuntimePhase               = "runtimePhase"
 	sessionStartupPathRuntimeHealth     = "runtime_health"
 	sessionStartupPathRuntimeContract   = "runtime_contract"
 	sessionStartupPathRuntimeConfig     = "runtime_configuration"
@@ -39,6 +40,16 @@ const (
 	SessionStartupNativeSessionCreate SessionStartupStage = "native_session_create"
 )
 
+// SessionStartupRuntimePhase identifies a values-free runtime construction boundary.
+type SessionStartupRuntimePhase string
+
+const (
+	SessionStartupRuntimePhaseResources     SessionStartupRuntimePhase = "resources"
+	SessionStartupRuntimePhaseConfiguration SessionStartupRuntimePhase = "configuration"
+	SessionStartupRuntimePhaseSpawn         SessionStartupRuntimePhase = "spawn"
+	SessionStartupRuntimePhaseReadiness     SessionStartupRuntimePhase = "readiness"
+)
+
 // SessionStartupHTTPFailure identifies an allowlisted loopback HTTP operation.
 type SessionStartupHTTPFailure struct {
 	Method     string `json:"method"`
@@ -48,8 +59,9 @@ type SessionStartupHTTPFailure struct {
 
 // SessionStartupFailure is the safe diagnostic projection of a startup error.
 type SessionStartupFailure struct {
-	Stage SessionStartupStage        `json:"stage"`
-	HTTP  *SessionStartupHTTPFailure `json:"http,omitempty"`
+	Stage        SessionStartupStage        `json:"stage"`
+	RuntimePhase SessionStartupRuntimePhase `json:"runtimePhase,omitempty"`
+	HTTP         *SessionStartupHTTPFailure `json:"http,omitempty"`
 }
 
 type sessionStartupError struct {
@@ -62,6 +74,20 @@ func (e *sessionStartupError) Error() string { return e.err.Error() }
 func (e *sessionStartupError) Unwrap() error { return e.err }
 
 func wrapSessionStartupError(stage SessionStartupStage, err error) error {
+	if stage == SessionStartupRuntimeStart {
+		return wrapSessionRuntimeStartupError(SessionStartupRuntimePhaseResources, err)
+	}
+
+	return wrapSessionStartupFailure(SessionStartupFailure{Stage: stage}, err)
+}
+
+func wrapSessionRuntimeStartupError(phase SessionStartupRuntimePhase, err error) error {
+	return wrapSessionStartupFailure(SessionStartupFailure{
+		Stage: SessionStartupRuntimeStart, RuntimePhase: phase,
+	}, err)
+}
+
+func wrapSessionStartupFailure(failure SessionStartupFailure, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -76,19 +102,22 @@ func wrapSessionStartupError(stage SessionStartupStage, err error) error {
 		return err
 	}
 
-	return &sessionStartupError{
-		failure: SessionStartupFailure{Stage: stage, HTTP: safeSessionStartupHTTP(stage, err)},
-		err:     err,
-	}
+	failure.HTTP = safeSessionStartupHTTP(failure.Stage, failure.RuntimePhase, err)
+
+	return &sessionStartupError{failure: failure, err: err}
 }
 
-func safeSessionStartupHTTP(stage SessionStartupStage, err error) *SessionStartupHTTPFailure {
+func safeSessionStartupHTTP(
+	stage SessionStartupStage,
+	runtimePhase SessionStartupRuntimePhase,
+	err error,
+) *SessionStartupHTTPFailure {
 	var httpErr *opencode.HTTPError
 	if !errors.As(err, &httpErr) {
 		return nil
 	}
 
-	pathClass := safeSessionStartupHTTPPathClass(stage, httpErr.Method, httpErr.Path)
+	pathClass := safeSessionStartupHTTPPathClass(stage, runtimePhase, httpErr.Method, httpErr.Path)
 
 	if pathClass == "" || !sessionStartupHTTPFailureStatus(httpErr.StatusCode) {
 		return nil
@@ -101,9 +130,18 @@ func safeSessionStartupHTTP(stage SessionStartupStage, err error) *SessionStartu
 	}
 }
 
-func safeSessionStartupHTTPPathClass(stage SessionStartupStage, method, path string) string {
+func safeSessionStartupHTTPPathClass(
+	stage SessionStartupStage,
+	runtimePhase SessionStartupRuntimePhase,
+	method string,
+	path string,
+) string {
 	switch stage {
 	case SessionStartupRuntimeStart:
+		if runtimePhase != SessionStartupRuntimePhaseReadiness {
+			return ""
+		}
+
 		switch {
 		case method == http.MethodGet && path == sessionStartupRouteRuntimeHealth:
 			return sessionStartupPathRuntimeHealth
@@ -138,10 +176,15 @@ func sessionStartupHTTPFailureStatus(statusCode int) bool {
 	return statusCode >= 100 && statusCode <= 599 && (statusCode < 200 || statusCode >= 300)
 }
 
-func safeSessionStartupHTTPTuple(stage SessionStartupStage, method, pathClass string) bool {
+func safeSessionStartupHTTPTuple(
+	stage SessionStartupStage,
+	runtimePhase SessionStartupRuntimePhase,
+	method string,
+	pathClass string,
+) bool {
 	switch stage {
 	case SessionStartupRuntimeStart:
-		return method == http.MethodGet &&
+		return runtimePhase == SessionStartupRuntimePhaseReadiness && method == http.MethodGet &&
 			(pathClass == sessionStartupPathRuntimeHealth || pathClass == sessionStartupPathRuntimeContract)
 	case SessionStartupCarrierProof:
 		return method == http.MethodGet && pathClass == sessionStartupPathRuntimeConfig
@@ -167,6 +210,10 @@ func sessionStartupErrorData(err error) (map[string]any, bool) {
 		jsonFieldError: sessionStartupErrorTag,
 		jsonFieldStage: string(failure.Stage),
 	}
+	if failure.RuntimePhase != "" {
+		data[jsonFieldRuntimePhase] = string(failure.RuntimePhase)
+	}
+
 	if failure.HTTP != nil {
 		data[jsonFieldHTTP] = map[string]any{
 			jsonFieldMethod:     failure.HTTP.Method,
@@ -215,8 +262,20 @@ func sessionStartupFailureFromRequestError(requestErr *acp.RequestError) (Sessio
 
 	failure := SessionStartupFailure{Stage: stage}
 
+	rawRuntimePhase, runtimePhaseExists := data[jsonFieldRuntimePhase]
+	if stage == SessionStartupRuntimeStart {
+		runtimePhase, valid := sessionStartupRuntimePhase(rawRuntimePhase)
+		if !runtimePhaseExists || !valid {
+			return SessionStartupFailure{}, false
+		}
+
+		failure.RuntimePhase = runtimePhase
+	} else if runtimePhaseExists {
+		return SessionStartupFailure{}, false
+	}
+
 	if rawHTTP, exists := data[jsonFieldHTTP]; exists {
-		httpFailure, valid := sessionStartupHTTPFailure(stage, rawHTTP)
+		httpFailure, valid := sessionStartupHTTPFailure(stage, failure.RuntimePhase, rawHTTP)
 		if !valid {
 			return SessionStartupFailure{}, false
 		}
@@ -225,6 +284,21 @@ func sessionStartupFailureFromRequestError(requestErr *acp.RequestError) (Sessio
 	}
 
 	return failure, true
+}
+
+func sessionStartupRuntimePhase(value any) (SessionStartupRuntimePhase, bool) {
+	phase, ok := value.(string)
+	if !ok {
+		return "", false
+	}
+
+	switch SessionStartupRuntimePhase(phase) {
+	case SessionStartupRuntimePhaseResources, SessionStartupRuntimePhaseConfiguration,
+		SessionStartupRuntimePhaseSpawn, SessionStartupRuntimePhaseReadiness:
+		return SessionStartupRuntimePhase(phase), true
+	default:
+		return "", false
+	}
 }
 
 func sessionStartupStage(value any) (SessionStartupStage, bool) {
@@ -242,7 +316,11 @@ func sessionStartupStage(value any) (SessionStartupStage, bool) {
 	}
 }
 
-func sessionStartupHTTPFailure(stage SessionStartupStage, value any) (SessionStartupHTTPFailure, bool) {
+func sessionStartupHTTPFailure(
+	stage SessionStartupStage,
+	runtimePhase SessionStartupRuntimePhase,
+	value any,
+) (SessionStartupHTTPFailure, bool) {
 	fields, ok := value.(map[string]any)
 	if !ok {
 		return SessionStartupHTTPFailure{}, false
@@ -252,7 +330,8 @@ func sessionStartupHTTPFailure(stage SessionStartupStage, value any) (SessionSta
 	pathClass, pathOK := fields[jsonFieldPathClass].(string)
 	statusCode, statusOK := integerField(fields[jsonFieldStatusCode])
 
-	if !methodOK || !pathOK || !statusOK || !safeSessionStartupHTTPTuple(stage, method, pathClass) ||
+	if !methodOK || !pathOK || !statusOK ||
+		!safeSessionStartupHTTPTuple(stage, runtimePhase, method, pathClass) ||
 		!sessionStartupHTTPFailureStatus(statusCode) {
 		return SessionStartupHTTPFailure{}, false
 	}

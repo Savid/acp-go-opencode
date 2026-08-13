@@ -76,7 +76,9 @@ carries that prompt's exact route envelope.
 A startup failure returned over ACP has error code `-32603` and a values-free
 data payload tagged `opencode_session_start_failed`. Its `stage` is one of
 `runtime_start`, `carrier_proof`, `scope`, `catalog`, or
-`native_session_create`. When the cause is an allowlisted loopback HTTP
+`native_session_create`. A `runtime_start` failure also carries a required
+`runtimePhase` of `resources`, `configuration`, `spawn`, or `readiness`.
+When the cause is an allowlisted loopback HTTP
 operation, `http` contains only `method`, `pathClass`, and `statusCode`; native
 response bodies, URLs, queries, model names, configuration, and credentials are
 never included.

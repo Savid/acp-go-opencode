@@ -16,13 +16,15 @@ import (
 func TestSessionStartupFailureBoundaries(t *testing.T) {
 	secret := "startup-secret-must-not-cross-acp"
 	cases := []struct {
-		name  string
-		stage SessionStartupStage
-		run   func(*testing.T, error) error
+		name    string
+		failure SessionStartupFailure
+		run     func(*testing.T, error) error
 	}{
 		{
-			name:  "runtime start",
-			stage: SessionStartupRuntimeStart,
+			name: "runtime start",
+			failure: SessionStartupFailure{
+				Stage: SessionStartupRuntimeStart, RuntimePhase: SessionStartupRuntimePhaseConfiguration,
+			},
 			run: func(t *testing.T, failure error) error {
 				t.Helper()
 
@@ -37,8 +39,8 @@ func TestSessionStartupFailureBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name:  "carrier proof",
-			stage: SessionStartupCarrierProof,
+			name:    "carrier proof",
+			failure: SessionStartupFailure{Stage: SessionStartupCarrierProof},
 			run: func(t *testing.T, failure error) error {
 				t.Helper()
 
@@ -55,8 +57,8 @@ func TestSessionStartupFailureBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name:  "scope",
-			stage: SessionStartupScope,
+			name:    "scope",
+			failure: SessionStartupFailure{Stage: SessionStartupScope},
 			run: func(t *testing.T, failure error) error {
 				t.Helper()
 
@@ -70,8 +72,8 @@ func TestSessionStartupFailureBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name:  "catalog",
-			stage: SessionStartupCatalog,
+			name:    "catalog",
+			failure: SessionStartupFailure{Stage: SessionStartupCatalog},
 			run: func(t *testing.T, failure error) error {
 				t.Helper()
 
@@ -88,8 +90,8 @@ func TestSessionStartupFailureBoundaries(t *testing.T) {
 			},
 		},
 		{
-			name:  "native session create",
-			stage: SessionStartupNativeSessionCreate,
+			name:    "native session create",
+			failure: SessionStartupFailure{Stage: SessionStartupNativeSessionCreate},
 			run: func(t *testing.T, failure error) error {
 				t.Helper()
 
@@ -112,7 +114,7 @@ func TestSessionStartupFailureBoundaries(t *testing.T) {
 
 			failure, ok := SessionStartupFailureFromError(directErr)
 			require.True(t, ok)
-			require.Equal(t, SessionStartupFailure{Stage: test.stage}, failure)
+			require.Equal(t, test.failure, failure)
 			directDiagnostic, err := json.Marshal(failure)
 			require.NoError(t, err)
 			require.NotContains(t, string(directDiagnostic), secret)
@@ -121,7 +123,7 @@ func TestSessionStartupFailureBoundaries(t *testing.T) {
 			require.Equal(t, -32603, wireErr.Code)
 			failure, ok = SessionStartupFailureFromError(wireErr)
 			require.True(t, ok)
-			require.Equal(t, SessionStartupFailure{Stage: test.stage}, failure)
+			require.Equal(t, test.failure, failure)
 
 			encoded, err := json.Marshal(wireErr)
 			require.NoError(t, err)
@@ -130,18 +132,141 @@ func TestSessionStartupFailureBoundaries(t *testing.T) {
 	}
 }
 
+func TestSessionStartupRuntimePhaseLifecycle(t *testing.T) {
+	const secret = "runtime-phase-secret-must-not-cross-acp"
+
+	tests := []struct {
+		name     string
+		phase    SessionStartupRuntimePhase
+		resource bool
+		stages   []RuntimeStartupStage
+	}{
+		{name: "resources", phase: SessionStartupRuntimePhaseResources, resource: true},
+		{name: "configuration before callback", phase: SessionStartupRuntimePhaseConfiguration},
+		{name: "configuration failure", phase: SessionStartupRuntimePhaseConfiguration, stages: []RuntimeStartupStage{RuntimeStartupConfiguration}},
+		{name: "spawn failure", phase: SessionStartupRuntimePhaseSpawn, stages: []RuntimeStartupStage{RuntimeStartupConfiguration, RuntimeStartupSpawn}},
+		{name: "readiness failure", phase: SessionStartupRuntimePhaseReadiness, stages: []RuntimeStartupStage{RuntimeStartupConfiguration, RuntimeStartupSpawn, RuntimeStartupReadiness}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var agent *Agent
+			if test.resource {
+				agent = NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
+					ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+						return nil, errors.New(secret)
+					},
+				}))
+			} else {
+				agent = NewAgent(WithHome(t.TempDir()), func(options *Options) {
+					options.clientFactory = func(ctx context.Context, start opencode.StartOptions) (opencode.Client, error) {
+						for index, stage := range test.stages {
+							stageErr := error(nil)
+							if index == len(test.stages)-1 {
+								stageErr = errors.New(secret)
+							}
+							start.ObserveStartupStage(ctx, string(RuntimeResourceRuntime), string(stage), 0, stageErr)
+						}
+
+						return nil, errors.New(secret)
+					}
+				})
+			}
+
+			_, directErr := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir()))
+			require.ErrorContains(t, directErr, secret)
+
+			failure, ok := SessionStartupFailureFromError(directErr)
+			require.True(t, ok)
+			require.Equal(t, SessionStartupFailure{
+				Stage: SessionStartupRuntimeStart, RuntimePhase: test.phase,
+			}, failure)
+
+			wireErr := requestError(directErr)
+			failure, ok = SessionStartupFailureFromError(wireErr)
+			require.True(t, ok)
+			require.Equal(t, test.phase, failure.RuntimePhase)
+
+			encoded, err := json.Marshal(wireErr)
+			require.NoError(t, err)
+			require.NotContains(t, string(encoded), secret)
+		})
+	}
+}
+
+func TestSessionStartupCarrierFailureOmitsRuntimePhase(t *testing.T) {
+	const secret = "carrier-phase-secret-must-not-cross-acp"
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(ctx context.Context, start opencode.StartOptions) (opencode.Client, error) {
+			for _, stage := range []RuntimeStartupStage{
+				RuntimeStartupConfiguration, RuntimeStartupSpawn, RuntimeStartupReadiness,
+			} {
+				start.ObserveStartupStage(ctx, string(RuntimeResourceRuntime), string(stage), 0, nil)
+			}
+			failure := errors.New(secret)
+			start.ObserveStartupStage(ctx, string(RuntimeResourceRuntime), string(RuntimeStartupCarrier), 0, failure)
+
+			return nil, failure
+		}
+	})
+
+	_, directErr := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir()))
+	require.ErrorContains(t, directErr, secret)
+	failure, ok := SessionStartupFailureFromError(directErr)
+	require.True(t, ok)
+	require.Equal(t, SessionStartupFailure{Stage: SessionStartupCarrierProof}, failure)
+
+	wireErr := requestError(directErr)
+	failure, ok = SessionStartupFailureFromError(wireErr)
+	require.True(t, ok)
+	require.Equal(t, SessionStartupFailure{Stage: SessionStartupCarrierProof}, failure)
+	encoded, err := json.Marshal(wireErr)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), secret)
+}
+
+func TestSessionStartupCarrierSuccessClassifiesFollowingFactoryFailure(t *testing.T) {
+	const secret = "post-carrier-secret-must-not-cross-acp"
+	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
+		options.clientFactory = func(ctx context.Context, start opencode.StartOptions) (opencode.Client, error) {
+			for _, stage := range []RuntimeStartupStage{
+				RuntimeStartupConfiguration, RuntimeStartupSpawn, RuntimeStartupReadiness, RuntimeStartupCarrier,
+			} {
+				start.ObserveStartupStage(ctx, string(RuntimeResourceRuntime), string(stage), 0, nil)
+			}
+
+			return nil, errors.New(secret)
+		}
+	})
+
+	_, directErr := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir()))
+	require.ErrorContains(t, directErr, secret)
+	failure, ok := SessionStartupFailureFromError(directErr)
+	require.True(t, ok)
+	require.Equal(t, SessionStartupFailure{Stage: SessionStartupCarrierProof}, failure)
+
+	wireErr := requestError(directErr)
+	failure, ok = SessionStartupFailureFromError(wireErr)
+	require.True(t, ok)
+	require.Equal(t, SessionStartupFailure{Stage: SessionStartupCarrierProof}, failure)
+	encoded, err := json.Marshal(wireErr)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), secret)
+}
+
 func TestSessionStartupFailureProjectsOnlyAllowlistedHTTPMetadata(t *testing.T) {
 	const secret = "body-url-query-model-config-credential-secret"
 
 	tests := []struct {
-		name      string
-		stage     SessionStartupStage
-		method    string
-		path      string
-		pathClass string
+		name         string
+		stage        SessionStartupStage
+		runtimePhase SessionStartupRuntimePhase
+		method       string
+		path         string
+		pathClass    string
 	}{
-		{name: "runtime health", stage: SessionStartupRuntimeStart, method: http.MethodGet, path: sessionStartupRouteRuntimeHealth, pathClass: sessionStartupPathRuntimeHealth},
-		{name: "runtime contract", stage: SessionStartupRuntimeStart, method: http.MethodGet, path: sessionStartupRouteRuntimeContract, pathClass: sessionStartupPathRuntimeContract},
+		{name: "runtime health", stage: SessionStartupRuntimeStart, runtimePhase: SessionStartupRuntimePhaseReadiness, method: http.MethodGet, path: sessionStartupRouteRuntimeHealth, pathClass: sessionStartupPathRuntimeHealth},
+		{name: "runtime contract", stage: SessionStartupRuntimeStart, runtimePhase: SessionStartupRuntimePhaseReadiness, method: http.MethodGet, path: sessionStartupRouteRuntimeContract, pathClass: sessionStartupPathRuntimeContract},
 		{name: "carrier configuration", stage: SessionStartupCarrierProof, method: http.MethodGet, path: sessionStartupRouteRuntimeConfig, pathClass: sessionStartupPathRuntimeConfig},
 		{name: "scope MCP", stage: SessionStartupScope, method: http.MethodPost, path: sessionStartupRouteMCP, pathClass: sessionStartupPathMCPRegistration},
 		{name: "scope MCP member", stage: SessionStartupScope, method: http.MethodDelete, path: sessionStartupRouteMCP + "/" + secret, pathClass: sessionStartupPathMCPRegistration},
@@ -155,11 +280,16 @@ func TestSessionStartupFailureProjectsOnlyAllowlistedHTTPMetadata(t *testing.T) 
 				Method: test.method, Path: test.path, Status: "401 " + secret,
 				StatusCode: http.StatusUnauthorized, Body: secret,
 			}
-			directErr := errors.Join(wrapSessionStartupError(test.stage, nativeErr), errors.New(secret))
+			wrapped := wrapSessionStartupError(test.stage, nativeErr)
+			if test.runtimePhase != "" {
+				wrapped = wrapSessionRuntimeStartupError(test.runtimePhase, nativeErr)
+			}
+			directErr := errors.Join(wrapped, errors.New(secret))
 
 			failure, ok := SessionStartupFailureFromError(directErr)
 			require.True(t, ok)
 			require.Equal(t, test.stage, failure.Stage)
+			require.Equal(t, test.runtimePhase, failure.RuntimePhase)
 			require.Equal(t, &SessionStartupHTTPFailure{
 				Method: test.method, PathClass: test.pathClass, StatusCode: http.StatusUnauthorized,
 			}, failure.HTTP)
@@ -204,6 +334,30 @@ func TestSessionStartupFailureRejectsUntrustedDiagnosticFields(t *testing.T) {
 			jsonFieldError: sessionStartupErrorTag,
 			jsonFieldStage: secret,
 		},
+		"runtime phase missing": {
+			jsonFieldError: sessionStartupErrorTag,
+			jsonFieldStage: string(SessionStartupRuntimeStart),
+		},
+		"runtime phase unknown": {
+			jsonFieldError:        sessionStartupErrorTag,
+			jsonFieldStage:        string(SessionStartupRuntimeStart),
+			jsonFieldRuntimePhase: secret,
+		},
+		"runtime phase on non-runtime stage": {
+			jsonFieldError:        sessionStartupErrorTag,
+			jsonFieldStage:        string(SessionStartupScope),
+			jsonFieldRuntimePhase: string(SessionStartupRuntimePhaseResources),
+		},
+		"runtime HTTP before readiness": {
+			jsonFieldError:        sessionStartupErrorTag,
+			jsonFieldStage:        string(SessionStartupRuntimeStart),
+			jsonFieldRuntimePhase: string(SessionStartupRuntimePhaseSpawn),
+			jsonFieldHTTP: map[string]any{
+				jsonFieldMethod:     http.MethodGet,
+				jsonFieldPathClass:  sessionStartupPathRuntimeHealth,
+				jsonFieldStatusCode: 503,
+			},
+		},
 		"method": {
 			jsonFieldError: sessionStartupErrorTag,
 			jsonFieldStage: string(SessionStartupScope),
@@ -244,14 +398,16 @@ func TestSessionStartupFailureRejectsUntrustedDiagnosticFields(t *testing.T) {
 
 func TestSessionStartupFailureRequiresExactHTTPRouteTuples(t *testing.T) {
 	tests := []struct {
-		name       string
-		stage      SessionStartupStage
-		method     string
-		path       string
-		statusCode int
+		name         string
+		stage        SessionStartupStage
+		runtimePhase SessionStartupRuntimePhase
+		method       string
+		path         string
+		statusCode   int
 	}{
-		{name: "runtime health method", stage: SessionStartupRuntimeStart, method: http.MethodPost, path: sessionStartupRouteRuntimeHealth, statusCode: 500},
-		{name: "runtime contract method", stage: SessionStartupRuntimeStart, method: http.MethodDelete, path: sessionStartupRouteRuntimeContract, statusCode: 500},
+		{name: "runtime health method", stage: SessionStartupRuntimeStart, runtimePhase: SessionStartupRuntimePhaseReadiness, method: http.MethodPost, path: sessionStartupRouteRuntimeHealth, statusCode: 500},
+		{name: "runtime contract method", stage: SessionStartupRuntimeStart, runtimePhase: SessionStartupRuntimePhaseReadiness, method: http.MethodDelete, path: sessionStartupRouteRuntimeContract, statusCode: 500},
+		{name: "runtime health before readiness", stage: SessionStartupRuntimeStart, runtimePhase: SessionStartupRuntimePhaseSpawn, method: http.MethodGet, path: sessionStartupRouteRuntimeHealth, statusCode: 500},
 		{name: "carrier method", stage: SessionStartupCarrierProof, method: http.MethodPost, path: sessionStartupRouteRuntimeConfig, statusCode: 500},
 		{name: "MCP collection method", stage: SessionStartupScope, method: http.MethodDelete, path: sessionStartupRouteMCP, statusCode: 500},
 		{name: "MCP member method", stage: SessionStartupScope, method: http.MethodPost, path: sessionStartupRouteMCP + "/name", statusCode: 500},
@@ -263,7 +419,7 @@ func TestSessionStartupFailureRequiresExactHTTPRouteTuples(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			httpFailure := safeSessionStartupHTTP(test.stage, &opencode.HTTPError{
+			httpFailure := safeSessionStartupHTTP(test.stage, test.runtimePhase, &opencode.HTTPError{
 				Method: test.method, Path: test.path, StatusCode: test.statusCode, Body: "secret",
 			})
 			require.Nil(t, httpFailure)
@@ -366,6 +522,11 @@ func TestSessionStartupFailureDecoderRejectsWrongFieldTypes(t *testing.T) {
 			jsonFieldError: sessionStartupErrorTag,
 			jsonFieldStage: 1,
 		},
+		"runtime phase": {
+			jsonFieldError:        sessionStartupErrorTag,
+			jsonFieldStage:        string(SessionStartupRuntimeStart),
+			jsonFieldRuntimePhase: 1,
+		},
 		"http": {
 			jsonFieldError: sessionStartupErrorTag,
 			jsonFieldStage: string(SessionStartupScope),
@@ -387,6 +548,6 @@ func TestSessionStartupFailureDecoderRejectsWrongFieldTypes(t *testing.T) {
 		})
 	}
 
-	require.Empty(t, safeSessionStartupHTTPPathClass(SessionStartupStage("unknown"), http.MethodPost, sessionStartupRouteMCP))
-	require.False(t, safeSessionStartupHTTPTuple(SessionStartupStage("unknown"), http.MethodPost, sessionStartupPathMCPRegistration))
+	require.Empty(t, safeSessionStartupHTTPPathClass(SessionStartupStage("unknown"), "", http.MethodPost, sessionStartupRouteMCP))
+	require.False(t, safeSessionStartupHTTPTuple(SessionStartupStage("unknown"), "", http.MethodPost, sessionStartupPathMCPRegistration))
 }
