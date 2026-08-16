@@ -393,3 +393,68 @@ func TestConnectionInputGateAndGenericResponseHandlers(t *testing.T) {
 	_, reqErr = notification(context.Background(), NewAgent(), mustJSON(t, CancelRequest("session", "nonce")))
 	require.NotNil(t, reqErr)
 }
+
+// TestRequestErrorReportsAnHonoredCancelAheadOfATypedRequestError pins the
+// discriminator that only a request context can supply: an honored
+// $/cancel_request cancels that context with cause context.Canceled, and it
+// outranks whatever typed error the aborted work was carrying. Answering a
+// withdrawn request with a complaint about its parameters is never honest, so
+// -32800 wins over the passthrough.
+func TestRequestErrorReportsAnHonoredCancelAheadOfATypedRequestError(t *testing.T) {
+	withdrawn, cancel := context.WithCancelCause(t.Context())
+	cancel(context.Canceled)
+
+	invalid := acp.NewInvalidParams(map[string]any{jsonFieldError: "cwd must be absolute"})
+
+	for name, err := range map[string]error{
+		"typed request error": invalid,
+		"wrapped typed error": fmt.Errorf("start session: %w", invalid),
+		"joined typed error":  errors.Join(invalid, context.Canceled),
+		"plain failure":       errors.New("boom"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, -32800, requestError(withdrawn, err).Code)
+		})
+	}
+}
+
+// TestRequestErrorPassesATypedRequestErrorThroughOnALiveContext pins the other
+// side of that ordering: with nothing cancelled, the caller still receives the
+// exact error value the handler produced rather than a flattened -32603.
+func TestRequestErrorPassesATypedRequestErrorThroughOnALiveContext(t *testing.T) {
+	live := t.Context()
+	invalid := acp.NewInvalidParams(map[string]any{jsonFieldError: "cwd must be absolute"})
+
+	require.Same(t, invalid, requestError(live, invalid))
+	require.Same(t, invalid, requestError(live, fmt.Errorf("start session: %w", invalid)))
+}
+
+// TestRequestErrorReportsAnExpiredDeadlineAsAnInternalFailure pins that an
+// adapter-owned deadline is a failure of the turn, not a withdrawal by the
+// client: its cause is context.DeadlineExceeded, which the cancel check
+// excludes by name instead of by accident of error matching.
+func TestRequestErrorReportsAnExpiredDeadlineAsAnInternalFailure(t *testing.T) {
+	expired, cancel := context.WithTimeout(t.Context(), -time.Second)
+	defer cancel()
+
+	<-expired.Done()
+	require.Equal(t, context.DeadlineExceeded, context.Cause(expired))
+	require.Equal(t, -32603, requestError(expired, context.DeadlineExceeded).Code)
+	require.Equal(t, -32603, requestError(expired, errors.New("boom")).Code)
+}
+
+// TestRequestErrorReportsATornDownConnectionByItsOwnError pins that transport
+// teardown is not a cancel. The SDK cancels the parent context with the
+// transport cause rather than context.Canceled, so a request killed by it
+// reports what actually failed even though the derived context error is
+// context.Canceled.
+func TestRequestErrorReportsATornDownConnectionByItsOwnError(t *testing.T) {
+	tornDown, cancel := context.WithCancelCause(t.Context())
+	cancel(errors.New("connection closed"))
+
+	require.ErrorIs(t, tornDown.Err(), context.Canceled)
+
+	invalid := acp.NewInvalidParams(map[string]any{jsonFieldError: "cwd must be absolute"})
+	require.Same(t, invalid, requestError(tornDown, errors.Join(invalid, context.Canceled)))
+	require.Equal(t, -32603, requestError(tornDown, context.Canceled).Code)
+}

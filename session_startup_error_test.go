@@ -88,11 +88,13 @@ func TestSessionStartHTTPFailuresNameTheRouteAndNeverTheBody(t *testing.T) {
 			})
 			agent.setAgentClient(newRecordingAgentClient())
 
-			_, err := agent.NewSession(context.Background(), NewSessionRequest(t.TempDir(),
+			ctx := t.Context()
+
+			_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(),
 				WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test")))))
 			require.Error(t, err)
 
-			reqErr := requestError(err)
+			reqErr := requestError(ctx, err)
 			require.Equal(t, -32603, reqErr.Code)
 
 			data, ok := reqErr.Data.(map[string]any)

@@ -108,7 +108,7 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 	}()
 
 	if err := c.agent.ensureOpen(); err != nil {
-		reqErr = requestError(err)
+		reqErr = requestError(ctx, err)
 
 		return nil, reqErr
 	}
@@ -124,7 +124,7 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 
 	if strings.HasPrefix(method, "_") {
 		extensionResult, err := c.agent.HandleExtensionMethod(ctx, method, params)
-		reqErr = requestError(err)
+		reqErr = requestError(ctx, err)
 
 		return extensionResult, reqErr
 	}
@@ -155,7 +155,7 @@ func localResponse[Req any, ReqPtr localAgentParams[Req], Resp any](
 
 		resp, err := call(agent, ctx, value)
 		if err != nil {
-			return nil, requestError(err)
+			return nil, requestError(ctx, err)
 		}
 
 		return resp, nil
@@ -172,7 +172,7 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 		}
 
 		if err := call(agent, ctx, value); err != nil {
-			return nil, requestError(err)
+			return nil, requestError(ctx, err)
 		}
 
 		return nil, nil
@@ -255,18 +255,26 @@ func (c *localAgentConnection) NotifyExtension(ctx context.Context, method strin
 	return c.conn.SendNotification(ctx, method, params)
 }
 
-func requestError(err error) *acp.RequestError {
+// requestError decides cancellation from the request context rather than from
+// the error, and decides it first. An honored $/cancel_request is the only
+// thing that cancels a request context with cause context.Canceled: connection
+// teardown cancels the parent with the transport cause, and an adapter deadline
+// surfaces context.DeadlineExceeded, so neither is reported as cancelled. Any
+// error the handler was carrying when the cancel landed is a casualty of the
+// cancel and never the answer, while reading cancellation off the error instead
+// would report -32800 for a request nobody cancelled.
+func requestError(ctx context.Context, err error) *acp.RequestError {
 	if err == nil {
 		return nil
+	}
+
+	if context.Cause(ctx) == context.Canceled {
+		return acp.NewRequestCancelled(map[string]any{jsonFieldError: err.Error()})
 	}
 
 	var reqErr *acp.RequestError
 	if errors.As(err, &reqErr) {
 		return reqErr
-	}
-
-	if errors.Is(err, context.Canceled) {
-		return acp.NewRequestCancelled(map[string]any{jsonFieldError: err.Error()})
 	}
 
 	return acp.NewInternalError(map[string]any{jsonFieldError: err.Error()})

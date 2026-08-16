@@ -900,11 +900,15 @@ func TestHandleExtensionAndLocalConnectionHelperBranches(t *testing.T) {
 	_, reqErr = conn.handle(ctx, acp.AgentMethodSessionList, json.RawMessage(`{"cwd":"relative"}`))
 	require.NotNil(t, reqErr)
 
-	require.Nil(t, requestError(nil))
-	require.Equal(t, -32800, requestError(context.Canceled).Code)
-	require.Equal(t, -32603, requestError(errors.New("boom")).Code)
+	require.Nil(t, requestError(ctx, nil))
+	require.Equal(t, -32603, requestError(ctx, errors.New("boom")).Code)
 	reqError := acp.NewInvalidParams(nil)
-	require.Same(t, reqError, requestError(reqError))
+	require.Same(t, reqError, requestError(ctx, reqError))
+
+	withdrawn, cancel := context.WithCancelCause(ctx)
+	cancel(context.Canceled)
+
+	require.Equal(t, -32800, requestError(withdrawn, context.Canceled).Code)
 
 	_, err = scopedElicitationParams(acp.UnstableCreateElicitationRequest{}, elicitationScope{})
 	require.ErrorContains(t, err, "include form or url")
