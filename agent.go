@@ -280,7 +280,7 @@ func (a *Agent) Close() error {
 
 func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
 	if a.optionsErr != nil {
-		return acp.InitializeResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldError: a.optionsErr.Error()})
+		return acp.InitializeResponse{}, a.optionsError()
 	}
 
 	title := a.options.AgentTitle
@@ -417,10 +417,20 @@ func (a *Agent) ensureOpen() error {
 	}
 
 	if a.optionsErr != nil {
-		return acp.NewInvalidParams(map[string]any{jsonFieldError: a.optionsErr.Error()})
+		return a.optionsError()
 	}
 
 	return nil
+}
+
+// optionsError reports the construction-time option failure that every entry
+// point must answer with. The code is internal error, not invalid params: the
+// caller's params are fine, and what is broken is the agent the embedding host
+// built, so blaming the request would send the caller chasing its own payload.
+// The data carries only the joined prose because no wire field is at fault to
+// name, and that text is all an operator has to find the bad option.
+func (a *Agent) optionsError() error {
+	return acp.NewInternalError(map[string]any{jsonFieldError: a.optionsErr.Error()})
 }
 
 func (a *Agent) sessionStore() SessionStore {

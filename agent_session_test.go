@@ -843,6 +843,7 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 	t.Cleanup(func() { agentRandRead = oldRead })
 	_, err := failedEntropy.Initialize(context.Background(), acp.InitializeRequest{})
 	require.ErrorContains(t, err, "fingerprint entropy failed")
+	require.Contains(t, requireInternalErrorData(t, err)[jsonFieldError], "fingerprint entropy failed")
 
 	for name, option := range map[string]Option{
 		"health":       WithOpenCodeHealthCheckTimeout(0),
@@ -851,8 +852,17 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 		"image limits": WithImageLimits(ImageLimits{MaxOutputBytesPerToolCall: -1}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := NewAgent(option).Initialize(context.Background(), acp.InitializeRequest{})
+			refused := NewAgent(option)
+
+			// Both entry points must reach the same verdict: an embedded host can
+			// open a session and prompt without ever handshaking.
+			_, err := refused.Initialize(context.Background(), acp.InitializeRequest{})
 			require.Error(t, err)
+			require.NotEmpty(t, requireInternalErrorData(t, err)[jsonFieldError])
+
+			ensureErr := refused.ensureOpen()
+			require.Error(t, ensureErr)
+			require.Equal(t, requireInternalErrorData(t, err), requireInternalErrorData(t, ensureErr))
 		})
 	}
 

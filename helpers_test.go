@@ -798,6 +798,30 @@ func requireInvalidParamsData(t testingT, err error, want map[string]any) {
 	}
 }
 
+// requireInternalErrorData asserts err is an ACP internal error (code -32603)
+// and returns its data map. Construction-time option failures land here rather
+// than on invalid params: the caller's request was well formed and the agent
+// itself is unserviceable.
+func requireInternalErrorData(t testingT, err error) map[string]any {
+	t.Helper()
+
+	var reqErr *acp.RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("error = %v, want RequestError", err)
+	}
+
+	if reqErr.Code != -32603 {
+		t.Fatalf("error code = %d, want -32603", reqErr.Code)
+	}
+
+	data, ok := reqErr.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("error data = %#v, want map", reqErr.Data)
+	}
+
+	return data
+}
+
 // assertTurnFailed asserts err is the uniform OpenCode turn-failure error:
 // code -32603, data.error == "opencode_turn_failed", data.cause == wantCause,
 // and data.message contains wantMessageSubstr (skipped when empty). It returns
