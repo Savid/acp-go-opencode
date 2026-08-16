@@ -280,6 +280,23 @@ func TestSessionCarrierPluginSourceRendersConstants(t *testing.T) {
 	require.NotContains(t, source, "ACP_GO")
 }
 
+// TestSessionCarrierPluginResolvesThePathVariableByEnvironmentIdentity pins the
+// platform gate on the search-path key. Only Windows resolves environment names
+// case-insensitively, so only there is an existing spelling worth adopting.
+// Adopting one elsewhere would let enumeration order pick an inert Path over the
+// real PATH the runtime resolves against, and silently turn the operation's
+// directories into a no-op.
+func TestSessionCarrierPluginResolvesThePathVariableByEnvironmentIdentity(t *testing.T) {
+	source := sessionCarrierPluginSource("/carrier/shell", "/carrier/mark",
+		sessionCarrierProof{Path: "/carrier/loaded", Token: "proof-token"},
+		&sessionCarrierBroker{endpoint: "http://127.0.0.1:1234", token: "broker-token"})
+
+	require.Contains(t, strings.Join(strings.Fields(source), " "),
+		`const pathKey = process.platform === "win32" `+
+			`? (Object.keys(process.env).find((key) => key.toUpperCase() === "PATH") ?? "PATH") `+
+			`: "PATH"`)
+}
+
 // TestSessionCarrierShellWrapperQuotesItsGeneratedPaths pins the one input a
 // generated path can carry that a single-quoted shell word cannot hold as is.
 func TestSessionCarrierShellWrapperQuotesItsGeneratedPaths(t *testing.T) {
@@ -414,14 +431,25 @@ func TestStartServerRefusesARuntimeWhoseCarrierNeverLoaded(t *testing.T) {
 		return wait(cmd)
 	}
 
+	// The carrier proof closes the readiness stage rather than opening one of
+	// its own, so a runtime whose plugin never loaded reports exactly one
+	// failed stage, and it is readiness.
+	var failedStages []string
+
 	_, err := StartServer(t.Context(), platformStartOptions(t, StartOptions{
 		Root:            testGeneratedTempDir(t),
 		ExecutablePath:  fakeOpenCodeExecutable(t),
 		MinVersion:      "1.18.3",
 		HealthTimeout:   2 * time.Second,
 		SkipVersionGate: false,
+		ObserveStartupStage: func(_ context.Context, _ string, stage string, _ time.Duration, stageErr error) {
+			if stageErr != nil {
+				failedStages = append(failedStages, stage)
+			}
+		},
 	}))
 	require.ErrorContains(t, err, "did not load")
+	require.Equal(t, []string{"readiness"}, failedStages)
 
 	select {
 	case <-waiting:

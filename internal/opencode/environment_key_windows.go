@@ -6,4 +6,7 @@ import "strings"
 
 func canonicalEnvironmentKey(key string) string { return strings.ToUpper(key) }
 
-func environmentKeyEqual(left string, right string) bool { return strings.EqualFold(left, right) }
+// EnvironmentKeyEqual reports whether two environment names address the same
+// variable. Windows resolves environment names case-insensitively, so PATH and
+// Path name one variable there.
+func EnvironmentKeyEqual(left string, right string) bool { return strings.EqualFold(left, right) }

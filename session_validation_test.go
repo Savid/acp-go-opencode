@@ -7,28 +7,26 @@ import (
 )
 
 func TestValidationHelperBranches(t *testing.T) {
-	if err := validateSessionStartPaths("relative", nil); err == nil {
-		t.Fatal("relative cwd accepted")
-	}
-	if err := validateRequiredAbsolutePath("cwd", ""); err == nil {
-		t.Fatal("empty required absolute path accepted")
-	}
-	if err := validateSessionStartPaths("/tmp/project", []string{"relative"}); err == nil {
-		t.Fatal("relative additional directory accepted")
-	}
+	// A malformed start path is not an unsupported field: an absent path is
+	// `required` and a relative one names the format it failed.
+	requireInvalidParamsData(t, validateSessionStartPaths("relative", nil),
+		map[string]any{jsonFieldError: errValueAbsolutePathRequired, jsonFieldField: jsonFieldCwd})
+	requireInvalidParamsData(t, validateRequiredAbsolutePath(jsonFieldCwd, ""),
+		map[string]any{jsonFieldCwd: validationRequired})
+	requireInvalidParamsData(t, validateSessionStartPaths("/tmp/project", []string{"relative"}),
+		map[string]any{jsonFieldError: errValueAbsolutePathRequired, jsonFieldField: "additionalDirectories[0]"})
 	value := "/tmp/project"
 	if err := validateOptionalAbsolutePath("cwd", &value); err != nil {
 		t.Fatalf("validateOptionalAbsolutePath: %v", err)
 	}
-	if err := validateMCPServers([]acp.McpServer{{Sse: &acp.McpServerSseInline{Name: "sse"}}}); err == nil {
-		t.Fatal("unsupported MCP servers accepted")
-	}
-	if err := validateMCPServers([]acp.McpServer{{Acp: &acp.McpServerAcpInline{Name: "acp"}}}); err == nil {
-		t.Fatal("unsupported ACP MCP server accepted")
-	}
-	if err := validateMCPServers([]acp.McpServer{{}}); err == nil {
-		t.Fatal("empty MCP server accepted")
-	}
+	// The MCP transport rejections keep their own shapes: the third `server`
+	// key and the `no_transport` token are family-wide, not local spellings.
+	requireInvalidParamsData(t, validateMCPServers([]acp.McpServer{{Sse: &acp.McpServerSseInline{Name: "sse"}}}),
+		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "mcpServers[0]", jsonFieldServer: "sse"})
+	requireInvalidParamsData(t, validateMCPServers([]acp.McpServer{{Acp: &acp.McpServerAcpInline{Name: "acp"}}}),
+		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "mcpServers[0]", jsonFieldServer: "acp"})
+	requireInvalidParamsData(t, validateMCPServers([]acp.McpServer{{}}),
+		map[string]any{jsonFieldError: errValueNoTransport, jsonFieldField: "mcpServers[0]"})
 	if err := validateMCPServers([]acp.McpServer{
 		{Http: &acp.McpServerHttpInline{Name: "http", Url: "https://mcp.example"}},
 		{Stdio: &acp.McpServerStdio{Name: "stdio", Command: "server"}},

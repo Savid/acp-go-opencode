@@ -72,7 +72,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	if err != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		return acp.NewSessionResponse{}, errors.Join(wrapSessionStartupError(SessionStartupNativeSessionCreate, err), closeErr)
+		return acp.NewSessionResponse{}, errors.Join(startupFailure(err), closeErr)
 	}
 
 	idmap := idmapRecord{
@@ -617,7 +617,7 @@ func (a *Agent) newOpenCodeClient(
 		if err != nil {
 			releaseDirectory()
 
-			return nil, nil, 0, wrapSessionStartupError(SessionStartupRuntimeStart, err)
+			return nil, nil, 0, startupFailure(err)
 		}
 
 		configurationStarted := time.Now()
@@ -628,7 +628,7 @@ func (a *Agent) newOpenCodeClient(
 			return client, releaseDirectory, generation, nil
 		}
 
-		startupErr := wrapSessionStartupError(SessionStartupScope, err)
+		startupErr := startupFailure(err)
 
 		current := a.runtimeGenerationIsCurrent(generation)
 		if !current || !errors.Is(err, opencode.ErrMCPDisconnectUnproven) {

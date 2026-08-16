@@ -1,364 +1,44 @@
 package opencodeacp
 
 import (
-	"context"
 	"errors"
-	"net/http"
-	"strings"
+	"fmt"
 
-	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
-const (
-	sessionStartupErrorTag              = "opencode_session_start_failed"
-	jsonFieldHTTP                       = "http"
-	jsonFieldPathClass                  = "pathClass"
-	jsonFieldRuntimePhase               = "runtimePhase"
-	sessionStartupPathRuntimeHealth     = "runtime_health"
-	sessionStartupPathRuntimeContract   = "runtime_contract"
-	sessionStartupPathRuntimeConfig     = "runtime_configuration"
-	sessionStartupPathMCPRegistration   = "mcp_registration"
-	sessionStartupPathProviderCatalog   = "provider_catalog"
-	sessionStartupPathSessionCollection = "session_collection"
-	sessionStartupRouteRuntimeHealth    = "/global/health"
-	sessionStartupRouteRuntimeContract  = "/doc"
-	sessionStartupRouteRuntimeConfig    = "/config"
-	sessionStartupRouteMCP              = "/mcp"
-	sessionStartupRouteProviderCatalog  = "/config/providers"
-	sessionStartupRouteSession          = "/session"
-)
-
-// SessionStartupStage identifies a values-free session startup boundary.
-type SessionStartupStage string
-
-const (
-	SessionStartupRuntimeStart        SessionStartupStage = "runtime_start"
-	SessionStartupCarrierProof        SessionStartupStage = "carrier_proof"
-	SessionStartupScope               SessionStartupStage = "scope"
-	SessionStartupCatalog             SessionStartupStage = "catalog"
-	SessionStartupNativeSessionCreate SessionStartupStage = "native_session_create"
-)
-
-// SessionStartupRuntimePhase identifies a values-free runtime construction boundary.
-type SessionStartupRuntimePhase string
-
-const (
-	SessionStartupRuntimePhaseResources     SessionStartupRuntimePhase = "resources"
-	SessionStartupRuntimePhaseConfiguration SessionStartupRuntimePhase = "configuration"
-	SessionStartupRuntimePhaseSpawn         SessionStartupRuntimePhase = "spawn"
-	SessionStartupRuntimePhaseReadiness     SessionStartupRuntimePhase = "readiness"
-)
-
-// SessionStartupHTTPFailure identifies an allowlisted loopback HTTP operation.
-type SessionStartupHTTPFailure struct {
-	Method     string `json:"method"`
-	PathClass  string `json:"pathClass"`
-	StatusCode int    `json:"statusCode"`
-}
-
-// SessionStartupFailure is the safe diagnostic projection of a startup error.
-type SessionStartupFailure struct {
-	Stage        SessionStartupStage        `json:"stage"`
-	RuntimePhase SessionStartupRuntimePhase `json:"runtimePhase,omitempty"`
-	HTTP         *SessionStartupHTTPFailure `json:"http,omitempty"`
-}
-
-type sessionStartupError struct {
-	failure SessionStartupFailure
+// startupError retells a failed runtime or session start by the loopback route
+// that failed. The native response body is dropped: it echoes the request that
+// produced it, which at session start carries MCP headers and the session
+// environment. The wrapped chain stays intact so the adapter's own containment
+// and cancellation matching still sees it.
+type startupError struct {
+	message string
 	err     error
 }
 
-func (e *sessionStartupError) Error() string { return e.err.Error() }
+func (e *startupError) Error() string { return e.message }
 
-func (e *sessionStartupError) Unwrap() error { return e.err }
+func (e *startupError) Unwrap() error { return e.err }
 
-func wrapSessionStartupError(stage SessionStartupStage, err error) error {
-	if stage == SessionStartupRuntimeStart {
-		return wrapSessionRuntimeStartupError(SessionStartupRuntimePhaseResources, err)
+// startupFailure maps a native runtime or session start failure onto the
+// adapter's ACP error surface: a field the native runtime refuses becomes the
+// uniform unsupported-field rejection (-32602), and every other failure keeps
+// the internal-error surface with a message that names the failing route and
+// status rather than the native body behind it.
+func startupFailure(err error) error {
+	var unsupported *opencode.UnsupportedFieldError
+	if errors.As(err, &unsupported) {
+		return unsupportedField(unsupported.Field)
 	}
 
-	return wrapSessionStartupFailure(SessionStartupFailure{Stage: stage}, err)
-}
-
-func wrapSessionRuntimeStartupError(phase SessionStartupRuntimePhase, err error) error {
-	return wrapSessionStartupFailure(SessionStartupFailure{
-		Stage: SessionStartupRuntimeStart, RuntimePhase: phase,
-	}, err)
-}
-
-func wrapSessionStartupFailure(failure SessionStartupFailure, err error) error {
-	if err == nil {
-		return nil
-	}
-
-	var existing *sessionStartupError
-	if errors.As(err, &existing) {
-		return err
-	}
-
-	var requestErr *acp.RequestError
-	if errors.As(err, &requestErr) || errors.Is(err, context.Canceled) {
-		return err
-	}
-
-	failure.HTTP = safeSessionStartupHTTP(failure.Stage, failure.RuntimePhase, err)
-
-	return &sessionStartupError{failure: failure, err: err}
-}
-
-func safeSessionStartupHTTP(
-	stage SessionStartupStage,
-	runtimePhase SessionStartupRuntimePhase,
-	err error,
-) *SessionStartupHTTPFailure {
 	var httpErr *opencode.HTTPError
 	if !errors.As(err, &httpErr) {
-		return nil
+		return err
 	}
 
-	pathClass := safeSessionStartupHTTPPathClass(stage, runtimePhase, httpErr.Method, httpErr.Path)
-
-	if pathClass == "" || !sessionStartupHTTPFailureStatus(httpErr.StatusCode) {
-		return nil
+	return &startupError{
+		message: fmt.Sprintf("opencode %s %s returned %s", httpErr.Method, httpErr.Path, httpErr.Status),
+		err:     err,
 	}
-
-	return &SessionStartupHTTPFailure{
-		Method:     httpErr.Method,
-		PathClass:  pathClass,
-		StatusCode: httpErr.StatusCode,
-	}
-}
-
-func safeSessionStartupHTTPPathClass(
-	stage SessionStartupStage,
-	runtimePhase SessionStartupRuntimePhase,
-	method string,
-	path string,
-) string {
-	switch stage {
-	case SessionStartupRuntimeStart:
-		if runtimePhase != SessionStartupRuntimePhaseReadiness {
-			return ""
-		}
-
-		switch {
-		case method == http.MethodGet && path == sessionStartupRouteRuntimeHealth:
-			return sessionStartupPathRuntimeHealth
-		case method == http.MethodGet && path == sessionStartupRouteRuntimeContract:
-			return sessionStartupPathRuntimeContract
-		}
-	case SessionStartupCarrierProof:
-		if method == http.MethodGet && path == sessionStartupRouteRuntimeConfig {
-			return sessionStartupPathRuntimeConfig
-		}
-	case SessionStartupScope:
-		switch {
-		case method == http.MethodPost && path == sessionStartupRouteMCP:
-			return sessionStartupPathMCPRegistration
-		case method == http.MethodDelete && strings.HasPrefix(path, sessionStartupRouteMCP+"/") && !strings.ContainsAny(path, "?#"):
-			return sessionStartupPathMCPRegistration
-		}
-	case SessionStartupCatalog:
-		if method == http.MethodGet && path == sessionStartupRouteProviderCatalog {
-			return sessionStartupPathProviderCatalog
-		}
-	case SessionStartupNativeSessionCreate:
-		if method == http.MethodPost && path == sessionStartupRouteSession {
-			return sessionStartupPathSessionCollection
-		}
-	}
-
-	return ""
-}
-
-func sessionStartupHTTPFailureStatus(statusCode int) bool {
-	return statusCode >= 100 && statusCode <= 599 && (statusCode < 200 || statusCode >= 300)
-}
-
-func safeSessionStartupHTTPTuple(
-	stage SessionStartupStage,
-	runtimePhase SessionStartupRuntimePhase,
-	method string,
-	pathClass string,
-) bool {
-	switch stage {
-	case SessionStartupRuntimeStart:
-		return runtimePhase == SessionStartupRuntimePhaseReadiness && method == http.MethodGet &&
-			(pathClass == sessionStartupPathRuntimeHealth || pathClass == sessionStartupPathRuntimeContract)
-	case SessionStartupCarrierProof:
-		return method == http.MethodGet && pathClass == sessionStartupPathRuntimeConfig
-	case SessionStartupScope:
-		return pathClass == sessionStartupPathMCPRegistration &&
-			(method == http.MethodPost || method == http.MethodDelete)
-	case SessionStartupCatalog:
-		return method == http.MethodGet && pathClass == sessionStartupPathProviderCatalog
-	case SessionStartupNativeSessionCreate:
-		return method == http.MethodPost && pathClass == sessionStartupPathSessionCollection
-	}
-
-	return false
-}
-
-func sessionStartupErrorData(err error) (map[string]any, bool) {
-	failure, ok := SessionStartupFailureFromError(err)
-	if !ok {
-		return nil, false
-	}
-
-	data := map[string]any{
-		jsonFieldError: sessionStartupErrorTag,
-		jsonFieldStage: string(failure.Stage),
-	}
-	if failure.RuntimePhase != "" {
-		data[jsonFieldRuntimePhase] = string(failure.RuntimePhase)
-	}
-
-	if failure.HTTP != nil {
-		data[jsonFieldHTTP] = map[string]any{
-			jsonFieldMethod:     failure.HTTP.Method,
-			jsonFieldPathClass:  failure.HTTP.PathClass,
-			jsonFieldStatusCode: failure.HTTP.StatusCode,
-		}
-	}
-
-	return data, true
-}
-
-// SessionStartupFailureFromError reads either an in-process startup error or
-// its ACP RequestError projection.
-func SessionStartupFailureFromError(err error) (SessionStartupFailure, bool) {
-	var requestErr *acp.RequestError
-	if errors.As(err, &requestErr) {
-		return sessionStartupFailureFromRequestError(requestErr)
-	}
-
-	if errors.Is(err, context.Canceled) {
-		return SessionStartupFailure{}, false
-	}
-
-	var startupErr *sessionStartupError
-	if errors.As(err, &startupErr) {
-		return cloneSessionStartupFailure(startupErr.failure), true
-	}
-
-	return SessionStartupFailure{}, false
-}
-
-func sessionStartupFailureFromRequestError(requestErr *acp.RequestError) (SessionStartupFailure, bool) {
-	if requestErr == nil || requestErr.Code != -32603 {
-		return SessionStartupFailure{}, false
-	}
-
-	data, ok := requestErr.Data.(map[string]any)
-	if !ok || data[jsonFieldError] != sessionStartupErrorTag {
-		return SessionStartupFailure{}, false
-	}
-
-	stage, ok := sessionStartupStage(data[jsonFieldStage])
-	if !ok {
-		return SessionStartupFailure{}, false
-	}
-
-	failure := SessionStartupFailure{Stage: stage}
-
-	rawRuntimePhase, runtimePhaseExists := data[jsonFieldRuntimePhase]
-	if stage == SessionStartupRuntimeStart {
-		runtimePhase, valid := sessionStartupRuntimePhase(rawRuntimePhase)
-		if !runtimePhaseExists || !valid {
-			return SessionStartupFailure{}, false
-		}
-
-		failure.RuntimePhase = runtimePhase
-	} else if runtimePhaseExists {
-		return SessionStartupFailure{}, false
-	}
-
-	if rawHTTP, exists := data[jsonFieldHTTP]; exists {
-		httpFailure, valid := sessionStartupHTTPFailure(stage, failure.RuntimePhase, rawHTTP)
-		if !valid {
-			return SessionStartupFailure{}, false
-		}
-
-		failure.HTTP = &httpFailure
-	}
-
-	return failure, true
-}
-
-func sessionStartupRuntimePhase(value any) (SessionStartupRuntimePhase, bool) {
-	phase, ok := value.(string)
-	if !ok {
-		return "", false
-	}
-
-	switch SessionStartupRuntimePhase(phase) {
-	case SessionStartupRuntimePhaseResources, SessionStartupRuntimePhaseConfiguration,
-		SessionStartupRuntimePhaseSpawn, SessionStartupRuntimePhaseReadiness:
-		return SessionStartupRuntimePhase(phase), true
-	default:
-		return "", false
-	}
-}
-
-func sessionStartupStage(value any) (SessionStartupStage, bool) {
-	stage, ok := value.(string)
-	if !ok {
-		return "", false
-	}
-
-	switch SessionStartupStage(stage) {
-	case SessionStartupRuntimeStart, SessionStartupCarrierProof, SessionStartupScope,
-		SessionStartupCatalog, SessionStartupNativeSessionCreate:
-		return SessionStartupStage(stage), true
-	default:
-		return "", false
-	}
-}
-
-func sessionStartupHTTPFailure(
-	stage SessionStartupStage,
-	runtimePhase SessionStartupRuntimePhase,
-	value any,
-) (SessionStartupHTTPFailure, bool) {
-	fields, ok := value.(map[string]any)
-	if !ok {
-		return SessionStartupHTTPFailure{}, false
-	}
-
-	method, methodOK := fields[jsonFieldMethod].(string)
-	pathClass, pathOK := fields[jsonFieldPathClass].(string)
-	statusCode, statusOK := integerField(fields[jsonFieldStatusCode])
-
-	if !methodOK || !pathOK || !statusOK ||
-		!safeSessionStartupHTTPTuple(stage, runtimePhase, method, pathClass) ||
-		!sessionStartupHTTPFailureStatus(statusCode) {
-		return SessionStartupHTTPFailure{}, false
-	}
-
-	return SessionStartupHTTPFailure{Method: method, PathClass: pathClass, StatusCode: statusCode}, true
-}
-
-func integerField(value any) (int, bool) {
-	switch number := value.(type) {
-	case int:
-		return number, true
-	case float64:
-		converted := int(number)
-
-		return converted, float64(converted) == number
-	default:
-		return 0, false
-	}
-}
-
-func cloneSessionStartupFailure(failure SessionStartupFailure) SessionStartupFailure {
-	if failure.HTTP == nil {
-		return failure
-	}
-
-	httpFailure := *failure.HTTP
-	failure.HTTP = &httpFailure
-
-	return failure
 }

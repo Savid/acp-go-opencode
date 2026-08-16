@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -59,8 +60,6 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 		{"name carries an equals sign", map[string]any{"A=B": "bearer"}, envOptionPath + ".A=B"},
 		{"name carries a NUL", map[string]any{"A\x00B": "bearer"}, envOptionPath + ".A\x00B"},
 		{"raw PATH", map[string]any{envPathKey: "/attacker/bin"}, envOptionPath + "." + envPathKey},
-		{"raw path lowercase", map[string]any{"path": "/attacker/bin"}, envOptionPath + ".path"},
-		{"raw Path mixed case", map[string]any{"Path": "/attacker/bin"}, envOptionPath + ".Path"},
 		{"managed OpenCode root", map[string]any{managedOpenCodeRoot: "/elsewhere"}, envOptionPath + "." + managedOpenCodeRoot},
 		{"managed XDG root", map[string]any{managedXDGRoot: "/elsewhere"}, envOptionPath + "." + managedXDGRoot},
 	}
@@ -70,6 +69,26 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 			_, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{metaEnvKey: test.value}))
 			require.Equal(t, unsupportedField(test.field), err)
 		})
+	}
+}
+
+// A session may not own the search path, and only the platform decides which
+// spellings address it: Windows resolves environment names case-insensitively,
+// so Path is PATH there and an ordinary variable of its own everywhere else.
+func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T) {
+	for _, spelling := range []string{"path", "Path", "PaTh"} {
+		meta, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{
+			metaEnvKey: map[string]any{spelling: "/attacker/bin"},
+		}))
+
+		if runtime.GOOS == "windows" {
+			require.Equal(t, unsupportedField(envOptionPath+"."+spelling), err)
+
+			continue
+		}
+
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{spelling: "/attacker/bin"}, meta.Env)
 	}
 }
 

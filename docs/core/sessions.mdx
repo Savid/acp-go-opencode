@@ -73,15 +73,14 @@ the lifecycle response returns. Those updates are lifecycle-scoped and omit a
 turn route. Command refresh caused by a slash-command prompt is turn-scoped and
 carries that prompt's exact route envelope.
 
-A startup failure returned over ACP has error code `-32603` and a values-free
-data payload tagged `opencode_session_start_failed`. Its `stage` is one of
-`runtime_start`, `carrier_proof`, `scope`, `catalog`, or
-`native_session_create`. A `runtime_start` failure also carries a required
-`runtimePhase` of `resources`, `configuration`, `spawn`, or `readiness`.
-When the cause is an allowlisted loopback HTTP
-operation, `http` contains only `method`, `pathClass`, and `statusCode`; native
-response bodies, URLs, queries, model names, configuration, and credentials are
-never included.
+A session start that fails on a caller-supplied option — a seeded file the
+runtime home cannot accept, a start path that is not absolute, an unusable
+`_meta.opencode` option — is rejected with `-32602` and the uniform
+`{"error":"unsupported","field":"<json path>"}` data. Every other startup
+failure is `-32603`. When a loopback call to the native server failed, the
+message names the method, route, and status of that call alone: native response
+bodies, query strings, model names, configuration, and credentials never reach
+the client.
 
 If the shared native server exits, the adapter fails every in-flight turn on
 that server with the uniform `opencode_turn_failed` transport error but retains

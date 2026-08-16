@@ -126,24 +126,33 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 
 func assertSetSessionConfigOptionBranches(t *testing.T, ctx context.Context, agent *Agent, sess *session, conn *recordingAgentClient) {
 	t.Helper()
-	if _, err := agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{}); err == nil {
-		t.Fatal("missing value accepted")
-	}
-	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest("missing", configModel, "p/m")); err == nil {
-		t.Fatal("unknown session config accepted")
-	}
-	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "")); err == nil {
-		t.Fatal("empty config value accepted")
-	}
-	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, "unknown", "x")); err == nil {
-		t.Fatal("unknown config id accepted")
-	}
-	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "missing/model")); err == nil {
-		t.Fatal("unknown model accepted")
-	}
-	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configMode, "missing")); err == nil {
-		t.Fatal("unknown mode accepted")
-	}
+	// Every refusal on this method carries the uniform two-key rejection, so a
+	// host reads one token rather than matching prose per sibling.
+	unsupportedValue := map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: jsonFieldValue}
+
+	_, err := agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{})
+	requireInvalidParamsData(t, err, unsupportedValue)
+
+	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest("missing", configModel, "p/m"))
+	requireInvalidParamsData(t, err, map[string]any{
+		jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID,
+	})
+
+	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, ""))
+	requireInvalidParamsData(t, err, unsupportedValue)
+
+	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, "unknown", "x"))
+	requireInvalidParamsData(t, err, map[string]any{
+		jsonFieldError: errValueUnsupported, jsonFieldField: "configId",
+	})
+
+	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "missing/model"))
+	requireInvalidParamsData(t, err, map[string]any{
+		jsonFieldError: "invalid_model", jsonFieldField: jsonFieldValue, configModel: "missing/model",
+	})
+
+	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configMode, "missing"))
+	requireInvalidParamsData(t, err, unsupportedValue)
 	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "p/m")); err != nil {
 		t.Fatalf("set model: %v", err)
 	}

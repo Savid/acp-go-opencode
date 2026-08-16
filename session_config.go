@@ -3,7 +3,6 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"slices"
 	"strings"
 
@@ -12,12 +11,15 @@ import (
 )
 
 func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+	// Every option this agent advertises is a select, so the request member
+	// that made this call unsupported is the discriminator that chose the
+	// boolean form, not the value it carried.
 	if params.Boolean != nil {
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: jsonFieldValue})
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldType)
 	}
 
 	if params.ValueId == nil {
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldField: jsonFieldValue})
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldValue)
 	}
 
 	session, err := a.session(params.ValueId.SessionId)
@@ -31,7 +33,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 
 	value := string(params.ValueId.Value)
 	if value == "" {
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldField: jsonFieldValue})
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldValue)
 	}
 
 	switch params.ValueId.ConfigId {
@@ -43,12 +45,12 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		session.setModel(value)
 	case configMode:
 		if !session.hasConfigValue(ctx, configMode, value) {
-			return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldField: jsonFieldValue})
+			return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldValue)
 		}
 
 		session.setMode(value)
 	default:
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldField: "configId"})
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField("configId")
 	}
 
 	options := session.configOptions(ctx)
@@ -87,17 +89,7 @@ func validateModel(ctx context.Context, client opencode.Client, value string, fi
 }
 
 func validateStartupModel(ctx context.Context, client opencode.Client, value string, field string) error {
-	err := validateModel(ctx, client, value, field)
-	if err == nil {
-		return nil
-	}
-
-	var requestErr *acp.RequestError
-	if errors.As(err, &requestErr) {
-		return err
-	}
-
-	return wrapSessionStartupError(SessionStartupCatalog, err)
+	return startupFailure(validateModel(ctx, client, value, field))
 }
 
 func invalidModel(value string, field string) error {

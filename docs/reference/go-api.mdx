@@ -122,8 +122,10 @@ the supervisor waiter observes exit; it never derives that count from root
 permits. Absolute provider-descendant snapshots are emitted only when the
 containment backend is authoritative; Darwin best-effort suppresses snapshots,
 including fabricated zeroes. Startup observations distinguish
-`spawn`, `readiness`, `configuration`, `carrier` proof, and native `session`
-creation and carry the stage error.
+`spawn`, `readiness`, `configuration`, and native `session` creation and carry
+the stage error. The session-carrier proof closes the `readiness` stage rather
+than reporting one of its own: a runtime whose carrier plugin never loaded is
+not ready.
 
 Cancellation, timeout, and turn-failure settlement use a 20-second adapter
 budget around a base-runtime shutdown whose internal containment proof is
@@ -167,7 +169,6 @@ vocabulary already populated:
 | `CancelRequest` | `session/cancel` for the same required turn nonce. |
 | `SetConfigOptionRequest` / `SetModelRequest` | `session/set_config_option`. |
 | `StdioMCPServer` / `HTTPMCPServer` | MCP server definitions. |
-| `SessionStartupFailureFromError` | Read the values-free startup stage, required runtime phase for `runtime_start`, and optional allowlisted loopback HTTP metadata from an in-process or ACP error. |
 
 `PromptRequest`, `TextPromptRequest`, and `CancelRequest` stamp route metadata
 only for a non-empty `turnNonce` of at most 4096 bytes. An invalid nonce leaves

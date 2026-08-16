@@ -251,7 +251,7 @@ func environmentMapValue(environment map[string]string, name string) string {
 func environmentValue(environment []string, name string) string {
 	for index := len(environment) - 1; index >= 0; index-- {
 		key, value, ok := strings.Cut(environment[index], "=")
-		if ok && environmentKeyEqual(key, name) {
+		if ok && EnvironmentKeyEqual(key, name) {
 			return value
 		}
 	}

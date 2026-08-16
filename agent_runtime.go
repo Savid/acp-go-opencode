@@ -399,27 +399,17 @@ func (a *Agent) startSharedRuntime(
 ) (opencode.Client, func(), func(), error) {
 	hooks := a.options.RuntimeResourceHooks
 
-	var (
-		startupFailureMu           sync.Mutex
-		startupFailureStage        = SessionStartupRuntimeStart
-		startupFailureRuntimePhase = SessionStartupRuntimePhaseResources
-	)
-
-	wrapRuntimeResourceError := func(err error) error {
-		return wrapSessionRuntimeStartupError(SessionStartupRuntimePhaseResources, err)
-	}
-
 	nativeOwnedXDG := a.options.Home != "" && a.options.ProcessIsolation != nil
 	if nativeOwnedXDG {
 		if err := validateNativeOwnedDirectory(a.options.Home, a.options.ProcessIsolation); err != nil {
-			return nil, nil, nil, wrapRuntimeResourceError(err)
+			return nil, nil, nil, err
 		}
 
+		// A native-owned home is the runtime's own directory, so the wrapper
+		// authors nothing there beyond the config file it already merges.
 		for path := range a.options.SeedFiles {
 			if path != "opencode.json" {
-				return nil, nil, nil, wrapRuntimeResourceError(
-					fmt.Errorf("seed file %q is unsupported with a native-owned OpenCode runtime home", path),
-				)
+				return nil, nil, nil, unsupportedField(fmt.Sprintf("seedFiles[%s]", path))
 			}
 		}
 	}
@@ -431,24 +421,20 @@ func (a *Agent) startSharedRuntime(
 
 		xdgScratchRelease, err = acquireRuntimeResource(ctx, hooks.ReserveScratchRoot, RuntimeResourceRuntime)
 		if err != nil {
-			return nil, nil, nil, wrapRuntimeResourceError(err)
+			return nil, nil, nil, err
 		}
 	}
 
 	nativeRelease, err := acquireRuntimeResource(ctx, hooks.AcquireNativeRoot, RuntimeResourceRuntime)
 	if err != nil {
-		err = errors.Join(err, a.cleanupRuntimeResources(nil, nil, xdgScratchRelease))
-
-		return nil, nil, nil, wrapRuntimeResourceError(err)
+		return nil, nil, nil, errors.Join(err, a.cleanupRuntimeResources(nil, nil, xdgScratchRelease))
 	}
 
 	xdg := opencode.RuntimeXDGDirs(a.homeRoot())
 	if !nativeOwnedXDG {
 		xdg, err = opencode.CreateRuntimeXDGDirs(a.homeRoot())
 		if err != nil {
-			err = errors.Join(err, a.cleanupRuntimeResources(nil, nativeRelease, xdgScratchRelease))
-
-			return nil, nil, nil, wrapRuntimeResourceError(err)
+			return nil, nil, nil, errors.Join(err, a.cleanupRuntimeResources(nil, nativeRelease, xdgScratchRelease))
 		}
 	}
 
@@ -458,8 +444,6 @@ func (a *Agent) startSharedRuntime(
 	}
 
 	a.observe.RecordOpenCodeProcessStart(ctx)
-
-	startupFailureRuntimePhase = SessionStartupRuntimePhaseConfiguration
 
 	runtime, err := factory(ctx, opencode.StartOptions{
 		Root: a.homeRoot(), ControlRoot: opencode.ControlRootForXDG(a.homeRoot()), ScratchParent: scratchParent(a.options.ScratchDir),
@@ -488,25 +472,6 @@ func (a *Agent) startSharedRuntime(
 			observeRuntimeProcessSnapshot(processCtx, hooks, RuntimeProcessKind(kind), count)
 		},
 		ObserveStartupStage: func(stageCtx context.Context, lifecycle, stage string, elapsed time.Duration, stageErr error) {
-			startupFailureMu.Lock()
-			switch RuntimeStartupStage(stage) {
-			case RuntimeStartupConfiguration:
-				startupFailureRuntimePhase = SessionStartupRuntimePhaseConfiguration
-				if stageErr == nil {
-					startupFailureRuntimePhase = SessionStartupRuntimePhaseSpawn
-				}
-			case RuntimeStartupSpawn:
-				startupFailureRuntimePhase = SessionStartupRuntimePhaseSpawn
-				if stageErr == nil {
-					startupFailureRuntimePhase = SessionStartupRuntimePhaseReadiness
-				}
-			case RuntimeStartupReadiness:
-				startupFailureRuntimePhase = SessionStartupRuntimePhaseReadiness
-			case RuntimeStartupCarrier:
-				startupFailureStage = SessionStartupCarrierProof
-			}
-			startupFailureMu.Unlock()
-
 			observe := hooks.ObserveStartupStage
 			if observe != nil {
 				observe(stageCtx, RuntimeResourceKind(lifecycle), RuntimeStartupStage(stage), elapsed, stageErr)
@@ -514,18 +479,7 @@ func (a *Agent) startSharedRuntime(
 		},
 	})
 	if err != nil {
-		err = a.cleanupRuntimeResources(err, nativeRelease, xdgScratchRelease)
-
-		startupFailureMu.Lock()
-		stage := startupFailureStage
-		runtimePhase := startupFailureRuntimePhase
-		startupFailureMu.Unlock()
-
-		if stage == SessionStartupCarrierProof {
-			return nil, nil, nil, wrapSessionStartupError(stage, err)
-		}
-
-		return nil, nil, nil, wrapSessionRuntimeStartupError(runtimePhase, err)
+		return nil, nil, nil, startupFailure(a.cleanupRuntimeResources(err, nativeRelease, xdgScratchRelease))
 	}
 
 	return runtime, nativeRelease, xdgScratchRelease, nil

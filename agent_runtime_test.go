@@ -848,7 +848,7 @@ func TestNativeOwnedDurableRuntimeHomeRejectsSeedFilesBeforeLaunch(t *testing.T)
 	}
 
 	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
-	require.ErrorContains(t, err, "seed file \"provider.json\" is unsupported")
+	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "seedFiles[provider.json]"})
 	require.Nil(t, client)
 	require.Nil(t, nativeRelease)
 	require.Nil(t, scratchRelease)

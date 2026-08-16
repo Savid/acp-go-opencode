@@ -260,7 +260,14 @@ export const AcpGoOpenCodeSessionCarrier = async ({ client, directory }) => {
 
       if (!loginShell && dirs.length === 0) return
 
-      const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === "PATH") ?? "PATH"
+      // Only Windows resolves environment names case-insensitively, so only
+      // there is an existing spelling worth adopting. Matching case-insensitively
+      // elsewhere would let enumeration order pick an inert Path over the real
+      // PATH and turn this operation's directories into a silent no-op.
+      const pathKey =
+        process.platform === "win32"
+          ? (Object.keys(process.env).find((key) => key.toUpperCase() === "PATH") ?? "PATH")
+          : "PATH"
       const base = process.env[pathKey] ?? ""
       const sep = separator()
 

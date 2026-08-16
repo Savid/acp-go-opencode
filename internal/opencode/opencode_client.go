@@ -1364,27 +1364,28 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		return nil, errors.Join(err, shutdownErr)
 	}
 
-	observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, nil)
-
 	// A runtime that cannot prove its carrier plugin is live is a runtime whose
 	// every shell operation would run with no bearer, no operation directories
-	// and no error. It never reaches a session.
+	// and no error. It never reaches a session, so it is not ready either: the
+	// carrier proof closes the readiness stage rather than opening its own.
 	if sessionCarrier.URL != "" {
-		carrierStarted := time.Now()
 		carrierCtx, carrierCancel := context.WithTimeout(ctx, options.HealthTimeout)
 		carrierErr := server.proveSessionCarrierLoaded(carrierCtx, sessionCarrier.Proof)
 
 		carrierCancel()
-		observeOpenCodeStartupStage(ctx, options, "runtime", "carrier", carrierStarted, carrierErr)
+
+		if carrierErr == nil {
+			carrierErr = eraseSessionCarrierBootstrap(sessionCarrier)
+		}
 
 		if carrierErr != nil {
+			observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, carrierErr)
+
 			return nil, errors.Join(carrierErr, server.Shutdown(ctx))
 		}
-
-		if eraseErr := eraseSessionCarrierBootstrap(sessionCarrier); eraseErr != nil {
-			return nil, errors.Join(eraseErr, server.Shutdown(ctx))
-		}
 	}
+
+	observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, nil)
 
 	if supervisor != nil {
 		processObservation.markSupervisorsReady(ctx)
@@ -3441,8 +3442,20 @@ func seedFileField(rel string) string {
 	return fmt.Sprintf("seedFiles[%s]", rel)
 }
 
+// UnsupportedFieldError names a caller-supplied option field the native
+// runtime refuses. It carries the field path alone so the ACP surface can
+// answer with the uniform unsupported-field rejection instead of an internal
+// error built from this package's prose.
+type UnsupportedFieldError struct {
+	Field string
+}
+
+func (e *UnsupportedFieldError) Error() string {
+	return "unsupported field " + e.Field
+}
+
 func unsupportedField(path string) error {
-	return fmt.Errorf("unsupported field %s", path)
+	return &UnsupportedFieldError{Field: path}
 }
 
 // deepMergeJSON returns base with override applied on top: nested maps are

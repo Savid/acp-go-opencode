@@ -87,8 +87,8 @@ func browserShimEnviron(env []string, dir string) []string {
 		}
 
 		switch {
-		case environmentKeyEqual(key, pathEnv):
-		case environmentKeyEqual(key, browserShimBrowserEnv):
+		case EnvironmentKeyEqual(key, pathEnv):
+		case EnvironmentKeyEqual(key, browserShimBrowserEnv):
 		default:
 			kept = append(kept, entry)
 		}

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const (
@@ -176,13 +177,13 @@ func sessionEnvFromMeta(value any) (map[string]string, error) {
 
 // validEnvName refuses names a child process cannot carry, the roots the
 // adapter manages on OpenCode's behalf, and the one name this option is not
-// allowed to own. PATH is compared without regard to case on every platform:
-// the refusal is a property of the protocol field rather than of the host that
-// happens to decode it, and a Windows child resolves PATH and Path to the same
-// variable.
+// allowed to own. PATH is refused by environment identity rather than by
+// spelling: only where the child resolves names case-insensitively does Path
+// address the search path, and refusing it elsewhere would deny a session an
+// ordinary variable of its own.
 func validEnvName(key string) bool {
 	return key != "" &&
-		!strings.EqualFold(key, envPathKey) &&
+		!opencode.EnvironmentKeyEqual(key, envPathKey) &&
 		!reservedOpenCodeEnvKey(key) &&
 		!strings.ContainsAny(key, "=\x00")
 }
