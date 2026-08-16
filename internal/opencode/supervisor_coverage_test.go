@@ -179,8 +179,14 @@ func TestSupervisorConfigAndDispatchFailures(t *testing.T) {
 	_, err = readSupervisorConfig(strings.NewReader("{"))
 	require.ErrorContains(t, err, "decode private")
 
-	_, err = readSupervisorConfig(strings.NewReader(`{"nativePath":"x"}`))
+	_, err = readSupervisorConfig(strings.NewReader(`{"nativeExecutable":{"path":"x"}}`))
 	require.ErrorContains(t, err, "incomplete")
+
+	// Both supervisors run from /, so the config is the last place a relative
+	// executable can be caught before the kernel resolves it there.
+	_, err = readSupervisorConfig(strings.NewReader(
+		`{"nativeExecutable":{"path":"bin/opencode"},"home":"/h","scratch":"/s","isolationUid":1,"isolationGid":2}`))
+	require.ErrorContains(t, err, `private supervisor native executable "bin/opencode" is not absolute`)
 
 	_, err = writeSupervisorConfig("", supervisorConfig{})
 	require.ErrorContains(t, err, "scratch root is required")
@@ -189,12 +195,12 @@ func TestSupervisorConfigAndDispatchFailures(t *testing.T) {
 	_, err = writeSupervisorConfig(filepath.Join(notDir, "child"), supervisorConfig{})
 	require.ErrorContains(t, err, "create private")
 
-	config := supervisorConfig{NativePath: "x", Home: "h", Scratch: "s", IsolationUID: 1, IsolationGID: 2}
+	config := supervisorConfig{NativeExecutable: processExecutable{Path: "/x"}, Home: "h", Scratch: "s", IsolationUID: 1, IsolationGID: 2}
 	path, err := writeSupervisorConfig(root, config)
 	require.NoError(t, err)
 	loaded, err := readSupervisorConfig(path)
 	require.NoError(t, err)
-	require.Equal(t, config.NativePath, loaded.NativePath)
+	require.Equal(t, config.NativeExecutable, loaded.NativeExecutable)
 
 	path, err = writeSupervisorConfig(root, config)
 	require.NoError(t, err)
@@ -213,7 +219,7 @@ func TestSupervisorCommandNonceEnvironmentAndProof(t *testing.T) {
 
 	supervisorExecutable = os.Executable
 	cmd, proof, err := supervisorCommand(context.Background(), supervisorConfig{
-		NativePath: "/usr/bin/true", Home: filepath.Join(root, "home"), Scratch: root,
+		NativeExecutable: testNativeExecutable(t, "/usr/bin/true"), Home: filepath.Join(root, "home"), Scratch: root,
 		Isolation: testProcessIsolation(),
 	})
 	require.NoError(t, err)
@@ -367,7 +373,7 @@ func TestRunLivenessControlEOFAndNativeFailure(t *testing.T) {
 	supervisorOutput = io.Discard
 	supervisorError = io.Discard
 	config := supervisorConfig{
-		NativePath: "/bin/sh", NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
+		NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
 		Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
 		NativePIDFile: filepath.Join(root, "native.pid"),
@@ -383,9 +389,54 @@ func TestRunLivenessControlEOFAndNativeFailure(t *testing.T) {
 	config.Started = filepath.Join(root, "started")
 	config.Completion = filepath.Join(root, "complete")
 	config.NativePIDFile = filepath.Join(root, "native.pid")
-	config.NativePath = filepath.Join(root, "missing")
+
+	// A file the identity fence accepts and the kernel still refuses to exec.
+	unrunnable := filepath.Join(root, "unrunnable")
+	require.NoError(t, os.WriteFile(unrunnable, []byte("not a program"), 0o700))
+	config.NativeExecutable = testNativeExecutable(t, unrunnable)
 	err = runLiveness(config)
 	require.ErrorContains(t, err, "start contained native root")
+}
+
+// TestRunLivenessRefusesAnExecutableSwappedAfterResolution proves the exec
+// boundary is fenced by identity rather than by name. The adapter resolved and
+// validated one file; a same-named replacement reaching the liveness supervisor
+// is refused, nothing is started, and the containment boundary still completes.
+func TestRunLivenessRefusesAnExecutableSwappedAfterResolution(t *testing.T) {
+	preserveSupervisorGlobals(t)
+	root := t.TempDir()
+	supervisorInput = strings.NewReader("")
+	supervisorOutput = io.Discard
+	supervisorError = io.Discard
+
+	native := filepath.Join(root, "opencode")
+	require.NoError(t, os.WriteFile(native, []byte("#!/bin/sh\nexec cat\n"), 0o700))
+	config := supervisorConfig{
+		NativeExecutable: testNativeExecutable(t, native), NativeEnv: os.Environ(),
+		Home: filepath.Join(root, "home"), Scratch: root,
+		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
+		NativePIDFile: filepath.Join(root, "native.pid"),
+	}
+
+	swapped := filepath.Join(root, "swapped")
+	require.NoError(t, os.WriteFile(swapped, []byte("#!/bin/sh\nexec cat\n"), 0o700))
+	require.NoError(t, os.Rename(swapped, native))
+
+	var started *exec.Cmd
+
+	command := supervisorExecCommand
+	supervisorExecCommand = func(name string, args ...string) *exec.Cmd {
+		started = command(name, args...)
+
+		return started
+	}
+
+	err := runLiveness(config)
+	require.ErrorContains(t, err, "no longer the file the launch resolved")
+	require.NotNil(t, started)
+	require.Nil(t, started.Process, "a refused identity must not reach exec")
+	require.FileExists(t, config.Completion)
+	require.NoFileExists(t, config.NativePIDFile)
 }
 
 func TestRunLivenessPublishAndPIDFailures(t *testing.T) {
@@ -395,7 +446,7 @@ func TestRunLivenessPublishAndPIDFailures(t *testing.T) {
 	supervisorOutput = io.Discard
 	supervisorError = supervisorErrorWriter{err: errors.New("write failed")}
 	config := supervisorConfig{
-		NativePath: "/bin/sh", NativeArgs: []string{"-c", "while :; do sleep 1; done"}, NativeEnv: os.Environ(),
+		NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "while :; do sleep 1; done"}, NativeEnv: os.Environ(),
 		Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
 		NativePIDFile: filepath.Join(root, "native.pid"),
@@ -422,7 +473,7 @@ func TestRunGuardianHappyPathAndPreReadinessFailure(t *testing.T) {
 	supervisorOutput = io.Discard
 	supervisorError = io.Discard
 	config := withTestSupervisorIdentity(supervisorConfig{
-		NativePath: "/bin/sh", NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
+		NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
 		Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
 		NativePIDFile: filepath.Join(root, "native.pid"),
@@ -530,7 +581,7 @@ func TestSupervisorBootstrapDispatchesMissingAndSuccessfulLiveness(t *testing.T)
 		t.Setenv(supervisorModeEnv, supervisorModeLiveness)
 		root := t.TempDir()
 		config := withTestSupervisorIdentity(supervisorConfig{
-			NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.5"}, NativeEnv: os.Environ(),
+			NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "sleep 0.5"}, NativeEnv: os.Environ(),
 			Home: filepath.Join(root, "home"), Scratch: root, Started: filepath.Join(root, "started"),
 			Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
@@ -562,7 +613,7 @@ func TestSupervisorBootstrapDispatchesMissingAndSuccessfulLiveness(t *testing.T)
 func TestSupervisorDispatchIdentityAdoptionBranches(t *testing.T) {
 	preserveSupervisorGlobals(t)
 	validateAdoptedAuthority := supervisorValidateAdoptedAuthority
-	valid := supervisorConfig{NativePath: "/bin/sh", NativeEnv: os.Environ(), Home: t.TempDir(), Scratch: t.TempDir(), IsolationUID: 1, IsolationGID: 2}
+	valid := supervisorConfig{NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeEnv: os.Environ(), Home: t.TempDir(), Scratch: t.TempDir(), IsolationUID: 1, IsolationGID: 2}
 	encoded := func(config supervisorConfig) io.Reader {
 		data, err := json.Marshal(config)
 		require.NoError(t, err)
@@ -830,11 +881,11 @@ func TestExplicitProcessIsolationNeverFallsBackToOrdinaryBackend(t *testing.T) {
 		scratch := t.TempDir()
 
 		return supervisorConfig{
-			NativePath: "/usr/bin/true",
-			NativeEnv:  []string{"PATH=/usr/bin:/bin"},
-			Home:       filepath.Join(scratch, "home"),
-			Scratch:    scratch,
-			Isolation:  testProcessIsolation(),
+			NativeExecutable: testNativeExecutable(t, "/usr/bin/true"),
+			NativeEnv:        []string{"PATH=/usr/bin:/bin"},
+			Home:             filepath.Join(scratch, "home"),
+			Scratch:          scratch,
+			Isolation:        testProcessIsolation(),
 		}
 	}
 
@@ -951,10 +1002,10 @@ func TestOrdinaryNonLinuxSupervisorUsesDirectBackend(t *testing.T) {
 	}
 
 	cmd, proof, err := supervisorCommand(context.Background(), supervisorConfig{
-		NativePath: "/usr/bin/true",
-		NativeArgs: []string{"--version"},
-		NativeEnv:  []string{"PATH=/usr/bin:/bin", "CANARY=present"},
-		NativeDir:  "/tmp",
+		NativeExecutable: testNativeExecutable(t, "/usr/bin/true"),
+		NativeArgs:       []string{"--version"},
+		NativeEnv:        []string{"PATH=/usr/bin:/bin", "CANARY=present"},
+		NativeDir:        "/tmp",
 	})
 	require.NoError(t, err)
 	require.True(t, called)
@@ -1124,7 +1175,7 @@ func TestGuardianAndLivenessEarlyFailureBranches(t *testing.T) {
 		generation := filepath.Join(root, "generation")
 		require.NoError(t, os.Mkdir(generation, 0o700))
 		err := runLiveness(supervisorConfig{
-			Home: filepath.Join(root, "home"), Started: filepath.Join(root, "started"), NativePath: "/usr/bin/true",
+			Home: filepath.Join(root, "home"), Started: filepath.Join(root, "started"), NativeExecutable: testNativeExecutable(t, "/usr/bin/true"),
 			IsolationUID: 1, IsolationGID: 0, NativeEnv: []string{"PATH=/usr/bin"}, DarwinBestEffort: true,
 			ScratchParent: root, Scratch: generation, LifecycleKind: darwinLifecycleRuntime,
 		})
@@ -1140,7 +1191,7 @@ func TestGuardianAndLivenessEarlyFailureBranches(t *testing.T) {
 		supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error { return nil }
 		err := runLiveness(supervisorConfig{
 			Home: filepath.Join(root, "home"), Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
-			NativePath: "/usr/bin/true", NativeEnv: []string{"PATH=/usr/bin"}, DarwinBestEffort: true,
+			NativeExecutable: testNativeExecutable(t, "/usr/bin/true"), NativeEnv: []string{"PATH=/usr/bin"}, DarwinBestEffort: true,
 			ScratchParent: root, Scratch: generation, LifecycleKind: darwinLifecycleRuntime,
 		})
 		require.ErrorIs(t, err, want)
@@ -1163,7 +1214,7 @@ func TestGuardianAndLivenessEarlyFailureBranches(t *testing.T) {
 		supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error { return nil }
 		err := runLiveness(supervisorConfig{
 			Home: filepath.Join(root, "home"), Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
-			NativePath: "/usr/bin/true", NativeEnv: []string{"PATH=/usr/bin"}, DarwinBestEffort: true,
+			NativeExecutable: testNativeExecutable(t, "/usr/bin/true"), NativeEnv: []string{"PATH=/usr/bin"}, DarwinBestEffort: true,
 			ScratchParent: root, Scratch: generation, LifecycleKind: darwinLifecycleRuntime,
 		})
 		require.ErrorIs(t, err, want)
@@ -1275,7 +1326,7 @@ func TestRunLivenessPipeAndExitFailures(t *testing.T) {
 				return command
 			}
 			err := runLiveness(supervisorConfig{
-				NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+				NativeExecutable: testNativeExecutable(t, "/usr/bin/true"), NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 				Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 			})
 			require.ErrorContains(t, err, "open native")
@@ -1291,7 +1342,7 @@ func TestRunLivenessPipeAndExitFailures(t *testing.T) {
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		err := runLiveness(supervisorConfig{
-			NativePath: "/usr/bin/false", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativeExecutable: testNativeExecutable(t, "/usr/bin/false"), NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.ErrorContains(t, err, "native root exited")
@@ -1299,6 +1350,11 @@ func TestRunLivenessPipeAndExitFailures(t *testing.T) {
 }
 
 func TestUnixQuiescenceSignalEscalationAndTimeout(t *testing.T) {
+	// This case drives the real containment constructors rather than the
+	// platform seams, so it makes the test host a subreaper for as long as it
+	// runs and no longer.
+	preserveProcessSubreaper(t)
+
 	oldKill := openCodeSyscallKill
 	t.Cleanup(func() {
 		openCodeSyscallKill = oldKill
@@ -1415,7 +1471,7 @@ func TestSupervisorDispatchBootstrapAndEarlyFailures(t *testing.T) {
 	isolation := testProcessIsolation()
 	root := t.TempDir()
 	config := withTestSupervisorIdentity(supervisorConfig{
-		NativePath: "/bin/sh", NativeArgs: []string{"-c", "sleep 0.5"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+		NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "sleep 0.5"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 	})
 	path, err := writeSupervisorConfig(root, config)
@@ -1677,7 +1733,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		want := errors.New("proof failed")
 		supervisorLivenessQuiesce = func(*livenessContainment, int, time.Duration) error { return want }
 		err := runLiveness(supervisorConfig{
-			NativePath: "/bin/sh", NativeArgs: []string{"-c", "IFS= read -r _"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "IFS= read -r _"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
@@ -1693,7 +1749,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		config := withTestSupervisorIdentity(supervisorConfig{
-			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativeExecutable: testNativeExecutable(t, "/usr/bin/true"), NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		path, err := writeSupervisorConfig(root, config)
@@ -1718,7 +1774,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		supervisorError = io.Discard
 		supervisorGuardianQuiesce = func(*guardianContainment, int, time.Duration) error { return nil }
 		err := runGuardian(supervisorConfig{
-			NativePath: "/usr/bin/true", NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativeExecutable: testNativeExecutable(t, "/usr/bin/true"), NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(notDirectory, "child"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.Error(t, err)
@@ -1753,7 +1809,7 @@ func TestSupervisorFinalRemainingBranches(t *testing.T) {
 		supervisorOutput = io.Discard
 		supervisorError = io.Discard
 		err := runLiveness(supervisorConfig{
-			NativePath: "/bin/sh", NativeArgs: []string{"-c", "IFS= read -r _"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
+			NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "IFS= read -r _"}, NativeEnv: os.Environ(), Home: filepath.Join(root, "home"), Scratch: root,
 			Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"), NativePIDFile: filepath.Join(root, "pid"),
 		})
 		require.NoError(t, err)
@@ -1856,7 +1912,7 @@ func TestRunGuardianWritesCompletionProofWhenLivenessLeftNone(t *testing.T) {
 
 	completion := filepath.Join(root, "complete")
 	require.NoError(t, runGuardian(supervisorConfig{
-		NativePath: "/bin/sh", NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
+		NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
 		Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: completion,
 		NativePIDFile: filepath.Join(root, "native.pid"),

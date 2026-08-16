@@ -28,7 +28,7 @@ func TestLinuxSupervisorConfigWriteFailsClosedAndKeepsNoDescriptor(t *testing.T)
 		want := errors.New("no anonymous memory")
 		linuxSupervisorMemfdCreate = func(string, int) (int, error) { return -1, want }
 
-		file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativePath: "/bin/true"})
+		file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativeExecutable: testNativeExecutable(t, "/bin/true")})
 		require.ErrorIs(t, err, want)
 		require.ErrorContains(t, err, "create private supervisor config descriptor")
 		require.Nil(t, file)
@@ -48,7 +48,7 @@ func TestLinuxSupervisorConfigWriteFailsClosedAndKeepsNoDescriptor(t *testing.T)
 			return fd, err
 		}
 
-		file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativePath: "/bin/true"})
+		file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativeExecutable: testNativeExecutable(t, "/bin/true")})
 		require.ErrorIs(t, err, unix.EBADF)
 		require.ErrorContains(t, err, "secure private supervisor config descriptor")
 		require.Nil(t, file)
@@ -78,7 +78,7 @@ func TestLinuxSupervisorConfigWriteFailsClosedAndKeepsNoDescriptor(t *testing.T)
 			return nil
 		}
 
-		file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativePath: "/bin/true"})
+		file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativeExecutable: testNativeExecutable(t, "/bin/true")})
 		require.ErrorIs(t, err, unix.EPERM)
 		require.ErrorContains(t, err, "seal private supervisor config descriptor")
 		require.Nil(t, file)
@@ -98,7 +98,7 @@ func TestLinuxSupervisorConfigWriteFailsClosedAndKeepsNoDescriptor(t *testing.T)
 		want := errors.New("descriptor will not rewind")
 		linuxSupervisorSeek = func(*os.File, int64, int) (int64, error) { return 0, want }
 
-		file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativePath: "/bin/true"})
+		file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativeExecutable: testNativeExecutable(t, "/bin/true")})
 		require.ErrorIs(t, err, want)
 		require.ErrorContains(t, err, "rewind private supervisor config descriptor")
 		require.Nil(t, file)

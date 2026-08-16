@@ -16,7 +16,6 @@ import (
 
 	"github.com/savid/acp-go-opencode/internal/homelock"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 )
 
 // withOrdinaryIdentitySeams restores the seams ordinary execution is stamped
@@ -112,7 +111,7 @@ func TestSupervisorCommandStampsTheAuthorityItsIdentityAllows(t *testing.T) {
 		sealed := captureSupervisorConfig(t)
 
 		cmd, proof, err := supervisorCommand(context.Background(), supervisorConfig{
-			NativePath: "/bin/true", Home: filepath.Join(scratch, "home"), Scratch: scratch,
+			NativeExecutable: testNativeExecutable(t, "/bin/true"), Home: filepath.Join(scratch, "home"), Scratch: scratch,
 		})
 		require.NoError(t, err)
 		require.NotNil(t, cmd)
@@ -143,7 +142,7 @@ func TestSupervisorCommandStampsTheAuthorityItsIdentityAllows(t *testing.T) {
 		sealed := captureSupervisorConfig(t)
 
 		_, proof, err := supervisorCommand(context.Background(), supervisorConfig{
-			NativePath: "/bin/true", Home: filepath.Join(scratch, "home"), Scratch: scratch,
+			NativeExecutable: testNativeExecutable(t, "/bin/true"), Home: filepath.Join(scratch, "home"), Scratch: scratch,
 		})
 		require.NoError(t, err)
 		require.NoError(t, proof.closeInherited())
@@ -172,7 +171,7 @@ func TestSupervisorCommandStampsTheAuthorityItsIdentityAllows(t *testing.T) {
 		isolation.UID, isolation.GID = 65534, 65534
 
 		cmd, proof, err := supervisorCommand(context.Background(), supervisorConfig{
-			NativePath: "/bin/true", Home: filepath.Join(scratch, "home"), Scratch: scratch,
+			NativeExecutable: testNativeExecutable(t, "/bin/true"), Home: filepath.Join(scratch, "home"), Scratch: scratch,
 			Isolation: isolation,
 		})
 		require.NoError(t, err)
@@ -220,7 +219,7 @@ func TestRunSupervisorRefusesAConfigItsIdentityContradicts(t *testing.T) {
 
 	base := func() supervisorConfig {
 		return supervisorConfig{
-			NativePath: "/bin/true", Home: "/home/runner", Scratch: "/tmp/scratch",
+			NativeExecutable: testNativeExecutable(t, "/bin/true"), Home: "/home/runner", Scratch: "/tmp/scratch",
 			IsolationUID: 1000, IsolationGID: 1000,
 			SharedIdentity: true, OrdinaryExecution: true,
 		}
@@ -333,42 +332,6 @@ func TestProcessIsolationOmissionAllowsRoot(t *testing.T) {
 func runOrdinaryOmissionLaunch(t *testing.T) {
 	t.Helper()
 
-	// Adopt the pair's orphans for the same reason the explicit proof does: a
-	// reparented liveness supervisor's process group would otherwise be resumed
-	// by POSIX before the test can observe containment.
-	require.NoError(t, unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0))
-
-	root, err := os.MkdirTemp("", "acp-go-opencode-ordinary-")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-
-	home := filepath.Join(root, "home")
-	scratch := filepath.Join(root, "scratch")
-	require.NoError(t, os.MkdirAll(scratch, 0o700))
-
-	rootPIDPath := filepath.Join(root, "root.pid")
-	descPIDPath := filepath.Join(root, "desc.pid")
-	identityPath := filepath.Join(root, "identity")
-	environmentPath := filepath.Join(root, "environment")
-	readyPath := filepath.Join(root, "ready")
-	script := filepath.Join(root, "native.sh")
-	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
-if [ "$1" = "descendant" ]; then
-  echo "$$" > "$DESC_PID_FILE"
-  trap '' TERM
-  while :; do sleep 1; done
-fi
-setsid "$0" descendant &
-echo "$$" > "$ROOT_PID_FILE"
-printf '%s %s %s\n' "$(id -u)" "$(id -g)" "$(id -G)" > "$IDENTITY_FILE"
-env > "$ENVIRONMENT_FILE"
-touch "$READY_FILE"
-trap '' TERM
-while IFS= read -r line; do printf '%s\n' "$line"; done
-`), 0o755))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-
 	// The ambient environment carries the private carriers a leak would show
 	// up in, so the launch is asked to build its own native environment from it
 	// exactly as an ordinary agent does.
@@ -376,65 +339,21 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	t.Setenv(DarwinRuntimeIDEnv, "leaked")
 	t.Setenv("OPENCODE_DB", "/leaked/opencode.db")
 
-	nativeEnvironment, err := buildProcessEnvironment(nil, map[string]string{
-		"ROOT_PID_FILE":    rootPIDPath,
-		"DESC_PID_FILE":    descPIDPath,
-		"IDENTITY_FILE":    identityPath,
-		"ENVIRONMENT_FILE": environmentPath,
-		"READY_FILE":       readyPath,
-	})
-	require.NoError(t, err)
+	supervised := startOrdinarySupervisedNative(t)
 
-	nativeEnv := envMapToSlice(nativeEnvironment)
-
-	cmd, proof, err := supervisorCommand(ctx, supervisorConfig{
-		NativePath: script,
-		NativeArgs: []string{"root"},
-		NativeEnv:  nativeEnv,
-		Home:       home,
-		Scratch:    scratch,
-	})
-	require.NoError(t, err)
-	require.Nil(t, cmd.SysProcAttr, "ordinary execution requests no credential change")
-	require.Equal(t, scratch, filepath.Dir(proof.completion),
+	require.Equal(t, filepath.Join(supervised.root, "scratch"), filepath.Dir(supervised.proof.completion),
 		"ordinary execution keeps its containment proofs in its own scratch root")
 	require.NoDirExists(t, filepath.Join(linuxAgentIdentityNamespace, "domain.lock"),
 		"ordinary execution never bootstraps the trusted authority namespace")
 
-	stdin, err := cmd.StdinPipe()
-	require.NoError(t, err)
-	stderr := new(supervisorTestBuffer)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = stderr
-	waiter, err := startOpenCodeProcess(cmd)
-	require.NoError(t, err)
-	require.NoError(t, proof.closeInherited())
-
 	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid()) // Kernel IDs fit the wire width.
-	supervised := &supervisedNative{
-		cmd: cmd, waiter: waiter, stdin: stdin, home: home,
-		stderr: stderr, cancel: cancel, proof: proof, isolationUID: uid,
-	}
-	t.Cleanup(func() {
-		cancel()
-		_ = stdin.Close()
-		killSupervisedGroup(supervised.rootPID)
-		killSupervisedGroup(supervised.descPID)
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-	})
 
-	supervised.rootPID = waitPIDFile(t, rootPIDPath, stderr)
-	supervised.descPID = waitPIDFile(t, descPIDPath, stderr)
-	waitFile(t, readyPath)
-
-	identity, err := os.ReadFile(identityPath)
+	identity, err := os.ReadFile(supervised.identityPath)
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(strings.TrimSpace(string(identity)), fmt.Sprintf("%d %d", uid, gid)),
 		"the native process must run as the identity the adapter already holds, groups untouched")
 
-	childEnvironment, err := os.ReadFile(environmentPath)
+	childEnvironment, err := os.ReadFile(supervised.environmentPath)
 	require.NoError(t, err)
 	require.NotContains(t, string(childEnvironment), privateAdapterEnvPrefix)
 	require.NotContains(t, string(childEnvironment), DarwinRuntimeIDEnv)
@@ -444,12 +363,12 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	require.Equal(t, supervised.descPID, descendantSession, "descendant must escape into a new session")
 	require.Equal(t, supervised.descPID, descendantGroup, "descendant must escape into a new process group")
 
-	_, err = homelock.Acquire(home)
+	_, err = homelock.Acquire(supervised.home)
 	require.Error(t, err, "second claimant must fail while the tree is live")
 
-	require.NoError(t, stdin.Close())
-	require.NoError(t, waitSupervisor(supervised, 20*time.Second), "supervisor stderr: %s", stderr.String())
+	require.NoError(t, supervised.stdin.Close())
+	require.NoError(t, waitSupervisor(supervised, 20*time.Second), "supervisor stderr: %s", supervised.stderr.String())
 	assertProcessGone(t, supervised.rootPID)
 	assertProcessGone(t, supervised.descPID)
-	assertHomeReacquires(t, home)
+	assertHomeReacquires(t, supervised.home)
 }

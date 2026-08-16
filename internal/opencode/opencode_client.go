@@ -874,6 +874,18 @@ var (
 // HealthCheckTimeout is the default bound on OpenCode server readiness checks.
 const HealthCheckTimeout = 60 * time.Second
 
+// startVerifiedOpenCodeProcess commits the launch. The native file was resolved
+// and validated far earlier in this call, so its identity is confirmed once more
+// here; the supervised arm repeats the confirmation inside the liveness
+// supervisor, which execs the file from another process and another directory.
+func startVerifiedOpenCodeProcess(cmd *exec.Cmd, executable processExecutable) (*supervisorWaiter, error) {
+	if err := executable.verify(); err != nil {
+		return nil, err
+	}
+
+	return openCodeStartProcess(cmd)
+}
+
 func normalizedStartOptions(options StartOptions) StartOptions {
 	options.ImplicitEnvironment = maps.Clone(options.ImplicitEnvironment)
 	if options.ProcessIsolation == nil && options.ImplicitEnvironment == nil {
@@ -1113,12 +1125,12 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		nativeEnv = options.BrowserShim.environ(nativeEnv)
 	}
 
-	executable := options.ExecutablePath
-	if executable == "" {
-		executable = opencodeExecutableName
+	configuredExecutable := options.ExecutablePath
+	if configuredExecutable == "" {
+		configuredExecutable = opencodeExecutableName
 	}
 
-	executable, err = resolveProcessExecutable(executable, nativeEnv, options.ProcessIsolation != nil)
+	executable, err := resolveProcessExecutable(configuredExecutable, nativeEnv, options.ProcessIsolation != nil)
 	if err != nil {
 		return nil, fmt.Errorf("find OpenCode executable: %w", err)
 	}
@@ -1169,7 +1181,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	}
 
 	if options.skipSupervisor {
-		cmd = openCodeCommandContext(processCtx, executable, args...)
+		cmd = openCodeCommandContext(processCtx, executable.Path, args...)
 		cmd.Env = nativeEnv
 
 		if credentialErr := openCodeApplyCredential(cmd, options.ProcessIsolation); credentialErr != nil {
@@ -1184,7 +1196,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		}
 
 		cmd, supervisor, err = openCodeSupervisorCommand(processCtx, supervisorConfig{
-			NativePath:       executable,
+			NativeExecutable: executable,
 			NativeArgs:       args,
 			NativeEnv:        nativeEnv,
 			NativeDir:        "",
@@ -1233,7 +1245,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	spawnStarted := time.Now()
 
-	runtimeWaiter, startErr := openCodeStartProcess(cmd)
+	runtimeWaiter, startErr := startVerifiedOpenCodeProcess(cmd, executable)
 	if startErr != nil {
 		_ = supervisor.closeInherited()
 

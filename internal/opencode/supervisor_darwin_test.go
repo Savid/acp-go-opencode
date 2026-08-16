@@ -758,7 +758,7 @@ func TestDarwinSupervisorProofFailureBranches(t *testing.T) {
 		preserveSupervisorGlobals(t)
 		preserveDarwinSupervisorSeams(t)
 		config := darwinSupervisorTestConfig(t)
-		config.NativePath = "/bin/sh"
+		config.NativeExecutable = testNativeExecutable(t, "/bin/sh")
 		config.NativeArgs = []string{"-c", "sleep 0.5"}
 		config.NativeEnv = os.Environ()
 		config.Home = filepath.Join(config.Scratch, "home")

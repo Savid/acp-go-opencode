@@ -24,19 +24,22 @@ import (
 )
 
 type supervisedNative struct {
-	cmd          *exec.Cmd
-	waiter       *supervisorWaiter
-	stdin        io.WriteCloser
-	home         string
-	rootPID      int
-	descPID      int
-	livenessPID  int
-	proof        *supervisorProof
-	stderr       *supervisorTestBuffer
-	cancel       context.CancelFunc
-	attackPath   string
-	forgePath    string
-	isolationUID uint32
+	cmd             *exec.Cmd
+	waiter          *supervisorWaiter
+	stdin           io.WriteCloser
+	root            string
+	home            string
+	rootPID         int
+	descPID         int
+	livenessPID     int
+	proof           *supervisorProof
+	stderr          *supervisorTestBuffer
+	cancel          context.CancelFunc
+	attackPath      string
+	forgePath       string
+	identityPath    string
+	environmentPath string
+	isolationUID    uint32
 }
 
 type supervisorTestBuffer struct {
@@ -156,7 +159,7 @@ func TestTrustedSupervisorDeniesNativeAuthorityAttacks(t *testing.T) {
 }
 
 func TestLinuxSupervisorConfigIsSealed(t *testing.T) {
-	file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativePath: "/bin/true"})
+	file, err := writeLinuxSupervisorConfig("", supervisorConfig{NativeExecutable: testNativeExecutable(t, "/bin/true")})
 	require.NoError(t, err)
 	defer file.Close()
 
@@ -293,11 +296,15 @@ func TestGuardianPersistentProofFailureQuarantinesUntilRecovery(t *testing.T) {
 	require.ErrorIs(t, <-done, ErrProcessContainmentIncomplete)
 }
 
+// TestSupervisorGuardianSIGKILLLeavesLivenessLockedUntilTreeExit observes the
+// survivor inside the window the fixture creates rather than by freezing it.
+// The native tree ignores SIGTERM and is stopped, so the liveness supervisor
+// spends its whole graceful phase there; stopping the survivor instead would
+// put a stopped member in the group the guardian's death orphans, which is a
+// topology the production system must never be observed through.
 func TestSupervisorGuardianSIGKILLLeavesLivenessLockedUntilTreeExit(t *testing.T) {
 	runtime := startSupervisedNative(t)
 	stopSupervisedGroup(t, runtime.rootPID)
-	stopSupervisedProcess(t, runtime.livenessPID)
-	t.Cleanup(func() { _ = syscall.Kill(runtime.livenessPID, syscall.SIGCONT) })
 	require.NoError(t, runtime.cmd.Process.Kill())
 	runtime.waiter.start()
 	<-runtime.waiter.result()
@@ -309,7 +316,6 @@ func TestSupervisorGuardianSIGKILLLeavesLivenessLockedUntilTreeExit(t *testing.T
 	require.Error(t, err, "surviving liveness supervisor must retain its lock")
 	require.NoError(t, syscall.Kill(runtime.descPID, 0), "setsid descendant must still be live during authority contention")
 	assertAgentIdentityAuthorityLocked(t, runtime.isolationUID)
-	require.NoError(t, syscall.Kill(runtime.livenessPID, syscall.SIGCONT))
 
 	liveness := acquireLivenessEventually(t, runtime.home)
 	require.NoError(t, liveness.Release())
@@ -356,14 +362,14 @@ func TestSupervisorGuardianSIGKILLBeforeNativeLaunchRefusesStartAndCompletesAfte
 
 	root := t.TempDir()
 	config := supervisorConfig{
-		NativePath:    "/bin/true",
-		NativeArgs:    []string{"true"},
-		NativeEnv:     os.Environ(),
-		Home:          filepath.Join(root, "home"),
-		Started:       filepath.Join(root, "started"),
-		Completion:    filepath.Join(root, "completion"),
-		Quarantine:    filepath.Join(root, "quarantine"),
-		NativePIDFile: filepath.Join(root, "native-pid"),
+		NativeExecutable: testNativeExecutable(t, "/bin/true"),
+		NativeArgs:       []string{"true"},
+		NativeEnv:        os.Environ(),
+		Home:             filepath.Join(root, "home"),
+		Started:          filepath.Join(root, "started"),
+		Completion:       filepath.Join(root, "completion"),
+		Quarantine:       filepath.Join(root, "quarantine"),
+		NativePIDFile:    filepath.Join(root, "native-pid"),
 	}
 	var native *exec.Cmd
 	supervisorExecCommand = func(string, ...string) *exec.Cmd {
@@ -417,15 +423,7 @@ func TestTurnTimeoutShutdownContainsStubbornSetsidDescendant(t *testing.T) {
 
 func startSupervisedNative(t *testing.T) *supervisedNative {
 	t.Helper()
-	// Adopt the supervisor pair's orphans. Without this the kernel reparents a
-	// killed guardian's liveness supervisor to init, which orphans the process
-	// group configureIndependentSupervisor gave it; POSIX then resumes an
-	// orphaned group that holds stopped jobs with SIGHUP and SIGCONT, so a
-	// frozen survivor thaws before the test can observe it. The runner reaches
-	// this only when the test's session differs from init's, which is why it
-	// reproduces on a hosted VM and not under a container whose PID 1 shares
-	// the session.
-	require.NoError(t, unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0))
+	requireNoTestSubreaper(t)
 
 	// One state root for the whole package: the authority permanently binds a
 	// UID to a single owner and state root.
@@ -474,11 +472,11 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 	)
 	const isolationUID = 65534
 	cmd, proof, err := supervisorCommand(ctx, supervisorConfig{
-		NativePath: script,
-		NativeArgs: []string{"root"},
-		NativeEnv:  nativeEnv,
-		Home:       home,
-		Scratch:    scratch,
+		NativeExecutable: testNativeExecutable(t, script),
+		NativeArgs:       []string{"root"},
+		NativeEnv:        nativeEnv,
+		Home:             home,
+		Scratch:          scratch,
 		Isolation: &ProcessIsolation{
 			UID: isolationUID, GID: 65534, BaseEnvironment: environmentMap(nativeEnv),
 			StandaloneOwnerID: "test-owner", StandaloneStateRoot: standaloneStateRoot,

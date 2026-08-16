@@ -39,7 +39,7 @@ func TestSupervisorRefusalReasonReachesTheGuardiansError(t *testing.T) {
 	}
 
 	config := withTestSupervisorIdentity(supervisorConfig{
-		NativePath: "/bin/sh", NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
+		NativeExecutable: testNativeExecutable(t, "/bin/sh"), NativeArgs: []string{"-c", "cat"}, NativeEnv: os.Environ(),
 		Home: filepath.Join(root, "home"), Scratch: root,
 		Started: filepath.Join(root, "started"), Completion: filepath.Join(root, "complete"),
 		NativePIDFile: filepath.Join(root, "native.pid"),

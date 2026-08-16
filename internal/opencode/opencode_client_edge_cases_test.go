@@ -799,6 +799,38 @@ func TestStartServerSupervisorControlAndStartFailures(t *testing.T) {
 	})
 }
 
+// TestStartServerRefusesAnExecutableReplacedBeforeTheLaunchCommits proves the
+// adapter commits a launch only against the file it resolved and validated. A
+// same-named replacement arriving between resolution and the start syscall is
+// refused instead of executed.
+func TestStartServerRefusesAnExecutableReplacedBeforeTheLaunchCommits(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+	preserveSupervisorGlobals(t)
+
+	root := t.TempDir()
+	native := filepath.Join(root, "opencode")
+	require.NoError(t, os.WriteFile(native, []byte("#!/bin/sh\nsleep 30\n"), 0o700))
+
+	openCodeSupervisorCommand = func(ctx context.Context, config supervisorConfig) (*exec.Cmd, *supervisorProof, error) {
+		replacement := filepath.Join(root, "replacement")
+		if err := os.WriteFile(replacement, []byte("#!/bin/sh\nsleep 30\n"), 0o700); err != nil {
+			return nil, nil, err
+		}
+
+		if err := os.Rename(replacement, config.NativeExecutable.Path); err != nil {
+			return nil, nil, err
+		}
+
+		return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 30"), &supervisorProof{}, nil
+	}
+
+	_, err := StartServer(context.Background(), StartOptions{
+		ExistingXDG:    testXDGDirs(t),
+		ExecutablePath: native,
+	})
+	require.ErrorContains(t, err, "no longer the file the launch resolved")
+}
+
 func TestStartServerSupervisedRollbackAndReadinessBranches(t *testing.T) {
 	options := func(t *testing.T) StartOptions {
 		t.Helper()

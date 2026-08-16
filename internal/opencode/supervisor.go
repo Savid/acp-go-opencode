@@ -11,8 +11,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/savid/acp-go-opencode/internal/homelock"
@@ -43,7 +45,7 @@ const (
 var ErrProcessContainmentIncomplete = errors.New("OpenCode process containment incomplete")
 
 type supervisorConfig struct {
-	NativePath          string            `json:"nativePath"`
+	NativeExecutable    processExecutable `json:"nativeExecutable"`
 	NativeArgs          []string          `json:"nativeArgs"`
 	NativeEnv           []string          `json:"nativeEnv"`
 	NativeDir           string            `json:"nativeDir,omitempty"`
@@ -156,11 +158,46 @@ func (p *supervisorProof) closeInherited() error {
 	return result
 }
 
+// superviseHangup keeps an orphaned supervisor alive long enough to finish
+// containment. configureIndependentSupervisor gives the liveness supervisor its
+// own process group inside the guardian's session, so the guardian's death
+// orphans that group, and POSIX resumes an orphaned group holding a stopped
+// member with SIGHUP followed by SIGCONT. The default disposition would kill
+// the one process still holding the containment boundary, the home locks and
+// the completion proof.
+//
+// Notify rather than Ignore: SIG_IGN survives exec and would leak into the
+// native child, while a Go handler is reset to the default disposition by exec.
+// The signal is drained and answered with nothing, so quiescence stays driven
+// by the guardian's death and the control EOF alone.
+func superviseHangup() func() {
+	hangups := make(chan os.Signal, 1)
+	signal.Notify(hangups, syscall.SIGHUP)
+
+	drained := make(chan struct{})
+
+	go func() {
+		defer close(drained)
+
+		for range hangups {
+		}
+	}()
+
+	return func() {
+		signal.Stop(hangups)
+		close(hangups)
+		<-drained
+	}
+}
+
 func supervisorBootstrap() {
 	mode := os.Getenv(supervisorModeEnv)
 	if mode == "" {
 		return
 	}
+
+	stopHangups := superviseHangup()
+	defer stopHangups()
 
 	var err error
 
@@ -261,9 +298,17 @@ func readSupervisorConfig(reader io.Reader) (supervisorConfig, error) {
 		return supervisorConfig{}, fmt.Errorf("decode private supervisor config: %w", err)
 	}
 
-	if config.NativePath == "" || config.Home == "" || config.Scratch == "" ||
+	if config.NativeExecutable.Path == "" || config.Home == "" || config.Scratch == "" ||
 		(!config.OrdinaryExecution && (config.IsolationUID == 0 || config.IsolationGID == 0)) {
 		return supervisorConfig{}, errors.New("private supervisor config is incomplete")
+	}
+
+	// Both supervisors run from /. A relative path here would be re-resolved by
+	// the kernel against that directory rather than the one the adapter
+	// validated it in.
+	if !filepath.IsAbs(config.NativeExecutable.Path) {
+		return supervisorConfig{}, fmt.Errorf(
+			"private supervisor native executable %q is not absolute", config.NativeExecutable.Path)
 	}
 
 	return config, nil
@@ -325,7 +370,7 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 	}
 
 	if ordinaryProcessBackend(config) {
-		cmd := openCodeCommandContext(ctx, config.NativePath, config.NativeArgs...)
+		cmd := openCodeCommandContext(ctx, config.NativeExecutable.Path, config.NativeArgs...)
 		cmd.Env = append([]string(nil), config.NativeEnv...)
 		cmd.Dir = config.NativeDir
 
@@ -400,14 +445,14 @@ func supervisorCommand(ctx context.Context, config supervisorConfig) (*exec.Cmd,
 
 	helperEnv := []string{supervisorModeEnv + "=" + supervisorModeGuardian}
 
-	executable, err = resolveProcessExecutable(executable, helperEnv, config.Isolation != nil)
+	helper, err := resolveProcessExecutable(executable, helperEnv, config.Isolation != nil)
 	if err != nil {
 		_ = configFile.Close()
 
 		return nil, nil, fmt.Errorf("resolve embedded runtime supervisor through process policy: %w", err)
 	}
 
-	cmd := openCodeCommandContext(ctx, executable)
+	cmd := openCodeCommandContext(ctx, helper.Path)
 	cmd.Cancel = nil
 	cmd.WaitDelay = 0
 	cmd.Env = helperEnv
@@ -638,14 +683,14 @@ func runGuardian(config supervisorConfig) (runErr error) { //nolint:gocyclo // G
 		return fmt.Errorf("resolve liveness supervisor executable: %w", err)
 	}
 
-	executable, err = resolveProcessExecutable(executable, config.NativeEnv, !config.OrdinaryExecution)
+	helper, err := resolveProcessExecutable(executable, config.NativeEnv, !config.OrdinaryExecution)
 	if err != nil {
 		_ = livenessConfig.Close()
 
 		return fmt.Errorf("resolve liveness supervisor executable through process policy: %w", err)
 	}
 
-	cmd := supervisorExecCommand(executable)
+	cmd := supervisorExecCommand(helper.Path)
 	cmd.Env = []string{supervisorModeEnv + "=" + supervisorModeLiveness}
 	cmd.Dir = "/"
 	cmd.ExtraFiles = []*os.File{livenessConfig, identityExtra, domainExtra, peerRead}
@@ -851,7 +896,7 @@ func runLiveness(config supervisorConfig) error {
 		}()
 	}
 
-	cmd := supervisorExecCommand(config.NativePath, config.NativeArgs...)
+	cmd := supervisorExecCommand(config.NativeExecutable.Path, config.NativeArgs...)
 	cmd.Env = config.NativeEnv
 	cmd.Dir = config.NativeDir
 
@@ -893,12 +938,18 @@ func runLiveness(config supervisorConfig) error {
 		return errors.Join(peerErr, proofErr)
 	}
 
-	var finalPeerErr error
+	var finalFenceErr error
 
+	// Both fences answer at the instant the exec commits. The guardian must
+	// still be able to contain whatever starts, and the file must still be the
+	// one the adapter resolved before this process moved to /.
 	containment.beforeStart = func() error {
-		finalPeerErr = supervisorValidateGuardianPeer(supervisorGuardianPeer, guardianDone)
+		finalFenceErr = errors.Join(
+			supervisorValidateGuardianPeer(supervisorGuardianPeer, guardianDone),
+			config.NativeExecutable.verify(),
+		)
 
-		return finalPeerErr
+		return finalFenceErr
 	}
 
 	if startErr := containment.Start(cmd); startErr != nil {
@@ -906,13 +957,13 @@ func runLiveness(config supervisorConfig) error {
 		_ = stdout.Close()
 		_ = stderr.Close()
 
-		if finalPeerErr != nil {
+		if finalFenceErr != nil {
 			proofErr := awaitQuiescence(func() error {
 				return supervisorLivenessQuiesce(containment, 0, supervisorQuiesceWindow)
 			})
 			proofErr = completeOrQuarantineLiveness(config, containment, proofErr)
 
-			return errors.Join(finalPeerErr, proofErr)
+			return errors.Join(finalFenceErr, proofErr)
 		}
 
 		return fmt.Errorf("start contained native root: %w", startErr)

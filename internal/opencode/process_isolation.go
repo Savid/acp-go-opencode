@@ -392,13 +392,35 @@ func validateProcessSearchPath(search string) error {
 	return nil
 }
 
-// resolveProcessExecutable finds the program a launch will exec. The strict
-// arm belongs to a complete explicit policy, which is a closed environment: a
-// configured path must be absolute and every PATH entry used for resolution
-// must be absolute too. The ordinary arm resolves the same way a shell would,
-// because policy omission is ordinary execution and an ordinary relative
-// executable or a relative PATH entry is not a security event there.
-func resolveProcessExecutable(path string, env []string, strict bool) (string, error) {
+// resolveProcessExecutable finds the program a launch will exec and freezes it
+// into one absolute, identified file. The lookup answers against this process's
+// working directory, while the guardian and liveness supervisors run from /, so
+// a relative answer would name a different file by the time it is executed.
+func resolveProcessExecutable(path string, env []string, strict bool) (processExecutable, error) {
+	resolved, err := lookupProcessExecutable(path, env, strict)
+	if err != nil {
+		return processExecutable{}, err
+	}
+
+	if !filepath.IsAbs(resolved) {
+		working, err := processWorkingDirectory()
+		if err != nil {
+			return processExecutable{}, fmt.Errorf("resolve working directory for executable %q: %w", resolved, err)
+		}
+
+		resolved = filepath.Join(working, resolved)
+	}
+
+	return freezeProcessExecutable(resolved)
+}
+
+// lookupProcessExecutable finds the program the way the launch's arm would. The
+// strict arm belongs to a complete explicit policy, which is a closed
+// environment: a configured path must be absolute and every PATH entry used for
+// resolution must be absolute too. The ordinary arm resolves the same way a
+// shell would, because policy omission is ordinary execution and an ordinary
+// relative executable or a relative PATH entry is not a security event there.
+func lookupProcessExecutable(path string, env []string, strict bool) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("executable path is empty")
 	}

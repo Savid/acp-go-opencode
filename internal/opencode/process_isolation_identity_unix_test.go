@@ -40,7 +40,7 @@ func TestOrdinaryLaunchFailsClosedOnAnUnreadableIdentity(t *testing.T) {
 
 	scratch := t.TempDir()
 	config := supervisorConfig{
-		NativePath: "/bin/sh", Home: filepath.Join(scratch, "home"), Scratch: scratch,
+		NativeExecutable: testNativeExecutable(t, "/bin/sh"), Home: filepath.Join(scratch, "home"), Scratch: scratch,
 	}
 
 	processEffectiveUID = func() int { return -1 }

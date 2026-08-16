@@ -54,9 +54,9 @@ func TestOrdinaryWindowsExecutableAndEnvironmentBehavior(t *testing.T) {
 	entries := envMapToSlice(environment)
 	resolved, err := resolveProcessExecutable("opencode", entries, false)
 	require.NoError(t, err)
-	require.Equal(t, targetPath, resolved)
+	require.Equal(t, targetPath, resolved.Path)
 
-	command := exec.Command(resolved,
+	command := exec.Command(resolved.Path,
 		"-test.run=^TestOrdinaryWindowsExecutableAndEnvironmentBehavior$",
 		"--", windowsEnvironmentChildMarker,
 	)
