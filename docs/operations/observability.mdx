@@ -1,0 +1,51 @@
+---
+title: Observability
+description: Wire logs, metrics, and traces for the adapter without leaking prompt or tool content.
+---
+
+The adapter emits diagnostics two ways: structured logs and OpenTelemetry
+signals. Both are opt-in and both redact sensitive content by default.
+
+## Logging
+
+Supply a `*slog.Logger` with `WithLogger` for adapter diagnostics. From the CLI,
+`-debug` installs a debug-level text handler on stderr.
+
+<Warning>
+stdout is reserved for ACP JSON-RPC. Diagnostics MUST go to stderr; logging to
+stdout corrupts the protocol stream. The CLI enforces this, and embedded hosts
+should point their logger at stderr or another non-stdout sink.
+</Warning>
+
+## OpenTelemetry
+
+Embedded hosts pass providers directly:
+
+- `WithTracerProvider`
+- `WithMeterProvider`
+- `WithTextMapPropagator`
+
+The command can also configure exporters from standard OpenTelemetry environment
+variables when the build includes OTel support.
+
+Telemetry records lifecycle timing, request outcomes, and counters — enough to
+observe latency and error rates.
+
+The `acp-go-opencode.runtime.containment` gauge records `1` with a
+`containment` attribute of `authoritative`, `shared_identity`, `best_effort`, or
+`unavailable`. `shared_identity` is the ordinary default and is reported on
+every platform where the native launch works: native work runs under the
+adapter's own credentials, with no credential separation, no provider-descendant
+inventory, and no whole-tree quiescence claim. `ObserveProcessSnapshot` is
+withheld for the whole Agent lifetime in every mode except `authoritative` —
+including a terminal zero, which would otherwise read as a proof the mode never
+performed. `authoritative` is the only mode that enumerates what it contains.
+Darwin best-effort never emits provider-descendant snapshots, including zero,
+because its process-group boundary cannot observe escaped descendants.
+
+## What is not recorded
+
+By default telemetry and logs avoid recording prompt text, tool inputs, tool
+outputs, and raw OpenCode event bodies, so enabling observability does not leak
+conversation content. Raw native event bodies are emitted only through the
+explicit [raw events](/docs/features/raw-events) opt-in, never through telemetry.

@@ -1,0 +1,24 @@
+---
+title: Examples
+description: Three runnable reference clients that embed the adapter and drive real ACP flows.
+---
+
+The repository ships three example programs. Each embeds the adapter in-process
+and acts as a small ACP client, so they are runnable references, not stubs. Run
+them from a checkout of this repository, since the commands are repo-relative:
+
+```sh
+git clone https://github.com/savid/acp-go-opencode && cd acp-go-opencode
+```
+
+## The examples
+
+| Example | What it shows | Run |
+|---|---|---|
+| `minimal-client` | Open a session and run one prompt to completion. | `go run ./examples/minimal-client "Say hello"` |
+| `interactive-chat` | A read-eval loop with streamed updates and permission prompts. | `go run ./examples/interactive-chat` |
+| `resume-from-file` | Replay a stored transcript, then resume the session. | `go run ./examples/resume-from-file -file ./examples/resume-from-file/session.jsonl` |
+
+Each example directory contains a `README.md` with its full flags and expected
+output. The `resume-from-file` example ships the `session.jsonl` fixture it
+replays, so the command above works against a fresh checkout.

@@ -1,0 +1,99 @@
+---
+title: Session Store
+description: Persist and restore native OpenCode session state across process restarts through a host-provided store.
+---
+
+Session persistence is opt-in and host-owned. Wire a `SessionStore` and the
+adapter snapshots each session's native OpenCode state into it, then restores
+that state on `session/load`, `session/resume`, and `_opencode/session/fork`.
+Without a store, an in-memory implementation is used and state does not survive
+the process.
+
+## Wiring a store
+
+Pass an implementation with `WithSessionStore`. The package ships
+`NewInMemorySessionStore` as the default and as a reference implementation of the
+`SessionStore` interface. Stored rows use the `opencode-sync-events-v1` format
+(`SessionStoreFormat`), keyed by `{SessionID, Subpath}`.
+
+```go
+store := opencodeacp.NewInMemorySessionStore()
+agent := opencodeacp.NewAgent(
+	opencodeacp.WithSessionStore(store),
+	opencodeacp.WithSessionStoreLoadTimeout(10*time.Second),
+)
+```
+
+`WithSessionStoreLoadTimeout` bounds each store read during hydration; it
+defaults to `10s`. Store writes are bounded separately by a fixed `60s`
+deadline, so a slow store can never stall a snapshot commit indefinitely.
+
+## Image artifacts
+
+Emitted image bytes live once, in canonical artifact records the store owns
+alongside the sanitized native events (under `images/<fingerprint>` subpaths);
+the captured events keep a reference, never a second base64 copy. On load,
+resume, and fork the records are rehydrated so replay reproduces the same image
+content and native identity as live output. The store is a bounded replay
+window, not permanent history: a record is reclaimed with its session and swept
+after a 24-hour TTL, and a replay that needs a swept artifact fails the load
+with a `storage_failed` reason rather than replaying a transcript with a hole.
+
+Store keys require a non-empty `SessionID`: `Append` and `Replace` with an
+empty session id fail, and `Delete` of an empty-id key is a pure no-op.
+
+## Snapshot contents
+
+A snapshot is taken after a completed turn and on lifecycle boundaries. The
+`main` subpath contains one atomic bundle with:
+
+- adapter, probed native, and event-schema versions;
+- a restore generation and the selected ACP/native session identity;
+- the adopted parent/child graph in parent-first order, including source cwd
+  and per-session permission policy;
+- the session's `extraPathDirs`, the durable half of the addressed-session
+  carrier; and
+- exact event arrays for each allowlisted aggregate.
+
+`extraPathDirs` is a required member of the bundle, and the format stays
+`opencode-sync-events-v1`: a bundle that omits it is refused rather than
+defaulted to an empty list. A cold load rebinds the native session to the
+directories the session was captured with, so a bundle that cannot name them
+would restore a session whose shell operations silently resolve against the
+reloading host's search path. The carrier environment is deliberately not
+persisted — an operation bearer is resupplied by the request that reloads the
+session.
+
+The adapter exports through `POST /sync/history`; it never opens or copies the
+live SQLite database. Only known event kinds and known fields are accepted.
+Unknown event data fails closed, and the finished bundle is scanned for MCP and
+process-environment secrets before the store replacement is published.
+
+Restore durably claims each source-to-destination aggregate mapping before the
+first `POST /sync/replay`, replays one complete aggregate per call in
+parent-before-child order, and rechecks ownership plus exact event equality
+after every call. Allowed absolute path fields must be inside the captured cwd
+and are rebased to the destination cwd; an escaping path is rejected.
+
+The same committed bundle is the recovery boundary for a loaded session after
+an unexpected shared-server exit. Recovery is graph-complete and exact before
+the next prompt is submitted; native state that does not match the committed
+event generation fails closed instead of accepting a prompt on ambiguous
+state.
+
+Hosts that reconcile their own turn checkpoints can call
+`InspectSessionStoreTerminalState` with the logical ACP session id and the
+committed main entries loaded from the store. The helper requires exactly one
+current snapshot entry, derives its private native aggregate, and returns the
+latest finished assistant message identity. The inspection is semantic rather
+than positional because OpenCode can append a repeated user-message event after
+the terminal assistant. Malformed, unsupported, or non-contiguous snapshots
+fail closed; a valid snapshot without a terminal assistant returns an empty
+`MessageID`.
+
+<Note>
+A snapshot is blocked while any input, permission, elicitation, or generation is
+pending, so a snapshot never captures a half-finished turn. `session/delete`
+removes a stored session and leaves a tombstone so the id is not silently
+reused.
+</Note>

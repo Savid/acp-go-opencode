@@ -1,0 +1,9 @@
+**
+!.tmp/
+!.tmp/browser-canary/
+!.tmp/browser-canary/native
+!.tmp/browser-canary/browser-canary.test
+!integration/
+!integration/browser_canary/
+!integration/browser_canary/decoy.sh
+!integration/browser_canary/entrypoint.sh

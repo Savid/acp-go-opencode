@@ -1,0 +1,51 @@
+---
+title: ACP Methods
+description: The ACP methods the adapter implements and the one namespaced extension it adds.
+---
+
+The adapter implements the standard ACP method set plus one namespaced fork
+extension. This page lists each method and its behavior.
+
+## Stable methods
+
+| Method | Behavior |
+|---|---|
+| `initialize` | Advertises capabilities, empty `authMethods`, and `_meta.opencode`. |
+| `authenticate` | Rejected with invalid-params echoing the requested `methodId`. |
+| `logout` | No-op; clears only adapter-owned session state. |
+| `session/new` | Create a native session in the Agent-owned OpenCode runtime. |
+| `session/load` | Recreate a stored session and replay its history. |
+| `session/resume` | Restore a stored session without replay. |
+| `session/list` | Enumerate stored sessions. Pages carry an opaque base64 cursor; a cursor past the end is invalid params. |
+| `session/prompt` | Run a prompt turn; requires route version 1 and a fresh turn nonce. |
+| `session/cancel` | Cancel only the running turn whose nonce exactly matches. |
+| `session/close` | End the session and take a final snapshot. |
+| `session/delete` | Remove a stored session, leaving a tombstone. |
+| `session/set_config_option` | Change the `model` or `mode` option live. |
+
+## Extensions and unsupported methods
+
+- `_opencode/session/fork` — the only fork surface; branches a session's native
+  state into a new session.
+- `_opencode/rawEvent` — an outbound notification, not a request (see
+  [Raw events](/docs/features/raw-events)).
+- `_opencode/auth/methods`, `_opencode/auth/authorize`,
+  `_opencode/auth/callback`, `_opencode/auth/status`, `_opencode/auth/cancel`,
+  `_opencode/auth/inventory`, and `_opencode/auth/disconnect` — the brokered
+  provider-login surface. All seven are advertised together under
+  `agentCapabilities._meta.opencode.providerAuth`, and only while both
+  `-provider-auth-root` and `-home` are configured; otherwise every one of them
+  returns method-not-found (see
+  [Authentication](/docs/features/authentication)). There is no
+  `_opencode/auth/credential` leg and no injection key: a completed login is
+  installed into OpenCode's own durable store and never crosses back out.
+- `session/set_mode` — returns method-not-found; mode is a config option set
+  through `session/set_config_option`, not a dedicated method.
+
+Unknown methods and foreign `_meta` namespaces are rejected or ignored per the
+ACP contract.
+
+After `Agent.Close`, the connection rejects every incoming request with
+invalid-request (`-32600`) before initialization gating, method lookup,
+extension dispatch, or parameter decoding. A malformed or unknown call cannot
+overtake the closed-agent fence.

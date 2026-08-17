@@ -1,0 +1,69 @@
+---
+title: Run Modes
+description: Choose between the standalone subprocess and embedding the adapter directly in your Go host.
+---
+
+The adapter offers the same behavior through two entry points. Pick by where the
+ACP transport lives: use the standalone binary when an editor or host spawns a
+subprocess and pipes JSON-RPC over stdio, and embed `Serve` when your host owns
+the streams directly.
+
+## Standalone
+
+With no isolation flag, the command launches OpenCode as its own current root
+or non-root identity, needs no privileged setup, and reports the
+non-authoritative `shared_identity`. Linux and an opted-in Darwin route that
+ordinary mode through the guardian/liveness supervisor pair; every other
+platform runs the native process directly and keeps the portable writable-home
+claim and liveness instead. Neither arm publishes a provider-descendant
+inventory or a whole-tree quiescence claim.
+
+Add `-process-isolation-config=/absolute/path/process-isolation.json` on Linux
+for the explicit hardened identity, environment, ownership, and containment
+contract documented in the [CLI reference](/docs/reference/cli). That policy is
+Linux-only and fail-closed: a loader, validation, authority, or platform failure
+refuses the launch and never retries in ordinary mode.
+
+`acp-go-opencode` is launched by an ACP client, which drives it over
+stdin/stdout. stdout carries ACP JSON-RPC only; diagnostics go to stderr.
+
+```sh
+acp-go-opencode -process-isolation-config /etc/acp-go/opencode-isolation.json -path /usr/bin/opencode -scratch-dir /tmp/acp-opencode
+```
+
+Use `-home` when the host assigns an exact exclusive runtime XDG root. Use
+`-scratch-dir` as the parent for adapter materialization when no exact home is
+assigned. Either location must resolve to an approved local filesystem; remote,
+overlay, and unrecognized filesystems are rejected before native startup.
+
+## Embedded
+
+`Serve` runs the agent against reader/writer streams you supply, so your host
+can back the transport with any pipe, socket, or in-memory buffer. `NewAgent`
+builds the same agent when you need to hold a reference before serving.
+
+<CodeGroup>
+
+```go Serve
+err := opencodeacp.Serve(ctx, input, output,
+	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
+	opencodeacp.WithScratchDir(scratchDir),
+)
+```
+
+```go NewAgent
+agent := opencodeacp.NewAgent(
+	opencodeacp.WithExecutablePath("/usr/bin/opencode"),
+	opencodeacp.WithScratchDir(scratchDir),
+)
+```
+
+</CodeGroup>
+
+Both entry points accept the same `Option` values. See the
+[Go API reference](/docs/reference/go-api) for the full catalog.
+Append `WithProcessIsolation(...)` only when the host explicitly selects the
+hardened Linux policy. It never combines with
+`WithDarwinBestEffortContainment`, and an invalid, unavailable, or
+unsupported-platform policy fails before native spawn and is never retried in
+ordinary mode.

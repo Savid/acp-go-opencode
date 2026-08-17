@@ -1,0 +1,50 @@
+---
+title: Raw Events
+description: Opt a session in to receive OpenCode's raw native events as ACP notifications for debugging.
+---
+
+For debugging and observability, a session can opt in to receive OpenCode's raw
+native SSE events, forwarded verbatim as ACP notifications. This is off by
+default — raw event bodies are never emitted unless a session enables them.
+
+## Enabling raw events
+
+Set `_meta.opencode.rawEvent.enabled` to `true` on a lifecycle request (or use
+`WithSessionRawEvents(true)`):
+
+```json
+{
+  "_meta": {
+    "opencode": {
+      "rawEvent": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+## Payload and limits
+
+| Property | Value |
+|---|---|
+| Notification method | `_opencode/rawEvent` |
+| Default | Disabled (`defaultEnabled: false`) |
+| Maximum size | 64 KiB per event |
+
+When an event's JSON exceeds the 64 KiB cap, its `event` field is swapped for a
+small marker (`truncated: true`, `maxBytes`, `reason`, and the original
+`sizeBytes`) while `sessionId`, `sequence`, and `source` are preserved, rather
+than sending the oversized body. The capability, its enable path, and the byte
+cap are advertised under `_meta.opencode.rawEvent` in the initialize response.
+
+Image payloads are the one exception to the unredacted rule: a base64 image data
+URL collapses to a `data:<mime>;base64,[redacted N bytes]` marker, where N is the
+length of the base64 payload that was dropped, and a remote `url`/`uri` loses its
+query and fragment, so a raw event never duplicates emitted image bytes or a
+signed location.
+
+<Warning>
+Raw events carry unredacted native OpenCode event bodies, which can include
+prompt and tool content. Enable them only for trusted debugging.
+</Warning>

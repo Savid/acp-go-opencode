@@ -1,0 +1,222 @@
+---
+title: Prompt Streaming
+description: How OpenCode's native REST and SSE output becomes ACP session updates, and how a turn ends.
+---
+
+A prompt turn submits the user message through
+`POST /session/{id}/prompt_async` and then consumes the canonical
+directory-scoped SSE stream, translating native events into ACP
+`session/update` notifications as they arrive. The turn ends when the native
+message completes, when the stream fails, when a deadline elapses, or when the
+host cancels. Every prompt carries a fresh route-envelope turn nonce; an active
+cancel must carry that same nonce.
+
+## Stream mapping
+
+Native part events map onto ACP update variants:
+
+| Native part | ACP update |
+|---|---|
+| Text | `agent_message_chunk` |
+| Reasoning | `agent_thought_chunk` |
+| Tool call | `tool_call` / `tool_call_update` |
+| Todos | `plan` |
+| Token totals | `usage_update` |
+
+ACP text blocks and text embedded resources become native text parts. A blob
+embedded resource whose MIME type is `image/*`, and a direct ACP image block,
+become a native file part carrying the image bytes as a data URL. The bytes are
+re-encoded from what validation inspected, so the payload OpenCode receives is
+canonical whatever base64 spelling the host sent. When an image block carries
+both `data` and a `uri`, the embedded `data` is authoritative and the URI
+contributes nothing at all: no native filename is derived from it, and the
+adapter never fetches it.
+
+## Prompt media validation
+
+Prompt media is validated before the turn starts, deterministically at the first
+failing block, and indexes are assigned across media-bearing blocks in request
+order. The image input allowlist is exactly `image/png`, `image/jpeg`,
+`image/gif`, and `image/webp`, static frames only: a multi-descriptor GIF, a
+WebP `VP8X` `ANIM` flag, and a PNG `acTL` chunk (APNG) are rejected without
+decoding any raster. A declared MIME is normalized — lowercased, trimmed, and
+stripped of parameters — before it is tested for the `image/` prefix, so a
+case or parameter variant is routed to the image contract and then rejected on
+the allowlist rather than escaping it. The allowlist itself compares the
+declared type exactly, so `IMAGE/PNG` is `invalid_media_type`.
+
+Missing data, undecodable base64, a MIME outside the allowlist, a
+sniffed/declared MIME mismatch, unreadable dimensions, and decoded bytes over
+the configured `ImageLimits` each fail with JSON-RPC `-32602` and a
+`prompt.image` error taxonomy (`error`, `index`, and byte sizes). When the
+selected model's authenticated provider metadata (`capabilities.input.image`)
+says the model cannot accept images, the prompt is rejected as
+`unsupported_by_model`; absent metadata forwards the turn and lets the provider
+decide.
+
+A blob embedded resource is gated whatever its MIME. Its base64 must decode, its
+decoded bytes must fit the per-image bound, and they count toward the per-prompt
+total, so no resource channel carries unbounded or unvalidated bytes to the
+harness. A text embedded resource is charged to that same per-prompt total, so
+bytes cannot evade the aggregate by arriving as text instead of as a blob; its
+native representation is otherwise unchanged.
+
+A verdict names the request member the bytes arrived on, never the gate chain
+they were routed through: a resource block is reported under `prompt.resource`
+even when an `image/*` MIME sends it through the image contract, and an image
+block is always reported under `prompt.image`.
+
+## Handoff input form
+
+When the host sets `WithInputHandoffRoot`, an image block may carry its bytes by
+reference instead of inline: empty `data`, a `file://` URI beneath the
+configured read root, and a
+`_meta["acp-go.dev/handoff"]` object containing exactly `version: 1`, a
+64-character lowercase-hexadecimal `digest`, and an integer `sizeBytes`.
+
+Form selection runs ahead of every embedded gate. Non-empty `data` is always the
+embedded form, even alongside a handoff envelope. Empty `data` with a handoff
+envelope or a `file://` URI is the handoff form. Empty `data` with neither stays
+`missing_data`.
+
+A handoff block resolves in a fixed order, first failure winning. The first three
+rows are decided from the request alone, so a block that was always going to be
+refused costs no filesystem access — and a refused declaration cannot be used to
+learn whether the path it named exists:
+
+| `error` | Cause |
+|---|---|
+| `invalid_handoff` | The block is malformed as a block: no configured read root, an absent or undecodable envelope, an unsupported `version`, an unrecognized envelope field, a malformed `digest` or `sizeBytes`, or a URI that is not an absolute local `file://` path. |
+| `invalid_media_type` | The declared media type is outside the four-format allowlist. |
+| `too_large` | The declared `sizeBytes` is past the effective per-image byte gate. |
+| `path_not_allowed` | The path does not open inside the read root, or the file it opens is not a regular file. |
+| `missing_file` | A path inside the read root that does not exist or cannot be read. |
+| `handoff_digest_mismatch` | The bytes do not match the declared `sizeBytes` and `digest`. |
+
+The file is opened relative to the read root, which the operating system
+enforces as the resolution boundary at the open itself: a name that would leave
+the root — through `..`, an absolute path, an absolute symbolic link, or a
+symbolic link pointing outside — is refused, and there is no window between
+deciding and opening for a component to be swapped in. A symbolic link with a
+relative target inside the root is followed normally. The open cannot block, and
+the opened descriptor must be a regular file, so a FIFO or device node placed
+under the root is refused rather than left holding the turn.
+
+The read root bounds where a *name* may resolve, not which bytes a directory
+entry may point at: a hard link placed under the root is read like any other
+file. The digest, not the root, is what makes the transport trustworthy.
+
+The read is bounded at one byte more than the block declared, not at the
+per-image byte gate: the work a block commits the adapter to is charged to the
+size its own envelope stood behind, so a host cannot provoke a large read without
+declaring one. A file larger than it declares is `handoff_digest_mismatch`,
+because it is not the file the declared digest covers, and none of its bytes are
+carried forward. Every surviving byte reaches verification, which is
+fail-closed — a mismatch is a rejection and never a fall back to the embedded
+form. All four handoff verdicts are JSON-RPC `-32602`, are fatal before the turn
+starts, and carry a `message` naming the real cause without repeating the host
+path, the file name, the digest, or an observed size.
+
+At most 64 handoff-form blocks are read for one prompt. The block that crosses
+the cap is rejected `too_large` before it is read, with `sizeBytes` carrying the
+block count and `maxBytes` carrying the cap. The cap applies whatever the
+per-prompt byte aggregate is set to, so a deployment that disables the aggregate
+still bounds the work a single prompt can ask for.
+
+Bytes that pass then run the same gate chain as the embedded form, minus the two
+gates that need base64, and count toward the per-prompt total identically. Both
+forms send OpenCode a data URL built from the bytes the adapter validated, and
+neither derives a native filename from a block URI, so a handoff turn and an
+embedded turn over the same bytes produce byte-identical native requests
+whatever base64 spelling or URI the host chose. The handoff path itself never
+appears in the native request and does not outlive the validation read.
+
+Native tool results and assistant file parts that carry an image are mapped back
+to ACP as embedded image content (each agent image alone in its own
+`agent_message_chunk`, tool images as the tool call's complete content array).
+Tool-result images are the common path; an assistant file part is the defensive,
+rarely exercised case, since model-native image output does not survive as a
+standalone assistant file part in practice. A
+remote URI-only artifact becomes an ACP `resource_link` on its true provenance;
+the adapter never downloads it. Output MIME is the truthful sniffed type and is
+not allowlisted. A local artifact path is read only when it resolves, through
+its symlinks, to a regular file inside the session workspace, an additional
+directory, the scratch parent, or the operating-system temporary directory the
+harness sandbox already writes to.
+
+An image the adapter will not ship — outside those roots, missing, not a
+regular file, over the configured or transport-frame limit, not a raster, or
+declaring a media type its bytes contradict — fails **that tool call only**.
+The failed tool call carries fixed guidance as its own content, saying what to
+do next without naming the path, filename, size, or operating-system error, and
+the turn keeps running with its context; an assistant file part, which has no
+tool call to attribute to, is replaced by the same guidance as agent text. Only
+a session-store failure (`reason: "storage_failed"`) still ends the turn with a
+`stage: "image_output"` envelope.
+
+OpenCode text and reasoning part events carry the complete part plus, on live
+updates, an explicit appended `delta`. The adapter forwards that delta and
+reconciles the final REST response against what was already delivered, so a
+metadata-only part change never repeats text. A final non-append rewrite cannot
+be represented by ACP chunk updates; it is diagnosed without logging content
+and is not appended as corrupt duplicate text.
+
+Each native tool part produces exactly one `tool_call`. Later pending,
+in-progress, completed, or failed states for the same call produce
+`tool_call_update`; failed states preserve the native error in `rawOutput`.
+If the first observed state is already terminal, the initial `tool_call`
+carries that terminal status and no follow-up update is fabricated.
+Identical message-level and step-level token snapshots produce one
+`usage_update`, while a changed snapshot still produces a later update.
+
+The native stream also echoes the just-posted user message back as part events.
+During a live turn those are suppressed — the client already owns that content,
+so only agent output streams back. The suppression is turn-local: user messages
+still replay as `user_message_chunk` during `session/load`.
+
+## How a turn ends
+
+A turn resolves to exactly one outcome, and cancellation always wins a tie with
+any concurrent failure:
+
+- **Success** — the native message completes; the prompt returns its stop
+  reason and usage.
+- **Cancelled** — the host cancelled, or a coinciding deadline resolves as
+  cancelled rather than timeout; the prompt returns `cancelled`.
+- **Failure** — the turn returns one terminal ACP internal error carrying a
+  uniform `opencode_turn_failed` payload. Transport/provider failures leave the
+  session usable.
+
+The failure payload's `cause` names the failure class:
+
+| `cause` | Meaning |
+|---|---|
+| `provider` | The model or provider raised an assistant error; carries the native `message`, plus `statusCode`/`providerCode` when reported. |
+| `transport` | The SSE stream or REST call failed, or the shared `opencode serve` runtime exited; carries the real detail, never a bare `EOF`. |
+| `timeout` | The turn exceeded the deadline set by `WithTurnTimeout`. |
+
+By default there is no deadline. `WithTurnTimeout` bounds a single turn; when it
+elapses the adapter sends native abort as a best-effort hint, retires that
+turn's exact shared-runtime generation, and waits for the one memoized
+containment result before reopening turn admission. Native `idle` status is
+never accepted as process containment. Failure to complete the selected
+boundary poisons the affected session and quarantines the runtime resources.
+Darwin best-effort completes only the captured original process group plus
+direct-child reap and never claims escaped descendants are absent.
+The same fence is used for host cancellation and stream/control failures that
+can leave native work running. See
+[Models and config](/docs/features/models-config) for the
+provider-error and structured-output details, and
+[Metadata](/docs/reference/meta) for the full error payload.
+
+Because cancellation containment retires a shared runtime, an Agent admits at
+most one native prompt turn at a time across all of its logical sessions.
+Queued prompts remain context-cancellable. Lifecycle calls and bounded REST
+calls retain their separate concurrency limit.
+
+A shared-runtime exit fails the in-flight turn with this same
+`opencode_turn_failed` transport shape; an overlapping cancel still resolves
+as cancelled, while containment failure is never erased by the runtime-loss
+race. Logical sessions remain loaded. A later prompt starts a replacement
+runtime and restores the last committed event generation before routing any
+user content.

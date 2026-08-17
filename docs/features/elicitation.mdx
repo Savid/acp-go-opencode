@@ -1,0 +1,34 @@
+---
+title: Elicitation
+description: Bridge OpenCode's native question prompts to ACP form elicitation, gated on client capability.
+---
+
+OpenCode can pause a turn to ask the user a question. The adapter forwards those
+native question events to the ACP client as elicitation requests — but only when
+the client has advertised that it can handle them.
+
+## When it fires
+
+Native questions are opt-in. Enable the mapping with the
+`-opencode-question-tool` flag (or `WithOpenCodeQuestionTool(true)`), which
+turns on OpenCode's native question tool. When `opencode serve` then emits a
+question request, the adapter maps it to an ACP `elicitation/create` call using
+the stable ACP v1 form-elicitation shape.
+
+## Capability gating
+
+The adapter records the client's capabilities during `initialize` and only sends
+an elicitation request when the client explicitly advertised a non-null `form`
+mode. An omitted or `null` top-level elicitation capability and an empty
+`elicitation: {}` object advertise no modes. The native question is rejected
+deterministically when:
+
+- the client did not advertise form elicitation, or
+- the client declines or cancels the request.
+
+<Note>
+Form elicitation is stable ACP v1. The separate
+`_meta.opencode.elicitation` discovery descriptor in the initialize response is
+private and unstable. A client that does not explicitly advertise form support
+never receives an elicitation request; the native question simply fails closed.
+</Note>

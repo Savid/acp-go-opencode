@@ -1,0 +1,133 @@
+---
+title: Sessions
+description: The mental model behind ACP sessions in one shared OpenCode runtime, and how load differs from resume.
+---
+
+An Agent owns exactly one `opencode serve` process and one exclusive XDG root.
+ACP sessions are native sessions inside that runtime. REST requests, aborts,
+callbacks, and SSE subscriptions carry the native session identity; event
+subscriptions also carry the canonical working directory.
+
+OpenCode registers MCP dynamically at directory scope. The adapter therefore
+admits only one live session principal for a canonical working directory. A
+second live session in that directory is rejected, and a changed MCP
+fingerprint is rejected as a principal conflict.
+
+## Session environment and tool paths
+
+`_meta.opencode.options.env` and `_meta.opencode.options.extraPathDirs` are the
+addressed session carrier. `env` is the environment that session's shell tools
+run under; `extraPathDirs` prepends ordered absolute directories to their
+`PATH`. The adapter writes both onto native session metadata, and its installed
+OpenCode plugin applies them only when that session invokes a shell tool. Neither
+changes the shared server process environment, so concurrent sessions hold
+distinct values — including distinct bearer tokens — without backpressure or
+runtime replacement.
+
+The search path is applied after the native shell has finished its own startup.
+OpenCode starts `bash` and `zsh` as login shells, which lets a user startup file
+rewrite `PATH` after the environment has been handed over. The adapter therefore
+also installs a shell wrapper that reproduces that startup sequence and then puts
+the session's directories in front, so the order the command resolves against is
+the order the session asked for. Without a carrier the wrapper runs exactly what
+OpenCode would have run.
+
+OpenCode configuration is directory scoped, so one shared server can serve two
+workspaces that configure two different login shells. The wrapper is told which
+shell to stand in for with each operation, by the workspace scope that operation
+belongs to, and it holds nothing between operations. That address is counted
+rather than delimited, so every executable path OpenCode itself accepts survives
+it — including one whose directories contain the search-path separator. A
+workspace that configures a shell OpenCode runs without a login sequence is left
+to OpenCode untouched, and an operation that reaches the wrapper without naming
+a readable shell address fails rather than choosing one.
+
+Both halves are stored with the logical session. Load, resume, recovery, and
+fork retain a half the request omits; an explicitly supplied half replaces it
+outright, and an empty value is a replacement rather than an omission. The
+durable snapshot carries `extraPathDirs` only: `env` is where an operation
+bearer lives, so a reloaded session takes its environment from the request that
+reloads it rather than from a value frozen at capture time.
+
+`PATH` is refused inside `env`, without regard to case, because the map replaces
+whole values. `extraPathDirs` is the additive mechanism that owns the search
+path. Static environment values configured with `WithEnv` remain shared by the
+Agent's native server and never carry session values.
+
+## Lifecycle
+
+The adapter implements the full ACP session lifecycle plus one namespaced
+extension for fork:
+
+- `session/new` — create a native session in the Agent runtime.
+- `session/load` — recreate a stored session and replay its history.
+- `session/resume` — restore a stored session without replaying history.
+- `session/list` — enumerate stored sessions.
+- `session/close` — end a session and take a final snapshot.
+- `session/delete` — remove a stored session, leaving a tombstone.
+- `_opencode/session/fork` — branch a session's native state into a new session.
+
+Native slash-command discovery and any resulting
+`available_commands_update` complete inside new, load, resume, and fork before
+the lifecycle response returns. Those updates are lifecycle-scoped and omit a
+turn route. Command refresh caused by a slash-command prompt is turn-scoped and
+carries that prompt's exact route envelope.
+
+A session start that fails on a caller-supplied option — a seeded file the
+runtime home cannot accept, a start path that is not absolute, an unusable
+`_meta.opencode` option — is rejected with `-32602` and the uniform
+`{"error":"unsupported","field":"<json path>"}` data. Every other startup
+failure is `-32603`. When a loopback call to the native server failed, the
+message names the method, route, and status of that call alone: native response
+bodies, query strings, model names, configuration, and credentials never reach
+the client.
+
+If the shared native server exits, the adapter fails every in-flight turn on
+that server with the uniform `opencode_turn_failed` transport error but retains
+the loaded logical sessions. A later prompt first
+starts a new runtime generation, reopens the session's directory/MCP scope,
+and verifies or completes replay of the last committed sync-event generation.
+Only a session fenced to that current runtime generation can publish its route
+and send the prompt; a replacement that crashes during reconstruction is
+discarded without routing the user prompt to it.
+
+Cancel and turn timeout retire the exact runtime generation used by that turn;
+stream/control failures use the same fence when native work may remain. All
+concurrent observers join one
+memoized base-runtime shutdown result. Retirement detaches every directory
+scope on that generation, completes the selected native containment boundary,
+and only then permits a replacement generation. The authoritative Linux
+boundary proves its owned tree empty. Ordinary same-identity mode completes the
+directly owned native root and its portable writable-home claim, and claims
+nothing about descendants. Darwin best-effort
+completes only its captured original process-group boundary and direct-child
+reap; escaped descendants can survive. Session snapshots and lazy restore
+remain available after the selected boundary completes.
+
+Closing a session releases its canonical-directory principal only after the
+native directory scope confirms all MCP registrations are absent. If that
+proof fails, close returns an error and retains the logical session/principal so
+the host can retry; admission never races ahead of uncertain native cleanup.
+Directory-scoped clients cannot own or initiate shutdown of the shared base
+runtime.
+
+## Load versus resume
+
+Both `session/load` and `session/resume` replay the stored native event graph
+through the running server. They differ in what the host sees:
+
+- **`session/load`** replays the stored conversation back to the client as
+  `session/update` notifications (user and agent message chunks) so the host can
+  rebuild its transcript view.
+- **`session/resume`** restores the same native state but returns without
+  replaying, for hosts that already hold the transcript and only need the
+session live again.
+
+## Storage and hydration
+
+Session persistence is optional and host-provided through a `SessionStore`. When
+one is wired, the adapter snapshots native state after completed turns and on
+lifecycle boundaries, then restores it through OpenCode's online sync API on
+load, resume, or fork. See [Session store](/docs/features/session-store) for the
+snapshot contents and wiring, and [Metadata](/docs/reference/meta) for the
+`opencode-sync-events-v1` advertisement.

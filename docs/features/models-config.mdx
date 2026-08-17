@@ -1,0 +1,95 @@
+---
+title: Models and Config
+description: Select the model and mode for a session, request native structured output, and seed a custom provider.
+---
+
+Model and mode are ACP config options; structured output is a native OpenCode
+feature the adapter turns on per session. This page covers each and how a failed
+structured-output turn surfaces to the host.
+
+## Model and mode options
+
+The model selector is an ACP config option with id `model` and category
+`model`. Values are built from authenticated `GET /config/providers` as
+`provider/model`.
+
+Mode selection uses config id `mode` and category `mode` when OpenCode agents
+are enumerable.
+
+| Option | Config id | Category | Values |
+|---|---|---|---|
+| Model | `model` | `model` | `provider/model`, from authenticated providers |
+| Mode | `mode` | `mode` | Enumerable OpenCode agents, when available |
+
+Set either at session start via `_meta.opencode.options` or on a running session
+with `session/set_config_option`.
+
+The selected model also gates image prompts. The adapter reads the model's
+authenticated provider `capabilities.input.image`: `true` accepts image blocks,
+`false` rejects an image prompt before the turn as `unsupported_by_model`, and a
+catalog that states nothing forwards the turn and lets the provider decide. The
+gate is evaluated per prompt against the current selection, so a mid-session
+model switch takes effect on the next prompt.
+
+## Structured output
+
+Structured output is native. Supplying a JSON Schema object at
+`_meta.opencode.options.outputSchema` (or via `WithOpenCodeOutputSchema` /
+`WithSessionOutputSchema`) makes every non-command prompt request the native
+`format: {"type": "json_schema", "schema": ...}` output mode on
+`POST /session/{id}/prompt_async`. The validated result is returned on the prompt
+response at `_meta.opencode.structuredOutput`. If OpenCode fails to produce
+valid structured output after its native retries, the turn fails with the
+uniform `opencode_turn_failed` provider error described below. Slash-command
+turns never request structured output. Startup fails closed unless the
+server's `/doc` advertises the `OutputFormatJsonSchema` component.
+
+When the selected model rejects structured output (the provider returns an
+assistant/provider error, common with free Zen models), the turn fails with a
+structured ACP internal error whose `data` carries
+`error: "opencode_turn_failed"`, `cause: "provider"`, the native `message`,
+and—when the provider reports them—`statusCode` (int) and `providerCode`
+(string). The
+`data` also carries `structuredOutputRequested: true` when this turn sent a
+native schema, letting a host detect that the structured-output turn was the
+trigger; slash-command turns always report `false`.
+
+## Seeding a custom provider
+
+The wrapper authors the shared runtime's `opencode.json` and owns `$schema`.
+To add immutable process config such as a custom `provider`, seed an
+`opencode.json` with `WithSeedFiles` (Go) or
+`-seed-file opencode.json=<hostpath>` (CLI). For the `opencode.json` filename
+the seed is deep-merged with the wrapper's `$schema`. The seed must not contain
+`permission` or `mcp`; permission rides the native session and MCP rides the
+directory scope. Keep secrets in the process environment (`WithEnv`) and
+reference them from the seed with OpenCode's `{env:...}` indirection.
+The process-isolated standalone command accepts only this `opencode.json` seed;
+it passes the merged JSON in memory and performs no privileged write beneath
+the durable native XDG root.
+
+The example below registers an OpenAI-style provider served by a self-hosted
+LiteLLM gateway. `options.baseURL` ends in `/v1`, and `apiKey` reads
+`LITELLM_API_KEY` from the environment rather than embedding a secret:
+
+```json
+{
+  "provider": {
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM",
+      "options": {
+        "baseURL": "https://litellm.internal.example/v1",
+        "apiKey": "{env:LITELLM_API_KEY}"
+      },
+      "models": {
+        "gpt-4o": {}
+      }
+    }
+  }
+}
+```
+
+Models seeded this way appear as
+`litellm/<model>` in the `model` config option, populated from authenticated
+`GET /config/providers` like every other provider.

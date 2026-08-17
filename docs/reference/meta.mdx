@@ -1,0 +1,186 @@
+---
+title: Metadata
+description: The _meta.opencode vocabulary on requests, responses, and error payloads.
+---
+
+The adapter carries its non-standard surface under the `_meta.opencode`
+namespace. Unknown keys under `_meta.opencode` are rejected; foreign top-level
+namespaces are ignored. Malformed `_meta` — a non-object `_meta.opencode`
+namespace, an unknown key, or a wrong-typed known option value — is rejected
+with an invalid-params error (`-32602`); unsupported keys and wrong-typed
+values carry the uniform `{"error": "unsupported", "field": "<path>"}` data.
+
+## Request input
+
+Lifecycle requests accept:
+
+```json
+{
+  "_meta": {
+    "opencode": {
+      "options": {
+        "model": "provider/model",
+        "mode": "build",
+        "permission": "ask",
+        "outputSchema": {},
+        "env": {"SERVICE_API_TOKEN": "..."},
+        "extraPathDirs": ["/absolute/bin"]
+      },
+      "rawEvent": {
+        "enabled": false
+      }
+    }
+  }
+}
+```
+
+| Key | Values |
+|---|---|
+| `options.model` | `provider/model` string. |
+| `options.mode` | An enumerable OpenCode agent name. |
+| `options.permission` | `ask`, `allow`, or `deny`; empty is treated as `ask`. |
+| `options.outputSchema` | JSON Schema object for native structured output. |
+| `options.env` | Environment the addressed native session's shell tools run under. `PATH` is refused without regard to case. |
+| `options.extraPathDirs` | Absolute directories placed ahead of the addressed native session's shell-tool `PATH`, in order. |
+| `rawEvent.enabled` | Opt in to `_opencode/rawEvent` notifications. |
+
+`_meta.opencode.options.permission` becomes the native session's permission
+rule list at creation. Model selection is fixed by the logical session but is
+sent on each native message or command request, not in the native creation
+body.
+
+`options.env` and `options.extraPathDirs` are carried on the addressed native
+session rather than on the shared `opencode serve` process. Concurrent sessions
+may therefore hold distinct environments and ordered directory lists without
+sharing them or restarting the server. Both are stored with the logical session
+and follow load, resume, recovery, and fork; supplying a half while restoring a
+session replaces the stored half outright. The durable snapshot records
+`extraPathDirs` only, so a reloaded session receives its environment from the
+reloading request rather than from stored bearer material.
+
+A relative, empty, or path-list `extraPathDirs` entry is rejected before a
+native session is created. Inside `options.env`, a non-string value, an empty
+name, a name containing `=` or NUL, a managed OpenCode or XDG root, and `PATH`
+in any casing are each rejected at the indexed field that owns them — a raw
+search path fails at `_meta.opencode.options.env.PATH`. Empty string values are
+preserved: clearing a variable is expressed by its empty value.
+
+`session/prompt` and an active `session/cancel` require a top-level
+`_meta["acp-go.dev/route"]` object containing exactly `version: 1` and a
+non-empty `turnNonce` of at most 4096 bytes. The cancel nonce must equal the
+active prompt nonce.
+
+Every live-turn `session/update` and `_opencode/rawEvent` notification carries
+that same exact `{version, turnNonce}` object in its notification `_meta`;
+raw-event payloads also carry their structural `sessionId`. Lifecycle and
+load-history updates remain outside a turn epoch and omit the envelope.
+
+## Response output
+
+| Path | Meaning |
+|---|---|
+| `_meta.opencode.structuredOutput` | Validated structured-output result on the prompt response. |
+| `_meta.opencode.messageId` | Native message id on `usage_update` notifications. |
+
+## Advertised capabilities
+
+The initialize response advertises adapter surfaces under
+`_meta.opencode`: `fork`, `elicitation`, `rawEvent` (method, enable path, and
+`maxBytes`), `sessionStore` (format and key), and `structuredOutput` (config
+path, result path, and schema mode). It additionally advertises
+`providerAuth` — a single `methods` array naming the seven enabled
+`_opencode/auth/*` extension names — but only while both `-provider-auth-root`
+and `-home` are configured. The array carries no `injectionKey`, because the
+adapter accepts no injected credential (see
+[Authentication](/docs/features/authentication)). `AgentCapabilities.Meta` also advertises
+`"acp-go.dev/route": {"versions": [1]}`.
+
+`promptCapabilities.image` is advertised `true`: the adapter accepts a standard
+ACP image content block and maps it to OpenCode. Per-model `_meta.opencode`
+metadata carries no capabilities list; selected-model image support is an
+internal decision sourced only from authenticated provider
+`capabilities.input.image`.
+
+`AgentCapabilities.Meta` always advertises the effective inbound media bounds:
+
+```json
+{
+  "acp-go.dev/mediaEnvelope": {
+    "maxBytes": 6291456,
+    "maxPromptBytes": 6291456,
+    "maxDimension": 0,
+    "imageFormats": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+    "documentFormats": []
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `maxBytes` | Effective per-image decoded byte gate: `ImageLimits.MaxInputBytesPerImage` while it fits the transport frame, and `7864155` when that limit is disabled or set wider than one frame. |
+| `maxPromptBytes` | Effective per-prompt aggregate decoded byte gate (`ImageLimits.MaxInputBytesPerPrompt`). `0` is truthful: no aggregate is enforced, and the handoff block-count cap bounds the turn instead. |
+| `maxDimension` | Per-dimension pixel bound; `0` because OpenCode bounds no image dimension. `0` means unbounded, never zero pixels. |
+| `imageFormats` | The inbound allowlist, in this order. |
+| `documentFormats` | MIME types mapped to a native document representation. Always an empty array here: no MIME has one. |
+
+The numbers are the gates themselves rather than a restatement of them, so a
+host pre-check that passes cannot be rejected on bytes by the adapter.
+
+```json
+{
+  "acp-go.dev/handoff": {"versions": [1]}
+}
+```
+
+The handoff advertisement appears **only** when the host set
+`WithInputHandoffRoot`. Its absence is the actionable signal that the option
+never reached this adapter, and every handoff-form block is then rejected
+`invalid_handoff`.
+
+Outbound elicitation requests preserve native metadata and add the reserved
+route envelope with `version`, `sessionId`, `turnNonce`, and exactly one of
+`toolCallId` or `requestId`. A native metadata collision with that reserved key
+is rejected. Permission requests instead use ACP's structural `sessionId` and
+`toolCallId`; the adapter accepts only tool calls published by the current turn.
+
+## Turn-failure error data
+
+A failed turn returns an ACP internal error whose `data` carries:
+
+| Field | Meaning |
+|---|---|
+| `error` | Always `opencode_turn_failed`. |
+| `cause` | `provider`, `transport`, or `timeout`; a shared-runtime exit is `transport`. |
+| `message` | The real native cause text. |
+| `statusCode` / `providerCode` | Included when the provider reports them. |
+| `structuredOutputRequested` | `true` when the turn sent a native output schema. |
+| `stage` / `reason` | Present on an image-output failure: `stage` is `image_output`; `reason` is always `storage_failed`, because the other image-output verdicts refuse the tool call without ending the turn. |
+| `sizeBytes` / `maxBytes` | Present when an image-output failure carries decoded sizes. |
+
+## Provider-auth error data
+
+A failed provider-auth leg returns JSON-RPC `-32000` whose `data` carries:
+
+| Field | Meaning |
+|---|---|
+| `error` | Always `opencode_auth_failed`. |
+| `cause` | One of `native_veto`, `provider_refused`, `transport`, `process`, `timeout`, `harvest_failed`, `unsupported_variant`, `flow_expired`, `flow_state`, `flow_cancelled`, `policy`, `binding_conflict`. |
+| `retryable` | Always present; `true` only for the transport-shaped causes. |
+| `providerId` / `method` / `flowId` | Present when the failure names one. |
+
+There is no free-form field and no native message text. A caller-owned
+addressing failure — an unknown, superseded, or cross-session `flowId`, a stale
+`methodsGeneration`, a `method` that does not match the flow, or a prompt answer
+that fails validation — is invalid params (`-32602`) carrying the offending
+field path instead. `connectionId` is caller-minted and bounded to at most 128
+bytes of `A-Z`, `a-z`, `0-9`, `-`, and `_`; every leg that carries one checks it
+before the value is compared or recorded, and anything outside that shape is
+`-32602` naming `connectionId`.
+
+`binding_conflict` comes only from `_opencode/auth/disconnect`, and it means the
+`connectionId` and `bindingGeneration` you sent do not match the binding the
+adapter recorded — no entry, a different connection, or a generation already
+spent. Nothing is mutated: no generation bump and no `DELETE /auth/{id}`.
+Reconnect to get a current binding; retrying the same one never succeeds. It is
+deliberately not `policy`, which is the adapter refusing on its own terms and
+which reconnecting does not clear.
