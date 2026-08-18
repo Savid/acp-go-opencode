@@ -163,6 +163,8 @@ func (s *session) handleStreamError(ctx context.Context, err error) {
 	s.lifecycleMu.Unlock()
 
 	if cycle == nil {
+		s.failPendingDispatch(acp.NewInternalError(turnFailedData(causeTransport, err.Error(), 0, "")))
+
 		return
 	}
 
@@ -205,8 +207,39 @@ func (s *session) routeNativeEvent(ctx context.Context, event opencode.Event) {
 	}
 
 	if err := s.applyNativeEvent(ctx, event); err != nil {
-		s.recordNativeFailure(err)
+		s.failCycleDelivery(ctx, err)
 	}
+}
+
+// failCycleDelivery ends the open cycle on an event the session could not apply
+// or deliver. The ordered representation of the turn is broken at that point:
+// the native work is interrupted, because output the session cannot report is
+// work nobody asked to continue, and the failure is the cycle's terminal
+// evidence rather than an idle the broken order would misreport.
+func (s *session) failCycleDelivery(ctx context.Context, err error) {
+	s.lifecycleMu.Lock()
+	cycle := s.cycle
+
+	if cycle == nil || cycle.settled {
+		s.lifecycleMu.Unlock()
+		s.recordNativeFailure(err)
+
+		return
+	}
+
+	if cycle.failure == nil {
+		cycle.failure = err
+	}
+
+	interrupt := !cycle.interrupted
+	cycle.interrupted = true
+	s.lifecycleMu.Unlock()
+
+	if interrupt {
+		s.interruptNativeWork(ctx)
+	}
+
+	s.markNativeTerminal(ctx)
 }
 
 // applyNativeEvent is the session's structured reading of the native event set.
@@ -283,9 +316,20 @@ func (s *session) applyNativeError(event opencode.Event) error {
 	}
 
 	s.lifecycleMu.Lock()
+
+	if s.cycle == nil {
+		s.lifecycleMu.Unlock()
+
+		// The error precedes acceptance: the run the pending frame started is
+		// the only work it can name, so the awaiting dispatch fails with it.
+		s.failPendingDispatch(opencode.AssistantErrorFromNativeError(nativeError.Error))
+
+		return nil
+	}
+
 	defer s.lifecycleMu.Unlock()
 
-	if s.cycle == nil || s.cycle.settled || s.cycle.failure != nil {
+	if s.cycle.settled || s.cycle.failure != nil {
 		return nil
 	}
 
@@ -336,11 +380,11 @@ func (s *session) applyNativePart(ctx context.Context, event opencode.Event) err
 
 func (s *session) applyNativeTodos(ctx context.Context, event opencode.Event) error {
 	var payload struct {
-		SessionID string                `json:"sessionID"`
+		SessionID string                `json:"sessionID"` //nolint:tagliatelle // OpenCode native event payloads use sessionID wire names.
 		Todos     []opencode.NativeTodo `json:"todos"`
 	}
 	if err := json.Unmarshal(event.Properties, &payload); err != nil || payload.SessionID != s.idmap.NativeSessionID {
-		return nil
+		return nil //nolint:nilerr // a malformed or foreign todo payload is skipped, never fatal
 	}
 
 	return s.emitPlan(ctx, payload.Todos)
@@ -422,8 +466,8 @@ func (s *session) reconcileNativeActions(ctx context.Context) error {
 	}
 
 	for i := range permissions {
-		if err := s.routeNativePermission(ctx, permissions[i]); err != nil {
-			return err
+		if routeErr := s.routeNativePermission(ctx, permissions[i]); routeErr != nil {
+			return routeErr
 		}
 	}
 

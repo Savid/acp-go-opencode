@@ -55,11 +55,15 @@ type Reducer struct {
 	// a blocker blocks the cycle current at its first sight, and that cycle may
 	// not move again until the blocker terminalizes.
 	actionCycle map[string]string
+	// retired remembers every stream identity a later incarnation superseded.
+	// Supersession fences an incarnation the same way close does, so a retired
+	// identity never opens again and its projection never resurrects.
+	retired map[string]struct{}
 }
 
 // NewReducer builds a reducer for one session.
 func NewReducer(opts Options) *Reducer {
-	reducer := &Reducer{negotiated: opts.Negotiated}
+	reducer := &Reducer{negotiated: opts.Negotiated, retired: map[string]struct{}{}}
 	reducer.reset("")
 
 	return reducer
@@ -158,6 +162,11 @@ func (r *Reducer) reduceForeign(delivery Delivery) error {
 		return r.fail(delivery, ViolationStaleStream, "stream is "+r.state.StreamID)
 	}
 
+	if _, superseded := r.retired[delivery.StreamID]; superseded {
+		return r.fail(delivery, ViolationStaleStream, "stream "+delivery.StreamID+" was superseded")
+	}
+
+	r.retired[r.state.StreamID] = struct{}{}
 	r.reset(delivery.StreamID)
 
 	return r.reduceFirst(delivery)

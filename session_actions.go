@@ -27,6 +27,8 @@ type nativeActionOutcome struct {
 	state lifecycle.ActionState
 	// permissionReply is the native permission answer, empty for elicitations.
 	permissionReply string
+	// message annotates the native reply with why the harness answered itself.
+	message string
 	// answers are the native question answers, nil for a rejection.
 	answers [][]string
 }
@@ -46,9 +48,8 @@ type pendingAction struct {
 	// arbitration writes the outcome and closes it.
 	terminal sync.Once
 	// permission and question hold the native request one of them describes.
-	permission  opencode.PermissionRequest
-	question    opencode.QuestionRequest
-	propertyIDs []string
+	permission opencode.PermissionRequest
+	question   opencode.QuestionRequest
 }
 
 // actionRegistry holds every action registered against this session. It is the
@@ -217,6 +218,7 @@ func (s *session) beginAction(ctx context.Context, action *pendingAction) error 
 	go func() {
 		defer handleAgentGoroutinePanicRecover(requestCtx, agentLogger(s.agent), "OpenCode action request", func(recovered any) {
 			answered <- nativeActionOutcome{state: lifecycle.ActionFailed}
+
 			s.recordActionFailure(fmt.Errorf("opencode action request panicked: %v", recovered))
 		})
 
@@ -326,8 +328,8 @@ func (s *session) replyNative(ctx context.Context, action *pendingAction, outcom
 			reply = permissionReplyReject
 		}
 
-		message := ""
-		if outcome.state == lifecycle.ActionCancelled {
+		message := outcome.message
+		if message == "" && outcome.state == lifecycle.ActionCancelled {
 			message = reasonCancelled
 		}
 
@@ -384,8 +386,12 @@ func (s *session) askHost(ctx context.Context, action *pendingAction) (nativeAct
 func (s *session) askPermission(ctx context.Context, action *pendingAction) (nativeActionOutcome, error) {
 	conn := s.agent.connection()
 	if conn == nil {
-		return nativeActionOutcome{state: lifecycle.ActionDeclined, permissionReply: permissionReplyReject},
-			errors.New("no ACP connection can answer an OpenCode permission request")
+		// A host that cannot be asked declines the permission, exactly as an
+		// unanswerable elicitation declines: an error here would fail a turn
+		// over a condition the native session can simply be answered about.
+		return nativeActionOutcome{
+			state: lifecycle.ActionDeclined, permissionReply: permissionReplyReject, message: "client unavailable",
+		}, nil
 	}
 
 	req := action.permission
@@ -407,8 +413,8 @@ func (s *session) askPermission(ctx context.Context, action *pendingAction) (nat
 			Kind:       &kind,
 			Status:     &status,
 			RawInput: map[string]any{
-				"action":              req.ActionName(),
-				"resources":           req.ResourceList(),
+				jsonFieldAction:       req.ActionName(),
+				jsonFieldResources:    req.ResourceList(),
 				"metadata":            req.Metadata,
 				jsonFieldSource:       req.Source,
 				"save":                req.Save,
@@ -438,6 +444,7 @@ func (s *session) askPermission(ctx context.Context, action *pendingAction) (nat
 	}
 
 	reply := permissionReplyReject
+
 	if resp.Outcome.Selected != nil {
 		switch resp.Outcome.Selected.OptionId {
 		case permissionReplyOnce, permissionReplyAlways, permissionReplyReject:

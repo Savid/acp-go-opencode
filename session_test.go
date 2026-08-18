@@ -146,7 +146,6 @@ func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 	current.markPublishedToolCall("tool")
 	require.True(t, current.publishedToolCall("tool"), "a published call stays answerable across turns")
 
-	current.mu.Unlock()
 	selector, present, err := current.validatedModelSelector(context.Background(), "model")
 	require.NoError(t, err)
 	require.True(t, present)
@@ -242,7 +241,14 @@ func TestCancelTurnInterruptsOnlyTheAddressedNativeSession(t *testing.T) {
 	require.Equal(t, []string{current.idmap.NativeSessionID}, client.abortedSessions())
 	require.True(t, current.wasCancelled())
 
+	// The turn is interrupted once: repeating the cancel touches nothing.
+	require.NoError(t, current.cancelTurn(context.Background()))
+	require.Len(t, client.abortedSessions(), 1)
+	current.finishTurn()
+
+	// A refused interrupt is reported to the caller on the next turn's cancel.
 	client.abortErr = errors.New("interrupt refused")
+	current.beginTurn(context.Background(), "nonce-2")
 	require.ErrorContains(t, current.cancelTurn(context.Background()), "interrupt refused")
 	current.finishTurn()
 }

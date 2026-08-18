@@ -36,6 +36,8 @@ const (
 	jsonFieldSequence       = "sequence"
 	jsonFieldEvent          = "event"
 	jsonFieldSource         = "source"
+	jsonFieldAction         = "action"
+	jsonFieldResources      = "resources"
 	jsonFieldCause          = "cause"
 	jsonFieldStatusCode     = "statusCode"
 	jsonFieldProviderCode   = "providerCode"

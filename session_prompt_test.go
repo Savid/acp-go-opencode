@@ -670,6 +670,7 @@ func TestUpdateReconciliationEdgeBranches(t *testing.T) {
 		t.Fatalf("delta-only committed text = %q", session.emittedPartText[deltaOnly.ID])
 	}
 
+	session.stopPump()
 	session.agent = nil
 	session.emittedPartText["rewrite"] = "before"
 	rewrite := opencode.NativePart{ID: "rewrite", Type: partTypeText, Text: "after"}
@@ -1726,8 +1727,9 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.permissionsErr = errors.New("permissions failed")
 		session := testSession(t, NewAgent(), client)
-		if _, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}); err == nil {
-			t.Fatal("permission error prompt succeeded")
+		err := session.applyNativeEvent(ctx, opencode.Event{Type: opencode.EventServerConnected})
+		if err == nil || !strings.Contains(err.Error(), "permissions failed") {
+			t.Fatalf("permission reconcile error = %v", err)
 		}
 	})
 
@@ -1735,8 +1737,9 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.questionsErr = errors.New("questions failed")
 		session := testSession(t, NewAgent(), client)
-		if _, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}); err == nil {
-			t.Fatal("question error prompt succeeded")
+		err := session.applyNativeEvent(ctx, opencode.Event{Type: opencode.EventServerConnected})
+		if err == nil || !strings.Contains(err.Error(), "questions failed") {
+			t.Fatalf("question reconcile error = %v", err)
 		}
 	})
 
@@ -1969,11 +1972,9 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 		agent := NewAgent()
 		agent.setAgentClient(conn)
 		session := testSession(t, agent, client)
-		started := make(chan struct{})
-		release := make(chan struct{})
+		dispatched := make(chan struct{})
 		client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
-			close(started)
-			<-release
+			close(dispatched)
 
 			return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
 		}
@@ -1982,7 +1983,7 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 			_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 			done <- err
 		}()
-		<-started
+		<-dispatched
 		client.events <- opencode.Event{Type: "server.connected"}
 		client.events <- opencode.Event{
 			Type:       "message.part.created",
@@ -1997,7 +1998,7 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 		}
-		close(release)
+		client.publishTurnCompletion("native-1", "assistant")
 		if err := <-done; err != nil {
 			t.Fatalf("Prompt: %v", err)
 		}
@@ -2013,19 +2014,18 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 		agent := NewAgent()
 		agent.setAgentClient(conn)
 		session := testSession(t, agent, client)
-		started := make(chan struct{})
-		client.dispatchMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
-			close(started)
-			<-ctx.Done()
+		dispatched := make(chan struct{})
+		client.dispatchMessage = func(_ context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+			close(dispatched)
 
-			return opencode.NativeMessage{}, ctx.Err()
+			return opencode.NativeMessage{}, nil
 		}
 		done := make(chan error, 1)
 		go func() {
 			_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 			done <- err
 		}()
-		<-started
+		<-dispatched
 		client.events <- opencode.Event{
 			Type:       "message.part.created",
 			Properties: json.RawMessage(`{"id":"event-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"stream"}`),
@@ -2228,7 +2228,7 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 			return opencode.NativeMessage{}, errors.New("cancelled send")
 		}
 		resp, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
-		if err != nil || resp.StopReason != acp.StopReasonCancelled {
+		if err == nil || !strings.Contains(err.Error(), "opencode_prompt_cancelled_before_dispatch") {
 			t.Fatalf("cancelled send resp=%#v err=%v", resp, err)
 		}
 	})
@@ -2629,6 +2629,7 @@ func providerNativeError(detail string, status int, code string) *opencode.Nativ
 
 func TestTurnTimeoutWithoutAgent(t *testing.T) {
 	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	session.stopPump()
 	session.agent = nil
 	if session.turnTimeout() != 0 {
 		t.Fatal("nil agent turn timeout != 0")
@@ -2767,14 +2768,11 @@ func TestPromptStreamErrorIsStructuredTransportFailure(t *testing.T) {
 
 func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	started := make(chan struct{})
-	stopped := make(chan struct{})
-	client.dispatchMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
-		close(started)
-		<-ctx.Done()
-		close(stopped)
+	dispatched := make(chan struct{})
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		close(dispatched)
 
-		return opencode.NativeMessage{}, ctx.Err()
+		return opencode.NativeMessage{}, nil
 	}
 	session := testSession(t, NewAgent(), client)
 
@@ -2790,7 +2788,7 @@ func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 	}()
 
 	select {
-	case <-started:
+	case <-dispatched:
 	case <-ctx.Done():
 		t.Fatal("Prompt did not start")
 	}
@@ -2809,6 +2807,7 @@ func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 			Error:     providerNativeError("model rejected", 400, "invalid_model"),
 		}),
 	}
+	client.publishSessionIdle(session.idmap.NativeSessionID)
 
 	select {
 	case err := <-done:
@@ -2818,12 +2817,6 @@ func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("Prompt did not return after session.error")
-	}
-
-	select {
-	case <-stopped:
-	case <-ctx.Done():
-		t.Fatal("native prompt polling did not stop")
 	}
 
 	client.mu.Lock()
@@ -2836,14 +2829,22 @@ func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 
 func TestPromptCancellationWinsSessionErrorEvent(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	started := make(chan struct{})
-	client.dispatchMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
-		close(started)
-		<-ctx.Done()
+	client.abortFunc = func(id string) error {
+		client.publishSessionIdle(id)
 
-		return opencode.NativeMessage{}, ctx.Err()
+		return nil
 	}
-	session := testSession(t, NewAgent(), client)
+	dispatched := make(chan struct{})
+	client.dispatchMessage = func(_ context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		close(dispatched)
+
+		return opencode.NativeMessage{}, nil
+	}
+	agent := NewAgent()
+	session := testSession(t, agent, client)
+	agent.mu.Lock()
+	agent.sessions[session.id] = session
+	agent.mu.Unlock()
 	done := make(chan struct {
 		response acp.PromptResponse
 		err      error
@@ -2858,16 +2859,16 @@ func TestPromptCancellationWinsSessionErrorEvent(t *testing.T) {
 			err      error
 		}{response: response, err: err}
 	}()
-	<-started
-	session.mu.Lock()
-	session.cancelled = true
-	session.mu.Unlock()
+	<-dispatched
 	client.events <- opencode.Event{
 		Type: eventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: session.idmap.NativeSessionID,
 			Error:     providerNativeError("cancelled provider error", 400, "cancelled"),
 		}),
+	}
+	if err := agent.Cancel(context.Background(), CancelRequest(session.id, internalSeamTurnNonce)); err != nil {
+		t.Fatalf("Cancel: %v", err)
 	}
 	result := <-done
 	require.NoError(t, result.err)
@@ -2880,8 +2881,10 @@ func TestSessionErrorEventRejectsMalformedProperties(t *testing.T) {
 	require.Error(t, err)
 }
 
-// T5 — a native error observed while the turn is cancelled maps to StopReason
-// cancelled with a nil error: the cancel guard runs before failure mapping.
+// T5 — a native dispatch failure observed while the host cancelled reports the
+// cancellation rather than the native error: the cancel guard runs before
+// failure mapping, and with no accepted turn there is no cancelled
+// PromptResponse to return.
 func TestPromptCancelSuppressesNativeError(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	started := make(chan struct{})
@@ -2920,17 +2923,20 @@ func TestPromptCancelSuppressesNativeError(t *testing.T) {
 	}
 	select {
 	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("cancelled turn returned error: %v", got.err)
+		if got.err == nil || !strings.Contains(got.err.Error(), "opencode_prompt_cancelled_before_dispatch") {
+			t.Fatalf("cancelled dispatch error = %v", got.err)
 		}
-		if got.resp.StopReason != acp.StopReasonCancelled {
-			t.Fatalf("StopReason = %q, want cancelled", got.resp.StopReason)
+		if got.resp.StopReason != "" {
+			t.Fatalf("StopReason = %q, want empty (no PromptResponse)", got.resp.StopReason)
 		}
 	case <-ctx.Done():
 		t.Fatal("Prompt did not return after cancel")
 	}
-	if !client.closed {
-		t.Fatal("cancel did not retire the shared runtime")
+	if client.closed {
+		t.Fatal("routine cancellation retired the shared runtime")
+	}
+	if client.abortCount() != 1 {
+		t.Fatalf("abort count = %d, want 1", client.abortCount())
 	}
 }
 
@@ -2956,8 +2962,8 @@ func TestPromptTurnTimeoutFailsWithTimeoutCause(t *testing.T) {
 	if client.abortCount() != 1 {
 		t.Fatalf("abort count = %d, want 1 (timeout aborts the native turn)", client.abortCount())
 	}
-	if !client.closed {
-		t.Fatal("timeout did not retire the shared runtime")
+	if client.closed {
+		t.Fatal("a turn timeout retired the shared runtime")
 	}
 }
 
@@ -2973,14 +2979,16 @@ func TestPromptTurnTimeoutFailsWithTimeoutCause(t *testing.T) {
 // timeout failure.
 func TestPromptCancelWinsCoincidentTimeout(t *testing.T) {
 	client := newFakeOpenCodeClient()
+	client.abortFunc = func(id string) error {
+		client.publishSessionIdle(id)
+
+		return nil
+	}
 	started := make(chan struct{})
-	release := make(chan struct{})
-	defer close(release)
 	client.dispatchMessage = func(_ context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(started)
-		<-release
 
-		return opencode.NativeMessage{}, errors.New("native error raised at coincident cancel+timeout")
+		return opencode.NativeMessage{}, nil
 	}
 	agent := NewAgent(WithTurnTimeout(15 * time.Millisecond))
 	session := testSession(t, agent, client)
@@ -3061,10 +3069,6 @@ func TestPromptDoubleTransportFailureNamesBoth(t *testing.T) {
 		}
 	}
 }
-func promptCoverageParams(id acp.SessionId) acp.PromptRequest {
-	return acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}
-}
-
 func TestPromptCancelAndLoadRejectRemainingRouteAndMCPBranches(t *testing.T) {
 	agent := NewAgent()
 	_, err := agent.Prompt(context.Background(), acp.PromptRequest{})

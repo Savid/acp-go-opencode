@@ -156,7 +156,6 @@ type fakeOpenCodeClient struct {
 	listSessions  []opencode.NativeSession
 	forkSession   opencode.NativeSession
 	messages      []opencode.NativeMessage
-	statuses      map[string]opencode.NativeSessionStatus
 	todos         []opencode.NativeTodo
 	providers     opencode.ProvidersResponse
 	agents        []opencode.NativeAgent
@@ -185,7 +184,6 @@ type fakeOpenCodeClient struct {
 	createErr      error
 	getErr         error
 	listErr        error
-	statusErr      error
 	deleteErr      error
 	messagesErr    error
 	commandsErr    error
@@ -982,6 +980,8 @@ func testNativeSession(id string) opencode.NativeSession {
 }
 
 func testSession(t *testing.T, agent *Agent, client *fakeOpenCodeClient) *session {
+	t.Helper()
+
 	if client.xdg.Root == "" {
 		root, err := os.MkdirTemp("", "acp-go-opencode-test-*")
 		if err == nil {
@@ -1006,9 +1006,12 @@ func testSession(t *testing.T, agent *Agent, client *fakeOpenCodeClient) *sessio
 	})
 	session.runtimeGeneration = generation
 
-	// The prompt path settles on the native event stream, so a test session
-	// needs its pump running exactly as an established production session does.
-	session.startPump()
+	// The prompt path settles on the native event stream, so a test session is
+	// established exactly as a production session is: the opening snapshot (when
+	// the agent negotiated the lifecycle extension) and then the pump.
+	if err := session.establish(context.Background()); err != nil {
+		t.Fatalf("establish test session: %v", err)
+	}
 	t.Cleanup(session.stopPump)
 
 	return session
@@ -1169,24 +1172,6 @@ func (c *fakeOpenCodeClient) hangsAfterDispatch(started chan struct{}) {
 	}
 }
 
-// failsNatively makes the next dispatch acknowledge the frame and then publish one
-// native turn failure followed by the session's idle signal, which is the order
-// OpenCode publishes them in.
-func (c *fakeOpenCodeClient) failsNatively(sessionID string, nativeErr *opencode.NativeError) {
-	c.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
-		c.publishEvent(opencode.Event{
-			Type: opencode.EventSessionError,
-			Properties: mustJSONValue(map[string]any{
-				"sessionID": sessionID,
-				"error":     nativeErr,
-			}),
-		})
-		c.publishSessionIdle(sessionID)
-
-		return opencode.NativeMessage{}, nil
-	}
-}
-
 // refusesDispatch makes the next dispatch refuse the frame, which creates neither
 // a submission nor a turn.
 func (c *fakeOpenCodeClient) refusesDispatch(err error) {
@@ -1223,8 +1208,9 @@ func (c *recordingAgentClient) lifecycleEnvelopes(t *testing.T) []map[string]any
 func (c *recordingAgentClient) lifecycleEvents(t *testing.T) []string {
 	t.Helper()
 
-	types := make([]string, 0)
-	for _, envelope := range c.lifecycleEnvelopes(t) {
+	envelopes := c.lifecycleEnvelopes(t)
+	types := make([]string, 0, len(envelopes))
+	for _, envelope := range envelopes {
 		event, ok := envelope["event"].(map[string]any)
 		require.True(t, ok, "envelope carries no event")
 		eventType, ok := event["type"].(string)

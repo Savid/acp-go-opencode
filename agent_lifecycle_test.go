@@ -45,7 +45,7 @@ func TestInitializeAnswersOnTheResponsesOwnMeta(t *testing.T) {
 	answer, ok := response.Meta[lifecycle.MetaKey].(map[string]any)
 	require.True(t, ok, "the answer is absent from the response _meta")
 	require.Equal(t, []int{1}, answer["versions"])
-	require.Equal(t, false, answer["updatesOutsidePrompt"])
+	require.Equal(t, true, answer["updatesOutsidePrompt"])
 	require.Equal(t, false, answer["authoritativeQuiescence"])
 	require.Equal(t, []string{}, answer["activityKinds"])
 	require.NotContains(t, answer, "quiescenceSource")
@@ -127,7 +127,7 @@ func TestLifecycleTruthTableIsResolvedPerConfiguration(t *testing.T) {
 		RuntimeContainmentMode("unnamed"),
 	} {
 		facts := provenLifecycleFacts(mode)
-		require.False(t, facts.UpdatesOutsidePrompt, mode)
+		require.True(t, facts.UpdatesOutsidePrompt, mode)
 		require.False(t, facts.AuthoritativeQuiescence, mode)
 		require.Empty(t, facts.QuiescenceSource, mode)
 		require.Equal(t, []lifecycle.ActivityKind{}, facts.ActivityKinds, mode)
@@ -299,6 +299,7 @@ func TestPromptCorrelationIsRequiredWhileNegotiated(t *testing.T) {
 	t.Parallel()
 
 	agent := negotiatedAgent(t)
+	agent.setAgentClient(newRecordingAgentClient())
 	client := newFakeOpenCodeClient()
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
@@ -411,6 +412,7 @@ func TestCancelCarryingTheKeyNeverReachesTheHarness(t *testing.T) {
 	t.Parallel()
 
 	agent := negotiatedAgent(t)
+	agent.setAgentClient(newRecordingAgentClient())
 	client := newFakeOpenCodeClient()
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session

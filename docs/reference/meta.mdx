@@ -12,12 +12,15 @@ values carry the uniform `{"error": "unsupported", "field": "<path>"}` data.
 
 ## `acp-go.dev/lifecycle`
 
-The lifecycle key is negotiated bilaterally in initialize `_meta`. Version 1
-correlates prompt submissions, ordered session updates, permission requests,
-and elicitation requests. It is rejected on every other method. OpenCode
-advertises an empty activity-kind set and no authoritative quiescence source;
-consumers requiring authoritative run settlement reject that configuration
-before dispatch.
+The lifecycle key is negotiated bilaterally in initialize `_meta`: the host
+offers on `InitializeRequest._meta`, and the negotiated `acp-go.dev/lifecycle`
+answer is placed on `InitializeResponse._meta`. Version 1 correlates prompt
+submissions, ordered session updates, permission requests, and elicitation
+requests. It is rejected on every other method. OpenCode advertises
+out-of-prompt update delivery (`updatesOutsidePrompt: true` — the session-owned
+event pump routes native events with no prompt in flight), an empty
+activity-kind set, and no authoritative quiescence source; consumers requiring
+authoritative run settlement reject that configuration before dispatch.
 
 ## Request input
 

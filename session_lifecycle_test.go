@@ -722,7 +722,9 @@ func TestRecoveryOpensANewIncarnationWithItsOwnSnapshot(t *testing.T) {
 
 	streams := make([]string, 0, 2)
 	for _, envelope := range connection.lifecycleEnvelopes(t) {
-		streams = append(streams, envelope["streamId"].(string))
+		streamID, ok := envelope["streamId"].(string)
+		require.True(t, ok, "envelope carries no streamId")
+		streams = append(streams, streamID)
 	}
 
 	require.Contains(t, streams, firstStream)

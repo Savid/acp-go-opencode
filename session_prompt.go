@@ -1,4 +1,3 @@
-//nolint:tagliatelle // OpenCode native event payloads use sessionID wire names.
 package opencodeacp
 
 import (
@@ -20,8 +19,6 @@ import (
 	"github.com/savid/acp-go-opencode/internal/observer"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
-
-var errPromptCancelled = errors.New("prompt cancelled")
 
 const (
 	eventServerConnected    = "server.connected"
@@ -64,6 +61,7 @@ const (
 	nativeStatusPending   = "pending"
 	nativeStatusCompleted = "completed"
 	nativeStatusSuccess   = "success"
+	nativeStatusFailed    = "failed"
 	nativeStatusError     = "error"
 	toolNameRead          = "read"
 	toolNameEdit          = "edit"
@@ -459,11 +457,18 @@ func (s *session) runPromptTurn(
 ) (acp.PromptResponse, error) {
 	cycle, completion, err := s.dispatchAndAccept(turnCtx, submission, dispatch)
 	if err != nil {
+		// A dying host request context withdraws the frame before acceptance:
+		// there is nobody left to answer, and the withdrawal is reported as the
+		// cancellation it is rather than as a failure of the route.
+		if !s.wasCancelled() && s.takePendingDispatchFailure() == nil && turnCtx.Err() != nil {
+			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil //nolint:nilerr // the withdrawal is the answer, not the route's error
+		}
+
 		// Nothing was accepted, so no submission and no turn exist. The native
 		// refusal is reported as it is, and if the frame was in fact admitted
 		// without this call learning so, the session's own event stream opens an
 		// agent-origin turn for it rather than a silently accepted one.
-		return acp.PromptResponse{}, s.classifyDispatchFailure(err)
+		return acp.PromptResponse{}, s.classifyDispatchFailure(turnCtx, err, dispatch)
 	}
 
 	end := s.awaitPromptTerminal(ctx, turnCtx, cycle, completion)
@@ -516,12 +521,33 @@ func (s *session) releaseDispatchGate() {
 // proven by the first native event the addressed session publishes; the returned
 // channel then carries that route's completion report.
 func (s *session) sendNativeFrame(turnCtx context.Context, dispatch nativeDispatch) (<-chan error, error) {
+	// The turn deadline bounds the dispatch boundary too: a route that never
+	// acknowledges admission would otherwise hold the prompt past the deadline
+	// the turn was configured with.
+	timeout := s.turnTimeout()
+
 	if !dispatch.reportsCompletion {
-		return nil, dispatch.send(turnCtx)
+		if timeout <= 0 {
+			return nil, sendRecoveringPanic(turnCtx, dispatch)
+		}
+
+		sendCtx, cancel := context.WithTimeout(turnCtx, timeout)
+		defer cancel()
+
+		return nil, sendRecoveringPanic(sendCtx, dispatch)
 	}
 
 	evidence := s.watchDispatchEvidence()
 	defer s.stopWatchingDispatchEvidence()
+
+	var timeoutC <-chan time.Time
+
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		timeoutC = timer.C
+	}
 
 	completion := make(chan error, 1)
 
@@ -549,7 +575,22 @@ func (s *session) sendNativeFrame(turnCtx context.Context, dispatch nativeDispat
 		return completion, nil
 	case <-turnCtx.Done():
 		return nil, turnCtx.Err()
+	case <-timeoutC:
+		return nil, fmt.Errorf("native dispatch acknowledged nothing before the turn deadline: %w", context.DeadlineExceeded)
 	}
+}
+
+// sendRecoveringPanic posts one frame on the caller's goroutine, converting a
+// panic in the native route into the dispatch failure it is: the prompt must
+// answer its caller, and a crashed route answers nothing on its own.
+func sendRecoveringPanic(turnCtx context.Context, dispatch nativeDispatch) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("opencode native command panicked: %v", recovered)
+		}
+	}()
+
+	return dispatch.send(turnCtx)
 }
 
 // watchDispatchEvidence arms the pump to report the first native event this
@@ -590,18 +631,37 @@ func (s *session) noteDispatchEvidence() {
 }
 
 // classifyDispatchFailure maps a pre-acceptance failure onto its ACP error. A
-// refusal from the native route is the caller's answer, and a cancellation that
-// arrived before acceptance is reported as one.
-func (s *session) classifyDispatchFailure(err error) error {
-	if errors.Is(err, context.Canceled) && s.wasCancelled() {
+// refusal from the native route is the caller's answer, and any failure observed
+// after the host cancelled is reported as the cancellation: the interrupt is
+// what broke the dispatch, and the route's own error text merely describes how.
+func (s *session) classifyDispatchFailure(ctx context.Context, err error, dispatch nativeDispatch) error {
+	if s.wasCancelled() {
 		return acp.NewInvalidRequest(map[string]any{
 			jsonFieldError:   "opencode_prompt_cancelled_before_dispatch",
 			jsonFieldMessage: err.Error(),
 		})
 	}
 
+	// A native failure that arrived while the frame awaited acceptance is the
+	// real cause; the route's own error is just the released context.
+	if pending := s.takePendingDispatchFailure(); pending != nil {
+		return s.classifyTurnFailure(context.WithoutCancel(ctx), pending, dispatch)
+	}
+
+	if s.turnTimeout() > 0 && errors.Is(err, context.DeadlineExceeded) {
+		s.interruptNativeWork(context.WithoutCancel(ctx))
+
+		return acp.NewInternalError(turnFailedData(
+			causeTimeout, fmt.Sprintf("turn exceeded %s deadline", s.turnTimeout()), 0, "",
+		))
+	}
+
 	if runtimeErr := s.runtimeFailure(); runtimeErr != nil {
 		return runtimeErr
+	}
+
+	if dispatch.matched && opencode.IsBadRequest(err) {
+		return s.classifyTurnFailure(context.WithoutCancel(ctx), err, dispatch)
 	}
 
 	var assistantErr *opencode.AssistantError
@@ -642,6 +702,13 @@ func (s *session) awaitPromptTerminal(
 
 	select {
 	case <-cycle.signal:
+		// The cancel guard runs here too: a cancel and the terminal evidence its
+		// own interrupt produced can arrive together, and the turn the host
+		// cancelled resolves to cancelled no matter which wakes the select.
+		if s.wasCancelled() {
+			return s.settleCancelledTurn(ctx, cycle)
+		}
+
 		return s.observedCycleEnd(cycle)
 	case err := <-completion:
 		if err != nil {
@@ -737,7 +804,7 @@ func (s *session) completePromptTurn(
 		})
 	}
 
-	response, turnErr, outcome, stopReason := s.promptOutcome(settleCtx, turnCtx, params, cycle, end, dispatch)
+	response, outcome, stopReason, turnErr := s.promptOutcome(settleCtx, turnCtx, params, cycle, end, dispatch)
 
 	if commitErr := s.commitForegroundPrefix(settleCtx); commitErr != nil {
 		s.fenceLifecycle(fmt.Sprintf("native-safe prefix commit failed: %v", commitErr))
@@ -767,29 +834,29 @@ func (s *session) promptOutcome(
 	cycle *foregroundCycle,
 	end nativeTurnEnd,
 	dispatch nativeDispatch,
-) (acp.PromptResponse, error, lifecycle.Outcome, string) {
+) (acp.PromptResponse, lifecycle.Outcome, string, error) {
 	if end.cancelled {
 		return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId},
-			nil, lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled)
+			lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled), nil
 	}
 
 	if end.timedOut {
-		return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(
+		return acp.PromptResponse{}, lifecycle.OutcomeFailed, "", acp.NewInternalError(turnFailedData(
 			causeTimeout, fmt.Sprintf("turn exceeded %s deadline", s.turnTimeout()), 0, "",
-		)), lifecycle.OutcomeFailed, ""
+		))
 	}
 
 	if failure := s.cycleFailure(cycle); failure != nil {
-		return acp.PromptResponse{}, s.classifyTurnFailure(settleCtx, failure, dispatch), lifecycle.OutcomeFailed, ""
+		return acp.PromptResponse{}, lifecycle.OutcomeFailed, "", s.classifyTurnFailure(settleCtx, failure, dispatch)
 	}
 
 	final, err := s.finalAssistantMessage(settleCtx, cycle)
 	if err != nil {
-		return acp.PromptResponse{}, s.classifyTurnFailure(settleCtx, err, dispatch), lifecycle.OutcomeFailed, ""
+		return acp.PromptResponse{}, lifecycle.OutcomeFailed, "", s.classifyTurnFailure(settleCtx, err, dispatch)
 	}
 
 	if err := s.emitMessage(turnCtx, final, false); err != nil {
-		return acp.PromptResponse{}, err, lifecycle.OutcomeFailed, ""
+		return acp.PromptResponse{}, lifecycle.OutcomeFailed, "", err
 	}
 
 	stopReason := stopReasonFromOpenCode(final.Info.Finish)
@@ -799,7 +866,7 @@ func (s *session) promptOutcome(
 		Usage:         usageFromTokens(final.Info.Tokens),
 		UserMessageId: params.MessageId,
 		Meta:          s.structuredOutputMeta(final),
-	}, nil, lifecycle.OutcomeSuccess, string(stopReason)
+	}, lifecycle.OutcomeSuccess, string(stopReason), nil
 }
 
 // cycleFailure reports the native failure recorded against this cycle.
@@ -2166,7 +2233,7 @@ func toolStatus(value string) acp.ToolCallStatus {
 		return acp.ToolCallStatusPending
 	case nativeStatusCompleted, nativeStatusSuccess:
 		return acp.ToolCallStatusCompleted
-	case "failed", nativeStatusError:
+	case nativeStatusFailed, nativeStatusError:
 		return acp.ToolCallStatusFailed
 	default:
 		return acp.ToolCallStatusInProgress

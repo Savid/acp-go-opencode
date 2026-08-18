@@ -307,6 +307,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		require.NoError(t, agent.Close())
 	})
 }
+
 // TestLostRuntimeFailsAPromptBeforeItIsAccepted proves a session whose runtime
 // generation was lost fails its prompt with the transport cause and never
 // dispatches: the loss is the answer, and no turn is accepted against a runtime

@@ -34,6 +34,7 @@ func TestImageLimitsDefaultsAndOption(t *testing.T) {
 
 func TestImageLimitsNilAgent(t *testing.T) {
 	sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	sess.stopPump()
 	sess.agent = nil
 	require.Equal(t, defaultImageLimits(), sess.imageLimits())
 }

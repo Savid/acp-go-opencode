@@ -122,3 +122,23 @@ func TestPermissionToolCallReadsEitherNativeShape(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`{"id":"per_1","sessionID":"ses_1"}`), &unsourced))
 	require.Equal(t, PermissionTool{}, unsourced.ToolCall())
 }
+
+// TestDecodeSessionStatusRequiresAnAddressableSession proves a status payload is
+// routable only when it decodes and names its session, and that a valid payload
+// carries the status through.
+func TestDecodeSessionStatusRequiresAnAddressableSession(t *testing.T) {
+	t.Parallel()
+
+	if _, ok := DecodeSessionStatus(json.RawMessage(`{`)); ok {
+		t.Fatal("malformed status payload was decoded")
+	}
+
+	if _, ok := DecodeSessionStatus(json.RawMessage(`{"status":{"type":"busy"}}`)); ok {
+		t.Fatal("status payload naming no session was routable")
+	}
+
+	status, ok := DecodeSessionStatus(json.RawMessage(`{"sessionID":"ses_1","status":{"type":"busy"}}`))
+	require.True(t, ok)
+	require.Equal(t, "ses_1", status.SessionID)
+	require.Equal(t, SessionStatusBusy, status.Status.Type)
+}

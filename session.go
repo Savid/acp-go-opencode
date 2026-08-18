@@ -63,19 +63,22 @@ type session struct {
 	dispatchEvidence chan struct{}
 	// lifecycleMu guards the lifecycle stream and the foreground cycle. Both the
 	// pump and a foreground prompt emit, so one mutex fixes one order.
-	lifecycleMu             sync.Mutex
-	lifecycleStream         *lifecycle.Stream
-	lifecycleFailed         error
-	lifecycleOpened         bool
-	cycle                   *foregroundCycle
-	cycleCounter            uint64
-	turnCounter             uint64
-	actions                 *actionRegistry
-	updateMu                sync.Mutex
-	rawEventMu              sync.Mutex
-	cancel                  context.CancelFunc
-	turnDone                <-chan struct{}
-	cancelled               bool
+	lifecycleMu     sync.Mutex
+	lifecycleStream *lifecycle.Stream
+	lifecycleFailed error
+	lifecycleOpened bool
+	cycle           *foregroundCycle
+	cycleCounter    uint64
+	turnCounter     uint64
+	actions         *actionRegistry
+	updateMu        sync.Mutex
+	rawEventMu      sync.Mutex
+	cancel          context.CancelFunc
+	turnDone        <-chan struct{}
+	cancelled       bool
+	// pendingDispatchFailure carries a native failure that arrived while a
+	// frame was still awaiting acceptance, where no cycle exists to carry it.
+	pendingDispatchFailure  error
 	rawSeq                  int64
 	emittedPartText         map[string]string
 	emittedTools            map[string]emittedToolState
@@ -328,10 +331,44 @@ func (s *session) beginTurn(ctx context.Context, turnNonces ...string) context.C
 	s.cancel = cancel
 	s.turnDone = turnCtx.Done()
 	s.cancelled = false
+	s.pendingDispatchFailure = nil
 	s.turnEpoch++
 	s.turnNonce = turnNonce
 
 	return turnCtx
+}
+
+// failPendingDispatch fails a frame still awaiting acceptance. The failure is
+// recorded for the dispatch classification and the turn context is released, so
+// the blocked route answers instead of waiting out a run that already died.
+// With no turn in flight there is nothing to fail and the event is the pump's to
+// judge.
+func (s *session) failPendingDispatch(err error) {
+	s.mu.Lock()
+
+	if s.cancel == nil {
+		s.mu.Unlock()
+
+		return
+	}
+
+	if s.pendingDispatchFailure == nil {
+		s.pendingDispatchFailure = err
+	}
+
+	cancel := s.cancel
+	s.mu.Unlock()
+
+	cancel()
+}
+
+// takePendingDispatchFailure reports the failure recorded against the frame the
+// session was dispatching, if any.
+func (s *session) takePendingDispatchFailure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.pendingDispatchFailure
 }
 
 func (s *session) finishTurn() {
@@ -394,10 +431,24 @@ func (s *session) cancelTurn(ctx context.Context) error {
 		cancel()
 	}
 
-	// One turn is interrupted once: a cancel notification and the cancelled
-	// turn's own settlement both arrive here, and a second native abort would
-	// interrupt whatever the session does next.
-	if alreadyCancelled || client == nil || nativeID == "" {
+	// One turn is interrupted once, whichever mechanism gets there first: a
+	// cancel notification, the cancelled turn's own settlement, and a delivery
+	// failure all share the open cycle's interrupt claim, and a second native
+	// abort would interrupt whatever the session does next. Before acceptance
+	// no cycle exists to carry the claim, so the cancelled flag itself is the
+	// once-guard there.
+	s.lifecycleMu.Lock()
+	cycle := s.cycle
+	interrupt := cycle != nil && !cycle.interrupted && !cycle.settled
+
+	if cycle != nil {
+		cycle.interrupted = true
+	} else {
+		interrupt = !alreadyCancelled
+	}
+	s.lifecycleMu.Unlock()
+
+	if !interrupt || client == nil || nativeID == "" {
 		return nil
 	}
 
@@ -408,6 +459,24 @@ func (s *session) cancelTurn(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// interruptNativeWork asks OpenCode to stop this session's current work without
+// marking the session cancelled: the caller is ending a turn on a failure, and
+// cancellation state belongs only to a cancel the host asked for.
+func (s *session) interruptNativeWork(ctx context.Context) {
+	s.mu.Lock()
+	client := s.client
+	nativeID := s.idmap.NativeSessionID
+	s.mu.Unlock()
+
+	if client == nil || nativeID == "" {
+		return
+	}
+
+	if err := client.Abort(ctx, nativeID); err != nil {
+		s.recordInterruptFailure(err)
+	}
 }
 
 // requireActiveTurn refuses a cancel that does not address the session's current
@@ -915,8 +984,7 @@ func (s *session) Close(_ context.Context) error {
 	release := s.directoryRelease
 	s.mu.Unlock()
 
-	var err = cancelErr
-
+	err := cancelErr
 	if err == nil {
 		s.stopPump()
 	}

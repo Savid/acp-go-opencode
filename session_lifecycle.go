@@ -34,6 +34,9 @@ type foregroundCycle struct {
 	// lost records an incarnation loss that ended the cycle with no native
 	// terminal signal at all.
 	lost error
+	// interrupted records that this cycle's native work was already asked to
+	// stop, so a second failure cannot interrupt whatever the session does next.
+	interrupted bool
 	// signal closes exactly once, when the cycle acquires terminal evidence.
 	signal chan struct{}
 }
