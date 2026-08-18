@@ -278,15 +278,14 @@ func TestOpenCodeServerMessageAndCommandMethods(t *testing.T) {
 	ctx := context.Background()
 	client, rec := newOpenCodeMethodsClient(t)
 
-	message, err := client.SendMessage(ctx, "s/1", MessageRequest{
+	if err := client.DispatchMessage(ctx, "s/1", MessageRequest{
 		MessageID: "user-1",
 		Model:     &ModelSelector{ProviderID: "openai", ModelID: "gpt-test"},
 		Agent:     "build",
 		Parts:     []map[string]any{{"type": "text", "text": "hello"}},
-	})
-	if err != nil || message.Info.ID != "assistant" || rec.messageBody.MessageID != "user-1" ||
+	}); err != nil || rec.messageBody.MessageID != "user-1" ||
 		rec.messageBody.Model.ModelID != "gpt-test" || rec.messageBody.Agent != "build" || len(rec.messageBody.Parts) != 1 {
-		t.Fatalf("SendMessage = %#v body=%#v err=%v", message, rec.messageBody, err)
+		t.Fatalf("DispatchMessage body=%#v err=%v", rec.messageBody, err)
 	}
 	messages, err := client.Messages(ctx, "s/1")
 	if err != nil || len(messages) != 1 || messages[0].Info.ID != "assistant" {
@@ -296,7 +295,7 @@ func TestOpenCodeServerMessageAndCommandMethods(t *testing.T) {
 	if err != nil || len(commands) != 1 || commands[0].Name != "review" || commands[0].Template == nil || len(commands[0].Hints) != 1 {
 		t.Fatalf("Commands = %#v err=%v", commands, err)
 	}
-	command, err := client.RunCommand(ctx, "s/1", CommandRequest{
+	commandErr := client.DispatchCommand(ctx, "s/1", CommandRequest{
 		MessageID: "user-2",
 		Agent:     "build",
 		Model:     "openai/gpt-test",
@@ -304,10 +303,10 @@ func TestOpenCodeServerMessageAndCommandMethods(t *testing.T) {
 		Arguments: "args",
 		Parts:     []map[string]any{{"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA=="}},
 	})
-	if err != nil || command.Info.ID != "assistant-command" || rec.commandBody.MessageID != "user-2" ||
+	if commandErr != nil || rec.commandBody.MessageID != "user-2" ||
 		rec.commandBody.Model != "openai/gpt-test" || rec.commandBody.Command != "review" || rec.commandBody.Arguments != "args" ||
 		len(rec.commandBody.Parts) != 1 {
-		t.Fatalf("RunCommand = %#v body=%#v err=%v", command, rec.commandBody, err)
+		t.Fatalf("DispatchCommand body=%#v err=%v", rec.commandBody, commandErr)
 	}
 }
 
@@ -315,10 +314,6 @@ func TestOpenCodeServerControlAndInfoMethods(t *testing.T) {
 	ctx := context.Background()
 	client, rec := newOpenCodeMethodsClient(t)
 
-	status, err := client.SessionStatus(ctx)
-	if err != nil || status["s/1"].Type != "idle" {
-		t.Fatalf("SessionStatus = %#v err=%v", status, err)
-	}
 	if abortErr := client.Abort(ctx, "s/1"); abortErr != nil {
 		t.Fatalf("Abort: %v", abortErr)
 	}
@@ -426,7 +421,7 @@ func TestAssistantMessageErrorFields(t *testing.T) {
 	}
 }
 
-func TestOpenCodeSendMessageErrors(t *testing.T) {
+func TestOpenCodeDispatchErrors(t *testing.T) {
 	ctx := context.Background()
 	for _, tt := range []struct {
 		name    string
@@ -513,9 +508,9 @@ func TestOpenCodeSendMessageErrors(t *testing.T) {
 			}
 			var err error
 			if tt.command {
-				_, err = client.RunCommand(ctx, "s", CommandRequest{Command: "review", Arguments: ""})
+				err = client.DispatchCommand(ctx, "s", CommandRequest{Command: "review", Arguments: ""})
 			} else {
-				_, err = client.SendMessage(ctx, "s", MessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}})
+				err = client.DispatchMessage(ctx, "s", MessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}})
 			}
 			if err == nil {
 				t.Fatal("native send unexpectedly succeeded")

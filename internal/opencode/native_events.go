@@ -22,7 +22,54 @@ const (
 	// that a question was answered.
 	EventQuestionReplied   = "question.replied"
 	EventQuestionV2Replied = "question.v2.replied"
+	// EventQuestionRejected and EventQuestionV2Rejected confirm, from the
+	// server, that a question was withdrawn without an answer.
+	EventQuestionRejected   = "question.rejected"
+	EventQuestionV2Rejected = "question.v2.rejected"
+	// EventSessionIdle is the native completion signal: the addressed session's
+	// agent loop has stopped. It is the only structured native event that ends a
+	// foreground turn, and nothing here infers completion from anything else.
+	EventSessionIdle = "session.idle"
+	// EventSessionStatus reports that a session took work on or put it down.
+	EventSessionStatus = "session.status"
+	// EventSessionError carries one native turn failure for a session.
+	EventSessionError = "session.error"
+	// EventMessageUpdated declares one message's role and identity. It precedes
+	// every part event for that message.
+	EventMessageUpdated = "message.updated"
+	// EventMessagePartCreated and EventMessagePartUpdated carry transcript parts.
+	EventMessagePartCreated = "message.part.created"
+	EventMessagePartUpdated = "message.part.updated"
+	// EventTodoUpdated carries the session's plan entries.
+	EventTodoUpdated = "todo.updated"
+	// EventServerConnected is the first event of every stream this client opens.
+	EventServerConnected = eventTypeServerConnected
 )
+
+// Native session status values.
+const (
+	// SessionStatusIdle names a session that holds no work.
+	SessionStatusIdle = "idle"
+	// SessionStatusBusy names a session running its agent loop.
+	SessionStatusBusy = "busy"
+)
+
+// SessionStatusEvent reports one session's native status transition.
+type SessionStatusEvent struct {
+	SessionID string              `json:"sessionID"`
+	Status    NativeSessionStatus `json:"status"`
+}
+
+// DecodeSessionStatus reads a `session.status` payload. A payload naming no
+// session reports nothing routable.
+func DecodeSessionStatus(properties json.RawMessage) (SessionStatusEvent, bool) {
+	var status SessionStatusEvent
+	if err := json.Unmarshal(properties, &status); err != nil || status.SessionID == "" {
+		return SessionStatusEvent{}, false
+	}
+
+	return status, true
+}
 
 // ActionRepliedEvent reports a server-confirmed resolution of one permission or
 // question request. The native payload names the session and the request it

@@ -105,7 +105,11 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
 	}
 
-	a.refreshLifecycleCommands(ctx, session)
+	if err := a.establishSession(ctx, session); err != nil {
+		closeErr := a.closeFailedSession(session)
+
+		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
+	}
 
 	return acp.NewSessionResponse{
 		SessionId:     id,
@@ -126,7 +130,9 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 		return acp.LoadSessionResponse{}, err
 	}
 
-	a.refreshLifecycleCommands(ctx, session)
+	if err := a.establishSession(ctx, session); err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
 
 	return acp.LoadSessionResponse{
 		Meta:          sessionResponseMeta(session.snapshot()),
@@ -145,7 +151,9 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 		return acp.ResumeSessionResponse{}, err
 	}
 
-	a.refreshLifecycleCommands(ctx, session)
+	if err := a.establishSession(ctx, session); err != nil {
+		return acp.ResumeSessionResponse{}, err
+	}
 
 	return acp.ResumeSessionResponse{
 		Meta:          sessionResponseMeta(session.snapshot()),
@@ -153,13 +161,20 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 	}, nil
 }
 
-func (a *Agent) refreshLifecycleCommands(ctx context.Context, session *session) {
+// establishSession publishes the session's initial command catalog and opens its
+// lifecycle stream. A catalog refresh failure is diagnostic — the catalog is
+// republished on the next prompt — but a stream that cannot be opened is not: the
+// session would owe a host an ordered stream it can never deliver, so the
+// establishing request fails.
+func (a *Agent) establishSession(ctx context.Context, session *session) error {
 	if err := session.refreshCommands(ctx); err != nil {
 		a.log.DebugContext(ctx, "refresh OpenCode commands during session lifecycle failed",
 			slog.String("session_id", string(session.id)),
 			slog.String("error", err.Error()),
 		)
 	}
+
+	return session.establish(ctx)
 }
 
 func (a *Agent) loadOrResumeSession(
@@ -541,7 +556,11 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
 	}
 
-	a.refreshLifecycleCommands(ctx, session)
+	if err := a.establishSession(ctx, session); err != nil {
+		closeErr := a.closeFailedSession(session)
+
+		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
+	}
 
 	return acp.UnstableForkSessionResponse{
 		SessionId:     id,

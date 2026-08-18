@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -169,8 +169,9 @@ type fakeOpenCodeClient struct {
 	questionRejects    []fakeQuestionReject
 
 	createSessionFunc func(context.Context, string) (opencode.NativeSession, error)
-	sendMessage       func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
-	runCommand        func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
+	dispatchMessage   func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
+	dispatchCommand   func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
+	abortFunc         func(string) error
 	syncHistoryFunc   func(context.Context, map[string]int64) ([]opencode.SyncEvent, error)
 	refreshMCPFunc    func(context.Context, []opencode.MCPServerConfig) error
 
@@ -382,39 +383,140 @@ func (c *fakeOpenCodeClient) Commands(context.Context) ([]opencode.NativeCommand
 	return append([]opencode.NativeCommand(nil), c.commands...), c.commandsErr
 }
 
-func (c *fakeOpenCodeClient) RunCommand(ctx context.Context, id string, req opencode.CommandRequest) (opencode.NativeMessage, error) {
-	if c.runCommand != nil {
-		return c.runCommand(ctx, id, req)
+// DispatchCommand mirrors the native command route: it answers only when the run
+// it started has finished, so a test that wants a live command turn publishes its
+// own events and blocks here.
+func (c *fakeOpenCodeClient) DispatchCommand(ctx context.Context, id string, req opencode.CommandRequest) error {
+	if c.dispatchCommand != nil {
+		message, err := c.dispatchCommand(ctx, id, req)
+
+		return c.completeFromHook(id, message, err)
 	}
 
-	return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, c.commandErr
+	c.publishTurnCompletion(id, "assistant-1")
+
+	return c.commandErr
 }
 
-func (c *fakeOpenCodeClient) SendMessage(ctx context.Context, id string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
-	if c.sendMessage != nil {
-		return c.sendMessage(ctx, id, req)
+// DispatchMessage mirrors the async prompt route: it acknowledges admission and
+// returns. The default publishes the events a completed native turn publishes, so
+// an ordinary prompt settles from the native stream exactly as it does live.
+func (c *fakeOpenCodeClient) DispatchMessage(ctx context.Context, id string, req opencode.MessageRequest) error {
+	if c.dispatchMessage != nil {
+		message, err := c.dispatchMessage(ctx, id, req)
+
+		return c.completeFromHook(id, message, err)
 	}
 
-	return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant-1", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
+	c.publishTurnCompletion(id, "assistant-1")
+
+	return nil
+}
+
+// completeFromHook maps a hook result onto native behaviour: an error refuses the
+// frame, a message publishes the events a finished turn publishes for it, and no
+// message at all acknowledges the frame and leaves the native session running.
+func (c *fakeOpenCodeClient) completeFromHook(id string, message opencode.NativeMessage, err error) error {
+	if err != nil {
+		return err
+	}
+
+	if message.Info.ID != "" {
+		c.completeTurnWith(id, message)
+	}
+
+	return nil
+}
+
+// completeTurnWith serves one native message as this session's transcript and
+// publishes the native events that finish a turn producing it.
+func (c *fakeOpenCodeClient) completeTurnWith(id string, message opencode.NativeMessage) {
+	c.mu.Lock()
+	c.messages = []opencode.NativeMessage{message}
+	c.mu.Unlock()
+
+	c.publishTurnCompletion(id, message.Info.ID)
+}
+
+// publishTurnCompletion publishes the native event sequence a finished turn
+// publishes: the assistant message's identity, then the session's idle signal.
+// The identity names whatever assistant message this fake serves, so a case that
+// stages its own transcript needs to stage nothing else.
+func (c *fakeOpenCodeClient) publishTurnCompletion(id string, assistantID string) {
+	c.mu.Lock()
+	if len(c.messages) == 0 {
+		c.messages = []opencode.NativeMessage{{Info: opencode.NativeMessageInfo{
+			ID: assistantID, SessionID: id, Role: "assistant", Finish: "stop",
+		}}}
+	}
+
+	for index := len(c.messages) - 1; index >= 0; index-- {
+		if c.messages[index].Info.Role == "assistant" {
+			assistantID = c.messages[index].Info.ID
+
+			break
+		}
+	}
+	c.mu.Unlock()
+
+	c.publishEvent(opencode.Event{
+		Type:       opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": assistantID, "sessionID": id, "role": "assistant"}}),
+	})
+	c.publishSessionIdle(id)
+}
+
+// publishSessionIdle publishes the native completion signal for one session.
+func (c *fakeOpenCodeClient) publishSessionIdle(id string) {
+	c.publishEvent(opencode.Event{
+		Type:       opencode.EventSessionIdle,
+		Properties: mustJSONValue(map[string]any{"sessionID": id}),
+	})
+}
+
+// publishEvent delivers one native event to whichever consumer is attached.
+func (c *fakeOpenCodeClient) publishEvent(event opencode.Event) {
+	select {
+	case c.events <- event:
+	default:
+	}
+}
+
+func mustJSONValue(value any) json.RawMessage {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+
+	return encoded
 }
 
 func (c *fakeOpenCodeClient) Messages(context.Context, string) ([]opencode.NativeMessage, error) {
-	return append([]opencode.NativeMessage(nil), c.messages...), c.messagesErr
-}
-
-func (c *fakeOpenCodeClient) SessionStatus(context.Context) (map[string]opencode.NativeSessionStatus, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return maps.Clone(c.statuses), c.statusErr
+	return append([]opencode.NativeMessage(nil), c.messages...), c.messagesErr
 }
 
 func (c *fakeOpenCodeClient) Abort(_ context.Context, id string) error {
 	c.mu.Lock()
 	c.aborts = append(c.aborts, id)
+	hook := c.abortFunc
 	c.mu.Unlock()
 
+	if hook != nil {
+		return hook(id)
+	}
+
 	return c.abortErr
+}
+
+// abortedSessions reports the native sessions this client was asked to interrupt.
+func (c *fakeOpenCodeClient) abortedSessions() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return append([]string(nil), c.aborts...)
 }
 
 func (c *fakeOpenCodeClient) Fork(context.Context, string, string) (opencode.NativeSession, error) {
@@ -1035,4 +1137,153 @@ type fakeAuthorizeCall struct {
 type fakeSetAuthCall struct {
 	providerID string
 	credential opencode.ProviderAuthCredential
+}
+
+// hangsAfterDispatch makes the next dispatch acknowledge the frame and then leave
+// the native session running: the turn stays open until something cancels it or a
+// deadline expires. started closes when the dispatch is acknowledged.
+func (c *fakeOpenCodeClient) hangsAfterDispatch(started chan struct{}) {
+	var once sync.Once
+
+	c.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		once.Do(func() { close(started) })
+
+		return opencode.NativeMessage{}, nil
+	}
+}
+
+// failsNatively makes the next dispatch acknowledge the frame and then publish one
+// native turn failure followed by the session's idle signal, which is the order
+// OpenCode publishes them in.
+func (c *fakeOpenCodeClient) failsNatively(sessionID string, nativeErr *opencode.NativeError) {
+	c.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		c.publishEvent(opencode.Event{
+			Type: opencode.EventSessionError,
+			Properties: mustJSONValue(map[string]any{
+				"sessionID": sessionID,
+				"error":     nativeErr,
+			}),
+		})
+		c.publishSessionIdle(sessionID)
+
+		return opencode.NativeMessage{}, nil
+	}
+}
+
+// refusesDispatch makes the next dispatch refuse the frame, which creates neither
+// a submission nor a turn.
+func (c *fakeOpenCodeClient) refusesDispatch(err error) {
+	c.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		return opencode.NativeMessage{}, err
+	}
+}
+
+// lifecycleEnvelopes decodes every lifecycle envelope this connection received, in
+// the order it received them. A notification carrying no envelope is not a
+// lifecycle event and is skipped.
+func (c *recordingAgentClient) lifecycleEnvelopes(t *testing.T) []map[string]any {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	envelopes := make([]map[string]any, 0, len(c.updates))
+
+	for _, notification := range c.updates {
+		envelope, ok := notification.Meta[lifecycle.MetaKey].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		require.NotNil(t, notification.Update.SessionInfoUpdate,
+			"a lifecycle envelope rode an ineligible carrier")
+		envelopes = append(envelopes, envelope)
+	}
+
+	return envelopes
+}
+
+// lifecycleEvents reports the `event.type` of every lifecycle envelope received.
+func (c *recordingAgentClient) lifecycleEvents(t *testing.T) []string {
+	t.Helper()
+
+	types := make([]string, 0)
+	for _, envelope := range c.lifecycleEnvelopes(t) {
+		event, ok := envelope["event"].(map[string]any)
+		require.True(t, ok, "envelope carries no event")
+		eventType, ok := event["type"].(string)
+		require.True(t, ok, "event carries no type")
+		types = append(types, eventType)
+	}
+
+	return types
+}
+
+// lifecycleEventsOfType reports every lifecycle event object of one type.
+func (c *recordingAgentClient) lifecycleEventsOfType(t *testing.T, want string) []map[string]any {
+	t.Helper()
+
+	matches := make([]map[string]any, 0)
+
+	for _, envelope := range c.lifecycleEnvelopes(t) {
+		event, ok := envelope["event"].(map[string]any)
+		if !ok || event["type"] != want {
+			continue
+		}
+
+		matches = append(matches, event)
+	}
+
+	return matches
+}
+
+// requireLifecycleOutcome asserts the stream's last ending idle recorded exactly
+// this outcome.
+func requireLifecycleOutcome(t *testing.T, connection *recordingAgentClient, want lifecycle.Outcome) {
+	t.Helper()
+
+	transitions := connection.lifecycleEventsOfType(t, "state_update")
+	require.NotEmpty(t, transitions, "the stream carried no foreground transition")
+
+	for index := len(transitions) - 1; index >= 0; index-- {
+		if transitions[index]["state"] != "idle" {
+			continue
+		}
+
+		require.Equal(t, string(want), transitions[index]["outcome"])
+
+		return
+	}
+
+	t.Fatal("the stream carried no ending idle")
+}
+
+// requireLifecycleReduces replays every lifecycle envelope this connection
+// received through the family reducer. A stream that reduces cleanly is one a
+// conformant consumer accepts; a stream that does not fails closed here with the
+// violation token that refused it.
+func requireLifecycleReduces(t *testing.T, connection *recordingAgentClient) lifecycle.State {
+	t.Helper()
+
+	reducer := lifecycle.NewReducer(lifecycle.Options{Negotiated: provenFacts()})
+
+	c := connection
+	c.mu.Lock()
+	updates := append([]acp.SessionNotification(nil), c.updates...)
+	c.mu.Unlock()
+
+	for _, notification := range updates {
+		if _, ok := notification.Meta[lifecycle.MetaKey]; !ok {
+			continue
+		}
+
+		payload, err := json.Marshal(map[string]any{
+			"sessionId": notification.SessionId,
+			"update":    notification.Update,
+			"_meta":     notification.Meta,
+		})
+		require.NoError(t, err)
+		require.NoError(t, reducer.ReduceSessionUpdate(payload), "the emitted lifecycle stream failed closed")
+	}
+
+	return reducer.State()
 }

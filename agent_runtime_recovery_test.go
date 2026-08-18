@@ -307,31 +307,28 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		require.NoError(t, agent.Close())
 	})
 }
-
-func TestCrashGenerationCancellationAndPromptFailureBranches(t *testing.T) {
+// TestLostRuntimeFailsAPromptBeforeItIsAccepted proves a session whose runtime
+// generation was lost fails its prompt with the transport cause and never
+// dispatches: the loss is the answer, and no turn is accepted against a runtime
+// this session no longer holds.
+func TestLostRuntimeFailsAPromptBeforeItIsAccepted(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	current := testSession(NewAgent(), client)
-	current.cancelling = true
-	current.cancellationEpoch = 1
-	current.runtimeLostCause = "runtime exited"
-	require.NoError(t, current.resolveCancellation(context.Background(), 1))
 
-	request := TextPromptRequest(current.id, "turn", "hello")
-	turnCtx := current.beginTurn(context.Background(), "turn")
-	current.pending["permission"] = opencode.PermissionRequest{ID: "permission", SessionID: "native-1"}
-	client.permissionsErr = errors.New("pending failed")
-	_, err := current.runPromptTurn(context.Background(), turnCtx, request, func(context.Context) (opencode.NativeMessage, error) {
-		return opencode.NativeMessage{}, nil
-	}, opencode.NativeCommand{}, false)
-	assertTurnFailed(t, err, causeTransport, "runtime retired after turn cancellation")
+	dispatched := false
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched = true
 
-	current = testSession(NewAgent(), newFakeOpenCodeClient())
-	turnCtx = current.beginTurn(context.Background(), "turn")
-	current.runtimeLostCause = "runtime exited"
-	_, err = current.runPromptTurn(context.Background(), turnCtx, request, func(context.Context) (opencode.NativeMessage, error) {
 		return opencode.NativeMessage{}, nil
-	}, opencode.NativeCommand{}, false)
+	}
+
+	current.mu.Lock()
+	current.runtimeLostCause = "runtime exited"
+	current.mu.Unlock()
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
 	assertTurnFailed(t, err, causeTransport, "runtime exited")
+	require.False(t, dispatched, "a lost runtime still received a frame")
 }
 
 func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {

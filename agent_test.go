@@ -127,17 +127,6 @@ func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	}
 }
 
-func TestAcquireNativeTurnHonorsQueuedCallerCancellation(t *testing.T) {
-	agent := NewAgent()
-	release, err := agent.acquireNativeTurn(context.Background())
-	require.NoError(t, err)
-	defer release()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = agent.acquireNativeTurn(ctx)
-	require.ErrorIs(t, err, context.Canceled)
-}
 func TestAgentAndRouteRemainingPublicBranches(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()

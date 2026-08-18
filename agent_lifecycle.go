@@ -14,41 +14,42 @@ const metaMember = "_meta"
 // containment mode that enforces the native process boundary rather than
 // compiled in once for the package.
 //
-// Every row is degenerate today, and each field is degenerate for its own
-// reason:
+// Each field states what this adapter proves, and nothing more:
 //
-//   - `updatesOutsidePrompt` is false because this adapter holds no channel to a
-//     host between prompts. A native event arriving out of turn is answered and
-//     terminalized against the runtime rather than held to be announced later, so
-//     one incarnation opens and fences inside each prompt.
+//   - `updatesOutsidePrompt` is true on every configuration. The native event
+//     stream is consumed by a session-owned pump that runs from session start to
+//     session close, so a transcript part, a plan change, a permission, or a
+//     foreground transition arriving with no prompt in flight is routed to the
+//     host rather than queued or refused. The pump drains the native channel
+//     unconditionally and holds nothing but the events of one dispatch
+//     acknowledgement, which it then routes in arrival order.
 //   - `authoritativeQuiescence` is false on every platform because no boundary
-//     here proves whole-tree vacancy for the addressed session. The one
-//     containment proof this adapter completes is agent-wide runtime generation
-//     retirement, which is not a session's own boundary; the live descendant
-//     inventory reports nothing on any platform; and the native completion signal
-//     is a message and status poll, which the closed proof-class set excludes by
-//     construction.
+//     here proves whole-tree vacancy for the addressed session. The native idle
+//     event proves the session's own agent loop stopped, which settles a
+//     foreground turn but says nothing about a subsession, a shell, or a pty the
+//     turn started; the live descendant inventory reports nothing on any
+//     platform; and one session cannot contain the shared runtime's process tree
+//     without ending every peer session's work.
 //   - `activityKinds` is empty because OpenCode publishes no owned-work state
-//     machine. Plan entries, the status poll, and the agent catalog are
+//     machine. Plan entries, session status, and the agent catalog are
 //     presentation and configuration, and none carries an instance identity with
 //     a lifecycle of its own.
 //
-// A row is upgraded only when a deterministic fixture in this repository proves
-// both the native source the fact reads and the ordering it claims.
+// A field is upgraded only when a deterministic fixture in this repository proves
+// both the native source it reads and the ordering it claims.
 var lifecycleFactsByContainment = map[RuntimeContainmentMode]lifecycle.Negotiated{
-	RuntimeContainmentAuthoritative:  degenerateLifecycleFacts(),
-	RuntimeContainmentBestEffort:     degenerateLifecycleFacts(),
-	RuntimeContainmentSharedIdentity: degenerateLifecycleFacts(),
-	RuntimeContainmentUnavailable:    degenerateLifecycleFacts(),
+	RuntimeContainmentAuthoritative:  provenFacts(),
+	RuntimeContainmentBestEffort:     provenFacts(),
+	RuntimeContainmentSharedIdentity: provenFacts(),
+	RuntimeContainmentUnavailable:    provenFacts(),
 }
 
-// degenerateLifecycleFacts is the answer a configuration gives when it proves no
-// out-of-prompt delivery, no quiescence class, and no activity kind. It is a
-// truthful answer rather than a gap: negotiating version 1 still obligates the
-// complete ordered foreground stream.
-func degenerateLifecycleFacts() lifecycle.Negotiated {
+// provenFacts is the answer every configuration gives: out-of-prompt delivery,
+// no quiescence class, and no activity kind. Negotiating version 1 obligates the
+// complete ordered foreground stream whatever the other fields say.
+func provenFacts() lifecycle.Negotiated {
 	return lifecycle.Negotiated{
-		UpdatesOutsidePrompt:    false,
+		UpdatesOutsidePrompt:    true,
 		AuthoritativeQuiescence: false,
 		ActivityKinds:           []lifecycle.ActivityKind{},
 	}
@@ -59,7 +60,7 @@ func degenerateLifecycleFacts() lifecycle.Negotiated {
 func provenLifecycleFacts(mode RuntimeContainmentMode) lifecycle.Negotiated {
 	facts, known := lifecycleFactsByContainment[mode]
 	if !known {
-		return degenerateLifecycleFacts()
+		return provenFacts()
 	}
 
 	return facts

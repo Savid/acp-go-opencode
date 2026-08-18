@@ -22,10 +22,10 @@ func lifecycleKey() map[string]any {
 	return map[string]any{lifecycle.MetaKey: map[string]any{}}
 }
 
-func negotiatedAgent(t *testing.T) *Agent {
+func negotiatedAgent(t *testing.T, options ...Option) *Agent {
 	t.Helper()
 
-	agent := NewAgent()
+	agent := NewAgent(options...)
 	response, err := agent.Initialize(context.Background(), acp.InitializeRequest{Meta: lifecycleOffer()})
 	require.NoError(t, err)
 	require.NotNil(t, response.Meta[lifecycle.MetaKey])
@@ -306,7 +306,7 @@ func TestPromptCorrelationIsRequiredWhileNegotiated(t *testing.T) {
 	request := TextPromptRequest(session.id, "nonce", "hello")
 
 	dispatched := false
-	client.sendMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
 		dispatched = true
 
 		return opencode.NativeMessage{}, nil
@@ -342,7 +342,7 @@ func TestPromptCorrelationIsRefusedWhileUnnegotiated(t *testing.T) {
 	}
 
 	dispatched := false
-	client.sendMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
 		dispatched = true
 
 		return opencode.NativeMessage{}, nil
@@ -371,7 +371,7 @@ func TestPromptBindsBothEnvelopesToTheSameTurn(t *testing.T) {
 		nonce    string
 	)
 
-	client.sendMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		observed = session.currentSubmission()
 		nonce = session.currentTurnNonce()
 

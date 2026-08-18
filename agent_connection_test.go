@@ -279,7 +279,7 @@ func TestLifecycleUpdatesFinishBeforeImmediatePromptAndTurnUpdatesCarryExactRout
 	wireClient.mu.Unlock()
 
 	turn := 0
-	nativeClient.sendMessage = func(ctx context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	nativeClient.dispatchMessage = func(ctx context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		turn++
 		messageID := fmt.Sprintf("assistant-%d", turn)
 		partID := fmt.Sprintf("part-%d", turn)
@@ -296,35 +296,17 @@ func TestLifecycleUpdatesFinishBeforeImmediatePromptAndTurnUpdatesCarryExactRout
 			)),
 		}
 
-		for {
-			wireClient.mu.Lock()
-			seen := false
-			for _, notification := range wireClient.updates {
-				chunk := notification.Update.AgentMessageChunk
-				if chunk != nil && chunk.MessageId != nil && *chunk.MessageId == messageID {
-					seen = true
-
-					break
-				}
-			}
-			wireClient.mu.Unlock()
-			if seen {
-				break
-			}
-
-			select {
-			case <-ctx.Done():
-				return opencode.NativeMessage{}, ctx.Err()
-			case <-time.After(time.Millisecond):
-			}
-		}
-
-		return opencode.NativeMessage{
+		nativeClient.mu.Lock()
+		nativeClient.messages = []opencode.NativeMessage{{
 			Info: opencode.NativeMessageInfo{ID: messageID, SessionID: id, Role: "assistant", Finish: "stop"},
 			Parts: []opencode.NativePart{{
 				ID: partID, SessionID: id, MessageID: messageID, Type: partTypeText, Text: streamed + "-terminal",
 			}},
-		}, nil
+		}}
+		nativeClient.mu.Unlock()
+		nativeClient.publishSessionIdle(id)
+
+		return opencode.NativeMessage{}, ctx.Err()
 	}
 
 	for index, nonce := range []string{"route-turn-one", "route-turn-two"} {

@@ -336,9 +336,7 @@ func TestRawEventEmitFailureDoesNotFailTurn(t *testing.T) {
 	conn := newRecordingAgentClient()
 	failing := &failThenRecordRawClient{recordingAgentClient: conn, failures: 1}
 	sess := rawEventSession(t, "session-1", failing)
-	if err := sess.handleEvent(context.Background(), normalRawEvent("boom")); err != nil {
-		t.Fatalf("raw emit failure aborted the turn: %v", err)
-	}
+	sess.routeNativeEvent(context.Background(), normalRawEvent("boom"))
 	if sess.rawSeq != 0 {
 		t.Fatalf("failed delivery consumed sequence %d", sess.rawSeq)
 	}

@@ -83,19 +83,21 @@ func AcceptedEvent(submission Submission, turnID string) Event {
 }
 
 // TransitionEvent reports one live foreground transition — running or
-// requires_action — for the named cycle and turn.
-func TransitionEvent(state ForegroundState, cycleID, turnID string) Event {
+// requires_action — for the named cycle and turn. The cause is stated rather
+// than assumed: an activity-caused running transition naming a turn the stream
+// has not introduced is the only event other than acceptance that opens one.
+func TransitionEvent(state ForegroundState, cycleID, turnID string, cause Cause) Event {
 	return Event{Type: EventStateUpdate, State: &StateTransition{
 		State:   state,
 		CycleID: cycleID,
 		TurnID:  turnID,
-		Cause:   CauseSubmission,
+		Cause:   cause,
 	}}
 }
 
-// IdleEvent ends the cycle a submission caused, carrying the turn's truthful stop
-// reason and recorded outcome. A failed outcome carries no stop reason: no ACP v1
-// stop reason names a failure and the v1 error carries it instead.
+// IdleEvent ends one cycle, carrying the turn's truthful stop reason and recorded
+// outcome. A failed outcome carries no stop reason: no ACP v1 stop reason names a
+// failure and the v1 error carries it instead.
 func IdleEvent(cycleID, turnID, stopReason string, outcome Outcome) Event {
 	return Event{Type: EventStateUpdate, State: &StateTransition{
 		State:      ForegroundIdle,

@@ -204,100 +204,55 @@ func TestOpenCodePendingSessionListErrors(t *testing.T) {
 	}
 }
 
-func TestOpenCodeSendMessageUsesNoDeadlineHTTPClient(t *testing.T) {
-	prompted := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(25 * time.Millisecond)
-		switch r.URL.Path {
-		case "/session/s/prompt_async":
-			prompted = true
-			w.WriteHeader(http.StatusNoContent)
-		case "/session/s/message":
-			if !prompted {
-				writeJSON(t, w, []map[string]any{})
+// TestDispatchMessageAcknowledgesAdmission proves the async prompt route's own
+// `204 No Content` is what this client reports as the dispatch acknowledgement,
+// and that it waits for nothing else: no message read, no status read, and no
+// poll.
+func TestDispatchMessageAcknowledgesAdmission(t *testing.T) {
+	var posts atomic.Int32
 
-				return
-			}
-			writeJSON(t, w, []map[string]any{{"info": map[string]any{
-				"id":        "assistant",
-				"sessionID": "s",
-				"role":      "assistant",
-				"finish":    "stop",
-			}}})
-		case "/session/status":
-			writeJSON(t, w, map[string]any{"s": map[string]any{"type": "idle"}})
-		case "/session/s":
-			writeJSON(t, w, map[string]any{"id": "s"})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session/s/prompt_async":
+			posts.Add(1)
+			w.WriteHeader(http.StatusNoContent)
 		default:
+			t.Errorf("dispatch read %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
-	client := &openCodeServer{
-		httpClient: &http.Client{Timeout: time.Millisecond},
-		baseURL:    server.URL,
-		username:   "opencode",
-		password:   "secret",
+	client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL, username: "opencode", password: "secret"}
+	if err := client.DispatchMessage(context.Background(), "s", MessageRequest{
+		Parts: []map[string]any{{"type": "text", "text": "hello"}},
+	}); err != nil {
+		t.Fatalf("DispatchMessage: %v", err)
 	}
-	if _, err := client.SendMessage(context.Background(), "s", MessageRequest{Parts: []map[string]any{{"type": "text", "text": "hello"}}}); err != nil {
-		t.Fatalf("SendMessage used deadline client: %v", err)
-	}
-	if _, err := client.GetSession(context.Background(), "s"); err == nil {
-		t.Fatal("regular REST call unexpectedly bypassed timeout")
+
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("prompt posts = %d, want exactly 1", got)
 	}
 }
 
-func TestOpenCodeSendMessageWaitsForIdleAfterToolCallStep(t *testing.T) {
-	var prompted atomic.Bool
-	var messagePolls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/session/s/prompt_async":
-			prompted.Store(true)
-			w.WriteHeader(http.StatusNoContent)
-		case "/session/s/message":
-			if !prompted.Load() {
-				writeJSON(t, w, []map[string]any{})
-
-				return
-			}
-			poll := messagePolls.Add(1)
-			message := map[string]any{"info": map[string]any{
-				"id": "assistant-tool-step", "sessionID": "s", "role": "assistant", "finish": "tool-calls",
-			}}
-			if poll > 1 {
-				message = map[string]any{"info": map[string]any{
-					"id": "assistant-final", "sessionID": "s", "role": "assistant", "finish": "stop",
-				}}
-			}
-			writeJSON(t, w, []map[string]any{message})
-		case "/session/status":
-			status := "busy"
-			if messagePolls.Load() > 1 {
-				status = "idle"
-			}
-			writeJSON(t, w, map[string]any{"s": map[string]any{"type": status}})
-		default:
-			http.NotFound(w, r)
-		}
+// TestDispatchMessageReportsRefusal proves a refused frame is reported as a
+// refusal rather than as an accepted turn.
+func TestDispatchMessageReportsRefusal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"name":"InvalidRequest"}`))
 	}))
 	defer server.Close()
 
-	client := &openCodeServer{
-		httpClient: server.Client(), baseURL: server.URL, username: "opencode", password: "secret",
+	client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL}
+
+	err := client.DispatchMessage(context.Background(), "s", MessageRequest{})
+	if err == nil {
+		t.Fatal("a refused prompt reported an acknowledgement")
 	}
-	message, err := client.SendMessage(t.Context(), "s", MessageRequest{
-		Parts: []map[string]any{{"type": "text", "text": "use a tool, then continue"}},
-	})
-	if err != nil {
-		t.Fatalf("SendMessage: %v", err)
-	}
-	if message.Info.ID != "assistant-final" {
-		t.Fatalf("SendMessage returned intermediate assistant %q", message.Info.ID)
-	}
-	if got := messagePolls.Load(); got < 2 {
-		t.Fatalf("message polls = %d, want at least 2", got)
+
+	if !IsBadRequest(err) {
+		t.Fatalf("refusal = %v, want a bad-request status", err)
 	}
 }
 
@@ -826,6 +781,9 @@ func fullOpenCodeDoc() map[string]any {
 				"EventQuestionReplied",
 				"EventMessagePartUpdated",
 				"EventServerConnected",
+				"EventSessionIdle",
+				"EventSessionStatus",
+				"EventSessionError",
 			),
 			"EventPermissionV2Asked": eventSchema("permission.v2.asked", []string{"id", "sessionID", "action", "resources"}),
 			"EventPermissionV2Replied": eventSchema("permission.v2.replied", []string{
@@ -845,6 +803,9 @@ func fullOpenCodeDoc() map[string]any {
 			"EventQuestionReplied":    eventSchema("question.replied", []string{"sessionID", "requestID", "answers"}),
 			"EventMessagePartUpdated": eventSchema("message.part.updated", []string{"sessionID", "part", "time"}),
 			"EventServerConnected":    eventSchema("server.connected", nil),
+			"EventSessionIdle":        eventSchema("session.idle", []string{"sessionID"}),
+			"EventSessionStatus":      eventSchema("session.status", []string{"sessionID", "status"}),
+			"EventSessionError":       eventSchema("session.error", nil),
 			"QuestionV2Reply": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -962,15 +923,11 @@ func TestOpenCodeBlockingPostRecoversPersistedCause(t *testing.T) {
 		wantCode    string
 		transparent bool
 	}{
-		{name: "message recovers persisted provider error", persist: true, wantErr: "provider exploded", wantStatus: 429, wantCode: "rate_limit_exceeded"},
 		{name: "command recovers persisted provider error", command: true, persist: true, wantErr: "provider exploded", wantStatus: 429, wantCode: "rate_limit_exceeded"},
-		{name: "message surfaces transport error when nothing persisted", transparent: true},
+		{name: "command surfaces transport error when nothing persisted", command: true, transparent: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			postPath := "/session/s/prompt_async"
-			if tt.command {
-				postPath = "/session/s/command"
-			}
+			const postPath = "/session/s/command"
 			messageReads := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
@@ -978,7 +935,7 @@ func TestOpenCodeBlockingPostRecoversPersistedCause(t *testing.T) {
 					severMidBody(w)
 				case r.Method == http.MethodGet && r.URL.Path == "/session/s/message":
 					messageReads++
-					if !tt.command && messageReads == 1 {
+					if messageReads == 1 && !tt.persist && !tt.transparent {
 						writeJSON(t, w, []map[string]any{{"info": map[string]any{"id": "u", "sessionID": "s", "role": "user"}}})
 
 						return
@@ -1017,12 +974,7 @@ func TestOpenCodeBlockingPostRecoversPersistedCause(t *testing.T) {
 				password:   "secret",
 			}
 
-			var err error
-			if tt.command {
-				_, err = client.RunCommand(ctx, "s", CommandRequest{Command: "review"})
-			} else {
-				_, err = client.SendMessage(ctx, "s", MessageRequest{Parts: []map[string]any{{"type": "text", "text": "hi"}}})
-			}
+			err := client.DispatchCommand(ctx, "s", CommandRequest{Command: "review"})
 
 			var assistantErr *AssistantError
 			if tt.transparent {
@@ -1078,15 +1030,10 @@ func TestOpenCodeBlockingPostDoubleFailureNamesBoth(t *testing.T) {
 	messageReads := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/session/s/prompt_async":
+		case r.Method == http.MethodPost && r.URL.Path == "/session/s/command":
 			severMidBody(w)
 		case r.Method == http.MethodGet && r.URL.Path == "/session/s/message":
 			messageReads++
-			if messageReads == 1 {
-				writeJSON(t, w, []map[string]any{{"info": map[string]any{"id": "u", "sessionID": "s", "role": "user"}}})
-
-				return
-			}
 			// The recovery re-fetch also fails: the server is effectively dead.
 			http.Error(w, "gateway is down", http.StatusBadGateway)
 		default:
@@ -1102,7 +1049,7 @@ func TestOpenCodeBlockingPostDoubleFailureNamesBoth(t *testing.T) {
 		password:   "secret",
 	}
 
-	_, err := client.SendMessage(ctx, "s", MessageRequest{Parts: []map[string]any{{"type": "text", "text": "hi"}}})
+	err := client.DispatchCommand(ctx, "s", CommandRequest{Command: "review"})
 	if err == nil {
 		t.Fatal("double failure unexpectedly succeeded")
 	}

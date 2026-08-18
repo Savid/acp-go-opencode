@@ -378,19 +378,18 @@ func (s *session) commitStateSnapshot(ctx context.Context, captured capturedStat
 }
 
 func (s *session) snapshotBlockedReason() string {
+	if s.actions.blocked() {
+		return metaPermissionKey
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	switch {
-	case len(s.pending) > 0:
-		return metaPermissionKey
-	case len(s.questions) > 0:
-		return "elicitation"
-	case len(s.activeMessageIDs) > 0:
+	if len(s.activeMessageIDs) > 0 {
 		return snapshotBlockGeneration
-	default:
-		return ""
 	}
+
+	return ""
 }
 
 func (a *Agent) adoptedGraph(selected *session) []*session {

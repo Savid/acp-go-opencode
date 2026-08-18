@@ -23,8 +23,6 @@ const sessionUpdateAvailableCommands = "available_commands_update"
 // path never reaches it: both Prompt and Cancel hard-fail on a missing route.
 const internalSeamTurnNonce = "internal-seam-turn"
 
-var observeCancellationWait = func() {}
-
 type session struct {
 	agent                 *Agent
 	id                    acp.SessionId
@@ -51,53 +49,58 @@ type session struct {
 	mcpRefreshPending bool
 	recoveryMu        sync.Mutex
 
-	turn                      chan struct{}
-	mu                        sync.Mutex
-	lifecycleMu               sync.Mutex
-	lifecycleStream           *lifecycle.Stream
-	lifecycleFailed           error
-	lifecycleCycle            string
-	lifecycleTurn             string
-	lifecycleSettled          bool
-	updateMu                  sync.Mutex
-	rawEventMu                sync.Mutex
-	cancel                    context.CancelFunc
-	turnDone                  <-chan struct{}
-	cancelled                 bool
-	cancelling                bool
-	cancellationEpoch         uint64
-	cancellationResolvedEpoch uint64
-	cancellationDone          chan struct{}
-	cancellationErr           error
-	rawSeq                    int64
-	emittedPartText           map[string]string
-	emittedTools              map[string]emittedToolState
-	emittedUsage              map[string]emittedUsageState
-	pending                   map[string]opencode.PermissionRequest
-	questions                 map[string]opencode.QuestionRequest
-	processedPermission       map[string]struct{}
-	processedQuestion         map[string]struct{}
-	turnEpoch                 uint64
-	turnNonce                 string
-	submission                lifecycle.Submission
-	imageArtifacts            map[string]imageArtifactRecord
-	imageArtifactIdentities   map[string]string
-	emittedToolContent        map[string][]imageOutputItem
-	emittedFileParts          map[string]struct{}
-	activeMessageIDs          map[string]struct{}
-	activeToolCallIDs         map[string]struct{}
-	failedStreamEpochs        map[uint64]struct{}
-	failedMessageIDs          map[string]struct{}
-	exclusiveTurn             bool
-	commandsByName            map[string]opencode.NativeCommand
-	availableCommands         []acp.AvailableCommand
-	commandCatalogPublished   bool
-	contextWindows            map[string]int
-	messageRoles              map[string]string
-	poisonCause               string
-	runtimeLostCause          string
-	runtimeGeneration         uint64
-	closed                    bool
+	turn chan struct{}
+	mu   sync.Mutex
+	// pump is the session-owned consumer of the native event stream for the
+	// current runtime binding.
+	pump *sessionPump
+	// dispatchGate holds native event routing across a dispatch acknowledgement,
+	// so no event caused by a frame reaches a host before the acceptance that
+	// explains it.
+	dispatchGate sync.Mutex
+	// dispatchEvidence is armed while a completion-reporting native route waits
+	// to learn that the harness admitted its frame.
+	dispatchEvidence chan struct{}
+	// lifecycleMu guards the lifecycle stream and the foreground cycle. Both the
+	// pump and a foreground prompt emit, so one mutex fixes one order.
+	lifecycleMu             sync.Mutex
+	lifecycleStream         *lifecycle.Stream
+	lifecycleFailed         error
+	lifecycleOpened         bool
+	cycle                   *foregroundCycle
+	cycleCounter            uint64
+	turnCounter             uint64
+	actions                 *actionRegistry
+	updateMu                sync.Mutex
+	rawEventMu              sync.Mutex
+	cancel                  context.CancelFunc
+	turnDone                <-chan struct{}
+	cancelled               bool
+	rawSeq                  int64
+	emittedPartText         map[string]string
+	emittedTools            map[string]emittedToolState
+	emittedUsage            map[string]emittedUsageState
+	turnEpoch               uint64
+	turnNonce               string
+	submission              lifecycle.Submission
+	imageArtifacts          map[string]imageArtifactRecord
+	imageArtifactIdentities map[string]string
+	emittedToolContent      map[string][]imageOutputItem
+	emittedFileParts        map[string]struct{}
+	activeMessageIDs        map[string]struct{}
+	publishedToolCalls      map[string]struct{}
+	failedStreamEpochs      map[uint64]struct{}
+	failedMessageIDs        map[string]struct{}
+	exclusiveTurn           bool
+	commandsByName          map[string]opencode.NativeCommand
+	availableCommands       []acp.AvailableCommand
+	commandCatalogPublished bool
+	contextWindows          map[string]int
+	messageRoles            map[string]string
+	poisonCause             string
+	runtimeLostCause        string
+	runtimeGeneration       uint64
+	closed                  bool
 }
 
 type sessionSnapshot struct {
@@ -176,18 +179,32 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		imageArtifactIdentities: map[string]string{},
 		emittedToolContent:      map[string][]imageOutputItem{},
 		emittedFileParts:        map[string]struct{}{},
-		pending:                 map[string]opencode.PermissionRequest{},
-		questions:               map[string]opencode.QuestionRequest{},
-		processedPermission:     map[string]struct{}{},
-		processedQuestion:       map[string]struct{}{},
 		activeMessageIDs:        map[string]struct{}{},
+		publishedToolCalls:      map[string]struct{}{},
 		failedStreamEpochs:      map[uint64]struct{}{},
 		failedMessageIDs:        map[string]struct{}{},
+		actions:                 newActionRegistry(),
 	}
 
 	session.openLifecycleStream()
 
 	return session
+}
+
+// establish opens the session's lifecycle stream to the host and starts routing
+// native events. It runs at the end of the establishing session request, so the
+// opening snapshot is the first lifecycle envelope a host sees for this session
+// and no native event is routed before it. Events the harness published in the
+// meantime wait in the native stream's own buffer and are routed in arrival order
+// as soon as the pump starts, so establishment holds no separate spool.
+func (s *session) establish(ctx context.Context) error {
+	if err := s.publishLifecycleStream(ctx); err != nil {
+		return err
+	}
+
+	s.startPump()
+
+	return nil
 }
 
 func (s *session) acquireTurn(ctx context.Context) (func(), error) {
@@ -211,10 +228,6 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 
 	if err := s.poisonedErrorLocked(); err != nil {
 		return nil, err
-	}
-
-	if s.cancelling {
-		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: "session_cancelling"})
 	}
 
 	if exclusive {
@@ -316,8 +329,6 @@ func (s *session) beginTurn(ctx context.Context, turnNonces ...string) context.C
 	s.cancelled = false
 	s.turnEpoch++
 	s.turnNonce = turnNonce
-	s.activeMessageIDs = map[string]struct{}{}
-	s.activeToolCallIDs = map[string]struct{}{}
 
 	return turnCtx
 }
@@ -328,17 +339,10 @@ func (s *session) finishTurn() {
 	s.cancel = nil
 
 	s.turnDone = nil
-	if !s.cancelling {
-		s.cancelled = false
-	}
-
+	s.cancelled = false
 	s.turnNonce = ""
 	s.submission = lifecycle.Submission{}
 	s.updatedAt = time.Now().UTC().Format(time.RFC3339)
-	s.pending = map[string]opencode.PermissionRequest{}
-	s.questions = map[string]opencode.QuestionRequest{}
-	s.activeMessageIDs = map[string]struct{}{}
-	s.activeToolCallIDs = map[string]struct{}{}
 	s.mu.Unlock()
 
 	if cancel != nil {
@@ -371,205 +375,121 @@ func (s *session) currentTurnNonce() string {
 	return s.turnNonce
 }
 
-func (s *session) cancelTurn() {
-	s.signalTurnCancellation(true)
-}
-
-func (s *session) signalTurnCancellation(markCancelled bool) {
+// cancelTurn is the session-scoped native interrupt. It marks the active turn
+// cancelled, releases its context so the waiting prompt arbitrates, and asks
+// OpenCode to abort this session's work. No peer session and no shared runtime is
+// touched: routine cancellation is one session putting its own work down, not a
+// containment event.
+func (s *session) cancelTurn(ctx context.Context) error {
 	s.mu.Lock()
-
 	cancel := s.cancel
-	if cancel != nil && markCancelled {
-		s.cancelled = true
-	}
-
-	pending := make([]opencode.PermissionRequest, 0, len(s.pending))
-	for id := range s.pending {
-		pending = append(pending, s.pending[id])
-	}
-
-	s.pending = map[string]opencode.PermissionRequest{}
-
-	questions := make([]opencode.QuestionRequest, 0, len(s.questions))
-	for _, req := range s.questions {
-		questions = append(questions, req)
-	}
-
-	s.questions = map[string]opencode.QuestionRequest{}
+	s.cancelled = true
+	client := s.client
+	nativeID := s.idmap.NativeSessionID
 	s.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
 
-	ctx, done := context.WithTimeout(context.Background(), closeTimeout)
-	defer done()
-
-	for i := range pending {
-		_ = s.client.ReplyPermission(ctx, pending[i], permissionReplyReject, reasonCancelled)
+	if client == nil || nativeID == "" {
+		return nil
 	}
 
-	for _, req := range questions {
-		_ = s.client.RejectQuestion(ctx, req)
+	if err := client.Abort(ctx, nativeID); err != nil {
+		s.recordInterruptFailure(err)
+
+		return fmt.Errorf("interrupt native OpenCode session: %w", err)
+	}
+
+	return nil
+}
+
+// requireActiveTurn refuses a cancel that does not address the session's current
+// turn. A stale or absent route is never applied to a later turn.
+func (s *session) requireActiveTurn(turnNonce string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.cancel == nil || turnNonce == "" || s.turnNonce != turnNonce {
+		return invalidRoute("cancel route is missing, stale, or does not target the active turn")
+	}
+
+	return nil
+}
+
+// recordInterruptFailure records that the native interrupt itself failed. The
+// open cycle escalates immediately rather than waiting out the settlement budget:
+// a harness that refused the interrupt is not going to report the idle the
+// cancellation needs.
+func (s *session) recordInterruptFailure(err error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if s.cycle == nil {
+		return
+	}
+
+	if s.cycle.lost == nil {
+		s.cycle.lost = err
+	}
+
+	s.cycle.wake()
+}
+
+// awaitNativeSettlement waits for the native terminal evidence of one cycle. It
+// is the cancellation and close boundary: OpenCode has been asked to stop, and
+// this is the acknowledgement that it did.
+func (s *session) awaitNativeSettlement(ctx context.Context, cycle *foregroundCycle) error {
+	if cycle == nil {
+		return nil
+	}
+
+	select {
+	case <-cycle.signal:
+		s.lifecycleMu.Lock()
+		lost := cycle.lost
+		s.lifecycleMu.Unlock()
+
+		return lost
+	case <-ctx.Done():
+		return fmt.Errorf("OpenCode session did not report idle after the interrupt: %w", ctx.Err())
 	}
 }
 
-// beginCancellation closes turn admission before cancelling the active turn.
-// The returned epoch is the native cancellation fence that must resolve before
-// another turn may start on this session.
-func (s *session) beginCancellation(turnNonce string, requireMatch bool, markCancelled bool) (uint64, error) {
+// currentClient reports the runtime client this session is bound to.
+func (s *session) currentClient() opencode.Client {
 	s.mu.Lock()
-	if requireMatch && (s.cancel == nil || turnNonce == "" || s.turnNonce != turnNonce) {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
 
-		return 0, invalidRoute("cancel route is missing, stale, or does not target the active turn")
-	}
+	return s.client
+}
 
-	if s.cancellationResolvedEpoch == s.turnEpoch {
-		s.cancelled = s.cancelled || markCancelled
-		epoch := s.turnEpoch
-		cancel := s.cancel
-		s.mu.Unlock()
+// lifecycleStreamAbsent reports that this session carries no lifecycle stream, so
+// nothing may be emitted or correlated on one.
+func (s *session) lifecycleStreamAbsent() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
-		if cancel != nil {
-			cancel()
-		}
+	return s.lifecycleStream == nil
+}
 
-		return epoch, nil
-	}
-
-	// A failed containment/snapshot fence remains the terminal result for this
-	// turn epoch. The prompt-side fence may arrive after the notification-side
-	// resolver finished; return the same epoch so resolveCancellation publishes
-	// the memoized error instead of mistaking the detached cancel function for
-	// an unstarted cancellation.
-	if !s.cancelling && s.cancellationEpoch == s.turnEpoch && s.cancellationErr != nil {
-		s.cancelled = s.cancelled || markCancelled
-		epoch := s.cancellationEpoch
-		s.mu.Unlock()
-
-		return epoch, nil
-	}
-
-	if s.cancelling {
-		s.cancelled = s.cancelled || markCancelled
-		epoch := s.cancellationEpoch
-		s.mu.Unlock()
-
-		return epoch, nil
-	}
-
-	if s.cancel == nil {
-		s.mu.Unlock()
-
-		return 0, nil
-	}
-
-	s.cancelling = true
-	s.cancelled = s.cancelled || markCancelled
-	s.cancellationEpoch = s.turnEpoch
-	s.cancellationErr = nil
-	epoch := s.cancellationEpoch
+// commitForegroundPrefix commits the native-safe prefix of the session's current
+// foreground work. Every terminal path — success, failure, and cancellation —
+// runs it before the ending lifecycle transition, so a reload can never restore a
+// generation older than the one the stream already reported as finished.
+func (s *session) commitForegroundPrefix(ctx context.Context) error {
+	s.mu.Lock()
+	s.activeMessageIDs = map[string]struct{}{}
 	s.mu.Unlock()
 
-	s.signalTurnCancellation(markCancelled)
-
-	return epoch, nil
-}
-
-func (s *session) resolveCancellation(ctx context.Context, epoch uint64) error {
-	if epoch == 0 {
-		return nil
+	captured, err := s.captureStateSnapshot(ctx, true)
+	if err != nil {
+		return err
 	}
 
-	for {
-		s.mu.Lock()
-		if !s.cancelling || s.cancellationEpoch != epoch {
-			err := s.cancellationErr
-			s.mu.Unlock()
-
-			return err
-		}
-
-		if done := s.cancellationDone; done != nil {
-			s.mu.Unlock()
-			observeCancellationWait()
-
-			select {
-			case <-done:
-				continue
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-
-		done := make(chan struct{})
-		s.cancellationDone = done
-		client := s.client
-		nativeID := s.idmap.NativeSessionID
-		generation := s.runtimeGeneration
-		agent := s.agent
-		s.mu.Unlock()
-
-		if client != nil && nativeID != "" {
-			// Native abort is advisory. The exact-generation runtime retirement
-			// below is the containment certificate and supersedes an abort error.
-			_ = client.Abort(ctx, nativeID)
-		}
-
-		// The abort response is the only online boundary at which the
-		// interrupted turn's user message, assistant/tool prefix, and terminal
-		// state can be exported through /sync/history. Capture that stable
-		// generation now, but defer remote store I/O until after the shared
-		// process tree is proved gone so a slow store cannot delay containment.
-		var captured capturedStateSnapshot
-
-		var captureErr error
-		if agent != nil && client != nil && nativeID != "" {
-			captured, captureErr = s.captureStateSnapshot(ctx, true)
-		}
-
-		var err error
-		if agent == nil {
-			err = errors.Join(opencode.ErrProcessContainmentIncomplete, errors.New("native runtime owner is unavailable"))
-		} else {
-			err = agent.retireSharedRuntime(generation, "shared OpenCode runtime retired after turn cancellation", s)
-		}
-
-		if captureErr == nil {
-			captureErr = s.commitStateSnapshot(ctx, captured)
-		}
-
-		err = errors.Join(err, captureErr)
-
-		s.mu.Lock()
-		if s.cancellationEpoch == epoch {
-			s.cancellationErr = err
-			s.cancelling = false
-
-			s.cancellationDone = nil
-
-			if err != nil && s.poisonCause == "" {
-				s.poisonCause = fmt.Sprintf("native cancellation fence failed: %v", err)
-			} else if err == nil {
-				s.cancellationResolvedEpoch = epoch
-			}
-		}
-
-		close(done)
-		s.mu.Unlock()
-
-		if err != nil {
-			return acp.NewInternalError(map[string]any{
-				jsonFieldError: "opencode_cancellation_fence_failed",
-				jsonFieldCause: err.Error(),
-			})
-		}
-
-		return nil
-	}
+	return s.commitStateSnapshot(ctx, captured)
 }
-
 func (s *session) wasCancelled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -653,21 +573,26 @@ func (s *session) markActiveMessageID(messageID string) {
 	s.mu.Unlock()
 }
 
-func (s *session) markActiveToolCallID(toolCallID string) {
+// markPublishedToolCall records a tool call this session has published to the
+// host. The set is session-scoped rather than turn-scoped: a native permission
+// can arrive for a call published before the current foreground cycle, and it
+// stays answerable, while a call this session never published is refused.
+func (s *session) markPublishedToolCall(toolCallID string) {
 	if toolCallID == "" {
 		return
 	}
 
 	s.mu.Lock()
-	if s.activeToolCallIDs == nil {
-		s.activeToolCallIDs = map[string]struct{}{}
+	if s.publishedToolCalls == nil {
+		s.publishedToolCalls = map[string]struct{}{}
 	}
 
-	s.activeToolCallIDs[toolCallID] = struct{}{}
+	s.publishedToolCalls[toolCallID] = struct{}{}
 	s.mu.Unlock()
 }
 
-func (s *session) ownsCurrentToolCall(toolCallID string) bool {
+// publishedToolCall reports whether this session published the named tool call.
+func (s *session) publishedToolCall(toolCallID string) bool {
 	if toolCallID == "" {
 		return false
 	}
@@ -675,11 +600,7 @@ func (s *session) ownsCurrentToolCall(toolCallID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.cancel == nil || s.cancelling {
-		return false
-	}
-
-	_, ok := s.activeToolCallIDs[toolCallID]
+	_, ok := s.publishedToolCalls[toolCallID]
 
 	return ok
 }
@@ -746,92 +667,6 @@ func (s *session) shouldSuppressEvent(event opencode.Event) bool {
 	}
 
 	return false
-}
-
-func (s *session) addPendingPermission(req opencode.PermissionRequest) {
-	s.mu.Lock()
-	if s.pending == nil {
-		s.pending = map[string]opencode.PermissionRequest{}
-	}
-
-	s.pending[req.ID] = req
-	s.mu.Unlock()
-}
-
-func (s *session) claimPermissionRequest(id string) bool {
-	if id == "" {
-		return true
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.processedPermission == nil {
-		s.processedPermission = map[string]struct{}{}
-	}
-
-	if _, ok := s.processedPermission[id]; ok {
-		return false
-	}
-
-	s.processedPermission[id] = struct{}{}
-
-	return true
-}
-
-func (s *session) takePendingPermission(id string) (opencode.PermissionRequest, bool, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	req, ok := s.pending[id]
-	if ok {
-		delete(s.pending, id)
-	}
-
-	return req, ok, s.cancelled
-}
-
-func (s *session) addPendingQuestion(req opencode.QuestionRequest) {
-	s.mu.Lock()
-	if s.questions == nil {
-		s.questions = map[string]opencode.QuestionRequest{}
-	}
-
-	s.questions[req.ID] = req
-	s.mu.Unlock()
-}
-
-func (s *session) claimQuestionRequest(id string) bool {
-	if id == "" {
-		return true
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.processedQuestion == nil {
-		s.processedQuestion = map[string]struct{}{}
-	}
-
-	if _, ok := s.processedQuestion[id]; ok {
-		return false
-	}
-
-	s.processedQuestion[id] = struct{}{}
-
-	return true
-}
-
-func (s *session) takePendingQuestion(id string) (opencode.QuestionRequest, bool, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	req, ok := s.questions[id]
-	if ok {
-		delete(s.questions, id)
-	}
-
-	return req, ok, s.cancelled
 }
 
 func (s *session) snapshot() sessionSnapshot {
@@ -1028,9 +863,12 @@ func validSlashCommandName(name string) bool {
 	return true
 }
 
-// Close shuts down the native OpenCode process under bounded background
-// contexts so a cancelled or expired caller context can never skip the
-// graceful abort/close ladder.
+// Close ends this session. It interrupts the session's own native work, waits
+// for OpenCode to acknowledge that the work stopped, commits the native-safe
+// prefix, and only then releases the session's resources and fences its lifecycle
+// stream. Every step runs under a bounded background context, so a cancelled or
+// expired caller context can never skip the ladder, and no step touches a peer
+// session or the shared runtime.
 func (s *session) Close(_ context.Context) error {
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
@@ -1050,15 +888,10 @@ func (s *session) Close(_ context.Context) error {
 	var cancelErr error
 
 	if firstClose {
-		epoch, err := s.beginCancellation("", false, true)
+		cancelCtx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+		cancelErr = s.settleForShutdown(cancelCtx)
 
-		cancelErr = err
-		if cancelErr == nil && epoch != 0 {
-			cancelCtx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
-			cancelErr = s.resolveCancellation(cancelCtx, epoch)
-
-			cancel()
-		}
+		cancel()
 	}
 
 	// Pending provider-auth flows are cancelled after pending elicitation is
@@ -1079,9 +912,13 @@ func (s *session) Close(_ context.Context) error {
 
 	var err = cancelErr
 
-	if client != nil && nativeID != "" {
+	if err == nil {
+		s.stopPump()
+	}
+
+	if err == nil && client != nil && nativeID != "" {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-		err = errors.Join(err, client.Close(closeCtx))
+		err = client.Close(closeCtx)
 
 		closeCancel()
 	}
@@ -1101,6 +938,34 @@ func (s *session) Close(_ context.Context) error {
 	return err
 }
 
+// settleForShutdown interrupts this session's native work and waits for the
+// harness to acknowledge that it stopped, then commits the native-safe prefix and
+// terminalizes the open cycle. It is the close and delete boundary: a session is
+// not released until the work it owned is over and durable.
+func (s *session) settleForShutdown(ctx context.Context) error {
+	cycle := s.currentCycle()
+
+	if err := s.cancelTurn(ctx); err != nil {
+		return err
+	}
+
+	if cycle == nil {
+		return nil
+	}
+
+	if err := s.awaitNativeSettlement(ctx, cycle); err != nil {
+		return err
+	}
+
+	s.cancelActions(ctx)
+
+	if err := s.commitForegroundPrefix(ctx); err != nil {
+		return err
+	}
+
+	return s.settleCycle(ctx, cycle, lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled))
+}
+
 func (s *session) detachRuntime(generation uint64, cause string) {
 	s.mu.Lock()
 	if s.closed || s.runtimeGeneration != generation {
@@ -1115,8 +980,6 @@ func (s *session) detachRuntime(generation uint64, cause string) {
 	cancel := s.cancel
 	s.cancel = nil
 	s.turnDone = nil
-	s.pending = make(map[string]opencode.PermissionRequest)
-	s.questions = make(map[string]opencode.QuestionRequest)
 	release := s.directoryRelease
 	s.directoryRelease = nil
 	client := s.client
@@ -1125,6 +988,11 @@ func (s *session) detachRuntime(generation uint64, cause string) {
 	if cancel != nil {
 		cancel()
 	}
+
+	// The pump belongs to the lost binding. Stopping it before the client is
+	// closed keeps a routed event from being attributed to a session that no
+	// longer holds the runtime that produced it.
+	s.stopPump()
 
 	if client != nil {
 		ctx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
@@ -1247,7 +1115,13 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 		if installed {
 			s.setImageArtifacts(artifacts)
 
-			return nil
+			// The recovered native session is a new incarnation: it gets its own
+			// stream identity, its own opening snapshot, and its own pump. A host
+			// therefore never reduces the new incarnation's events against the
+			// fenced one's ordering.
+			s.reopenLifecycleStream()
+
+			return s.establish(ctx)
 		}
 
 		_ = releaseCandidate()
@@ -1290,11 +1164,9 @@ func (s *session) installRecoveredRuntime(client opencode.Client, releaseDirecto
 	s.availableCommands = nil
 	s.contextWindows = nil
 	s.messageRoles = nil
-	s.processedPermission = map[string]struct{}{}
-	s.processedQuestion = map[string]struct{}{}
-	s.cancelling = false
-	s.cancellationErr = nil
-	s.cancellationDone = nil
+	s.publishedToolCalls = map[string]struct{}{}
+	s.actions = newActionRegistry()
+	s.commandCatalogPublished = false
 
 	return true, false
 }
@@ -1311,13 +1183,10 @@ func (s *session) runtimeFailure() error {
 }
 
 func (s *session) DeleteNativeAndClose(ctx context.Context) error {
-	epoch, err := s.beginCancellation("", false, true)
-	if err == nil && epoch != 0 {
-		cancelCtx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
-		err = s.resolveCancellation(cancelCtx, epoch)
+	settleCtx, settleCancel := context.WithTimeout(context.Background(), settlementTimeout)
+	err := s.settleForShutdown(settleCtx)
 
-		cancel()
-	}
+	settleCancel()
 
 	s.mu.Lock()
 	client := s.client

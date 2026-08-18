@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -128,7 +129,7 @@ func TestLifecycleMCPRefreshesImmediatelyBeforeFirstNativePrompt(t *testing.T) {
 
 		return nil
 	}
-	client.sendMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		orderMu.Lock()
 		order = append(order, "prompt")
 		orderMu.Unlock()
@@ -177,7 +178,7 @@ func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T)
 	client.createSession = testNativeSession("native-refresh-failure")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 	client.refreshMCPErr = errors.Join(opencode.ErrMCPDisconnectUnproven, errors.New("delete failed"))
-	client.sendMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
 		t.Fatal("native prompt ran with a stale MCP catalog")
 
 		return opencode.NativeMessage{}, nil
@@ -234,13 +235,20 @@ func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T)
 	require.Equal(t, 1, releases)
 }
 
-func TestCancellationPublishesInterruptedCheckpointBeforeRetiredClose(t *testing.T) {
+// TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime proves
+// routine cancellation is session-scoped: the addressed native session is
+// interrupted, its interrupted prefix is committed durably before the turn
+// settles, and the shared runtime keeps running.
+func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemorySessionStore()
 	client := newFakeOpenCodeClient()
-	agent := NewAgent(WithHome(t.TempDir()), WithSessionStore(store))
+	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
 	current := testSession(agent, client)
 	agent.sessions[current.id] = current
+	require.NoError(t, current.establish(ctx))
 
 	committed := validSyncSnapshot(string(current.id), current.idmap.NativeSessionID, current.cwd)
 	committedAssistant := terminalMessageEvent(
@@ -270,64 +278,61 @@ func TestCancellationPublishesInterruptedCheckpointBeforeRetiredClose(t *testing
 		Entries: []SessionStoreEntry{entry},
 	}}))
 
-	turnCtx := current.beginTurn(ctx, "interrupted-turn")
-	current.mu.Lock()
-	current.activeMessageIDs["assistant-interrupted"] = struct{}{}
-	current.mu.Unlock()
-	epoch, err := current.beginCancellation("interrupted-turn", true, true)
-	require.NoError(t, err)
-	require.NoError(t, current.resolveCancellation(ctx, epoch))
-	current.finishTurn()
-	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
-	require.Equal(t, "shared OpenCode runtime retired after turn cancellation", current.runtimeLostCause)
+	// The native session reports idle when the interrupt lands, which is the
+	// acknowledgement the cancelled turn settles on.
+	started := make(chan struct{})
+	client.hangsAfterDispatch(started)
+	client.abortFunc = func(id string) error {
+		client.publishSessionIdle(id)
+
+		return nil
+	}
+
+	done := make(chan acp.PromptResponse, 1)
+
+	go func() {
+		response, promptErr := current.Prompt(ctx, TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+		require.NoError(t, promptErr)
+		done <- response
+	}()
+
+	<-started
+	require.NoError(t, agent.Cancel(ctx, CancelRequest(current.id, internalSeamTurnNonce)))
+	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
+
+	require.Equal(t, []string{current.idmap.NativeSessionID}, client.abortedSessions())
+	require.NotNil(t, agent.runtime, "routine cancellation retired the shared runtime")
+	require.NoError(t, current.ensureNotPoisoned())
 
 	captured, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
 	require.NoError(t, err)
 	require.Len(t, captured, 1)
 	require.NotEqual(t, SessionStoreEntry(entry), captured[0])
+
 	var interrupted stateSnapshot
 	require.NoError(t, json.Unmarshal(captured[0], &interrupted))
 	require.Equal(t, []opencode.SyncEvent{
 		client.syncEvents[0], client.syncEvents[1], interruptedUser, interruptedAssistant,
 	}, interrupted.Events[current.idmap.NativeSessionID])
-	terminal, err := InspectSessionStoreTerminalState(string(current.id), captured)
-	require.NoError(t, err)
-	require.Equal(t, "assistant-before-interrupt", terminal.MessageID)
 
-	restored := newFakeOpenCodeClient()
-	restored.xdg = client.xdg
-	restored.getSession = testNativeSession(current.idmap.NativeSessionID)
-	_, err = restoreSyncState(ctx, restored, interrupted, current.idmap.NativeSessionID, current.cwd)
-	require.NoError(t, err)
-	require.Equal(t, interrupted.Events[current.idmap.NativeSessionID], restored.syncEvents)
-
-	var historyCalls atomic.Int64
-	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
-		historyCalls.Add(1)
-
-		return nil, errors.New("Post http://127.0.0.1:1/sync/history: connect: connection refused")
-	}
-
-	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: current.id})
-	require.NoError(t, err)
-	require.Zero(t, historyCalls.Load(), "a retired generation must never be contacted during close")
-	require.NotContains(t, agent.sessions, current.id)
-
-	retained, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
-	require.NoError(t, err)
-	require.Equal(t, captured, retained)
-	terminal, err = InspectSessionStoreTerminalState(string(current.id), retained)
-	require.NoError(t, err)
-	require.Equal(t, "assistant-before-interrupt", terminal.MessageID)
+	// The terminal idle is the last lifecycle event of the cancelled turn, and it
+	// is emitted after the commit above.
+	requireLifecycleOutcome(t, connection, lifecycle.OutcomeCancelled)
 }
 
-func TestCancellationCaptureFailureStillRetiresAndPreservesPriorCheckpoint(t *testing.T) {
+// TestCancellationCaptureFailureFencesInsteadOfSettling proves a cancelled turn
+// whose native-safe prefix cannot be committed reports a settlement failure
+// instead of an idle the store cannot back, keeps the prior checkpoint, and still
+// leaves the shared runtime alone.
+func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemorySessionStore()
 	client := newFakeOpenCodeClient()
-	agent := NewAgent(WithHome(t.TempDir()), WithSessionStore(store))
+	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
+	agent.setAgentClient(newRecordingAgentClient())
 	current := testSession(agent, client)
 	agent.sessions[current.id] = current
+	require.NoError(t, current.establish(ctx))
 
 	committed := validSyncSnapshot(string(current.id), current.idmap.NativeSessionID, current.cwd)
 	entry, err := json.Marshal(committed)
@@ -338,24 +343,30 @@ func TestCancellationCaptureFailureStillRetiresAndPreservesPriorCheckpoint(t *te
 	}}))
 	client.syncHistoryErr = errors.New("sync history unavailable")
 
-	current.beginTurn(ctx, "interrupted-turn")
-	epoch, err := current.beginCancellation("interrupted-turn", true, true)
-	require.NoError(t, err)
-	err = current.resolveCancellation(ctx, epoch)
-	require.ErrorContains(t, err, "sync history unavailable")
-	retryEpoch, err := current.beginCancellation("", false, true)
-	require.NoError(t, err)
-	require.Equal(t, epoch, retryEpoch)
-	require.ErrorContains(t, current.resolveCancellation(ctx, retryEpoch), "sync history unavailable")
-	require.Equal(t, "shared OpenCode runtime retired after turn cancellation", current.runtimeLostCause)
-	require.Nil(t, agent.runtime)
-	require.Error(t, current.ensureNotPoisoned())
+	started := make(chan struct{})
+	client.hangsAfterDispatch(started)
+	client.abortFunc = func(id string) error {
+		client.publishSessionIdle(id)
+
+		return nil
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, promptErr := current.Prompt(ctx, TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+		done <- promptErr
+	}()
+
+	<-started
+	require.NoError(t, agent.Cancel(ctx, CancelRequest(current.id, internalSeamTurnNonce)))
+	require.ErrorContains(t, <-done, "sync history unavailable")
+	require.NotNil(t, agent.runtime, "a commit failure retired the shared runtime")
 
 	retained, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
 	require.NoError(t, err)
 	require.Equal(t, []SessionStoreEntry{entry}, retained)
 }
-
 func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
@@ -496,12 +507,7 @@ func TestRuntimeCrashFailsInflightTurnThenRecoversBeforeFollowingPrompt(t *testi
 	first.createSession = testNativeSession("native-first")
 	first.agents = []opencode.NativeAgent{{Name: "build"}}
 	started := make(chan struct{})
-	first.sendMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
-		close(started)
-		<-ctx.Done()
-
-		return opencode.NativeMessage{}, ctx.Err()
-	}
+	first.hangsAfterDispatch(started)
 
 	second := newFakeOpenCodeClient()
 	second.xdg = first.xdg
@@ -1233,7 +1239,7 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 	agent = NewAgent()
 	session := testSession(agent, client)
 	agent.sessions[session.id] = session
-	agent.refreshLifecycleCommands(ctx, session)
+	require.NoError(t, agent.establishSession(ctx, session))
 
 	closed := storedAgent(newFakeOpenCodeClient())
 	closed.closed = true

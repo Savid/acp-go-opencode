@@ -5,8 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
-
-	"sync"
+	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
 
@@ -17,14 +16,8 @@ import (
 
 func TestTurnFenceHelperBranches(t *testing.T) {
 	session := testSession(NewAgent(), newFakeOpenCodeClient())
-	if !session.claimPermissionRequest("") || !session.claimQuestionRequest("") {
-		t.Fatal("empty request ids should not be fenced")
-	}
-	session.processedPermission = nil
-	session.processedQuestion = nil
-	if !session.claimPermissionRequest("perm") || !session.claimQuestionRequest("question") {
-		t.Fatal("nil processed request maps were not initialized")
-	}
+	require.True(t, session.actions.claim(&pendingAction{id: "perm"}))
+	require.False(t, session.actions.claim(&pendingAction{id: "perm"}), "an id is claimed once for the life of the session")
 	session.markActiveMessageID("")
 	session.activeMessageIDs = nil
 	session.markActiveMessageID("message-1")
@@ -44,7 +37,7 @@ func TestTurnFenceHelperBranches(t *testing.T) {
 	}) {
 		t.Fatal("unfailed message id was suppressed")
 	}
-	if err := session.handleEvent(context.Background(), opencode.Event{
+	if err := session.applyNativeEvent(context.Background(), opencode.Event{
 		StreamEpoch: 9,
 		Properties:  json.RawMessage(`{"sessionID":"native-1","messageID":"message-1","type":"text","text":"late"}`),
 	}); err != nil {
@@ -107,10 +100,6 @@ func TestSessionTurnAdmissionAndCancellationFailureShapes(t *testing.T) {
 	_, err = current.acquireTurn(context.Background())
 	require.Error(t, err)
 	current.poisonCause = ""
-	current.cancelling = true
-	_, err = current.acquireTurn(context.Background())
-	require.ErrorContains(t, err, "session_cancelling")
-	current.cancelling = false
 
 	release, err := current.acquireCommandTurn(context.Background())
 	require.NoError(t, err)
@@ -148,26 +137,15 @@ func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 	require.Equal(t, "openai/gpt-test", model)
 	require.Equal(t, acp.SessionId("session"), current.info().SessionId)
 
-	current.markActiveToolCallID("")
-	require.False(t, current.ownsCurrentToolCall(""))
-	require.False(t, current.ownsCurrentToolCall("tool"))
-	turnCtx, turnCancel := context.WithCancel(context.Background())
+	current.markPublishedToolCall("")
+	require.False(t, current.publishedToolCall(""))
+	require.False(t, current.publishedToolCall("tool"))
 	current.mu.Lock()
-	current.cancel = turnCancel
-	current.activeToolCallIDs = nil
+	current.publishedToolCalls = nil
 	current.mu.Unlock()
-	current.markActiveToolCallID("tool")
-	require.True(t, current.ownsCurrentToolCall("tool"))
-	current.mu.Lock()
-	current.cancelling = true
-	current.mu.Unlock()
-	require.False(t, current.ownsCurrentToolCall("tool"))
-	turnCancel()
-	<-turnCtx.Done()
+	current.markPublishedToolCall("tool")
+	require.True(t, current.publishedToolCall("tool"), "a published call stays answerable across turns")
 
-	current.mu.Lock()
-	current.cancel = nil
-	current.cancelling = false
 	current.mu.Unlock()
 	selector, present, err := current.validatedModelSelector(context.Background(), "model")
 	require.NoError(t, err)
@@ -235,86 +213,58 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 	require.Equal(t, "provider", joinModelValue("provider", ""))
 }
 
-func TestSessionCancellationEpochCoordinationRemainingBranches(t *testing.T) {
+// TestCancelRequiresTheActiveTurnRoute proves a cancel that does not address the
+// session's current turn is refused before any native interrupt.
+func TestCancelRequiresTheActiveTurnRoute(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
 	current := testSession(agent, client)
 
-	_, err := current.beginCancellation("missing", true, true)
-	require.Error(t, err)
-	require.NoError(t, current.resolveCancellation(context.Background(), 0))
+	require.Error(t, current.requireActiveTurn("missing"), "a cancel with no active turn was admitted")
 
-	resolved := testSession(NewAgent(), newFakeOpenCodeClient())
-	turnCtx := resolved.beginTurn(context.Background(), "resolved")
-	resolved.cancellationResolvedEpoch = resolved.turnEpoch
-	epoch, err := resolved.beginCancellation("", false, true)
-	require.NoError(t, err)
-	require.Equal(t, resolved.turnEpoch, epoch)
-	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
-
-	done := make(chan struct{})
-	current.cancelling = true
-	current.cancellationEpoch = 7
-	current.cancellationDone = done
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	require.ErrorIs(t, current.resolveCancellation(cancelled, 7), context.Canceled)
-	originalObserve := observeCancellationWait
-	waiting := make(chan struct{}, 1)
-	var observeOnce sync.Once
-	observeCancellationWait = func() { observeOnce.Do(func() { waiting <- struct{}{} }) }
-	t.Cleanup(func() { observeCancellationWait = originalObserve })
-	resolvedResult := make(chan error, 1)
-	go func() { resolvedResult <- current.resolveCancellation(context.Background(), 7) }()
-	<-waiting
-	current.mu.Lock()
-	current.cancelling = false
-	current.mu.Unlock()
-	close(done)
-	require.NoError(t, <-resolvedResult)
-
-	current = testSession(agent, client)
 	current.beginTurn(context.Background(), "nonce")
-	client.statuses = map[string]opencode.NativeSessionStatus{"native-1": {Type: "idle"}}
-	epoch, err = current.beginCancellation("nonce", true, true)
-	require.NoError(t, err)
-	require.NoError(t, current.resolveCancellation(context.Background(), epoch))
-	epoch, err = current.beginCancellation("nonce", true, true)
-	require.Error(t, err)
-	require.Zero(t, epoch)
+	require.Error(t, current.requireActiveTurn("stale"))
+	require.NoError(t, current.requireActiveTurn("nonce"))
+	current.finishTurn()
 
-	current = testSession(agent, newFakeOpenCodeClient())
-	current.beginTurn(context.Background(), "nonce")
-	current.cancelling = true
-	current.cancellationEpoch = current.turnEpoch
-	epoch, err = current.beginCancellation("", false, true)
-	require.NoError(t, err)
-	require.EqualValues(t, current.turnEpoch, epoch)
-
-	errorClient := newFakeOpenCodeClient()
-	errorClient.closeErr = errors.New("containment failed")
-	errorAgent := NewAgent()
-	current = testSession(errorAgent, errorClient)
-	current.beginTurn(context.Background(), "nonce")
-	epoch, err = current.beginCancellation("", false, false)
-	require.NoError(t, err)
-	current.mu.Lock()
-	current.cancel = nil
-	current.mu.Unlock()
-	require.Error(t, current.resolveCancellation(context.Background(), epoch))
-	require.Error(t, current.ensureNotPoisoned())
-
-	orphan := testSession(NewAgent(), newFakeOpenCodeClient())
-	orphan.beginTurn(context.Background(), "nonce")
-	epoch, err = orphan.beginCancellation("", false, false)
-	require.NoError(t, err)
-	orphan.agent = nil
-	require.ErrorContains(t, orphan.resolveCancellation(context.Background(), epoch), opencode.ErrProcessContainmentIncomplete.Error())
+	require.Zero(t, client.abortCount(), "a refused cancel reached the harness")
 }
 
-func TestDeleteNativeAndCloseFencesActiveTurn(t *testing.T) {
+// TestCancelTurnInterruptsOnlyTheAddressedNativeSession proves the interrupt names
+// this session's native id and reports a refusal from the harness as a failure the
+// open cycle escalates on.
+func TestCancelTurnInterruptsOnlyTheAddressedNativeSession(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	client.statuses = map[string]opencode.NativeSessionStatus{"native-1": {Type: "idle"}}
+	current := testSession(NewAgent(), client)
+	current.beginTurn(context.Background(), "nonce")
+
+	require.NoError(t, current.cancelTurn(context.Background()))
+	require.Equal(t, []string{current.idmap.NativeSessionID}, client.abortedSessions())
+	require.True(t, current.wasCancelled())
+
+	client.abortErr = errors.New("interrupt refused")
+	require.ErrorContains(t, current.cancelTurn(context.Background()), "interrupt refused")
+	current.finishTurn()
+}
+
+// TestAwaitNativeSettlementReportsTheMissingAcknowledgement proves a native session
+// that never reports idle after an interrupt is a settlement failure rather than a
+// clean cancellation.
+func TestAwaitNativeSettlementReportsTheMissingAcknowledgement(t *testing.T) {
+	current := testSession(NewAgent(), newFakeOpenCodeClient())
+	require.NoError(t, current.awaitNativeSettlement(context.Background(), nil))
+
+	cycle := &foregroundCycle{id: "cycle-1", turnID: "turn-1", signal: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	require.ErrorContains(t, current.awaitNativeSettlement(ctx, cycle), "did not report idle")
+
+	cycle.wake()
+	require.NoError(t, current.awaitNativeSettlement(context.Background(), cycle))
+}
+
+func TestDeleteNativeAndCloseSettlesTheSession(t *testing.T) {
+	client := newFakeOpenCodeClient()
 	current := testSession(NewAgent(), client)
 	current.beginTurn(context.Background(), "nonce")
 	require.NoError(t, current.DeleteNativeAndClose(context.Background()))

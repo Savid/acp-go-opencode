@@ -380,12 +380,10 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 	current := testSession(agent, client)
 	agent.sessions[current.id] = current
 
-	current.pending["permission"] = opencode.PermissionRequest{}
+	require.True(t, current.actions.claim(&pendingAction{id: "permission"}))
 	require.Equal(t, metaPermissionKey, current.snapshotBlockedReason())
-	delete(current.pending, "permission")
-	current.questions["question"] = opencode.QuestionRequest{}
-	require.Equal(t, "elicitation", current.snapshotBlockedReason())
-	delete(current.questions, "question")
+	_, held := current.actions.take("permission")
+	require.True(t, held)
 	current.activeMessageIDs["message"] = struct{}{}
 	require.Equal(t, "generation", current.snapshotBlockedReason())
 	delete(current.activeMessageIDs, "message")
@@ -417,7 +415,7 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	}
 
 	current, _ := newSnapshotSession()
-	current.pending["permission"] = opencode.PermissionRequest{}
+	require.True(t, current.actions.claim(&pendingAction{id: "permission"}))
 	require.ErrorContains(t, current.snapshotToStore(context.Background()), "permission")
 
 	current, client := newSnapshotSession()

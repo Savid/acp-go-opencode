@@ -56,14 +56,13 @@ const (
 	routeCommand              = "/command"
 	routeEvent                = "/event"
 	routeSession              = "/session"
-	routeSessionStatus        = "/session/status"
+	routePromptAsync          = "/prompt_async"
 	routePermission           = "/permission"
 	routeQuestion             = "/question"
 	routeAPIPermissionRequest = "/api/permission/request"
 	routeAPIQuestionRequest   = "/api/question/request"
 
-	roleAssistant           = "assistant"
-	nativeSessionStatusIdle = "idle"
+	roleAssistant = "assistant"
 )
 
 // Native OpenCode /doc path templates validated during readiness.
@@ -93,6 +92,7 @@ const (
 	fieldSessionID            = "sessionID"
 	fieldMessageID            = "messageID"
 	fieldCallID               = "callID"
+	fieldStatus               = "status"
 )
 
 // openAPITypeArray is the OpenAPI schema "type" value for arrays.
@@ -122,10 +122,15 @@ type Client interface {
 	ListSessions(context.Context, string) ([]NativeSession, error)
 	DeleteSession(context.Context, string) error
 	Commands(context.Context) ([]NativeCommand, error)
-	RunCommand(context.Context, string, CommandRequest) (NativeMessage, error)
-	SendMessage(context.Context, string, MessageRequest) (NativeMessage, error)
+	// DispatchCommand posts one resolved native command. The native command
+	// route answers only when the agent loop it started has finished, so its
+	// return is a completion report and never the dispatch acknowledgement.
+	DispatchCommand(context.Context, string, CommandRequest) error
+	// DispatchMessage posts one prompt frame and returns when the native
+	// dispatcher has accepted durable ownership of it. It waits for nothing
+	// else: the turn's transcript and its completion arrive as native events.
+	DispatchMessage(context.Context, string, MessageRequest) error
 	Messages(context.Context, string) ([]NativeMessage, error)
-	SessionStatus(context.Context) (map[string]NativeSessionStatus, error)
 	Abort(context.Context, string) error
 	Fork(context.Context, string, string) (NativeSession, error)
 	Todos(context.Context, string) ([]NativeTodo, error)
@@ -2092,78 +2097,30 @@ func (s *openCodeServer) Commands(ctx context.Context) ([]NativeCommand, error) 
 	return out, err
 }
 
-func (s *openCodeServer) RunCommand(ctx context.Context, id string, req CommandRequest) (NativeMessage, error) {
+// DispatchCommand posts one resolved native command. The native route expands
+// the command template and then runs the agent loop to completion before it
+// answers, so this call reports the run's outcome rather than its admission; the
+// caller takes admission and completion from the session's own native events.
+func (s *openCodeServer) DispatchCommand(ctx context.Context, id string, req CommandRequest) error {
 	var out NativeMessage
 	if err := s.doJSONWithClient(ctx, s.blockingHTTPClient(), http.MethodPost, "/session/"+url.PathEscape(id)+routeCommand, nil, req, &out); err != nil {
-		return s.recoverBlockingTurnFailure(ctx, id, err)
+		_, recovered := s.recoverBlockingTurnFailure(ctx, id, err)
+
+		return recovered
 	}
 
-	if err := AssistantMessageError(out); err != nil {
-		return NativeMessage{}, err
-	}
-
-	return out, nil
+	return AssistantMessageError(out)
 }
 
-func (s *openCodeServer) SendMessage(ctx context.Context, id string, req MessageRequest) (NativeMessage, error) {
-	client := s.blockingHTTPClient()
-
-	before, err := s.messagesWithClient(ctx, client, id)
-	if err != nil {
-		return NativeMessage{}, fmt.Errorf("load opencode messages before prompt: %w", err)
-	}
-
-	beforeAssistant := ""
-
-	for index := len(before) - 1; index >= 0; index-- {
-		if before[index].Info.Role == roleAssistant {
-			beforeAssistant = before[index].Info.ID
-
-			break
-		}
-	}
-
-	if err := s.doJSONWithClient(ctx, client, http.MethodPost, "/session/"+url.PathEscape(id)+"/prompt_async", nil, req, nil); err != nil {
-		return s.recoverBlockingTurnFailure(ctx, id, err)
-	}
-
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	var candidate NativeMessage
-
-	for {
-		messages, err := s.messagesWithClient(ctx, client, id)
-		if err == nil {
-			for index := len(messages) - 1; index >= 0; index-- {
-				message := messages[index]
-				if message.Info.Role != roleAssistant || message.Info.ID == beforeAssistant || message.Info.Finish == "" {
-					continue
-				}
-
-				candidate = message
-
-				break
-			}
-		}
-
-		statuses, statusErr := s.sessionStatusWithClient(ctx, client)
-		status, active := statuses[id]
-
-		if candidate.Info.ID != "" && statusErr == nil && (!active || status.Type == nativeSessionStatusIdle) {
-			if err := AssistantMessageError(candidate); err != nil {
-				return NativeMessage{}, err
-			}
-
-			return candidate, nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return NativeMessage{}, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+// DispatchMessage posts one prompt frame to the native async prompt route. That
+// route resolves the addressed session, schedules the agent loop, and answers
+// `204 No Content` — the native dispatcher's own acknowledgement that it holds
+// the frame. A refusal answers with a status instead, and a transport failure
+// leaves admission unknown, so both are reported as a refusal: an admitted frame
+// this call could not confirm still announces itself on the session's event
+// stream, where it opens an agent-origin turn rather than a silently accepted one.
+func (s *openCodeServer) DispatchMessage(ctx context.Context, id string, req MessageRequest) error {
+	return s.doJSON(ctx, http.MethodPost, "/session/"+url.PathEscape(id)+routePromptAsync, nil, req, nil)
 }
 
 // recoverBlockingTurnFailure resolves the real cause of a transport failure on
@@ -2254,19 +2211,6 @@ func (s *openCodeServer) messagesWithClient(ctx context.Context, client *http.Cl
 	var out []NativeMessage
 
 	err := s.doJSONWithClient(ctx, client, http.MethodGet, "/session/"+url.PathEscape(id)+"/message", nil, nil, &out)
-
-	return out, err
-}
-
-func (s *openCodeServer) SessionStatus(ctx context.Context) (map[string]NativeSessionStatus, error) {
-	return s.sessionStatusWithClient(ctx, s.httpClient)
-}
-
-func (s *openCodeServer) sessionStatusWithClient(
-	ctx context.Context, client *http.Client,
-) (map[string]NativeSessionStatus, error) {
-	out := map[string]NativeSessionStatus{}
-	err := s.doJSONWithClient(ctx, client, http.MethodGet, routeSessionStatus, nil, nil, &out)
 
 	return out, err
 }
@@ -2730,7 +2674,6 @@ func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 		routeConfigProviders,
 		routeCommand,
 		routeEvent,
-		routeSessionStatus,
 		routeSession,
 		"/session/{sessionID}",
 		docPathSessionCommand,
@@ -2829,6 +2772,14 @@ type openCodeEventContract struct {
 
 func validateOpenCodeEventSchemas(doc map[string]any) error {
 	for _, contract := range []openCodeEventContract{
+		// The idle event is this adapter's completion authority for a native
+		// turn, and the status event is how a session reports that it took work
+		// on. A build that publishes neither cannot report a foreground
+		// boundary at all, so readiness refuses it rather than falling back to
+		// a poll.
+		{schema: "EventSessionIdle", event: EventSessionIdle, requiredProperties: []string{fieldSessionID}},
+		{schema: "EventSessionStatus", event: EventSessionStatus, requiredProperties: []string{fieldSessionID, fieldStatus}},
+		{schema: "EventSessionError", event: EventSessionError},
 		{schema: "EventPermissionV2Asked", event: "permission.v2.asked", requiredProperties: []string{fieldID, fieldSessionID, fieldAction, "resources"}},
 		{schema: "EventPermissionV2Replied", event: "permission.v2.replied", requiredProperties: []string{fieldSessionID, fieldRequestID, fieldReply}},
 		{schema: "EventPermissionAsked", event: "permission.asked", requiredProperties: []string{fieldID, fieldSessionID, fieldPermission, "patterns"}},

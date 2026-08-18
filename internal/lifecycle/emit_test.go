@@ -47,11 +47,11 @@ func TestEmittedPromptStreamReducesThroughItsOwnValidator(t *testing.T) {
 	for _, event := range []Event{
 		SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "cycle-1"}, nil, QuiescenceFact{}),
 		AcceptedEvent(submission, "turn-1"),
-		TransitionEvent(ForegroundRunning, "cycle-1", "turn-1"),
+		TransitionEvent(ForegroundRunning, "cycle-1", "turn-1", CauseSubmission),
 		ActionEvent(PendingAction("action-1", ActionPermission, Owner{Type: OwnerTurn, ID: "turn-1"}, true)),
-		TransitionEvent(ForegroundRequiresAction, "cycle-1", "turn-1"),
+		TransitionEvent(ForegroundRequiresAction, "cycle-1", "turn-1", CauseSubmission),
 		ActionEvent(ResolvedAction("action-1", ActionAccepted)),
-		TransitionEvent(ForegroundRunning, "cycle-1", "turn-1"),
+		TransitionEvent(ForegroundRunning, "cycle-1", "turn-1", CauseSubmission),
 		IdleEvent("cycle-1", "turn-1", StopReasonEndTurn, OutcomeSuccess),
 	} {
 		_, err := stream.Emit(event)
@@ -154,7 +154,7 @@ func TestEncodedEventsRoundTripThroughTheDecoder(t *testing.T) {
 			[]ActionUpdate{PendingAction("action-1", ActionElicitation, Owner{Type: OwnerTurn, ID: "turn-1"}, false)},
 			QuiescenceFact{})},
 		{"acceptance", AcceptedEvent(Submission{SubmissionID: "s", ClientNonce: "n"}, "turn-1")},
-		{"running", TransitionEvent(ForegroundRunning, "cycle-1", "turn-1")},
+		{"running", TransitionEvent(ForegroundRunning, "cycle-1", "turn-1", CauseSubmission)},
 		{"ending idle", IdleEvent("cycle-1", "turn-1", StopReasonRefusal, OutcomeRefused)},
 		{"action first sight", ActionEvent(PendingAction("action-1", ActionPermission, Owner{Type: OwnerActivity, ID: "activity-1"}, true))},
 		{"action patch", ActionEvent(ResolvedAction("action-1", ActionDeclined))},

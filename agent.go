@@ -50,7 +50,6 @@ type Agent struct {
 	sessions                 map[acp.SessionId]*session
 	deleted                  map[acp.SessionId]struct{}
 	clientCalls              chan struct{}
-	nativeTurns              chan struct{}
 	clientCapabilities       acp.ClientCapabilities
 	positionEncoding         acp.PositionEncodingKind
 	lifecycle                lifecycle.Negotiated
@@ -149,7 +148,6 @@ func NewAgent(opts ...Option) *Agent {
 		directories:        make(map[string]directoryBinding),
 		runtimeRetirements: make(map[uint64]*runtimeRetirement),
 		clientCalls:        make(chan struct{}, limits.MaxConcurrentClientCalls),
-		nativeTurns:        make(chan struct{}, 1),
 	}
 	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
 		agent.optionsErr = errors.Join(agent.optionsErr, fmt.Errorf("create runtime fingerprint key: %w", err))
@@ -500,18 +498,6 @@ func (a *Agent) acquireClientCall(ctx context.Context) (func(), error) {
 		return nil, ctx.Err()
 	default:
 		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "client_calls"})
-	}
-}
-
-// acquireNativeTurn serializes prompts across every logical session sharing
-// this Agent's native runtime. Cancellation retires that whole runtime, so a
-// second active native turn could otherwise be killed as collateral work.
-func (a *Agent) acquireNativeTurn(ctx context.Context) (func(), error) {
-	select {
-	case a.nativeTurns <- struct{}{}:
-		return func() { <-a.nativeTurns }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
 }
 

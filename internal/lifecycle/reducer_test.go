@@ -45,7 +45,7 @@ func (r *reduction) openTurn(t *testing.T) {
 
 	r.open(t)
 	require.NoError(t, r.push(AcceptedEvent(Submission{SubmissionID: "s", ClientNonce: "n"}, "turn-1")))
-	require.NoError(t, r.push(TransitionEvent(ForegroundRunning, "cycle-1", "turn-1")))
+	require.NoError(t, r.push(TransitionEvent(ForegroundRunning, "cycle-1", "turn-1", CauseSubmission)))
 }
 
 func fullyProven() Negotiated {
@@ -65,7 +65,7 @@ func TestReducerLatchesOnItsFirstRefusal(t *testing.T) {
 	r := newReduction(promptContained())
 	require.Nil(t, r.reducer.Failed())
 
-	err := r.push(TransitionEvent(ForegroundRunning, "cycle-1", "turn-1"))
+	err := r.push(TransitionEvent(ForegroundRunning, "cycle-1", "turn-1", CauseSubmission))
 	require.ErrorIs(t, err, &ViolationError{Kind: ViolationDeltaBeforeSnapshot})
 
 	latched := r.reducer.Failed()
@@ -106,7 +106,7 @@ func TestReducerRefusesAForeignDeltaAsStale(t *testing.T) {
 		StreamID: "stream-2",
 		Sequence: 1,
 		Carrier:  CarrierSessionInfo,
-		Event:    TransitionEvent(ForegroundRunning, "cycle-2", "turn-2"),
+		Event:    TransitionEvent(ForegroundRunning, "cycle-2", "turn-2", CauseSubmission),
 	})
 	require.ErrorIs(t, err, &ViolationError{Kind: ViolationStaleStream})
 }
@@ -233,7 +233,7 @@ func TestTurnIdentityIsIntroducedOnce(t *testing.T) {
 
 	for _, event := range []Event{
 		AcceptedEvent(Submission{SubmissionID: "s2", ClientNonce: "n2"}, "turn-1"),
-		TransitionEvent(ForegroundRunning, "cycle-2", "turn-1"),
+		TransitionEvent(ForegroundRunning, "cycle-2", "turn-1", CauseSubmission),
 		IdleEvent("cycle-2", "turn-1", StopReasonEndTurn, OutcomeSuccess),
 	} {
 		reopened := newReduction(promptContained())
@@ -378,7 +378,7 @@ func TestActionImmutableMembersAreFixedOnFirstSight(t *testing.T) {
 				ActionID: "action-1", Kind: ActionPermission, State: ActionPending,
 				Owner: owner, BlocksForeground: &blocks,
 			})))
-			require.NoError(t, r.push(TransitionEvent(ForegroundRequiresAction, "cycle-1", "turn-1")))
+			require.NoError(t, r.push(TransitionEvent(ForegroundRequiresAction, "cycle-1", "turn-1", CauseSubmission)))
 			require.ErrorIs(t, r.push(ActionEvent(row.patch)),
 				&ViolationError{Kind: ViolationImmutableIdentityChange})
 		})
