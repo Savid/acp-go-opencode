@@ -367,6 +367,9 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 	}
 
 	snapshotErr := session.snapshotToStore(context.WithoutCancel(ctx))
+	if snapshotErr != nil {
+		return acp.CloseSessionResponse{}, snapshotErr
+	}
 
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
 	closeErr := session.Close(closeCtx)
@@ -377,7 +380,7 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
-	return acp.CloseSessionResponse{}, errors.Join(snapshotErr, closeErr)
+	return acp.CloseSessionResponse{}, closeErr
 }
 
 func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
@@ -394,11 +397,22 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	session := a.sessions[params.SessionId]
 	a.mu.Unlock()
 
+	if session != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+		err := session.DeleteNativeAndClose(closeCtx)
+
+		closeCancel()
+		if err != nil {
+			return acp.UnstableDeleteSessionResponse{}, err
+		}
+	}
+
+	// Publish the durable tombstone only after native deletion and containment
+	// succeed. A failure before this point leaves the handle addressable for a
+	// retry instead of reporting deletion while its process or state survives.
 	storeCtx, cancel := a.sessionStoreContext(ctx)
 	err := a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
-
 	cancel()
-
 	if err != nil {
 		return acp.UnstableDeleteSessionResponse{}, err
 	}
@@ -407,20 +421,13 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	if session == nil || a.sessions[params.SessionId] == session {
 		delete(a.sessions, params.SessionId)
 	}
-
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
-
 	if session != nil {
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-		err = session.DeleteNativeAndClose(closeCtx)
-
-		closeCancel()
-
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
-	return acp.UnstableDeleteSessionResponse{}, err
+	return acp.UnstableDeleteSessionResponse{}, nil
 }
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {

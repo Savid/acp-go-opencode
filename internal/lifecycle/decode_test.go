@@ -8,6 +8,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestDecodedDuplicateComparisonPreservesIntegersAboveFloatPrecision(t *testing.T) {
+	negotiated := Negotiated{Versions: []int{Version}}
+	frame := func(marker string) json.RawMessage {
+		return json.RawMessage(`{"sessionId":"s","update":{"sessionUpdate":"session_info_update"},"_meta":{"acp-go.dev/lifecycle":{"version":1,"streamId":"stream","sequence":1,"event":{"type":"lifecycle_snapshot","foreground":{"state":"idle","cycleId":"idle"},"activities":[],"actions":[],"quiescence":{"quiescent":false}}},"marker":` + marker + `}}`)
+	}
+	first, err := DecodeSessionUpdate(frame("9007199254740992"), negotiated)
+	require.NoError(t, err)
+	second, err := DecodeSessionUpdate(frame("9007199254740993"), negotiated)
+	require.NoError(t, err)
+	r := NewReducer(Options{Negotiated: negotiated})
+	require.NoError(t, r.Reduce(first))
+	require.ErrorContains(t, r.Reduce(second), string(ViolationConflictingDuplicate))
+}
+
 func decodeNegotiated() Negotiated {
 	return Negotiated{
 		Versions:                []int{1},

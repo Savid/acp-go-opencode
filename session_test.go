@@ -220,8 +220,9 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 	client = newFakeOpenCodeClient()
 	client.deleteErr = errors.New("delete failed")
 	current = testSession(agent, client)
-	require.NoError(t, current.DeleteNativeAndClose(context.Background()), "native deletion is best-effort")
+	require.ErrorContains(t, current.DeleteNativeAndClose(context.Background()), "delete failed")
 	require.NotEmpty(t, client.deleted)
+	require.False(t, client.closed, "failed native deletion must remain retryable")
 
 	require.Equal(t, "fallback", firstNonEmpty("", "fallback"))
 	provider, model := splitModelValue("malformed", "provider", "fallback")

@@ -11,6 +11,21 @@ message completes, when the stream fails, when a deadline elapses, or when the
 host cancels. Every prompt carries a fresh route-envelope turn nonce; an active
 cancel must carry that same nonce.
 
+## Negotiated lifecycle stream
+
+When the client offers `acp-go.dev/lifecycle` version 1 during initialize,
+OpenCode emits a session-incarnation stream on identity-only
+`session_info_update` notifications. Its first notification is a complete
+snapshot. Prompt acceptance, foreground state, permissions, and elicitations
+then use contiguous, claimed-before-delivery sequence numbers. Interactive
+requests carry the same stream and action identity in `_meta`.
+
+The stream is session-owned rather than prompt-owned. Delivery failure,
+ordering conflict, native-incarnation loss, or an event after a terminal fence
+fails closed. Prompt completion proves only foreground idle. OpenCode does not
+advertise authoritative background quiescence because native status polling
+cannot prove it.
+
 ## Stream mapping
 
 Native part events map onto ACP update variants:

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -54,6 +53,12 @@ type session struct {
 
 	turn                      chan struct{}
 	mu                        sync.Mutex
+	lifecycleMu               sync.Mutex
+	lifecycleStream           *lifecycle.Stream
+	lifecycleFailed           error
+	lifecycleCycle            string
+	lifecycleTurn             string
+	lifecycleSettled          bool
 	updateMu                  sync.Mutex
 	rawEventMu                sync.Mutex
 	cancel                    context.CancelFunc
@@ -148,7 +153,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 
 	idmap.UpdatedAtUnixMilli = now
 
-	return &session{
+	session := &session{
 		agent:                   agent,
 		id:                      id,
 		cwd:                     cwd,
@@ -179,6 +184,10 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		failedStreamEpochs:      map[uint64]struct{}{},
 		failedMessageIDs:        map[string]struct{}{},
 	}
+
+	session.openLifecycleStream()
+
+	return session
 }
 
 func (s *session) acquireTurn(ctx context.Context) (func(), error) {
@@ -1084,6 +1093,9 @@ func (s *session) Close(_ context.Context) error {
 		s.directoryRelease = nil
 		s.mu.Unlock()
 	}
+	if err == nil {
+		s.fenceLifecycle("session closed")
+	}
 
 	return err
 }
@@ -1123,6 +1135,7 @@ func (s *session) detachRuntime(generation uint64, cause string) {
 	if release != nil {
 		release()
 	}
+	s.fenceLifecycle(cause)
 }
 
 func (s *session) ensureRuntime(ctx context.Context) error {
@@ -1311,11 +1324,12 @@ func (s *session) DeleteNativeAndClose(ctx context.Context) error {
 
 	if client != nil && nativeID != "" {
 		deleteCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		if deleteErr := client.DeleteSession(deleteCtx, nativeID); deleteErr != nil && s.agent != nil && s.agent.log != nil {
-			s.agent.log.DebugContext(deleteCtx, "delete native OpenCode session failed", slog.String("error", deleteErr.Error()))
-		}
+		deleteErr := client.DeleteSession(deleteCtx, nativeID)
 
 		cancel()
+		if deleteErr != nil {
+			return errors.Join(err, fmt.Errorf("delete native OpenCode session: %w", deleteErr))
+		}
 	}
 
 	return errors.Join(err, s.Close(ctx))

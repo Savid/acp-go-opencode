@@ -360,6 +360,8 @@ func TestPromptBindsBothEnvelopesToTheSameTurn(t *testing.T) {
 	t.Parallel()
 
 	agent := negotiatedAgent(t)
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
 	client := newFakeOpenCodeClient()
 	session := testSession(agent, client)
 	agent.sessions[session.id] = session
@@ -397,6 +399,7 @@ func TestPromptBindsBothEnvelopesToTheSameTurn(t *testing.T) {
 		RunID:        "run-1",
 	}, observed)
 	require.Equal(t, "route-nonce", nonce)
+	require.GreaterOrEqual(t, connection.updateCount(), 4, "snapshot, acceptance, running, and terminal idle")
 
 	// The turn's identities are released with the turn.
 	require.Equal(t, lifecycle.Submission{}, session.currentSubmission())

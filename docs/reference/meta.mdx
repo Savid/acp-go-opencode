@@ -10,6 +10,15 @@ namespace, an unknown key, or a wrong-typed known option value — is rejected
 with an invalid-params error (`-32602`); unsupported keys and wrong-typed
 values carry the uniform `{"error": "unsupported", "field": "<path>"}` data.
 
+## `acp-go.dev/lifecycle`
+
+The lifecycle key is negotiated bilaterally in initialize `_meta`. Version 1
+correlates prompt submissions, ordered session updates, permission requests,
+and elicitation requests. It is rejected on every other method. OpenCode
+advertises an empty activity-kind set and no authoritative quiescence source;
+consumers requiring authoritative run settlement reject that configuration
+before dispatch.
+
 ## Request input
 
 Lifecycle requests accept:

@@ -30,6 +30,10 @@ func (s *Stream) State() State { return s.reducer.State() }
 // Negotiated reports the facts this stream is allowed to state.
 func (s *Stream) Negotiated() Negotiated { return s.reducer.Negotiated() }
 
+// Close fences this incarnation after process containment. No later event may
+// be emitted from the native source.
+func (s *Stream) Close() { s.reducer.Close() }
+
 // Emit claims the next sequence, reduces the event, and renders the envelope for
 // the notification's `_meta`. A refused event is never rendered and its sequence
 // stays consumed, which is exactly the detectable gap the ordering rule wants.

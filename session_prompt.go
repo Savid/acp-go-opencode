@@ -423,7 +423,7 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 	runNative func(context.Context) (opencode.NativeMessage, error),
 	command opencode.NativeCommand,
 	matchedCommand bool,
-) (acp.PromptResponse, error) {
+) (response acp.PromptResponse, returnErr error) {
 	var fenceOnce sync.Once
 
 	var fenceErr error
@@ -451,6 +451,25 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 	if err := s.reconcileQuestions(turnCtx); err != nil {
 		return failTurn(err)
 	}
+
+	// The stream route exists before native dispatch. Once validation,
+	// reconciliation, and admission have completed, publish acceptance and
+	// running before any event caused by the native frame can be forwarded.
+	if err := s.beginLifecycleTurn(turnCtx); err != nil {
+		return failTurn(err)
+	}
+	defer func() {
+		outcome := lifecycle.OutcomeSuccess
+		stopReason := string(response.StopReason)
+		if returnErr != nil {
+			outcome, stopReason = lifecycle.OutcomeFailed, ""
+		} else if response.StopReason == acp.StopReasonCancelled {
+			outcome = lifecycle.OutcomeCancelled
+		}
+		if settleErr := s.settleLifecycleTurn(context.WithoutCancel(turnCtx), stopReason, outcome); settleErr != nil {
+			returnErr = errors.Join(returnErr, settleErr)
+		}
+	}()
 
 	done := make(chan promptTurnResult, 1)
 
@@ -1697,6 +1716,12 @@ func (s *session) handlePermission(ctx context.Context, req opencode.PermissionR
 	}
 
 	s.addPendingPermission(req)
+	owner := s.currentLifecycleOwner()
+	if err := s.lifecycleActionPending(ctx, lifecycle.PendingAction(
+		req.ID, lifecycle.ActionPermission, owner, true,
+	)); err != nil {
+		return err
+	}
 
 	conn := s.agent.connection()
 	if conn == nil {
@@ -1744,7 +1769,7 @@ func (s *session) handlePermission(ctx context.Context, req opencode.PermissionR
 			{OptionId: permissionReplyAlways, Name: "Always allow", Kind: acp.PermissionOptionKindAllowAlways},
 			{OptionId: permissionReplyReject, Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
 		},
-		Meta: map[string]any{opencodeMetaKey: map[string]any{routeFieldRequestID: req.ID, opencodeNativeIDMetaKey: req.SessionID}},
+		Meta: mergeMeta(map[string]any{opencodeMetaKey: map[string]any{routeFieldRequestID: req.ID, opencodeNativeIDMetaKey: req.SessionID}}, s.lifecycleActionMeta(req.ID, owner)),
 	})
 	if err != nil {
 		_, ok, cancelled := s.takePendingPermission(req.ID)
@@ -1785,6 +1810,15 @@ func (s *session) handlePermission(ctx context.Context, req opencode.PermissionR
 	if resp.Outcome.Cancelled != nil {
 		reply = permissionReplyReject
 	}
+	actionState := lifecycle.ActionDeclined
+	if reply == permissionReplyOnce || reply == permissionReplyAlways {
+		actionState = lifecycle.ActionAccepted
+	} else if resp.Outcome.Cancelled != nil {
+		actionState = lifecycle.ActionCancelled
+	}
+	if err := s.lifecycleActionResolved(ctx, req.ID, actionState); err != nil {
+		return err
+	}
 
 	_, ok, cancelled := s.takePendingPermission(req.ID)
 	if !ok {
@@ -1815,6 +1849,10 @@ func (s *session) handleQuestion(ctx context.Context, req opencode.QuestionReque
 	}
 
 	s.addPendingQuestion(req)
+	owner := s.currentLifecycleOwner()
+	if err := s.lifecycleActionPending(ctx, lifecycle.PendingAction(req.ID, lifecycle.ActionElicitation, owner, true)); err != nil {
+		return err
+	}
 
 	conn := s.agent.connection()
 	if conn == nil || !s.agent.clientSupportsFormElicitation() {
@@ -1832,6 +1870,9 @@ func (s *session) handleQuestion(ctx context.Context, req opencode.QuestionReque
 	}
 
 	request, propertyIDs := questionElicitationRequest(req)
+	if request.Form != nil {
+		request.Form.Meta = mergeMeta(request.Form.Meta, s.lifecycleActionMeta(req.ID, owner))
+	}
 
 	scope := elicitationScope{SessionID: s.id, TurnNonce: s.currentTurnNonce()}
 	if req.Tool.CallID != "" {
@@ -1871,6 +1912,9 @@ func (s *session) handleQuestion(ctx context.Context, req opencode.QuestionReque
 	}
 
 	if resp.Accept == nil {
+		if err := s.lifecycleActionResolved(ctx, req.ID, lifecycle.ActionDeclined); err != nil {
+			return err
+		}
 		_, ok, cancelled := s.takePendingQuestion(req.ID)
 		if !ok {
 			return errPromptCancelled
@@ -1911,7 +1955,21 @@ func (s *session) handleQuestion(ctx context.Context, req opencode.QuestionReque
 		return errPromptCancelled
 	}
 
+	if err := s.lifecycleActionResolved(ctx, req.ID, lifecycle.ActionAccepted); err != nil {
+		return err
+	}
 	return s.client.ReplyQuestion(ctx, req, questionAnswersFromContent(resp.Accept.Content, propertyIDs))
+}
+
+func mergeMeta(left, right map[string]any) map[string]any {
+	out := make(map[string]any, len(left)+len(right))
+	for key, value := range left {
+		out[key] = value
+	}
+	for key, value := range right {
+		out[key] = value
+	}
+	return out
 }
 
 func (s *session) drainClientBacklog(ctx context.Context) error {

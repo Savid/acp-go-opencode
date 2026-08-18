@@ -3,7 +3,6 @@ package lifecycle
 import (
 	"encoding/json"
 	"errors"
-	"reflect"
 )
 
 // Options configures a reducer.
@@ -198,13 +197,23 @@ func (r *Reducer) reduceFirst(delivery Delivery) error {
 }
 
 func (r *Reducer) reduceDuplicate(delivery Delivery) error {
-	if recorded, known := r.frames[delivery.Sequence]; known && reflect.DeepEqual(recorded, delivery.Frame) {
+	if recorded, known := r.frames[delivery.Sequence]; known && equalJSONValue(recorded, delivery.Frame) {
 		r.state.SuppressedRetransmissions++
 
 		return nil
 	}
 
 	return r.fail(delivery, ViolationConflictingDuplicate, "the identity already delivered different content")
+}
+
+// equalJSONValue compares decoded JSON without converting integers through
+// float64. Lifecycle sequences and opaque carrier metadata may exceed 2^53;
+// treating adjacent integers there as equal would suppress a conflicting
+// duplicate and silently corrupt the ordered stream.
+func equalJSONValue(left, right any) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
 }
 
 func (r *Reducer) commit(delivery Delivery) {
