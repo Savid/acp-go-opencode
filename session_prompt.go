@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/observer"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
@@ -127,6 +128,10 @@ func mergeAssistantErrorFields(data map[string]any, err *opencode.AssistantError
 }
 
 func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (resp acp.PromptResponse, err error) {
+	// The route envelope is the anti-stale turn authenticator and the lifecycle
+	// value is submission identity: neither is derived from the other, the route
+	// is validated first so a prompt never reports two rejections, and both
+	// verdicts are reached before anything is dispatched to the harness.
 	route, err := parseInboundTurnRoute(params.Meta)
 	if err != nil {
 		return acp.PromptResponse{}, err
@@ -137,10 +142,15 @@ func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (resp acp.
 		return acp.PromptResponse{}, err
 	}
 
+	submission, err := a.promptSubmission(params.Meta)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
 	ctx, finish := a.observe.StartPrompt(ctx, params.Meta, session.currentModel())
 	defer func() { finish(promptResultForObserver(resp, err, session.currentModel())) }()
 
-	resp, err = session.promptWithRoute(ctx, params, route.TurnNonce)
+	resp, err = session.promptWithRoute(ctx, params, route.TurnNonce, submission)
 
 	return resp, err
 }
@@ -180,6 +190,14 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 		return err
 	}
 
+	// A cancel carries no lifecycle value. The refusal lands before the native
+	// interrupt and before any local turn state moves, so the cancel is never
+	// applied; being a notification it carries no response frame, which makes the
+	// refusal wire-silent rather than absent.
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return refusal
+	}
+
 	session, err := a.session(params.SessionId)
 	if err != nil {
 		return err
@@ -203,16 +221,28 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 
 // Prompt is the internal session seam used by deterministic unit tests. The
 // public Agent path always calls promptWithRoute after strict route validation.
+// The lifecycle correlation is read through the same helper the public path uses,
+// so the seam can never accept a submission identity the wire would refuse.
 func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
-	nonce := "unit-test-turn"
+	nonce := internalSeamTurnNonce
 	if route, err := parseInboundTurnRoute(params.Meta); err == nil {
 		nonce = route.TurnNonce
 	}
 
-	return s.promptWithRoute(ctx, params, nonce)
+	submission, err := s.agent.promptSubmission(params.Meta)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	return s.promptWithRoute(ctx, params, nonce, submission)
 }
 
-func (s *session) promptWithRoute(ctx context.Context, params acp.PromptRequest, turnNonce string) (acp.PromptResponse, error) {
+func (s *session) promptWithRoute(
+	ctx context.Context,
+	params acp.PromptRequest,
+	turnNonce string,
+	submission lifecycle.Submission,
+) (acp.PromptResponse, error) {
 	if err := s.ensureNotPoisoned(); err != nil {
 		return acp.PromptResponse{}, err
 	}
@@ -245,6 +275,8 @@ func (s *session) promptWithRoute(ctx context.Context, params acp.PromptRequest,
 
 	turnCtx := s.beginTurn(ctx, turnNonce)
 	defer s.finishTurn()
+
+	s.recordSubmission(submission)
 
 	invocation, command, matchedCommand, err := s.resolvePromptCommand(turnCtx, params)
 	if err != nil {

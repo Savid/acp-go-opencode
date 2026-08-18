@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/observer"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
@@ -52,6 +53,7 @@ type Agent struct {
 	nativeTurns              chan struct{}
 	clientCapabilities       acp.ClientCapabilities
 	positionEncoding         acp.PositionEncodingKind
+	lifecycle                lifecycle.Negotiated
 	runtime                  opencode.Client
 	runtimeGeneration        uint64
 	runtimeStarting          chan struct{}
@@ -283,6 +285,11 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		return acp.InitializeResponse{}, a.optionsError()
 	}
 
+	lifecycleAnswer, err := a.negotiateLifecycle(params.Meta)
+	if err != nil {
+		return acp.InitializeResponse{}, err
+	}
+
 	title := a.options.AgentTitle
 	positionEncoding := selectPositionEncoding(params.ClientCapabilities.PositionEncodings)
 
@@ -337,6 +344,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 	}
 
 	return acp.InitializeResponse{
+		Meta:            lifecycleAnswerMeta(lifecycleAnswer),
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
 			Name:    a.options.AgentName,
@@ -367,13 +375,27 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 }
 
 func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
+	// This adapter advertises no auth method, but "the key is not read here" and
+	// "there is no such method id" are different answers and a host that got the
+	// reserved literal wrong is owed the first one.
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.AuthenticateResponse{}, refusal
+	}
+
 	return acp.AuthenticateResponse{}, acp.NewInvalidParams(map[string]any{"methodId": params.MethodId})
 }
 
-func (a *Agent) Logout(context.Context, acp.LogoutRequest) (acp.LogoutResponse, error) {
+func (a *Agent) Logout(_ context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.LogoutResponse{}, refusal
+	}
+
 	return acp.LogoutResponse{}, nil
 }
 
+// SetSessionMode does not exist on this adapter, so it answers method not found
+// before any parameter is inspected: a method with no implementation has no
+// params to validate.
 func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
@@ -381,6 +403,12 @@ func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.
 func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	if err := a.ensureOpen(); err != nil {
 		return nil, err
+	}
+
+	if implementsExtensionMethod(method) {
+		if refusal := refuseLifecycleRawMeta(params); refusal != nil {
+			return nil, refusal
+		}
 	}
 
 	switch method {
@@ -401,6 +429,20 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 		}
 
 		return nil, acp.NewMethodNotFound(method)
+	}
+}
+
+// implementsExtensionMethod reports whether this adapter owns the named
+// extension method. The reserved lifecycle literal is refused on every route it
+// owns — including a provider-auth leg whose broker is unconfigured — while a
+// method this adapter does not implement keeps answering method not found.
+func implementsExtensionMethod(method string) bool {
+	switch method {
+	case ForkSessionMethod, AuthMethodsMethod, AuthAuthorizeMethod, AuthCallbackMethod,
+		AuthStatusMethod, AuthCancelMethod, AuthInventoryMethod, AuthDisconnectMethod:
+		return true
+	default:
+		return false
 	}
 }
 

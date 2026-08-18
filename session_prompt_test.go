@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -3839,7 +3840,7 @@ func TestPromptCancelSuppressesNativeError(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("Prompt did not start")
 	}
-	if err := agent.Cancel(ctx, CancelRequest(session.id, "unit-test-turn")); err != nil {
+	if err := agent.Cancel(ctx, CancelRequest(session.id, internalSeamTurnNonce)); err != nil {
 		t.Fatalf("Cancel: %v", err)
 	}
 	select {
@@ -4018,7 +4019,7 @@ func TestPromptBacklogQuestionFailsClosedBeforeNativeTurn(t *testing.T) {
 		Properties: json.RawMessage(`{"id":"question","sessionID":"native-1","questions":[{"question":"Continue?"}]}`),
 	}
 
-	response, err := current.promptWithRoute(context.Background(), promptCoverageParams(current.id), "nonce")
+	response, err := current.promptWithRoute(context.Background(), promptCoverageParams(current.id), "nonce", lifecycle.Submission{})
 	require.ErrorContains(t, err, "question callback arrived outside its originating turn")
 	require.Empty(t, response.StopReason)
 	require.Equal(t, 1, client.questionRejectCount())

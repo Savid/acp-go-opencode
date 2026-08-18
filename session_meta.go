@@ -30,8 +30,10 @@ type sessionMeta struct {
 	RawMessages      rawMessageConfig
 }
 
-func sessionMetaFromLifecycle(meta map[string]any) (sessionMeta, error) {
-	if err := validateLifecycleMeta(meta); err != nil {
+// sessionMetaFromVendorOptions reads the session-start options this adapter
+// carries in its own vendor namespace.
+func sessionMetaFromVendorOptions(meta map[string]any) (sessionMeta, error) {
+	if err := validateVendorOptionsMeta(meta); err != nil {
 		return sessionMeta{}, err
 	}
 
@@ -229,7 +231,11 @@ func extraPathDirsFromMeta(value any) ([]string, error) {
 	return dirs, nil
 }
 
-func validateLifecycleMeta(meta map[string]any) error {
+// validateVendorOptionsMeta refuses any member of this adapter's own
+// `_meta.opencode` namespace that it does not fix. It is the vendor-options
+// validator and has nothing to do with the family lifecycle extension, whose
+// negotiation and correlation values live in their own reserved literal.
+func validateVendorOptionsMeta(meta map[string]any) error {
 	if len(meta) == 0 {
 		return nil
 	}
@@ -289,11 +295,11 @@ func unsupportedField(path string) error {
 	})
 }
 
-// lifecycleMetaError normalizes lifecycle _meta validation failures to invalid
-// params (-32602): structured request errors pass through unchanged and plain
-// validation errors are wrapped so malformed _meta never surfaces as an
-// internal error.
-func lifecycleMetaError(err error) error {
+// vendorOptionsMetaError normalizes vendor `_meta.opencode` validation failures
+// to invalid params (-32602): structured request errors pass through unchanged
+// and plain validation errors are wrapped so malformed `_meta` never surfaces as
+// an internal error.
+func vendorOptionsMetaError(err error) error {
 	var reqErr *acp.RequestError
 	if errors.As(err, &reqErr) {
 		return reqErr

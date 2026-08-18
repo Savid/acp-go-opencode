@@ -19,7 +19,7 @@ import (
 
 func TestOutputSchemaAccepted(t *testing.T) {
 	schema := map[string]any{"type": "object"}
-	meta, err := sessionMetaFromLifecycle(OpenCodeOptions{OutputSchema: schema}.Meta())
+	meta, err := sessionMetaFromVendorOptions(OpenCodeOptions{OutputSchema: schema}.Meta())
 	if err != nil {
 		t.Fatalf("outputSchema rejected: %v", err)
 	}
@@ -33,7 +33,7 @@ func TestOutputSchemaAccepted(t *testing.T) {
 }
 
 func TestOutputSchemaInvalidRejected(t *testing.T) {
-	_, err := sessionMetaFromLifecycle(map[string]any{
+	_, err := sessionMetaFromVendorOptions(map[string]any{
 		opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: "not-an-object"}},
 	})
 	if err == nil {

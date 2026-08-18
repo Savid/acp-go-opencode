@@ -232,7 +232,7 @@ func TestOpenCodeExtraPathDirsBuilderClones(t *testing.T) {
 
 	dirs[0] = "/mutated"
 
-	meta, err := sessionMetaFromLifecycle(req.Meta)
+	meta, err := sessionMetaFromVendorOptions(req.Meta)
 	if err != nil {
 		t.Fatalf("session meta from builder: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestOpenCodeEnvBuilderClones(t *testing.T) {
 	env["WAGIE_API_TOKEN"] = "mutated"
 	delete(env, "CLEARED")
 
-	meta, err := sessionMetaFromLifecycle(req.Meta)
+	meta, err := sessionMetaFromVendorOptions(req.Meta)
 	if err != nil {
 		t.Fatalf("session meta from builder: %v", err)
 	}

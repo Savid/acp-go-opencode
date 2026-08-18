@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -207,7 +208,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent := NewAgent()
 		current := testSession(agent, newFakeOpenCodeClient())
 		current.runtimeLostCause = "runtime exited"
-		_, err := current.promptWithRoute(context.Background(), TextPromptRequest(current.id, "turn", "hello"), "turn")
+		_, err := current.promptWithRoute(context.Background(), TextPromptRequest(current.id, "turn", "hello"), "turn", lifecycle.Submission{})
 		require.ErrorContains(t, err, "opencode_recovery_generation_missing")
 	})
 

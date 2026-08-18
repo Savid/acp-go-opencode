@@ -22,6 +22,10 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
+	if err := refuseLifecycleMeta(params.Meta); err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+
 	if err := validateProviderAuthOptions(a.options); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -34,9 +38,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
-	meta, err := sessionMetaFromLifecycle(params.Meta)
+	meta, err := sessionMetaFromVendorOptions(params.Meta)
 	if err != nil {
-		return acp.NewSessionResponse{}, lifecycleMetaError(err)
+		return acp.NewSessionResponse{}, vendorOptionsMetaError(err)
 	}
 
 	if meta.Model == "" {
@@ -166,6 +170,10 @@ func (a *Agent) loadOrResumeSession(
 	mcpServers []acp.McpServer,
 	metaMap map[string]any,
 ) (*session, error) {
+	if err := refuseLifecycleMeta(metaMap); err != nil {
+		return nil, err
+	}
+
 	if err := a.ensureOpen(); err != nil {
 		return nil, err
 	}
@@ -190,9 +198,9 @@ func (a *Agent) loadOrResumeSession(
 		return nil, err
 	}
 
-	meta, err := sessionMetaFromLifecycle(metaMap)
+	meta, err := sessionMetaFromVendorOptions(metaMap)
 	if err != nil {
-		return nil, lifecycleMetaError(err)
+		return nil, vendorOptionsMetaError(err)
 	}
 
 	storeCtx, cancel := a.sessionStoreContext(ctx)
@@ -266,6 +274,10 @@ func (a *Agent) loadOrResumeSession(
 }
 
 func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.ListSessionsResponse{}, refusal
+	}
+
 	if err := a.ensureOpen(); err != nil {
 		return acp.ListSessionsResponse{}, err
 	}
@@ -345,6 +357,10 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 }
 
 func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.CloseSessionResponse{}, refusal
+	}
+
 	session, err := a.session(params.SessionId)
 	if err != nil {
 		return acp.CloseSessionResponse{}, err
@@ -366,6 +382,10 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 
 func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
 	ctx = a.observe.Extract(ctx, params.Meta)
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.UnstableDeleteSessionResponse{}, refusal
+	}
+
 	if params.SessionId == "" {
 		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
@@ -417,9 +437,9 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		return acp.UnstableForkSessionResponse{}, err
 	}
 
-	meta, err := sessionMetaFromLifecycle(params.Meta)
+	meta, err := sessionMetaFromVendorOptions(params.Meta)
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, lifecycleMetaError(err)
+		return acp.UnstableForkSessionResponse{}, vendorOptionsMetaError(err)
 	}
 
 	parent, err := a.session(params.SessionId)

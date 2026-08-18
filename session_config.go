@@ -10,7 +10,27 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
+// configOptionMeta reads the `_meta` of whichever variant of the config-option
+// union arrived.
+func configOptionMeta(params acp.SetSessionConfigOptionRequest) map[string]any {
+	switch {
+	case params.ValueId != nil:
+		return params.ValueId.Meta
+	case params.Boolean != nil:
+		return params.Boolean.Meta
+	default:
+		return nil
+	}
+}
+
 func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+	// The request is a union whose `_meta` lives on the chosen variant, so the
+	// reserved literal is refused on whichever variant the host sent, before the
+	// discriminator itself is judged.
+	if refusal := refuseLifecycleMeta(configOptionMeta(params)); refusal != nil {
+		return acp.SetSessionConfigOptionResponse{}, refusal
+	}
+
 	// Every option this agent advertises is a select, so the request member
 	// that made this call unsupported is the discriminator that chose the
 	// boolean form, not the value it carried.

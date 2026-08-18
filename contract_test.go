@@ -238,7 +238,7 @@ func TestLifecycleMetaStrictAllowlist(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := sessionMetaFromLifecycle(tt.meta)
+			_, err := sessionMetaFromVendorOptions(tt.meta)
 			if tt.err && err == nil {
 				t.Fatal("expected error")
 			}

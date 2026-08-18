@@ -18,7 +18,7 @@ func carrierOptions(meta map[string]any) map[string]any {
 }
 
 func TestSessionEnvMetaAcceptsBothShapesAndPreservesValues(t *testing.T) {
-	meta, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{
+	meta, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 		metaEnvKey: map[string]any{"WAGIE_API_TOKEN": "bearer", "CLEARED": ""},
 	}))
 	require.NoError(t, err)
@@ -26,20 +26,20 @@ func TestSessionEnvMetaAcceptsBothShapesAndPreservesValues(t *testing.T) {
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer", "CLEARED": ""}, meta.Env)
 
 	// An in-process host hands the map over already typed.
-	meta, err = sessionMetaFromLifecycle(carrierOptions(map[string]any{
+	meta, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 		metaEnvKey: map[string]string{"WAGIE_API_TOKEN": "bearer"},
 	}))
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer"}, meta.Env)
 
 	// An empty map is a value, not an omission: it clears the environment.
-	meta, err = sessionMetaFromLifecycle(carrierOptions(map[string]any{metaEnvKey: map[string]any{}}))
+	meta, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{metaEnvKey: map[string]any{}}))
 	require.NoError(t, err)
 	require.True(t, meta.EnvSet)
 	require.Empty(t, meta.Env)
 
 	// An absent option leaves the recorded value in place.
-	meta, err = sessionMetaFromLifecycle(carrierOptions(map[string]any{}))
+	meta, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{}))
 	require.NoError(t, err)
 	require.False(t, meta.EnvSet)
 	require.Nil(t, meta.Env)
@@ -66,7 +66,7 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{metaEnvKey: test.value}))
+			_, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{metaEnvKey: test.value}))
 			require.Equal(t, unsupportedField(test.field), err)
 		})
 	}
@@ -77,7 +77,7 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 // so Path is PATH there and an ordinary variable of its own everywhere else.
 func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T) {
 	for _, spelling := range []string{"path", "Path", "PaTh"} {
-		meta, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{
+		meta, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 			metaEnvKey: map[string]any{spelling: "/attacker/bin"},
 		}))
 
@@ -93,13 +93,13 @@ func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T)
 }
 
 func TestLifecycleMetaAllowsTheCarrierOptionsOnly(t *testing.T) {
-	_, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{
+	_, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 		metaEnvKey:           map[string]any{"WAGIE_API_TOKEN": "bearer"},
 		metaExtraPathDirsKey: []any{"/session/bin"},
 	}))
 	require.NoError(t, err)
 
-	_, err = sessionMetaFromLifecycle(carrierOptions(map[string]any{"envs": map[string]any{}}))
+	_, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{"envs": map[string]any{}}))
 	require.Equal(t, unsupportedField("_meta.opencode.options.envs"), err)
 }
 

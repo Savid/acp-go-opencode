@@ -13,10 +13,16 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const sessionUpdateAvailableCommands = "available_commands_update"
+
+// internalSeamTurnNonce authenticates a turn driven through the internal session
+// seam, which deterministic unit tests use in place of the wire. The public Agent
+// path never reaches it: both Prompt and Cancel hard-fail on a missing route.
+const internalSeamTurnNonce = "internal-seam-turn"
 
 var observeCancellationWait = func() {}
 
@@ -68,6 +74,7 @@ type session struct {
 	processedQuestion         map[string]struct{}
 	turnEpoch                 uint64
 	turnNonce                 string
+	submission                lifecycle.Submission
 	imageArtifacts            map[string]imageArtifactRecord
 	imageArtifactIdentities   map[string]string
 	emittedToolContent        map[string][]imageOutputItem
@@ -287,7 +294,7 @@ func (s *session) beginTurn(ctx context.Context, turnNonces ...string) context.C
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	turnNonce := "unit-test-turn"
+	turnNonce := internalSeamTurnNonce
 	if len(turnNonces) > 0 {
 		turnNonce = turnNonces[0]
 	}
@@ -316,6 +323,7 @@ func (s *session) finishTurn() {
 	}
 
 	s.turnNonce = ""
+	s.submission = lifecycle.Submission{}
 	s.updatedAt = time.Now().UTC().Format(time.RFC3339)
 	s.pending = map[string]opencode.PermissionRequest{}
 	s.questions = map[string]opencode.QuestionRequest{}
@@ -326,6 +334,24 @@ func (s *session) finishTurn() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// recordSubmission binds the prompt's submission identity to the turn the route
+// nonce authorized. Both envelopes name the same turn, and neither value is
+// derived from the other.
+func (s *session) recordSubmission(submission lifecycle.Submission) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.submission = submission
+}
+
+// currentSubmission reports the submission identity bound to the active turn.
+func (s *session) currentSubmission() lifecycle.Submission {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.submission
 }
 
 func (s *session) currentTurnNonce() string {
