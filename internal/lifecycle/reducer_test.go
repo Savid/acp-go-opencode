@@ -157,6 +157,47 @@ func TestReducerRefusesAnIncompleteSnapshotForeground(t *testing.T) {
 	}
 }
 
+// TestReducerRefusesAMisshapenSnapshotForegroundTurn proves the reducer holds an
+// in-memory snapshot to the same turn and origin rules the wire decoder holds a
+// received one to. An emitted snapshot never passes through the decoder, so a
+// rule enforced only there would let this adapter emit a foreground it would
+// refuse to read.
+func TestReducerRefusesAMisshapenSnapshotForegroundTurn(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name       string
+		foreground Foreground
+	}{
+		{
+			name:       "idle naming a turn",
+			foreground: Foreground{State: ForegroundIdle, CycleID: "cycle-1", TurnID: "turn-1", Origin: CauseSubmission},
+		},
+		{
+			name:       "turn without an origin",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cycle-1", TurnID: "turn-1"},
+		},
+		{
+			name:       "origin without a turn",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cycle-1", Origin: CauseSubmission},
+		},
+		{
+			name:       "origin outside the closed pair",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cycle-1", TurnID: "turn-1", Origin: Cause("close")},
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newReduction(promptContained())
+			require.ErrorIs(t, r.push(SnapshotEvent(row.foreground, nil, QuiescenceFact{})),
+				&ViolationError{Kind: ViolationMalformedEnvelope})
+			require.Nil(t, r.reducer.State().Foreground)
+			require.Empty(t, r.reducer.State().Turns)
+		})
+	}
+}
+
 // TestSnapshotActionSetIsJudgedWhole proves each rule the asserted action set is
 // held to, and that a refused snapshot projects nothing.
 func TestSnapshotActionSetIsJudgedWhole(t *testing.T) {

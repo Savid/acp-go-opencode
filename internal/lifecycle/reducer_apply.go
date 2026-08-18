@@ -23,9 +23,25 @@ func (r *Reducer) applySnapshot(delivery Delivery) error {
 // names — the turn its foreground reports, the turns its activities name as
 // origin, and its own activities — and every reference it makes resolves inside
 // that set: an action owner is a reference rather than an introduction.
+//
+// The foreground turn and origin rules are enforced here as well as in the
+// decoder, because this reducer is also the gate on what this adapter emits: a
+// snapshot built in memory never passes through the decoder, so a rule that
+// lived only there would judge streams this package reads and none it writes.
 func (r *Reducer) checkSnapshot(delivery Delivery, snapshot Snapshot) error {
 	if !snapshot.Foreground.State.Valid() || snapshot.Foreground.CycleID == "" {
 		return r.fail(delivery, ViolationMalformedEnvelope, "the snapshot's foreground is incomplete")
+	}
+
+	foreground := snapshot.Foreground
+
+	switch {
+	case foreground.State == ForegroundIdle && foreground.TurnID != "":
+		return r.fail(delivery, ViolationMalformedEnvelope, "an idle foreground reports no turn")
+	case (foreground.TurnID == "") != (foreground.Origin == ""):
+		return r.fail(delivery, ViolationMalformedEnvelope, "foreground origin is present exactly while a turn is")
+	case foreground.Origin != "" && foreground.Origin != CauseSubmission && foreground.Origin != CauseActivity:
+		return r.fail(delivery, ViolationMalformedEnvelope, "foreground origin "+string(foreground.Origin))
 	}
 
 	introduced := snapshot.introduces()
