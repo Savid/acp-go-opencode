@@ -1082,6 +1082,83 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	}
 }
 
+// TestOpenCodeReadEventStreamReportsAClosedScopeAtCleanEnd proves a stream that
+// ends cleanly on a scope that is already closed reports the close rather than a
+// disconnect: the scope is gone, so there is nothing to reconnect to.
+func TestOpenCodeReadEventStreamReportsAClosedScopeAtCleanEnd(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+
+	emptyStream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+	}))
+	defer emptyStream.Close()
+
+	client := &openCodeServer{
+		httpClient: emptyStream.Client(),
+		baseURL:    emptyStream.URL,
+		username:   "opencode",
+		password:   "secret",
+		events:     make(chan Event),
+		errs:       make(chan error, 1),
+		closed:     make(chan struct{}),
+	}
+	close(client.closed)
+
+	if err := client.readEventStream(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("closed scope clean end error = %v", err)
+	}
+}
+
+// TestOpenCodeReadEventsStopsWhenItsSubscriptionIsCancelled proves a cancelled
+// subscription stops reconnecting. The readiness handshake cancels its own
+// subscription once the handshake frame arrives, and a reader that kept
+// reconnecting on a dead context would hold an SSE connection nothing reads.
+func TestOpenCodeReadEventsStopsWhenItsSubscriptionIsCancelled(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+
+	requests := 0
+	client := &openCodeServer{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		})},
+		baseURL:  "http://opencode.test",
+		username: "opencode",
+		password: "secret",
+		events:   make(chan Event, 1),
+		errs:     make(chan error, 1),
+		closed:   make(chan struct{}),
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// The reconnect delay never fires, so the only way this returns at all is the
+	// cancelled subscription's own exit.
+	delays := 0
+	openCodeAfter = func(time.Duration) <-chan time.Time {
+		delays++
+
+		return make(chan time.Time)
+	}
+
+	client.readEvents(cancelled)
+
+	if delays != 1 {
+		t.Fatalf("reconnect delays = %d, want 1", delays)
+	}
+
+	if requests > 1 {
+		t.Fatalf("requests = %d, want at most 1", requests)
+	}
+}
+
 func TestOpenCodeReadEventsDropsErrorWhenChannelFullAndReconnects(t *testing.T) {
 	restoreOpenCodeClientSeams(t)
 	requests := 0

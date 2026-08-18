@@ -91,6 +91,8 @@ const (
 	fieldReply                = "reply"
 	fieldRequestID            = "requestID"
 	fieldSessionID            = "sessionID"
+	fieldMessageID            = "messageID"
+	fieldCallID               = "callID"
 )
 
 // openAPITypeArray is the OpenAPI schema "type" value for arrays.
@@ -713,6 +715,21 @@ func (r PermissionRequest) Route() PermissionRoute {
 	}
 
 	return PermissionRouteSession
+}
+
+// ToolCall reports the tool call this permission request holds up. The two native
+// shapes carry that correlation in different members — the session route names a
+// `tool` object and the API route names a `source` of type tool — and a reader
+// outside this package must not have to know which arrived.
+func (r PermissionRequest) ToolCall() PermissionTool {
+	if r.Tool.CallID != "" {
+		return r.Tool
+	}
+
+	messageID, _ := r.Source[fieldMessageID].(string)
+	callID, _ := r.Source[fieldCallID].(string)
+
+	return PermissionTool{MessageID: messageID, CallID: callID}
 }
 
 func (r PermissionRequest) ActionName() string {
@@ -1487,7 +1504,15 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 
 	s.sessionQuestionListSupport = docCapabilities.sessionQuestionList
 
-	go s.readEvents(eventCtx)
+	// The readiness handshake is the whole purpose of the runtime-wide event
+	// subscription: every session consumes its own directory-scoped stream, so
+	// nothing reads this one again. The subscription is cancelled the moment the
+	// handshake frame arrives rather than left running with no reader, where a
+	// full buffer would hold an SSE connection open for the process's whole life.
+	handshakeCtx, endHandshake := context.WithCancel(eventCtx)
+	defer endHandshake()
+
+	go s.readEvents(handshakeCtx)
 
 	select {
 	case event := <-s.events:
@@ -2549,6 +2574,8 @@ func (s *openCodeServer) readEventsWithTiming(ctx context.Context, after func(ti
 
 		select {
 		case <-s.closed:
+			return
+		case <-ctx.Done():
 			return
 		case <-after(reconnectDelay):
 		}
