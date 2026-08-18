@@ -48,12 +48,9 @@ func (c *foregroundCycle) terminalEvidence() bool {
 }
 
 // wake publishes terminal evidence to whoever waits on the cycle. It fires once:
-// the first evidence ends the cycle and later evidence changes nothing.
+// the first evidence ends the cycle and later evidence changes nothing. Every
+// cycle is created with its signal, so there is no unsignalled cycle to guard.
 func (c *foregroundCycle) wake() {
-	if c.signal == nil {
-		return
-	}
-
 	select {
 	case <-c.signal:
 	default:
@@ -68,10 +65,6 @@ func (c *foregroundCycle) wake() {
 // The stream is deliberately session-owned rather than prompt-owned. Prompt
 // completion never rotates it; native generation loss and session close fence it.
 func (s *session) openLifecycleStream() {
-	if s.agent == nil {
-		return
-	}
-
 	s.installLifecycleStream(s.agent.lifecycleNegotiated())
 }
 
@@ -100,10 +93,6 @@ func (s *session) installLifecycleStream(facts lifecycle.Negotiated) {
 // native session's events belong to their own ordering, so the identity changes
 // with the incarnation rather than outliving it.
 func (s *session) reopenLifecycleStream() {
-	if s.agent == nil {
-		return
-	}
-
 	facts := s.agent.lifecycleNegotiated()
 
 	s.lifecycleMu.Lock()
@@ -313,17 +302,10 @@ func (s *session) settleCycle(ctx context.Context, cycle *foregroundCycle, outco
 	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(cycle.id, cycle.turnID, stopReason, outcome))
 }
 
-// blockCycle records that an action stopped the current cycle and reports the
-// cycle that owes the accompanying foreground transition.
+// blockCycleLocked records that an action stopped the cycle that owes the
+// accompanying foreground transition. Every cycle is created with its blocker
+// set, so there is no unopened cycle to guard.
 func (s *session) blockCycleLocked(actionID string, cycle *foregroundCycle) {
-	if cycle == nil {
-		return
-	}
-
-	if cycle.blockers == nil {
-		cycle.blockers = map[string]struct{}{}
-	}
-
 	cycle.blockers[actionID] = struct{}{}
 }
 

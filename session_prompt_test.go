@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -3360,4 +3362,302 @@ func TestCommandPromptPartsPropagatesBlobError(t *testing.T) {
 		Type: "resource", Resource: acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{}},
 	}}}, nil)
 	require.Error(t, err)
+}
+
+// TestSeamPromptRefusesAnUnreadableSubmissionCorrelation proves the internal
+// prompt seam decodes its correlation through the same helper the wire path uses:
+// a request carrying an unreadable lifecycle envelope is refused rather than
+// silently promoted to a seam-minted submission.
+func TestSeamPromptRefusesAnUnreadableSubmissionCorrelation(t *testing.T) {
+	current, _, connection := lifecycleSession(t)
+
+	request := TextPromptRequest(current.id, internalSeamTurnNonce, "hello")
+	request.Meta[lifecycle.MetaKey] = "not an envelope"
+
+	_, err := current.Prompt(context.Background(), request)
+	require.Error(t, err)
+	require.Equal(t, []string{"lifecycle_snapshot"}, connection.lifecycleEvents(t))
+}
+
+// TestCommandDispatchWithoutEvidenceFailsOnTheTurnDeadline proves the dispatch
+// boundary is bounded too: a completion-reporting route that acknowledges nothing
+// and publishes nothing fails on the turn deadline instead of holding the prompt
+// past it.
+func TestCommandDispatchWithoutEvidenceFailsOnTheTurnDeadline(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+
+	hold := make(chan struct{})
+	defer close(hold)
+
+	client.dispatchCommand = func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error) {
+		<-hold
+
+		return opencode.NativeMessage{}, nil
+	}
+
+	current := testSession(t, NewAgent(WithTurnTimeout(20*time.Millisecond)), client)
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "/review"))
+	assertTurnFailed(t, err, causeTimeout, "deadline")
+	require.Equal(t, 1, client.abortCount(), "the timed-out dispatch left native work running")
+	require.Nil(t, current.currentCycle(), "a frame that acknowledged nothing opened a turn")
+}
+
+// TestCommandDispatchWithdrawnByCancelIsReportedAsTheCancellation proves a host
+// cancel during the dispatch boundary answers the prompt as a cancellation: the
+// frame was never accepted, so no turn and no submission exist to report.
+func TestCommandDispatchWithdrawnByCancelIsReportedAsTheCancellation(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+
+	started := make(chan struct{})
+	hold := make(chan struct{})
+
+	defer close(hold)
+
+	client.dispatchCommand = func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error) {
+		close(started)
+		<-hold
+
+		return opencode.NativeMessage{}, nil
+	}
+
+	agent := NewAgent()
+	current := testSession(t, agent, client)
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "/review"))
+		done <- err
+	}()
+
+	<-started
+	require.NoError(t, agent.Cancel(context.Background(), CancelRequest(current.id, internalSeamTurnNonce)))
+	require.ErrorContains(t, <-done, "opencode_prompt_cancelled_before_dispatch")
+}
+
+// TestCommandDispatchPanicAnswersThePrompt proves a crashed native command route
+// answers its caller: the panic becomes the dispatch failure it is instead of
+// leaving the prompt waiting on a goroutine that died.
+func TestCommandDispatchPanicAnswersThePrompt(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+	client.dispatchCommand = func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error) {
+		panic("native command exploded")
+	}
+
+	current := testSession(t, NewAgent(), client)
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "/review"))
+	assertTurnFailed(t, err, causeTransport, "panicked")
+}
+
+// TestDispatchFailureAfterTheBindingIsLostReportsTheLostRuntime proves a route
+// that failed because its runtime binding died reports the loss rather than the
+// route's own description of it.
+func TestDispatchFailureAfterTheBindingIsLostReportsTheLostRuntime(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	current := testSession(t, NewAgent(), client)
+
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		// The runtime-exit watcher records the loss while the frame is in flight;
+		// the turn's own cancel handle was published before it, so the route
+		// simply fails against a binding that is already gone.
+		current.mu.Lock()
+		current.runtimeLostCause = "shared OpenCode runtime exited"
+		current.mu.Unlock()
+
+		return opencode.NativeMessage{}, errors.New("write on a closed runtime")
+	}
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+	assertTurnFailed(t, err, causeTransport, "shared OpenCode runtime exited")
+}
+
+// TestRefusedMessageFrameIsReportedAsRejected proves a plain prompt frame the
+// native dispatcher refused with a bad request is the caller's answer: invalid
+// params naming the refusal, never a turn failure.
+func TestRefusedMessageFrameIsReportedAsRejected(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.refusesDispatch(&opencode.HTTPError{
+		Method: "POST", Path: "/session/native-1/message", Status: "400 Bad Request",
+		StatusCode: http.StatusBadRequest, Body: "unsupported part",
+	})
+
+	current := testSession(t, NewAgent(), client)
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+
+	var reqErr *acp.RequestError
+	require.ErrorAs(t, err, &reqErr)
+	require.Equal(t, -32602, reqErr.Code)
+
+	data, ok := reqErr.Data.(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "opencode_prompt_rejected", data[jsonFieldError])
+}
+
+// TestCommandRunFailureAfterAcceptanceFailsTheAcceptedTurn proves the
+// completion-reporting route's two boundaries are distinct: the first native
+// event admits the frame, and the route's later error is the accepted turn's
+// outcome rather than a dispatch refusal.
+func TestCommandRunFailureAfterAcceptanceFailsTheAcceptedTurn(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+
+	hold := make(chan struct{})
+	client.dispatchCommand = func(_ context.Context, id string, _ opencode.CommandRequest) (opencode.NativeMessage, error) {
+		client.publishEvent(opencode.Event{
+			Type:       opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": "assistant-1", "sessionID": id, "role": "assistant"}}),
+		})
+		<-hold
+
+		return opencode.NativeMessage{}, errors.New("command run failed")
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "/review"))
+		done <- err
+	}()
+
+	requireEventually(t, func() bool {
+		return len(connection.lifecycleEventsOfType(t, "prompt_accepted")) == 1
+	}, "the admitted frame was never accepted")
+
+	close(hold)
+	assertTurnFailed(t, <-done, causeTransport, "command run failed")
+	requireLifecycleOutcome(t, connection, lifecycle.OutcomeFailed)
+	requireLifecycleReduces(t, connection)
+}
+
+// TestAcceptedTurnOutlivingItsCallerReadsTheEvidenceItAlreadyHas proves a turn
+// context that dies for a reason this host did not ask for is not a cancellation:
+// the turn reports the terminal evidence its cycle already holds.
+func TestAcceptedTurnOutlivingItsCallerReadsTheEvidenceItAlreadyHas(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	started := make(chan struct{})
+	client.hangsAfterDispatch(started)
+	client.stageAssistantMessage("native-1", "assistant-1")
+
+	current := testSession(t, NewAgent(), client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan acp.PromptResponse, 1)
+
+	go func() {
+		response, err := current.Prompt(ctx, TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+		require.NoError(t, err)
+		done <- response
+	}()
+
+	<-started
+	cancel()
+
+	require.Equal(t, acp.StopReasonEndTurn, (<-done).StopReason)
+	require.False(t, current.wasCancelled(), "a released caller context was reported as a cancellation")
+}
+
+// TestAcceptedTurnThatOutlivesItsDeadlineFailsAsATimeout proves the configured
+// deadline settles an accepted turn the same way every other terminal does: the
+// native work is interrupted, the harness acknowledges it stopped, and the turn
+// fails with cause timeout rather than reporting a cancellation nobody asked for.
+func TestAcceptedTurnThatOutlivesItsDeadlineFailsAsATimeout(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	started := make(chan struct{})
+	client.hangsAfterDispatch(started)
+	client.abortFunc = func(id string) error {
+		client.publishSessionIdle(id)
+
+		return nil
+	}
+
+	current := testSession(t, NewAgent(WithTurnTimeout(20*time.Millisecond)), client)
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+	assertTurnFailed(t, err, causeTimeout, "deadline")
+	require.Equal(t, 1, client.abortCount())
+}
+
+// TestTimedOutTurnWhoseInterruptIsRefusedReportsAnUnprovenSettlement proves the
+// interrupt acknowledgement is the settlement boundary: a harness that refused
+// the interrupt leaves the turn's end unproven, and the prompt says so rather
+// than reporting a deadline it cannot back.
+func TestTimedOutTurnWhoseInterruptIsRefusedReportsAnUnprovenSettlement(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	started := make(chan struct{})
+	client.hangsAfterDispatch(started)
+	client.abortFunc = func(string) error { return errors.New("harness refused the interrupt") }
+
+	current := testSession(t, NewAgent(WithTurnTimeout(20*time.Millisecond)), client)
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+	require.ErrorContains(t, err, "opencode_turn_settlement_unproven")
+	require.ErrorContains(t, err, "harness refused the interrupt")
+}
+
+// TestCancelledTurnThatCannotReportItsEndSurfacesTheDeliveryFailure proves the
+// ending transition is load-bearing: a cancellation whose one ending envelope
+// could not be delivered answers with that failure instead of a clean cancelled
+// response the stream never carried.
+func TestCancelledTurnThatCannotReportItsEndSurfacesTheDeliveryFailure(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+
+	started := make(chan struct{})
+	client.hangsAfterDispatch(started)
+	client.abortFunc = func(id string) error {
+		connection.mu.Lock()
+		connection.updateErr = errors.New("wire down")
+		connection.mu.Unlock()
+		client.publishSessionIdle(id)
+
+		return nil
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
+		done <- err
+	}()
+
+	<-started
+	require.NoError(t, current.agent.Cancel(context.Background(), CancelRequest(current.id, internalSeamTurnNonce)))
+	require.ErrorContains(t, <-done, "wire down")
+
+	require.ErrorContains(t, current.lifecycleFailure(), "deliver lifecycle sequence",
+		"an undeliverable ending transition left the stream unlatched")
+}
+
+// TestTurnWithNoReadableTranscriptFails proves the settling read is not optional:
+// a transcript this session cannot read, and a transcript holding no assistant
+// message for the turn, both fail the turn rather than answering end_turn with
+// nothing behind it.
+func TestTurnWithNoReadableTranscriptFails(t *testing.T) {
+	t.Run("transcript read fails", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.messagesErr = errors.New("transcript unavailable")
+		current := testSession(t, NewAgent(), client)
+
+		_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+		assertTurnFailed(t, err, causeTransport, "read OpenCode turn messages")
+	})
+
+	t.Run("transcript holds no assistant message", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.messages = []opencode.NativeMessage{{Info: opencode.NativeMessageInfo{
+			ID: "user-1", SessionID: "native-1", Role: roleUser,
+		}}}
+		current := testSession(t, NewAgent(), client)
+
+		_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+		assertTurnFailed(t, err, causeTransport, "no assistant message")
+	})
 }

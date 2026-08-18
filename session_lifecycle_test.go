@@ -900,3 +900,124 @@ func TestHeldEventOverflowFailsClosed(t *testing.T) {
 
 	require.ErrorContains(t, current.lifecycleFailure(), "held OpenCode event queue exceeded")
 }
+
+// TestAnEventTheStreamsOwnRulesRefuseLatchesIt proves emission is validated
+// against the same rules a consumer applies: an event naming a turn the stream
+// never introduced consumes its sequence and latches the stream rather than
+// reaching a host that would fail closed on it.
+func TestAnEventTheStreamsOwnRulesRefuseLatchesIt(t *testing.T) {
+	current, _, connection := lifecycleSession(t)
+
+	before := connection.updateCount()
+	require.Error(t, current.emitLifecycle(context.Background(),
+		lifecycle.IdleEvent("cycle-9", "turn-9", string(acp.StopReasonEndTurn), lifecycle.OutcomeSuccess)))
+
+	require.Equal(t, before, connection.updateCount(), "a refused event was delivered anyway")
+	require.Error(t, current.lifecycleFailure())
+}
+
+// TestLifecycleDeliveryWithoutAConnectionFailsTheEstablishingRequest proves the
+// stream has exactly one legal carrier: with no ACP connection to carry it, the
+// session refuses to establish rather than opening a stream it can never deliver.
+func TestLifecycleDeliveryWithoutAConnectionFailsTheEstablishingRequest(t *testing.T) {
+	agent := negotiatedAgent(t)
+	client := newFakeOpenCodeClient()
+	client.ensureSyncAggregate("native-1")
+
+	current := newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"),
+		client, sessionMeta{}, idmapRecord{
+			SessionID: "session-1", NativeSessionID: "native-1", Format: SessionStoreFormat,
+		})
+
+	require.ErrorContains(t, current.establish(context.Background()), "no ACP connection")
+	require.ErrorContains(t, current.lifecycleFailure(), "no ACP connection")
+}
+
+// TestAgentOriginCycleThatCannotBeAnnouncedIsNeverOpened proves the agent-origin
+// turn and its opening transition are one step: a transition that could not be
+// delivered leaves no cycle behind for later events to attach to.
+func TestAgentOriginCycleThatCannotBeAnnouncedIsNeverOpened(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+	native := current.idmap.NativeSessionID
+
+	connection.mu.Lock()
+	connection.updateErr = errors.New("wire down")
+	connection.mu.Unlock()
+
+	client.publishEvent(opencode.Event{
+		Type:       opencode.EventSessionStatus,
+		Properties: mustJSONValue(map[string]any{"sessionID": native, "status": map[string]any{"type": "busy"}}),
+	})
+
+	requireEventually(t, func() bool { return current.lifecycleFailure() != nil }, "the transition failure was swallowed")
+	require.Nil(t, current.currentCycle(), "an unannounced cycle was opened anyway")
+}
+
+// TestASecondForegroundCycleIsRefused proves the foreground is single-occupancy:
+// a prompt arriving while agent-origin work already holds the cycle is refused
+// rather than opening a second turn over the same foreground.
+func TestASecondForegroundCycleIsRefused(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+	native := current.idmap.NativeSessionID
+
+	started := make(chan struct{})
+	client.hangsAfterDispatch(started)
+
+	client.publishEvent(opencode.Event{
+		Type:       opencode.EventSessionStatus,
+		Properties: mustJSONValue(map[string]any{"sessionID": native, "status": map[string]any{"type": "busy"}}),
+	})
+	requireEventually(t, func() bool { return current.currentCycle() != nil }, "no agent-origin cycle opened")
+
+	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
+	require.ErrorContains(t, err, "already holds foreground cycle")
+
+	requireSignal(t, started)
+	require.NotNil(t, current.currentCycle(), "the refused prompt ended the agent-origin turn")
+
+	client.publishSessionIdle(native)
+	requireEventually(t, func() bool { return current.currentCycle() == nil }, "the agent-origin turn never settled")
+	requireLifecycleReduces(t, connection)
+}
+
+// TestPanickingPermissionRequestFailsItsActionInstead proves a crashed outbound
+// request answers OpenCode: the action reports failed and the harness is released
+// rather than left blocked on a request whose goroutine died.
+func TestPanickingPermissionRequestFailsItsActionInstead(t *testing.T) {
+	agent := negotiatedAgent(t)
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(&panickingPermissionClient{recordingAgentClient: connection})
+	client := newFakeOpenCodeClient()
+	current := testSession(t, agent, client)
+	require.NoError(t, current.establish(context.Background()))
+	t.Cleanup(current.stopPump)
+
+	current.markPublishedToolCall("call-1")
+	client.publishEvent(permissionAskedEvent(current.idmap.NativeSessionID, "permission-1", "call-1"))
+
+	requireEventually(t, func() bool { return client.permissionReplyCount() == 1 }, "OpenCode was left blocked")
+	require.Equal(t, permissionReplyReject, client.permissionReply(0).reply)
+
+	requireEventually(t, func() bool {
+		actions := connection.lifecycleEventsOfType(t, "action_update")
+		if len(actions) != 2 {
+			return false
+		}
+
+		terminal, _ := actions[1]["action"].(map[string]any)
+
+		return terminal["state"] == string(lifecycle.ActionFailed)
+	}, "the crashed request never terminalized")
+}
+
+// panickingPermissionClient is a host whose permission request crashes.
+type panickingPermissionClient struct {
+	*recordingAgentClient
+}
+
+func (c *panickingPermissionClient) RequestPermission(
+	context.Context,
+	acp.RequestPermissionRequest,
+) (acp.RequestPermissionResponse, error) {
+	panic("host permission handler exploded")
+}

@@ -143,10 +143,10 @@ func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 	missing.runtimeFatalErr = containmentErr
 	require.ErrorIs(t, missing.retireSharedRuntime(9, "fatal"), containmentErr)
 
-	nilTarget := NewAgent(WithHome(t.TempDir()))
-	nilTarget.runtime = newFakeOpenCodeClient()
-	nilTarget.runtimeGeneration = 1
-	require.NoError(t, nilTarget.retireSharedRuntime(1, "nil target", nil))
+	sessionless := NewAgent(WithHome(t.TempDir()))
+	sessionless.runtime = newFakeOpenCodeClient()
+	sessionless.runtimeGeneration = 1
+	require.NoError(t, sessionless.retireSharedRuntime(1, "no sessions"))
 }
 
 func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {

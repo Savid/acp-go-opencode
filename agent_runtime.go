@@ -191,7 +191,7 @@ func (a *Agent) handleSharedRuntimeExit(runtime opencode.Client, generation uint
 // retireSharedRuntime is the sole exact-generation process-containment fence.
 // Every caller for one generation observes the same shutdown/proof result, and
 // no replacement runtime can start until that result has been published.
-func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...*session) error {
+func (a *Agent) retireSharedRuntime(generation uint64, cause string) error {
 	a.mu.Lock()
 	if retirement := a.runtimeRetirements[generation]; retirement != nil {
 		done := retirement.done
@@ -218,23 +218,8 @@ func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...
 	runtime := a.runtime
 	sessions := make([]*session, 0, len(a.sessions))
 
-	seenSessions := make(map[*session]struct{}, len(a.sessions)+len(targets))
 	for _, current := range a.sessions {
 		sessions = append(sessions, current)
-		seenSessions[current] = struct{}{}
-	}
-
-	for _, target := range targets {
-		if target == nil {
-			continue
-		}
-
-		if _, exists := seenSessions[target]; exists {
-			continue
-		}
-
-		sessions = append(sessions, target)
-		seenSessions[target] = struct{}{}
 	}
 
 	retirement := &runtimeRetirement{generation: generation, done: make(chan struct{})}

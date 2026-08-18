@@ -276,3 +276,123 @@ func TestDeleteNativeAndCloseSettlesTheSession(t *testing.T) {
 	require.NoError(t, current.DeleteNativeAndClose(context.Background()))
 	require.NotEmpty(t, client.deleted)
 }
+
+// TestInterruptNativeWorkNeedsABindingAndReportsRefusals proves the failure-path
+// interrupt is bounded by the session's own binding: with no runtime bound it
+// asks nobody, and a refused interrupt is recorded rather than swallowed.
+func TestInterruptNativeWorkNeedsABindingAndReportsRefusals(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	current := testSession(t, NewAgent(), client)
+	current.stopPump()
+
+	client.abortErr = errors.New("harness refused the interrupt")
+	current.interruptNativeWork(ctx)
+	require.Equal(t, []string{"native-1"}, client.abortedSessions())
+
+	current.mu.Lock()
+	current.client = nil
+	current.mu.Unlock()
+
+	current.interruptNativeWork(ctx)
+	require.Equal(t, []string{"native-1"}, client.abortedSessions(), "a session with no binding interrupted anyway")
+}
+
+// TestCloneAvailableCommandsKeepsTheAbsentCatalogAbsent proves an absent command
+// catalog clones as absent: an empty catalog is a published fact, and inventing
+// one would report a catalog this session never read.
+func TestCloneAvailableCommandsKeepsTheAbsentCatalogAbsent(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, cloneAvailableCommands(nil))
+	require.Equal(t, []acp.AvailableCommand{}, cloneAvailableCommands([]acp.AvailableCommand{}))
+}
+
+// TestSettleForShutdownStopsAtTheFirstUnprovenStep proves the close and delete
+// boundary is a ladder: the interrupt, its native acknowledgement, and the
+// native-safe prefix each have to succeed before the session may report its work
+// over, and a rung that fails stops the ladder there.
+func TestSettleForShutdownStopsAtTheFirstUnprovenStep(t *testing.T) {
+	t.Parallel()
+
+	openCycle := func(current *session, terminal bool) *foregroundCycle {
+		cycle := &foregroundCycle{id: "cycle-1", turnID: "turn-1", blockers: map[string]struct{}{}, signal: make(chan struct{})}
+		if terminal {
+			cycle.idle = true
+
+			close(cycle.signal)
+		}
+
+		current.lifecycleMu.Lock()
+		current.cycle = cycle
+		current.lifecycleMu.Unlock()
+
+		return cycle
+	}
+
+	t.Run("refused interrupt", func(t *testing.T) {
+		t.Parallel()
+
+		client := newFakeOpenCodeClient()
+		client.abortErr = errors.New("harness refused the interrupt")
+		current := testSession(t, NewAgent(), client)
+		current.stopPump()
+		openCycle(current, false)
+
+		require.ErrorContains(t, current.settleForShutdown(context.Background()), "harness refused the interrupt")
+	})
+
+	t.Run("unacknowledged interrupt", func(t *testing.T) {
+		t.Parallel()
+
+		current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		current.stopPump()
+		cycle := openCycle(current, false)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+
+		require.ErrorContains(t, current.settleForShutdown(ctx), "did not report idle after the interrupt")
+		require.False(t, cycle.settled, "an unacknowledged cycle was reported settled")
+	})
+
+	t.Run("uncommittable prefix", func(t *testing.T) {
+		t.Parallel()
+
+		store := &errorSessionStore{err: errors.New("store offline")}
+		current := testSession(t, NewAgent(WithSessionStore(store)), newFakeOpenCodeClient())
+		current.stopPump()
+		cycle := openCycle(current, true)
+
+		require.ErrorContains(t, current.settleForShutdown(context.Background()), "store offline")
+		require.False(t, cycle.settled, "a cycle whose prefix is unbacked was reported settled")
+	})
+}
+
+// TestRecoveryWithoutACommittedGenerationRefusesThePrompt proves recovery is
+// store-backed: with the loss already cleared by a concurrent recovery and no
+// committed generation to restore, the prompt is refused rather than rebound to a
+// native session this adapter cannot prove it owns.
+func TestRecoveryWithoutACommittedGenerationRefusesThePrompt(t *testing.T) {
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := NewAgent(WithSessionStore(store))
+	current := testSession(t, agent, newFakeOpenCodeClient())
+
+	store.onLoad = func(SessionKey) ([]SessionStoreEntry, error) {
+		// A concurrent recovery installs a fresh binding while this read is in
+		// flight, so the loss that sent this prompt here is no longer recorded.
+		current.mu.Lock()
+		current.runtimeLostCause = ""
+		current.mu.Unlock()
+
+		return nil, nil
+	}
+
+	agent.mu.Lock()
+	agent.runtimeGeneration++
+	agent.mu.Unlock()
+
+	require.ErrorContains(t, current.ensureRuntime(context.Background()), "opencode_recovery_generation_missing")
+}

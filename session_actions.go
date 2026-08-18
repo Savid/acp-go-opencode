@@ -110,13 +110,8 @@ func (r *actionRegistry) snapshot() []*pendingAction {
 	return actions
 }
 
-// blocked reports whether any action is pending. A session with no registry holds
-// no action, which is what an absent registry means.
+// blocked reports whether any action is pending.
 func (r *actionRegistry) blocked() bool {
-	if r == nil {
-		return false
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -556,12 +551,9 @@ func (s *session) resolveActionRequest(ctx context.Context, action *pendingActio
 
 // recordActionFailure latches an action failure onto the session's lifecycle
 // state. A failure here is not a prompt's own failure — the action may belong to
-// an agent-origin turn — so it is recorded where the owning cycle settles.
+// an agent-origin turn — so it is recorded where the owning cycle settles. Every
+// caller reports a failure it already holds, so there is no nil error to guard.
 func (s *session) recordActionFailure(err error) {
-	if err == nil {
-		return
-	}
-
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 

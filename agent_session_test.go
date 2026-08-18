@@ -1509,3 +1509,116 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	require.Equal(t, []string{"/session/bin"}, second.scopes()[0].ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }
+
+// TestEstablishFailureFailsEveryEstablishingRequest proves the lifecycle stream
+// is part of establishment on all four paths that open one: a session whose
+// opening snapshot cannot be delivered fails its request instead of being handed
+// to a host it can never speak to.
+func TestEstablishFailureFailsEveryEstablishingRequest(t *testing.T) {
+	ctx := context.Background()
+
+	breakStream := func(connection *recordingAgentClient) {
+		connection.mu.Lock()
+		defer connection.mu.Unlock()
+
+		connection.updateErr = errors.New("wire down")
+	}
+
+	t.Run("new", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.createSession = testNativeSession("native")
+		agent := negotiatedAgent(t)
+		connection := newRecordingAgentClient()
+		agent.setAgentClient(connection)
+		agent.runtime = client
+		breakStream(connection)
+
+		_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+		require.ErrorContains(t, err, "wire down")
+		require.True(t, client.closed, "a session that never established kept its native scope")
+	})
+
+	stored := func(t *testing.T, cwd string) *Agent {
+		t.Helper()
+
+		snapshot := validSyncSnapshot("session", "native", cwd)
+		snapshot.Session.Model = stateSnapshotModel{ProviderID: "openai", ModelID: "gpt-test"}
+		encoded, err := json.Marshal(snapshot)
+		require.NoError(t, err)
+
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+			Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{encoded},
+		}}))
+
+		client := newFakeOpenCodeClient()
+		client.getSession = testNativeSession("native")
+		agent := negotiatedAgent(t, WithSessionStore(store))
+		connection := newRecordingAgentClient()
+		agent.setAgentClient(connection)
+		agent.runtime = client
+		breakStream(connection)
+
+		return agent
+	}
+
+	t.Run("load", func(t *testing.T) {
+		cwd := t.TempDir()
+		_, err := stored(t, cwd).LoadSession(ctx, LoadSessionRequest("session", cwd))
+		require.ErrorContains(t, err, "wire down")
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		cwd := t.TempDir()
+		_, err := stored(t, cwd).ResumeSession(ctx, ResumeSessionRequest("session", cwd))
+		require.ErrorContains(t, err, "wire down")
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.forkSession = testNativeSession("native-child")
+		client.getSession = testNativeSession("native-child")
+		client.ensureSyncAggregate("native-child")
+
+		agent := negotiatedAgent(t)
+		connection := newRecordingAgentClient()
+		agent.setAgentClient(connection)
+		agent.runtime = client
+		parent := testSession(t, agent, client)
+		agent.sessions[parent.id] = parent
+		breakStream(connection)
+
+		_, err := agent.forkSession(ctx, ForkSessionRequest(parent.id, t.TempDir()))
+		require.ErrorContains(t, err, "wire down")
+	})
+}
+
+// TestCloseSessionRefusesWithoutADurableSnapshot proves close is store-backed:
+// a session whose snapshot cannot be committed stays addressable for a retry
+// rather than being released with state no reload could restore.
+func TestCloseSessionRefusesWithoutADurableSnapshot(t *testing.T) {
+	agent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("store offline")}))
+	current := testSession(t, agent, newFakeOpenCodeClient())
+	agent.sessions[current.id] = current
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorContains(t, err, "store offline")
+	require.Contains(t, agent.sessions, current.id, "the session was released without a durable snapshot")
+}
+
+// TestDeleteSessionKeepsTheHandleWhenNativeTeardownFails proves the durable
+// tombstone is published only after native deletion and containment succeed: a
+// refused interrupt leaves the handle addressable instead of reporting a deletion
+// whose native state survived.
+func TestDeleteSessionKeepsTheHandleWhenNativeTeardownFails(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.abortErr = errors.New("harness refused the interrupt")
+	agent := NewAgent()
+	current := testSession(t, agent, client)
+	agent.sessions[current.id] = current
+
+	_, err := agent.UnstableDeleteSession(context.Background(), DeleteSessionRequest(current.id))
+	require.ErrorContains(t, err, "harness refused the interrupt")
+	require.Contains(t, agent.sessions, current.id, "a session whose native teardown failed was forgotten")
+	require.False(t, agent.isDeleted(current.id), "a tombstone was published for an uncontained session")
+}
