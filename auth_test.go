@@ -38,7 +38,7 @@ func newAuthAgent(t *testing.T) authHarness {
 	require.NotNil(t, agent.providerAuth)
 
 	client := newFakeOpenCodeClient()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 
 	agent.mu.Lock()
 	agent.sessions[session.id] = session

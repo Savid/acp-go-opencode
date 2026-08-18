@@ -109,7 +109,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent := NewAgent()
 		agent.runtime = newFakeOpenCodeClient()
 		agent.runtimeGeneration = 2
-		current := testSession(agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient())
 		current.runtimeGeneration = 1
 		require.ErrorContains(t, agent.storeStartedSession(current), "runtime generation changed")
 	})
@@ -150,7 +150,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent = NewAgent()
 		agent.runtime = exited
 		agent.runtimeGeneration = 1
-		current := testSession(agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient())
 		installed, closed := current.installRecoveredRuntime(exited, func() {}, current.idmap, 1)
 		require.False(t, installed)
 		require.False(t, closed)
@@ -199,17 +199,17 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("store error", func(t *testing.T) {
 		store := &errorSessionStore{err: errors.New("store failed")}
 		agent := NewAgent(WithSessionStore(store))
-		current := testSession(agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient())
 		current.runtimeLostCause = "runtime exited"
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), "store failed")
 	})
 
-	t.Run("missing committed generation reaches prompt", func(t *testing.T) {
+	t.Run("missing committed generation reaches prompt as the loss", func(t *testing.T) {
 		agent := NewAgent()
-		current := testSession(agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient())
 		current.runtimeLostCause = "runtime exited"
 		_, err := current.promptWithRoute(context.Background(), TextPromptRequest(current.id, "turn", "hello"), "turn", lifecycle.Submission{})
-		require.ErrorContains(t, err, "opencode_recovery_generation_missing")
+		assertTurnFailed(t, err, causeTransport, "runtime exited")
 	})
 
 	t.Run("cancelled after successful store load", func(t *testing.T) {
@@ -313,7 +313,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 // this session no longer holds.
 func TestLostRuntimeFailsAPromptBeforeItIsAccepted(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	current := testSession(NewAgent(), client)
+	current := testSession(t, NewAgent(), client)
 
 	dispatched := false
 	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {

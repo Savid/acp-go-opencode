@@ -83,6 +83,7 @@ type session struct {
 	turnEpoch               uint64
 	turnNonce               string
 	submission              lifecycle.Submission
+	seamSubmissions         uint64
 	imageArtifacts          map[string]imageArtifactRecord
 	imageArtifactIdentities map[string]string
 	emittedToolContent      map[string][]imageOutputItem
@@ -383,6 +384,7 @@ func (s *session) currentTurnNonce() string {
 func (s *session) cancelTurn(ctx context.Context) error {
 	s.mu.Lock()
 	cancel := s.cancel
+	alreadyCancelled := s.cancelled
 	s.cancelled = true
 	client := s.client
 	nativeID := s.idmap.NativeSessionID
@@ -392,7 +394,10 @@ func (s *session) cancelTurn(ctx context.Context) error {
 		cancel()
 	}
 
-	if client == nil || nativeID == "" {
+	// One turn is interrupted once: a cancel notification and the cancelled
+	// turn's own settlement both arrive here, and a second native abort would
+	// interrupt whatever the session does next.
+	if alreadyCancelled || client == nil || nativeID == "" {
 		return nil
 	}
 
@@ -985,6 +990,17 @@ func (s *session) detachRuntime(generation uint64, cause string) {
 	client := s.client
 	s.mu.Unlock()
 
+	// The runtime that would have reported the open cycle's idle is gone, so
+	// that evidence can never arrive: the loss itself is the terminal evidence,
+	// recorded as the cycle's failure before its waiter is woken. The cancelled
+	// flag stays untouched — a lost runtime is not a cancellation.
+	s.lifecycleMu.Lock()
+	if s.cycle != nil && s.cycle.failure == nil && !s.cycle.settled {
+		s.cycle.failure = acp.NewInternalError(turnFailedData(causeTransport, cause, 0, ""))
+		s.cycle.wake()
+	}
+	s.lifecycleMu.Unlock()
+
 	if cancel != nil {
 		cancel()
 	}
@@ -1052,6 +1068,10 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 	}
 
 	if !ok {
+		if failure := s.runtimeFailure(); failure != nil {
+			return failure
+		}
+
 		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "opencode_recovery_generation_missing"})
 	}
 

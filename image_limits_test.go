@@ -33,7 +33,7 @@ func TestImageLimitsDefaultsAndOption(t *testing.T) {
 }
 
 func TestImageLimitsNilAgent(t *testing.T) {
-	sess := testSession(NewAgent(), newFakeOpenCodeClient())
+	sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
 	sess.agent = nil
 	require.Equal(t, defaultImageLimits(), sess.imageLimits())
 }
@@ -49,7 +49,7 @@ func TestEffectiveOutputLimitClampsToFrameBound(t *testing.T) {
 
 func TestRegisterImageArtifactInitializesMaps(t *testing.T) {
 	png := fixtureImage(t, "valid.png")
-	sess := testSession(NewAgent(), newFakeOpenCodeClient())
+	sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
 	sess.imageArtifacts = nil
 	sess.imageArtifactIdentities = nil
 

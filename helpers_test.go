@@ -67,7 +67,7 @@ func newImageSession(t *testing.T) (*session, *recordingAgentClient) {
 	conn := newRecordingAgentClient()
 	agent := NewAgent()
 	agent.setAgentClient(conn)
-	session := testSession(agent, newFakeOpenCodeClient())
+	session := testSession(t, agent, newFakeOpenCodeClient())
 	session.cwd = t.TempDir()
 
 	return session, conn
@@ -464,6 +464,18 @@ func (c *fakeOpenCodeClient) publishTurnCompletion(id string, assistantID string
 		Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": assistantID, "sessionID": id, "role": "assistant"}}),
 	})
 	c.publishSessionIdle(id)
+}
+
+// stageAssistantMessage serves one assistant message as this session's
+// transcript without publishing any event, for hooks that control the event
+// order themselves.
+func (c *fakeOpenCodeClient) stageAssistantMessage(id, assistantID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.messages = []opencode.NativeMessage{{Info: opencode.NativeMessageInfo{
+		ID: assistantID, SessionID: id, Role: "assistant", Finish: "stop",
+	}}}
 }
 
 // publishSessionIdle publishes the native completion signal for one session.
@@ -969,7 +981,7 @@ func testNativeSession(id string) opencode.NativeSession {
 	return native
 }
 
-func testSession(agent *Agent, client *fakeOpenCodeClient) *session {
+func testSession(t *testing.T, agent *Agent, client *fakeOpenCodeClient) *session {
 	if client.xdg.Root == "" {
 		root, err := os.MkdirTemp("", "acp-go-opencode-test-*")
 		if err == nil {
@@ -993,6 +1005,11 @@ func testSession(agent *Agent, client *fakeOpenCodeClient) *session {
 		Format:          SessionStoreFormat,
 	})
 	session.runtimeGeneration = generation
+
+	// The prompt path settles on the native event stream, so a test session
+	// needs its pump running exactly as an established production session does.
+	session.startPump()
+	t.Cleanup(session.stopPump)
 
 	return session
 }
@@ -1257,6 +1274,15 @@ func requireLifecycleOutcome(t *testing.T, connection *recordingAgentClient, wan
 	t.Fatal("the stream carried no ending idle")
 }
 
+// negotiatedTestFacts is the connection's answered lifecycle configuration:
+// the proven facts plus the version marker the answer carries on the wire.
+func negotiatedTestFacts() lifecycle.Negotiated {
+	facts := provenFacts()
+	facts.Versions = []int{lifecycle.Version}
+
+	return facts
+}
+
 // requireLifecycleReduces replays every lifecycle envelope this connection
 // received through the family reducer. A stream that reduces cleanly is one a
 // conformant consumer accepts; a stream that does not fails closed here with the
@@ -1264,7 +1290,7 @@ func requireLifecycleOutcome(t *testing.T, connection *recordingAgentClient, wan
 func requireLifecycleReduces(t *testing.T, connection *recordingAgentClient) lifecycle.State {
 	t.Helper()
 
-	reducer := lifecycle.NewReducer(lifecycle.Options{Negotiated: provenFacts()})
+	reducer := lifecycle.NewReducer(lifecycle.Options{Negotiated: negotiatedTestFacts()})
 
 	c := connection
 	c.mu.Lock()

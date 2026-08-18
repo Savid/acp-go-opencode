@@ -46,7 +46,7 @@ func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.closeErr = errors.Join(errors.New("close failed"), opencode.ErrProcessContainmentIncomplete)
 	agent := NewAgent()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
 	oldNewAgent := newAgentForServe
@@ -84,7 +84,7 @@ func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	agent := NewAgent()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.mu.Lock()
 	agent.sessions[session.id] = session
 	agent.mu.Unlock()
@@ -148,7 +148,7 @@ func TestAgentAndRouteRemainingPublicBranches(t *testing.T) {
 	client.getSession = testNativeSession("native-child")
 	client.ensureSyncAggregate("native-child")
 	agent.runtime = client
-	parent := testSession(agent, client)
+	parent := testSession(t, agent, client)
 	agent.sessions[parent.id] = parent
 	request := ForkSessionRequest(parent.id, t.TempDir())
 	value, err := agent.HandleExtensionMethod(context.Background(), ForkSessionMethod, mustJSON(t, request))
@@ -208,7 +208,7 @@ func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
 	client.agents = []opencode.NativeAgent{{Name: "build"}, {Name: "plan"}}
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
 	boolean := true

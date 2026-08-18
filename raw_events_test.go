@@ -371,7 +371,7 @@ func TestSessionPromptBackpressureLimitString(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	agent := NewAgent()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 
 	release, err := session.acquireTurn(ctx)
 	if err != nil {

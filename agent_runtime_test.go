@@ -570,7 +570,7 @@ func TestDirectoryScopeCloseFailureQuarantinesWithoutRelease(t *testing.T) {
 	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrMCPDisconnectUnproven)
 
 	agent.runtimeFatalErr = nil
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	current.directoryRelease = func() { releases++ }
 	err = agent.closeFailedSession(current)
 	require.ErrorContains(t, err, "disconnect failed")

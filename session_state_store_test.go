@@ -177,7 +177,7 @@ func TestBundleCredentialScan(t *testing.T) {
 func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierReference(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 	client.syncEvents[0].Data[syncFieldInfo] = json.RawMessage(`{
 		"id":"native-1",
@@ -377,7 +377,7 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 		"API_TOKEN": "token", "PASSWORD": "password", "COOKIE": "cookie", "EMPTY_TOKEN": "", "NORMAL": "ignored",
 	}))
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 
 	require.True(t, current.actions.claim(&pendingAction{id: "permission"}))
@@ -408,7 +408,7 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	newSnapshotSession := func() (*session, *fakeOpenCodeClient) {
 		agent := NewAgent()
 		client := newFakeOpenCodeClient()
-		current := testSession(agent, client)
+		current := testSession(t, agent, client)
 		agent.sessions[current.id] = current
 
 		return current, client
@@ -550,7 +550,7 @@ func TestCaptureStateSnapshotArtifactReplacementError(t *testing.T) {
 	conn := newRecordingAgentClient()
 	agent := NewAgent()
 	agent.setAgentClient(conn)
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	session.cwd = t.TempDir()
 
 	png := fixtureImage(t, "valid.png")
@@ -570,7 +570,7 @@ func TestCaptureStateSnapshotRetriesUnstableSyncGeneration(t *testing.T) {
 	newSnapshotSession := func() (*session, *fakeOpenCodeClient) {
 		agent := NewAgent()
 		client := newFakeOpenCodeClient()
-		current := testSession(agent, client)
+		current := testSession(t, agent, client)
 		agent.sessions[current.id] = current
 
 		return current, client

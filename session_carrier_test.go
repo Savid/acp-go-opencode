@@ -349,7 +349,7 @@ func TestCarrierBearerIsRedactedFromTheDurableSnapshot(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
 	agent.runtime = client
-	member := testSession(agent, client)
+	member := testSession(t, agent, client)
 	member.carrier = newSessionCarrier(map[string]string{
 		"WAGIE_API_TOKEN": "bearer-secret",
 		"OPERATION_NAME":  "ordinary",

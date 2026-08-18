@@ -223,20 +223,44 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 
 // Prompt is the internal session seam used by deterministic unit tests. The
 // public Agent path always calls promptWithRoute after strict route validation.
-// The lifecycle correlation is read through the same helper the public path uses,
-// so the seam can never accept a submission identity the wire would refuse.
+// A request carrying the lifecycle key is decoded through the same helper the
+// public path uses, so the seam can never accept a submission identity the wire
+// would refuse; a negotiated request without one plays the host's role and
+// mints the correlation itself.
 func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
 	nonce := internalSeamTurnNonce
 	if route, err := parseInboundTurnRoute(params.Meta); err == nil {
 		nonce = route.TurnNonce
 	}
 
-	submission, err := s.agent.promptSubmission(params.Meta)
-	if err != nil {
-		return acp.PromptResponse{}, err
+	var submission lifecycle.Submission
+
+	if _, carries := params.Meta[lifecycle.MetaKey]; carries {
+		var err error
+
+		submission, err = s.agent.promptSubmission(params.Meta)
+		if err != nil {
+			return acp.PromptResponse{}, err
+		}
+	} else if s.agent.lifecycleNegotiated().Present() {
+		submission = s.mintSeamSubmission(nonce)
 	}
 
 	return s.promptWithRoute(ctx, params, nonce, submission)
+}
+
+// mintSeamSubmission mints the correlation a host would have supplied for one
+// seam-driven turn.
+func (s *session) mintSeamSubmission(nonce string) lifecycle.Submission {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.seamSubmissions++
+
+	return lifecycle.Submission{
+		SubmissionID: fmt.Sprintf("internal-seam-submission-%d", s.seamSubmissions),
+		ClientNonce:  nonce,
+	}
 }
 
 func (s *session) promptWithRoute(
@@ -626,6 +650,13 @@ func (s *session) awaitPromptTerminal(
 
 		return s.observedCycleEnd(cycle)
 	case <-turnCtx.Done():
+		// Only a cancellation this host asked for settles as cancelled. The turn
+		// context also dies when the runtime binding does, and that cycle ends on
+		// the transport failure the detach recorded.
+		if !s.wasCancelled() {
+			return s.observedCycleEnd(cycle)
+		}
+
 		return s.settleCancelledTurn(ctx, cycle)
 	case <-timeoutC:
 		// The cancel guard runs before the deadline is applied: when a user

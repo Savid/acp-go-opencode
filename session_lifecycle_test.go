@@ -23,7 +23,7 @@ func lifecycleSession(t *testing.T, options ...Option) (*session, *fakeOpenCodeC
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 
 	agent.mu.Lock()
 	agent.sessions[current.id] = current
@@ -88,6 +88,7 @@ func TestAcceptanceFollowsNativeAdmissionAndPrecedesItsEvents(t *testing.T) {
 	// The harness publishes a transcript part before its POST is even answered,
 	// which is the race the dispatch hold exists for.
 	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		client.stageAssistantMessage(id, "assistant-1")
 		client.publishEvent(opencode.Event{
 			Type:       opencode.EventMessageUpdated,
 			Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": "assistant-1", "sessionID": id, "role": "assistant"}}),
@@ -154,6 +155,8 @@ func TestNativeIdleSettlesTheTurnWithoutPolling(t *testing.T) {
 
 	release := make(chan struct{})
 	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		client.stageAssistantMessage(id, "assistant-1")
+
 		go func() {
 			<-release
 			client.publishSessionIdle(id)
@@ -297,8 +300,13 @@ func TestOutOfTurnPermissionIsAnsweredAndSettledBeforeTheNextPrompt(t *testing.T
 
 	requireEventually(t, func() bool {
 		actions := connection.lifecycleEventsOfType(t, "action_update")
+		if len(actions) != 2 {
+			return false
+		}
 
-		return len(actions) == 2 && actions[1]["state"] == "accepted"
+		terminal, _ := actions[1]["action"].(map[string]any)
+
+		return terminal["state"] == "accepted"
 	}, "the action never terminalized")
 
 	actions := connection.lifecycleEventsOfType(t, "action_update")
@@ -400,8 +408,13 @@ func TestNativelyResolvedActionTerminalizesWithoutTheHostAnswer(t *testing.T) {
 
 	requireEventually(t, func() bool {
 		actions := connection.lifecycleEventsOfType(t, "action_update")
+		if len(actions) != 2 {
+			return false
+		}
 
-		return len(actions) == 2 && actions[1]["state"] == "accepted"
+		terminal, _ := actions[1]["action"].(map[string]any)
+
+		return terminal["state"] == "accepted"
 	}, "a natively resolved action never terminalized")
 
 	require.Zero(t, client.permissionReplyCount(), "an action OpenCode resolved was answered twice")
@@ -426,8 +439,13 @@ func TestUnanswerableElicitationDeclinesInsteadOfBlockingForever(t *testing.T) {
 	requireEventually(t, func() bool { return client.questionRejectCount() == 1 }, "OpenCode was left blocked")
 	requireEventually(t, func() bool {
 		actions := connection.lifecycleEventsOfType(t, "action_update")
+		if len(actions) != 2 {
+			return false
+		}
 
-		return len(actions) == 2 && actions[1]["state"] == "declined"
+		terminal, _ := actions[1]["action"].(map[string]any)
+
+		return terminal["state"] == "declined"
 	}, "the unanswerable action never terminalized")
 
 	require.Empty(t, connection.elicitations)
@@ -521,7 +539,7 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 	agent.setAgentClient(connection)
 
 	clientA := newFakeOpenCodeClient()
-	first := testSession(agent, clientA)
+	first := testSession(t, agent, clientA)
 	clientB := newFakeOpenCodeClient()
 	second := newSession(agent, "session-2", "/tmp/project", nil, testNativeSession("native-2"), clientB, sessionMeta{}, idmapRecord{
 		SessionID: "session-2", NativeSessionID: "native-2", Format: SessionStoreFormat,
@@ -552,6 +570,7 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 	secondRelease := make(chan struct{})
 	clientB.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(secondStarted)
+		clientB.stageAssistantMessage(id, "assistant-b")
 
 		go func() {
 			<-secondRelease
@@ -602,7 +621,7 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 	agent.setAgentClient(newRecordingAgentClient())
 
 	clientA := newFakeOpenCodeClient()
-	first := testSession(agent, clientA)
+	first := testSession(t, agent, clientA)
 	clientB := newFakeOpenCodeClient()
 	second := newSession(agent, "session-2", "/tmp/project", nil, testNativeSession("native-2"), clientB, sessionMeta{}, idmapRecord{
 		SessionID: "session-2", NativeSessionID: "native-2", Format: SessionStoreFormat,
@@ -619,6 +638,7 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 	firstStarted := make(chan struct{})
 	clientA.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(firstStarted)
+		clientA.stageAssistantMessage(id, "assistant-a")
 
 		go func() {
 			<-held
@@ -651,7 +671,7 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 // and no ending idle is emitted for the turn.
 func TestPersistenceFailureFencesInsteadOfEmittingIdle(t *testing.T) {
 	current, client, connection := lifecycleSession(t, WithSessionStore(&errorSessionStore{err: errors.New("store offline")}))
-	client.syncEvents = []opencode.SyncEvent{terminalMessageEvent(current.idmap.NativeSessionID, 1, "assistant-1", "assistant", "stop", nil)}
+	client.syncEvents = []opencode.SyncEvent{terminalMessageEvent(current.idmap.NativeSessionID, 0, "assistant-1", "assistant", "stop", nil)}
 
 	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
 	require.ErrorContains(t, err, "store offline")
@@ -740,7 +760,7 @@ func TestUnnegotiatedConnectionEmitsNoEnvelopeAndStillAnswersPermissions(t *test
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	require.NoError(t, current.establish(context.Background()))
 	t.Cleanup(current.stopPump)
 

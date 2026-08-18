@@ -85,7 +85,7 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	agent := NewAgent()
 	conn := newRecordingAgentClient()
 	agent.setAgentClient(conn)
-	sess := testSession(agent, client)
+	sess := testSession(t, agent, client)
 	agent.mu.Lock()
 	agent.sessions[sess.id] = sess
 	agent.mu.Unlock()
@@ -101,7 +101,7 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	}
 	fallbackClient := newFakeOpenCodeClient()
 	fallbackClient.providers = opencode.ProvidersResponse{}
-	fallbackSession := testSession(agent, fallbackClient)
+	fallbackSession := testSession(t, agent, fallbackClient)
 	if !fallbackSession.hasConfigValue(ctx, configModel, "openai/gpt-test") {
 		t.Fatal("fallback model config value was not found")
 	}
@@ -113,7 +113,7 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	}
 	errorClient := newFakeOpenCodeClient()
 	errorClient.providersErr = errors.New("providers failed")
-	errorSession := testSession(agent, errorClient)
+	errorSession := testSession(t, agent, errorClient)
 	if err := errorSession.validateModel(ctx, "openai/gpt-test", "model"); err == nil {
 		t.Fatal("provider catalog error was ignored")
 	}

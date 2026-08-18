@@ -156,7 +156,7 @@ func TestMediaEnvelopeAdvertisesTheBoundTheGateReports(t *testing.T) {
 				declaration[handoffFieldSizeBytes] = tt.want + 1
 
 				block := handoffBlock(mimePNG, path, declaration)
-				requireInvalidParamsData(t, validatePromptMediaError(testSession(agent, newFakeOpenCodeClient()), block), map[string]any{
+				requireInvalidParamsData(t, validatePromptMediaError(testSession(t, agent, newFakeOpenCodeClient()), block), map[string]any{
 					jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 					jsonFieldSizeBytes: tt.want + 1, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxBytes],
 				})
@@ -182,7 +182,7 @@ func TestMediaEnvelopeAdvertisesTheBoundTheGateReports(t *testing.T) {
 		require.Equal(t, perPrompt, envelope[mediaEnvelopeFieldMaxPromptBytes])
 
 		block := handoffBlock(mimePNG, path, handoffEnvelope(decoded))
-		requireInvalidParamsData(t, validatePromptMediaError(testSession(agent, newFakeOpenCodeClient()), block, block), map[string]any{
+		requireInvalidParamsData(t, validatePromptMediaError(testSession(t, agent, newFakeOpenCodeClient()), block, block), map[string]any{
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
 			jsonFieldSizeBytes: 2 * perImage, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxPromptBytes],
 		})

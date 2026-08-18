@@ -300,7 +300,7 @@ func TestPromptCorrelationIsRequiredWhileNegotiated(t *testing.T) {
 
 	agent := negotiatedAgent(t)
 	client := newFakeOpenCodeClient()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
 	request := TextPromptRequest(session.id, "nonce", "hello")
@@ -332,7 +332,7 @@ func TestPromptCorrelationIsRefusedWhileUnnegotiated(t *testing.T) {
 
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
 	request := TextPromptRequest(session.id, "nonce", "hello")
@@ -363,7 +363,7 @@ func TestPromptBindsBothEnvelopesToTheSameTurn(t *testing.T) {
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
 	client := newFakeOpenCodeClient()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
 	var (
@@ -412,7 +412,7 @@ func TestCancelCarryingTheKeyNeverReachesTheHarness(t *testing.T) {
 
 	agent := negotiatedAgent(t)
 	client := newFakeOpenCodeClient()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 	session.beginTurn(context.Background(), "nonce")
 

@@ -217,7 +217,7 @@ func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T)
 func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	releases := 0
 	current.directoryRelease = func() { releases++ }
 	agent.sessions[current.id] = current
@@ -246,7 +246,7 @@ func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *test
 	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 	require.NoError(t, current.establish(ctx))
 
@@ -330,7 +330,7 @@ func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
 	agent.setAgentClient(newRecordingAgentClient())
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 	require.NoError(t, current.establish(ctx))
 
@@ -592,6 +592,35 @@ func (s *fanoutScope) SendMessage(_ context.Context, id string, request opencode
 	}}, nil
 }
 
+func (s *fanoutScope) DispatchMessage(_ context.Context, id string, request opencode.MessageRequest) error {
+	if id != s.nativeID {
+		return fmt.Errorf("scope %q received native session %q", s.nativeID, id)
+	}
+
+	text, _ := request.Parts[0][partTypeText].(string)
+	if err := os.WriteFile(filepath.Join(s.directory, "native-cwd-proof.txt"), []byte(text), 0o600); err != nil {
+		return err
+	}
+
+	assistantID := "assistant-" + id
+	s.root.mu.Lock()
+	s.root.messages = append(s.root.messages, opencode.NativeMessage{Info: opencode.NativeMessageInfo{
+		ID: assistantID, SessionID: id, Role: "assistant", Finish: "stop",
+	}})
+	s.root.mu.Unlock()
+
+	s.events <- opencode.Event{
+		Type:       opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": assistantID, "sessionID": id, "role": "assistant"}}),
+	}
+	s.events <- opencode.Event{
+		Type:       opencode.EventSessionIdle,
+		Properties: mustJSONValue(map[string]any{"sessionID": id}),
+	}
+
+	return nil
+}
+
 func (s *fanoutScope) Events() <-chan opencode.Event      { return s.events }
 func (s *fanoutScope) EventErrors() <-chan error          { return s.errs }
 func (s *fanoutScope) XDGDirs() opencode.XDGDirs          { return s.root.XDGDirs() }
@@ -676,7 +705,7 @@ func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 func TestForkPermissionMustInherit(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	agent := NewAgent()
-	parent := testSession(agent, client)
+	parent := testSession(t, agent, client)
 	parent.permission = openCodePermissionDeny
 	agent.sessions[parent.id] = parent
 	_, err := agent.forkSession(context.Background(), ForkSessionRequest(parent.id, t.TempDir(),
@@ -875,7 +904,7 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 	agent := NewAgent()
 	agent.options.SessionStore = nil
 	require.NotNil(t, agent.sessionStore())
-	current := testSession(agent, newFakeOpenCodeClient())
+	current := testSession(t, agent, newFakeOpenCodeClient())
 	agent.runtime = nil
 	require.Error(t, agent.storeStartedSession(current), "missing runtime must reject publication")
 	agent.runtime = newFakeOpenCodeClient()
@@ -1058,7 +1087,7 @@ func TestNewSessionRemainingFailureStages(t *testing.T) {
 	client.createSession = testNativeSession("native")
 	limited := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
 	limited.runtime = client
-	limited.sessions["existing"] = testSession(limited, client)
+	limited.sessions["existing"] = testSession(t, limited, client)
 	_, err = limited.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.ErrorContains(t, err, "backpressure")
 }
@@ -1116,7 +1145,7 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 		client.ensureSyncAggregate("native-child")
 		agent := NewAgent()
 		agent.runtime = client
-		parent := testSession(agent, client)
+		parent := testSession(t, agent, client)
 		agent.sessions[parent.id] = parent
 
 		return agent, client, parent
@@ -1167,7 +1196,7 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 		client.ensureSyncAggregate("native-child")
 		agent := NewAgent()
 		agent.runtime = client
-		parent := testSession(agent, client)
+		parent := testSession(t, agent, client)
 		parent.carrier = newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "parent-token"}, []string{"/parent/bin"})
 		agent.sessions[parent.id] = parent
 
@@ -1237,7 +1266,7 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 	client = newFakeOpenCodeClient()
 	client.commandsErr = errors.New("commands failed")
 	agent = NewAgent()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 	require.NoError(t, agent.establishSession(ctx, session))
 
@@ -1266,7 +1295,7 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 	client.getSession = testNativeSession("native")
 	agent = storedAgent(client)
 	agent.options.ConcurrencyLimits.MaxActiveSessions = 1
-	agent.sessions["occupied"] = testSession(agent, client)
+	agent.sessions["occupied"] = testSession(t, agent, client)
 	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
 	require.ErrorContains(t, err, "backpressure")
 }
@@ -1284,10 +1313,10 @@ func TestListSessionsRemainingFilteringSortingAndCloseBranches(t *testing.T) {
 	}}
 	agent := NewAgent(WithSessionStore(store))
 	client := newFakeOpenCodeClient()
-	active := testSession(agent, client)
+	active := testSession(t, agent, client)
 	active.id = "seen"
 	active.cwd = cwd
-	filtered := testSession(agent, client)
+	filtered := testSession(t, agent, client)
 	filtered.id = "filtered-active"
 	filtered.cwd = otherCwd
 	agent.sessions[active.id] = active
@@ -1311,7 +1340,7 @@ func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing
 	client.ensureSyncAggregate("native-child")
 	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
 	agent.runtime = client
-	parent := testSession(agent, client)
+	parent := testSession(t, agent, client)
 	agent.sessions[parent.id] = parent
 
 	_, err := agent.forkSession(context.Background(), acp.UnstableForkSessionRequest{

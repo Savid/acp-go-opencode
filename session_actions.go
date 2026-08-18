@@ -428,7 +428,9 @@ func (s *session) askPermission(ctx context.Context, action *pendingAction) (nat
 		),
 	})
 	if err != nil {
-		return nativeActionOutcome{state: lifecycle.ActionDeclined, permissionReply: permissionReplyReject}, err
+		// The request itself failed: the host never decided, so the action
+		// failed — it was not declined.
+		return nativeActionOutcome{state: lifecycle.ActionFailed, permissionReply: permissionReplyReject}, err
 	}
 
 	if resp.Outcome.Cancelled != nil {
@@ -476,7 +478,7 @@ func (s *session) askElicitation(ctx context.Context, action *pendingAction) (na
 
 	resp, err := conn.CreateElicitation(ctx, request, scope)
 	if err != nil {
-		return nativeActionOutcome{state: lifecycle.ActionDeclined}, err
+		return nativeActionOutcome{state: lifecycle.ActionFailed}, err
 	}
 
 	if resp.Accept == nil {

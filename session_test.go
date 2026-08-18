@@ -15,7 +15,7 @@ import (
 )
 
 func TestTurnFenceHelperBranches(t *testing.T) {
-	session := testSession(NewAgent(), newFakeOpenCodeClient())
+	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
 	require.True(t, session.actions.claim(&pendingAction{id: "perm"}))
 	require.False(t, session.actions.claim(&pendingAction{id: "perm"}), "an id is claimed once for the life of the session")
 	session.markActiveMessageID("")
@@ -50,7 +50,7 @@ func TestSessionContextWindow(t *testing.T) {
 
 	t.Run("caches lookups per model", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
-		session := testSession(NewAgent(), client)
+		session := testSession(t, NewAgent(), client)
 		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 1000 {
 			t.Fatalf("first lookup = %d, want 1000", got)
 		}
@@ -63,14 +63,14 @@ func TestSessionContextWindow(t *testing.T) {
 	t.Run("provider error reports unknown", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.providersErr = errors.New("boom")
-		session := testSession(NewAgent(), client)
+		session := testSession(t, NewAgent(), client)
 		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 0 {
 			t.Fatalf("provider error lookup = %d, want 0", got)
 		}
 	})
 
 	t.Run("nil client reports unknown", func(t *testing.T) {
-		session := testSession(NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
 		session.client = nil
 		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 0 {
 			t.Fatalf("nil client lookup = %d, want 0", got)
@@ -89,7 +89,7 @@ func TestModelValueSplitAndJoin(t *testing.T) {
 func TestSessionTurnAdmissionAndCancellationFailureShapes(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -167,7 +167,7 @@ func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 func TestSessionCloseReleasesDirectoryOnlyAfterNativeMCPDisconnect(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.closeErr = errors.New("disconnect failed")
-	current := testSession(NewAgent(), client)
+	current := testSession(t, NewAgent(), client)
 	releases := 0
 	current.directoryRelease = func() { releases++ }
 
@@ -186,7 +186,7 @@ func TestSessionCloseReleasesDirectoryOnlyAfterNativeMCPDisconnect(t *testing.T)
 func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	released := false
 	current.directoryRelease = func() { released = true }
 	current.beginTurn(context.Background(), "nonce")
@@ -197,7 +197,7 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 
 	client = newFakeOpenCodeClient()
 	client.deleteErr = errors.New("delete failed")
-	current = testSession(agent, client)
+	current = testSession(t, agent, client)
 	require.ErrorContains(t, current.DeleteNativeAndClose(context.Background()), "delete failed")
 	require.NotEmpty(t, client.deleted)
 	require.False(t, client.closed, "failed native deletion must remain retryable")
@@ -218,7 +218,7 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 func TestCancelRequiresTheActiveTurnRoute(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 
 	require.Error(t, current.requireActiveTurn("missing"), "a cancel with no active turn was admitted")
 
@@ -235,7 +235,7 @@ func TestCancelRequiresTheActiveTurnRoute(t *testing.T) {
 // open cycle escalates on.
 func TestCancelTurnInterruptsOnlyTheAddressedNativeSession(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	current := testSession(NewAgent(), client)
+	current := testSession(t, NewAgent(), client)
 	current.beginTurn(context.Background(), "nonce")
 
 	require.NoError(t, current.cancelTurn(context.Background()))
@@ -251,7 +251,7 @@ func TestCancelTurnInterruptsOnlyTheAddressedNativeSession(t *testing.T) {
 // that never reports idle after an interrupt is a settlement failure rather than a
 // clean cancellation.
 func TestAwaitNativeSettlementReportsTheMissingAcknowledgement(t *testing.T) {
-	current := testSession(NewAgent(), newFakeOpenCodeClient())
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
 	require.NoError(t, current.awaitNativeSettlement(context.Background(), nil))
 
 	cycle := &foregroundCycle{id: "cycle-1", turnID: "turn-1", signal: make(chan struct{})}
@@ -265,7 +265,7 @@ func TestAwaitNativeSettlementReportsTheMissingAcknowledgement(t *testing.T) {
 
 func TestDeleteNativeAndCloseSettlesTheSession(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	current := testSession(NewAgent(), client)
+	current := testSession(t, NewAgent(), client)
 	current.beginTurn(context.Background(), "nonce")
 	require.NoError(t, current.DeleteNativeAndClose(context.Background()))
 	require.NotEmpty(t, client.deleted)
