@@ -1093,6 +1093,7 @@ func (s *session) Close(_ context.Context) error {
 		s.directoryRelease = nil
 		s.mu.Unlock()
 	}
+
 	if err == nil {
 		s.fenceLifecycle("session closed")
 	}
@@ -1135,6 +1136,7 @@ func (s *session) detachRuntime(generation uint64, cause string) {
 	if release != nil {
 		release()
 	}
+
 	s.fenceLifecycle(cause)
 }
 
@@ -1327,6 +1329,7 @@ func (s *session) DeleteNativeAndClose(ctx context.Context) error {
 		deleteErr := client.DeleteSession(deleteCtx, nativeID)
 
 		cancel()
+
 		if deleteErr != nil {
 			return errors.Join(err, fmt.Errorf("delete native OpenCode session: %w", deleteErr))
 		}

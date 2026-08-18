@@ -402,6 +402,7 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 		err := session.DeleteNativeAndClose(closeCtx)
 
 		closeCancel()
+
 		if err != nil {
 			return acp.UnstableDeleteSessionResponse{}, err
 		}
@@ -412,7 +413,9 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	// retry instead of reporting deletion while its process or state survives.
 	storeCtx, cancel := a.sessionStoreContext(ctx)
 	err := a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
+
 	cancel()
+
 	if err != nil {
 		return acp.UnstableDeleteSessionResponse{}, err
 	}
@@ -421,8 +424,10 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	if session == nil || a.sessions[params.SessionId] == session {
 		delete(a.sessions, params.SessionId)
 	}
+
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
+
 	if session != nil {
 		a.observe.AddActiveSession(ctx, -1)
 	}

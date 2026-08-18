@@ -458,14 +458,17 @@ func (s *session) runPromptTurnWithRefreshedMCP(
 	if err := s.beginLifecycleTurn(turnCtx); err != nil {
 		return failTurn(err)
 	}
+
 	defer func() {
 		outcome := lifecycle.OutcomeSuccess
 		stopReason := string(response.StopReason)
+
 		if returnErr != nil {
 			outcome, stopReason = lifecycle.OutcomeFailed, ""
 		} else if response.StopReason == acp.StopReasonCancelled {
 			outcome = lifecycle.OutcomeCancelled
 		}
+
 		if settleErr := s.settleLifecycleTurn(context.WithoutCancel(turnCtx), stopReason, outcome); settleErr != nil {
 			returnErr = errors.Join(returnErr, settleErr)
 		}
@@ -1717,6 +1720,7 @@ func (s *session) handlePermission(ctx context.Context, req opencode.PermissionR
 
 	s.addPendingPermission(req)
 	owner := s.currentLifecycleOwner()
+
 	if err := s.lifecycleActionPending(ctx, lifecycle.PendingAction(
 		req.ID, lifecycle.ActionPermission, owner, true,
 	)); err != nil {
@@ -1810,12 +1814,14 @@ func (s *session) handlePermission(ctx context.Context, req opencode.PermissionR
 	if resp.Outcome.Cancelled != nil {
 		reply = permissionReplyReject
 	}
+
 	actionState := lifecycle.ActionDeclined
 	if reply == permissionReplyOnce || reply == permissionReplyAlways {
 		actionState = lifecycle.ActionAccepted
 	} else if resp.Outcome.Cancelled != nil {
 		actionState = lifecycle.ActionCancelled
 	}
+
 	if err := s.lifecycleActionResolved(ctx, req.ID, actionState); err != nil {
 		return err
 	}
@@ -1850,6 +1856,7 @@ func (s *session) handleQuestion(ctx context.Context, req opencode.QuestionReque
 
 	s.addPendingQuestion(req)
 	owner := s.currentLifecycleOwner()
+
 	if err := s.lifecycleActionPending(ctx, lifecycle.PendingAction(req.ID, lifecycle.ActionElicitation, owner, true)); err != nil {
 		return err
 	}
@@ -1915,6 +1922,7 @@ func (s *session) handleQuestion(ctx context.Context, req opencode.QuestionReque
 		if err := s.lifecycleActionResolved(ctx, req.ID, lifecycle.ActionDeclined); err != nil {
 			return err
 		}
+
 		_, ok, cancelled := s.takePendingQuestion(req.ID)
 		if !ok {
 			return errPromptCancelled
@@ -1958,6 +1966,7 @@ func (s *session) handleQuestion(ctx context.Context, req opencode.QuestionReque
 	if err := s.lifecycleActionResolved(ctx, req.ID, lifecycle.ActionAccepted); err != nil {
 		return err
 	}
+
 	return s.client.ReplyQuestion(ctx, req, questionAnswersFromContent(resp.Accept.Content, propertyIDs))
 }
 
@@ -1966,9 +1975,11 @@ func mergeMeta(left, right map[string]any) map[string]any {
 	for key, value := range left {
 		out[key] = value
 	}
+
 	for key, value := range right {
 		out[key] = value
 	}
+
 	return out
 }
 

@@ -202,3 +202,10 @@ func notification(t *testing.T, envelope map[string]any, update map[string]any) 
 
 	return params
 }
+
+func TestStreamCloseRejectsLaterEmission(t *testing.T) {
+	stream := NewStream("stream", Negotiated{Versions: []int{Version}})
+	stream.Close()
+	_, err := stream.Emit(SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "idle"}, nil, QuiescenceFact{}))
+	require.ErrorContains(t, err, string(ViolationStaleStream))
+}

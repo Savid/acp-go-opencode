@@ -27,8 +27,10 @@ const sessionUpdateField = "sessionUpdate"
 // refuses.
 func DecodeSessionUpdate(params json.RawMessage, negotiated Negotiated) (Delivery, error) {
 	var frame any
+
 	jsonDecoder := json.NewDecoder(bytes.NewReader(params))
 	jsonDecoder.UseNumber()
+
 	if err := jsonDecoder.Decode(&frame); err != nil {
 		return Delivery{}, violation(ViolationMalformedEnvelope, "", 0, "the notification is not decodable JSON")
 	}
