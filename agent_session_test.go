@@ -1263,13 +1263,6 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 	_, err = agent.LoadSession(ctx, LoadSessionRequest("session", cwd))
 	require.ErrorContains(t, err, "messages failed")
 
-	client = newFakeOpenCodeClient()
-	client.commandsErr = errors.New("commands failed")
-	agent = NewAgent()
-	session := testSession(t, agent, client)
-	agent.sessions[session.id] = session
-	require.NoError(t, agent.establishSession(ctx, session))
-
 	closed := storedAgent(newFakeOpenCodeClient())
 	closed.closed = true
 	_, err = closed.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
@@ -1510,35 +1503,36 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	require.NoError(t, agent.Close())
 }
 
-// TestEstablishFailureFailsEveryEstablishingRequest proves the lifecycle stream
-// is part of establishment on all four paths that open one: a session whose
-// opening snapshot cannot be delivered fails its request instead of being handed
-// to a host it can never speak to.
-func TestEstablishFailureFailsEveryEstablishingRequest(t *testing.T) {
+// TestEstablishingHandlersPublishNothingBeforeTheyReturn proves the opening
+// lifecycle snapshot and the initial command catalog leave none of the four
+// establishing handlers. Both are owed to the host only after the establishing
+// response has been written to the transport, so a handler that has returned has
+// published neither.
+func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
 	ctx := context.Background()
 
-	breakStream := func(connection *recordingAgentClient) {
-		connection.mu.Lock()
-		defer connection.mu.Unlock()
+	requireNothingPublished := func(t *testing.T, connection *recordingAgentClient) {
+		t.Helper()
 
-		connection.updateErr = errors.New("wire down")
+		require.Empty(t, connection.lifecycleEnvelopes(t), "the opening snapshot left the establishing handler")
+		require.Empty(t, connection.availableCommandUpdates(), "the command catalog left the establishing handler")
 	}
 
 	t.Run("new", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.createSession = testNativeSession("native")
+		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
 		agent := negotiatedAgent(t)
 		connection := newRecordingAgentClient()
 		agent.setAgentClient(connection)
 		agent.runtime = client
-		breakStream(connection)
 
 		_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
-		require.ErrorContains(t, err, "wire down")
-		require.True(t, client.closed, "a session that never established kept its native scope")
+		require.NoError(t, err)
+		requireNothingPublished(t, connection)
 	})
 
-	stored := func(t *testing.T, cwd string) *Agent {
+	stored := func(t *testing.T, cwd string) (*Agent, *recordingAgentClient) {
 		t.Helper()
 
 		snapshot := validSyncSnapshot("session", "native", cwd)
@@ -1553,31 +1547,36 @@ func TestEstablishFailureFailsEveryEstablishingRequest(t *testing.T) {
 
 		client := newFakeOpenCodeClient()
 		client.getSession = testNativeSession("native")
+		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
 		agent := negotiatedAgent(t, WithSessionStore(store))
 		connection := newRecordingAgentClient()
 		agent.setAgentClient(connection)
 		agent.runtime = client
-		breakStream(connection)
 
-		return agent
+		return agent, connection
 	}
 
 	t.Run("load", func(t *testing.T) {
 		cwd := t.TempDir()
-		_, err := stored(t, cwd).LoadSession(ctx, LoadSessionRequest("session", cwd))
-		require.ErrorContains(t, err, "wire down")
+		agent, connection := stored(t, cwd)
+		_, err := agent.LoadSession(ctx, LoadSessionRequest("session", cwd))
+		require.NoError(t, err)
+		requireNothingPublished(t, connection)
 	})
 
 	t.Run("resume", func(t *testing.T) {
 		cwd := t.TempDir()
-		_, err := stored(t, cwd).ResumeSession(ctx, ResumeSessionRequest("session", cwd))
-		require.ErrorContains(t, err, "wire down")
+		agent, connection := stored(t, cwd)
+		_, err := agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
+		require.NoError(t, err)
+		requireNothingPublished(t, connection)
 	})
 
 	t.Run("fork", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		client.forkSession = testNativeSession("native-child")
 		client.getSession = testNativeSession("native-child")
+		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
 		client.ensureSyncAggregate("native-child")
 
 		agent := negotiatedAgent(t)
@@ -1586,10 +1585,16 @@ func TestEstablishFailureFailsEveryEstablishingRequest(t *testing.T) {
 		agent.runtime = client
 		parent := testSession(t, agent, client)
 		agent.sessions[parent.id] = parent
-		breakStream(connection)
+
+		// The parent was established by the test helper; only what the fork
+		// itself publishes is at stake.
+		connection.mu.Lock()
+		connection.updates = nil
+		connection.mu.Unlock()
 
 		_, err := agent.forkSession(ctx, ForkSessionRequest(parent.id, t.TempDir()))
-		require.ErrorContains(t, err, "wire down")
+		require.NoError(t, err)
+		requireNothingPublished(t, connection)
 	})
 }
 

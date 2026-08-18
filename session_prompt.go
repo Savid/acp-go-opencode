@@ -291,6 +291,14 @@ func (s *session) promptWithRoute(
 		return acp.PromptResponse{}, recoveryErr
 	}
 
+	// Establishment normally runs from the establishing request's post-response
+	// hook. A host driving this Agent in process never writes that response, so
+	// the turn opens the stream itself rather than accepting a submission on a
+	// stream nothing opened.
+	if establishErr := s.ensureEstablished(ctx); establishErr != nil {
+		return acp.PromptResponse{}, establishErr
+	}
+
 	turnCtx := s.beginTurn(ctx, turnNonce)
 	defer s.finishTurn()
 

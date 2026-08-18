@@ -835,6 +835,22 @@ func (c *recordingAgentClient) NotifyExtension(_ context.Context, method string,
 	return err
 }
 
+// availableCommandUpdates lists the command catalogs this connection was sent.
+func (c *recordingAgentClient) availableCommandUpdates() []*acp.SessionAvailableCommandsUpdate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var catalogs []*acp.SessionAvailableCommandsUpdate
+
+	for index := range c.updates {
+		if catalog := c.updates[index].Update.AvailableCommandsUpdate; catalog != nil {
+			catalogs = append(catalogs, catalog)
+		}
+	}
+
+	return catalogs
+}
+
 func (c *recordingAgentClient) updateCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

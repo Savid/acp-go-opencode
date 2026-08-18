@@ -67,10 +67,14 @@ extension for fork:
 - `session/delete` — remove a stored session, leaving a tombstone.
 - `_opencode/session/fork` — branch a session's native state into a new session.
 
-Native slash-command discovery and any resulting
-`available_commands_update` complete inside new, load, resume, and fork before
-the lifecycle response returns. Those updates are lifecycle-scoped and omit a
-turn route. Command refresh caused by a slash-command prompt is turn-scoped and
+New, load, resume, and fork publish two notifications after their own response
+has been written to the transport: the session's opening lifecycle snapshot,
+which is the first lifecycle-bearing notification of that session's stream, and
+then the initial `available_commands_update` carrying native slash-command
+discovery. Neither can arrive before the response that names the session it
+speaks for, and a failure to publish either is logged rather than turned into a
+failed lifecycle response. Both updates are lifecycle-scoped and omit a turn
+route. Command refresh caused by a slash-command prompt is turn-scoped and
 carries that prompt's exact route envelope.
 
 A session start that fails on a caller-supplied option — a seeded file the

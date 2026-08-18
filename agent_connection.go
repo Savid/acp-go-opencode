@@ -33,6 +33,7 @@ type localAgentConnection struct {
 	agent       *Agent
 	conn        *acp.Connection
 	initialized atomic.Bool
+	hooks       *establishmentHooks
 }
 
 type localAgentHandler func(context.Context, *Agent, json.RawMessage) (any, *acp.RequestError)
@@ -63,9 +64,10 @@ var (
 )
 
 func newLocalAgentConnection(agent *Agent, output io.Writer, input io.Reader) *localAgentConnection {
-	conn := &localAgentConnection{agent: agent}
-	inputGate := newConnectionInputGate(input)
-	conn.conn = acp.NewConnection(conn.handle, output, inputGate)
+	hooks := newEstablishmentHooks(agent.log)
+	conn := &localAgentConnection{agent: agent, hooks: hooks}
+	inputGate := newConnectionInputGate(newEstablishmentTagReader(input))
+	conn.conn = acp.NewConnection(conn.handle, hooks.wrap(output), inputGate)
 	conn.conn.SetLogger(agent.log)
 	inputGate.open()
 
@@ -124,7 +126,11 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 
 	if strings.HasPrefix(method, "_") {
 		extensionResult, err := c.agent.HandleExtensionMethod(ctx, method, params)
+
 		reqErr = requestError(ctx, err)
+		if reqErr == nil {
+			c.queueEstablishment(ctx, method, params, extensionResult)
+		}
 
 		return extensionResult, reqErr
 	}
@@ -139,6 +145,10 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 	result, reqErr = handler(ctx, c.agent, params)
 	if method == acp.AgentMethodInitialize && reqErr == nil {
 		c.initialized.Store(true)
+	}
+
+	if reqErr == nil {
+		c.queueEstablishment(ctx, method, params, result)
 	}
 
 	return result, reqErr

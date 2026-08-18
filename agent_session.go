@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -105,12 +104,6 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
 	}
 
-	if err := a.establishSession(ctx, session); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
-	}
-
 	return acp.NewSessionResponse{
 		SessionId:     id,
 		Meta:          sessionResponseMeta(session.snapshot()),
@@ -127,10 +120,6 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 	}
 
 	if err := session.replayMessages(ctx); err != nil {
-		return acp.LoadSessionResponse{}, err
-	}
-
-	if err := a.establishSession(ctx, session); err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
 
@@ -151,30 +140,10 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 		return acp.ResumeSessionResponse{}, err
 	}
 
-	if err := a.establishSession(ctx, session); err != nil {
-		return acp.ResumeSessionResponse{}, err
-	}
-
 	return acp.ResumeSessionResponse{
 		Meta:          sessionResponseMeta(session.snapshot()),
 		ConfigOptions: session.configOptions(ctx),
 	}, nil
-}
-
-// establishSession publishes the session's initial command catalog and opens its
-// lifecycle stream. A catalog refresh failure is diagnostic — the catalog is
-// republished on the next prompt — but a stream that cannot be opened is not: the
-// session would owe a host an ordered stream it can never deliver, so the
-// establishing request fails.
-func (a *Agent) establishSession(ctx context.Context, session *session) error {
-	if err := session.refreshCommands(ctx); err != nil {
-		a.log.DebugContext(ctx, "refresh OpenCode commands during session lifecycle failed",
-			slog.String("session_id", string(session.id)),
-			slog.String("error", err.Error()),
-		)
-	}
-
-	return session.establish(ctx)
 }
 
 func (a *Agent) loadOrResumeSession(
@@ -551,12 +520,6 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	}
 
 	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
-	}
-
-	if err := a.establishSession(ctx, session); err != nil {
 		closeErr := a.closeFailedSession(session)
 
 		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)

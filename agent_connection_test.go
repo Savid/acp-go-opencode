@@ -257,7 +257,7 @@ func TestLocalAgentConnectionOutboundClientMethods(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestLifecycleUpdatesFinishBeforeImmediatePromptAndTurnUpdatesCarryExactRoute(t *testing.T) {
+func TestCommandCatalogFollowsTheResponseAndTurnUpdatesCarryExactRoute(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -272,8 +272,17 @@ func TestLifecycleUpdatesFinishBeforeImmediatePromptAndTurnUpdatesCarryExactRout
 	created, err := peer.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
 
+	// The initial catalog is owed to the host only once the establishing
+	// response has been written, so it lands after session/new returns rather
+	// than before it.
+	require.Eventually(t, func() bool {
+		wireClient.mu.Lock()
+		defer wireClient.mu.Unlock()
+
+		return len(wireClient.updates) == 1
+	}, time.Second, time.Millisecond, "the command catalog never followed session/new")
+
 	wireClient.mu.Lock()
-	require.Len(t, wireClient.updates, 1, "lifecycle command discovery must finish before session/new returns")
 	require.Nil(t, wireClient.updates[0].Meta)
 	require.NotNil(t, wireClient.updates[0].Update.AvailableCommandsUpdate)
 	wireClient.mu.Unlock()

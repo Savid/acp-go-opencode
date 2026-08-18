@@ -48,6 +48,10 @@ type session struct {
 	mcpServers        []opencode.MCPServerConfig
 	mcpRefreshPending bool
 	recoveryMu        sync.Mutex
+	// establishMu serializes establishment, so the post-response hook and a
+	// prompt racing it cannot open two pumps or emit two opening snapshots.
+	establishMu sync.Mutex
+	established bool
 
 	turn chan struct{}
 	mu   sync.Mutex
@@ -195,16 +199,44 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 	return session
 }
 
-// establish opens the session's lifecycle stream to the host and starts routing
-// native events. It runs at the end of the establishing session request, so the
-// opening snapshot is the first lifecycle envelope a host sees for this session
-// and no native event is routed before it. Events the harness published in the
-// meantime wait in the native stream's own buffer and are routed in arrival order
-// as soon as the pump starts, so establishment holds no separate spool.
+// establish opens this incarnation's lifecycle stream to the host and starts
+// routing native events. The opening snapshot goes out first, so it is the first
+// lifecycle envelope a host sees for the incarnation and no native event is
+// routed before it. Events the harness published in the meantime wait in the
+// native stream's own buffer and are routed in arrival order as soon as the pump
+// starts, so establishment holds no separate spool.
+//
+// A recovered incarnation calls this directly: it has just reopened its stream
+// and owes a snapshot of its own whatever the previous one did.
 func (s *session) establish(ctx context.Context) error {
+	s.establishMu.Lock()
+	defer s.establishMu.Unlock()
+
+	return s.establishLocked(ctx)
+}
+
+// ensureEstablished establishes the session once. The establishing request's
+// post-response hook is what normally calls it — the opening snapshot may not be
+// written before the response it follows — and the prompt path calls it again so
+// a host driving this Agent in process still gets an opened stream before the
+// first turn is accepted rather than a delta on a stream nothing opened.
+func (s *session) ensureEstablished(ctx context.Context) error {
+	s.establishMu.Lock()
+	defer s.establishMu.Unlock()
+
+	if s.established {
+		return nil
+	}
+
+	return s.establishLocked(ctx)
+}
+
+func (s *session) establishLocked(ctx context.Context) error {
 	if err := s.publishLifecycleStream(ctx); err != nil {
 		return err
 	}
+
+	s.established = true
 
 	s.startPump()
 
