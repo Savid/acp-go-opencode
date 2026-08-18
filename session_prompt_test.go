@@ -2081,6 +2081,25 @@ func TestSlashCommandRefreshAdvertisesNativeListWithSanitizer(t *testing.T) {
 	}
 }
 
+func TestSlashCommandRefreshAdvertisesInitialEmptyCatalogOnce(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	conn := newRecordingAgentClient()
+	agent := NewAgent()
+	agent.setAgentClient(conn)
+	session := testSession(agent, client)
+
+	require.NoError(t, session.refreshCommands(ctx))
+	require.Len(t, conn.updates, 1)
+	update := conn.updates[0].Update.AvailableCommandsUpdate
+	require.NotNil(t, update)
+	require.NotNil(t, update.AvailableCommands)
+	require.Empty(t, update.AvailableCommands)
+
+	require.NoError(t, session.refreshCommands(ctx))
+	require.Len(t, conn.updates, 1)
+}
+
 func TestSlashCommandRefreshEmptyClearAndFailureKeepsCache(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
@@ -2092,21 +2111,21 @@ func TestSlashCommandRefreshEmptyClearAndFailureKeepsCache(t *testing.T) {
 	if err := session.refreshCommands(ctx); err != nil {
 		t.Fatalf("initial refresh: %v", err)
 	}
-	if conn.updateCount() != 0 {
-		t.Fatalf("initial empty update emitted: %#v", conn.updates)
+	if conn.updateCount() != 1 {
+		t.Fatalf("initial empty update missing: %#v", conn.updates)
 	}
 
 	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
 	if err := session.refreshCommands(ctx); err != nil {
 		t.Fatalf("non-empty refresh: %v", err)
 	}
-	if conn.updateCount() != 1 {
+	if conn.updateCount() != 2 {
 		t.Fatalf("updates after non-empty = %#v", conn.updates)
 	}
 	if err := session.refreshCommands(ctx); err != nil {
 		t.Fatalf("unchanged refresh: %v", err)
 	}
-	if conn.updateCount() != 1 {
+	if conn.updateCount() != 2 {
 		t.Fatalf("unchanged refresh emitted: %#v", conn.updates)
 	}
 
@@ -2114,7 +2133,7 @@ func TestSlashCommandRefreshEmptyClearAndFailureKeepsCache(t *testing.T) {
 	if err := session.refreshCommands(ctx); err == nil {
 		t.Fatal("refresh failure returned nil")
 	}
-	if conn.updateCount() != 1 {
+	if conn.updateCount() != 2 {
 		t.Fatalf("failed refresh emitted update: %#v", conn.updates)
 	}
 	if _, ok := session.cachedCommand("review"); !ok {
@@ -2126,14 +2145,14 @@ func TestSlashCommandRefreshEmptyClearAndFailureKeepsCache(t *testing.T) {
 	if err := session.refreshCommands(ctx); err != nil {
 		t.Fatalf("clear refresh: %v", err)
 	}
-	if conn.updateCount() != 2 {
+	if conn.updateCount() != 3 {
 		t.Fatalf("clear update missing: %#v", conn.updates)
 	}
-	clearUpdate := conn.updates[1].Update.AvailableCommandsUpdate
+	clearUpdate := conn.updates[2].Update.AvailableCommandsUpdate
 	if clearUpdate == nil || len(clearUpdate.AvailableCommands) != 0 {
 		t.Fatalf("clear update = %#v", clearUpdate)
 	}
-	wire, err := json.Marshal(conn.updates[1])
+	wire, err := json.Marshal(conn.updates[2])
 	if err != nil {
 		t.Fatalf("marshal clear update: %v", err)
 	}

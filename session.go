@@ -86,6 +86,7 @@ type session struct {
 	exclusiveTurn             bool
 	commandsByName            map[string]opencode.NativeCommand
 	availableCommands         []acp.AvailableCommand
+	commandCatalogPublished   bool
 	contextWindows            map[string]int
 	messageRoles              map[string]string
 	poisonCause               string
@@ -934,9 +935,10 @@ func (s *session) refreshCommands(ctx context.Context) error {
 
 	s.mu.Lock()
 
-	changed := !sameAvailableCommands(s.availableCommands, available)
+	changed := !s.commandCatalogPublished || !sameAvailableCommands(s.availableCommands, available)
 	if changed {
 		s.availableCommands = cloneAvailableCommands(available)
+		s.commandCatalogPublished = true
 	}
 
 	s.commandsByName = commandsByName
