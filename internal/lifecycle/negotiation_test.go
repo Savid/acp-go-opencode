@@ -1,0 +1,245 @@
+package lifecycle
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestDecodeOfferReadsTheHostsVersions(t *testing.T) {
+	t.Parallel()
+
+	offer, present, refusal := DecodeOffer(map[string]any{MetaKey: map[string]any{"versions": []any{1.0}}})
+	require.Nil(t, refusal)
+	require.True(t, present)
+	require.Equal(t, []int{1}, offer.Versions)
+}
+
+// TestDecodeOfferTreatsAbsenceAsNoRequest proves an absent key is the host asking
+// for nothing rather than a refusal.
+func TestDecodeOfferTreatsAbsenceAsNoRequest(t *testing.T) {
+	t.Parallel()
+
+	offer, present, refusal := DecodeOffer(map[string]any{})
+	require.Nil(t, refusal)
+	require.False(t, present)
+	require.Empty(t, offer.Versions)
+}
+
+func TestDecodeOfferStrictness(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name  string
+		value any
+		field string
+	}{
+		{"not an object", []any{1}, MetaPath},
+		{"unknown member", map[string]any{"versions": []any{1}, "extra": true}, MetaPath + ".extra"},
+		{"versions missing", map[string]any{}, MetaPath + ".versions"},
+		{"versions not an array", map[string]any{"versions": 1}, MetaPath + ".versions"},
+		{"versions empty", map[string]any{"versions": []any{}}, MetaPath + ".versions"},
+		{"version not an integer", map[string]any{"versions": []any{"1"}}, MetaPath + ".versions"},
+		{"version fractional", map[string]any{"versions": []any{1.5}}, MetaPath + ".versions"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, present, refusal := DecodeOffer(map[string]any{MetaKey: row.value})
+			require.False(t, present)
+			require.NotNil(t, refusal)
+			require.Equal(t, row.field, refusal.Field)
+			require.Equal(t, "unsupported "+row.field, refusal.Error())
+		})
+	}
+}
+
+// TestAnswerIntersectsAnUnorderedOffer proves the offer's order is never a
+// refusal reason: only the answer is ordered, and refusing an unordered offer
+// would break the forward compatibility the array exists for.
+func TestAnswerIntersectsAnUnorderedOffer(t *testing.T) {
+	t.Parallel()
+
+	proven := Negotiated{ActivityKinds: []ActivityKind{}}
+
+	answer, ok := Offer{Versions: []int{2, 1}}.Answer(proven)
+	require.True(t, ok)
+	require.Equal(t, []int{1}, answer.Versions)
+	require.Equal(t, 1, answer.NegotiatedVersion())
+
+	answer, ok = Offer{Versions: []int{1, 1}}.Answer(proven)
+	require.True(t, ok)
+	require.Equal(t, []int{1}, answer.Versions)
+
+	_, ok = Offer{Versions: []int{2}}.Answer(proven)
+	require.False(t, ok)
+}
+
+func TestNegotiatedAdvertisementShape(t *testing.T) {
+	t.Parallel()
+
+	degenerate := Negotiated{Versions: []int{1}}
+	require.Equal(t, map[string]any{
+		"versions":                []int{1},
+		"updatesOutsidePrompt":    false,
+		"authoritativeQuiescence": false,
+		"activityKinds":           []string{},
+	}, degenerate.Advertisement())
+
+	proven := Negotiated{
+		Versions:                []int{1},
+		AuthoritativeQuiescence: true,
+		QuiescenceSource:        ProofClassProcessContainment,
+		ActivityKinds:           []ActivityKind{ActivityTask},
+	}
+	require.Equal(t, "process-containment", proven.Advertisement()["quiescenceSource"])
+	require.Equal(t, []string{"task"}, proven.Advertisement()["activityKinds"])
+	require.True(t, proven.DeclaresActivityKind(ActivityTask))
+	require.False(t, proven.DeclaresActivityKind(ActivityGoal))
+	require.True(t, proven.SupportsVersion(1))
+
+	var absent Negotiated
+	require.False(t, absent.Present())
+	require.Zero(t, absent.NegotiatedVersion())
+}
+
+// TestRefuseKeyNamesTheExactPath proves a surface that carries no lifecycle value
+// refuses the reserved literal by path rather than ignoring it.
+func TestRefuseKeyNamesTheExactPath(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, RefuseKey(nil))
+	require.Nil(t, RefuseKey(map[string]any{"acp-go.dev/route": map[string]any{}}))
+
+	refusal := RefuseKey(map[string]any{MetaKey: map[string]any{}})
+	require.NotNil(t, refusal)
+	require.Equal(t, MetaPath, refusal.Field)
+}
+
+func TestDecodePromptCorrelation(t *testing.T) {
+	t.Parallel()
+
+	negotiated := Negotiated{Versions: []int{1}}
+
+	submission, refusal := DecodePromptCorrelation(map[string]any{MetaKey: map[string]any{
+		"version":    1,
+		"submission": map[string]any{"submissionId": "sub-1", "clientNonce": "nonce-1", "runId": "run-1"},
+	}}, negotiated)
+	require.Nil(t, refusal)
+	require.Equal(t, Submission{SubmissionID: "sub-1", ClientNonce: "nonce-1", RunID: "run-1"}, submission)
+}
+
+// TestDecodePromptCorrelationUnnegotiated proves the key is forbidden while the
+// extension is not negotiated and absent is then the correct shape.
+func TestDecodePromptCorrelationUnnegotiated(t *testing.T) {
+	t.Parallel()
+
+	_, refusal := DecodePromptCorrelation(map[string]any{MetaKey: map[string]any{}}, Negotiated{})
+	require.NotNil(t, refusal)
+	require.Equal(t, MetaPath, refusal.Field)
+
+	submission, refusal := DecodePromptCorrelation(map[string]any{}, Negotiated{})
+	require.Nil(t, refusal)
+	require.Equal(t, Submission{}, submission)
+}
+
+func TestDecodePromptCorrelationStrictness(t *testing.T) {
+	t.Parallel()
+
+	valid := map[string]any{"submissionId": "sub-1", "clientNonce": "nonce-1"}
+
+	for _, row := range []struct {
+		name  string
+		meta  map[string]any
+		field string
+	}{
+		{"key missing", map[string]any{}, MetaPath},
+		{"not an object", map[string]any{MetaKey: []any{}}, MetaPath},
+		{"unknown member", map[string]any{MetaKey: map[string]any{"version": 1, "submission": valid, "extra": 1}}, MetaPath + ".extra"},
+		{"version missing", map[string]any{MetaKey: map[string]any{"submission": valid}}, MetaPath + ".version"},
+		{"version unsupported", map[string]any{MetaKey: map[string]any{"version": 2, "submission": valid}}, MetaPath + ".version"},
+		{"version fractional", map[string]any{MetaKey: map[string]any{"version": 1.5, "submission": valid}}, MetaPath + ".version"},
+		{"submission missing", map[string]any{MetaKey: map[string]any{"version": 1}}, MetaPath + ".submission"},
+		{"submission unknown member", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"submissionId": "s", "clientNonce": "n", "extra": 1}}}, MetaPath + ".submission.extra"},
+		{"submission id missing", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"clientNonce": "n"}}}, MetaPath + ".submission.submissionId"},
+		{"client nonce missing", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"submissionId": "s"}}}, MetaPath + ".submission.clientNonce"},
+		{"submission id empty", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"submissionId": "", "clientNonce": "n"}}}, MetaPath + ".submission.submissionId"},
+		{"submission id not a string", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"submissionId": 1, "clientNonce": "n"}}}, MetaPath + ".submission.submissionId"},
+		{"submission id over bound", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"submissionId": overBound(), "clientNonce": "n"}}}, MetaPath + ".submission.submissionId"},
+		{"empty run id", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"submissionId": "s", "clientNonce": "n", "runId": ""}}}, MetaPath + ".submission.runId"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, refusal := DecodePromptCorrelation(row.meta, Negotiated{Versions: []int{1}})
+			require.NotNil(t, refusal)
+			require.Equal(t, row.field, refusal.Field)
+		})
+	}
+}
+
+// TestDecodePromptCorrelationReadsAWireInteger proves a value that arrived through
+// JSON decoding is the same integer an embedding Go host writes.
+func TestDecodePromptCorrelationReadsAWireInteger(t *testing.T) {
+	t.Parallel()
+
+	var meta map[string]any
+	require.NoError(t, json.Unmarshal([]byte(`{"acp-go.dev/lifecycle":{"version":1,`+
+		`"submission":{"submissionId":"sub-1","clientNonce":"nonce-1"}}}`), &meta))
+
+	submission, refusal := DecodePromptCorrelation(meta, Negotiated{Versions: []int{1}})
+	require.Nil(t, refusal)
+	require.Equal(t, "sub-1", submission.SubmissionID)
+
+	decoder := json.NewDecoder(strings.NewReader("1"))
+	decoder.UseNumber()
+
+	var number json.Number
+
+	require.NoError(t, decoder.Decode(&number))
+
+	value, ok := integerValue(number)
+	require.True(t, ok)
+	require.Equal(t, 1, value)
+
+	_, ok = integerValue(json.Number("x"))
+	require.False(t, ok)
+}
+
+// TestActionCorrelationValue proves the outbound correlation carries exactly the
+// fixed members, with the optional ownership root present only when named.
+func TestActionCorrelationValue(t *testing.T) {
+	t.Parallel()
+
+	bare := ActionCorrelation{
+		StreamID: "stream-1",
+		ActionID: "action-1",
+		Owner:    Owner{Type: OwnerTurn, ID: "turn-1"},
+	}
+	require.Equal(t, map[string]any{
+		"version":  1,
+		"streamId": "stream-1",
+		"action": map[string]any{
+			"actionId": "action-1",
+			"owner":    map[string]any{"type": "turn", "id": "turn-1"},
+		},
+	}, bare.Value())
+
+	rooted := bare
+	rooted.RunID = "run-1"
+
+	action, ok := rooted.Value()["action"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "run-1", action["runId"])
+}
+
+func overBound() string {
+	value := make([]byte, IdentifierBound+1)
+	for index := range value {
+		value[index] = 'x'
+	}
+
+	return string(value)
+}
