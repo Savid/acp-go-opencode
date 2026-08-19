@@ -233,6 +233,19 @@ func TestInMemoryStoreReplaceValidation(t *testing.T) {
 			}
 		})
 	}
+	// A refused duplicate names the key it refused, subpath included, so a caller
+	// holding a long replacement set is not left to diff it by hand.
+	require.ErrorContains(t, store.Replace(ctx, main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+		{Key: SessionKey{SessionID: "s1", Subpath: "idmap"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+		{Key: SessionKey{SessionID: "s1", Subpath: "idmap"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+	}), `duplicate replacement key: session "s1" subpath "idmap"`)
+
+	require.ErrorContains(t, store.Replace(ctx, main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+	}), `duplicate replacement key: session "s1" subpath ""`)
+
 	if err := store.Replace(ctx, SessionKey{}, nil); err == nil {
 		t.Fatal("replace accepted missing main session id")
 	}

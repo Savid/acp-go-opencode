@@ -163,8 +163,12 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 	seenReplacement := make(map[SessionKey]struct{}, len(replacements))
 
 	for _, replacement := range replacements {
+		// The refusal names the key it refused. A replacement set lists many keys
+		// and a caller that listed one twice has to be told which, or the only way
+		// to find it is to diff the set by hand.
 		if _, duplicate := seenReplacement[replacement.Key]; duplicate {
-			return fmt.Errorf("duplicate replacement key")
+			return fmt.Errorf("duplicate replacement key: session %q subpath %q",
+				replacement.Key.SessionID, replacement.Key.Subpath)
 		}
 
 		seenReplacement[replacement.Key] = struct{}{}
