@@ -18,6 +18,7 @@ table lists every variant and its native source.
 | `usage_update` | Native token totals. |
 | `available_commands_update` | Changes to the session's native slash-command set. |
 | config option update | Model/mode option changes (including on `session/set_config_option`). |
+| `session_info_update` | The negotiated lifecycle stream, identity-only and carrying its envelope in `_meta`. See [Prompt streaming](/docs/core/prompt-streaming). |
 
 `usage_update` notifications may carry `_meta.opencode.messageId`; identical
 snapshots for the same message are suppressed. Tool failures carry the native
