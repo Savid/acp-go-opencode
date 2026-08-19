@@ -218,7 +218,13 @@ func (s *session) beginAction(ctx context.Context, action *pendingAction) error 
 		})
 
 		outcome, err := s.askHost(requestCtx, action)
-		if err != nil {
+		// An ask this adapter abandoned is not a failure of the turn. The two
+		// paths that abandon one — OpenCode resolving the action itself, and a
+		// cycle ending under it — cancel this context first and then record
+		// whatever actually went wrong, and a cancellation racing them to the
+		// cycle's single failure slot would report the abandonment instead of
+		// the reason for it.
+		if err != nil && requestCtx.Err() == nil {
 			s.recordActionFailure(err)
 		}
 

@@ -316,3 +316,40 @@ func TestActionAndTranscriptRepliesNeedARuntimeBinding(t *testing.T) {
 	_, err := current.finalAssistantMessage(ctx, &foregroundCycle{id: "cycle-1"})
 	require.ErrorContains(t, err, "no runtime client")
 }
+
+// TestAnAbandonedHostAskRecordsNoCycleFailure proves an ask this adapter walked
+// away from is not what ends the turn. Every path that abandons an outstanding
+// host request cancels its context first and then records whatever actually
+// resolved the action — OpenCode answering it itself, or the cycle ending under
+// it — so the cancellation the abandonment produces must never reach the cycle's
+// single failure slot and shadow the real reason. The reply OpenCode receives is
+// the observable proof the abandoned request reached its own verdict first.
+func TestAnAbandonedHostAskRecordsNoCycleFailure(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+	native := current.idmap.NativeSessionID
+
+	connection.mu.Lock()
+	connection.permissionStarted = make(chan struct{})
+	connection.permissionRelease = make(chan struct{})
+	started := connection.permissionStarted
+	connection.mu.Unlock()
+
+	current.markPublishedToolCall("call-1")
+	client.publishEvent(permissionAskedEvent(native, "permission-1", "call-1"))
+	requireSignal(t, started)
+
+	var pending *pendingAction
+
+	for _, action := range current.actions.snapshot() {
+		if action.id == "permission-1" {
+			pending = action
+		}
+	}
+
+	require.NotNil(t, pending, "the action was never registered")
+	pending.cancel()
+
+	requireEventually(t, func() bool { return client.permissionReplyCount() == 1 }, "OpenCode was left blocked")
+	require.NoError(t, current.cycleFailure(current.currentCycle()), "an abandoned ask ended the cycle")
+	require.NoError(t, current.lifecycleFailure())
+}

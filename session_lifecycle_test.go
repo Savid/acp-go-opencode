@@ -1021,3 +1021,24 @@ func (c *panickingPermissionClient) RequestPermission(
 ) (acp.RequestPermissionResponse, error) {
 	panic("host permission handler exploded")
 }
+
+// TestACycleSettlesExactlyOnce proves the ending transition is emitted once,
+// whichever path reaches the cycle first. Retirement is what makes it once: a
+// cycle already retired says nothing further, so a second settlement emits no
+// second idle and reports no error, because the turn it would be ending is over.
+func TestACycleSettlesExactlyOnce(t *testing.T) {
+	current, _, connection := lifecycleSession(t)
+	cycle := acceptTestTurn(t, current)
+
+	require.NoError(t, current.settleCycle(
+		context.Background(), cycle, lifecycle.OutcomeSuccess, string(acp.StopReasonEndTurn)))
+
+	settled := len(connection.lifecycleEventsOfType(t, "state_update"))
+
+	require.NoError(t, current.settleCycle(
+		context.Background(), cycle, lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled)))
+	require.Len(t, connection.lifecycleEventsOfType(t, "state_update"), settled,
+		"a retired cycle reported a second ending")
+	require.NoError(t, current.settleCycle(
+		context.Background(), nil, lifecycle.OutcomeSuccess, string(acp.StopReasonEndTurn)))
+}
