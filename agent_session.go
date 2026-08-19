@@ -273,7 +273,16 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 	a.mu.Lock()
 
 	active := make([]*session, 0, len(a.sessions))
-	for _, session := range a.sessions {
+
+	for id, session := range a.sessions {
+		// A tombstoned id is hidden however this agent's own bookkeeping stands.
+		// A delete whose teardown failed keeps the handle so the scope it left
+		// running is still reachable for cleanup, and that retained ownership is
+		// this process's business: the host was already told the session is gone.
+		if _, deleted := a.deleted[id]; deleted {
+			continue
+		}
+
 		if params.Cwd != nil && session.cwd != *params.Cwd {
 			continue
 		}
@@ -415,10 +424,6 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	}
 
 	a.mu.Lock()
-	if session == nil || a.sessions[params.SessionId] == session {
-		delete(a.sessions, params.SessionId)
-	}
-
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
 
@@ -426,14 +431,27 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 		return acp.UnstableDeleteSessionResponse{}, nil
 	}
 
-	a.observe.AddActiveSession(ctx, -1)
-
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
 	teardownErr := session.DeleteNativeAndClose(closeCtx)
 
 	closeCancel()
 
-	return acp.UnstableDeleteSessionResponse{}, teardownErr
+	// Hidden is a wire fact, not a bookkeeping one. The tombstone above is what
+	// hides the id, and it hides it whatever happens here; the handle is released
+	// only once this session's native scope is proven contained. A teardown that
+	// failed leaves a live native scope, and dropping the only reference to it
+	// would leave nothing in this process able to reach it again: the retained
+	// handle is what a later delete retries the cleanup through and what
+	// `Agent.Close` sweeps on the way out.
+	if teardownErr != nil {
+		return acp.UnstableDeleteSessionResponse{}, teardownErr
+	}
+
+	if a.removeSessionIf(params.SessionId, session) {
+		a.observe.AddActiveSession(ctx, -1)
+	}
+
+	return acp.UnstableDeleteSessionResponse{}, nil
 }
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {

@@ -347,6 +347,16 @@ func (c *fakeOpenCodeClient) isClosed() bool {
 	return c.closed
 }
 
+// containmentAttempts reports how many times a boundary tried to contain this
+// scope, which is how a caller distinguishes a retried containment from a
+// boundary that answered without reaching the scope at all.
+func (c *fakeOpenCodeClient) containmentAttempts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.closeCalls
+}
+
 func (c *fakeOpenCodeClient) Scope(_ context.Context, options opencode.ScopeOptions) (opencode.Client, error) {
 	c.mu.Lock()
 	c.scopeOptions = append(c.scopeOptions, opencode.ScopeOptions{

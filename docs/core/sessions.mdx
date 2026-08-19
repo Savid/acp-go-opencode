@@ -86,7 +86,11 @@ what a wire close would have committed rather than dropping it with the wrapper.
 
 `session/delete` writes its durable tombstone first and hides the id with it, so
 a teardown that fails afterwards is reported to the caller without leaving the
-session listable, loadable, or resumable. A settlement still in flight when the
+session listable, loadable, or resumable. Hiding an id is a wire fact and not a
+bookkeeping one: a teardown that could not contain the native scope leaves the
+agent holding that scope internally, so a later `session/delete` retries the
+cleanup and `Agent.Close` sweeps it, while the id itself stays gone from every
+method. A settlement still in flight when the
 tombstone lands commits nothing: the store itself refuses an append or a
 replacement addressed to a tombstoned key, writing nothing, clearing nothing, and
 answering success. A `session/load` or `session/resume` already past its entry

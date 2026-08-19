@@ -1600,14 +1600,21 @@ func TestCloseSessionRefusesWithoutADurableSnapshot(t *testing.T) {
 	require.Contains(t, agent.sessions, current.id, "the session was released without a durable snapshot")
 }
 
-// TestDeleteHidesTheSessionEvenWhenTeardownFails proves the delete order: the
-// durable tombstone is written first and the id is hidden with it, so a teardown
-// that fails afterwards is reported to the caller without leaving a session that
-// delete already answered for still listable, loadable, or resumable.
+// TestDeleteHidesTheSessionEvenWhenTeardownFails proves the delete order and
+// what hiding an id does and does not mean. The durable tombstone is written
+// first and the id is hidden with it, so a teardown that fails afterwards is
+// reported to the caller without leaving a session that delete already answered
+// for still listable, loadable, or resumable.
+//
+// Hidden is a wire fact, not a bookkeeping fact. The failed teardown left a live
+// native scope, so this agent keeps internal ownership of it: dropping the handle
+// would leave a scope nothing in this process could reach again. The retained
+// handle is what a later delete retries the cleanup through, and only a teardown
+// that proved containment releases it.
 func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.abortErr = errors.New("harness refused the interrupt")
+	client.closeErr = errors.Join(errors.New("scope refused to close"), opencode.ErrProcessContainmentIncomplete)
 	store := NewInMemorySessionStore()
 	agent := NewAgent(WithSessionStore(store))
 	current := testSession(t, agent, client)
@@ -1615,9 +1622,9 @@ func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	require.NoError(t, current.snapshotToStore(ctx))
 
 	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
-	require.ErrorContains(t, err, "harness refused the interrupt")
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	require.True(t, agent.isDeleted(current.id), "a failed teardown left the deleted id addressable")
-	require.NotContains(t, agent.sessions, current.id)
+	require.Contains(t, agent.sessions, current.id, "the failed teardown abandoned the native scope it left running")
 
 	listed, err := agent.ListSessions(ctx, ListSessionsRequest())
 	require.NoError(t, err)
@@ -1630,10 +1637,47 @@ func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	_, err = agent.LoadSession(ctx, LoadSessionRequest(current.id, t.TempDir()))
 	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
 
-	// Delete is idempotent: the second one answers for a session that is
-	// already gone without touching anything.
+	_, err = agent.ResumeSession(ctx, ResumeSessionRequest(current.id, t.TempDir()))
+	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+
+	// The scope the failed teardown left behind is reclaimed by the next delete,
+	// which runs the same containment again rather than answering for a session
+	// it never contained.
+	client.closeErr = nil
+	attempts := client.containmentAttempts()
+
 	_, err = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
 	require.NoError(t, err)
+	require.Greater(t, client.containmentAttempts(), attempts, "the retried delete never reached the scope again")
+	require.NotContains(t, agent.sessions, current.id, "the proven teardown kept the handle")
+
+	stored, err = store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the retried delete resurrected the tombstoned row")
+}
+
+// TestAgentCloseSweepsTheScopeAFailedDeleteLeftBehind proves the other half of
+// that retained ownership: an agent shutting down closes the native scope of a
+// session whose delete could not contain it, exactly as it closes every other
+// session's. A handle dropped at the tombstone would have left that scope running
+// past the process that owned it.
+func TestAgentCloseSweepsTheScopeAFailedDeleteLeftBehind(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.closeErr = errors.Join(errors.New("scope refused to close"), opencode.ErrProcessContainmentIncomplete)
+	agent := NewAgent(WithSessionStore(NewInMemorySessionStore()))
+	current := testSession(t, agent, client)
+	agent.sessions[current.id] = current
+
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+
+	client.closeErr = nil
+	attempts := client.containmentAttempts()
+
+	require.NoError(t, agent.Close())
+	require.Greater(t, client.containmentAttempts(), attempts,
+		"the shutdown swept every scope but the one the failed delete left behind")
 }
 
 // TestACommitRacingASucceededDeleteRecreatesNothing proves the write barrier a
