@@ -162,6 +162,12 @@ func TestReducerRefusesAnIncompleteSnapshotForeground(t *testing.T) {
 // received one to. An emitted snapshot never passes through the decoder, so a
 // rule enforced only there would let this adapter emit a foreground it would
 // refuse to read.
+//
+// Presence binds in both directions: an idle foreground names no turn, and a live
+// one — running or blocked alike — asserts a cycle a turn owns, so one carrying
+// neither turn nor origin is refused whole rather than projected as a foreground
+// nothing introduced. The blocked row is refused for the missing turn before its
+// action set is consulted for a blocker.
 func TestReducerRefusesAMisshapenSnapshotForegroundTurn(t *testing.T) {
 	t.Parallel()
 
@@ -174,12 +180,20 @@ func TestReducerRefusesAMisshapenSnapshotForegroundTurn(t *testing.T) {
 			foreground: Foreground{State: ForegroundIdle, CycleID: "cycle-1", TurnID: "turn-1", Origin: CauseSubmission},
 		},
 		{
+			name:       "live foreground naming no turn",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cycle-1"},
+		},
+		{
+			name:       "blocked foreground naming no turn",
+			foreground: Foreground{State: ForegroundRequiresAction, CycleID: "cycle-1"},
+		},
+		{
 			name:       "turn without an origin",
 			foreground: Foreground{State: ForegroundRunning, CycleID: "cycle-1", TurnID: "turn-1"},
 		},
 		{
 			name:       "origin without a turn",
-			foreground: Foreground{State: ForegroundRunning, CycleID: "cycle-1", Origin: CauseSubmission},
+			foreground: Foreground{State: ForegroundIdle, CycleID: "cycle-1", Origin: CauseSubmission},
 		},
 		{
 			name:       "origin outside the closed pair",
@@ -913,6 +927,36 @@ func TestReducerJudgesTheEndingIdleItIsGivenDirectly(t *testing.T) {
 			require.ErrorIs(t,
 				r.push(IdleEvent("cycle-1", "turn-1", row.stopReason, row.outcome)),
 				&ViolationError{Kind: ViolationMalformedEnvelope})
+		})
+	}
+}
+
+// TestReducerRefusesATurnlessLiveTransition proves a transition asserting a live
+// foreground with no turn is refused structurally, and that the refusal outranks
+// both the rules it would otherwise reach: the running row would resolve an empty
+// name and report an unknown entity, and the requires-action row names a cycle
+// nothing blocks and would report an inconsistent foreground. Neither verdict is
+// reachable, because an event omitting a member its state requires is judged
+// before any name is resolved and before any cycle is consulted.
+func TestReducerRefusesATurnlessLiveTransition(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name  string
+		state ForegroundState
+	}{
+		{name: "running", state: ForegroundRunning},
+		{name: "requires action on an unblocked cycle", state: ForegroundRequiresAction},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newReduction(promptContained())
+			r.open(t)
+
+			require.ErrorIs(t, r.push(TransitionEvent(row.state, "cycle-1", "", CauseSession)),
+				&ViolationError{Kind: ViolationMalformedEnvelope})
+			require.Empty(t, r.reducer.State().Turns)
 		})
 	}
 }

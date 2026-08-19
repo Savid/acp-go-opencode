@@ -112,6 +112,17 @@ type StateTransition struct {
 	Outcome    Outcome
 }
 
+// liveForegroundDetail states the rule an assertion of a live foreground breaks
+// when it names no turn. A running foreground is a turn running and a blocked one
+// is owned work blocked, so neither an update nor a snapshot may assert either
+// without the turn that owns it, whatever the update's cause.
+//
+// The defect is structural, so it is judged before ordering, before any name is
+// resolved — an event carrying no name has no name to report unresolvable — and
+// before the blocked-cycle rule, because an event omitting a member its state
+// requires says nothing about a cycle for that rule to judge.
+const liveForegroundDetail = "a live foreground names the turn that owns it"
+
 // endingIdleDefect reports why an idle transition that settles a turn is
 // structurally incomplete, or the empty string when it is not. An idle naming a
 // turn ends it, so the outcome is always required; the stop reason is required

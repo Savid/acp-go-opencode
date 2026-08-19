@@ -38,6 +38,8 @@ func (r *Reducer) checkSnapshot(delivery Delivery, snapshot Snapshot) error {
 	switch {
 	case foreground.State == ForegroundIdle && foreground.TurnID != "":
 		return r.fail(delivery, ViolationMalformedEnvelope, "an idle foreground reports no turn")
+	case foreground.State != ForegroundIdle && foreground.TurnID == "":
+		return r.fail(delivery, ViolationMalformedEnvelope, liveForegroundDetail)
 	case (foreground.TurnID == "") != (foreground.Origin == ""):
 		return r.fail(delivery, ViolationMalformedEnvelope, "foreground origin is present exactly while a turn is")
 	case foreground.Origin != "" && foreground.Origin != CauseSubmission && foreground.Origin != CauseActivity:
@@ -238,10 +240,24 @@ func (r *Reducer) applyPromptAccepted(delivery Delivery) error {
 	return nil
 }
 
+// applyStateUpdate reduces one foreground transition. The structural defects come
+// first and in their own order: a transition asserting a live foreground with no
+// turn is refused before the cycle is consulted and before the turn is resolved,
+// so a properly blocked cycle never converts the defect into a consistency
+// verdict and an event carrying no name never reports an unresolvable one.
+//
+// The turn rule is enforced here as well as in the decoder, because this reducer
+// is also the gate on what this adapter emits: an event built in memory never
+// passes through the decoder, so a rule that lived only there would judge streams
+// this package reads and none it writes.
 func (r *Reducer) applyStateUpdate(delivery Delivery) error {
 	transition := delivery.Event.State
 	if transition == nil {
 		return r.fail(delivery, ViolationMalformedEnvelope, "the transition payload is missing")
+	}
+
+	if transition.State != ForegroundIdle && transition.TurnID == "" {
+		return r.fail(delivery, ViolationMalformedEnvelope, liveForegroundDetail)
 	}
 
 	if detail := endingIdleDefect(*transition); detail != "" {

@@ -238,8 +238,9 @@ func (d *decoder) snapshot(fields map[string]json.RawMessage) Event {
 }
 
 // foreground reads the snapshot's foreground object. Presence is a rule rather
-// than a preference: a turn is named exactly while one is open, and its origin is
-// named exactly with it, so a resumed turn always carries recorded provenance.
+// than a preference, and it binds in both directions: an idle foreground names no
+// turn, a live one names the turn that owns it, and the origin is named exactly
+// with the turn, so a resumed turn always carries recorded provenance.
 func (d *decoder) foreground(raw json.RawMessage) Foreground {
 	fields, ok := jsonObject(raw)
 	if !ok {
@@ -262,6 +263,8 @@ func (d *decoder) foreground(raw json.RawMessage) Foreground {
 		d.fail(ViolationMalformedEnvelope, "foreground state "+string(foreground.State))
 	case foreground.State == ForegroundIdle && foreground.TurnID != "":
 		d.fail(ViolationMalformedEnvelope, "an idle foreground reports no turn")
+	case foreground.State != ForegroundIdle && foreground.TurnID == "":
+		d.fail(ViolationMalformedEnvelope, liveForegroundDetail)
 	case (foreground.TurnID == "") != (foreground.Origin == ""):
 		d.fail(ViolationMalformedEnvelope, "foreground origin is present exactly while a turn is")
 	case foreground.Origin != "" && foreground.Origin != CauseSubmission && foreground.Origin != CauseActivity:
@@ -302,6 +305,8 @@ func (d *decoder) stateUpdate(fields map[string]json.RawMessage) Event {
 		d.fail(ViolationMalformedEnvelope, "transition cause "+string(transition.Cause))
 	case transition.TurnID == "" && transition.Cause != CauseSession:
 		d.fail(ViolationMalformedEnvelope, "a "+string(transition.Cause)+"-caused transition names its turn")
+	case transition.TurnID == "" && transition.State != ForegroundIdle:
+		d.fail(ViolationMalformedEnvelope, liveForegroundDetail)
 	case transition.State != ForegroundIdle && (transition.StopReason != "" || transition.Outcome != ""):
 		d.fail(ViolationMalformedEnvelope, "only an ending transition carries a stop reason and an outcome")
 	case transition.StopReason != "" && !ValidStopReason(transition.StopReason):
