@@ -240,6 +240,24 @@ func (a *Agent) Close() error {
 	a.mu.Unlock()
 
 	err := stickyRuntimeErr
+
+	// The ladder runs per logical session first and closes the shared native
+	// tree exactly once afterwards, and the order is load-bearing rather than
+	// tidy. Each session owes the same durable commit a wire `session/close`
+	// owes, that commit reads the native scope through the loopback API, and
+	// retiring the shared runtime first would destroy the material every
+	// still-owed commit needs — an embedded shutdown would then drop state a
+	// wire close would have committed, which is the same lost generation
+	// however the process ended.
+	for _, session := range sessions {
+		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+		err = errors.Join(err, session.CloseAndCommit(ctx))
+
+		cancel()
+	}
+
+	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
+
 	if runtime != nil {
 		err = errors.Join(err, a.retireSharedRuntime(generation, "shared OpenCode runtime retired while closing agent"))
 	} else if waiting != nil {
@@ -258,15 +276,6 @@ func (a *Agent) Close() error {
 			err = errors.Join(err, startErr)
 		}
 	}
-
-	for _, session := range sessions {
-		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
-		err = errors.Join(err, session.Close(ctx))
-
-		cancel()
-	}
-
-	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
 
 	a.mu.Lock()
 	a.sessions = make(map[acp.SessionId]*session)

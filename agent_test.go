@@ -288,3 +288,53 @@ func requireExplicitPolicyReachesTheRuntime(t *testing.T, policy ProcessIsolatio
 	require.Equal(t, "deployment-1", launched.StandaloneOwnerID)
 	require.Equal(t, home, launched.StandaloneStateRoot)
 }
+
+// TestAgentCloseRunsTheDurableRungAWireCloseOwes proves the durable rung travels
+// with the ladder. An embedded shutdown closes each session through the same
+// committing boundary a wire `session/close` runs, so state the session took on
+// since its last turn — the model set through a config option here — reaches the
+// store instead of being dropped with the wrapper. A later load restores what the
+// host last saw rather than what the last turn happened to leave behind.
+func TestAgentCloseRunsTheDurableRungAWireCloseOwes(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-shutdown")
+	client.getSession = testNativeSession("native-shutdown")
+	client.agents = []opencode.NativeAgent{{Name: "build"}, {Name: "plan"}}
+
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	stored := func(t *testing.T) stateSnapshot {
+		t.Helper()
+
+		entries, loadErr := store.Load(ctx,
+			SessionKey{SessionID: string(created.SessionId), Subpath: SessionStoreMainSubpath})
+		require.NoError(t, loadErr)
+		require.Len(t, entries, 1)
+
+		var bundle stateSnapshot
+
+		require.NoError(t, json.Unmarshal(entries[0], &bundle))
+
+		return bundle
+	}
+
+	require.Equal(t, "build", stored(t).Session.Model.Agent)
+
+	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(created.SessionId, configMode, "plan"))
+	require.NoError(t, err)
+	require.Equal(t, "build", stored(t).Session.Model.Agent,
+		"the config option committed on its own, so this test proves nothing about the boundary")
+
+	require.NoError(t, agent.Close())
+
+	require.Equal(t, "plan", stored(t).Session.Model.Agent,
+		"the embedded shutdown dropped state a wire close would have committed")
+}
