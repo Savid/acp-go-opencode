@@ -283,8 +283,44 @@ func (s *session) settleCycle(ctx context.Context, cycle *foregroundCycle, outco
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if cycle == nil || cycle.settled {
+	if !s.retireCycleLocked(cycle) {
 		return nil
+	}
+
+	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(cycle.id, cycle.turnID, stopReason, outcome))
+}
+
+// settleCloseCycle ends the close boundary's foreground cycle. The emission rungs
+// of the close ladder apply only to a live incarnation: when this session's stream
+// is already fenced — a cancel or an incarnation loss ended it — or none ever
+// opened, the boundary emits nothing on it, because an event bearing a fenced
+// stream identity is exactly what a conforming reducer refuses as stale and the
+// terminal state was already reported by whatever fenced the stream. The cycle the
+// loss ended keeps the end it was given: close never restates it as cancelled. The
+// chain of preconditions stays intact across the skipped rung, so the settlement
+// response follows the last durable commit directly.
+func (s *session) settleCloseCycle(ctx context.Context, cycle *foregroundCycle) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if !s.retireCycleLocked(cycle) {
+		return nil
+	}
+
+	if s.lifecycleStream == nil || s.lifecycleFailed != nil {
+		return nil
+	}
+
+	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(
+		cycle.id, cycle.turnID, string(acp.StopReasonCancelled), lifecycle.OutcomeCancelled))
+}
+
+// retireCycleLocked ends the cycle locally and reports whether this caller is the
+// one that ended it. Retirement is what makes the ending transition emit once: a
+// cycle already retired says nothing further, whichever path reaches it.
+func (s *session) retireCycleLocked(cycle *foregroundCycle) bool {
+	if cycle == nil || cycle.settled {
+		return false
 	}
 
 	cycle.settled = true
@@ -295,11 +331,7 @@ func (s *session) settleCycle(ctx context.Context, cycle *foregroundCycle, outco
 
 	cycle.wake()
 
-	if s.lifecycleStream == nil {
-		return s.lifecycleFailed
-	}
-
-	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(cycle.id, cycle.turnID, stopReason, outcome))
+	return true
 }
 
 // blockCycleLocked records that an action stopped the cycle that owes the

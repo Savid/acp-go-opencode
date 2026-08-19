@@ -555,6 +555,29 @@ func (s *session) awaitNativeSettlement(ctx context.Context, cycle *foregroundCy
 	}
 }
 
+// awaitCloseSettlement waits for the close boundary's cycle to acquire terminal
+// evidence. An incarnation loss is terminal evidence rather than an unproven
+// interrupt: the cycle is over, the stream that would have reported it is fenced,
+// and the rungs below this one — the containment proof and both durable commits —
+// run whether or not the incarnation survived to say anything. Only a cycle that
+// never reported at all stops the ladder, because that leaves native work this
+// boundary has not proved stopped.
+func (s *session) awaitCloseSettlement(ctx context.Context, cycle *foregroundCycle) error {
+	err := s.awaitNativeSettlement(ctx, cycle)
+	if err == nil {
+		return nil
+	}
+
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if cycle != nil && cycle.lost != nil {
+		return nil
+	}
+
+	return err
+}
+
 // currentClient reports the runtime client this session is bound to.
 func (s *session) currentClient() opencode.Client {
 	s.mu.Lock()
@@ -1015,6 +1038,10 @@ func (s *session) closeSession(commitResumable bool) error {
 // nothing, commits nothing new, and answers with the containment error, because
 // terminal is immutable and this session has just failed to prove what it would
 // be declaring over.
+//
+// The containment proof and the durable commit are unconditional; only the
+// terminal transition is a stream rung, and it is emitted only while this session
+// still speaks for a live incarnation.
 func (s *session) closeBoundary(firstClose bool, commitResumable bool) error {
 	var (
 		cycle    *foregroundCycle
@@ -1058,7 +1085,7 @@ func (s *session) closeBoundary(firstClose bool, commitResumable bool) error {
 		return err
 	}
 
-	return s.settleCycle(commitCtx, cycle, lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled))
+	return s.settleCloseCycle(commitCtx, cycle)
 }
 
 // settleBeforeContainment stops this session's native work and reads the state a
@@ -1081,7 +1108,7 @@ func (s *session) settleBeforeContainment(
 		return nil, capturedStateSnapshot{}, err
 	}
 
-	if err := s.awaitNativeSettlement(ctx, cycle); err != nil {
+	if err := s.awaitCloseSettlement(ctx, cycle); err != nil {
 		return nil, capturedStateSnapshot{}, err
 	}
 

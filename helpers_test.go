@@ -184,6 +184,9 @@ type fakeOpenCodeClient struct {
 	abortFunc         func(string) error
 	syncHistoryFunc   func(context.Context, map[string]int64) ([]opencode.SyncEvent, error)
 	refreshMCPFunc    func(context.Context, []opencode.MCPServerConfig) error
+	// closeHook runs inside the containment rung, which is the one point of the
+	// close ladder that sits between the capture and the durable commit.
+	closeHook func()
 
 	aborts         []string
 	deleted        []string
@@ -314,6 +317,14 @@ func testProviders() opencode.ProvidersResponse {
 // hands the same fake back for a second broker start. Signalling outside the
 // mutex read both of them while that replacement was writing them.
 func (c *fakeOpenCodeClient) Close(context.Context) error {
+	c.mu.Lock()
+	hook := c.closeHook
+	c.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

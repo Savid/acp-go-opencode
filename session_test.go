@@ -500,3 +500,157 @@ func TestRecoveryWithoutACommittedGenerationRefusesThePrompt(t *testing.T) {
 
 	require.ErrorContains(t, current.ensureRuntime(context.Background()), "opencode_recovery_generation_missing")
 }
+
+// TestCloseOnAFencedIncarnationEmitsNothingAndStillCommits proves the close
+// ladder's stream rungs apply only to a live incarnation. A cancel that retired
+// the native generation, an incarnation loss that left a turn unsettled, and a
+// session that never opened an incarnation at all each close successfully with no
+// lifecycle event on the dead stream, while the rungs that are not emissions —
+// the containment proof and the durable commit — run exactly as they do on the
+// live branch. A turn the loss ended is never restated as cancelled: the two
+// paths do not share a terminal state, and rewriting one as the other would tell
+// a host a contained end from a lost one.
+func TestCloseOnAFencedIncarnationEmitsNothingAndStillCommits(t *testing.T) {
+	t.Parallel()
+
+	t.Run("incarnation lost with a turn still open", func(t *testing.T) {
+		t.Parallel()
+
+		client := newFakeOpenCodeClient()
+		store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+		agent := negotiatedAgent(t, WithSessionStore(store))
+		connection := newRecordingAgentClient()
+		agent.setAgentClient(connection)
+		current := testSession(t, agent, client)
+
+		agent.mu.Lock()
+		agent.sessions[current.id] = current
+		agent.mu.Unlock()
+
+		cycle := acceptTestTurn(t, current)
+		current.fenceLifecycle("native generation retired")
+		require.Error(t, cycle.lost, "the fence left the open cycle without its loss")
+
+		fenced := len(connection.lifecycleEnvelopes(t))
+
+		var committed int
+
+		store.onReplace = func(SessionKey) error {
+			committed++
+
+			return nil
+		}
+
+		_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+		require.NoError(t, err, "a fenced incarnation blocked the containment boundary")
+		require.True(t, client.isClosed(), "the fenced incarnation was never contained")
+		require.Positive(t, committed, "the fenced branch skipped the durable commit")
+		require.Len(t, connection.lifecycleEnvelopes(t), fenced, "the boundary emitted on a fenced stream")
+
+		for _, transition := range connection.lifecycleEventsOfType(t, "state_update") {
+			require.NotEqual(t, "idle", transition["state"],
+				"close restated a turn the incarnation loss already ended")
+		}
+	})
+
+	t.Run("never opened", func(t *testing.T) {
+		t.Parallel()
+
+		client := newFakeOpenCodeClient()
+		store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+		agent := NewAgent(WithSessionStore(store))
+		connection := newRecordingAgentClient()
+		agent.setAgentClient(connection)
+		current := testSession(t, agent, client)
+		require.True(t, current.lifecycleStreamAbsent(), "the unnegotiated session opened an incarnation")
+
+		agent.mu.Lock()
+		agent.sessions[current.id] = current
+		agent.mu.Unlock()
+
+		cycle := acceptTestTurn(t, current)
+
+		var committed int
+
+		store.onReplace = func(SessionKey) error {
+			committed++
+
+			return nil
+		}
+
+		_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+		require.NoError(t, err)
+		require.True(t, client.isClosed(), "a session with no incarnation was never contained")
+		require.Positive(t, committed, "a session with no incarnation skipped the durable commit")
+		require.True(t, cycle.settled, "the boundary left its cycle addressable")
+		require.Empty(t, connection.lifecycleEnvelopes(t), "a session with no incarnation emitted an envelope")
+	})
+}
+
+// TestCloseCommitsAGenerationCapturedBeforeAConcurrentFence proves the durable
+// commit is not a stream rung. The generation is read while the loopback API can
+// still answer, the incarnation is fenced underneath the boundary before the
+// write, and the captured generation still lands: a fence decides what may be
+// emitted, never what has already been proved worth keeping.
+func TestCloseCommitsAGenerationCapturedBeforeAConcurrentFence(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptTestTurn(t, current)
+
+	// Containment sits between the capture and the commit, so fencing there is
+	// the narrowest way to land a fence on a generation already captured.
+	client.closeHook = func() { current.fenceLifecycle("native generation retired mid-close") }
+
+	var committed int
+
+	store.onReplace = func(SessionKey) error {
+		committed++
+
+		return nil
+	}
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.NoError(t, err)
+	require.Positive(t, committed, "a concurrent fence discarded a generation already captured")
+	require.True(t, cycle.settled, "the boundary left its cycle addressable")
+
+	for _, transition := range connection.lifecycleEventsOfType(t, "state_update") {
+		require.NotEqual(t, "idle", transition["state"], "the boundary emitted on a stream fenced under it")
+	}
+}
+
+// TestCloseFailsOnACaptureItCannotRead proves the capture rung is not optional.
+// The state a reload restores from is read before containment, and a read the
+// boundary cannot complete fails the close rather than contain a session whose
+// durable generation this adapter could not prove.
+func TestCloseFailsOnACaptureItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	client.syncHistoryErr = errors.New("sync history unavailable")
+	agent := negotiatedAgent(t, WithSessionStore(NewInMemorySessionStore()))
+	agent.setAgentClient(newRecordingAgentClient())
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	acceptTestTurn(t, current)
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorContains(t, err, "sync history unavailable")
+	require.False(t, client.isClosed(), "an unreadable capture contained the session anyway")
+	require.Contains(t, agent.sessions, current.id, "the session was released without a durable capture")
+}
