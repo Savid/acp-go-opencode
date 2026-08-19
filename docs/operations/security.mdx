@@ -139,9 +139,11 @@ only trusted peer:
   and every other owner or `ACTIVE` refuses. A changed boot carries every valid standalone
   owner+`ACTIVE` unchanged and excluded, and ownerless
   `CLEAN_READY` may be carried. A provider never recovers ownerless `ACTIVE`:
-  it performs no kill, path deletion, disposition rewrite, or CLEAN publish and
-  fails with `Host recovery required`. The host authority alone owns that
-  destructive recovery grammar and authority. Only the exact standalone owner may roll
+  it performs no kill, path deletion, disposition rewrite, or CLEAN publish, and
+  refuses the launch instead, reporting that authoritative host recovery is
+  required. The operator posture that refusal leaves is
+  `Host recovery required` — the host authority alone owns that destructive
+  recovery grammar and authority. Only the exact standalone owner may roll
   retained `ACTIVE` after publication and two consecutive vacancy scans.
   Missing domain state plus any owner or disposition fails closed. Every
   authorized cleanup requires exact persisted root device/inode; device
