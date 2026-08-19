@@ -391,10 +391,18 @@ func (a *Agent) Logout(_ context.Context, params acp.LogoutRequest) (acp.LogoutR
 	return acp.LogoutResponse{}, nil
 }
 
-// SetSessionMode does not exist on this adapter, so it answers method not found
-// before any parameter is inspected: a method with no implementation has no
-// params to validate.
-func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+// SetSessionMode is not implemented by this adapter, but the family literal is
+// refused before the method verdict is given. The reserved key has no meaning on
+// any inbound surface the pinned SDK dispatches, and a surface that answers
+// method-not-found without reading it would let a host stamp the key anywhere
+// unimplemented and be told the key was fine. The refusal is the one every other
+// inbound surface gives, so the verdict does not depend on which method carried
+// the key.
+func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.SetSessionModeResponse{}, refusal
+	}
+
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
 
