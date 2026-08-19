@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 
@@ -43,6 +44,7 @@ func TestDecodeOfferStrictness(t *testing.T) {
 		{"versions empty", map[string]any{"versions": []any{}}, MetaPath + ".versions"},
 		{"version not an integer", map[string]any{"versions": []any{"1"}}, MetaPath + ".versions"},
 		{"version fractional", map[string]any{"versions": []any{1.5}}, MetaPath + ".versions"},
+		{"version beyond every int", map[string]any{"versions": []any{1e300}}, MetaPath + ".versions"},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
@@ -161,6 +163,7 @@ func TestDecodePromptCorrelationStrictness(t *testing.T) {
 		{"version missing", map[string]any{MetaKey: map[string]any{"submission": valid}}, MetaPath + ".version"},
 		{"version unsupported", map[string]any{MetaKey: map[string]any{"version": 2, "submission": valid}}, MetaPath + ".version"},
 		{"version fractional", map[string]any{MetaKey: map[string]any{"version": 1.5, "submission": valid}}, MetaPath + ".version"},
+		{"version beyond every int", map[string]any{MetaKey: map[string]any{"version": 1e300, "submission": valid}}, MetaPath + ".version"},
 		{"submission missing", map[string]any{MetaKey: map[string]any{"version": 1}}, MetaPath + ".submission"},
 		{"submission unknown member", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"submissionId": "s", "clientNonce": "n", "extra": 1}}}, MetaPath + ".submission.extra"},
 		{"submission id missing", map[string]any{MetaKey: map[string]any{"version": 1, "submission": map[string]any{"clientNonce": "n"}}}, MetaPath + ".submission.submissionId"},
@@ -206,6 +209,56 @@ func TestDecodePromptCorrelationReadsAWireInteger(t *testing.T) {
 
 	_, ok = integerValue(json.Number("x"))
 	require.False(t, ok)
+}
+
+// TestIntegerValueReadsOnlyTheIntegersAnIntHolds proves the wire-integer read is
+// exact rather than merely fractionless: a magnitude no int can hold names no
+// version, whatever its whole-numberedness, while the integers a host actually
+// writes — as a wire float, as a Go int, as a decoded number — read as themselves.
+func TestIntegerValueReadsOnlyTheIntegersAnIntHolds(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name  string
+		raw   any
+		value int
+	}{
+		{"wire float", 1.0, 1},
+		{"go int", 1, 1},
+		{"negative", -7.0, -7},
+		{"zero", 0.0, 0},
+		{"largest exact float integer", float64(1 << 53), 1 << 53},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+
+			value, ok := integerValue(row.raw)
+			require.True(t, ok)
+			require.Equal(t, row.value, value)
+		})
+	}
+
+	for _, row := range []struct {
+		name string
+		raw  any
+	}{
+		{"fractional", 1.5},
+		{"beyond every int", 1e300},
+		{"below every int", -1e300},
+		{"largest float", math.MaxFloat64},
+		{"at the int64 ceiling", math.Ldexp(1, 63)},
+		{"positive infinity", math.Inf(1)},
+		{"not a number", math.NaN()},
+		{"a string", "1"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+
+			value, ok := integerValue(row.raw)
+			require.False(t, ok)
+			require.Zero(t, value)
+		})
+	}
 }
 
 // TestActionCorrelationValue proves the outbound correlation carries exactly the
