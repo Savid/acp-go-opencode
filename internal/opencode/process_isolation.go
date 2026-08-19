@@ -172,10 +172,6 @@ func environmentMap(entries []string) map[string]string {
 	return values
 }
 
-func buildProcessEnvironment(isolation *ProcessIsolation, overlays ...map[string]string) (map[string]string, error) {
-	return buildProcessEnvironmentFrom(isolation, nil, overlays...)
-}
-
 func buildProcessEnvironmentFrom(
 	isolation *ProcessIsolation,
 	implicitEnvironment map[string]string,

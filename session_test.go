@@ -374,6 +374,32 @@ func lifecycleFenced(current *session) bool {
 	return current.incarnationFencedLocked()
 }
 
+// lifecycleFailure reports the latched stream failure, if any. A latched stream
+// can carry nothing further: the sequence it consumed is spent, and a later
+// delivery would hide that gap behind an apparently contiguous stream. Nothing
+// in production asks — the latch is read where it is written, under the lock —
+// so the accessor belongs to the cases that assert on it.
+func (s *session) lifecycleFailure() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	return s.lifecycleFailed
+}
+
+// lifecycleStreamID reports the incarnation this session's stream speaks for,
+// which is how a case proves a recovered incarnation opened a stream of its own
+// rather than inheriting the fenced one's identity.
+func (s *session) lifecycleStreamID() string {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if s.lifecycleStream == nil {
+		return ""
+	}
+
+	return s.lifecycleStream.ID()
+}
+
 // testRuntimeGeneration reports the runtime binding this session holds, which the
 // production loss ladder addresses by generation.
 func testRuntimeGeneration(current *session) uint64 {

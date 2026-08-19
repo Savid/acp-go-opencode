@@ -107,7 +107,7 @@ func TestCarrierFromMetaReplacesOnlyThePresentHalf(t *testing.T) {
 	recorded := newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "old"}, []string{"/old/bin"})
 
 	unchanged := carrierFromMeta(sessionMeta{}, recorded)
-	require.True(t, unchanged.equal(recorded))
+	require.Equal(t, recorded, unchanged)
 
 	rotated := carrierFromMeta(sessionMeta{
 		EnvSet: true, Env: map[string]string{"WAGIE_API_TOKEN": "new"},
@@ -115,7 +115,7 @@ func TestCarrierFromMetaReplacesOnlyThePresentHalf(t *testing.T) {
 	}, recorded)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "new"}, rotated.Env)
 	require.Equal(t, []string{"/new/bin"}, rotated.ExtraPathDirs)
-	require.False(t, rotated.equal(recorded), "the recorded carrier must not be mutated in place")
+	require.NotEqual(t, recorded, rotated, "the recorded carrier must not be mutated in place")
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "old"}, recorded.Env)
 
 	cleared := carrierFromMeta(sessionMeta{EnvSet: true, ExtraPathDirsSet: true}, recorded)
@@ -129,7 +129,7 @@ func TestCarrierFromMetaReplacesOnlyThePresentHalf(t *testing.T) {
 	copied.ExtraPathDirs[0] = "/other"
 	require.Equal(t, map[string]string{"A": "1"}, source.Env)
 	require.Equal(t, []string{"/bin"}, source.ExtraPathDirs)
-	require.False(t, source.equal(copied))
+	require.NotEqual(t, source, copied)
 }
 
 func TestCarrierScopeOptionsClone(t *testing.T) {
@@ -192,9 +192,9 @@ func TestConcurrentSessionsCarryDistinctBearersAndDirectories(t *testing.T) {
 	require.NoError(t, agent.Close())
 }
 
-// TestRebindRotatesOneSessionAndLeavesItsPeerAlone covers the rotation the
-// review requires: a live peer keeps its bearer while the rebound session's
-// previous bearer disappears entirely.
+// TestRebindRotatesOneSessionAndLeavesItsPeerAlone covers what a rebind owes a
+// peer: a live peer keeps its bearer while the rebound session's previous
+// bearer disappears entirely.
 func TestRebindRotatesOneSessionAndLeavesItsPeerAlone(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()

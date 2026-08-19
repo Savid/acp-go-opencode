@@ -400,7 +400,7 @@ func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
 	rejected := NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
 		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) { return nil, errors.New("pool full") },
 	}))
-	_, err = rejected.sharedRuntime(ctx)
+	_, _, err = rejected.sharedRuntimeBinding(ctx)
 	require.ErrorContains(t, err, "pool full")
 }
 

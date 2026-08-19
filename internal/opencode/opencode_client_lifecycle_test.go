@@ -1279,10 +1279,10 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	if err != nil || password == "" {
 		t.Fatalf("randomPassword = %q err=%v", password, err)
 	}
-	env, err := buildProcessEnvironment(&ProcessIsolation{
+	env, err := buildProcessEnvironmentFrom(&ProcessIsolation{
 		UID: 1, GID: 2, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin"},
 		StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test",
-	}, map[string]string{"A": "1"}, map[string]string{"A": "2", "B": "3"})
+	}, nil, map[string]string{"A": "1"}, map[string]string{"A": "2", "B": "3"})
 	if err != nil || env["A"] != "2" || env["B"] != "3" {
 		t.Fatalf("merged env = %#v, err = %v", env, err)
 	}

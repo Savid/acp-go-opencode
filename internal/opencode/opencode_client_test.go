@@ -278,17 +278,17 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 	doc := fullOpenCodeDoc()
 	paths := docMap(t, doc, "paths")
 	delete(paths, "/api/session/{sessionID}/question/{requestID}/reply")
-	if err := validateOpenCodeDoc(doc); err == nil || !strings.Contains(err.Error(), "question") {
-		t.Fatalf("validateOpenCodeDoc error = %v", err)
+	if _, err := inspectOpenCodeDoc(doc); err == nil || !strings.Contains(err.Error(), "question") {
+		t.Fatalf("inspectOpenCodeDoc error = %v", err)
 	}
 	for _, path := range []string{"/command", "/session/{sessionID}/command", "/session/{sessionID}/message"} {
 		t.Run("route gate missing "+path, func(t *testing.T) {
 			doc := cloneOpenCodeDoc(t, fullOpenCodeDoc())
 			paths := docMap(t, doc, "paths")
 			delete(paths, path)
-			err := validateOpenCodeDoc(doc)
+			_, err := inspectOpenCodeDoc(doc)
 			if err == nil || !strings.Contains(err.Error(), path) {
-				t.Fatalf("validateOpenCodeDoc error = %v", err)
+				t.Fatalf("inspectOpenCodeDoc error = %v", err)
 			}
 		})
 	}
@@ -296,8 +296,8 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 		doc := cloneOpenCodeDoc(t, fullOpenCodeDoc())
 		paths := docMap(t, doc, "paths")
 		delete(paths, "/api/session/{sessionID}/prompt")
-		if err := validateOpenCodeDoc(doc); err != nil {
-			t.Fatalf("validateOpenCodeDoc without deleted prompt route: %v", err)
+		if _, err := inspectOpenCodeDoc(doc); err != nil {
+			t.Fatalf("inspectOpenCodeDoc without deleted prompt route: %v", err)
 		}
 	})
 	for _, tt := range []struct {
@@ -586,8 +586,8 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := cloneOpenCodeDoc(t, fullOpenCodeDoc())
 			tt.mutate(t, doc)
-			if err := validateOpenCodeDoc(doc); err == nil {
-				t.Fatal("validateOpenCodeDoc accepted invalid /doc")
+			if _, err := inspectOpenCodeDoc(doc); err == nil {
+				t.Fatal("inspectOpenCodeDoc accepted invalid /doc")
 			}
 		})
 	}

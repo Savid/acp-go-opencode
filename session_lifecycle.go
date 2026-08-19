@@ -442,25 +442,3 @@ func (s *session) lifecycleActionMeta(actionID string, owner lifecycle.Owner) ma
 		StreamID: s.lifecycleStream.ID(), ActionID: actionID, Owner: owner, RunID: runID,
 	}.Value()}
 }
-
-// lifecycleFailure reports the latched stream failure, if any. A latched stream
-// can carry nothing further: the sequence it consumed is spent, and a later
-// delivery would hide that gap behind an apparently contiguous stream.
-func (s *session) lifecycleFailure() error {
-	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-
-	return s.lifecycleFailed
-}
-
-// lifecycleStreamID reports the incarnation this session's stream speaks for.
-func (s *session) lifecycleStreamID() string {
-	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-
-	if s.lifecycleStream == nil {
-		return ""
-	}
-
-	return s.lifecycleStream.ID()
-}

@@ -298,7 +298,7 @@ func TestAgentCloseWaitsForConstructionCleanupAndReturnsContainmentFailure(t *te
 
 	startResult := make(chan error, 1)
 	go func() {
-		_, err := agent.sharedRuntime(context.Background())
+		_, _, err := agent.sharedRuntimeBinding(context.Background())
 		startResult <- err
 	}()
 	<-factoryEntered
@@ -328,14 +328,14 @@ func TestAgentCloseWaitsForConstructionCleanupAndReturnsContainmentFailure(t *te
 func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
 	closed := NewAgent()
 	closed.closed = true
-	_, err := closed.sharedRuntime(context.Background())
+	_, _, err := closed.sharedRuntimeBinding(context.Background())
 	require.Error(t, err)
 
 	waiting := NewAgent()
 	waiting.runtimeStarting = make(chan struct{})
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = waiting.sharedRuntime(cancelled)
+	_, _, err = waiting.sharedRuntimeBinding(cancelled)
 	require.ErrorIs(t, err, context.Canceled)
 
 	client := newFakeOpenCodeClient()
@@ -348,7 +348,7 @@ func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
 		ready.runtimeStarting = nil
 		ready.mu.Unlock()
 	}()
-	got, err := ready.sharedRuntime(context.Background())
+	got, _, err := ready.sharedRuntimeBinding(context.Background())
 	require.NoError(t, err)
 	require.Same(t, client, got)
 
@@ -368,7 +368,7 @@ func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
 
 		return client, nil
 	}
-	_, err = duringStart.sharedRuntime(context.Background())
+	_, _, err = duringStart.sharedRuntimeBinding(context.Background())
 	require.Error(t, err)
 	require.True(t, client.closed)
 	require.True(t, nativeReleased.Load())
@@ -911,7 +911,7 @@ func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
 
 	require.False(t, nativeReleased.Load())
 	require.False(t, scratchReleased.Load())
-	_, err := agent.sharedRuntime(context.Background())
+	_, _, err := agent.sharedRuntimeBinding(context.Background())
 	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
 	require.EqualValues(t, 0, replacementStarts.Load())
 }
@@ -955,7 +955,7 @@ func TestRuntimeExitWatcherLatchesScratchCleanupFailure(t *testing.T) {
 
 	require.True(t, nativeReleased.Load())
 	require.False(t, scratchReleased.Load())
-	_, err := agent.sharedRuntime(context.Background())
+	_, _, err := agent.sharedRuntimeBinding(context.Background())
 	require.ErrorIs(t, err, removeErr)
 	require.ErrorIs(t, err, errRuntimeScratchCleanup)
 	require.EqualValues(t, 0, replacementStarts.Load())
@@ -978,9 +978,9 @@ func TestRuntimeStartLatchesUnprovenTree(t *testing.T) {
 		return nil, errors.Join(errors.New("start containment failed"), opencode.ErrProcessContainmentIncomplete)
 	}
 
-	_, err := agent.sharedRuntime(context.Background())
+	_, _, err := agent.sharedRuntimeBinding(context.Background())
 	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
-	_, err = agent.sharedRuntime(context.Background())
+	_, _, err = agent.sharedRuntimeBinding(context.Background())
 	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
 	require.EqualValues(t, 1, starts.Load())
 	require.False(t, nativeReleased.Load())
@@ -1009,10 +1009,10 @@ func TestRuntimeStartLatchesScratchCleanupFailure(t *testing.T) {
 		return nil, errors.New("start failed after scratch creation")
 	}
 
-	_, err := agent.sharedRuntime(context.Background())
+	_, _, err := agent.sharedRuntimeBinding(context.Background())
 	require.ErrorIs(t, err, removeErr)
 	require.ErrorIs(t, err, errRuntimeScratchCleanup)
-	_, err = agent.sharedRuntime(context.Background())
+	_, _, err = agent.sharedRuntimeBinding(context.Background())
 	require.ErrorIs(t, err, errRuntimeScratchCleanup)
 	require.EqualValues(t, 1, starts.Load())
 	require.True(t, nativeReleased.Load())
@@ -1042,10 +1042,10 @@ func TestRuntimeStartLatchesGenerationScratchCleanupFailure(t *testing.T) {
 		return nil, errors.Join(opencode.ErrRuntimeScratchCleanup, generationRemoveErr)
 	}
 
-	_, err := agent.sharedRuntime(context.Background())
+	_, _, err := agent.sharedRuntimeBinding(context.Background())
 	require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
 	require.ErrorIs(t, err, generationRemoveErr)
-	_, err = agent.sharedRuntime(context.Background())
+	_, _, err = agent.sharedRuntimeBinding(context.Background())
 	require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
 	require.EqualValues(t, 1, starts.Load())
 	require.EqualValues(t, 1, scratchAcquired.Load())

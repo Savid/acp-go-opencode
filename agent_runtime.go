@@ -40,12 +40,6 @@ func fatalRuntimeCleanup(err error) bool {
 		errors.Is(err, errRuntimeScratchCleanup)
 }
 
-func (a *Agent) sharedRuntime(ctx context.Context) (opencode.Client, error) {
-	runtime, _, err := a.sharedRuntimeBinding(ctx)
-
-	return runtime, err
-}
-
 func (a *Agent) sharedRuntimeBinding(
 	ctx context.Context,
 ) (opencode.Client, uint64, error) {

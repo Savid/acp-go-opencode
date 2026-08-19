@@ -94,7 +94,7 @@ while IFS= read -r line; do printf '%s\n' "$line"; done
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 
-	nativeEnvironment, err := buildProcessEnvironment(nil, map[string]string{
+	nativeEnvironment, err := buildProcessEnvironmentFrom(nil, nil, map[string]string{
 		"ROOT_PID_FILE":    rootPIDPath,
 		"DESC_PID_FILE":    descPIDPath,
 		"IDENTITY_FILE":    identityPath,

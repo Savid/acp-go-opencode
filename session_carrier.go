@@ -1,11 +1,6 @@
 package opencodeacp
 
-import (
-	"maps"
-	"slices"
-
-	"github.com/savid/acp-go-opencode/internal/opencode"
-)
+import "github.com/savid/acp-go-opencode/internal/opencode"
 
 // sessionCarrier is the environment and search-path prefix one ACP session
 // holds. It travels with the session rather than with the runtime: one native
@@ -33,10 +28,6 @@ func (c sessionCarrier) clone() sessionCarrier {
 		Env:           cloneStringMap(c.Env),
 		ExtraPathDirs: append([]string{}, c.ExtraPathDirs...),
 	}
-}
-
-func (c sessionCarrier) equal(other sessionCarrier) bool {
-	return maps.Equal(c.Env, other.Env) && slices.Equal(c.ExtraPathDirs, other.ExtraPathDirs)
 }
 
 // scopeOptions renders the carrier for the native directory scope that owns the

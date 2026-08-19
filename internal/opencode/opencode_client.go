@@ -2659,12 +2659,6 @@ type openCodeDocCapabilities struct {
 	sessionQuestionList   bool
 }
 
-func validateOpenCodeDoc(doc map[string]any) error {
-	_, err := inspectOpenCodeDoc(doc)
-
-	return err
-}
-
 func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 	rawPaths, _ := doc["paths"].(map[string]any)
 
