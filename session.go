@@ -1414,6 +1414,12 @@ func (s *session) runtimeFailure() error {
 // session's own work has stopped; the close boundary that follows contains the
 // scope whether or not the deletion succeeded, so a refused deletion never
 // leaves a native process nobody owns.
+//
+// It waits on the same settlement the close boundary does, because it is the same
+// boundary with a deletion in front of it: the tombstone is already durable by the
+// time this runs, so a fenced incarnation that close accepts as terminal evidence
+// cannot be the thing that makes delete report failure for a session already
+// answered for.
 func (s *session) DeleteNativeAndClose(ctx context.Context) error {
 	cycle := s.currentCycle()
 
@@ -1421,7 +1427,7 @@ func (s *session) DeleteNativeAndClose(ctx context.Context) error {
 
 	err := s.cancelTurn(settleCtx)
 	if err == nil {
-		err = s.awaitNativeSettlement(settleCtx, cycle)
+		err = s.awaitCloseSettlement(settleCtx, cycle)
 	}
 
 	settleCancel()

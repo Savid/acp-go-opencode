@@ -725,6 +725,43 @@ func TestCloseRefusesToSettleOnAnInterruptTheHarnessRefused(t *testing.T) {
 	}
 }
 
+// TestDeleteSettlesOnTheSameEvidenceCloseDoes proves the delete boundary waits on
+// the settlement the close boundary waits on, because it is that boundary with a
+// deletion in front of it. The tombstone is durable before anything is torn down,
+// so a fenced incarnation — evidence close accepts as terminal — must not be the
+// thing that makes delete report failure for a session it has already answered
+// for.
+func TestDeleteSettlesOnTheSameEvidenceCloseDoes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	store := NewInMemorySessionStore()
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptOpenTestTurn(t, current)
+
+	current.detachRuntime(testRuntimeGeneration(current), "shared OpenCode runtime exited")
+	require.Error(t, cycle.lost, "the loss left the open cycle without its terminal evidence")
+	require.True(t, lifecycleFenced(current), "the loss left the incarnation unfenced")
+
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.NoError(t, err, "delete failed on the loss close accepts, after its tombstone already landed")
+	require.True(t, agent.isDeleted(current.id))
+	require.NotContains(t, agent.sessions, current.id)
+
+	stored, err := store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the deleted session is listable again")
+}
+
 // TestCloseCommitsAGenerationCapturedBeforeAConcurrentFence proves the durable
 // commit is not a stream rung. The generation is read while the loopback API can
 // still answer, the incarnation is fenced underneath the boundary before the
