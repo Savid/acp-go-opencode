@@ -299,6 +299,12 @@ func (s *session) settleCycle(ctx context.Context, cycle *foregroundCycle, outco
 // loss ended keeps the end it was given: close never restates it as cancelled. The
 // chain of preconditions stays intact across the skipped rung, so the settlement
 // response follows the last durable commit directly.
+//
+// The fence is the only thing that skips the rung. A stream that merely latched —
+// one refused or undelivered event on an incarnation still live — is not fenced,
+// so this boundary still owes it the terminal transition, and the latch is what
+// refuses to let the boundary claim one: the close fails with the latched error
+// rather than reporting a turn over on a stream that has already lost a sequence.
 func (s *session) settleCloseCycle(ctx context.Context, cycle *foregroundCycle) error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -307,12 +313,26 @@ func (s *session) settleCloseCycle(ctx context.Context, cycle *foregroundCycle) 
 		return nil
 	}
 
-	if s.lifecycleStream == nil || s.lifecycleFailed != nil {
+	if s.lifecycleStream == nil || s.incarnationFencedLocked() {
 		return nil
 	}
 
 	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(
 		cycle.id, cycle.turnID, string(acp.StopReasonCancelled), lifecycle.OutcomeCancelled))
+}
+
+// incarnationFencedLocked reports that this session's incarnation was fenced: the
+// stream it spoke for is closed, so nothing may be emitted on it again and
+// whatever fenced it already reported the end.
+//
+// It is deliberately the stream's own fence rather than the session's latched
+// failure. A latch records that one event did not reach the host; a fence records
+// that the incarnation behind the stream is over. Reading the latch as a fence
+// would let a live incarnation close in silence on a stream that already dropped
+// an event, and reading the latch as terminal evidence would let a close accept a
+// stop no fence ever proved.
+func (s *session) incarnationFencedLocked() bool {
+	return s.lifecycleStream != nil && s.lifecycleStream.State().Closed
 }
 
 // retireCycleLocked ends the cycle locally and reports whether this caller is the

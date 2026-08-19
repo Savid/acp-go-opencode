@@ -335,15 +335,26 @@ func openTestCycle(current *session, terminal bool) *foregroundCycle {
 	return cycle
 }
 
+// acceptOpenTestTurn opens one prompt-origin turn on the session's own stream and
+// leaves it running: the turn the stream introduced holds no native terminal
+// evidence, which is the state a boundary has to obtain evidence for.
+func acceptOpenTestTurn(t *testing.T, current *session) *foregroundCycle {
+	t.Helper()
+
+	cycle, err := current.acceptPromptCycle(context.Background(),
+		lifecycle.Submission{SubmissionID: "submission-1", ClientNonce: "nonce-1"})
+	require.NoError(t, err)
+
+	return cycle
+}
+
 // acceptTestTurn opens one prompt-origin turn on the session's own stream and
 // hands it the native terminal evidence a settled turn holds, so a close can
 // report it over without a live harness.
 func acceptTestTurn(t *testing.T, current *session) *foregroundCycle {
 	t.Helper()
 
-	cycle, err := current.acceptPromptCycle(context.Background(),
-		lifecycle.Submission{SubmissionID: "submission-1", ClientNonce: "nonce-1"})
-	require.NoError(t, err)
+	cycle := acceptOpenTestTurn(t, current)
 
 	current.lifecycleMu.Lock()
 	cycle.idle = true
@@ -351,6 +362,25 @@ func acceptTestTurn(t *testing.T, current *session) *foregroundCycle {
 	current.lifecycleMu.Unlock()
 
 	return cycle
+}
+
+// lifecycleFenced reports whether this session's incarnation is fenced, which is
+// the only thing that excuses the close boundary from its terminal transition and
+// the only thing that makes an unreported cycle terminal evidence.
+func lifecycleFenced(current *session) bool {
+	current.lifecycleMu.Lock()
+	defer current.lifecycleMu.Unlock()
+
+	return current.incarnationFencedLocked()
+}
+
+// testRuntimeGeneration reports the runtime binding this session holds, which the
+// production loss ladder addresses by generation.
+func testRuntimeGeneration(current *session) uint64 {
+	current.mu.Lock()
+	defer current.mu.Unlock()
+
+	return current.runtimeGeneration
 }
 
 // TestCloseStopsAtTheFirstUnprovenStep proves the close and delete boundary is a
@@ -585,6 +615,114 @@ func TestCloseOnAFencedIncarnationEmitsNothingAndStillCommits(t *testing.T) {
 		require.True(t, cycle.settled, "the boundary left its cycle addressable")
 		require.Empty(t, connection.lifecycleEnvelopes(t), "a session with no incarnation emitted an envelope")
 	})
+}
+
+// TestCloseOnALatchedLiveStreamFailsWithTheLatchedError proves only a fence
+// excuses the close boundary from its terminal transition. An incarnation that
+// merely dropped an update is still live and still owes the boundary that
+// transition; the latch is what refuses to let it claim one, so the close answers
+// with the latched error instead of ending the turn in silence on a stream that
+// has already lost a sequence. The rungs that are not emissions are unaffected:
+// the scope is contained and the captured generation is durable before the
+// boundary reaches the rung it fails on.
+func TestCloseOnALatchedLiveStreamFailsWithTheLatchedError(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptTestTurn(t, current)
+
+	// One update the wire dropped, on an incarnation nothing fenced.
+	connection.mu.Lock()
+	connection.updateErr = errors.New("wire down")
+	connection.mu.Unlock()
+
+	require.ErrorContains(t, current.emitLifecycle(context.Background(), lifecycle.TransitionEvent(
+		lifecycle.ForegroundRunning, cycle.id, cycle.turnID, lifecycle.CauseSubmission,
+	)), "wire down")
+
+	// Delivery is restored: the connection is healthy again and the gap is not.
+	connection.mu.Lock()
+	connection.updateErr = nil
+	connection.mu.Unlock()
+
+	require.ErrorContains(t, current.lifecycleFailure(), "wire down")
+	require.False(t, lifecycleFenced(current), "a dropped update fenced the incarnation")
+
+	var committed int
+
+	store.onReplace = func(SessionKey) error {
+		committed++
+
+		return nil
+	}
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorContains(t, err, "wire down", "close reported a turn over on a stream that lost a sequence")
+	require.True(t, client.isClosed(), "the latched stream stopped the containment proof")
+	require.Positive(t, committed, "the latched stream stopped the durable commit")
+	require.Contains(t, agent.sessions, current.id, "the session was released on an unproven boundary")
+}
+
+// TestCloseRefusesToSettleOnAnInterruptTheHarnessRefused proves a refused native
+// interrupt is not the incarnation loss the close boundary accepts as terminal
+// evidence. The harness is still there and declined to stop, so nothing fenced
+// the incarnation and the work this boundary asked it to put down was never proved
+// stopped. The ladder stops at that rung exactly as it does for a cycle that never
+// reported at all: the scope stays untouched and no idle or cancelled end is
+// reported over native work that may still be running.
+func TestCloseRefusesToSettleOnAnInterruptTheHarnessRefused(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	client.abortErr = errors.New("harness refused the interrupt")
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptOpenTestTurn(t, current)
+
+	// A host cancel the harness refuses escalates the open cycle — it is not
+	// going to report the idle the cancellation needs — and fences nothing. The
+	// notification carries no response, so the refusal reaches no host either.
+	require.ErrorContains(t, current.cancelTurn(context.Background()), "harness refused the interrupt")
+	require.Error(t, cycle.lost, "the refusal left the cycle waiting on evidence that cannot arrive")
+	require.False(t, lifecycleFenced(current), "a refused interrupt fenced the incarnation")
+
+	var committed int
+
+	store.onReplace = func(SessionKey) error {
+		committed++
+
+		return nil
+	}
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorContains(t, err, "harness refused the interrupt")
+	require.False(t, client.isClosed(), "the scope was contained over work never proved stopped")
+	require.Zero(t, committed, "an unproven stop committed a generation anyway")
+	require.False(t, cycle.settled, "an unproven stop terminalized the turn anyway")
+	require.Contains(t, agent.sessions, current.id, "the session was released on an unproven boundary")
+
+	for _, transition := range connection.lifecycleEventsOfType(t, "state_update") {
+		require.NotEqual(t, "idle", transition["state"],
+			"close reported the turn over on work it never proved stopped")
+	}
 }
 
 // TestCloseCommitsAGenerationCapturedBeforeAConcurrentFence proves the durable

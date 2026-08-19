@@ -559,9 +559,15 @@ func (s *session) awaitNativeSettlement(ctx context.Context, cycle *foregroundCy
 // evidence. An incarnation loss is terminal evidence rather than an unproven
 // interrupt: the cycle is over, the stream that would have reported it is fenced,
 // and the rungs below this one — the containment proof and both durable commits —
-// run whether or not the incarnation survived to say anything. Only a cycle that
-// never reported at all stops the ladder, because that leaves native work this
-// boundary has not proved stopped.
+// run whether or not the incarnation survived to say anything.
+//
+// The fence is what makes the loss evidence, so it is what this reads. A cycle
+// woken by a refused native interrupt carries the same failure in the same member
+// and fences nothing: the harness is still there, it declined to stop, and the
+// work this boundary asked it to put down was never proved stopped. That is not a
+// loss and it does not settle the boundary — it stops the ladder exactly where a
+// cycle that never reported at all does, rather than letting close report the turn
+// cancelled and the session idle over native work still running.
 func (s *session) awaitCloseSettlement(ctx context.Context, cycle *foregroundCycle) error {
 	err := s.awaitNativeSettlement(ctx, cycle)
 	if err == nil {
@@ -571,7 +577,7 @@ func (s *session) awaitCloseSettlement(ctx context.Context, cycle *foregroundCyc
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if cycle != nil && cycle.lost != nil {
+	if cycle != nil && cycle.lost != nil && s.incarnationFencedLocked() {
 		return nil
 	}
 
