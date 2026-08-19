@@ -66,7 +66,7 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 			},
 		}
 		if err := session.routeNativeQuestion(ctx, req); err != nil {
-			t.Fatalf("handleQuestion: %v", err)
+			t.Fatalf("routeNativeQuestion: %v", err)
 		}
 		if len(conn.elicitations) != 1 {
 			t.Fatalf("elicitations = %d, want 1", len(conn.elicitations))
@@ -103,7 +103,7 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 		}
 		session := testSession(t, agent, client)
 		if err := session.routeNativeQuestion(ctx, opencode.QuestionRequest{ID: "q", SessionID: "native-1"}); err != nil {
-			t.Fatalf("handleQuestion: %v", err)
+			t.Fatalf("routeNativeQuestion: %v", err)
 		}
 		if client.questionRejectCount() != 1 {
 			t.Fatalf("question rejects = %d, want 1", client.questionRejectCount())
@@ -117,7 +117,7 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 		agent.setAgentClient(conn)
 		session := testSession(t, agent, client)
 		if err := session.routeNativeQuestion(ctx, opencode.QuestionRequest{ID: "q", SessionID: "native-1"}); err != nil {
-			t.Fatalf("handleQuestion: %v", err)
+			t.Fatalf("routeNativeQuestion: %v", err)
 		}
 		if len(conn.elicitations) != 0 {
 			t.Fatalf("elicitation sent without capability: %#v", conn.elicitations)
@@ -1401,7 +1401,7 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
 		session := testSession(t, NewAgent(), client)
 		client.dispatchCommand = func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error) {
-			t.Fatal("RunCommand called for unconvertible block")
+			t.Fatal("DispatchCommand called for unconvertible block")
 
 			return opencode.NativeMessage{}, nil
 		}
@@ -1661,7 +1661,7 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 		messageID := "user-message"
 		client.dispatchMessage = func(_ context.Context, id string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
 			if id != "native-1" || req.MessageID != messageID || len(req.Parts) != 1 {
-				t.Fatalf("SendMessage id=%q req=%#v", id, req)
+				t.Fatalf("DispatchMessage id=%q req=%#v", id, req)
 			}
 			msg := opencode.NativeMessage{Info: opencode.NativeMessageInfo{
 				ID:        "assistant-1",
@@ -2304,7 +2304,7 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 			t.Fatalf("duplicate emitMessage: %v", err)
 		}
 		// A raw-event emit failure is non-authoritative debug output and must
-		// not abort the turn: handleEvent records it internally and continues.
+		// not abort the turn: applyNativeEvent records it internally and continues.
 		conn.notifyErr = errors.New("notify failed")
 		session.rawMessages = rawMessageConfig{enabled: true}
 		if err := session.applyNativeEvent(ctx, opencode.Event{Type: "unknown", Raw: json.RawMessage(`{"type":"unknown"}`)}); err != nil {
@@ -2327,7 +2327,7 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 		}
 		client.pendingPermissions = []opencode.PermissionRequest{{ID: "p2", SessionID: "native-1"}}
 		if err := session.reconcileNativeActions(ctx); err == nil {
-			t.Fatal("reconcilePermissions ignored handle error")
+			t.Fatal("reconcileNativeActions ignored the permission failure")
 		}
 		conn.permErr = nil
 
@@ -2341,7 +2341,7 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 		}
 		client.pendingQuestions = []opencode.QuestionRequest{{ID: "q2", SessionID: "native-1"}}
 		if err := session.reconcileNativeActions(ctx); err == nil {
-			t.Fatal("reconcileQuestions ignored handle error")
+			t.Fatal("reconcileNativeActions ignored the question failure")
 		}
 		if req, ok := eventQuestion(json.RawMessage(`{"id":"direct","sessionID":"native-1"}`)); !ok || req.ID != "direct" {
 			t.Fatalf("direct eventQuestion = %#v ok=%v", req, ok)

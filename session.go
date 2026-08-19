@@ -145,16 +145,8 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		providerID, modelID = splitModelValue(meta.Model, providerID, modelID)
 	}
 
-	if idmap.SessionID == "" {
-		idmap.SessionID = string(id)
-	}
-
 	if idmap.NativeSessionID == "" {
 		idmap.NativeSessionID = native.ID
-	}
-
-	if idmap.Format == "" {
-		idmap.Format = SessionStoreFormat
 	}
 
 	now := time.Now().UnixMilli()

@@ -794,7 +794,6 @@ type MessageRequest struct {
 	MessageID string           `json:"messageID,omitempty"`
 	Model     *ModelSelector   `json:"model,omitempty"`
 	Agent     string           `json:"agent,omitempty"`
-	NoReply   bool             `json:"noReply,omitempty"`
 	Parts     []map[string]any `json:"parts"`
 	Format    *OutputFormat    `json:"format,omitempty"`
 }

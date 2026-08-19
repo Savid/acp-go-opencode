@@ -244,9 +244,9 @@ func TestInMemoryStoreReplaceValidation(t *testing.T) {
 		t.Fatalf("replace with empty subkey: %v", err)
 	}
 
-	// A listed key survives even when its Entries are empty (docs/04:
-	// "exactly the listed keys survive"). The empty subkey must stay live,
-	// not be tombstoned.
+	// A replacement leaves exactly the keys it lists alive: a listed key
+	// survives even when its Entries are empty, so the empty subkey stays live
+	// rather than being tombstoned.
 	subkeys, err := store.ListSubkeys(ctx, main)
 	if err != nil {
 		t.Fatalf("list subkeys: %v", err)

@@ -42,7 +42,7 @@ func TestTurnFenceHelperBranches(t *testing.T) {
 		StreamEpoch: 9,
 		Properties:  json.RawMessage(`{"sessionID":"native-1","messageID":"message-1","type":"text","text":"late"}`),
 	}); err != nil {
-		t.Fatalf("suppressed handleEvent: %v", err)
+		t.Fatalf("suppressed applyNativeEvent: %v", err)
 	}
 }
 
@@ -122,12 +122,12 @@ func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	native := opencode.NativeSession{ID: "native"}
 	native.Model.ID = "fallback-model"
-	current := newSession(agent, "session", "/repo", []string{"/other"}, native, client, sessionMeta{}, idmapRecord{})
+	current := newSession(agent, "session", "/repo", []string{"/other"}, native, client, sessionMeta{},
+		idmapRecord{SessionID: "session", Format: SessionStoreFormat})
 	require.Equal(t, "OpenCode session", current.title)
 	require.Equal(t, "fallback-model", current.modelID)
 	require.Equal(t, "build", current.mode)
-	require.Equal(t, "session", current.idmap.SessionID)
-	require.Equal(t, SessionStoreFormat, current.idmap.Format)
+	require.Equal(t, "native", current.idmap.NativeSessionID)
 
 	current.setMode("plan")
 	require.Equal(t, "plan", current.currentMode())

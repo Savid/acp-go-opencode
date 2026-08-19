@@ -577,21 +577,6 @@ func (s *fanoutScope) CreateSessionWithPolicy(context.Context, string, []opencod
 	return native, nil
 }
 
-func (s *fanoutScope) SendMessage(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
-	if id != s.nativeID {
-		return opencode.NativeMessage{}, fmt.Errorf("scope %q received native session %q", s.nativeID, id)
-	}
-
-	text, _ := request.Parts[0][partTypeText].(string)
-	if err := os.WriteFile(filepath.Join(s.directory, "native-cwd-proof.txt"), []byte(text), 0o600); err != nil {
-		return opencode.NativeMessage{}, err
-	}
-
-	return opencode.NativeMessage{Info: opencode.NativeMessageInfo{
-		ID: "assistant-" + id, SessionID: id, Role: "assistant", Finish: "stop",
-	}}, nil
-}
-
 func (s *fanoutScope) DispatchMessage(_ context.Context, id string, request opencode.MessageRequest) error {
 	if id != s.nativeID {
 		return fmt.Errorf("scope %q received native session %q", s.nativeID, id)
