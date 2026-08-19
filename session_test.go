@@ -531,21 +531,27 @@ func TestRecoveryWithoutACommittedGenerationRefusesThePrompt(t *testing.T) {
 	require.ErrorContains(t, current.ensureRuntime(context.Background()), "opencode_recovery_generation_missing")
 }
 
-// TestCloseOnAFencedIncarnationEmitsNothingAndStillCommits proves the close
-// ladder's stream rungs apply only to a live incarnation. A cancel that retired
-// the native generation, an incarnation loss that left a turn unsettled, and a
-// session that never opened an incarnation at all each close successfully with no
-// lifecycle event on the dead stream, while the rungs that are not emissions —
-// the containment proof and the durable commit — run exactly as they do on the
-// live branch. A turn the loss ended is never restated as cancelled: the two
-// paths do not share a terminal state, and rewriting one as the other would tell
-// a host a contained end from a lost one.
-func TestCloseOnAFencedIncarnationEmitsNothingAndStillCommits(t *testing.T) {
+// TestCloseOnAFencedIncarnationEmitsNothingAndKeepsItsDurableRecord proves the
+// close ladder's stream rungs apply only to a live incarnation. An incarnation
+// loss that left a turn unsettled and a session that never opened an incarnation
+// at all each close successfully with no lifecycle event on the dead stream, while
+// the rungs that are not emissions run to whatever they can prove: the containment
+// proof always, and the durable record either committed fresh or retained intact.
+// A turn the loss ended is never restated as cancelled: the two paths do not share
+// a terminal state, and rewriting one as the other would tell a host a contained
+// end from a lost one.
+func TestCloseOnAFencedIncarnationEmitsNothingAndKeepsItsDurableRecord(t *testing.T) {
 	t.Parallel()
 
+	// The loss branch runs the production ladder: detachRuntime records the loss
+	// before it fences, and a recorded loss is exactly what tells the capture the
+	// interrupted native generation is no longer an online snapshot source. So the
+	// durable guarantee here is retention, not a fresh commit — the last committed
+	// generation survives the boundary unrewritten.
 	t.Run("incarnation lost with a turn still open", func(t *testing.T) {
 		t.Parallel()
 
+		ctx := context.Background()
 		client := newFakeOpenCodeClient()
 		store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 		agent := negotiatedAgent(t, WithSessionStore(store))
@@ -557,25 +563,39 @@ func TestCloseOnAFencedIncarnationEmitsNothingAndStillCommits(t *testing.T) {
 		agent.sessions[current.id] = current
 		agent.mu.Unlock()
 
-		cycle := acceptTestTurn(t, current)
-		current.fenceLifecycle("native generation retired")
-		require.Error(t, cycle.lost, "the fence left the open cycle without its loss")
+		cycle := acceptOpenTestTurn(t, current)
+
+		key := SessionKey{SessionID: string(current.id)}
+		require.NoError(t, current.snapshotToStore(ctx))
+
+		committed, err := store.Load(ctx, key)
+		require.NoError(t, err)
+		require.NotEmpty(t, committed, "the session committed no generation for the boundary to retain")
+
+		current.detachRuntime(testRuntimeGeneration(current), "shared OpenCode runtime exited")
+		require.Error(t, cycle.lost, "the loss left the open cycle without its terminal evidence")
+		require.True(t, lifecycleFenced(current), "the loss left the incarnation unfenced")
 
 		fenced := len(connection.lifecycleEnvelopes(t))
 
-		var committed int
+		var wrote int
 
 		store.onReplace = func(SessionKey) error {
-			committed++
+			wrote++
 
 			return nil
 		}
 
-		_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+		_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: current.id})
 		require.NoError(t, err, "a fenced incarnation blocked the containment boundary")
-		require.True(t, client.isClosed(), "the fenced incarnation was never contained")
-		require.Positive(t, committed, "the fenced branch skipped the durable commit")
+		require.NotContains(t, agent.sessions, current.id, "the boundary never released the session")
+		require.True(t, client.isClosed(), "the fenced incarnation's scope was never released")
 		require.Len(t, connection.lifecycleEnvelopes(t), fenced, "the boundary emitted on a fenced stream")
+
+		retained, err := store.Load(ctx, key)
+		require.NoError(t, err)
+		require.Equal(t, committed, retained, "the boundary lost the last committed generation")
+		require.Zero(t, wrote, "the boundary wrote over a generation it could no longer read")
 
 		for _, transition := range connection.lifecycleEventsOfType(t, "state_update") {
 			require.NotEqual(t, "idle", transition["state"],
