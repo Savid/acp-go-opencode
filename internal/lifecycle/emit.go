@@ -1,5 +1,7 @@
 package lifecycle
 
+import "encoding/json"
+
 // Stream is one incarnation's ordered emitter. It claims a sequence before
 // delivery is attempted, so a lost or refused event leaves a detectable gap
 // rather than a silently contiguous stream, and it reduces every event through
@@ -34,28 +36,94 @@ func (s *Stream) Negotiated() Negotiated { return s.reducer.Negotiated() }
 // be emitted from the native source.
 func (s *Stream) Close() { s.reducer.Close() }
 
-// Emit claims the next sequence, reduces the event, and renders the envelope for
-// the notification's `_meta`. A refused event is never rendered and its sequence
-// stays consumed, which is exactly the detectable gap the ordering rule wants.
+// Emit claims the next sequence, renders the envelope for the notification's
+// `_meta`, and validates what it rendered. A refused event is never handed back
+// and its sequence stays consumed, which is exactly the detectable gap the
+// ordering rule wants.
+//
+// The self-validation runs on the rendered bytes rather than on the in-process
+// value: "the envelopes this adapter emits are well formed" is a claim about
+// what goes on the wire, so the notification is marshalled, decoded, and reduced
+// by the exact path a consumer takes. Reducing the struct instead proves the
+// struct well formed and leaves every encoder infidelity between the two —
+// a dropped member, a mistyped one, a patch rendered as a first sight — to be
+// discovered by the host.
 func (s *Stream) Emit(event Event) (map[string]any, error) {
-	s.sequence++
+	// The payload is judged before the sequence claim, so a caller defect
+	// neither burns a sequence nor dereferences a payload that is not there.
+	// The verdicts mirror the decoder's: an unknown discriminant is the
+	// discriminant's violation, a known one without its payload is shape.
+	if !event.payloadMatchesType() {
+		if !knownEventType(event.Type) {
+			return nil, violation(ViolationUnknownEventType, s.id, s.sequence+1,
+				"event type "+string(event.Type))
+		}
 
-	err := s.reducer.Reduce(Delivery{
-		StreamID: s.id,
-		Sequence: s.sequence,
-		Carrier:  CarrierSessionInfo,
-		Event:    event,
-	})
-	if err != nil {
-		return nil, err
+		return nil, violation(ViolationMalformedEnvelope, s.id, s.sequence+1,
+			"event payload does not match type "+string(event.Type))
 	}
 
-	return map[string]any{
+	s.sequence++
+
+	envelope := map[string]any{
 		fieldVersion:  Version,
 		fieldStreamID: s.id,
 		fieldSequence: s.sequence,
 		fieldEvent:    encodeEvent(event),
-	}, nil
+	}
+
+	// A rendered envelope holds only JSON-safe values, and an opaque member this
+	// step could not render fails the decode below as a malformed envelope
+	// rather than escaping as an untyped error.
+	params, _ := json.Marshal(map[string]any{
+		metaField:   map[string]any{MetaKey: envelope},
+		updateField: map[string]any{sessionUpdateField: string(CarrierSessionInfo)},
+	})
+
+	delivery, err := DecodeSessionUpdate(params, s.reducer.Negotiated())
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.reducer.Reduce(delivery); err != nil {
+		return nil, err
+	}
+
+	return envelope, nil
+}
+
+// knownEventType reports membership of the closed set of six.
+func knownEventType(kind EventType) bool {
+	switch kind {
+	case EventSnapshot, EventPromptAccepted, EventStateUpdate,
+		EventActivityUpdate, EventActionUpdate, EventQuiescenceUpdate:
+		return true
+	default:
+		return false
+	}
+}
+
+// payloadMatchesType reports that this event carries exactly the payload its
+// discriminant names. The decoder is the only other producer of an Event and it
+// builds the pair together, so this guards the in-process construction paths the
+// wire never reaches.
+func (e Event) payloadMatchesType() bool {
+	switch e.Type {
+	case EventSnapshot:
+		return e.Snapshot != nil
+	case EventPromptAccepted:
+		return e.PromptAccepted != nil
+	case EventStateUpdate:
+		return e.State != nil
+	case EventActivityUpdate:
+		return e.Activity != nil
+	case EventActionUpdate:
+		return e.Action != nil
+	case EventQuiescenceUpdate:
+		return e.Quiescence != nil
+	default:
+		return false
+	}
 }
 
 // SnapshotEvent opens a stream from the whole state this adapter can state
