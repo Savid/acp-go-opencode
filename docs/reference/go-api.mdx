@@ -170,6 +170,14 @@ vocabulary already populated:
 | `SetConfigOptionRequest` / `SetModelRequest` | `session/set_config_option`. |
 | `StdioMCPServer` / `HTTPMCPServer` | MCP server definitions. |
 
+Two exported sentinels classify a native-runtime failure.
+`ErrProcessContainmentIncomplete` means the selected containment boundary did
+not complete, so the runtime stays quarantined.
+`ErrRuntimeLockUnsupported` means the platform has no advisory-lock primitive
+for the runtime home's single-writer fence: construction fails with it rather
+than proceeding unlocked, and it is distinct from a lock another process is
+holding — that one is worth retrying and this one never is.
+
 `PromptRequest`, `TextPromptRequest`, and `CancelRequest` stamp route metadata
 only for a non-empty `turnNonce` of at most 4096 bytes. An invalid nonce leaves
 the request without a route envelope, so the adapter rejects it rather than

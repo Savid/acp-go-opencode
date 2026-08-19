@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-opencode/internal/homelock"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -337,4 +339,35 @@ func TestAgentCloseRunsTheDurableRungAWireCloseOwes(t *testing.T) {
 
 	require.Equal(t, "plan", stored(t).Session.Model.Agent,
 		"the embedded shutdown dropped state a wire close would have committed")
+}
+
+// TestRuntimeConstructionFailsWithThePublicUnsupportedLockSentinel proves the
+// platform gate reaches a host through the exported name. A runtime home nobody
+// can claim exclusively is not a lock somebody else is holding: the second is
+// worth retrying and the first never is, so the refusal has to be classifiable
+// rather than a message to match, and it has to be classifiable from outside
+// this module.
+func TestRuntimeConstructionFailsWithThePublicUnsupportedLockSentinel(t *testing.T) {
+	require.ErrorIs(t, ErrRuntimeLockUnsupported, homelock.ErrRuntimeLockUnsupported)
+
+	originalStart := runtimeStartServer
+	runtimeStartServer = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+		return nil, fmt.Errorf("claim OpenCode writable home: %w", homelock.ErrRuntimeLockUnsupported)
+	}
+
+	t.Cleanup(func() { runtimeStartServer = originalStart })
+
+	agent := NewAgent(WithHome(t.TempDir()))
+	agent.options.clientFactory = nil
+
+	runtime, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
+	require.ErrorIs(t, err, ErrRuntimeLockUnsupported,
+		"an unsupported platform failed construction with something a host cannot classify")
+	require.Nil(t, runtime)
+	require.Nil(t, nativeRelease)
+	require.Nil(t, scratchRelease)
+
+	_, err = agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
+	require.ErrorIs(t, err, ErrRuntimeLockUnsupported,
+		"the public session surface hid the construction refusal")
 }
