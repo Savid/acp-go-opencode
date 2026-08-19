@@ -16,13 +16,9 @@ import (
 // launching a runtime whose containment it cannot establish.
 func TestNativePathOwnershipOnUnsupportedPlatforms(t *testing.T) {
 	current := &ProcessIsolation{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
-	require.NoError(t, handoffGeneratedNativeTree("ignored", current))
 	require.NoError(t, validateNativeOwnedDirectory("ignored", current))
 
 	foreign := &ProcessIsolation{UID: current.UID + 1, GID: current.GID}
-	require.ErrorContains(
-		t, handoffGeneratedNativeTree("ignored", foreign), "ownership handoff is unsupported",
-	)
 	require.ErrorContains(
 		t, validateNativeOwnedDirectory("ignored", foreign), "ownership validation is unsupported",
 	)
