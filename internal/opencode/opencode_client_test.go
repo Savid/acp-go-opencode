@@ -591,9 +591,6 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 			}
 		})
 	}
-	if compareSemver("1.2.3", "1.2.4") >= 0 || compareSemver("1.3.0", "1.2.9") <= 0 || compareSemver("v1.2.3-beta", "1.2.3") != 0 {
-		t.Fatal("compareSemver returned unexpected ordering")
-	}
 	if got := envMapToSlice(map[string]string{"B": "2", "A": "1"}); !reflect.DeepEqual(got, []string{"A=1", "B=2"}) {
 		t.Fatalf("envMapToSlice = %#v", got)
 	}

@@ -3511,45 +3511,6 @@ func drainProcessPipe(log *slog.Logger, name string, reader io.Reader) {
 	}
 }
 
-func compareSemver(got string, want string) int {
-	g := parseSemver(got)
-
-	w := parseSemver(want)
-	for i := range g {
-		if g[i] < w[i] {
-			return -1
-		}
-
-		if g[i] > w[i] {
-			return 1
-		}
-	}
-
-	return 0
-}
-
-func parseSemver(value string) [3]int {
-	value = strings.TrimPrefix(strings.TrimSpace(value), "v")
-	parts := strings.Split(value, ".")
-
-	var out [3]int
-	for i := 0; i < len(parts) && i < len(out); i++ {
-		part := parts[i]
-		for j, r := range part {
-			if r < '0' || r > '9' {
-				part = part[:j]
-
-				break
-			}
-		}
-
-		n, _ := strconv.Atoi(part)
-		out[i] = n
-	}
-
-	return out
-}
-
 func IntFromNumber(value any) (int, bool) {
 	switch typed := value.(type) {
 	case float64:
