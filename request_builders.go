@@ -3,8 +3,10 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 )
 
 const (
@@ -150,11 +152,47 @@ func WithSessionAdditionalDirectories(paths ...string) SessionRequestOption {
 	}
 }
 
+// WithSessionMeta merges host-supplied metadata into the request's `_meta`.
+//
+// A caller key naming any family-reserved `acp-go.dev/*` literal is rejected
+// rather than merged or overwritten. The namespace is family-global and closed,
+// its values are minted by this package on the surfaces that carry them, and a
+// host that stamps one by hand is naming a value it does not own. Silently
+// dropping the key would be the "ignored as a no-op" treatment the contract
+// forbids everywhere else it appears, and merging it would put an unvalidated
+// family value on the wire; the collision is a defect in the calling code, in a
+// closed set the caller can check before calling, so the builder refuses to
+// build the request at all.
 func WithSessionMeta(meta map[string]any) SessionRequestOption {
+	rejectReservedMeta("WithSessionMeta", meta)
+
 	cloned := cloneAnyMap(meta)
 
 	return func(config *sessionRequestConfig) {
 		config.meta = mergeAnyMap(config.meta, cloned)
+	}
+}
+
+// reservedMetaLiterals is the closed family-global set. Adding a fifth is a
+// contract amendment, so the set is written out rather than matched by prefix:
+// a prefix test would also reject a literal this family has not defined and
+// report it as though the contract already did.
+var reservedMetaLiterals = []string{
+	routeEnvelopeKey,
+	mediaEnvelopeKey,
+	handoffEnvelopeKey,
+	lifecycle.MetaKey,
+}
+
+// rejectReservedMeta refuses a caller `_meta` map that names a family literal.
+// The builders return values rather than errors, so the refusal is a panic: the
+// only alternatives inside the signature the family fixes are merging the key or
+// dropping it, and the contract forbids both.
+func rejectReservedMeta(builder string, meta map[string]any) {
+	for _, literal := range reservedMetaLiterals {
+		if _, present := meta[literal]; present {
+			panic(builder + ": caller metadata used the family-reserved key " + strconv.Quote(literal))
+		}
 	}
 }
 
@@ -282,7 +320,12 @@ func WithListSessionsCursor(cursor string) ListSessionsRequestOption {
 	}
 }
 
+// WithListSessionsMeta merges host-supplied metadata into the request's `_meta`,
+// and rejects a family-reserved `acp-go.dev/*` literal in it on the same terms
+// as [WithSessionMeta].
 func WithListSessionsMeta(meta map[string]any) ListSessionsRequestOption {
+	rejectReservedMeta("WithListSessionsMeta", meta)
+
 	cloned := cloneAnyMap(meta)
 
 	return func(req *acp.ListSessionsRequest) {

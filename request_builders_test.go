@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRequestBuilders(t *testing.T) {
@@ -294,4 +295,47 @@ func TestOpenCodeEnvBuilderClones(t *testing.T) {
 	if _, present := values[metaEnvKey]; !present {
 		t.Fatalf("cleared options omit %q: %#v", metaEnvKey, values)
 	}
+}
+
+// TestCallerMetaBuildersRejectEveryFamilyLiteral proves the builders that take a
+// host-supplied `_meta` map refuse the reserved namespace rather than merging or
+// overwriting it. The four `acp-go.dev/*` literals are family-global, closed, and
+// minted by this package on the surfaces that carry them; a caller that stamps
+// one by hand is naming a value it does not own, and the two alternatives inside
+// the signature the family fixes — merge it, or drop it silently — are the two
+// treatments the contract forbids.
+func TestCallerMetaBuildersRejectEveryFamilyLiteral(t *testing.T) {
+	t.Parallel()
+
+	for _, literal := range []string{
+		"acp-go.dev/route",
+		"acp-go.dev/mediaEnvelope",
+		"acp-go.dev/handoff",
+		"acp-go.dev/lifecycle",
+	} {
+		t.Run(literal, func(t *testing.T) {
+			t.Parallel()
+
+			meta := map[string]any{literal: map[string]any{"version": 1}}
+
+			require.PanicsWithValue(t,
+				`WithSessionMeta: caller metadata used the family-reserved key "`+literal+`"`,
+				func() { WithSessionMeta(meta) })
+
+			require.PanicsWithValue(t,
+				`WithListSessionsMeta: caller metadata used the family-reserved key "`+literal+`"`,
+				func() { WithListSessionsMeta(meta) })
+		})
+	}
+
+	// An ordinary host key still merges, and the vendor namespace is not
+	// reserved: only the family-global literals are.
+	request := NewSessionRequest("/repo", WithSessionMeta(map[string]any{
+		"host.example/trace": "trace-1",
+		opencodeMetaKey:      map[string]any{"stored": true},
+	}))
+	require.Equal(t, "trace-1", request.Meta["host.example/trace"])
+
+	listed := ListSessionsRequest(WithListSessionsMeta(map[string]any{"host.example/trace": "trace-1"}))
+	require.Equal(t, "trace-1", listed.Meta["host.example/trace"])
 }
