@@ -32,8 +32,8 @@ func (s *Stream) State() State { return s.reducer.State() }
 // Negotiated reports the facts this stream is allowed to state.
 func (s *Stream) Negotiated() Negotiated { return s.reducer.Negotiated() }
 
-// Close fences this incarnation after process containment. No later event may
-// be emitted from the native source.
+// Close fences this incarnation at the boundary that ended it, whatever that
+// boundary proved. No later event may be emitted from the native source.
 func (s *Stream) Close() { s.reducer.Close() }
 
 // Emit claims the next sequence, renders the envelope for the notification's
