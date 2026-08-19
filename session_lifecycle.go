@@ -31,9 +31,14 @@ type foregroundCycle struct {
 	// native assistant message it produced.
 	failure     error
 	assistantID string
-	// lost records an incarnation loss that ended the cycle with no native
-	// terminal signal at all.
-	lost error
+	// lost records that the cycle ended with no native terminal signal at all,
+	// and incarnationLost records that the reason was the death of the
+	// incarnation itself rather than a stop the harness declined to make. The
+	// distinction is the close boundary's: a dead incarnation can never send the
+	// idle, so its loss is terminal evidence, while a refused interrupt leaves
+	// the harness alive with work this adapter never proved stopped.
+	lost            error
+	incarnationLost bool
 	// interrupted records that this cycle's native work was already asked to
 	// stop, so a second failure cannot interrupt whatever the session does next.
 	interrupted bool
@@ -327,10 +332,12 @@ func (s *session) settleCloseCycle(ctx context.Context, cycle *foregroundCycle) 
 //
 // It is deliberately the stream's own fence rather than the session's latched
 // failure. A latch records that one event did not reach the host; a fence records
-// that the incarnation behind the stream is over. Reading the latch as a fence
-// would let a live incarnation close in silence on a stream that already dropped
-// an event, and reading the latch as terminal evidence would let a close accept a
-// stop no fence ever proved.
+// that the stream is over. Reading the latch as a fence would let a live
+// incarnation close in silence on a stream that had merely dropped an event.
+//
+// It answers only the emission question. A fence is not terminal evidence of
+// anything the native harness did — a close boundary installs one whether or not
+// it proved the stop — so no settlement decision is made from it.
 func (s *session) incarnationFencedLocked() bool {
 	return s.lifecycleStream != nil && s.lifecycleStream.State().Closed
 }
@@ -364,6 +371,12 @@ func (s *session) blockCycleLocked(actionID string, cycle *foregroundCycle) {
 // fenceLifecycle ends this incarnation. Nothing may be emitted on the stream
 // afterwards, and an unsettled cycle is woken with the loss so its waiter reports
 // a failed turn instead of blocking on a signal the dead source cannot send.
+//
+// The woken cycle is marked as ended by the loss of its incarnation, which is
+// what makes it terminal evidence for a close boundary: the source that would
+// have sent the native idle is gone, so no later boundary can obtain one. That
+// mark travels on the cycle rather than on the stream, because the fence alone
+// says only that the stream is over — a close boundary installs one too.
 func (s *session) fenceLifecycle(cause string) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -381,12 +394,35 @@ func (s *session) fenceLifecycle(cause string) {
 			s.cycle.lost = loss
 		}
 
+		s.cycle.incarnationLost = true
+
 		s.cycle.wake()
 	}
 
 	if s.lifecycleFailed == nil {
 		s.lifecycleFailed = loss
 	}
+}
+
+// fenceBoundary installs the close boundary's end-of-emissions mark. The
+// boundary has said everything this incarnation will ever say — whether or not
+// it proved what it set out to prove — so the stream carries nothing further and
+// a conforming reducer refuses anything that arrives after it.
+//
+// It is deliberately not an incarnation loss. It records no failure on the open
+// cycle and wakes no waiter, because a boundary that failed to prove the stop
+// must present the next boundary with that same unproven stop rather than with
+// terminal evidence this one invented. The fence marks where the stream ended;
+// only the completed-boundary latch says a close settled.
+func (s *session) fenceBoundary() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if s.lifecycleStream == nil {
+		return
+	}
+
+	s.lifecycleStream.Close()
 }
 
 // lifecycleActionMeta stamps one outbound permission or elicitation request with

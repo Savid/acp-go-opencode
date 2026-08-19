@@ -74,10 +74,11 @@ loopback API can still answer it, the session's native scope is proven
 contained, and only then is that state committed and the open turn reported
 over. A boundary that does not complete commits nothing new, ends no turn on the
 stream, and answers with the containment error, leaving the handle addressable
-for a retry — and it fences nothing, because the fence is the completed
-boundary's own mark that this incarnation has said everything it will ever say.
-The retry runs the whole ladder again, the still-owed durable commit included,
-and only the boundary that completes fences the stream.
+for a retry. It still fences: the fence marks where this incarnation stopped
+speaking, not what the boundary proved. The retry therefore runs the whole ladder
+again — the still-owed durable commit included — and loses only the emission
+rungs a fenced stream cannot carry, answering silently on success because the
+failure was already reported to the caller of the close that failed.
 
 `Agent.Close` runs the same ladder per session, and the same durable rung with
 it, before the shared native runtime is retired. An embedded shutdown commits

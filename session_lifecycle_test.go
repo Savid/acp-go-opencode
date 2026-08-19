@@ -856,7 +856,7 @@ func TestCloseSettlesTheOpenTurnBeforeReleasingTheSession(t *testing.T) {
 	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
 	require.NoError(t, <-closeErr)
 	require.NotNil(t, current.agent.runtime, "close retired the shared runtime")
-	require.Error(t, current.lifecycleFailure(), "close left the stream unfenced")
+	require.True(t, lifecycleFenced(current), "close left the stream unfenced")
 	requireLifecycleReduces(t, connection)
 }
 

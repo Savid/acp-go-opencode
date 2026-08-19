@@ -571,22 +571,24 @@ func (s *session) awaitNativeSettlement(ctx context.Context, cycle *foregroundCy
 
 // awaitCloseSettlement waits for the close boundary's cycle to acquire terminal
 // evidence. An incarnation loss is terminal evidence rather than an unproven
-// interrupt: the cycle is over, the stream that would have reported it is fenced,
-// and the rungs below this one — the containment proof and both durable commits —
-// run whether or not the incarnation survived to say anything.
+// interrupt: the source that would have reported the idle is gone, so no boundary
+// will ever obtain one, and the rungs below this one — the containment proof and
+// both durable commits — run whether or not the incarnation survived to say
+// anything.
 //
-// The fence is what makes the loss evidence, so it is what this reads. A cycle
-// woken by a refused native interrupt carries the same failure in the same member
-// and fences nothing: the harness is still there, it declined to stop, and the
-// work this boundary asked it to put down was never proved stopped. That is not a
-// loss and it does not settle the boundary — it stops the ladder exactly where a
-// cycle that never reported at all does, rather than letting close report the turn
-// cancelled and the session idle over native work still running.
+// What it reads is the cycle's own record of that loss, never the fence on the
+// stream. A close boundary fences on its way out whatever it proved, so a fence
+// says only that this incarnation has stopped speaking; reading it as evidence
+// would let a failed boundary's own mark answer for the stop the harness never
+// made, and the retry — or the delete behind it — would contain and delete over
+// native work still running.
 //
-// Reading the fence is only sound because a failed boundary never installs one.
-// A close that fenced on its way out would leave the next boundary — a retry, or
-// the delete that follows — reading its own predecessor's mark as the terminal
-// evidence the harness never gave, and deleting natively over work still running.
+// A cycle woken by a refused native interrupt carries its failure in the same
+// member and carries no loss of incarnation: the harness is still there, it
+// declined to stop, and the work this boundary asked it to put down was never
+// proved stopped. That does not settle the boundary — it stops the ladder exactly
+// where a cycle that never reported at all does, rather than letting close report
+// the turn cancelled and the session idle over native work still running.
 func (s *session) awaitCloseSettlement(ctx context.Context, cycle *foregroundCycle) error {
 	err := s.awaitNativeSettlement(ctx, cycle)
 	if err == nil {
@@ -596,7 +598,7 @@ func (s *session) awaitCloseSettlement(ctx context.Context, cycle *foregroundCyc
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if cycle != nil && cycle.lost != nil && s.incarnationFencedLocked() {
+	if cycle != nil && cycle.incarnationLost {
 		return nil
 	}
 
@@ -1014,11 +1016,12 @@ func validSlashCommandName(name string) bool {
 // can never skip the ladder, and no step touches a peer session or the shared
 // runtime.
 //
-// Only a boundary that completed fences the stream. The fence is the successful
-// boundary's own mark — it says this incarnation has said everything it will
-// ever say — and a boundary that terminalizes nothing and states nothing has not
-// earned it. Fencing on the failure path would let the next boundary read this
-// one's mark as the terminal evidence a refused native interrupt never produced.
+// Both branches of the boundary fence the stream. The fence is the boundary's
+// end-of-emissions mark rather than a proof of containment: this incarnation has
+// said everything it will ever say, and a failed boundary — which terminalizes
+// nothing, commits nothing new, and emits no quiescence fact — has said the last
+// of it too. What the fence never becomes is evidence: settlement is judged from
+// the cycle's own loss, and a completed close from the boundary latch.
 func (s *session) Close(_ context.Context) error {
 	return s.closeSession(false)
 }
@@ -1040,8 +1043,17 @@ func (s *session) CloseAndCommit(_ context.Context) error {
 // so a failed close still admits no further prompt, while `boundarySettled`
 // latches only after every rung completed. A close that failed a rung therefore
 // leaves the session retryable, and the retry re-runs the ladder from the top —
-// capture, containment, durable commit, terminal transition — because a boundary
-// that proved nothing owes all of it. Only the settled boundary fences.
+// capture, containment, durable commit — because a boundary that proved nothing
+// owes all of it. The completed-boundary latch is the only thing that answers
+// "this session was closed"; the fence never is.
+//
+// Every boundary fences on its way out, because the fence marks the end of what
+// this incarnation says rather than the success of what it did. The retry
+// therefore runs against a stream already dead, which costs it only the emission
+// rungs: the terminal transition is skipped exactly as it is for any other fenced
+// incarnation, while capture, containment, and the durable commit all still run.
+// It answers silently on success because the failure was already reported to the
+// caller who ran the boundary that failed.
 func (s *session) closeSession(commitResumable bool) error {
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
@@ -1057,15 +1069,17 @@ func (s *session) closeSession(commitResumable bool) error {
 	s.closed = true
 	s.mu.Unlock()
 
-	if err := s.closeBoundary(commitResumable); err != nil {
+	err := s.closeBoundary(commitResumable)
+
+	s.fenceBoundary()
+
+	if err != nil {
 		return err
 	}
 
 	s.mu.Lock()
 	s.boundarySettled = true
 	s.mu.Unlock()
-
-	s.fenceLifecycle("session closed")
 
 	return nil
 }
@@ -1082,7 +1096,9 @@ func (s *session) closeSession(commitResumable bool) error {
 // The containment proof and the durable commit are unconditional; only the
 // terminal transition is a stream rung, and it is emitted only while this session
 // still speaks for a live incarnation. Every rung is re-run by a retry, because a
-// boundary that answered with an error proved none of them.
+// boundary that answered with an error proved none of them — and the retry loses
+// only the emission, which the fence its predecessor left behind skips for the
+// same reason any fenced incarnation skips it.
 func (s *session) closeBoundary(commitResumable bool) error {
 	settleCtx, settleCancel := context.WithTimeout(context.Background(), settlementTimeout)
 	cycle, captured, err := s.settleBeforeContainment(settleCtx, commitResumable)

@@ -365,8 +365,8 @@ func acceptTestTurn(t *testing.T, current *session) *foregroundCycle {
 }
 
 // lifecycleFenced reports whether this session's incarnation is fenced, which is
-// the only thing that excuses the close boundary from its terminal transition and
-// the only thing that makes an unreported cycle terminal evidence.
+// the one thing that excuses a boundary from its terminal transition — and, on
+// its own, says nothing about what that boundary proved.
 func lifecycleFenced(current *session) bool {
 	current.lifecycleMu.Lock()
 	defer current.lifecycleMu.Unlock()
@@ -462,13 +462,15 @@ func TestCloseCommitsOnlyAfterTheContainmentProof(t *testing.T) {
 	require.NotContains(t, agent.sessions, current.id)
 }
 
-// TestCloseLeavesTheStreamUnfencedOnAnIncompleteContainment proves the failing
+// TestAnIncompleteContainmentTerminalizesNothingAndStillFences proves the failing
 // branch of the same boundary: a containment that does not complete terminalizes
-// nothing, commits nothing new, answers with the containment error — and installs
-// no fence, because the fence is the successful boundary's own mark. A failed
-// close that fenced would leave its own mark behind as the terminal evidence the
-// harness never gave, and the next boundary would read it as one.
-func TestCloseLeavesTheStreamUnfencedOnAnIncompleteContainment(t *testing.T) {
+// nothing, commits nothing new, emits no quiescence fact, and answers with the
+// containment error — and it still fences, because the fence is where this
+// incarnation stopped speaking rather than a claim about what the boundary
+// proved. The session stays addressable, and nothing the fence leaves behind is
+// readable as evidence: the stream is not latched, and the settlement proof the
+// harness refused is still owed.
+func TestAnIncompleteContainmentTerminalizesNothingAndStillFences(t *testing.T) {
 	t.Parallel()
 
 	client := newFakeOpenCodeClient()
@@ -502,7 +504,7 @@ func TestCloseLeavesTheStreamUnfencedOnAnIncompleteContainment(t *testing.T) {
 		require.NotEqual(t, "idle", transition["state"], "an unproven containment ended the turn on the stream")
 	}
 
-	require.False(t, lifecycleFenced(current), "a failed boundary fenced the incarnation it proved nothing about")
+	require.True(t, lifecycleFenced(current), "the boundary left the incarnation speaking after it had stopped")
 	require.NoError(t, current.lifecycleFailure(), "a failed boundary latched the stream it said nothing on")
 	require.Contains(t, agent.sessions, current.id, "the session was released without a containment proof")
 }
@@ -854,11 +856,17 @@ func TestCloseFailsOnACaptureItCannotRead(t *testing.T) {
 
 // TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung proves the retry
 // contract of a boundary that failed. A close whose durable rung the store
-// refused proved nothing: it terminalized nothing, fenced nothing, and released
-// nothing, so the session stays addressable and the next close re-runs every rung
-// the failed one owed — including the commit, against a store that has healed.
-// A retry that answered success over a generation nobody wrote would report a
-// boundary no one completed.
+// refused proved nothing: it terminalized nothing and released nothing, so the
+// session stays addressable and the next close re-runs every rung the failed one
+// owed — including the commit, against a store that has healed. A retry that
+// answered success over a generation nobody wrote would report a boundary no one
+// completed.
+//
+// The retry runs across the fence the failed boundary left, which costs it the
+// emission rung and nothing else: the terminal transition is skipped as it is for
+// any fenced incarnation, the retained capture makes the durable rung runnable
+// without the loopback API the containment took away, and the retry answers
+// silently because the first close already reported the failure to its caller.
 func TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung(t *testing.T) {
 	t.Parallel()
 
@@ -887,7 +895,7 @@ func TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung(t *testing.T) {
 	require.ErrorContains(t, err, "store refused the resumable commit")
 	require.Equal(t, 1, commits)
 	require.False(t, cycle.settled, "a boundary that committed nothing terminalized the turn anyway")
-	require.False(t, lifecycleFenced(current), "a boundary that committed nothing fenced the stream anyway")
+	require.True(t, lifecycleFenced(current), "the failed boundary left the incarnation speaking after it had stopped")
 	require.Contains(t, agent.sessions, current.id, "a failed boundary released the session")
 
 	entries, loadErr := store.Load(context.Background(), SessionKey{SessionID: string(current.id)})
@@ -903,26 +911,30 @@ func TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung(t *testing.T) {
 	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
 	require.NoError(t, err)
 	require.Equal(t, 2, commits, "the retry answered success without re-running the durable rung")
-	require.True(t, cycle.settled, "the completed retry never terminalized the turn")
-	require.True(t, lifecycleFenced(current), "the completed boundary left the incarnation unfenced")
+	require.True(t, cycle.settled, "the completed retry never retired the turn")
 	require.NotContains(t, agent.sessions, current.id, "the completed boundary kept the session addressable")
 
 	entries, loadErr = store.Load(context.Background(), SessionKey{SessionID: string(current.id)})
 	require.NoError(t, loadErr)
 	require.NotEmpty(t, entries, "the retry reported success with no durable commit")
 
-	idle := connection.lifecycleEventsOfType(t, "state_update")
-	require.NotEmpty(t, idle)
-	require.Equal(t, "idle", idle[len(idle)-1]["state"], "the completed retry never emitted the terminal transition")
+	for _, transition := range connection.lifecycleEventsOfType(t, "state_update") {
+		require.NotEqual(t, "idle", transition["state"],
+			"the retry emitted a terminal transition on a stream its predecessor had already fenced")
+	}
 }
 
-// TestAFailedCloseLaundersNoUnprovenStop proves the fence is the successful
-// boundary's own mark. A harness that refuses the interrupt leaves the stop
-// unproved, so the close fails classified against the containment sentinel — and
-// installs no fence, because a fence here would be read by the next boundary as
-// the terminal evidence the harness never gave. The retry and the delete that
-// follows both fail on the same unproved stop, and nothing is deleted natively
-// over work still running.
+// TestAFailedCloseLaundersNoUnprovenStop proves the fence is never evidence. A
+// harness that refuses the interrupt leaves the stop unproved, so the close fails
+// classified against the containment sentinel and still fences on its way out —
+// and that fence answers for nothing. Settlement is judged from the cycle's own
+// loss, which a refused interrupt is not, so the retry and the delete behind it
+// both fail on the same unproved stop and nothing is deleted natively over work
+// still running.
+//
+// The mutation this pins: read fence presence as terminal evidence instead of the
+// cycle's loss and the second close reports success over a harness that never
+// stopped.
 func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
 	t.Parallel()
 
@@ -943,12 +955,12 @@ func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
 	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
 	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 	require.ErrorContains(t, err, "harness refused the interrupt")
-	require.False(t, lifecycleFenced(current), "the failed close fenced the incarnation it proved nothing about")
+	require.True(t, lifecycleFenced(current), "the failed close left the incarnation speaking after it had stopped")
 	require.NoError(t, current.lifecycleFailure(), "the failed close latched a stream it said nothing on")
 	require.False(t, client.isClosed(), "an unproved stop contained the scope anyway")
 
-	// The very same unproved stop is presented to the boundary again. Nothing
-	// this close left behind may answer for it.
+	// The very same unproved stop is presented to the boundary again, now with
+	// this close's fence standing. Nothing it left behind may answer for it.
 	require.Error(t, current.awaitCloseSettlement(context.Background(), cycle),
 		"the failed close turned a refused interrupt into accepted terminal evidence")
 
