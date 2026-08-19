@@ -13,6 +13,12 @@ const (
 	LivenessFileName = "acp-go-opencode-runtime.liveness.lock"
 )
 
+// ErrRuntimeLockUnsupported reports that this platform has no advisory-lock
+// primitive to build the runtime's single-writer fence from. Construction fails
+// with it rather than proceeding unlocked: a home nobody can claim exclusively
+// would let two runtimes write one native database and call it ownership.
+var ErrRuntimeLockUnsupported = errors.New("OpenCode runtime home lock is unsupported on this platform")
+
 var chmodLockFile = (*os.File).Chmod
 var lockPlatform = platformLock
 var verifyLockPath = verifyLockedPath

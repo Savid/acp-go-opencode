@@ -9,7 +9,7 @@ import (
 )
 
 func platformLock(*os.File) error {
-	return fmt.Errorf("OpenCode writable-home locking is unsupported on %s", runtime.GOOS)
+	return fmt.Errorf("%w: %s", ErrRuntimeLockUnsupported, runtime.GOOS)
 }
 
 func platformUnlock(*os.File) error { return nil }

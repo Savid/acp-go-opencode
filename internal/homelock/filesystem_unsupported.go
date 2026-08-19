@@ -9,5 +9,5 @@ import (
 )
 
 func validateLockFilesystem(*os.File) error {
-	return fmt.Errorf("OpenCode writable-home filesystem validation is unsupported on %s", runtime.GOOS)
+	return fmt.Errorf("%w: filesystem validation on %s", ErrRuntimeLockUnsupported, runtime.GOOS)
 }
