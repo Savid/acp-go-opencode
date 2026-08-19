@@ -72,17 +72,27 @@ extension for fork:
 interrupted and acknowledged, the state a reload restores from is read while the
 loopback API can still answer it, the session's native scope is proven
 contained, and only then is that state committed and the open turn reported
-over. A containment that does not complete commits nothing new, ends no turn on
-the stream, and answers with the containment error, leaving the handle
-addressable for a retry. Either way the session's lifecycle stream is fenced:
-nothing is emitted on it again.
+over. A boundary that does not complete commits nothing new, ends no turn on the
+stream, and answers with the containment error, leaving the handle addressable
+for a retry — and it fences nothing, because the fence is the completed
+boundary's own mark that this incarnation has said everything it will ever say.
+The retry runs the whole ladder again, the still-owed durable commit included,
+and only the boundary that completes fences the stream.
+
+`Agent.Close` runs the same ladder per session, and the same durable rung with
+it, before the shared native runtime is retired. An embedded shutdown commits
+what a wire close would have committed rather than dropping it with the wrapper.
 
 `session/delete` writes its durable tombstone first and hides the id with it, so
 a teardown that fails afterwards is reported to the caller without leaving the
 session listable, loadable, or resumable. A settlement still in flight when the
-tombstone lands commits nothing, because a store write would unlist the
-tombstone and resurrect a session already reported gone. Deleting an unknown or
-already-deleted session succeeds silently.
+tombstone lands commits nothing: the store itself refuses an append or a
+replacement addressed to a tombstoned key, writing nothing, clearing nothing, and
+answering success. A `session/load` or `session/resume` already past its entry
+check re-reads the tombstone under the lock that installs the session, so a
+delete that completes during preparation wins — the prepared replacement is torn
+down and the id stays gone. Deleting an unknown or already-deleted session
+succeeds silently.
 
 New, load, resume, and fork publish two notifications after their own response
 has been written to the transport: the session's opening lifecycle snapshot,

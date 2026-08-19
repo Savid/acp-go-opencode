@@ -40,7 +40,10 @@ extension. This page lists each method and its behavior.
   `_opencode/auth/credential` leg and no injection key: a completed login is
   installed into OpenCode's own durable store and never crosses back out.
 - `session/set_mode` — returns method-not-found; mode is a config option set
-  through `session/set_config_option`, not a dedicated method.
+  through `session/set_config_option`, not a dedicated method. The reserved
+  `_meta["acp-go.dev/lifecycle"]` key is still refused with invalid params
+  first: the key has no meaning on any inbound route, and a method-not-found
+  answer would tell a host the key was accepted.
 
 Unknown methods and foreign `_meta` namespaces are rejected or ignored per the
 ACP contract.

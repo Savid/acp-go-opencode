@@ -95,5 +95,10 @@ fail closed; a valid snapshot without a terminal assistant returns an empty
 A snapshot is blocked while any input, permission, elicitation, or generation is
 pending, so a snapshot never captures a half-finished turn. `session/delete`
 removes a stored session and leaves a tombstone so the id is not silently
-reused.
+reused. The tombstone is final in the store itself: an `Append` or a `Replace`
+addressed to a tombstoned key writes nothing, clears nothing, and returns
+success. A custom `SessionStore` owes the same rule — the deleted state is
+already the caller's answer, and a store that leaves the rule to its caller
+resurrects a session whenever a settlement races the delete that answered for
+it.
 </Note>

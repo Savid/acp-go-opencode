@@ -179,6 +179,13 @@ Session-scoped request options include `WithSessionMCPServers`,
 `WithSessionAdditionalDirectories`, `WithSessionMeta`, `WithSessionOutputSchema`,
 `WithSessionRawEvents`, and `WithSessionOpenCodeOptions`.
 
+`WithSessionMeta` and `WithListSessionsMeta` take host-supplied metadata. A
+caller key naming a reserved `acp-go.dev/*` literal — `route`, `mediaEnvelope`,
+`handoff`, or `lifecycle` — is refused rather than merged or overwritten: those
+values are minted by the adapter on the surfaces that carry them, so a collision
+is a defect in the calling code and the builder panics rather than putting an
+unvalidated reserved value on the wire.
+
 `OpenCodeOptions` (built with `NewOpenCodeOptions` and `WithOpenCodeModel`,
 `WithOpenCodeOutputSchema`, `WithOpenCodeMode`,
 `WithOpenCodePermission`, `WithOpenCodeEnv`, and `WithOpenCodeExtraPathDirs`)
