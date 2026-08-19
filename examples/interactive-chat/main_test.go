@@ -967,6 +967,41 @@ func TestRunInteractiveLoopTicksAndCancelsRunningPrompt(t *testing.T) {
 	require.Greater(t, ui.spinner, 0)
 }
 
+func TestRunInteractiveLoopQueuesPromptWhileRunning(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	conn := &fakeAgentConnection{promptWait: release}
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	output := newSignalWriter("queued> second")
+	done := make(chan error, 1)
+	go func() {
+		done <- runInteractiveLoop(context.Background(), conn, newChatUI(output), reader, "session-1", "first")
+	}()
+
+	require.Eventually(t, func() bool {
+		return len(conn.promptsSnapshot()) == 1
+	}, time.Second, 10*time.Millisecond)
+
+	go func() { _, _ = io.WriteString(writer, "second\n") }()
+
+	select {
+	case <-output.seen:
+	case <-time.After(time.Second):
+		t.Fatal("queued prompt was not written")
+	}
+
+	close(release)
+	require.NoError(t, writer.Close())
+	require.NoError(t, <-done)
+	require.Equal(t, 2, len(conn.promptsSnapshot()))
+}
+
 func TestRunInteractiveLoopContextCancelWhileRunning(t *testing.T) {
 	t.Parallel()
 
