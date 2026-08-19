@@ -672,9 +672,13 @@ func TestCloseOnAFencedIncarnationEmitsNothingAndKeepsItsDurableRecord(t *testin
 // merely dropped an update is still live and still owes the boundary that
 // transition; the latch is what refuses to let it claim one, so the close answers
 // with the latched error instead of ending the turn in silence on a stream that
-// has already lost a sequence. The rungs that are not emissions are unaffected:
-// the scope is contained and the captured generation is durable before the
-// boundary reaches the rung it fails on.
+// has already lost a sequence.
+//
+// The terminal transition is the rung before the durable commit, so a boundary
+// that cannot make the transition writes no generation either — each rung is a
+// precondition of the next. Nothing is lost by that: the close failed, the
+// session stays addressable, and the retry across the fence runs the durable rung
+// the failed boundary owed.
 func TestCloseOnALatchedLiveStreamFailsWithTheLatchedError(t *testing.T) {
 	t.Parallel()
 
@@ -719,8 +723,16 @@ func TestCloseOnALatchedLiveStreamFailsWithTheLatchedError(t *testing.T) {
 	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
 	require.ErrorContains(t, err, "wire down", "close reported a turn over on a stream that lost a sequence")
 	require.True(t, client.isClosed(), "the latched stream stopped the containment proof")
-	require.Positive(t, committed, "the latched stream stopped the durable commit")
+	require.Zero(t, committed, "the boundary committed a generation over a transition it never made")
 	require.Contains(t, agent.sessions, current.id, "the session was released on an unproven boundary")
+
+	// The retry runs against the fence the failed boundary left, so the rung the
+	// latch refused is skipped rather than retried, and the durable rung behind it
+	// lands.
+	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.NoError(t, err)
+	require.Positive(t, committed, "the retry answered success with no durable commit")
+	require.NotContains(t, agent.sessions, current.id, "the completed boundary kept the session addressable")
 }
 
 // TestCloseRefusesToSettleOnAnInterruptTheHarnessRefused proves a refused native
@@ -880,19 +892,24 @@ func TestCloseFailsOnACaptureItCannotRead(t *testing.T) {
 	require.Contains(t, agent.sessions, current.id, "the session was released without a durable capture")
 }
 
-// TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung proves the retry
-// contract of a boundary that failed. A close whose durable rung the store
-// refused proved nothing: it terminalized nothing and released nothing, so the
-// session stays addressable and the next close re-runs every rung the failed one
-// owed — including the commit, against a store that has healed. A retry that
-// answered success over a generation nobody wrote would report a boundary no one
-// completed.
+// TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung proves the rung order
+// of the close boundary and the retry contract of one that failed. Terminalization
+// comes first: the still-open turn is told this boundary ended it, and only then is
+// the generation a reload restores written. A store that refuses that write fails
+// the close with the stream fenced behind a terminal transition the host has
+// already seen — the durable rung is what failed, not the transition that preceded
+// it.
+//
+// The failed boundary proved nothing durable and released nothing, so the session
+// stays addressable and the next close re-runs every rung the failed one owed —
+// including the commit, against a store that has healed. A retry that answered
+// success over a generation nobody wrote would report a boundary no one completed.
 //
 // The retry runs across the fence the failed boundary left, which costs it the
-// emission rung and nothing else: the terminal transition is skipped as it is for
-// any fenced incarnation, the retained capture makes the durable rung runnable
-// without the loopback API the containment took away, and the retry answers
-// silently because the first close already reported the failure to its caller.
+// emission rung and nothing else: the terminal transition is not restated on a
+// fenced stream, the retained capture makes the durable rung runnable without the
+// loopback API the containment took away, and the retry answers silently because
+// the first close already reported the failure to its caller.
 func TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung(t *testing.T) {
 	t.Parallel()
 
@@ -920,9 +937,13 @@ func TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung(t *testing.T) {
 	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
 	require.ErrorContains(t, err, "store refused the resumable commit")
 	require.Equal(t, 1, commits)
-	require.False(t, cycle.settled, "a boundary that committed nothing terminalized the turn anyway")
+	require.True(t, cycle.settled, "the boundary refused the commit without first ending the turn it was closing")
 	require.True(t, lifecycleFenced(current), "the failed boundary left the incarnation speaking after it had stopped")
 	require.Contains(t, agent.sessions, current.id, "a failed boundary released the session")
+
+	terminal := endingIdleTransitions(t, connection)
+	require.Len(t, terminal, 1, "the refused commit came before the terminal transition the host is owed")
+	require.Equal(t, string(lifecycle.OutcomeCancelled), terminal[0]["outcome"])
 
 	entries, loadErr := store.Load(context.Background(), SessionKey{SessionID: string(current.id)})
 	require.NoError(t, loadErr)
@@ -937,17 +958,30 @@ func TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung(t *testing.T) {
 	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
 	require.NoError(t, err)
 	require.Equal(t, 2, commits, "the retry answered success without re-running the durable rung")
-	require.True(t, cycle.settled, "the completed retry never retired the turn")
 	require.NotContains(t, agent.sessions, current.id, "the completed boundary kept the session addressable")
 
 	entries, loadErr = store.Load(context.Background(), SessionKey{SessionID: string(current.id)})
 	require.NoError(t, loadErr)
 	require.NotEmpty(t, entries, "the retry reported success with no durable commit")
 
+	require.Len(t, endingIdleTransitions(t, connection), 1,
+		"the retry emitted a terminal transition on a stream its predecessor had already fenced")
+}
+
+// endingIdleTransitions reports every terminal foreground transition the stream
+// carried, in the order the host received them.
+func endingIdleTransitions(t *testing.T, connection *recordingAgentClient) []map[string]any {
+	t.Helper()
+
+	ending := make([]map[string]any, 0)
+
 	for _, transition := range connection.lifecycleEventsOfType(t, "state_update") {
-		require.NotEqual(t, "idle", transition["state"],
-			"the retry emitted a terminal transition on a stream its predecessor had already fenced")
+		if transition["state"] == "idle" {
+			ending = append(ending, transition)
+		}
 	}
+
+	return ending
 }
 
 // TestAFailedCloseLaundersNoUnprovenStop proves the fence is never evidence. A

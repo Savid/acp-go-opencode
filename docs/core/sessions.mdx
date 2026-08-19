@@ -71,9 +71,9 @@ extension for fork:
 `session/close` is a ladder and runs in one order: the session's native work is
 interrupted and acknowledged, the state a reload restores from is read while the
 loopback API can still answer it, the session's native scope is proven
-contained, and only then is that state committed and the open turn reported
-over. A boundary that does not complete commits nothing new, ends no turn on the
-stream, and answers with the containment error, leaving the handle addressable
+contained, and only then is the open turn reported over and that state
+committed. A boundary that does not complete commits nothing new, ends no turn on
+the stream, and answers with the containment error, leaving the handle addressable
 for a retry. It still fences: the fence marks where this incarnation stopped
 speaking, not what the boundary proved. The retry therefore runs the whole ladder
 again — the still-owed durable commit included — and loses only the emission

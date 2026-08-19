@@ -1087,11 +1087,16 @@ func (s *session) closeSession(commitResumable bool) error {
 // closeBoundary runs the close ladder in the one order it has: this session's
 // native work stops, the state a reload restores from is captured while the
 // loopback API can still answer it, the native scope is contained — and only a
-// containment that completed earns the durable commit and the terminal
-// transition that follow it. A boundary that does not complete terminalizes
-// nothing, commits nothing new, and answers with the containment error, because
-// terminal is immutable and this session has just failed to prove what it would
-// be declaring over.
+// containment that completed earns the terminal transition and the durable
+// commit that follow it. A boundary that does not complete terminalizes nothing,
+// commits nothing new, and answers with the containment error, because terminal
+// is immutable and this session has just failed to prove what it would be
+// declaring over.
+//
+// Terminalization precedes the durable commit, and each rung is a precondition of
+// the next: the still-open turn is told the boundary ended it before the boundary
+// writes the generation a reload restores, and a commit the store refuses fails
+// the close with the stream fenced behind terminalizations that already stand.
 //
 // The containment proof and the durable commit are unconditional; only the
 // terminal transition is a stream rung, and it is emitted only while this session
@@ -1123,10 +1128,14 @@ func (s *session) closeBoundary(commitResumable bool) error {
 		return err
 	}
 
-	commitCtx, commitCancel := context.WithTimeout(context.Background(), closeTimeout)
-	defer commitCancel()
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer closeCancel()
 
-	if err := s.commitStateSnapshot(commitCtx, captured); err != nil {
+	if err := s.settleCloseCycle(closeCtx, cycle); err != nil {
+		return err
+	}
+
+	if err := s.commitStateSnapshot(closeCtx, captured); err != nil {
 		return err
 	}
 
@@ -1136,7 +1145,7 @@ func (s *session) closeBoundary(commitResumable bool) error {
 	s.retainedCapture = nil
 	s.mu.Unlock()
 
-	return s.settleCloseCycle(commitCtx, cycle)
+	return nil
 }
 
 // settleBeforeContainment stops this session's native work and reads the state a
