@@ -420,10 +420,13 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 		return nil, err
 	}
 
-	if implementsExtensionMethod(method) {
-		if refusal := refuseLifecycleRawMeta(params); refusal != nil {
-			return nil, refusal
-		}
+	// The reserved family literal is refused before the method is resolved. The
+	// key belongs to the family on every inbound surface, so an extension name
+	// this adapter does not implement is not a place a host may stamp it and be
+	// told the key was fine: "the key is not read here" outranks "there is no
+	// such method".
+	if refusal := refuseLifecycleRawMeta(params); refusal != nil {
+		return nil, refusal
 	}
 
 	switch method {
@@ -444,20 +447,6 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 		}
 
 		return nil, acp.NewMethodNotFound(method)
-	}
-}
-
-// implementsExtensionMethod reports whether this adapter owns the named
-// extension method. The reserved lifecycle literal is refused on every route it
-// owns — including a provider-auth leg whose broker is unconfigured — while a
-// method this adapter does not implement keeps answering method not found.
-func implementsExtensionMethod(method string) bool {
-	switch method {
-	case ForkSessionMethod, AuthMethodsMethod, AuthAuthorizeMethod, AuthCallbackMethod,
-		AuthStatusMethod, AuthCancelMethod, AuthInventoryMethod, AuthDisconnectMethod:
-		return true
-	default:
-		return false
 	}
 }
 

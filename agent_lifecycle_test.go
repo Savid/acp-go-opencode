@@ -276,14 +276,15 @@ func TestReservedLifecycleKeyIsRefusedOnEveryExtensionRoute(t *testing.T) {
 }
 
 // TestUnimplementedRoutesKeepTheirOwnAnswer proves a method this adapter does not
-// implement answers method not found, that the reserved key is still refused on a
-// declared SDK route before that verdict is given, and that a params body carrying
-// no reserved key is left to its own decoder.
+// implement answers method not found, that the reserved key is still refused
+// before that verdict is given, and that a params body carrying no reserved key is
+// left to its own decoder.
 //
-// The declared route is the distinction. `session/set_mode` is a surface the
-// pinned SDK dispatches, so the surfaces table binds it and the key has to fail
-// closed there whether or not this adapter implements the method; an undeclared
-// extension name is not a surface at all, and nothing on it is read.
+// The refusal does not depend on the route being one this adapter implements. The
+// family literal is never foreign: it is refused on every inbound surface the
+// pinned SDK dispatches, extension names included, because an unimplemented name
+// that answered method not found over a stamped key would tell a host the key was
+// fine anywhere unimplemented.
 func TestUnimplementedRoutesKeepTheirOwnAnswer(t *testing.T) {
 	t.Parallel()
 
@@ -299,8 +300,19 @@ func TestUnimplementedRoutesKeepTheirOwnAnswer(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "Method not found")
 
+	_, err = agent.HandleExtensionMethod(context.Background(), "_x/nonexistent",
+		json.RawMessage(`{"_meta":{"acp-go.dev/lifecycle":{}}}`))
+	requireUnsupportedField(t, err, lifecycle.MetaPath)
+
 	_, err = agent.HandleExtensionMethod(context.Background(), "_opencode/unknown",
 		json.RawMessage(`{"_meta":{"acp-go.dev/lifecycle":{}}}`))
+	requireUnsupportedField(t, err, lifecycle.MetaPath)
+
+	_, err = agent.HandleExtensionMethod(context.Background(), "_opencode/unknown",
+		json.RawMessage(`{"_meta":{"opencode":{}}}`))
+	require.ErrorContains(t, err, "Method not found")
+
+	_, err = agent.HandleExtensionMethod(context.Background(), "_opencode/unknown", nil)
 	require.ErrorContains(t, err, "Method not found")
 
 	_, err = agent.HandleExtensionMethod(context.Background(), ForkSessionMethod, json.RawMessage(`not json`))

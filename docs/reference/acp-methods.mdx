@@ -46,7 +46,9 @@ extension. This page lists each method and its behavior.
   answer would tell a host the key was accepted.
 
 Unknown methods and foreign `_meta` namespaces are rejected or ignored per the
-ACP contract.
+ACP contract. The reserved key is not foreign on any of them: an unknown
+extension method whose params carry `_meta["acp-go.dev/lifecycle"]` is refused
+with invalid params, because the key is read before the method is resolved.
 
 After `Agent.Close`, the connection rejects every incoming request with
 invalid-request (`-32600`) before initialization gating, method lookup,
