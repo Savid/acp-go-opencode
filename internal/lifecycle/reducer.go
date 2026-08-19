@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"math/big"
+	"strings"
 )
 
 // Options configures a reducer.
@@ -216,15 +218,151 @@ func (r *Reducer) reduceDuplicate(delivery Delivery) error {
 	return r.fail(delivery, ViolationConflictingDuplicate, "the identity already delivered different content")
 }
 
-// equalJSONValue compares decoded JSON without converting integers through
-// float64. Lifecycle sequences and opaque carrier metadata may exceed 2^53;
-// treating adjacent integers there as equal would suppress a conflicting
-// duplicate and silently corrupt the ordered stream.
+// equalJSONValue compares two decoded JSON values under lifecycle value
+// equality: key order and insignificant whitespace are not differences, and
+// numbers compare as exact mathematical values rather than as lexemes or as
+// float64. Opaque carrier members and progress objects may carry integers beyond
+// IEEE-754 double precision, and collapsing those through a double would suppress
+// a conflicting duplicate that changed its content.
 func equalJSONValue(left, right any) bool {
-	leftJSON, leftErr := json.Marshal(left)
-	rightJSON, rightErr := json.Marshal(right)
+	switch value := left.(type) {
+	case map[string]any:
+		return equalJSONObject(value, right)
+	case []any:
+		return equalJSONArray(value, right)
+	case json.Number:
+		other, ok := right.(json.Number)
 
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
+		return ok && equalNumber(string(value), string(other))
+	default:
+		return value == right
+	}
+}
+
+func equalJSONObject(left map[string]any, right any) bool {
+	other, ok := right.(map[string]any)
+	if !ok || len(left) != len(other) {
+		return false
+	}
+
+	for key, member := range left {
+		counterpart, present := other[key]
+		if !present || !equalJSONValue(member, counterpart) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func equalJSONArray(left []any, right any) bool {
+	other, ok := right.([]any)
+	if !ok || len(left) != len(other) {
+		return false
+	}
+
+	for index := range left {
+		if !equalJSONValue(left[index], other[index]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// equalRawJSON compares two encoded members under the same predicate. A member
+// neither side can decode is compared as written: a byte comparison never calls
+// two different values equal, and nothing undecodable reaches a comparison here
+// because the decoder refuses it first.
+func equalRawJSON(left, right json.RawMessage) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+
+	leftValue, leftOK := decodeJSONValue(left)
+
+	rightValue, rightOK := decodeJSONValue(right)
+	if !leftOK || !rightOK {
+		return bytes.Equal(left, right)
+	}
+
+	return equalJSONValue(leftValue, rightValue)
+}
+
+// decodeJSONValue decodes one member without materializing any number it carries.
+func decodeJSONValue(raw json.RawMessage) (any, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, false
+	}
+
+	return value, true
+}
+
+// normalizedNumber is one JSON number lexeme's normalized decimal form: a sign, a
+// coefficient stripped of leading and trailing zeros, and the power of ten that
+// coefficient scales by. Every zero normalizes to an empty coefficient, which is
+// what makes -0 equal to 0.
+type normalizedNumber struct {
+	negative bool
+	digits   string
+	exponent *big.Int
+}
+
+// equalNumber decides two number lexemes without expanding either. The decision
+// costs the digits a literal is written with rather than the value it names, so a
+// twelve-byte literal carrying a nine-digit exponent allocates nothing beyond its
+// own exponent.
+func equalNumber(left, right string) bool {
+	leftParts, leftOK := normalizeNumber(left)
+
+	rightParts, rightOK := normalizeNumber(right)
+	if !leftOK || !rightOK {
+		return left == right
+	}
+
+	if leftParts.digits == "" || rightParts.digits == "" {
+		return leftParts.digits == rightParts.digits
+	}
+
+	return leftParts.negative == rightParts.negative &&
+		leftParts.digits == rightParts.digits &&
+		leftParts.exponent.Cmp(rightParts.exponent) == 0
+}
+
+func normalizeNumber(lexeme string) (normalizedNumber, bool) {
+	negative := strings.HasPrefix(lexeme, "-")
+	mantissa := strings.TrimPrefix(lexeme, "-")
+	exponent := new(big.Int)
+
+	if index := strings.IndexAny(mantissa, "eE"); index >= 0 {
+		if _, ok := exponent.SetString(strings.TrimPrefix(mantissa[index+1:], "+"), 10); !ok {
+			return normalizedNumber{}, false
+		}
+
+		mantissa = mantissa[:index]
+	}
+
+	whole, fraction := mantissa, ""
+	if index := strings.IndexByte(mantissa, '.'); index >= 0 {
+		whole, fraction = mantissa[:index], mantissa[index+1:]
+	}
+
+	digits := whole + fraction
+	if digits == "" || strings.TrimLeft(digits, "0123456789") != "" {
+		return normalizedNumber{}, false
+	}
+
+	exponent.Sub(exponent, big.NewInt(int64(len(fraction))))
+
+	digits = strings.TrimLeft(digits, "0")
+	trimmed := strings.TrimRight(digits, "0")
+	exponent.Add(exponent, big.NewInt(int64(len(digits)-len(trimmed))))
+
+	return normalizedNumber{negative: negative, digits: trimmed, exponent: exponent}, true
 }
 
 func (r *Reducer) commit(delivery Delivery) {
