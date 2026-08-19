@@ -1697,3 +1697,132 @@ func TestDeleteLeavesNoWriteThatRecreatesTheRow(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, entries, "the deleted session's row was recreated")
 }
+
+// TestLoadRacingDeleteInstallsNothingAndResurrectsNothing proves the tombstone
+// check is not once-at-entry. A load that passed its entry check and prepared a
+// complete replacement re-reads the deletion marker under the very lock that
+// installs, so a delete that completed inside that window wins however far the
+// preparation got: the replacement is torn down, the marker is left set rather
+// than cleared as an install side effect, and neither the active map nor the
+// store carries the deleted id afterwards.
+func TestLoadRacingDeleteInstallsNothingAndResurrectsNothing(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-race")
+	client.getSession = testNativeSession("native-race")
+
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	store.onLoad = func(key SessionKey) ([]SessionStoreEntry, error) {
+		entries, loadErr := store.InMemorySessionStore.Load(ctx, key)
+
+		once.Do(func() {
+			close(reached)
+			<-release
+		})
+
+		return entries, loadErr
+	}
+
+	var (
+		wg      sync.WaitGroup
+		loadErr error
+	)
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		_, loadErr = agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the load never reached the store read")
+	}
+
+	// The delete completes entirely inside the load's preparation window.
+	_, delErr := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
+	require.NoError(t, delErr)
+	require.True(t, agent.isDeleted(created.SessionId), "the tombstone did not hide the id")
+
+	close(release)
+	wg.Wait()
+
+	store.onLoad = nil
+
+	requireInvalidParamsData(t, loadErr, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	require.True(t, agent.isDeleted(created.SessionId),
+		"installing the replacement cleared the deletion marker")
+
+	agent.mu.Lock()
+	_, mapped := agent.sessions[created.SessionId]
+	agent.mu.Unlock()
+	require.False(t, mapped, "the losing replacement was installed anyway")
+
+	listed, listErr := agent.ListSessions(ctx, ListSessionsRequest())
+	require.NoError(t, listErr)
+	require.Empty(t, listed.Sessions, "the deleted session is listable again")
+
+	rows, rowErr := store.ListSessions(ctx)
+	require.NoError(t, rowErr)
+	require.Empty(t, rows, "the deleted session's durable row came back")
+
+	_, reloadErr := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
+	requireInvalidParamsData(t, reloadErr, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+}
+
+// TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes proves the answer to a
+// refused installation is the refusal itself. A load that lost its race with a
+// delete owes the host the uniform unknown-session invalid params, and wrapping
+// that in a join would turn it into an internal error; only a teardown that
+// itself failed has anything to add.
+func TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes(t *testing.T) {
+	t.Parallel()
+
+	refusal := acp.NewInvalidParams(map[string]any{
+		jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID,
+	})
+
+	t.Run("clean teardown", func(t *testing.T) {
+		t.Parallel()
+
+		agent := NewAgent()
+		current := testSession(t, agent, newFakeOpenCodeClient())
+
+		requireInvalidParamsData(t, agent.rollbackStartedSession(current, refusal),
+			map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	})
+
+	t.Run("teardown that failed too", func(t *testing.T) {
+		t.Parallel()
+
+		client := newFakeOpenCodeClient()
+		client.closeErr = errors.New("disconnect failed")
+		agent := NewAgent()
+		current := testSession(t, agent, client)
+
+		err := agent.rollbackStartedSession(current, refusal)
+		require.ErrorIs(t, err, refusal)
+		require.ErrorContains(t, err, "disconnect failed")
+	})
+}

@@ -93,9 +93,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	session.runtimeGeneration = generation
 
 	if err := a.storeStartedSession(session); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
+		return acp.NewSessionResponse{}, a.rollbackStartedSession(session, err)
 	}
 
 	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
@@ -249,9 +247,11 @@ func (a *Agent) loadOrResumeSession(
 	session.setImageArtifacts(artifacts)
 
 	if err := a.storeStartedSession(session); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return nil, errors.Join(err, closeErr)
+		// A delete that completed while this replacement was being prepared
+		// wins, however far the preparation got: the prepared session is torn
+		// down and the uniform unknown-session refusal reaches the host as it
+		// was raised.
+		return nil, a.rollbackStartedSession(session, err)
 	}
 
 	return session, nil
@@ -369,6 +369,19 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 	}
 
 	return acp.CloseSessionResponse{}, nil
+}
+
+// rollbackStartedSession answers a refused installation. The refusal is the
+// answer the request owes and it survives the rollback intact — a load that lost
+// its race with a delete gets the uniform unknown-session invalid params rather
+// than an internal error wrapped around it — so only a teardown that itself
+// failed is joined onto it.
+func (a *Agent) rollbackStartedSession(session *session, refusal error) error {
+	if closeErr := a.closeFailedSession(session); closeErr != nil {
+		return errors.Join(refusal, closeErr)
+	}
+
+	return refusal
 }
 
 func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
@@ -518,9 +531,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	session.setImageArtifacts(parent.cloneImageArtifacts())
 
 	if err := a.storeStartedSession(session); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
+		return acp.UnstableForkSessionResponse{}, a.rollbackStartedSession(session, err)
 	}
 
 	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {

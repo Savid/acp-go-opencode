@@ -517,12 +517,23 @@ func (a *Agent) session(id acp.SessionId) (*session, error) {
 	return session, nil
 }
 
+// storeStartedSession installs a fully prepared session into the active set. The
+// tombstone check is not once-at-entry: a delete that completed while this
+// session was being prepared wins, however far the preparation got, so the
+// marker is re-read under the very lock that installs — and never cleared as a
+// side effect of installing. Clearing it would unhide an id the host has already
+// been told is gone, and the caller tears the prepared replacement down on the
+// refusal it gets back.
 func (a *Agent) storeStartedSession(session *session) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.closed {
 		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+	}
+
+	if _, deleted := a.deleted[session.id]; deleted {
+		return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	if a.runtime == nil {
@@ -538,7 +549,6 @@ func (a *Agent) storeStartedSession(session *session) error {
 	}
 
 	a.sessions[session.id] = session
-	delete(a.deleted, session.id)
 
 	if a.providerAuth != nil {
 		a.providerAuth.reopenSession(session.id)
