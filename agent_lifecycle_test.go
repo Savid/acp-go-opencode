@@ -435,6 +435,53 @@ func TestCancelCarryingTheKeyNeverReachesTheHarness(t *testing.T) {
 	require.False(t, session.wasCancelled())
 }
 
+// TestRouteValidationPrecedesTheReservedLifecycleRefusal proves the one verdict a
+// surface carrying both envelopes reports. The route envelope is the anti-stale
+// authenticator, so it is validated before the placement rule that refuses the
+// reserved key: a request carrying an invalid route and the key reports the route
+// verdict, never the key's, and never an implementation-defined choice between
+// them. On the cancel notification the refusal is still wire-silent and still
+// lands before the native interrupt.
+func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
+	t.Parallel()
+
+	agent := negotiatedAgent(t)
+	agent.setAgentClient(newRecordingAgentClient())
+	client := newFakeOpenCodeClient()
+	session := testSession(t, agent, client)
+	agent.sessions[session.id] = session
+	session.beginTurn(context.Background(), "nonce")
+
+	both := map[string]any{
+		routeEnvelopeKey:  map[string]any{routeFieldVersion: 99, routeFieldTurnNonce: "nonce"},
+		lifecycle.MetaKey: map[string]any{},
+	}
+
+	err := agent.Cancel(context.Background(), acp.CancelNotification{SessionId: session.id, Meta: both})
+	require.ErrorContains(t, err, "invalid_route_envelope")
+
+	client.mu.Lock()
+	aborts := len(client.aborts)
+	client.mu.Unlock()
+
+	require.Zero(t, aborts)
+	require.False(t, session.wasCancelled())
+
+	dispatched := false
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched = true
+
+		return opencode.NativeMessage{}, nil
+	}
+
+	request := TextPromptRequest(session.id, "nonce", "hello")
+	request.Meta = both
+
+	_, err = agent.Prompt(context.Background(), request)
+	require.ErrorContains(t, err, "invalid_route_envelope")
+	require.False(t, dispatched, "the prompt reached the harness")
+}
+
 // TestNegotiatedAnswerIsAbsentWithoutAnAgent proves a session with no owning agent
 // states no lifecycle fact, which is what keeps an envelope illegal rather than
 // merely unsent.
