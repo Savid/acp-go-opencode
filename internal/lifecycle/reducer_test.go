@@ -807,3 +807,112 @@ func TestLifecycleValueEqualityFallsBackToTheWrittenForm(t *testing.T) {
 	require.False(t, equalJSONArray([]any{json.Number("1")}, []any{json.Number("1"), json.Number("2")}))
 	require.False(t, equalJSONArray([]any{json.Number("1")}, json.Number("1")))
 }
+
+// TestRefusedReplacementSnapshotPreservesTheStandingProjection proves a snapshot
+// opens nothing when it is refused, in the replacement position as much as the
+// opening one. The reducer validates the whole replacement and swaps only on
+// success, so a malformed successor leaves the superseded incarnation's
+// projection exactly as it stood — and the refusal latches over that projection
+// rather than over an empty one. A reader that terminalizes what it holds needs
+// something held, and the superseded incarnation's work is the only truth anyone
+// has when its would-be successor turns out to be unreadable.
+func TestRefusedReplacementSnapshotPreservesTheStandingProjection(t *testing.T) {
+	t.Parallel()
+
+	r := newReduction(fullyProven())
+	r.open(t)
+	require.NoError(t, r.push(AcceptedEvent(Submission{SubmissionID: "sub-1", ClientNonce: "nonce-1"}, "turn-1")))
+	require.NoError(t, r.push(ActionEvent(PendingAction("action-1", ActionPermission, Owner{Type: OwnerTurn, ID: "turn-1"}, true))))
+
+	standing := r.reducer.State()
+	require.Equal(t, "stream-1", standing.StreamID)
+	require.NotEmpty(t, standing.Turns)
+	require.NotEmpty(t, standing.Actions)
+
+	err := r.reducer.Reduce(Delivery{
+		StreamID: "stream-2",
+		Sequence: 1,
+		Carrier:  CarrierSessionInfo,
+		// A foreground naming no cycle is refused by the whole-snapshot check.
+		Event: SnapshotEvent(Foreground{State: ForegroundIdle}, nil, QuiescenceFact{}),
+	})
+	require.ErrorIs(t, err, &ViolationError{Kind: ViolationMalformedEnvelope})
+
+	require.Equal(t, standing, r.reducer.State(),
+		"the refused replacement retired the standing projection before validating itself")
+
+	latched := r.reducer.Failed()
+	require.NotNil(t, latched)
+	require.Equal(t, "stream-2", latched.StreamID,
+		"the latch named the projection's stream rather than the frame that failed closed")
+	require.Equal(t, uint64(1), latched.Sequence)
+
+	// The latch is the reducer's: every later delivery, on either identity,
+	// answers with it and the projection never moves again.
+	require.ErrorIs(t, r.push(ActionEvent(ResolvedAction("action-1", ActionAccepted))), latched)
+	require.Equal(t, standing, r.reducer.State())
+}
+
+// TestAcceptedReplacementSnapshotSupersedesTheStandingProjection proves the
+// success half of the same swap: a replacement that validates whole takes over,
+// adopts nothing from the incarnation it supersedes, and retires that identity so
+// it never opens again.
+func TestAcceptedReplacementSnapshotSupersedesTheStandingProjection(t *testing.T) {
+	t.Parallel()
+
+	r := newReduction(fullyProven())
+	r.open(t)
+	require.NoError(t, r.push(AcceptedEvent(Submission{SubmissionID: "sub-1", ClientNonce: "nonce-1"}, "turn-1")))
+
+	require.NoError(t, r.reducer.Reduce(Delivery{
+		StreamID: "stream-2",
+		Sequence: 7,
+		Carrier:  CarrierSessionInfo,
+		Event:    SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "cycle-2"}, nil, QuiescenceFact{}),
+	}))
+
+	replaced := r.reducer.State()
+	require.Equal(t, "stream-2", replaced.StreamID)
+	require.Empty(t, replaced.Turns, "the replacement adopted work from the incarnation it superseded")
+	require.Equal(t, uint64(7), replaced.ReducedThrough)
+
+	err := r.reducer.Reduce(Delivery{
+		StreamID: "stream-1",
+		Sequence: 1,
+		Carrier:  CarrierSessionInfo,
+		Event:    SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "cycle-1"}, nil, QuiescenceFact{}),
+	})
+	require.ErrorIs(t, err, &ViolationError{Kind: ViolationStaleStream})
+}
+
+// TestReducerJudgesTheEndingIdleItIsGivenDirectly proves the ending-idle rule is
+// the reducer's own and not merely the decoder's. The rule holds wherever a
+// delivery comes from: the wire decoder refuses a malformed ending transition
+// before the reducer sees it, so this drives the reducer directly and pins the
+// rule at the layer that projects the turn.
+func TestReducerJudgesTheEndingIdleItIsGivenDirectly(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name       string
+		stopReason string
+		outcome    Outcome
+	}{
+		{name: "outcome omitted", stopReason: StopReasonEndTurn},
+		{name: "failed with a stop reason", stopReason: StopReasonEndTurn, outcome: OutcomeFailed},
+		{name: "stop reason omitted", outcome: OutcomeSuccess},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newReduction(promptContained())
+			r.open(t)
+			require.NoError(t, r.push(AcceptedEvent(
+				Submission{SubmissionID: "sub-1", ClientNonce: "nonce-1"}, "turn-1")))
+
+			require.ErrorIs(t,
+				r.push(IdleEvent("cycle-1", "turn-1", row.stopReason, row.outcome)),
+				&ViolationError{Kind: ViolationMalformedEnvelope})
+		})
+	}
+}

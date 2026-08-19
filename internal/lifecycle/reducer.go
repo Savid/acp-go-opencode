@@ -159,6 +159,14 @@ func (r *Reducer) Reduce(delivery Delivery) error {
 // on a stream identity this reducer has not seen; a projection is per incarnation
 // and adopts nothing from the one it supersedes. A closed session admits no
 // incarnation at all, which is why the fence is judged before this.
+//
+// The replacement is validated whole and swapped in only on success. A refused
+// snapshot opens nothing and leaves no half-built projection behind, and that
+// governs the replacement position too: the standing projection stays exactly as
+// it stood and the refusal latches over it. Retiring the old incarnation first
+// would latch over an empty projection instead — a reader that terminalizes what
+// it holds needs something held, and the superseded incarnation's work is the
+// only truth anyone has when its would-be successor turns out to be malformed.
 func (r *Reducer) reduceForeign(delivery Delivery) error {
 	if delivery.Event.Type != EventSnapshot {
 		return r.fail(delivery, ViolationStaleStream, "stream is "+r.state.StreamID)
@@ -168,10 +176,21 @@ func (r *Reducer) reduceForeign(delivery Delivery) error {
 		return r.fail(delivery, ViolationStaleStream, "stream "+delivery.StreamID+" was superseded")
 	}
 
-	r.retired[r.state.StreamID] = struct{}{}
-	r.reset(delivery.StreamID)
+	next := &Reducer{negotiated: r.negotiated}
+	next.reset(delivery.StreamID)
 
-	return r.reduceFirst(delivery)
+	if err := next.reduceFirst(delivery); err != nil {
+		r.failed = next.failed
+
+		return err
+	}
+
+	next.state.Closed = r.state.Closed
+	next.retired = r.retired
+	next.retired[r.state.StreamID] = struct{}{}
+	*r = *next
+
+	return nil
 }
 
 func (r *Reducer) reset(streamID string) {
