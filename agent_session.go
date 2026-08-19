@@ -350,21 +350,25 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		return acp.CloseSessionResponse{}, err
 	}
 
-	snapshotErr := session.snapshotToStore(context.WithoutCancel(ctx))
-	if snapshotErr != nil {
-		return acp.CloseSessionResponse{}, snapshotErr
-	}
-
+	// Close is the containment-proving boundary and it owns the whole ladder:
+	// the containment proof runs first, the durable commit and the terminal
+	// transition follow only a proof that completed, and the stream is fenced
+	// either way. A boundary that did not complete answers with its containment
+	// error and keeps the handle addressable for a retry.
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-	closeErr := session.Close(closeCtx)
+	closeErr := session.CloseAndCommit(closeCtx)
 
 	closeCancel()
 
-	if closeErr == nil && a.removeSessionIf(params.SessionId, session) {
+	if closeErr != nil {
+		return acp.CloseSessionResponse{}, closeErr
+	}
+
+	if a.removeSessionIf(params.SessionId, session) {
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
-	return acp.CloseSessionResponse{}, closeErr
+	return acp.CloseSessionResponse{}, nil
 }
 
 func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
@@ -381,20 +385,13 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	session := a.sessions[params.SessionId]
 	a.mu.Unlock()
 
-	if session != nil {
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-		err := session.DeleteNativeAndClose(closeCtx)
-
-		closeCancel()
-
-		if err != nil {
-			return acp.UnstableDeleteSessionResponse{}, err
-		}
-	}
-
-	// Publish the durable tombstone only after native deletion and containment
-	// succeed. A failure before this point leaves the handle addressable for a
-	// retry instead of reporting deletion while its process or state survives.
+	// The durable tombstone is written before anything is torn down, and the id
+	// is hidden with it. A teardown that fails afterwards is reported to the
+	// caller, but it never leaves a session that delete already answered for
+	// still listable, loadable, or resumable: a deleted session is
+	// wire-indistinguishable from one that never existed. A store that could not
+	// record the tombstone is the one failure that leaves the handle exactly as
+	// it was, because nothing was promised.
 	storeCtx, cancel := a.sessionStoreContext(ctx)
 	err := a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
 
@@ -412,11 +409,18 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
 
-	if session != nil {
-		a.observe.AddActiveSession(ctx, -1)
+	if session == nil {
+		return acp.UnstableDeleteSessionResponse{}, nil
 	}
 
-	return acp.UnstableDeleteSessionResponse{}, nil
+	a.observe.AddActiveSession(ctx, -1)
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+	teardownErr := session.DeleteNativeAndClose(closeCtx)
+
+	closeCancel()
+
+	return acp.UnstableDeleteSessionResponse{}, teardownErr
 }
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {

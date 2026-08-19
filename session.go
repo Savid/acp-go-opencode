@@ -969,13 +969,30 @@ func validSlashCommandName(name string) bool {
 	return true
 }
 
-// Close ends this session. It interrupts the session's own native work, waits
-// for OpenCode to acknowledge that the work stopped, commits the native-safe
-// prefix, and only then releases the session's resources and fences its lifecycle
-// stream. Every step runs under a bounded background context, so a cancelled or
-// expired caller context can never skip the ladder, and no step touches a peer
-// session or the shared runtime.
+// Close ends this session at the containment-proving boundary. Every step runs
+// under a bounded background context, so a cancelled or expired caller context
+// can never skip the ladder, and no step touches a peer session or the shared
+// runtime.
+//
+// The stream is fenced on both branches. A boundary that completed has said
+// everything this incarnation will ever say, and a boundary that did not leaves
+// an incarnation this session can no longer speak for; either way nothing may be
+// emitted on it again.
 func (s *session) Close(_ context.Context) error {
+	return s.closeSession(false)
+}
+
+// CloseAndCommit is the ACP close boundary. It runs the same ladder and, on a
+// containment that completed, additionally commits the state a later load or
+// resume restores this conversation from. Every other caller closes without that
+// commit: an agent shutting down, a rollback of a session that never finished
+// starting, and a delete that has already tombstoned the id each owe a host no
+// resumable generation.
+func (s *session) CloseAndCommit(_ context.Context) error {
+	return s.closeSession(true)
+}
+
+func (s *session) closeSession(commitResumable bool) error {
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
 
@@ -991,18 +1008,42 @@ func (s *session) Close(_ context.Context) error {
 	s.closed = true
 	s.mu.Unlock()
 
-	var cancelErr error
+	err := s.closeBoundary(firstClose, commitResumable)
+
+	s.fenceLifecycle("session closed")
+
+	return err
+}
+
+// closeBoundary runs the close ladder in the one order it has: this session's
+// native work stops, the state a reload restores from is captured while the
+// loopback API can still answer it, the native scope is contained — and only a
+// containment that completed earns the durable commit and the terminal
+// transition that follow it. A boundary that does not complete terminalizes
+// nothing, commits nothing new, and answers with the containment error, because
+// terminal is immutable and this session has just failed to prove what it would
+// be declaring over.
+func (s *session) closeBoundary(firstClose bool, commitResumable bool) error {
+	var (
+		cycle    *foregroundCycle
+		captured capturedStateSnapshot
+		err      error
+	)
 
 	if firstClose {
-		cancelCtx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
-		cancelErr = s.settleForShutdown(cancelCtx)
+		settleCtx, settleCancel := context.WithTimeout(context.Background(), settlementTimeout)
+		cycle, captured, err = s.settleBeforeContainment(settleCtx, commitResumable)
 
-		cancel()
+		settleCancel()
+
+		if err != nil {
+			return err
+		}
 	}
 
 	// Pending provider-auth flows are cancelled after pending elicitation is
-	// resolved and before the native interrupt, so a flow is never abandoned to
-	// a process that is already being torn down.
+	// resolved and before the native scope is closed, so a flow is never
+	// abandoned to a process that is already being torn down.
 	if s.agent != nil && s.agent.providerAuth != nil {
 		flowCtx, flowCancel := context.WithTimeout(context.Background(), closeTimeout)
 		s.agent.providerAuth.closeSession(flowCtx, s.id)
@@ -1010,25 +1051,91 @@ func (s *session) Close(_ context.Context) error {
 		flowCancel()
 	}
 
+	if err := s.containNativeScope(); err != nil {
+		return err
+	}
+
+	if !firstClose {
+		return nil
+	}
+
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer commitCancel()
+
+	if err := s.commitStateSnapshot(commitCtx, captured); err != nil {
+		return err
+	}
+
+	return s.settleCycle(commitCtx, cycle, lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled))
+}
+
+// settleBeforeContainment stops this session's native work and reads the state a
+// reload restores from. Both halves need the loopback API, so both run ahead of
+// the containment boundary, and neither writes anything durable: a commit before
+// the boundary completes would publish a generation this session has not proved
+// contained.
+//
+// There is state to read whenever a turn was open — that turn's native-safe
+// prefix is owed to the stream before its terminal transition — or whenever this
+// close commits a resumable generation. A tombstoned session owns no durable row
+// at all, so it captures nothing whatever it was closed for.
+func (s *session) settleBeforeContainment(
+	ctx context.Context,
+	commitResumable bool,
+) (*foregroundCycle, capturedStateSnapshot, error) {
+	cycle := s.currentCycle()
+
+	if err := s.cancelTurn(ctx); err != nil {
+		return nil, capturedStateSnapshot{}, err
+	}
+
+	if err := s.awaitNativeSettlement(ctx, cycle); err != nil {
+		return nil, capturedStateSnapshot{}, err
+	}
+
+	// Every pending action is answered while OpenCode can still receive the
+	// answer, and ahead of the capture, which refuses to read a graph still
+	// blocked on one.
+	s.cancelActions(ctx)
+
+	if (cycle == nil && !commitResumable) || s.tombstoned() {
+		return cycle, capturedStateSnapshot{}, nil
+	}
+
+	s.mu.Lock()
+	s.activeMessageIDs = map[string]struct{}{}
+	s.mu.Unlock()
+
+	captured, err := s.captureStateSnapshot(ctx, true)
+
+	return cycle, captured, err
+}
+
+// containNativeScope proves this session's native scope gone: the pump stops
+// routing, the directory-scoped client is closed, and the directory binding is
+// released. This is the containment boundary the whole close ladder is ordered
+// around.
+func (s *session) containNativeScope() error {
 	s.mu.Lock()
 	client := s.client
 	nativeID := s.idmap.NativeSessionID
 	release := s.directoryRelease
 	s.mu.Unlock()
 
-	err := cancelErr
-	if err == nil {
-		s.stopPump()
-	}
+	s.stopPump()
 
-	if err == nil && client != nil && nativeID != "" {
+	if client != nil && nativeID != "" {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-		err = client.Close(closeCtx)
+		err := client.Close(closeCtx)
 
 		closeCancel()
+
+		if err != nil {
+			return err
+		}
 	}
 
-	if err == nil && release != nil {
+	if release != nil {
 		release()
 
 		s.mu.Lock()
@@ -1036,39 +1143,14 @@ func (s *session) Close(_ context.Context) error {
 		s.mu.Unlock()
 	}
 
-	if err == nil {
-		s.fenceLifecycle("session closed")
-	}
-
-	return err
+	return nil
 }
 
-// settleForShutdown interrupts this session's native work and waits for the
-// harness to acknowledge that it stopped, then commits the native-safe prefix and
-// terminalizes the open cycle. It is the close and delete boundary: a session is
-// not released until the work it owned is over and durable.
-func (s *session) settleForShutdown(ctx context.Context) error {
-	cycle := s.currentCycle()
-
-	if err := s.cancelTurn(ctx); err != nil {
-		return err
-	}
-
-	if cycle == nil {
-		return nil
-	}
-
-	if err := s.awaitNativeSettlement(ctx, cycle); err != nil {
-		return err
-	}
-
-	s.cancelActions(ctx)
-
-	if err := s.commitForegroundPrefix(ctx); err != nil {
-		return err
-	}
-
-	return s.settleCycle(ctx, cycle, lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled))
+// tombstoned reports that this session's id is durably deleted. A tombstoned
+// session owns no store row: writing one would unlist a tombstone this session
+// did not create and resurrect a session already reported gone.
+func (s *session) tombstoned() bool {
+	return s.agent != nil && s.agent.isDeleted(s.id)
 }
 
 func (s *session) detachRuntime(generation uint64, cause string) {
@@ -1302,29 +1384,48 @@ func (s *session) runtimeFailure() error {
 	return acp.NewInternalError(turnFailedData(causeTransport, s.runtimeLostCause, 0, ""))
 }
 
+// DeleteNativeAndClose removes the native session and then closes this one. The
+// native deletion runs while the loopback API is still online and after this
+// session's own work has stopped; the close boundary that follows contains the
+// scope whether or not the deletion succeeded, so a refused deletion never
+// leaves a native process nobody owns.
 func (s *session) DeleteNativeAndClose(ctx context.Context) error {
+	cycle := s.currentCycle()
+
 	settleCtx, settleCancel := context.WithTimeout(context.Background(), settlementTimeout)
-	err := s.settleForShutdown(settleCtx)
+
+	err := s.cancelTurn(settleCtx)
+	if err == nil {
+		err = s.awaitNativeSettlement(settleCtx, cycle)
+	}
 
 	settleCancel()
 
+	if err == nil {
+		err = s.deleteNativeSession()
+	}
+
+	return errors.Join(err, s.Close(ctx))
+}
+
+func (s *session) deleteNativeSession() error {
 	s.mu.Lock()
 	client := s.client
 	nativeID := s.idmap.NativeSessionID
 	s.mu.Unlock()
 
-	if client != nil && nativeID != "" {
-		deleteCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		deleteErr := client.DeleteSession(deleteCtx, nativeID)
-
-		cancel()
-
-		if deleteErr != nil {
-			return errors.Join(err, fmt.Errorf("delete native OpenCode session: %w", deleteErr))
-		}
+	if client == nil || nativeID == "" {
+		return nil
 	}
 
-	return errors.Join(err, s.Close(ctx))
+	deleteCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer cancel()
+
+	if err := client.DeleteSession(deleteCtx, nativeID); err != nil {
+		return fmt.Errorf("delete native OpenCode session: %w", err)
+	}
+
+	return nil
 }
 
 func (s *session) info() acp.SessionInfo {

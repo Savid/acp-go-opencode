@@ -109,9 +109,20 @@ func dataURL(mime string, decoded []byte) string {
 type hookSessionStore struct {
 	*InMemorySessionStore
 
-	onList   func() ([]string, error)
-	onLoad   func(SessionKey) ([]SessionStoreEntry, error)
-	onDelete func(SessionKey) error
+	onList    func() ([]string, error)
+	onLoad    func(SessionKey) ([]SessionStoreEntry, error)
+	onDelete  func(SessionKey) error
+	onReplace func(SessionKey) error
+}
+
+func (s *hookSessionStore) Replace(ctx context.Context, main SessionKey, replacements []SessionStoreReplacement) error {
+	if s.onReplace != nil {
+		if err := s.onReplace(main); err != nil {
+			return err
+		}
+	}
+
+	return s.InMemorySessionStore.Replace(ctx, main, replacements)
 }
 
 func (s *hookSessionStore) ListSubkeys(ctx context.Context, key SessionKey) ([]string, error) {
@@ -316,6 +327,14 @@ func (c *fakeOpenCodeClient) Close(context.Context) error {
 }
 
 func (c *fakeOpenCodeClient) Shutdown(ctx context.Context) error { return c.Close(ctx) }
+
+// isClosed reports whether this scope's containment boundary has run.
+func (c *fakeOpenCodeClient) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.closed
+}
 
 func (c *fakeOpenCodeClient) Scope(_ context.Context, options opencode.ScopeOptions) (opencode.Client, error) {
 	c.mu.Lock()

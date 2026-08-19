@@ -1600,30 +1600,115 @@ func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
 
 // TestCloseSessionRefusesWithoutADurableSnapshot proves close is store-backed:
 // a session whose snapshot cannot be committed stays addressable for a retry
-// rather than being released with state no reload could restore.
+// rather than being released with state no reload could restore. The commit is
+// the last rung of the ladder, so a store that is offline never costs the
+// containment proof that runs ahead of it.
 func TestCloseSessionRefusesWithoutADurableSnapshot(t *testing.T) {
+	client := newFakeOpenCodeClient()
 	agent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("store offline")}))
-	current := testSession(t, agent, newFakeOpenCodeClient())
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 
 	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
 	require.ErrorContains(t, err, "store offline")
+	require.True(t, client.isClosed(), "an uncommittable snapshot skipped the containment boundary")
 	require.Contains(t, agent.sessions, current.id, "the session was released without a durable snapshot")
 }
 
-// TestDeleteSessionKeepsTheHandleWhenNativeTeardownFails proves the durable
-// tombstone is published only after native deletion and containment succeed: a
-// refused interrupt leaves the handle addressable instead of reporting a deletion
-// whose native state survived.
-func TestDeleteSessionKeepsTheHandleWhenNativeTeardownFails(t *testing.T) {
+// TestDeleteHidesTheSessionEvenWhenTeardownFails proves the delete order: the
+// durable tombstone is written first and the id is hidden with it, so a teardown
+// that fails afterwards is reported to the caller without leaving a session that
+// delete already answered for still listable, loadable, or resumable.
+func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
+	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	client.abortErr = errors.New("harness refused the interrupt")
-	agent := NewAgent()
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithSessionStore(store))
 	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
+	require.NoError(t, current.snapshotToStore(ctx))
 
-	_, err := agent.UnstableDeleteSession(context.Background(), DeleteSessionRequest(current.id))
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
 	require.ErrorContains(t, err, "harness refused the interrupt")
-	require.Contains(t, agent.sessions, current.id, "a session whose native teardown failed was forgotten")
-	require.False(t, agent.isDeleted(current.id), "a tombstone was published for an uncontained session")
+	require.True(t, agent.isDeleted(current.id), "a failed teardown left the deleted id addressable")
+	require.NotContains(t, agent.sessions, current.id)
+
+	listed, err := agent.ListSessions(ctx, ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, listed.Sessions, "a deleted session was still listable")
+
+	stored, err := store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the tombstone was cleared by the failed teardown")
+
+	_, err = agent.LoadSession(ctx, LoadSessionRequest(current.id, t.TempDir()))
+	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+
+	// Delete is idempotent: the second one answers for a session that is
+	// already gone without touching anything.
+	_, err = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.NoError(t, err)
+}
+
+// TestACommitRacingASucceededDeleteRecreatesNothing proves the write barrier a
+// late settlement meets: a turn that was still in flight when delete tombstoned
+// the id commits nothing afterwards, because a replacement unlists the tombstone
+// for every key it writes.
+func TestACommitRacingASucceededDeleteRecreatesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithSessionStore(store))
+	current := testSession(t, agent, newFakeOpenCodeClient())
+	agent.sessions[current.id] = current
+	require.NoError(t, current.snapshotToStore(ctx))
+
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.NoError(t, err)
+
+	require.NoError(t, current.commitForegroundPrefix(ctx))
+
+	stored, err := store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "a settlement after the delete recreated the row")
+}
+
+// TestDeleteLeavesNoWriteThatRecreatesTheRow proves the tombstone survives the
+// teardown it precedes: the settlement that follows a successful delete writes
+// nothing, because a replacement unlists the tombstone for every key it writes
+// and would resurrect a session already reported gone.
+func TestDeleteLeavesNoWriteThatRecreatesTheRow(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := NewAgent(WithSessionStore(store))
+	current := testSession(t, agent, client)
+	agent.sessions[current.id] = current
+	require.NoError(t, current.snapshotToStore(ctx))
+
+	openTestCycle(current, true)
+
+	var wroteAfterTombstone bool
+
+	store.onDelete = func(key SessionKey) error {
+		store.onReplace = func(SessionKey) error {
+			wroteAfterTombstone = true
+
+			return nil
+		}
+
+		return store.InMemorySessionStore.Delete(ctx, key)
+	}
+
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.NoError(t, err)
+	require.False(t, wroteAfterTombstone, "a write after the tombstone recreated the deleted row")
+
+	stored, err := store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the deleted session is listable again")
+
+	entries, err := store.Load(ctx, SessionKey{SessionID: string(current.id)})
+	require.NoError(t, err)
+	require.Empty(t, entries, "the deleted session's row was recreated")
 }

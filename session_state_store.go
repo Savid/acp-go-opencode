@@ -367,6 +367,14 @@ func (s *session) commitStateSnapshot(ctx context.Context, captured capturedStat
 		return nil
 	}
 
+	// A tombstoned session writes nothing. A replacement unlists the tombstone
+	// for every key it writes, so a settlement racing the delete that already
+	// succeeded would recreate the row and make a deleted session listable and
+	// loadable again.
+	if s.tombstoned() {
+		return nil
+	}
+
 	storeCtx, cancel := context.WithTimeout(ctx, sessionStateReplaceTimeout)
 	defer cancel()
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 
 	"github.com/coder/acp-go-sdk"
@@ -194,12 +195,19 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 	require.NoError(t, current.ensureNotPoisoned())
 	require.ErrorContains(t, current.runtimeFailure(), "runtime exited")
 
+	// A session whose binding is already gone has no native session to delete,
+	// so deletion is the containment boundary alone.
+	current.mu.Lock()
+	current.client = nil
+	current.mu.Unlock()
+	require.NoError(t, current.DeleteNativeAndClose(context.Background()))
+
 	client = newFakeOpenCodeClient()
 	client.deleteErr = errors.New("delete failed")
 	current = testSession(t, agent, client)
 	require.ErrorContains(t, current.DeleteNativeAndClose(context.Background()), "delete failed")
 	require.NotEmpty(t, client.deleted)
-	require.False(t, client.closed, "failed native deletion must remain retryable")
+	require.True(t, client.isClosed(), "a refused native deletion left the scope uncontained")
 
 	require.Equal(t, "fallback", firstNonEmpty("", "fallback"))
 	provider, model := splitModelValue("malformed", "provider", "fallback")
@@ -310,27 +318,47 @@ func TestCloneAvailableCommandsKeepsTheAbsentCatalogAbsent(t *testing.T) {
 	require.Equal(t, []acp.AvailableCommand{}, cloneAvailableCommands([]acp.AvailableCommand{}))
 }
 
-// TestSettleForShutdownStopsAtTheFirstUnprovenStep proves the close and delete
-// boundary is a ladder: the interrupt, its native acknowledgement, and the
-// native-safe prefix each have to succeed before the session may report its work
-// over, and a rung that fails stops the ladder there.
-func TestSettleForShutdownStopsAtTheFirstUnprovenStep(t *testing.T) {
-	t.Parallel()
+// openTestCycle installs one foreground cycle on a session, optionally already
+// holding its native terminal evidence.
+func openTestCycle(current *session, terminal bool) *foregroundCycle {
+	cycle := &foregroundCycle{id: "cycle-1", turnID: "turn-1", blockers: map[string]struct{}{}, signal: make(chan struct{})}
+	if terminal {
+		cycle.idle = true
 
-	openCycle := func(current *session, terminal bool) *foregroundCycle {
-		cycle := &foregroundCycle{id: "cycle-1", turnID: "turn-1", blockers: map[string]struct{}{}, signal: make(chan struct{})}
-		if terminal {
-			cycle.idle = true
-
-			close(cycle.signal)
-		}
-
-		current.lifecycleMu.Lock()
-		current.cycle = cycle
-		current.lifecycleMu.Unlock()
-
-		return cycle
+		close(cycle.signal)
 	}
+
+	current.lifecycleMu.Lock()
+	current.cycle = cycle
+	current.lifecycleMu.Unlock()
+
+	return cycle
+}
+
+// acceptTestTurn opens one prompt-origin turn on the session's own stream and
+// hands it the native terminal evidence a settled turn holds, so a close can
+// report it over without a live harness.
+func acceptTestTurn(t *testing.T, current *session) *foregroundCycle {
+	t.Helper()
+
+	cycle, err := current.acceptPromptCycle(context.Background(),
+		lifecycle.Submission{SubmissionID: "submission-1", ClientNonce: "nonce-1"})
+	require.NoError(t, err)
+
+	current.lifecycleMu.Lock()
+	cycle.idle = true
+	cycle.wake()
+	current.lifecycleMu.Unlock()
+
+	return cycle
+}
+
+// TestCloseStopsAtTheFirstUnprovenStep proves the close and delete boundary is a
+// ladder: the interrupt and its native acknowledgement have to succeed before
+// the session is contained, and a rung that fails stops the ladder there with
+// the native scope untouched.
+func TestCloseStopsAtTheFirstUnprovenStep(t *testing.T) {
+	t.Parallel()
 
 	t.Run("refused interrupt", func(t *testing.T) {
 		t.Parallel()
@@ -339,36 +367,112 @@ func TestSettleForShutdownStopsAtTheFirstUnprovenStep(t *testing.T) {
 		client.abortErr = errors.New("harness refused the interrupt")
 		current := testSession(t, NewAgent(), client)
 		current.stopPump()
-		openCycle(current, false)
+		openTestCycle(current, false)
 
-		require.ErrorContains(t, current.settleForShutdown(context.Background()), "harness refused the interrupt")
+		require.ErrorContains(t, current.Close(context.Background()), "harness refused the interrupt")
+		require.False(t, client.isClosed(), "the scope was contained on an unproven interrupt")
 	})
 
 	t.Run("unacknowledged interrupt", func(t *testing.T) {
 		t.Parallel()
 
-		current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		client := newFakeOpenCodeClient()
+		current := testSession(t, NewAgent(), client)
 		current.stopPump()
-		cycle := openCycle(current, false)
+		cycle := openTestCycle(current, false)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 		defer cancel()
 
-		require.ErrorContains(t, current.settleForShutdown(ctx), "did not report idle after the interrupt")
+		_, _, err := current.settleBeforeContainment(ctx, true)
+		require.ErrorContains(t, err, "did not report idle after the interrupt")
 		require.False(t, cycle.settled, "an unacknowledged cycle was reported settled")
+		require.False(t, client.isClosed(), "the scope was contained on an unacknowledged interrupt")
 	})
+}
 
-	t.Run("uncommittable prefix", func(t *testing.T) {
-		t.Parallel()
+// TestCloseCommitsOnlyAfterTheContainmentProof proves the close ladder's order:
+// the resumable snapshot is read while the loopback API can still answer, but it
+// is written only once this session's native scope is proven contained, and the
+// turn's terminal transition follows that durable write.
+func TestCloseCommitsOnlyAfterTheContainmentProof(t *testing.T) {
+	t.Parallel()
 
-		store := &errorSessionStore{err: errors.New("store offline")}
-		current := testSession(t, NewAgent(WithSessionStore(store)), newFakeOpenCodeClient())
-		current.stopPump()
-		cycle := openCycle(current, true)
+	client := newFakeOpenCodeClient()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
 
-		require.ErrorContains(t, current.settleForShutdown(context.Background()), "store offline")
-		require.False(t, cycle.settled, "a cycle whose prefix is unbacked was reported settled")
-	})
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptTestTurn(t, current)
+
+	var before, after int
+
+	store.onReplace = func(SessionKey) error {
+		if client.isClosed() {
+			after++
+		} else {
+			before++
+		}
+
+		return nil
+	}
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.NoError(t, err)
+	require.Zero(t, before, "the close boundary committed before it had proved containment")
+	require.Positive(t, after, "the close boundary committed nothing after its containment proof")
+	require.True(t, cycle.settled, "the contained session never reported its turn over")
+	requireLifecycleOutcome(t, connection, lifecycle.OutcomeCancelled)
+	require.NotContains(t, agent.sessions, current.id)
+}
+
+// TestCloseFencesTheStreamOnAnIncompleteContainment proves the failing branch of
+// the same boundary: a containment that does not complete terminalizes nothing,
+// commits nothing new, answers with the containment error, and still fences the
+// stream, because the incarnation behind it is one this session can no longer
+// speak for.
+func TestCloseFencesTheStreamOnAnIncompleteContainment(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	client.closeErr = errors.Join(errors.New("close failed"), opencode.ErrProcessContainmentIncomplete)
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptTestTurn(t, current)
+
+	var committed bool
+
+	store.onReplace = func(SessionKey) error {
+		committed = true
+
+		return nil
+	}
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.False(t, committed, "an unproven containment committed a resumable snapshot anyway")
+	require.False(t, cycle.settled, "an unproven containment terminalized the turn anyway")
+
+	for _, transition := range connection.lifecycleEventsOfType(t, "state_update") {
+		require.NotEqual(t, "idle", transition["state"], "an unproven containment ended the turn on the stream")
+	}
+
+	require.ErrorContains(t, current.lifecycleFailure(), "session closed")
+	require.Contains(t, agent.sessions, current.id, "the session was released without a containment proof")
 }
 
 // TestRecoveryWithoutACommittedGenerationRefusesThePrompt proves recovery is

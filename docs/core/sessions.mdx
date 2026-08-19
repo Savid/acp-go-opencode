@@ -63,9 +63,26 @@ extension for fork:
 - `session/load` — recreate a stored session and replay its history.
 - `session/resume` — restore a stored session without replaying history.
 - `session/list` — enumerate stored sessions.
-- `session/close` — end a session and take a final snapshot.
+- `session/close` — end a session at its containment boundary and commit the
+  final snapshot.
 - `session/delete` — remove a stored session, leaving a tombstone.
 - `_opencode/session/fork` — branch a session's native state into a new session.
+
+`session/close` is a ladder and runs in one order: the session's native work is
+interrupted and acknowledged, the state a reload restores from is read while the
+loopback API can still answer it, the session's native scope is proven
+contained, and only then is that state committed and the open turn reported
+over. A containment that does not complete commits nothing new, ends no turn on
+the stream, and answers with the containment error, leaving the handle
+addressable for a retry. Either way the session's lifecycle stream is fenced:
+nothing is emitted on it again.
+
+`session/delete` writes its durable tombstone first and hides the id with it, so
+a teardown that fails afterwards is reported to the caller without leaving the
+session listable, loadable, or resumable. A settlement still in flight when the
+tombstone lands commits nothing, because a store write would unlist the
+tombstone and resurrect a session already reported gone. Deleting an unknown or
+already-deleted session succeeds silently.
 
 New, load, resume, and fork publish two notifications after their own response
 has been written to the transport: the session's opening lifecycle snapshot,

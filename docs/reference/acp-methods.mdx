@@ -19,8 +19,8 @@ extension. This page lists each method and its behavior.
 | `session/list` | Enumerate stored sessions. Pages carry an opaque base64 cursor; a cursor past the end is invalid params. |
 | `session/prompt` | Run a prompt turn; requires route version 1 and a fresh turn nonce. |
 | `session/cancel` | Cancel only the running turn whose nonce exactly matches. |
-| `session/close` | End the session and take a final snapshot. |
-| `session/delete` | Remove a stored session, leaving a tombstone. |
+| `session/close` | Prove the session's native scope contained, then commit its final snapshot. |
+| `session/delete` | Write the tombstone first, hide the id, then tear the session down. |
 | `session/set_config_option` | Change the `model` or `mode` option live. |
 
 ## Extensions and unsupported methods
