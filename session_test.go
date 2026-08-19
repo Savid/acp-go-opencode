@@ -462,12 +462,13 @@ func TestCloseCommitsOnlyAfterTheContainmentProof(t *testing.T) {
 	require.NotContains(t, agent.sessions, current.id)
 }
 
-// TestCloseFencesTheStreamOnAnIncompleteContainment proves the failing branch of
-// the same boundary: a containment that does not complete terminalizes nothing,
-// commits nothing new, answers with the containment error, and still fences the
-// stream, because the incarnation behind it is one this session can no longer
-// speak for.
-func TestCloseFencesTheStreamOnAnIncompleteContainment(t *testing.T) {
+// TestCloseLeavesTheStreamUnfencedOnAnIncompleteContainment proves the failing
+// branch of the same boundary: a containment that does not complete terminalizes
+// nothing, commits nothing new, answers with the containment error — and installs
+// no fence, because the fence is the successful boundary's own mark. A failed
+// close that fenced would leave its own mark behind as the terminal evidence the
+// harness never gave, and the next boundary would read it as one.
+func TestCloseLeavesTheStreamUnfencedOnAnIncompleteContainment(t *testing.T) {
 	t.Parallel()
 
 	client := newFakeOpenCodeClient()
@@ -501,7 +502,8 @@ func TestCloseFencesTheStreamOnAnIncompleteContainment(t *testing.T) {
 		require.NotEqual(t, "idle", transition["state"], "an unproven containment ended the turn on the stream")
 	}
 
-	require.ErrorContains(t, current.lifecycleFailure(), "session closed")
+	require.False(t, lifecycleFenced(current), "a failed boundary fenced the incarnation it proved nothing about")
+	require.NoError(t, current.lifecycleFailure(), "a failed boundary latched the stream it said nothing on")
 	require.Contains(t, agent.sessions, current.id, "the session was released without a containment proof")
 }
 
@@ -848,4 +850,139 @@ func TestCloseFailsOnACaptureItCannotRead(t *testing.T) {
 	require.ErrorContains(t, err, "sync history unavailable")
 	require.False(t, client.isClosed(), "an unreadable capture contained the session anyway")
 	require.Contains(t, agent.sessions, current.id, "the session was released without a durable capture")
+}
+
+// TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung proves the retry
+// contract of a boundary that failed. A close whose durable rung the store
+// refused proved nothing: it terminalized nothing, fenced nothing, and released
+// nothing, so the session stays addressable and the next close re-runs every rung
+// the failed one owed — including the commit, against a store that has healed.
+// A retry that answered success over a generation nobody wrote would report a
+// boundary no one completed.
+func TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptTestTurn(t, current)
+
+	var commits int
+
+	store.onReplace = func(SessionKey) error {
+		commits++
+
+		return errors.New("store refused the resumable commit")
+	}
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorContains(t, err, "store refused the resumable commit")
+	require.Equal(t, 1, commits)
+	require.False(t, cycle.settled, "a boundary that committed nothing terminalized the turn anyway")
+	require.False(t, lifecycleFenced(current), "a boundary that committed nothing fenced the stream anyway")
+	require.Contains(t, agent.sessions, current.id, "a failed boundary released the session")
+
+	entries, loadErr := store.Load(context.Background(), SessionKey{SessionID: string(current.id)})
+	require.NoError(t, loadErr)
+	require.Empty(t, entries, "a refused commit landed a generation anyway")
+
+	store.onReplace = func(SessionKey) error {
+		commits++
+
+		return nil
+	}
+
+	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.NoError(t, err)
+	require.Equal(t, 2, commits, "the retry answered success without re-running the durable rung")
+	require.True(t, cycle.settled, "the completed retry never terminalized the turn")
+	require.True(t, lifecycleFenced(current), "the completed boundary left the incarnation unfenced")
+	require.NotContains(t, agent.sessions, current.id, "the completed boundary kept the session addressable")
+
+	entries, loadErr = store.Load(context.Background(), SessionKey{SessionID: string(current.id)})
+	require.NoError(t, loadErr)
+	require.NotEmpty(t, entries, "the retry reported success with no durable commit")
+
+	idle := connection.lifecycleEventsOfType(t, "state_update")
+	require.NotEmpty(t, idle)
+	require.Equal(t, "idle", idle[len(idle)-1]["state"], "the completed retry never emitted the terminal transition")
+}
+
+// TestAFailedCloseLaundersNoUnprovenStop proves the fence is the successful
+// boundary's own mark. A harness that refuses the interrupt leaves the stop
+// unproved, so the close fails classified against the containment sentinel — and
+// installs no fence, because a fence here would be read by the next boundary as
+// the terminal evidence the harness never gave. The retry and the delete that
+// follows both fail on the same unproved stop, and nothing is deleted natively
+// over work still running.
+func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	client.abortErr = errors.New("harness refused the interrupt")
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptTestTurn(t, current)
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorContains(t, err, "harness refused the interrupt")
+	require.False(t, lifecycleFenced(current), "the failed close fenced the incarnation it proved nothing about")
+	require.NoError(t, current.lifecycleFailure(), "the failed close latched a stream it said nothing on")
+	require.False(t, client.isClosed(), "an unproved stop contained the scope anyway")
+
+	// The very same unproved stop is presented to the boundary again. Nothing
+	// this close left behind may answer for it.
+	require.Error(t, current.awaitCloseSettlement(context.Background(), cycle),
+		"the failed close turned a refused interrupt into accepted terminal evidence")
+
+	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+
+	_, err = agent.UnstableDeleteSession(context.Background(), DeleteSessionRequest(current.id))
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.Empty(t, client.deleted, "delete removed native state over a stop nobody proved")
+}
+
+// TestDeleteOnAFencedIncarnationSettlesBothBoundaries proves the real fenced path
+// still settles. An incarnation the runtime lost fenced its own stream and woke
+// its cycle with that loss, which is terminal evidence rather than an unproved
+// stop: the delete boundary reads it, contains what is left, and answers.
+func TestDeleteOnAFencedIncarnationSettlesBothBoundaries(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	agent.setAgentClient(newRecordingAgentClient())
+	current := testSession(t, agent, client)
+
+	agent.mu.Lock()
+	agent.sessions[current.id] = current
+	agent.mu.Unlock()
+
+	cycle := acceptOpenTestTurn(t, current)
+	current.detachRuntime(testRuntimeGeneration(current), "shared OpenCode runtime exited")
+	require.Error(t, cycle.lost)
+	require.True(t, lifecycleFenced(current))
+
+	_, err := agent.UnstableDeleteSession(context.Background(), DeleteSessionRequest(current.id))
+	require.NoError(t, err, "a fenced incarnation failed the delete boundary")
+	require.True(t, agent.isDeleted(current.id))
 }

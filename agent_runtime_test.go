@@ -577,8 +577,11 @@ func TestDirectoryScopeCloseFailureQuarantinesWithoutRelease(t *testing.T) {
 	require.Zero(t, releases)
 	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrMCPDisconnectUnproven)
 
+	// The session boundary answered with the containment sentinel, so the
+	// quarantined configuration now carries it and the Agent's own shutdown
+	// reports it rather than swallowing an unproven containment on the way out.
 	client.closeErr = nil
-	require.NoError(t, agent.Close())
+	require.ErrorIs(t, agent.Close(), opencode.ErrProcessContainmentIncomplete)
 }
 
 func TestDirectoryBindingIncarnationSkipsZeroAfterWrap(t *testing.T) {

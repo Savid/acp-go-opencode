@@ -109,6 +109,20 @@ type session struct {
 	runtimeLostCause        string
 	runtimeGeneration       uint64
 	closed                  bool
+	// retainedCapture holds the generation a close boundary read before it
+	// contained the native scope. The capture needs the loopback API and the
+	// containment proof takes it away, so a boundary that fails after the
+	// capture could never read it again: the material a still-owed commit needs
+	// is retained rather than destroyed with the scope, and the retry commits
+	// exactly what this capture read.
+	retainedCapture *capturedStateSnapshot
+	// boundarySettled records that a close boundary ran to completion: the
+	// containment proof passed, the durable rung it owed committed, and the
+	// terminal transition was made. It is deliberately not `closed`, which
+	// latches at ladder step 1 so no further prompt is admitted. A close that
+	// failed a rung has stopped admitting work but has proved nothing, so it
+	// leaves this false and the next close re-runs the whole boundary.
+	boundarySettled bool
 }
 
 type sessionSnapshot struct {
@@ -568,6 +582,11 @@ func (s *session) awaitNativeSettlement(ctx context.Context, cycle *foregroundCy
 // loss and it does not settle the boundary — it stops the ladder exactly where a
 // cycle that never reported at all does, rather than letting close report the turn
 // cancelled and the session idle over native work still running.
+//
+// Reading the fence is only sound because a failed boundary never installs one.
+// A close that fenced on its way out would leave the next boundary — a retry, or
+// the delete that follows — reading its own predecessor's mark as the terminal
+// evidence the harness never gave, and deleting natively over work still running.
 func (s *session) awaitCloseSettlement(ctx context.Context, cycle *foregroundCycle) error {
 	err := s.awaitNativeSettlement(ctx, cycle)
 	if err == nil {
@@ -995,32 +1014,41 @@ func validSlashCommandName(name string) bool {
 // can never skip the ladder, and no step touches a peer session or the shared
 // runtime.
 //
-// The stream is fenced on both branches. A boundary that completed has said
-// everything this incarnation will ever say, and a boundary that did not leaves
-// an incarnation this session can no longer speak for; either way nothing may be
-// emitted on it again.
+// Only a boundary that completed fences the stream. The fence is the successful
+// boundary's own mark — it says this incarnation has said everything it will
+// ever say — and a boundary that terminalizes nothing and states nothing has not
+// earned it. Fencing on the failure path would let the next boundary read this
+// one's mark as the terminal evidence a refused native interrupt never produced.
 func (s *session) Close(_ context.Context) error {
 	return s.closeSession(false)
 }
 
-// CloseAndCommit is the ACP close boundary. It runs the same ladder and, on a
-// containment that completed, additionally commits the state a later load or
-// resume restores this conversation from. Every other caller closes without that
-// commit: an agent shutting down, a rollback of a session that never finished
-// starting, and a delete that has already tombstoned the id each owe a host no
-// resumable generation.
+// CloseAndCommit is the close boundary that owes a resumable generation. It runs
+// the same ladder and, on a containment that completed, additionally commits the
+// state a later load or resume restores this conversation from. Agent.Close runs
+// it too: the durable rung travels with the ladder, and an embedded shutdown
+// dropping state a wire close would have committed is the same lost generation
+// however the process ended. Close without the commit belongs to the two callers
+// that owe a host no generation at all: a rollback of a session that never
+// finished starting, and a delete that has already tombstoned the id.
 func (s *session) CloseAndCommit(_ context.Context) error {
 	return s.closeSession(true)
 }
 
+// closeSession runs the boundary once and answers for it. The retry contract is
+// the whole point of the two flags it reads: `closed` latches at ladder step 1,
+// so a failed close still admits no further prompt, while `boundarySettled`
+// latches only after every rung completed. A close that failed a rung therefore
+// leaves the session retryable, and the retry re-runs the ladder from the top —
+// capture, containment, durable commit, terminal transition — because a boundary
+// that proved nothing owes all of it. Only the settled boundary fences.
 func (s *session) closeSession(commitResumable bool) error {
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
 
 	s.mu.Lock()
 
-	firstClose := !s.closed
-	if !firstClose && s.directoryRelease == nil {
+	if s.boundarySettled {
 		s.mu.Unlock()
 
 		return nil
@@ -1029,11 +1057,17 @@ func (s *session) closeSession(commitResumable bool) error {
 	s.closed = true
 	s.mu.Unlock()
 
-	err := s.closeBoundary(firstClose, commitResumable)
+	if err := s.closeBoundary(commitResumable); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.boundarySettled = true
+	s.mu.Unlock()
 
 	s.fenceLifecycle("session closed")
 
-	return err
+	return nil
 }
 
 // closeBoundary runs the close ladder in the one order it has: this session's
@@ -1047,23 +1081,16 @@ func (s *session) closeSession(commitResumable bool) error {
 //
 // The containment proof and the durable commit are unconditional; only the
 // terminal transition is a stream rung, and it is emitted only while this session
-// still speaks for a live incarnation.
-func (s *session) closeBoundary(firstClose bool, commitResumable bool) error {
-	var (
-		cycle    *foregroundCycle
-		captured capturedStateSnapshot
-		err      error
-	)
+// still speaks for a live incarnation. Every rung is re-run by a retry, because a
+// boundary that answered with an error proved none of them.
+func (s *session) closeBoundary(commitResumable bool) error {
+	settleCtx, settleCancel := context.WithTimeout(context.Background(), settlementTimeout)
+	cycle, captured, err := s.settleBeforeContainment(settleCtx, commitResumable)
 
-	if firstClose {
-		settleCtx, settleCancel := context.WithTimeout(context.Background(), settlementTimeout)
-		cycle, captured, err = s.settleBeforeContainment(settleCtx, commitResumable)
+	settleCancel()
 
-		settleCancel()
-
-		if err != nil {
-			return err
-		}
+	if err != nil {
+		return err
 	}
 
 	// Pending provider-auth flows are cancelled after pending elicitation is
@@ -1080,16 +1107,18 @@ func (s *session) closeBoundary(firstClose bool, commitResumable bool) error {
 		return err
 	}
 
-	if !firstClose {
-		return nil
-	}
-
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer commitCancel()
 
 	if err := s.commitStateSnapshot(commitCtx, captured); err != nil {
 		return err
 	}
+
+	// The generation is durable, so the boundary owes it nothing further and the
+	// retained copy is released.
+	s.mu.Lock()
+	s.retainedCapture = nil
+	s.mu.Unlock()
 
 	return s.settleCloseCycle(commitCtx, cycle)
 }
@@ -1111,11 +1140,11 @@ func (s *session) settleBeforeContainment(
 	cycle := s.currentCycle()
 
 	if err := s.cancelTurn(ctx); err != nil {
-		return nil, capturedStateSnapshot{}, err
+		return nil, capturedStateSnapshot{}, containmentFailure(err)
 	}
 
 	if err := s.awaitCloseSettlement(ctx, cycle); err != nil {
-		return nil, capturedStateSnapshot{}, err
+		return nil, capturedStateSnapshot{}, containmentFailure(err)
 	}
 
 	// Every pending action is answered while OpenCode can still receive the
@@ -1128,12 +1157,41 @@ func (s *session) settleBeforeContainment(
 	}
 
 	s.mu.Lock()
+	retained := s.retainedCapture
+	s.mu.Unlock()
+
+	if retained != nil {
+		return cycle, *retained, nil
+	}
+
+	s.mu.Lock()
 	s.activeMessageIDs = map[string]struct{}{}
 	s.mu.Unlock()
 
 	captured, err := s.captureStateSnapshot(ctx, true)
+	if err != nil {
+		return cycle, capturedStateSnapshot{}, err
+	}
 
-	return cycle, captured, err
+	s.mu.Lock()
+	s.retainedCapture = &captured
+	s.mu.Unlock()
+
+	return cycle, captured, nil
+}
+
+// containmentFailure marks a close-boundary error whose subject is the
+// containment proof itself: the native interrupt was refused, the stop was never
+// proved, or the native scope would not close. The boundary answers those with
+// the sentinel a host tests for, and never with a bare transport error that
+// reads like an ordinary failure. An error already carrying the sentinel is
+// returned as it is, so the classification never nests.
+func containmentFailure(err error) error {
+	if err == nil || errors.Is(err, opencode.ErrProcessContainmentIncomplete) {
+		return err
+	}
+
+	return errors.Join(opencode.ErrProcessContainmentIncomplete, err)
 }
 
 // containNativeScope proves this session's native scope gone: the pump stops
@@ -1156,7 +1214,7 @@ func (s *session) containNativeScope() error {
 		closeCancel()
 
 		if err != nil {
-			return err
+			return containmentFailure(err)
 		}
 	}
 
