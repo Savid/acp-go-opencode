@@ -184,13 +184,6 @@ func ActionEvent(action ActionUpdate) Event {
 	return Event{Type: EventActionUpdate, Action: &action}
 }
 
-// ActivityUpdateEvent reports one activity. This adapter proves no activity kind,
-// so nothing here emits one; the constructor exists because the same package
-// validates streams it reads.
-func ActivityUpdateEvent(activity ActivityUpdate) Event {
-	return Event{Type: EventActivityUpdate, Activity: &activity}
-}
-
 // QuiescenceEvent states the authoritative quiescence fact a completed proof
 // produced. It carries the proof class and the watermark that proof covers, never
 // a guess, a heuristic, or a confidence.

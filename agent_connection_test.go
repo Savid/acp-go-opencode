@@ -294,11 +294,11 @@ func TestCommandCatalogFollowsTheResponseAndTurnUpdatesCarryExactRoute(t *testin
 		partID := fmt.Sprintf("part-%d", turn)
 		streamed := fmt.Sprintf("stream-%d", turn)
 		nativeClient.events <- opencode.Event{
-			Type:       eventMessageUpdated,
+			Type:       opencode.EventMessageUpdated,
 			Properties: json.RawMessage(fmt.Sprintf(`{"info":{"id":%q,"sessionID":%q,"role":"assistant"}}`, messageID, id)),
 		}
 		nativeClient.events <- opencode.Event{
-			Type: eventMessagePartCreated,
+			Type: opencode.EventMessagePartCreated,
 			Properties: json.RawMessage(fmt.Sprintf(
 				`{"id":%q,"sessionID":%q,"messageID":%q,"type":"text","text":%q}`,
 				partID, id, messageID, streamed,

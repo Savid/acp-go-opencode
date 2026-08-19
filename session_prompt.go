@@ -21,16 +21,6 @@ import (
 )
 
 const (
-	eventServerConnected    = "server.connected"
-	eventPermissionV2Asked  = "permission.v2.asked"
-	eventPermissionAsked    = "permission.asked"
-	eventMessagePartCreated = "message.part.created"
-	eventMessagePartUpdated = "message.part.updated"
-	eventMessageUpdated     = "message.updated"
-	eventSessionError       = "session.error"
-	eventQuestionAsked      = "question.asked"
-	eventQuestionV2Asked    = "question.v2.asked"
-
 	fieldPrompt         = "prompt"
 	fieldPromptResource = "prompt.resource"
 
@@ -41,7 +31,6 @@ const (
 	partTypeFile            = "file"
 	partTypeTool            = "tool"
 	partTypeStepFinish      = "step-finish"
-	contentTypeAudio        = "audio"
 	mediaTypeImage          = "image"
 	roleUser                = "user"
 	roleAssistant           = "assistant"

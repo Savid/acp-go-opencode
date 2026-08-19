@@ -287,13 +287,13 @@ func TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire(t *testing.
 			State:     json.RawMessage(`{"status":"pending"}`),
 		})
 		require.NoError(t, session.applyNativeEvent(turnCtx, opencode.Event{
-			Type: eventMessagePartCreated, Properties: properties,
+			Type: opencode.EventMessagePartCreated, Properties: properties,
 		}))
 	}
 
 	emitToolStart("permission-tool")
 	require.NoError(t, session.applyNativeEvent(turnCtx, opencode.Event{
-		Type: eventPermissionV2Asked,
+		Type: opencode.EventPermissionV2Asked,
 		Properties: json.RawMessage(
 			`{"id":"permission-1","sessionID":"native-1","action":"edit","tool":{"callID":"permission-tool"}}`,
 		),
@@ -301,7 +301,7 @@ func TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire(t *testing.
 
 	emitToolStart("question-tool")
 	require.NoError(t, session.applyNativeEvent(turnCtx, opencode.Event{
-		Type: eventQuestionV2Asked,
+		Type: opencode.EventQuestionV2Asked,
 		Properties: json.RawMessage(
 			`{"id":"question-1","sessionID":"native-1","tool":{"callID":"question-tool"},"questions":[{"question":"Proceed?"}]}`,
 		),
@@ -323,7 +323,7 @@ func TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire(t *testing.
 	wireClient.mu.Unlock()
 
 	err = session.applyNativeEvent(turnCtx, opencode.Event{
-		Type: eventQuestionV2Asked,
+		Type: opencode.EventQuestionV2Asked,
 		Properties: json.RawMessage(
 			`{"id":"question-stale","sessionID":"native-1","tool":{"callID":"not-published"},"questions":[{"question":"Proceed?"}]}`,
 		),
@@ -725,7 +725,7 @@ func TestLiveUserMessagePartsAreNotEchoed(t *testing.T) {
 	// The native stream declares the user message (wrapped payload) before its
 	// part events; the prompt echo must not stream back as an agent chunk.
 	if err := session.applyNativeEvent(ctx, opencode.Event{
-		Type:       eventMessageUpdated,
+		Type:       opencode.EventMessageUpdated,
 		Properties: json.RawMessage(`{"info":{"id":"user-1","sessionID":"native-1","role":"user"}}`),
 	}); err != nil {
 		t.Fatalf("message.updated event: %v", err)
@@ -742,7 +742,7 @@ func TestLiveUserMessagePartsAreNotEchoed(t *testing.T) {
 
 	// Bare (unwrapped) message.updated payloads are also recognized.
 	if err := session.applyNativeEvent(ctx, opencode.Event{
-		Type:       eventMessageUpdated,
+		Type:       opencode.EventMessageUpdated,
 		Properties: json.RawMessage(`{"id":"user-2","sessionID":"native-1","role":"user"}`),
 	}); err != nil {
 		t.Fatalf("bare message.updated event: %v", err)
@@ -759,7 +759,7 @@ func TestLiveUserMessagePartsAreNotEchoed(t *testing.T) {
 
 	// Assistant parts (role declared or unknown) still stream.
 	if err := session.applyNativeEvent(ctx, opencode.Event{
-		Type:       eventMessageUpdated,
+		Type:       opencode.EventMessageUpdated,
 		Properties: json.RawMessage(`{"info":{"id":"asst-1","sessionID":"native-1","role":"assistant"}}`),
 	}); err != nil {
 		t.Fatalf("assistant message.updated event: %v", err)
@@ -789,7 +789,7 @@ func TestLiveUserMessagePartsAreNotEchoed(t *testing.T) {
 		`not json`,
 	} {
 		if err := session.applyNativeEvent(ctx, opencode.Event{
-			Type:       eventMessageUpdated,
+			Type:       opencode.EventMessageUpdated,
 			Properties: json.RawMessage(properties),
 		}); err != nil {
 			t.Fatalf("message.updated %q: %v", properties, err)
@@ -2796,14 +2796,14 @@ func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 	}
 
 	client.events <- opencode.Event{
-		Type: eventSessionError,
+		Type: opencode.EventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: "foreign-session",
 			Error:     providerNativeError("foreign failure", 400, "foreign"),
 		}),
 	}
 	client.events <- opencode.Event{
-		Type: eventSessionError,
+		Type: opencode.EventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: session.idmap.NativeSessionID,
 			Error:     providerNativeError("model rejected", 400, "invalid_model"),
@@ -2863,7 +2863,7 @@ func TestPromptCancellationWinsSessionErrorEvent(t *testing.T) {
 	}()
 	<-dispatched
 	client.events <- opencode.Event{
-		Type: eventSessionError,
+		Type: opencode.EventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: session.idmap.NativeSessionID,
 			Error:     providerNativeError("cancelled provider error", 400, "cancelled"),
@@ -2879,7 +2879,7 @@ func TestPromptCancellationWinsSessionErrorEvent(t *testing.T) {
 
 func TestSessionErrorEventRejectsMalformedProperties(t *testing.T) {
 	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
-	err := session.applyNativeEvent(context.Background(), opencode.Event{Type: eventSessionError, Properties: json.RawMessage(`{`)})
+	err := session.applyNativeEvent(context.Background(), opencode.Event{Type: opencode.EventSessionError, Properties: json.RawMessage(`{`)})
 	require.Error(t, err)
 }
 

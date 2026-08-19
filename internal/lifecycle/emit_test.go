@@ -160,7 +160,7 @@ func TestEncodedEventsRoundTripThroughTheDecoder(t *testing.T) {
 		{"action patch", ActionEvent(ResolvedAction("action-1", ActionDeclined))},
 		{"action patch restating what it blocks", ActionEvent(ActionUpdate{
 			ActionID: "action-1", State: ActionCancelled, BlocksForeground: &blocks, RunID: "run-1"})},
-		{"activity", ActivityUpdateEvent(ActivityUpdate{
+		{"activity", activityUpdateEvent(ActivityUpdate{
 			ActivityID: "activity-1", Kind: ActivityTask, State: ActivityRunning,
 			Cause: CauseSubmission, OriginTurnID: "turn-1", ParentID: "activity-0",
 			ToolCallID: "tool-1", RunID: "run-1", Progress: progress})},
@@ -229,7 +229,7 @@ func TestEmitValidatesTheRenderedBytesRatherThanTheStruct(t *testing.T) {
 
 		// The struct holds a perfectly good *ActivityUpdate; its progress member
 		// only becomes a violation once it is written and read back.
-		_, err = stream.Emit(ActivityUpdateEvent(ActivityUpdate{
+		_, err = stream.Emit(activityUpdateEvent(ActivityUpdate{
 			ActivityID: "activity-1",
 			Kind:       ActivityKind("background"),
 			State:      ActivityRunning,
@@ -304,4 +304,12 @@ func TestEmitJudgesThePayloadBeforeClaimingASequence(t *testing.T) {
 			require.Equal(t, uint64(1), opening[fieldSequence])
 		})
 	}
+}
+
+// activityUpdateEvent builds the activity envelope a stream carries. Nothing in
+// this adapter emits one — it proves no activity kind — so the constructor
+// belongs to the cases that exercise the encoder and the reducer over activity a
+// stream this package reads may still carry.
+func activityUpdateEvent(activity ActivityUpdate) Event {
+	return Event{Type: EventActivityUpdate, Activity: &activity}
 }

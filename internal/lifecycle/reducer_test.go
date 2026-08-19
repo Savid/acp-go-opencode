@@ -350,20 +350,20 @@ func TestActivityImmutableIdentityIsFixedOnFirstSight(t *testing.T) {
 
 			r := newReduction(fullyProven())
 			r.openTurn(t)
-			require.NoError(t, r.push(ActivityUpdateEvent(firstSight)))
-			require.ErrorIs(t, r.push(ActivityUpdateEvent(row.patch)),
+			require.NoError(t, r.push(activityUpdateEvent(firstSight)))
+			require.ErrorIs(t, r.push(activityUpdateEvent(row.patch)),
 				&ViolationError{Kind: ViolationImmutableIdentityChange})
 		})
 	}
 
 	r := newReduction(fullyProven())
 	r.openTurn(t)
-	require.NoError(t, r.push(ActivityUpdateEvent(firstSight)))
+	require.NoError(t, r.push(activityUpdateEvent(firstSight)))
 
 	restated := firstSight
 	restated.State = ActivityRequiresAction
 	restated.Progress = json.RawMessage(`{"step":2}`)
-	require.NoError(t, r.push(ActivityUpdateEvent(restated)))
+	require.NoError(t, r.push(activityUpdateEvent(restated)))
 
 	activity, ok := r.reducer.State().Activity("activity-1")
 	require.True(t, ok)
@@ -379,14 +379,14 @@ func TestParentTerminalizesAfterEveryOwnedEntity(t *testing.T) {
 
 	r := newReduction(fullyProven())
 	r.openTurn(t)
-	require.NoError(t, r.push(ActivityUpdateEvent(ActivityUpdate{
+	require.NoError(t, r.push(activityUpdateEvent(ActivityUpdate{
 		ActivityID: "activity-1", Kind: ActivityTask, State: ActivityRunning,
 		Cause: CauseSubmission, OriginTurnID: "turn-1",
 	})))
 	require.NoError(t, r.push(ActionEvent(PendingAction(
 		"action-1", ActionElicitation, Owner{Type: OwnerActivity, ID: "activity-1"}, false))))
 
-	require.ErrorIs(t, r.push(ActivityUpdateEvent(ActivityUpdate{
+	require.ErrorIs(t, r.push(activityUpdateEvent(ActivityUpdate{
 		ActivityID: "activity-1", State: ActivityCompleted,
 	})), &ViolationError{Kind: ViolationParentTerminalBeforeChild})
 }

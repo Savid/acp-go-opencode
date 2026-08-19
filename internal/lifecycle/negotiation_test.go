@@ -69,7 +69,6 @@ func TestAnswerIntersectsAnUnorderedOffer(t *testing.T) {
 	answer, ok := Offer{Versions: []int{2, 1}}.Answer(proven)
 	require.True(t, ok)
 	require.Equal(t, []int{1}, answer.Versions)
-	require.Equal(t, 1, answer.NegotiatedVersion())
 
 	answer, ok = Offer{Versions: []int{1, 1}}.Answer(proven)
 	require.True(t, ok)
@@ -104,7 +103,6 @@ func TestNegotiatedAdvertisementShape(t *testing.T) {
 
 	var absent Negotiated
 	require.False(t, absent.Present())
-	require.Zero(t, absent.NegotiatedVersion())
 }
 
 // TestRefuseKeyNamesTheExactPath proves a surface that carries no lifecycle value

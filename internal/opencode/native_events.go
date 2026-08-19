@@ -93,7 +93,6 @@ func (e ActionRepliedEvent) Accepted() bool {
 const (
 	PermissionReplyOnce   = "once"
 	PermissionReplyAlways = "always"
-	PermissionReplyReject = "reject"
 )
 
 // DecodeActionReplied reads a `permission[.v2].replied` or

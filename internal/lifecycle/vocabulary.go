@@ -281,16 +281,6 @@ func (n Negotiated) SupportsVersion(version int) bool {
 	return slices.Contains(n.Versions, version)
 }
 
-// NegotiatedVersion is the single integer every envelope and correlation value
-// on the connection carries: the highest member of the intersection.
-func (n Negotiated) NegotiatedVersion() int {
-	if !n.Present() {
-		return 0
-	}
-
-	return slices.Max(n.Versions)
-}
-
 // DeclaresActivityKind reports whether the answer advertised an activity kind. A
 // kind it never advertised is a kind it cannot prove.
 func (n Negotiated) DeclaresActivityKind(kind ActivityKind) bool {
