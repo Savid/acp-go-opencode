@@ -48,6 +48,14 @@ type SessionStoreReplacement struct {
 	Entries []SessionStoreEntry
 }
 
+// SessionStore is the durable authority for every list, load, resume, and delete
+// this adapter answers.
+//
+// Tombstone finality is the store's own obligation rather than the adapter's: an
+// `Append` or a `Replace` addressed to a key `Delete` tombstoned writes nothing,
+// clears nothing, and returns success. An implementation that leaves the rule to
+// its caller resurrects a deleted session whenever a settlement races the delete
+// that already answered for it.
 type SessionStore interface {
 	Append(ctx context.Context, key SessionKey, entries []SessionStoreEntry) error
 	Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error)
@@ -96,6 +104,9 @@ func (s *InMemorySessionStore) Append(ctx context.Context, key SessionKey, entri
 
 	s.ensureLocked()
 
+	// A key tombstoned by Delete is final: the append writes nothing, clears
+	// nothing, and answers success. The deleted state is already the caller's
+	// answer, so there is nothing left for a later write to add to it.
 	if s.isTombstonedLocked(key) {
 		return nil
 	}
@@ -173,10 +184,27 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		return fmt.Errorf("replacements must include at least one main key")
 	}
 
+	// A tombstone is final and the store is where that finality lives, not the
+	// adapter above it: a replacement addressed to a deleted session writes
+	// nothing, clears nothing, and answers success, because the delete already
+	// gave the host its answer for that id. The addressed session decides the
+	// whole call, and a graph member deleted on its own drops out of the set the
+	// call still applies to the rest.
+	if s.isTombstonedLocked(main) {
+		return nil
+	}
+
 	now := time.Now().UnixMilli()
 
+	live := make([]SessionStoreReplacement, 0, len(replacements))
 	replacedSessions := make(map[string]struct{}, len(replacements))
+
 	for _, replacement := range replacements {
+		if s.isTombstonedLocked(mainSessionKey(replacement.Key.SessionID)) {
+			continue
+		}
+
+		live = append(live, replacement)
 		replacedSessions[replacement.Key.SessionID] = struct{}{}
 	}
 
@@ -188,7 +216,7 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		}
 	}
 
-	for _, replacement := range replacements {
+	for _, replacement := range live {
 		s.entries[replacement.Key] = cloneStoreEntries(replacement.Entries)
 		s.updatedAt[replacement.Key] = now
 		delete(s.tombstones, replacement.Key)

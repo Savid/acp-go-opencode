@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestInMemoryStoreReplaceTombstonesUnlistedSubpaths(t *testing.T) {
@@ -271,4 +273,98 @@ func TestInMemoryStoreReplaceValidation(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("empty subkey entries = %v", entries)
 	}
+}
+
+// TestInMemoryStoreEnforcesTombstoneFinality proves the store itself is where a
+// deletion becomes final. Append and Replace addressed to a key Delete
+// tombstoned write nothing, clear nothing, and answer success: the deleted state
+// is already the caller's answer, and a store that left the rule to the adapter
+// above it would resurrect a session whenever a settlement raced the delete that
+// had already answered for it.
+func TestInMemoryStoreEnforcesTombstoneFinality(t *testing.T) {
+	ctx := context.Background()
+	main := SessionKey{SessionID: "s1", Subpath: SessionStoreMainSubpath}
+	subpath := SessionKey{SessionID: "s1", Subpath: "idmap"}
+	bundle := SessionStoreEntry(`{"format":"opencode-sync-events-v1"}`)
+
+	seed := func(t *testing.T) *InMemorySessionStore {
+		t.Helper()
+
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+			{Key: main, Entries: []SessionStoreEntry{bundle}},
+			{Key: subpath, Entries: []SessionStoreEntry{bundle}},
+		}))
+		require.NoError(t, store.Delete(ctx, main))
+
+		return store
+	}
+
+	requireStillDeleted := func(t *testing.T, store *InMemorySessionStore) {
+		t.Helper()
+
+		entries, err := store.Load(ctx, main)
+		require.NoError(t, err)
+		require.Empty(t, entries, "a write over a tombstone recreated the main key")
+
+		entries, err = store.Load(ctx, subpath)
+		require.NoError(t, err)
+		require.Empty(t, entries, "a write over a tombstone recreated a subpath")
+
+		summaries, err := store.ListSessions(ctx)
+		require.NoError(t, err)
+		require.Empty(t, summaries, "a write over a tombstone made the session listable again")
+
+		subkeys, err := store.ListSubkeys(ctx, main)
+		require.NoError(t, err)
+		require.Empty(t, subkeys, "a write over a tombstone made a subpath visible again")
+	}
+
+	t.Run("append to a tombstoned main key", func(t *testing.T) {
+		store := seed(t)
+		require.NoError(t, store.Append(ctx, main, []SessionStoreEntry{bundle}))
+		requireStillDeleted(t, store)
+	})
+
+	t.Run("append to a tombstoned subpath", func(t *testing.T) {
+		store := seed(t)
+		require.NoError(t, store.Append(ctx, subpath, []SessionStoreEntry{bundle}))
+		requireStillDeleted(t, store)
+	})
+
+	t.Run("replace over a tombstoned session", func(t *testing.T) {
+		store := seed(t)
+		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+			{Key: main, Entries: []SessionStoreEntry{bundle}},
+			{Key: subpath, Entries: []SessionStoreEntry{bundle}},
+		}))
+		requireStillDeleted(t, store)
+	})
+
+	// A graph replacement carries one member per session. A member the host
+	// deleted on its own drops out of the set; the addressed session is still
+	// written, because the delete answered for that one id and no other.
+	t.Run("replace drops a separately deleted graph member", func(t *testing.T) {
+		store := NewInMemorySessionStore()
+		child := SessionKey{SessionID: "s2", Subpath: SessionStoreMainSubpath}
+
+		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+			{Key: main, Entries: []SessionStoreEntry{bundle}},
+			{Key: child, Entries: []SessionStoreEntry{bundle}},
+		}))
+		require.NoError(t, store.Delete(ctx, child))
+
+		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+			{Key: main, Entries: []SessionStoreEntry{bundle}},
+			{Key: child, Entries: []SessionStoreEntry{bundle}},
+		}))
+
+		entries, err := store.Load(ctx, main)
+		require.NoError(t, err)
+		require.Len(t, entries, 1, "the addressed session was refused along with the deleted member")
+
+		entries, err = store.Load(ctx, child)
+		require.NoError(t, err)
+		require.Empty(t, entries, "a deleted graph member was resurrected by its parent's replacement")
+	})
 }
