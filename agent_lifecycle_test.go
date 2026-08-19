@@ -113,10 +113,13 @@ func TestInitializeRefusesAMalformedOfferByPath(t *testing.T) {
 	}
 }
 
-// TestLifecycleTruthTableIsResolvedPerConfiguration proves the answer comes from
-// the containment mode that enforces the boundary rather than from a compiled-in
-// constant, and that every configuration answers the degenerate row it can prove.
-func TestLifecycleTruthTableIsResolvedPerConfiguration(t *testing.T) {
+// TestLifecycleAnswerIsTheSameOnEveryContainmentMode proves the answer states
+// only what this adapter proves, and that no containment mode changes it. The
+// mode decides how the native process boundary is enforced; it decides nothing
+// about out-of-prompt delivery, quiescence, or activity kinds, so a host reading
+// the answer learns the same degenerate row however the runtime is contained —
+// including the quiescence source, which an answer proving no class never states.
+func TestLifecycleAnswerIsTheSameOnEveryContainmentMode(t *testing.T) {
 	t.Parallel()
 
 	for _, mode := range []RuntimeContainmentMode{
@@ -126,22 +129,22 @@ func TestLifecycleTruthTableIsResolvedPerConfiguration(t *testing.T) {
 		RuntimeContainmentUnavailable,
 		RuntimeContainmentMode("unnamed"),
 	} {
-		facts := provenLifecycleFacts(mode)
+		agent := NewAgent()
+		agent.containmentMode = mode
+
+		response, err := agent.Initialize(context.Background(), acp.InitializeRequest{Meta: lifecycleOffer()})
+		require.NoError(t, err)
+
+		facts := agent.lifecycleNegotiated()
 		require.True(t, facts.UpdatesOutsidePrompt, mode)
 		require.False(t, facts.AuthoritativeQuiescence, mode)
 		require.Empty(t, facts.QuiescenceSource, mode)
 		require.Equal(t, []lifecycle.ActivityKind{}, facts.ActivityKinds, mode)
+
+		answer, ok := response.Meta[lifecycle.MetaKey].(map[string]any)
+		require.True(t, ok, mode)
+		require.NotContains(t, answer, "quiescenceSource", mode)
 	}
-
-	agent := NewAgent()
-	agent.containmentMode = RuntimeContainmentAuthoritative
-
-	response, err := agent.Initialize(context.Background(), acp.InitializeRequest{Meta: lifecycleOffer()})
-	require.NoError(t, err)
-
-	answer, ok := response.Meta[lifecycle.MetaKey].(map[string]any)
-	require.True(t, ok)
-	require.NotContains(t, answer, "quiescenceSource")
 }
 
 // TestReservedLifecycleKeyIsRefusedOnEveryCarryingRoute walks the complete

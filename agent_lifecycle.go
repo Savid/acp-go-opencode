@@ -9,10 +9,11 @@ import (
 // metaMember is the ACP request member every reserved value rides under.
 const metaMember = "_meta"
 
-// lifecycleFactsByContainment is the per-configuration lifecycle truth table.
-// The answer describes the active configuration, so it is keyed on the same
-// containment mode that enforces the native process boundary rather than
-// compiled in once for the package.
+// provenFacts is the lifecycle answer this adapter gives, and it is one answer
+// rather than a table: no field below turns on how the native process boundary
+// is enforced, so keying them on the containment mode would state a dependency
+// the values do not have. Negotiating version 1 obligates the complete ordered
+// foreground stream whatever the fields say.
 //
 // Each field states what this adapter proves, and nothing more:
 //
@@ -37,33 +38,12 @@ const metaMember = "_meta"
 //
 // A field is upgraded only when a deterministic fixture in this repository proves
 // both the native source it reads and the ordering it claims.
-var lifecycleFactsByContainment = map[RuntimeContainmentMode]lifecycle.Negotiated{
-	RuntimeContainmentAuthoritative:  provenFacts(),
-	RuntimeContainmentBestEffort:     provenFacts(),
-	RuntimeContainmentSharedIdentity: provenFacts(),
-	RuntimeContainmentUnavailable:    provenFacts(),
-}
-
-// provenFacts is the answer every configuration gives: out-of-prompt delivery,
-// no quiescence class, and no activity kind. Negotiating version 1 obligates the
-// complete ordered foreground stream whatever the other fields say.
 func provenFacts() lifecycle.Negotiated {
 	return lifecycle.Negotiated{
 		UpdatesOutsidePrompt:    true,
 		AuthoritativeQuiescence: false,
 		ActivityKinds:           []lifecycle.ActivityKind{},
 	}
-}
-
-// provenLifecycleFacts reads one configuration's row. A mode with no row proves
-// nothing, which is the same answer the unavailable boundary gives.
-func provenLifecycleFacts(mode RuntimeContainmentMode) lifecycle.Negotiated {
-	facts, known := lifecycleFactsByContainment[mode]
-	if !known {
-		return provenFacts()
-	}
-
-	return facts
 }
 
 // negotiateLifecycle reads the host's `initialize` offer and records the answer
@@ -79,7 +59,7 @@ func (a *Agent) negotiateLifecycle(meta map[string]any) (lifecycle.Negotiated, e
 
 	var answer lifecycle.Negotiated
 	if present {
-		answer, _ = offer.Answer(provenLifecycleFacts(a.containmentMode))
+		answer, _ = offer.Answer(provenFacts())
 	}
 
 	a.mu.Lock()
