@@ -21,6 +21,10 @@ const (
 	structuredOutputPath    = "_meta.opencode.structuredOutput"
 	configModel             = "model"
 	configMode              = "mode"
+	// defaultMode is the native agent OpenCode runs when no other is named. It
+	// is a starting value only: what a session addresses its frames with is
+	// whatever it was last told, judged by OpenCode rather than by this adapter.
+	defaultMode             = "build"
 	configTypeSelect        = "select"
 	openCodePermissionAsk   = "ask"
 	openCodePermissionAllow = "allow"

@@ -57,19 +57,17 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldValue)
 	}
 
+	// Neither value is judged against the advertisement. That advertisement is
+	// whatever the native runtime resolved when it started and never reloads
+	// within that runtime's life, so a value absent from it is not evidence the
+	// value is unusable — only that this runtime has not heard of it yet. The
+	// session-start door has always carried both through unjudged; this one now
+	// says the same thing, because OpenCode owns model and agent resolution
+	// alike and answers for a name it does not know at use time.
 	switch params.ValueId.ConfigId {
 	case configModel:
-		// A model value is carried to OpenCode exactly as the host chose it. The
-		// advertised catalog is whatever the native runtime resolved when it
-		// started and never reloads within that runtime's life, so a value absent
-		// from it is not evidence the model is unusable. OpenCode owns model
-		// resolution and answers for a name it does not know at use time.
 		session.setModel(value)
 	case configMode:
-		if !session.hasConfigValue(ctx, configMode, value) {
-			return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldValue)
-		}
-
 		session.setMode(value)
 	default:
 		return acp.SetSessionConfigOptionResponse{}, unsupportedField("configId")
@@ -81,34 +79,6 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	})
 
 	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
-}
-
-func (s *session) hasConfigValue(ctx context.Context, configID acp.SessionConfigId, value string) bool {
-	for _, option := range s.configOptions(ctx) {
-		if option.Select == nil || option.Select.Id != configID {
-			continue
-		}
-
-		if option.Select.Options.Ungrouped != nil {
-			for _, item := range *option.Select.Options.Ungrouped {
-				if string(item.Value) == value {
-					return true
-				}
-			}
-		}
-
-		if option.Select.Options.Grouped != nil {
-			for _, group := range *option.Select.Options.Grouped {
-				for _, item := range group.Options {
-					if string(item.Value) == value {
-						return true
-					}
-				}
-			}
-		}
-	}
-
-	return false
 }
 
 // configOptions advertises the selects this session offers, each built from its
@@ -221,7 +191,11 @@ func modelConfigOption(snapshot sessionSnapshot, providers opencode.ProvidersRes
 
 func modeConfigOption(snapshot sessionSnapshot, agents []opencode.NativeAgent) acp.SessionConfigOption {
 	category := acp.SessionConfigOptionCategoryMode
-	current := firstNonEmpty(snapshot.mode, "build")
+	// The current value is the mode this session will actually address its native
+	// frames with, listed or not. The model option already answers this way, and
+	// an advertisement that renamed the session's mode to one the list happens to
+	// carry would describe a session that does not exist.
+	current := firstNonEmpty(snapshot.mode, defaultMode)
 	values := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(agents))
 	seen := map[string]struct{}{}
 
@@ -251,20 +225,6 @@ func modeConfigOption(snapshot sessionSnapshot, agents []opencode.NativeAgent) a
 
 	if len(values) == 0 {
 		return acp.SessionConfigOption{}
-	}
-
-	foundCurrent := false
-
-	for _, value := range values {
-		if string(value.Value) == current {
-			foundCurrent = true
-
-			break
-		}
-	}
-
-	if !foundCurrent {
-		current = string(values[0].Value)
 	}
 
 	return acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{

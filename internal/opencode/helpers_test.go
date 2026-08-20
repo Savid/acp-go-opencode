@@ -54,29 +54,6 @@ func TestQuestionRequestRoute(t *testing.T) {
 	}
 }
 
-func TestProvidersResponseHasModel(t *testing.T) {
-	providers := ProvidersResponse{Providers: []ProviderInfo{{
-		ID:     "openai",
-		Models: map[string]ProviderModel{"gpt-test": {ID: "gpt-test"}},
-	}}}
-
-	if !providers.HasModel("openai/gpt-test") {
-		t.Fatal("HasModel should match provider/model")
-	}
-
-	if providers.HasModel("openai/missing") {
-		t.Fatal("HasModel should not match unknown model")
-	}
-
-	if providers.HasModel("no-slash") {
-		t.Fatal("HasModel should reject value without a slash")
-	}
-
-	if providers.HasModel("other/gpt-test") {
-		t.Fatal("HasModel should not match a different provider id")
-	}
-}
-
 func TestProvidersResponseModelContextWindow(t *testing.T) {
 	providers := ProvidersResponse{Providers: []ProviderInfo{{
 		ID: "openai",

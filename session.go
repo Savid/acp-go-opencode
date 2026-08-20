@@ -180,7 +180,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		updatedAt:               updatedAt,
 		providerID:              providerID,
 		modelID:                 modelID,
-		mode:                    firstNonEmpty(meta.Mode, native.Agent, "build"),
+		mode:                    firstNonEmpty(meta.Mode, native.Agent, defaultMode),
 		permission:              normalizeOpenCodePermission(meta.Permission),
 		outputSchema:            cloneAnyMap(meta.OutputSchema),
 		rawMessages:             meta.RawMessages,

@@ -35,13 +35,6 @@ func (p ProvidersResponse) Model(value string) (ProviderModel, bool) {
 	return ProviderModel{}, false
 }
 
-// HasModel reports whether the provider catalog contains the "provider/model" value.
-func (p ProvidersResponse) HasModel(value string) bool {
-	_, ok := p.Model(value)
-
-	return ok
-}
-
 // ModelContextWindow returns the "provider/model" model's context-window size
 // in tokens, or (0, false) when the catalog does not advertise one.
 func (p ProvidersResponse) ModelContextWindow(value string) (int, bool) {

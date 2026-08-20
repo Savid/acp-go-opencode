@@ -42,14 +42,22 @@ type foregroundCycle struct {
 	// interrupted records that this cycle's native work was already asked to
 	// stop, so a second failure cannot interrupt whatever the session does next.
 	interrupted bool
+	// runStarted records that the native session began speaking for this cycle —
+	// the message it created for the frame, or the busy status of the run it
+	// scheduled. Until it does, no run exists to fail.
+	runStarted bool
+	// refused records that OpenCode rejected the frame before any run existed.
+	// Such a cycle is never idled, because there is nothing to idle.
+	refused bool
 	// signal closes exactly once, when the cycle acquires terminal evidence.
 	signal chan struct{}
 }
 
 // terminalEvidence reports whether the cycle has native terminal evidence: the
-// native idle signal, or the loss of the incarnation that would have sent it.
+// native idle signal, the refusal of a frame that never became a run, or the
+// loss of the incarnation that would have sent the idle.
 func (c *foregroundCycle) terminalEvidence() bool {
-	return c.idle || c.lost != nil
+	return c.idle || c.refused || c.lost != nil
 }
 
 // wake publishes terminal evidence to whoever waits on the cycle. It fires once:

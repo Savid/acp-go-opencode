@@ -97,21 +97,6 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	if options := (&session{agent: agent}).configOptions(ctx); options != nil {
 		t.Fatalf("nil client config options = %#v", options)
 	}
-	if !sess.hasConfigValue(ctx, configModel, "p/m") {
-		t.Fatal("known model config value was not found")
-	}
-	if sess.hasConfigValue(ctx, configModel, "missing/model") {
-		t.Fatal("missing model config value was found")
-	}
-	fallbackClient := newFakeOpenCodeClient()
-	fallbackClient.providers = opencode.ProvidersResponse{}
-	fallbackSession := testSession(t, agent, fallbackClient)
-	if !fallbackSession.hasConfigValue(ctx, configModel, "openai/gpt-test") {
-		t.Fatal("fallback model config value was not found")
-	}
-	if testProviders().HasModel("gpt-test") {
-		t.Fatal("provider-less model was accepted")
-	}
 	assertSetSessionConfigOptionBranches(t, ctx, agent, sess, conn)
 	assertConfigOptionBuilders(t, client)
 }
@@ -138,8 +123,6 @@ func assertSetSessionConfigOptionBranches(t *testing.T, ctx context.Context, age
 		jsonFieldError: errValueUnsupported, jsonFieldField: "configId",
 	})
 
-	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configMode, "missing"))
-	requireInvalidParamsData(t, err, unsupportedValue)
 	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "p/m")); err != nil {
 		t.Fatalf("set model: %v", err)
 	}
@@ -157,9 +140,14 @@ func assertConfigOptionBuilders(t *testing.T, client *fakeOpenCodeClient) {
 	if empty := modelConfigOption(sessionSnapshot{}, opencode.ProvidersResponse{}); empty.Select != nil {
 		t.Fatalf("empty model option = %#v", empty)
 	}
+	// A mode the list does not carry is still the mode this session uses, so it
+	// is what the advertisement names as current.
 	mode := modeConfigOption(sessionSnapshot{mode: "missing"}, client.agents)
-	if mode.Select == nil || len(*mode.Select.Options.Ungrouped) != 2 || mode.Select.CurrentValue != "build" {
+	if mode.Select == nil || len(*mode.Select.Options.Ungrouped) != 2 || mode.Select.CurrentValue != "missing" {
 		t.Fatalf("mode option = %#v", mode)
+	}
+	if named := modeConfigOption(sessionSnapshot{}, client.agents); named.Select.CurrentValue != defaultMode {
+		t.Fatalf("unnamed mode option = %#v", named)
 	}
 	if empty := modeConfigOption(sessionSnapshot{}, []opencode.NativeAgent{{}}); empty.Select != nil {
 		t.Fatalf("empty mode option = %#v", empty)
@@ -279,6 +267,218 @@ func TestUnknownModelReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("prompt did not return the native model error")
 	}
+}
+
+// nativeAgentNotFoundMessage is what a real `opencode serve` publishes for an
+// agent name it does not know. The async prompt route still answers 204, and the
+// session stream then carries this error naming the agents it does know.
+const nativeAgentNotFoundMessage = `Agent not found: "does-not-exist-mode". Available agents: build, explore, general, plan`
+
+// TestUnadvertisedModeReachesOpenCodeAndCarriesItsNativeError proves the mode
+// door is no narrower than the model one. A mode the advertisement does not list
+// is set rather than refused, it is what the session then advertises as current,
+// it travels to the native runtime on the frame's own agent field, and the turn
+// fails with the words OpenCode itself used.
+func TestUnadvertisedModeReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-unknown-mode")
+	client.providers = testProviders()
+	// The advertisement carries one agent, and the host asks for another.
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+
+	dispatched := make(chan opencode.MessageRequest, 1)
+	client.dispatchMessage = func(_ context.Context, _ string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched <- req
+
+		// The native route acknowledges the frame and publishes nothing further,
+		// so the errors below are what settle the turn.
+		return opencode.NativeMessage{}, nil
+	}
+
+	agent := NewAgent(WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	set, err := agent.SetSessionConfigOption(ctx,
+		SetConfigOptionRequest(created.SessionId, configMode, "does-not-exist-mode"))
+	require.NoError(t, err, "an unlisted mode must be set, not refused")
+	require.Equal(t, acp.SessionConfigValueId("does-not-exist-mode"),
+		requireConfigOption(t, set.ConfigOptions, configMode).CurrentValue,
+		"the advertisement must name the mode the session will actually use")
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, promptErr := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "unknown-mode", "hello"))
+		done <- promptErr
+	}()
+
+	select {
+	case req := <-dispatched:
+		require.Equal(t, "does-not-exist-mode", req.Agent, "the frame must name the mode the host chose")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the unlisted mode never reached OpenCode")
+	}
+
+	// The answer OpenCode gives an agent it cannot resolve: the readable refusal
+	// first, then a second error carrying only the native stack. No idle follows
+	// — the failure precedes the run that would have published one — so the
+	// readable message is the whole of what the turn may report.
+	notFound := &opencode.NativeError{Name: "UnknownError"}
+	notFound.Data.Message = nativeAgentNotFoundMessage
+
+	trace := &opencode.NativeError{Name: "UnknownError"}
+	trace.Data.Message = "UnknownError: UnknownError\n    at SessionPrompt.createUserMessage"
+
+	for _, nativeErr := range []*opencode.NativeError{notFound, trace} {
+		client.events <- opencode.Event{
+			Type: opencode.EventSessionError,
+			Properties: mustJSON(t, opencode.SessionError{
+				SessionID: "native-unknown-mode",
+				Error:     nativeErr,
+			}),
+		}
+	}
+
+	select {
+	case promptErr := <-done:
+		data := assertTurnFailed(t, promptErr, causeProvider, nativeAgentNotFoundMessage)
+		require.NotContains(t, data[jsonFieldMessage], "createUserMessage",
+			"the first error names the cause; the stack that followed it must not overwrite it")
+	case <-time.After(5 * time.Second):
+		t.Fatal("prompt did not return the native agent error")
+	}
+}
+
+// TestUnknownModelSetThroughConfigOptionReachesOpenCode proves the model door is
+// one door however it is opened: a model outside the advertised catalog set
+// through `session/set_config_option` travels to the native runtime on the next
+// frame exactly as the session-start route's does.
+func TestUnknownModelSetThroughConfigOptionReachesOpenCode(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-config-model")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	client.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
+		ID:     "openai",
+		Models: map[string]opencode.ProviderModel{"gpt-test": {ID: "gpt-test"}},
+	}}}
+
+	dispatched := make(chan opencode.MessageRequest, 1)
+	client.dispatchMessage = func(_ context.Context, _ string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched <- req
+
+		return opencode.NativeMessage{}, nil
+	}
+
+	agent := NewAgent(WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	set, err := agent.SetSessionConfigOption(ctx,
+		SetConfigOptionRequest(created.SessionId, configModel, "anthropic/claude-sonnet-4-6"))
+	require.NoError(t, err, "an unlisted model must be set, not refused")
+	require.Equal(t, acp.SessionConfigValueId("anthropic/claude-sonnet-4-6"),
+		requireConfigOption(t, set.ConfigOptions, configModel).CurrentValue)
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, promptErr := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "config-model", "hello"))
+		done <- promptErr
+	}()
+
+	select {
+	case req := <-dispatched:
+		require.NotNil(t, req.Model, "the frame must name the model the host chose")
+		require.Equal(t, "anthropic", req.Model.ProviderID)
+		require.Equal(t, "claude-sonnet-4-6", req.Model.ModelID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the unlisted model never reached OpenCode")
+	}
+
+	nativeErr := &opencode.NativeError{Name: "UnknownError"}
+	nativeErr.Data.Message = "Model not found: anthropic/claude-sonnet-4-6. Did you mean: claude-sonnet-4-6?"
+
+	client.events <- opencode.Event{
+		Type: opencode.EventSessionError,
+		Properties: mustJSON(t, opencode.SessionError{
+			SessionID: "native-config-model",
+			Error:     nativeErr,
+		}),
+	}
+	client.publishSessionIdle("native-config-model")
+
+	select {
+	case promptErr := <-done:
+		assertTurnFailed(t, promptErr, causeProvider, "Model not found: anthropic/claude-sonnet-4-6")
+	case <-time.After(5 * time.Second):
+		t.Fatal("prompt did not return the native model error")
+	}
+}
+
+// TestSetModeSurvivesAgentCatalogFailure proves what a failed `/agent` read now
+// means for setting a mode: nothing. No read stands between the host's value and
+// the session, so the mode is set and used even while the option it would have
+// been listed under cannot be advertised at all.
+func TestSetModeSurvivesAgentCatalogFailure(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-agentless")
+	client.providers = testProviders()
+	client.agentsErr = errors.New("agents unreachable")
+
+	agent := NewAgent(WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	set, err := agent.SetSessionConfigOption(ctx,
+		SetConfigOptionRequest(created.SessionId, configMode, "plan"))
+	require.NoError(t, err, "an unreadable agent list must not refuse a mode")
+
+	// The option itself is still omitted, because a read that failed advertises
+	// nothing; the value it could not list is set all the same.
+	for _, option := range set.ConfigOptions {
+		require.NotEqual(t, acp.SessionConfigId(configMode), option.Select.Id)
+	}
+
+	session, err := agent.session(created.SessionId)
+	require.NoError(t, err)
+	require.Equal(t, "plan", session.currentMode(), "the mode the host set is the one the session carries")
+}
+
+// requireConfigOption returns the advertised select with the given id.
+func requireConfigOption(t *testing.T, options []acp.SessionConfigOption, id acp.SessionConfigId) *acp.SessionConfigOptionSelect {
+	t.Helper()
+
+	for _, option := range options {
+		if option.Select != nil && option.Select.Id == id {
+			return option.Select
+		}
+	}
+
+	t.Fatalf("config option %q was not advertised: %#v", id, options)
+
+	return nil
 }
 
 // TestConfigOptionCatalogFailureIsReported proves an advertisement failure is

@@ -293,10 +293,15 @@ func (s *session) applyNativeStatus(ctx context.Context, event opencode.Event) e
 	defer s.lifecycleMu.Unlock()
 
 	if s.cycle != nil {
+		s.cycle.runStarted = true
+
 		return nil
 	}
 
-	_, err := s.openAgentCycleLocked(ctx)
+	cycle, err := s.openAgentCycleLocked(ctx)
+	if cycle != nil {
+		cycle.runStarted = true
+	}
 
 	return err
 }
@@ -335,7 +340,31 @@ func (s *session) applyNativeError(event opencode.Event) error {
 
 	s.cycle.failure = opencode.AssistantErrorFromNativeError(nativeError.Error)
 
+	// A failure against a run the native session never started is the whole of
+	// that frame's story. OpenCode refuses an agent it cannot resolve before it
+	// creates the message for the frame: it publishes no message, no status, and
+	// so it never idles the cycle either. Waiting for an idle that cannot come
+	// would hold the turn open forever, so the cycle ends on the evidence it has.
+	// This is not a boundary read out of silence — the native runtime spoke, and
+	// what it said was that nothing is running.
+	if !s.cycle.runStarted {
+		s.cycle.refused = true
+		s.cycle.wake()
+	}
+
 	return nil
+}
+
+// markCycleRunning records that the native session has begun speaking for the
+// open cycle: the frame became a message, or the run it scheduled reported
+// itself busy. Either one proves there is a run for a later failure to name.
+func (s *session) markCycleRunning() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if s.cycle != nil {
+		s.cycle.runStarted = true
+	}
 }
 
 // applyNativeMessageInfo records the role a message declared and, for an
@@ -348,6 +377,10 @@ func (s *session) applyNativeMessageInfo(event opencode.Event) {
 	}
 
 	s.recordMessageRole(info)
+
+	// The message OpenCode created for the frame is the first proof that the
+	// frame became a run.
+	s.markCycleRunning()
 
 	if info.Role != roleAssistant {
 		return
