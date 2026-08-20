@@ -1048,7 +1048,6 @@ func TestNewSessionRemainingFailureStages(t *testing.T) {
 
 	for name, configure := range map[string]func(*fakeOpenCodeClient, *Agent){
 		"scope":  func(client *fakeOpenCodeClient, _ *Agent) { client.scopeErr = errors.New("scope failed") },
-		"model":  func(client *fakeOpenCodeClient, _ *Agent) { client.providersErr = errors.New("providers failed") },
 		"create": func(client *fakeOpenCodeClient, _ *Agent) { client.createErr = errors.New("create failed") },
 		"snapshot history": func(client *fakeOpenCodeClient, _ *Agent) {
 			client.syncHistoryErr = errors.New("history failed")
@@ -1098,7 +1097,6 @@ func TestLoadResumeRemainingFailureStages(t *testing.T) {
 
 	for name, configure := range map[string]func(*fakeOpenCodeClient){
 		"scope":       func(client *fakeOpenCodeClient) { client.scopeErr = errors.New("scope failed") },
-		"model":       func(client *fakeOpenCodeClient) { client.providersErr = errors.New("providers failed") },
 		"history":     func(client *fakeOpenCodeClient) { client.syncHistoryErr = errors.New("history failed") },
 		"replay":      func(client *fakeOpenCodeClient) { client.syncReplayErr = errors.New("replay failed") },
 		"get session": func(client *fakeOpenCodeClient) { client.getErr = errors.New("get failed") },
@@ -1144,7 +1142,6 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 	for name, configure := range map[string]func(*Agent, *fakeOpenCodeClient){
 		"native fork": func(_ *Agent, client *fakeOpenCodeClient) { client.forkErr = errors.New("fork failed") },
 		"scope":       func(_ *Agent, client *fakeOpenCodeClient) { client.scopeErr = errors.New("scope failed") },
-		"model":       func(_ *Agent, client *fakeOpenCodeClient) { client.providersErr = errors.New("providers failed") },
 		"get":         func(_ *Agent, client *fakeOpenCodeClient) { client.getErr = errors.New("get failed") },
 		"snapshot": func(_ *Agent, client *fakeOpenCodeClient) {
 			client.syncHistoryErr = errors.New("snapshot failed")
@@ -1261,13 +1258,6 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 		_, err = storedAgent(newFakeOpenCodeClient()).ResumeSession(ctx, request)
 		require.Error(t, err)
 	}
-
-	client = newFakeOpenCodeClient()
-	client.getSession = testNativeSession("native")
-	agent = storedAgent(client)
-	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd,
-		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("missing/model")))))
-	require.Error(t, err)
 
 	client = newFakeOpenCodeClient()
 	client.getSession = testNativeSession("native")

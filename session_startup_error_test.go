@@ -57,14 +57,6 @@ func TestSessionStartHTTPFailuresNameTheRouteAndNeverTheBody(t *testing.T) {
 			},
 		},
 		{
-			name:   "provider catalog",
-			method: http.MethodGet,
-			path:   "/config/providers",
-			arrange: func(client *fakeOpenCodeClient, _ *Options, httpErr *opencode.HTTPError) {
-				client.providersErr = httpErr
-			},
-		},
-		{
 			name:   "native session create",
 			method: http.MethodPost,
 			path:   "/session",

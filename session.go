@@ -853,19 +853,19 @@ func (s *session) setMode(value string) {
 	s.mu.Unlock()
 }
 
-func (s *session) validatedModelSelector(ctx context.Context, field string) (opencode.ModelSelector, bool, error) {
+// modelSelector reports the model this session addresses its native frames
+// with. A half-named model addresses nothing, so the frame carries no selector
+// at all and OpenCode picks its own default; a named one is passed through
+// unjudged, because the runtime that runs it is the authority on whether it
+// resolves.
+func (s *session) modelSelector() (opencode.ModelSelector, bool) {
 	snapshot := s.snapshot()
 
-	modelValue := snapshot.modelValue()
-	if err := validateModel(ctx, snapshot.client, modelValue, field); err != nil {
-		return opencode.ModelSelector{}, false, err
-	}
-
 	if snapshot.providerID == "" || snapshot.modelID == "" {
-		return opencode.ModelSelector{}, false, nil
+		return opencode.ModelSelector{}, false
 	}
 
-	return opencode.ModelSelector{ProviderID: snapshot.providerID, ModelID: snapshot.modelID}, true, nil
+	return opencode.ModelSelector{ProviderID: snapshot.providerID, ModelID: snapshot.modelID}, true
 }
 
 func (s *session) currentMode() string {
@@ -1343,7 +1343,6 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 
 	id := s.id
 	cwd := s.cwd
-	model := joinModelValue(s.providerID, s.modelID)
 	mcpServers := cloneNativeMCPServerConfigs(s.mcpServers)
 	carrier := s.carrier.clone()
 	s.mu.Unlock()
@@ -1382,18 +1381,6 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 
 		releaseCandidate := func() error {
 			return s.agent.closeDirectoryScope(client, releaseDirectory, generation)
-		}
-
-		if validateErr := validateStartupModel(ctx, client, model, modelFieldSessionMeta); validateErr != nil {
-			current := s.agent.runtimeGenerationIsCurrent(generation)
-
-			closeErr := releaseCandidate()
-
-			if !current {
-				continue
-			}
-
-			return errors.Join(validateErr, closeErr)
 		}
 
 		s.agent.restoreMu.Lock()

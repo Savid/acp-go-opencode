@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"slices"
 	"strings"
 
@@ -58,10 +59,11 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 
 	switch params.ValueId.ConfigId {
 	case configModel:
-		if err := session.validateModel(ctx, value, jsonFieldValue); err != nil {
-			return acp.SetSessionConfigOptionResponse{}, err
-		}
-
+		// A model value is carried to OpenCode exactly as the host chose it. The
+		// advertised catalog is whatever the native runtime resolved when it
+		// started and never reloads within that runtime's life, so a value absent
+		// from it is not evidence the model is unusable. OpenCode owns model
+		// resolution and answers for a name it does not know at use time.
 		session.setModel(value)
 	case configMode:
 		if !session.hasConfigValue(ctx, configMode, value) {
@@ -79,45 +81,6 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	})
 
 	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
-}
-
-func (s *session) validateModel(ctx context.Context, value string, field string) error {
-	if value == "" {
-		return nil
-	}
-
-	snapshot := s.snapshot()
-
-	return validateModel(ctx, snapshot.client, value, field)
-}
-
-func validateModel(ctx context.Context, client opencode.Client, value string, field string) error {
-	if value == "" || client == nil {
-		return nil
-	}
-
-	providers, err := client.ConfigProviders(ctx)
-	if err != nil {
-		return err
-	}
-
-	if providers.HasModel(value) {
-		return nil
-	}
-
-	return invalidModel(value, field)
-}
-
-func validateStartupModel(ctx context.Context, client opencode.Client, value string, field string) error {
-	return startupFailure(validateModel(ctx, client, value, field))
-}
-
-func invalidModel(value string, field string) error {
-	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: "invalid_model", //nolint:goconst // Wire error value is intentionally local to this response table.
-		jsonFieldField: field,
-		configModel:    value,
-	})
 }
 
 func (s *session) hasConfigValue(ctx context.Context, configID acp.SessionConfigId, value string) bool {
@@ -148,6 +111,12 @@ func (s *session) hasConfigValue(ctx context.Context, configID acp.SessionConfig
 	return false
 }
 
+// configOptions advertises the selects this session offers, each built from its
+// own native read. A read that fails omits only the option it feeds, because the
+// rest of the advertisement is still true and a session that already exists is
+// never refused over a catalog the next call repeats. What such a failure must
+// not be is silent: the omission always states its cause, so a host missing an
+// option has a reason recorded for it rather than an empty list.
 func (s *session) configOptions(ctx context.Context) []acp.SessionConfigOption {
 	snapshot := s.snapshot()
 	if snapshot.client == nil {
@@ -156,19 +125,29 @@ func (s *session) configOptions(ctx context.Context) []acp.SessionConfigOption {
 
 	var options []acp.SessionConfigOption
 
-	if providers, err := snapshot.client.ConfigProviders(ctx); err == nil {
-		if model := modelConfigOption(snapshot, providers); model.Select != nil {
-			options = append(options, model)
-		}
+	if providers, err := snapshot.client.ConfigProviders(ctx); err != nil {
+		s.reportConfigOptionUnavailable(ctx, configModel, err)
+	} else if model := modelConfigOption(snapshot, providers); model.Select != nil {
+		options = append(options, model)
 	}
 
-	if agents, err := snapshot.client.Agents(ctx); err == nil && len(agents) > 0 {
-		if mode := modeConfigOption(snapshot, agents); mode.Select != nil {
-			options = append(options, mode)
-		}
+	if agents, err := snapshot.client.Agents(ctx); err != nil {
+		s.reportConfigOptionUnavailable(ctx, configMode, err)
+	} else if mode := modeConfigOption(snapshot, agents); mode.Select != nil {
+		options = append(options, mode)
 	}
 
 	return options
+}
+
+// reportConfigOptionUnavailable names the native read that left one option out
+// of a session's advertised config options.
+func (s *session) reportConfigOptionUnavailable(ctx context.Context, configID acp.SessionConfigId, err error) {
+	s.agent.log.WarnContext(ctx, "OpenCode config option is unavailable",
+		slog.String("session_id", string(s.id)),
+		slog.String("config_id", string(configID)),
+		loggableError(err),
+	)
 }
 
 func modelConfigOption(snapshot sessionSnapshot, providers opencode.ProvidersResponse) acp.SessionConfigOption {

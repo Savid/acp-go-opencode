@@ -1,13 +1,17 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
+	"github.com/stretchr/testify/require"
 )
 
 func TestModelConfigOptionMetadataMapping(t *testing.T) {
@@ -105,18 +109,6 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	if !fallbackSession.hasConfigValue(ctx, configModel, "openai/gpt-test") {
 		t.Fatal("fallback model config value was not found")
 	}
-	if err := fallbackSession.validateModel(ctx, "", "model"); err != nil {
-		t.Fatalf("empty model validation = %v", err)
-	}
-	if err := validateModel(ctx, nil, "openai/gpt-test", "model"); err != nil {
-		t.Fatalf("nil client model validation = %v", err)
-	}
-	errorClient := newFakeOpenCodeClient()
-	errorClient.providersErr = errors.New("providers failed")
-	errorSession := testSession(t, agent, errorClient)
-	if err := errorSession.validateModel(ctx, "openai/gpt-test", "model"); err == nil {
-		t.Fatal("provider catalog error was ignored")
-	}
 	if testProviders().HasModel("gpt-test") {
 		t.Fatal("provider-less model was accepted")
 	}
@@ -144,11 +136,6 @@ func assertSetSessionConfigOptionBranches(t *testing.T, ctx context.Context, age
 	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, "unknown", "x"))
 	requireInvalidParamsData(t, err, map[string]any{
 		jsonFieldError: errValueUnsupported, jsonFieldField: "configId",
-	})
-
-	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "missing/model"))
-	requireInvalidParamsData(t, err, map[string]any{
-		jsonFieldError: "invalid_model", jsonFieldField: jsonFieldValue, configModel: "missing/model",
 	})
 
 	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configMode, "missing"))
@@ -209,6 +196,130 @@ func assertConfigOptionBuilders(t *testing.T, client *fakeOpenCodeClient) {
 	}}); len(got) != 0 {
 		t.Fatalf("bad unstable config option was not skipped: %#v", got)
 	}
+}
+
+// TestUnknownModelReachesOpenCodeAndCarriesItsNativeError proves the adapter
+// never judges a model name against the advertised catalog: a model that catalog
+// does not list still opens a session, travels to the native runtime exactly as
+// the host asked for it, and fails the turn with the words OpenCode itself used.
+func TestUnknownModelReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-unknown-model")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	// One provider is resolved, and the host asks for a model outside it.
+	client.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
+		ID:     "openai",
+		Models: map[string]opencode.ProviderModel{"gpt-test": {ID: "gpt-test"}},
+	}}}
+
+	dispatched := make(chan opencode.MessageRequest, 1)
+	client.dispatchMessage = func(_ context.Context, _ string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched <- req
+
+		// An acknowledged frame with no message leaves the turn open, so the
+		// native error below is what settles it.
+		return opencode.NativeMessage{}, nil
+	}
+
+	agent := NewAgent(WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("anthropic/claude-sonnet-4-6"))),
+	))
+	require.NoError(t, err, "an unlisted model must not refuse session creation")
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, promptErr := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "unknown-model", "hello"))
+		done <- promptErr
+	}()
+
+	select {
+	case req := <-dispatched:
+		require.NotNil(t, req.Model, "the frame must name the model the host chose")
+		require.Equal(t, "anthropic", req.Model.ProviderID)
+		require.Equal(t, "claude-sonnet-4-6", req.Model.ModelID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the unlisted model never reached OpenCode")
+	}
+
+	// The answer OpenCode gives a model it cannot resolve: one session.error that
+	// names the model, then the idle that ends the turn.
+	nativeErr := &opencode.NativeError{Name: "UnknownError"}
+	nativeErr.Data.Message = "Model not found: anthropic/claude-sonnet-4-6. Did you mean: claude-sonnet-4-6?"
+
+	client.events <- opencode.Event{
+		Type: opencode.EventSessionError,
+		Properties: mustJSON(t, opencode.SessionError{
+			SessionID: "native-unknown-model",
+			Error:     nativeErr,
+		}),
+	}
+	client.publishSessionIdle("native-unknown-model")
+
+	select {
+	case promptErr := <-done:
+		data := assertTurnFailed(t, promptErr, causeProvider,
+			"Model not found: anthropic/claude-sonnet-4-6. Did you mean: claude-sonnet-4-6?")
+		// The native error names no status and no provider code, and the adapter
+		// invents neither.
+		if _, present := data[jsonFieldStatusCode]; present {
+			t.Fatalf("status code was invented: %#v", data)
+		}
+		if _, present := data[jsonFieldProviderCode]; present {
+			t.Fatalf("provider code was invented: %#v", data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt did not return the native model error")
+	}
+}
+
+// TestConfigOptionCatalogFailureIsReported proves an advertisement failure is
+// never silent: the option whose native read failed is left out, every other
+// option still stands, and the omission states its cause.
+func TestConfigOptionCatalogFailureIsReported(t *testing.T) {
+	ctx := context.Background()
+
+	var logs bytes.Buffer
+
+	agent := NewAgent(WithLogger(slog.New(slog.NewJSONHandler(&logs, nil))))
+	client := newFakeOpenCodeClient()
+	client.providersErr = errors.New("providers unreachable")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	sess := testSession(t, agent, client)
+
+	options := sess.configOptions(ctx)
+	require.Len(t, options, 1, "a failed catalog read must not remove the options it did not feed")
+	require.Equal(t, acp.SessionConfigId(configMode), options[0].Select.Id)
+
+	record := logs.String()
+	require.Contains(t, record, "OpenCode config option is unavailable")
+	require.Contains(t, record, `"config_id":"model"`)
+	require.Contains(t, record, "providers unreachable")
+
+	// The rule is per option, not per catalog: the agent read states its own
+	// failure the same way.
+	logs.Reset()
+
+	modeless := newFakeOpenCodeClient()
+	modeless.providers = testProviders()
+	modeless.agentsErr = errors.New("agents unreachable")
+	modelessSession := testSession(t, agent, modeless)
+
+	options = modelessSession.configOptions(ctx)
+	require.Len(t, options, 1)
+	require.Equal(t, acp.SessionConfigId(configModel), options[0].Select.Id)
+
+	record = logs.String()
+	require.Contains(t, record, `"config_id":"mode"`)
+	require.Contains(t, record, "agents unreachable")
 }
 
 func containsStringAny(value any, want string) bool {

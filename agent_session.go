@@ -62,12 +62,6 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
-	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return acp.NewSessionResponse{}, errors.Join(validateErr, closeErr)
-	}
-
 	sessionStarted := time.Now()
 	native, err := client.CreateSessionWithPolicy(ctx, "", nativePermissionPolicy(meta.Permission))
 	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err)
@@ -219,12 +213,6 @@ func (a *Agent) loadOrResumeSession(
 	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, cwd, mcpConfigs, carrier)
 	if err != nil {
 		return nil, err
-	}
-
-	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return nil, errors.Join(validateErr, closeErr)
 	}
 
 	a.restoreMu.Lock()
@@ -516,12 +504,6 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, carrier)
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
-	}
-
-	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return acp.UnstableForkSessionResponse{}, errors.Join(validateErr, closeErr)
 	}
 
 	native, err := client.GetSession(ctx, nativeChild.ID)

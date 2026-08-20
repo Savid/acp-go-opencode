@@ -128,43 +128,6 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 	})
 }
 
-func TestPromptRejectsInvalidCurrentModel(t *testing.T) {
-	ctx := context.Background()
-	client := newFakeOpenCodeClient()
-	client.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
-		ID:     "openai",
-		Models: map[string]opencode.ProviderModel{"other": {ID: "other"}},
-	}}}
-	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
-		t.Fatal("a frame was dispatched after an invalid model")
-
-		return opencode.NativeMessage{}, nil
-	}
-	session := testSession(t, NewAgent(), client)
-
-	_, err := session.Prompt(ctx, TextPromptRequest(session.id, "nonce", "hello"))
-	assertInvalidModelField(t, err, modelFieldPrompt)
-}
-
-func TestCommandPromptRejectsInvalidCurrentModel(t *testing.T) {
-	ctx := context.Background()
-	client := newFakeOpenCodeClient()
-	client.commands = []opencode.NativeCommand{{Name: "review"}}
-	client.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
-		ID:     "openai",
-		Models: map[string]opencode.ProviderModel{"other": {ID: "other"}},
-	}}}
-	client.dispatchCommand = func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error) {
-		t.Fatal("a command was dispatched after an invalid model")
-
-		return opencode.NativeMessage{}, nil
-	}
-	session := testSession(t, NewAgent(), client)
-
-	_, err := session.Prompt(ctx, TextPromptRequest(session.id, "nonce", "/review"))
-	assertInvalidModelField(t, err, modelFieldPrompt)
-}
-
 // TestNativeActionReconciliationRoutesOnlyThisSession proves reconciliation reads
 // the native pending sets and admits exactly the requests that name this session's
 // native id.

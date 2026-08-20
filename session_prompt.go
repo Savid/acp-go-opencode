@@ -366,9 +366,6 @@ func (s *session) commandDispatch(ctx context.Context, params acp.PromptRequest,
 	}
 
 	agent, model := s.commandContext()
-	if err := s.validateModel(ctx, model, modelFieldPrompt); err != nil {
-		return nativeDispatch{}, err
-	}
 
 	req := opencode.CommandRequest{
 		Agent:     agent,
@@ -402,10 +399,7 @@ func (s *session) messageDispatch(ctx context.Context, params acp.PromptRequest)
 		return nativeDispatch{}, err
 	}
 
-	modelSelector, hasModel, err := s.validatedModelSelector(ctx, modelFieldPrompt)
-	if err != nil {
-		return nativeDispatch{}, err
-	}
+	modelSelector, hasModel := s.modelSelector()
 
 	req := opencode.MessageRequest{
 		Parts: parts,

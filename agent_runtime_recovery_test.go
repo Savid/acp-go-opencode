@@ -224,11 +224,11 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("cancelled between recovery attempts", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		crashed := readyRecoveryClient()
-		crashed.providersFunc = func(context.Context) (opencode.ProvidersResponse, error) {
+		crashed.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
 			close(crashed.runtimeExited)
 			cancel()
 
-			return opencode.ProvidersResponse{}, errors.New("generation exited")
+			return nil, errors.New("generation exited")
 		}
 		agent, current := recoveryFixture(t, nil, crashed)
 		require.ErrorIs(t, current.ensureRuntime(ctx), context.Canceled)
@@ -238,28 +238,6 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("runtime construction error", func(t *testing.T) {
 		agent, current := recoveryFixture(t, nil)
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), "unexpected recovery factory call")
-		require.NoError(t, agent.Close())
-	})
-
-	t.Run("model validation error on live generation", func(t *testing.T) {
-		candidate := readyRecoveryClient()
-		candidate.providersErr = errors.New("providers failed")
-		agent, current := recoveryFixture(t, nil, candidate)
-		require.ErrorContains(t, current.ensureRuntime(context.Background()), "providers failed")
-		require.NoError(t, agent.Close())
-	})
-
-	t.Run("model validation discards exited generation", func(t *testing.T) {
-		crashed := readyRecoveryClient()
-		crashed.providersFunc = func(context.Context) (opencode.ProvidersResponse, error) {
-			close(crashed.runtimeExited)
-
-			return opencode.ProvidersResponse{}, errors.New("generation exited")
-		}
-		replacement := readyRecoveryClient()
-		agent, current := recoveryFixture(t, nil, crashed, replacement)
-		require.NoError(t, current.ensureRuntime(context.Background()))
-		require.EqualValues(t, 2, current.runtimeGeneration)
 		require.NoError(t, agent.Close())
 	})
 

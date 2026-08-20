@@ -24,6 +24,36 @@ are enumerable.
 Set either at session start via `_meta.opencode.options` or on a running session
 with `session/set_config_option`.
 
+### Model values are passed through, never gated
+
+The adapter does not check a model value against the advertised catalog. A
+model is carried to OpenCode exactly as the host asked for it, at session
+start, on `session/set_config_option`, and on every prompt; OpenCode owns model
+resolution and answers for a name it does not know.
+
+The catalog is why. `GET /config/providers` reports what the `opencode serve`
+process resolved when it started, and that answer does not change for the life
+of that process: a credential added afterwards is invisible to the running
+runtime until it restarts. A value missing from the catalog is therefore not
+evidence the model is unusable, and refusing on it would turn a per-turn
+condition into a failed `session/new`.
+
+An unknown model surfaces as OpenCode's own error, on the turn that used it:
+the uniform `opencode_turn_failed` provider failure described below, carrying
+the native message (`Model not found: <provider>/<model>.`). `statusCode` and
+`providerCode` are absent, because the native error reports neither and the
+adapter invents nothing.
+
+### A failed catalog read is reported, not hidden
+
+Each config option is built from its own native read. When
+`GET /config/providers` fails, the model option is left out of the advertised
+set, the options that read successfully are still advertised, and the session
+is not refused — the next call repeats the read. The omission is never silent:
+its cause is logged on `stderr` as `OpenCode config option is unavailable` with
+the session id, the config id, and the native error. The mode option follows
+the same rule for `GET /agent`.
+
 The selected model also gates image prompts. The adapter reads the model's
 authenticated provider `capabilities.input.image`: `true` accepts image blocks,
 `false` rejects an image prompt before the turn as `unsupported_by_model`, and a

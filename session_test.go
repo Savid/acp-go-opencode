@@ -147,13 +147,11 @@ func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 	current.markPublishedToolCall("tool")
 	require.True(t, current.publishedToolCall("tool"), "a published call stays answerable across turns")
 
-	selector, present, err := current.validatedModelSelector(context.Background(), "model")
-	require.NoError(t, err)
+	selector, present := current.modelSelector()
 	require.True(t, present)
 	require.Equal(t, "openai", selector.ProviderID)
 	current.setModel("")
-	_, present, err = current.validatedModelSelector(context.Background(), "model")
-	require.NoError(t, err)
+	_, present = current.modelSelector()
 	require.False(t, present)
 
 	released := false
