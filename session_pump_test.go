@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync"
@@ -466,4 +467,189 @@ func TestPumpWithoutARuntimeBindingRoutesNothing(t *testing.T) {
 	require.Nil(t, current.pump, "a session with no runtime binding started a pump")
 	current.incarnation = bound
 	current.lifecycleMu.Unlock()
+}
+
+func TestCorrectionNativeCausalPureBranches(t *testing.T) {
+	cycle := &foregroundCycle{
+		origin: lifecycle.CauseSubmission, nativeMessageID: "user", assistantID: "assistant",
+		blockers: map[string]struct{}{"action": {}},
+	}
+
+	for _, event := range []opencode.Event{
+		{Type: opencode.EventMessageUpdated, Properties: json.RawMessage(`{"info":{"id":"other","role":"assistant","parentID":"other"}}`)},
+		{Type: opencode.EventMessageUpdated, Properties: json.RawMessage(`{"info":{"id":"other","role":"assistant","parentID":"user"}}`)},
+		{Type: opencode.EventPermissionV2Asked, Properties: json.RawMessage(`{`)},
+		{Type: opencode.EventPermissionV2Asked, Properties: json.RawMessage(`{"tool":{"messageID":"assistant"}}`)},
+		{Type: opencode.EventQuestionV2Asked, Properties: json.RawMessage(`{"tool":{"messageID":"assistant"}}`)},
+		{Type: opencode.EventPermissionV2Replied, Properties: json.RawMessage(`{"requestID":"action"}`)},
+		{Type: "other"},
+	} {
+		_ = nativeEventCausallyMatchesCycleLocked(event, cycle)
+	}
+
+	require.False(t, nativeEventCausallyMatchesCycleLocked(opencode.Event{}, nil))
+	require.False(t, nativeEventCausallyMatchesCycleLocked(opencode.Event{}, &foregroundCycle{}))
+}
+
+func TestCorrectionPumpBarrierAndRoutingBranches(t *testing.T) {
+	filledWake := &sessionPump{released: make(chan struct{}, 1)}
+	filledWake.released <- struct{}{}
+	filledWake.wake()
+
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstCancel()
+	rejectedPause := &sessionPump{hold: make(chan chan error), done: make(chan struct{})}
+	require.ErrorIs(t, rejectedPause.pauseForDispatch(firstCtx), context.Canceled)
+
+	stoppedDuring := &sessionPump{hold: make(chan chan error), done: make(chan struct{})}
+	go func() {
+		<-stoppedDuring.hold
+		close(stoppedDuring.done)
+	}()
+	require.ErrorContains(t, stoppedDuring.pauseForDispatch(context.Background()), "during dispatch barrier")
+
+	cancelDuring := &sessionPump{hold: make(chan chan error), done: make(chan struct{})}
+	barrierTaken := make(chan struct{})
+	go func() {
+		<-cancelDuring.hold
+		close(barrierTaken)
+	}()
+	duringCtx, duringCancel := context.WithCancel(context.Background())
+	go func() {
+		<-barrierTaken
+		duringCancel()
+	}()
+	require.ErrorIs(t, cancelDuring.pauseForDispatch(duringCtx), context.Canceled)
+
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	binding := testIncarnation(current)
+	require.NotNil(t, binding)
+
+	pausedCtx, pausedCancel := context.WithCancel(context.Background())
+	paused := &sessionPump{
+		session: current, binding: binding, hold: make(chan chan error), released: make(chan struct{}, 1),
+		done: make(chan struct{}),
+	}
+	go paused.run(pausedCtx)
+	ack := make(chan error, 1)
+	paused.hold <- ack
+	require.NoError(t, <-ack)
+	pausedCancel()
+	<-paused.done
+
+	emptyClient := newFakeOpenCodeClient()
+	emptyBinding := &nativeIncarnationBinding{client: emptyClient, registry: newActionRegistry()}
+	emptySession := &session{idmap: idmapRecord{NativeSessionID: "native"}, incarnation: emptyBinding}
+	emptyPump := &sessionPump{
+		session: emptySession, binding: emptyBinding, hold: make(chan chan error), released: make(chan struct{}, 1),
+		done: make(chan struct{}),
+	}
+	emptyClient.eventStream <- opencode.EventStreamItem{}
+	emptyPump.run(context.Background())
+	<-emptyPump.done
+
+	staleBinding := &nativeIncarnationBinding{client: binding.client, registry: newActionRegistry()}
+	(&session{}).routeNativeEvent(context.Background(), opencode.Event{})
+	current.routeNativeEvent(context.Background(), opencode.Event{})
+	require.NoError(t, current.routeNativeEventForIncarnation(context.Background(), staleBinding, opencode.Event{}))
+	require.NoError(t, current.routeNativeEventForIncarnation(context.Background(), binding, opencode.Event{}))
+	require.NoError(t, current.routeNativeEventForIncarnation(context.Background(), binding, opencode.Event{
+		Type:       opencode.EventSessionIdle,
+		Properties: mustJSONValue(map[string]any{"sessionID": "foreign"}),
+	}, &nativeEventObservation{binding: binding}))
+
+	cycle := &foregroundCycle{blockers: map[string]struct{}{"action": {}}}
+	require.True(t, nativeEventCausallyMatchesCycleLocked(opencode.Event{
+		Type:       opencode.EventPermissionV2Replied,
+		Properties: mustJSONValue(map[string]any{"requestID": "action", "sessionID": current.idmap.NativeSessionID}),
+	}, &foregroundCycle{origin: lifecycle.CauseSubmission, blockers: cycle.blockers}))
+}
+
+func TestCorrectionObservedOwnershipAndNativeFailureBranches(t *testing.T) {
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	current.stopPump()
+	binding := testIncarnation(current)
+	other := &nativeIncarnationBinding{registry: newActionRegistry()}
+
+	current.lifecycleMu.Lock()
+	require.Nil(t, func() *foregroundCycle {
+		cycle, _ := current.observedCycleLocked(
+			context.WithValue(context.Background(), nativeEventObservationKey{}, &nativeEventObservation{binding: other}), true)
+
+		return cycle
+	}())
+
+	for _, observation := range []*nativeEventObservation{
+		{binding: binding, ownership: nativeEventPromptBeforeEvidence},
+		{binding: binding, ownership: nativeEventCycle, cycle: &foregroundCycle{}},
+		{binding: binding, ownership: nativeEventAgent, cycle: &foregroundCycle{}},
+		{binding: binding, ownership: nativeEventAgent},
+		{binding: binding, ownership: nativeEventOwnership(99)},
+	} {
+		current.cycle = &foregroundCycle{}
+		cycle, err := current.observedCycleLocked(
+			context.WithValue(context.Background(), nativeEventObservationKey{}, observation), false)
+		require.NoError(t, err)
+		require.Nil(t, cycle)
+	}
+	current.cycle = nil
+	current.lifecycleMu.Unlock()
+
+	closedStream := lifecycle.NewStream("closed", lifecycle.Negotiated{Versions: []int{1}})
+	closedStream.Close()
+	current.lifecycleMu.Lock()
+	current.incarnation = &nativeIncarnationBinding{client: binding.client, stream: closedStream, registry: newActionRegistry()}
+	current.cycle = nil
+	closedBinding := current.incarnation
+	current.lifecycleMu.Unlock()
+
+	agentObservation := &nativeEventObservation{binding: closedBinding, ownership: nativeEventAgent}
+	agentCtx := context.WithValue(withNativeIncarnationBinding(context.Background(), closedBinding), nativeEventObservationKey{}, agentObservation)
+	busy := opencode.Event{Type: opencode.EventSessionStatus, Properties: mustJSONValue(map[string]any{
+		"sessionID": current.idmap.NativeSessionID, "status": map[string]any{"type": "busy"},
+	})}
+	require.Error(t, current.applyNativeStatus(agentCtx, busy))
+	require.Error(t, current.markCycleRunning(agentCtx))
+	require.Error(t, current.applyNativeMessageInfo(agentCtx, opencode.Event{
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "assistant", "sessionID": current.idmap.NativeSessionID, "role": roleAssistant,
+		}}),
+	}))
+
+	beforeEvidence := context.WithValue(context.Background(), nativeEventObservationKey{},
+		&nativeEventObservation{ownership: nativeEventPromptBeforeEvidence})
+	require.Error(t, current.applyNativePermissionAsked(beforeEvidence, opencode.Event{}))
+	require.Error(t, current.applyNativeQuestionAsked(beforeEvidence, opencode.Event{}))
+	require.NoError(t, current.markNativeTerminal(context.Background()))
+	require.NoError(t, current.applyNativePart(context.Background(), opencode.Event{Properties: json.RawMessage(`{`)}))
+	current.applyNativeActionReplied(context.Background(), opencode.Event{Properties: json.RawMessage(`{`)})
+
+	current.lifecycleMu.Lock()
+	current.incarnation = binding
+	conflictCycle := &foregroundCycle{assistantID: "assistant-a"}
+	current.cycle = conflictCycle
+	current.lifecycleMu.Unlock()
+	conflictCtx := context.WithValue(context.Background(), nativeEventObservationKey{},
+		&nativeEventObservation{binding: binding, ownership: nativeEventCycle, cycle: conflictCycle})
+	require.ErrorContains(t, current.applyNativeMessageInfo(conflictCtx, opencode.Event{
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "assistant-b", "sessionID": current.idmap.NativeSessionID, "role": roleAssistant,
+		}}),
+	}), "conflicting assistant")
+
+	current.lifecycleMu.Lock()
+	current.cycle = &foregroundCycle{}
+	cycle, err := current.observedCycleLocked(
+		context.WithValue(context.Background(), nativeEventObservationKey{},
+			&nativeEventObservation{binding: binding, ownership: nativeEventAgent}), true)
+	current.lifecycleMu.Unlock()
+	require.NoError(t, err)
+	require.Nil(t, cycle)
+
+	current.lifecycleMu.Lock()
+	current.cycle = nil
+	current.lifecycleMu.Unlock()
+	nilCycleCtx := context.WithValue(context.Background(), nativeEventObservationKey{},
+		&nativeEventObservation{binding: binding, ownership: nativeEventPromptBeforeEvidence})
+	require.NoError(t, current.applyNativeStatus(nilCycleCtx, busy))
 }

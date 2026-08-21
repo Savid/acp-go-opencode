@@ -544,3 +544,22 @@ func lifecycleSessionWithBrokenStream(t *testing.T) *session {
 
 	return current
 }
+
+func TestCorrectionDefensiveEstablishmentBranches(t *testing.T) {
+	hooks := newEstablishmentHooks(nil)
+	admitted := false
+	hooks.queue("1", func() {}, func() { admitted = true })
+	hooks.runAfterWrite([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	require.True(t, admitted)
+
+	for _, frame := range [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":,"result":{}}`),
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":}`),
+	} {
+		_, _, ok := establishmentResponseFrame(frame)
+		require.False(t, ok)
+	}
+	require.NoError(t, runEstablishmentCallback(nil))
+	runEstablishmentFailure(nil, nil, errors.New("ignored"))
+	require.Equal(t, "", turnNonceFromContext(nil)) //nolint:staticcheck // nil is the defensive input under test.
+}

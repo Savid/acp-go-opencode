@@ -1020,3 +1020,65 @@ func TestDeleteOnAFencedIncarnationSettlesBothBoundaries(t *testing.T) {
 	require.NoError(t, err, "a fenced incarnation failed the delete boundary")
 	require.True(t, agent.isDeleted(current.id))
 }
+
+func TestCorrectionEstablishmentStateBranches(t *testing.T) {
+	failure := errors.New("establishment failed")
+	failed := &session{establishmentFailed: failure}
+	require.ErrorIs(t, failed.establishCurrentIncarnation(context.Background(), false), failure)
+
+	cancelledAttempt := make(chan struct{})
+	waitCancelled := &session{establishing: true, establishmentAttempt: cancelledAttempt}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, waitCancelled.establishCurrentIncarnation(ctx, false), context.Canceled)
+
+	failedAttempt := make(chan struct{})
+	close(failedAttempt)
+	waitFailed := &session{
+		establishing: true, establishmentAttempt: failedAttempt, establishmentAttemptErr: failure,
+		establishmentFailed: failure,
+	}
+	require.ErrorIs(t, waitFailed.establishCurrentIncarnation(context.Background(), false), failure)
+	successfulAttempt := make(chan struct{})
+	close(successfulAttempt)
+	require.NoError(t, (&session{
+		establishing: true, establishmentAttempt: successfulAttempt,
+	}).establishCurrentIncarnation(context.Background(), false))
+
+	established := &session{established: true}
+	established.failEstablishment(errors.New("ignored"))
+	require.Nil(t, established.establishmentFailed)
+
+	ready := make(chan struct{})
+	awaitReady := &session{establishmentWritten: true, establishmentReady: ready}
+	readyCtx, readyCancel := context.WithCancel(context.Background())
+	readyCancel()
+	require.ErrorIs(t, awaitReady.requireEstablished(readyCtx), context.Canceled)
+
+	agent := NewAgent()
+	local := &localAgentConnection{agent: agent, hooks: newEstablishmentHooks(agent.log)}
+	params := mustJSON(t, map[string]any{establishmentHookParam: "7"})
+	local.queueEstablishment(context.Background(), acp.AgentMethodSessionNew, params,
+		acp.NewSessionResponse{SessionId: "missing"})
+	require.Empty(t, local.hooks.all)
+
+	done := make(chan struct{})
+	close(done)
+	agent.runtimeRetirements[77] = &runtimeRetirement{generation: 77, done: done, err: errors.New("contained")}
+	agent.containSharedRuntimeGeneration(77, "coverage")
+}
+
+func TestCorrectionCloseBoundaryRejectsLatchedTerminal(t *testing.T) {
+	current, _, _ := lifecycleSession(t)
+	current.stopPump()
+	cycle := &foregroundCycle{
+		id: "close-cycle", turnID: "close-turn", origin: lifecycle.CauseActivity,
+		interrupted: true, blockers: map[string]struct{}{}, signal: make(chan struct{}),
+	}
+	close(cycle.signal)
+	current.lifecycleMu.Lock()
+	current.cycle = cycle
+	current.lifecycleFailed = errors.New("latched lifecycle failure")
+	current.lifecycleMu.Unlock()
+	require.ErrorContains(t, current.closeBoundary(false), "latched lifecycle failure")
+}

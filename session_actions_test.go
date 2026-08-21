@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -623,4 +624,301 @@ func TestAnAbandonedHostAskRecordsNoCycleFailure(t *testing.T) {
 	requireEventually(t, func() bool { return client.permissionReplyCount() == 1 }, "OpenCode was left blocked")
 	require.NoError(t, current.cycleFailure(current.currentCycle()), "an abandoned ask ended the cycle")
 	require.NoError(t, current.lifecycleFailure())
+}
+
+func TestCorrectionPureOwnershipAndCallbackBranches(t *testing.T) {
+	registry := newActionRegistry()
+	action := &pendingAction{id: "action"}
+	require.False(t, func() bool {
+		_, ok := registry.takeIf("missing", action)
+
+		return ok
+	}())
+
+	require.Error(t, validateActionIdentifiers(&pendingAction{id: "", owner: lifecycle.Owner{ID: "turn"}}))
+	require.NoError(t, validateActionIdentifiers(&pendingAction{id: "action", owner: lifecycle.Owner{ID: "turn"}}))
+
+	current := &session{idmap: idmapRecord{NativeSessionID: "native"}}
+	require.NoError(t, current.refuseNativeAction(context.Background(), &pendingAction{}, false, nil))
+	require.Error(t, current.refuseNativeAction(
+		context.Background(), &pendingAction{}, false, errors.New("refused"),
+	))
+	require.Nil(t, withNativeIncarnationBinding(context.Background(), nil).Value(nativeIncarnationContextKey{}))
+	current.failNativeIncarnation(nil, nil)
+	current.failPendingDispatch(errors.New("ignored"))
+
+	require.False(t, cycleOwnsAction(nil, "action"))
+	require.False(t, cycleOwnsAction(&foregroundCycle{blockers: map[string]struct{}{}}, ""))
+	require.True(t, cycleOwnsAction(&foregroundCycle{blockers: map[string]struct{}{"action": {}}}, "action"))
+
+	original := newTurnNonceRead
+	newTurnNonceRead = func([]byte) (int, error) { return 0, errors.New("nonce failed") }
+	_, err := nativePromptMessageID()
+	newTurnNonceRead = original
+	require.ErrorContains(t, err, "create native prompt message id")
+
+	transport := newConnectionTransport(io.Discard, strings.NewReader(""))
+	transport.interrupt()
+}
+
+func TestCorrectionActionPreflightAndAnnouncementFailures(t *testing.T) {
+	current, _, _ := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+
+	require.Error(t, current.validateHostActionFrame(&pendingAction{
+		id: "question-action", kind: actionElicitation, turnNonce: strings.Repeat("n", lifecycle.IdentifierBound+1),
+		question: opencode.QuestionRequest{
+			ID: "question-action", SessionID: current.idmap.NativeSessionID,
+			Questions: []opencode.QuestionInfo{{Question: "answer", Header: "header"}},
+		},
+		binding: binding,
+	}))
+
+	current.lifecycleMu.Lock()
+	preflightCycle, err := current.openAgentCycleLocked(context.Background())
+	require.NoError(t, err)
+	for index := range lifecycle.EmitterActionLimit {
+		actionID := fmt.Sprintf("preflight-quota-%d", index)
+		_, err = binding.stream.Emit(lifecycle.ActionEvent(lifecycle.PendingAction(
+			actionID, lifecycle.ActionPermission,
+			lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: preflightCycle.turnID}, true,
+		)))
+		require.NoError(t, err)
+		_, err = binding.stream.Emit(lifecycle.ActionEvent(lifecycle.ResolvedAction(
+			actionID, lifecycle.ActionAccepted,
+		)))
+		require.NoError(t, err)
+	}
+	current.lifecycleMu.Unlock()
+	_, err = current.beginAction(context.Background(), &pendingAction{
+		id: "preflight", binding: binding,
+		owner:      lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: preflightCycle.turnID},
+		permission: opencode.PermissionRequest{ID: "preflight", SessionID: current.idmap.NativeSessionID},
+	})
+	require.Error(t, err)
+
+	announcer, _, announceConnection := lifecycleSession(t)
+	announcer.stopPump()
+	binding = testIncarnation(announcer)
+	announcer.lifecycleMu.Lock()
+	cycle, err := announcer.openAgentCycleLocked(context.Background())
+	announcer.lifecycleMu.Unlock()
+	require.NoError(t, err)
+	require.NotNil(t, cycle)
+	announced, err := announcer.announceAction(context.Background(), &pendingAction{
+		id: "bad-transition", binding: binding,
+		owner: lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: cycle.turnID},
+	}, &foregroundCycle{id: "wrong-cycle", turnID: cycle.turnID, origin: cycle.origin})
+	require.True(t, announced)
+	require.Error(t, err)
+
+	announceConnection.mu.Lock()
+	announceConnection.updateErr = errors.New("delivery failed")
+	announceConnection.mu.Unlock()
+	announcer.lifecycleMu.Lock()
+	announcer.lifecycleFailed = nil
+	announcer.installLifecycleStream(announcer.agent.lifecycleNegotiated())
+	announcer.lifecycleMu.Unlock()
+	require.Error(t, announcer.publishLifecycleStream(context.Background()))
+}
+
+func TestCorrectionActionDeliveryAndBlockedTerminalBranches(t *testing.T) {
+	current, _, connection := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+	current.lifecycleMu.Lock()
+	cycle, err := current.openAgentCycleLocked(context.Background())
+	current.lifecycleMu.Unlock()
+	require.NoError(t, err)
+	require.NoError(t, current.emitUpdate(context.Background(), acp.UpdateAgentMessageText("ready")))
+
+	connection.mu.Lock()
+	connection.updateErr = errors.New("delivery failed")
+	connection.updateStarted = make(chan struct{})
+	connection.updateRelease = make(chan struct{})
+	started, release := connection.updateStarted, connection.updateRelease
+	connection.mu.Unlock()
+	result := make(chan struct {
+		announced bool
+		err       error
+	}, 1)
+	go func() {
+		announced, announceErr := current.announceAction(context.Background(), &pendingAction{
+			id: "delivery-failure", binding: binding,
+			owner: lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: cycle.turnID},
+		}, cycle)
+		result <- struct {
+			announced bool
+			err       error
+		}{announced: announced, err: announceErr}
+	}()
+	requireSignal(t, started)
+	current.lifecycleMu.Lock()
+	_ = current.cycle
+	current.lifecycleMu.Unlock()
+	close(release)
+	announcement := <-result
+	announced, err := announcement.announced, announcement.err
+	require.True(t, announced)
+	require.Error(t, err)
+
+	blocked, _, _ := lifecycleSession(t)
+	blocked.stopPump()
+	blockedBinding := testIncarnation(blocked)
+	blocked.lifecycleMu.Lock()
+	blockedCycle, err := blocked.openAgentCycleLocked(context.Background())
+	blocked.lifecycleMu.Unlock()
+	require.NoError(t, err)
+	action := &pendingAction{
+		id: "blocked-action", binding: blockedBinding, cycle: blockedCycle,
+		owner: lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: blockedCycle.turnID},
+	}
+	announced, err = blocked.announceAction(context.Background(), action, blockedCycle)
+	require.True(t, announced)
+	require.NoError(t, err)
+	blocked.lifecycleMu.Lock()
+	blockedCycle.blockers[action.id] = struct{}{}
+	blockedCycle.blockers["other-action"] = struct{}{}
+	blocked.lifecycleMu.Unlock()
+	require.NoError(t, blocked.terminalizeAction(context.Background(), action, lifecycle.ActionCancelled))
+
+	failingTerminal, _, terminalConnection := lifecycleSession(t)
+	failingTerminal.stopPump()
+	terminalBinding := testIncarnation(failingTerminal)
+	failingTerminal.lifecycleMu.Lock()
+	terminalCycle, err := failingTerminal.openAgentCycleLocked(context.Background())
+	failingTerminal.lifecycleMu.Unlock()
+	require.NoError(t, err)
+	terminalAction := &pendingAction{
+		id: "terminal-delivery", binding: terminalBinding, cycle: terminalCycle,
+		owner: lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: terminalCycle.turnID},
+	}
+	announced, err = failingTerminal.announceAction(context.Background(), terminalAction, terminalCycle)
+	require.True(t, announced)
+	require.NoError(t, err)
+	failingTerminal.lifecycleMu.Lock()
+	terminalCycle.blockers[terminalAction.id] = struct{}{}
+	failingTerminal.lifecycleMu.Unlock()
+	terminalConnection.mu.Lock()
+	terminalConnection.updateErr = errors.New("terminal delivery failed")
+	terminalConnection.updateStarted = make(chan struct{})
+	terminalConnection.updateRelease = make(chan struct{})
+	terminalStarted, terminalRelease := terminalConnection.updateStarted, terminalConnection.updateRelease
+	terminalConnection.mu.Unlock()
+	terminalResult := make(chan error, 1)
+	go func() {
+		terminalResult <- failingTerminal.terminalizeAction(
+			context.Background(), terminalAction, lifecycle.ActionCancelled,
+		)
+	}()
+	requireSignal(t, terminalStarted)
+	failingTerminal.lifecycleMu.Lock()
+	_ = failingTerminal.cycle
+	failingTerminal.lifecycleMu.Unlock()
+	close(terminalRelease)
+	require.Error(t, <-terminalResult)
+}
+
+func TestCorrectionActionAdmissionAndSettlementBranches(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+	binding := testIncarnation(current)
+
+	stale := &pendingAction{id: "stale", binding: &nativeIncarnationBinding{}, owner: lifecycle.Owner{ID: "turn"}}
+	_, err := current.beginAction(context.Background(), stale)
+	require.ErrorContains(t, err, "binding is stale")
+
+	wrongOwner := &pendingAction{
+		id: "wrong-owner", binding: binding, owner: lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: "wrong"},
+		permission: opencode.PermissionRequest{ID: "wrong-owner", SessionID: current.idmap.NativeSessionID},
+	}
+	_, err = current.beginAction(context.Background(), wrongOwner)
+	require.ErrorContains(t, err, "owner changed")
+
+	require.Error(t, current.validateHostActionFrame(&pendingAction{
+		id: "marshal", kind: actionPermission, owner: lifecycle.Owner{ID: "turn"},
+		permission: opencode.PermissionRequest{Metadata: map[string]any{"invalid": func() {}}},
+	}))
+	require.ErrorContains(t, current.validateHostActionFrame(&pendingAction{
+		id: "large", kind: actionPermission, owner: lifecycle.Owner{ID: "turn"},
+		permission: opencode.PermissionRequest{Metadata: map[string]any{"large": strings.Repeat("x", maxACPFrameBytes)}},
+	}), "exceeds")
+
+	cycle := &foregroundCycle{
+		id: "cycle", turnID: "turn", origin: lifecycle.CauseActivity,
+		blockers: map[string]struct{}{}, signal: make(chan struct{}),
+	}
+	current.lifecycleMu.Lock()
+	current.cycle = cycle
+	current.lifecycleMu.Unlock()
+
+	cancelledAdmission := &pendingAction{
+		id: "cancelled-admission", binding: binding,
+		owner:              lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: cycle.turnID},
+		permission:         opencode.PermissionRequest{ID: "cancelled-admission", SessionID: current.idmap.NativeSessionID},
+		admissionCancelled: true,
+	}
+	answered, err := current.beginAction(context.Background(), cancelledAdmission)
+	require.NoError(t, err)
+	require.True(t, answered)
+
+	require.False(t, func() bool {
+		_, announceErr := current.announceAction(context.Background(), &pendingAction{binding: &nativeIncarnationBinding{}}, cycle)
+
+		return announceErr == nil
+	}())
+
+	for _, action := range []*pendingAction{
+		{admissionCancelled: true, cycle: &foregroundCycle{signal: make(chan struct{})}},
+		{cycle: func() *foregroundCycle {
+			settledCycle := &foregroundCycle{signal: make(chan struct{})}
+			close(settledCycle.signal)
+
+			return settledCycle
+		}()},
+	} {
+		answered := make(chan nativeActionOutcome, 1)
+		answered <- nativeActionOutcome{state: lifecycle.ActionAccepted}
+		current.awaitActionOutcome(action, answered)
+	}
+
+	innerCancelled := &pendingAction{
+		cycle: &foregroundCycle{signal: make(chan struct{})}, binding: nil,
+	}
+	innerCancelled.admissionMu.Lock()
+	innerAnswered := make(chan nativeActionOutcome)
+	innerDone := make(chan struct{})
+	go func() {
+		current.awaitActionOutcome(innerCancelled, innerAnswered)
+		close(innerDone)
+	}()
+	innerAnswered <- nativeActionOutcome{state: lifecycle.ActionAccepted}
+	close(innerCancelled.cycle.signal)
+	innerCancelled.admissionMu.Unlock()
+	<-innerDone
+
+	unheld := &pendingAction{id: "unheld", binding: binding}
+	current.settleActionNatively(context.Background(), unheld, nativeActionOutcome{})
+	current.settleActionNatively(context.Background(), &pendingAction{
+		id: "stale-settlement", binding: &nativeIncarnationBinding{},
+	}, nativeActionOutcome{})
+	require.ErrorContains(t, current.replyNative(context.Background(), nil, nativeActionOutcome{}), "no incarnation binding")
+
+	require.NoError(t, current.terminalizeAction(context.Background(), &pendingAction{
+		id: "no-cycle", binding: binding,
+	}, lifecycle.ActionCancelled))
+
+	withoutBinding := &session{}
+	withoutBinding.nativeActionResolved(context.Background(), opencode.ActionRepliedEvent{}, lifecycle.ActionCancelled)
+
+	unannounced := &pendingAction{
+		id: "unannounced", binding: binding, cycle: cycle, admissionDone: make(chan struct{}),
+	}
+	close(unannounced.admissionDone)
+	binding.registry.pending[unannounced.id] = unannounced
+	binding.registry.claimed[unannounced.id] = struct{}{}
+	current.nativeActionResolved(context.Background(), opencode.ActionRepliedEvent{RequestID: unannounced.id}, lifecycle.ActionCancelled)
+
+	_ = client
+	_ = connection
 }

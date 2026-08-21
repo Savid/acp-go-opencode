@@ -3632,3 +3632,71 @@ func TestTurnWithNoReadableTranscriptFails(t *testing.T) {
 		require.Equal(t, causeProvider, data[jsonFieldCause])
 	})
 }
+
+func TestCorrectionPromptDispatchAndEmissionFailureBranches(t *testing.T) {
+	original := newTurnNonceRead
+	newTurnNonceRead = func([]byte) (int, error) { return 0, errors.New("nonce failed") }
+	current := &session{}
+	_, commandErr := current.commandDispatch(context.Background(), acp.PromptRequest{
+		Prompt: []acp.ContentBlock{acp.TextBlock("/command")},
+	}, slashCommandPrompt{}, opencode.NativeCommand{Name: "command"})
+	_, messageErr := current.messageDispatch(context.Background(), acp.PromptRequest{
+		Prompt: []acp.ContentBlock{acp.TextBlock("message")},
+	})
+	newTurnNonceRead = original
+	require.ErrorContains(t, commandErr, "native prompt message id")
+	require.ErrorContains(t, messageErr, "native prompt message id")
+
+	donePump := &sessionPump{done: make(chan struct{}), hold: make(chan chan error), released: make(chan struct{}, 1)}
+	close(donePump.done)
+	dispatchSession := &session{pump: donePump}
+	acceptedCycle, turnCtx, completionResult, err := dispatchSession.dispatchAndAccept(
+		context.Background(), "turn", lifecycle.Submission{}, nativeDispatch{},
+	)
+	require.Nil(t, completionResult)
+	require.Nil(t, acceptedCycle)
+	require.Equal(t, "turn", turnNonceFromContext(turnCtx))
+	require.ErrorContains(t, err, "pump stopped")
+
+	cycle := &foregroundCycle{dispatchProven: true, dispatchEvidence: make(chan struct{})}
+	reserved := &session{cycle: cycle}
+	completion, err := reserved.sendReservedNativeFrame(context.Background(), cycle, nativeDispatch{
+		send: func(context.Context) error { return errors.New("completion failed") },
+	})
+	require.NoError(t, err)
+	require.ErrorContains(t, <-completion, "completion failed")
+
+	completion, err = reserved.sendReservedNativeFrame(context.Background(), cycle, nativeDispatch{
+		send: func(context.Context) error { return nil }, reportsCompletion: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, <-completion)
+
+	cancelClient := newFakeOpenCodeClient()
+	cancelSession := testSession(t, NewAgent(), cancelClient)
+	cancelCycle := &foregroundCycle{signal: make(chan struct{})}
+	cancelSession.lifecycleMu.Lock()
+	cancelSession.cycle = cancelCycle
+	cancelSession.lifecycleMu.Unlock()
+	cancelClient.abortFunc = func(string) error {
+		cancelSession.lifecycleMu.Lock()
+		cancelCycle.lost = errors.New("lost after interrupt")
+		cancelCycle.wake()
+		cancelSession.lifecycleMu.Unlock()
+
+		return nil
+	}
+	end := cancelSession.settleCancelledTurn(context.Background(), cancelCycle)
+	require.ErrorContains(t, end.lost, "lost after interrupt")
+
+	emitFailure := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	emitFailure.delivery.close()
+	err = emitFailure.emitPartUpdates(context.Background(), roleAssistant, opencode.NativePart{
+		ID: "part", MessageID: "assistant", Type: partTypeText, Text: "text",
+	}, "", false)
+	require.Error(t, err)
+
+	emitFailure.emittedUsage = map[string]emittedUsageState{}
+	err = emitFailure.emitUsageUpdate(context.Background(), "assistant", opencode.NativeTokens{Input: 1}, 10)
+	require.Error(t, err)
+}

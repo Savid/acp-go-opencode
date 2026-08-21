@@ -201,3 +201,129 @@ func TestRawWriterPanicFencesWithoutBlockingClose(t *testing.T) {
 	}()
 	requireSignal(t, closed)
 }
+
+type coverageInterruptClient struct {
+	*recordingAgentClient
+	once  sync.Once
+	typed chan struct{}
+	raw   chan struct{}
+}
+
+func (c *coverageInterruptClient) InterruptWrites() {
+	c.once.Do(func() {
+		close(c.typed)
+		close(c.raw)
+	})
+}
+
+func TestCorrectionDeliveryDefensiveBranches(t *testing.T) {
+	agent := NewAgent()
+	delivery := newSessionDelivery(agent, "missing")
+	delivery.terminalizePanic("ignored")
+	(*sessionDelivery)(nil).terminalizePanic("ignored")
+
+	full := newSessionDelivery(agent, "session")
+	full.started = true
+	for range authoritativeDeliveryCapacity {
+		full.typed <- authoritativeDelivery{done: make(chan error, 1)}
+	}
+	_, err := full.enqueueUpdate(context.Background(), acp.SessionNotification{})
+	require.ErrorContains(t, err, "queue is full")
+	for range authoritativeDeliveryCapacity {
+		<-full.typed
+	}
+
+	closed := newSessionDelivery(agent, "session")
+	closed.closed = true
+	closed.enqueueRaw(context.Background(), map[string]any{"type": "ignored"})
+	require.ErrorContains(t, closed.flushRaw(context.Background()), "closed")
+	closed.close()
+	(*sessionDelivery)(nil).close()
+
+	queueBlocked := newSessionDelivery(agent, "session")
+	queueBlocked.started = true
+	for range rawDeliveryCapacity {
+		queueBlocked.raw <- rawDelivery{}
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, queueBlocked.flushRaw(cancelled), context.Canceled)
+	for range rawDeliveryCapacity {
+		<-queueBlocked.raw
+	}
+
+	waiting := newSessionDelivery(agent, "session")
+	waiting.started = true
+	received := make(chan struct{})
+	go func() {
+		<-waiting.raw
+		close(received)
+	}()
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- waiting.flushRaw(waitCtx) }()
+	requireSignal(t, received)
+	waitCancel()
+	require.ErrorIs(t, <-waitDone, context.Canceled)
+
+	rawWorker := newSessionDelivery(agent, "session")
+	rawCtx, rawCancel := context.WithCancel(context.Background())
+	go rawWorker.runRaw(rawCtx)
+	flushDone := make(chan error, 1)
+	rawWorker.raw <- rawDelivery{done: flushDone}
+	require.NoError(t, <-flushDone)
+	rawCancel()
+	requireSignal(t, rawWorker.rawDone)
+
+	require.ErrorContains(t,
+		newSessionDelivery(NewAgent(), "session").deliverRaw(context.Background(), map[string]any{}, 1),
+		"no ACP connection",
+	)
+	rawAgent := NewAgent()
+	rawAgent.setAgentClient(newRecordingAgentClient())
+	require.Error(t, newSessionDelivery(rawAgent, "session").deliverRaw(
+		context.Background(), map[string]any{"invalid": func() {}, "_meta": func() {}}, 1,
+	))
+
+	queuedRaw := newSessionDelivery(agent, "session")
+	rawReceipt := make(chan error, 1)
+	queuedRaw.raw <- rawDelivery{}
+	queuedRaw.raw <- rawDelivery{done: rawReceipt}
+	queuedRaw.failRawQueued(errors.New("stopped"))
+	require.ErrorContains(t, <-rawReceipt, "stopped")
+
+	typedDone, rawDone := make(chan struct{}), make(chan struct{})
+	interruptAgent := NewAgent()
+	interruptAgent.setAgentClient(&coverageInterruptClient{
+		recordingAgentClient: newRecordingAgentClient(), typed: typedDone, raw: rawDone,
+	})
+	alreadyClosed := newSessionDelivery(interruptAgent, "session")
+	alreadyClosed.closed = true
+	alreadyClosed.started = true
+	alreadyClosed.typedDone = typedDone
+	alreadyClosed.rawDone = rawDone
+	alreadyClosed.close()
+}
+
+func TestCorrectionAuxiliaryDeliveryAndAuthBranches(t *testing.T) {
+	delivery := newSessionDelivery(nil, "raw")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go delivery.runRaw(ctx)
+	delivery.raw <- rawDelivery{payload: map[string]any{"value": true}, done: done}
+	require.Error(t, <-done)
+	cancel()
+	<-delivery.rawDone
+
+	auth := &providerAuth{}
+	authCtx, authCancel := context.WithCancel(context.Background())
+	authCancel()
+	auth.waitCompletion(authCtx, &authFlow{completionDone: make(chan struct{})})
+
+	droppedRaw := newSessionDelivery(nil, "full-raw")
+	droppedRaw.started = true
+	for index := 0; index < cap(droppedRaw.raw); index++ {
+		droppedRaw.raw <- rawDelivery{payload: map[string]any{"index": index}}
+	}
+	droppedRaw.enqueueRaw(context.Background(), map[string]any{"overflow": true})
+}

@@ -1744,3 +1744,76 @@ func TestACycleSettlesExactlyOnce(t *testing.T) {
 	require.NoError(t, current.settleCycle(
 		context.Background(), nil, lifecycle.OutcomeSuccess, string(acp.StopReasonEndTurn)))
 }
+
+func TestCorrectionAcceptPromptDeliveryFailure(t *testing.T) {
+	current, _, connection := lifecycleSession(t)
+	current.stopPump()
+	cycle, _, err := current.reservePromptCycle(context.Background(), "message", lifecycle.Submission{
+		SubmissionID: "submission", ClientNonce: "nonce",
+	})
+	require.NoError(t, err)
+	connection.mu.Lock()
+	connection.updateErr = errors.New("delivery failed")
+	connection.updateStarted = make(chan struct{})
+	connection.updateRelease = make(chan struct{})
+	started, release := connection.updateStarted, connection.updateRelease
+	connection.mu.Unlock()
+	result := make(chan error, 1)
+	go func() {
+		result <- current.acceptPromptCycle(context.Background(), cycle, lifecycle.Submission{
+			SubmissionID: "submission", ClientNonce: "nonce",
+		})
+	}()
+	requireSignal(t, started)
+	current.lifecycleMu.Lock()
+	_ = current.cycle
+	current.lifecycleMu.Unlock()
+	close(release)
+	require.Error(t, <-result)
+}
+
+func TestCorrectionLifecycleDirectFailureBranches(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	current := &session{}
+	current.stampIncarnationGeneration(client, 7)
+	require.NotNil(t, current.incarnation)
+
+	invalidCycle := &foregroundCycle{reserved: true}
+	require.Error(t, current.acceptPromptCycle(context.Background(), invalidCycle, lifecycle.Submission{}))
+	current.abandonPromptCycle(nil)
+
+	stream := lifecycle.NewStream("stream", lifecycle.Negotiated{Versions: []int{1}})
+	stream.Close()
+	cycle := &foregroundCycle{
+		id: "cycle", turnID: "turn", reserved: true, blockers: map[string]struct{}{}, signal: make(chan struct{}),
+	}
+	direct := &session{
+		incarnation: &nativeIncarnationBinding{client: client, stream: stream, registry: newActionRegistry()},
+		cycle:       cycle,
+		delivery:    newSessionDelivery(nil, "session"),
+	}
+	direct.delivery.agent = nil
+	require.Error(t, direct.acceptPromptCycle(context.Background(), cycle,
+		lifecycle.Submission{SubmissionID: "submission", ClientNonce: "nonce"}))
+
+	validStream := lifecycle.NewStream("open", lifecycle.Negotiated{Versions: []int{1}})
+	_, err := validStream.Emit(lifecycle.SnapshotEvent(
+		lifecycle.Foreground{State: lifecycle.ForegroundIdle, CycleID: "cycle-0"}, nil, lifecycle.QuiescenceFact{},
+	))
+	require.NoError(t, err)
+	closedDelivery := newSessionDelivery(nil, "session")
+	closedDelivery.closed = true
+	openFailure := &session{
+		incarnation: &nativeIncarnationBinding{client: client, stream: validStream, registry: newActionRegistry()},
+		delivery:    closedDelivery,
+	}
+	_, err = openFailure.openAgentCycleLocked(context.Background())
+	require.Error(t, err)
+
+	closeCycle := &foregroundCycle{
+		id: "close-cycle", turnID: "close-turn", blockers: map[string]struct{}{}, signal: make(chan struct{}),
+	}
+	openFailure.cycle = closeCycle
+	require.Error(t, openFailure.settleCloseCycle(context.Background(), closeCycle))
+	require.False(t, openFailure.latchLifecycleIncarnationLossLocked(nil, "ignored", nil))
+}
