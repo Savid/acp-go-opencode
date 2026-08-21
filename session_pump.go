@@ -435,8 +435,8 @@ func nativeEventCausallyMatchesCycleLocked(event opencode.Event, cycle *foregrou
 		}
 
 		// OpenCode echoes the parts of the dispatched user message back over the
-		// stream, so the prompt's own message is one of the identities its cycle
-		// owns.
+		// stream after accepting it, so the prompt's own message addresses this
+		// cycle just as much as any step the answer is built from.
 		return part.MessageID == cycle.nativeMessageID || cycle.ownsAssistant(part.MessageID)
 	case opencode.EventSessionIdle:
 		return cycle.assistantTerminal || cycle.interrupted
