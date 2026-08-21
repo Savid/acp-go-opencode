@@ -651,10 +651,10 @@ func TestCorrectionPureOwnershipAndCallbackBranches(t *testing.T) {
 	require.False(t, cycleOwnsAction(&foregroundCycle{blockers: map[string]struct{}{}}, ""))
 	require.True(t, cycleOwnsAction(&foregroundCycle{blockers: map[string]struct{}{"action": {}}}, "action"))
 
-	original := newTurnNonceRead
-	newTurnNonceRead = func([]byte) (int, error) { return 0, errors.New("nonce failed") }
+	original := nativeMessageIDEntropy
+	nativeMessageIDEntropy = failingRouteReader{}
 	_, err := nativePromptMessageID()
-	newTurnNonceRead = original
+	nativeMessageIDEntropy = original
 	require.ErrorContains(t, err, "create native prompt message id")
 
 	transport := newConnectionTransport(io.Discard, strings.NewReader(""))

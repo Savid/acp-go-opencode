@@ -2,10 +2,12 @@ package opencodeacp
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"path/filepath"
@@ -394,8 +396,12 @@ func (s *session) messageDispatch(ctx context.Context, params acp.PromptRequest)
 	}, nil
 }
 
+// nativeMessageIDEntropy is the randomness the native user-message identifier
+// of a prompt is minted from.
+var nativeMessageIDEntropy io.Reader = rand.Reader
+
 func nativePromptMessageID() (string, error) {
-	id, err := NewTurnNonce()
+	id, err := opencode.NewMessageID(nativeMessageIDEntropy)
 	if err != nil {
 		return "", fmt.Errorf("create native prompt message id: %w", err)
 	}

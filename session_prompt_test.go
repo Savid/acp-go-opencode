@@ -3424,6 +3424,29 @@ func TestRefusedMessageFrameIsReportedAsRejected(t *testing.T) {
 	require.Equal(t, "opencode_prompt_rejected", data[jsonFieldError])
 }
 
+// TestPromptNamesItsUserMessageInNativeIdentifierShape proves the identifier
+// this adapter posts with a prompt is spelled the way OpenCode spells the
+// message identifiers it mints itself — the installed server's own journal
+// holds `msg_022cba89d001cpfIW4PKqfWORF`. A messageID in any other shape is
+// refused by the native dispatcher before a run exists.
+func TestPromptNamesItsUserMessageInNativeIdentifierShape(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	current := testSession(t, NewAgent(), client)
+	posted := make(chan string, 1)
+
+	client.dispatchMessage = func(_ context.Context, id string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
+		posted <- req.MessageID
+
+		return opencode.NativeMessage{Info: opencode.NativeMessageInfo{
+			ID: "assistant-1", SessionID: id, Role: roleAssistant, Finish: "stop",
+		}}, nil
+	}
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+	require.NoError(t, err)
+	require.Regexp(t, `^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`, <-posted)
+}
+
 // TestCommandRunFailureAfterAcceptanceFailsTheAcceptedTurn proves the
 // completion-reporting route's two boundaries are distinct: the first native
 // event admits the frame, and the route's later error is the accepted turn's
@@ -3634,8 +3657,8 @@ func TestTurnWithNoReadableTranscriptFails(t *testing.T) {
 }
 
 func TestCorrectionPromptDispatchAndEmissionFailureBranches(t *testing.T) {
-	original := newTurnNonceRead
-	newTurnNonceRead = func([]byte) (int, error) { return 0, errors.New("nonce failed") }
+	original := nativeMessageIDEntropy
+	nativeMessageIDEntropy = failingRouteReader{}
 	current := &session{}
 	_, commandErr := current.commandDispatch(context.Background(), acp.PromptRequest{
 		Prompt: []acp.ContentBlock{acp.TextBlock("/command")},
@@ -3643,7 +3666,7 @@ func TestCorrectionPromptDispatchAndEmissionFailureBranches(t *testing.T) {
 	_, messageErr := current.messageDispatch(context.Background(), acp.PromptRequest{
 		Prompt: []acp.ContentBlock{acp.TextBlock("message")},
 	})
-	newTurnNonceRead = original
+	nativeMessageIDEntropy = original
 	require.ErrorContains(t, commandErr, "native prompt message id")
 	require.ErrorContains(t, messageErr, "native prompt message id")
 
