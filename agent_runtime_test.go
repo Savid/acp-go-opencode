@@ -152,7 +152,11 @@ func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	current := &session{
+		client:            client,
 		runtimeGeneration: 1,
+		incarnation: &nativeIncarnationBinding{
+			client: client, generation: 1, registry: newActionRegistry(),
+		},
 		directoryRelease: func() {
 			panic("detach release panic")
 		},
@@ -232,7 +236,8 @@ func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
 			fatalErr := agent.runtimeFatalErr
 			agent.mu.Unlock()
 			require.ErrorIs(t, retirement.err, opencode.ErrProcessContainmentIncomplete)
-			require.ErrorContains(t, retirement.err, test.panicText)
+			require.ErrorContains(t, retirement.err, "panicked")
+			require.NotContains(t, retirement.err.Error(), test.panicText)
 			require.ErrorIs(t, fatalErr, opencode.ErrProcessContainmentIncomplete)
 			require.True(t, retirement.err == agent.retireSharedRuntime(1, "late waiter"))
 		})
@@ -592,9 +597,6 @@ func TestDirectoryBindingIncarnationSkipsZeroAfterWrap(t *testing.T) {
 }
 
 func TestRuntimeResourceCleanupProofAndDeletionGates(t *testing.T) {
-	originalRemoveAll := runtimeRemoveAll
-	t.Cleanup(func() { runtimeRemoveAll = originalRemoveAll })
-
 	t.Run("ordinary post-proof error releases both permits after deletion", func(t *testing.T) {
 		root := t.TempDir()
 		agent := NewAgent(WithScratchDir(root))
@@ -638,8 +640,7 @@ func TestRuntimeResourceCleanupProofAndDeletionGates(t *testing.T) {
 		root := t.TempDir()
 		agent := NewAgent(WithScratchDir(root))
 		removeErr := errors.New("remove failed")
-		runtimeRemoveAll = func(string) error { return removeErr }
-		t.Cleanup(func() { runtimeRemoveAll = originalRemoveAll })
+		t.Cleanup(replaceRuntimeRemoveAll(func(string) error { return removeErr }))
 
 		var nativeReleased, scratchReleased atomic.Bool
 		err := agent.cleanupRuntimeResources(
@@ -689,8 +690,7 @@ func TestRuntimeResourceCleanupProofAndDeletionGates(t *testing.T) {
 	t.Run("dual generation and XDG delete failures retain both scratch reservations", func(t *testing.T) {
 		agent := NewAgent(WithScratchDir(t.TempDir()))
 		xdgRemoveErr := errors.New("XDG removal failed")
-		runtimeRemoveAll = func(string) error { return xdgRemoveErr }
-		t.Cleanup(func() { runtimeRemoveAll = originalRemoveAll })
+		t.Cleanup(replaceRuntimeRemoveAll(func(string) error { return xdgRemoveErr }))
 
 		var nativeReleased, xdgReleased atomic.Bool
 		generationRemoveErr := errors.New("generation removal failed")
@@ -917,10 +917,8 @@ func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
 }
 
 func TestRuntimeExitWatcherLatchesScratchCleanupFailure(t *testing.T) {
-	originalRemoveAll := runtimeRemoveAll
 	removeErr := errors.New("remove failed")
-	runtimeRemoveAll = func(string) error { return removeErr }
-	t.Cleanup(func() { runtimeRemoveAll = originalRemoveAll })
+	t.Cleanup(replaceRuntimeRemoveAll(func(string) error { return removeErr }))
 
 	base := newFakeOpenCodeClient()
 	client := &proofFailureRuntimeClient{
@@ -988,10 +986,8 @@ func TestRuntimeStartLatchesUnprovenTree(t *testing.T) {
 }
 
 func TestRuntimeStartLatchesScratchCleanupFailure(t *testing.T) {
-	originalRemoveAll := runtimeRemoveAll
 	removeErr := errors.New("remove failed")
-	runtimeRemoveAll = func(string) error { return removeErr }
-	t.Cleanup(func() { runtimeRemoveAll = originalRemoveAll })
+	t.Cleanup(replaceRuntimeRemoveAll(func(string) error { return removeErr }))
 
 	var starts atomic.Int32
 	var nativeReleased, scratchReleased atomic.Bool

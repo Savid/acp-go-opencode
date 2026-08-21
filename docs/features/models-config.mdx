@@ -45,17 +45,17 @@ to the running runtime until it restarts. A value missing from the advertised
 set is therefore not evidence it is unusable, and refusing on it would turn a
 per-turn condition into a failed `session/new`.
 
-An unknown value surfaces as OpenCode's own error, on the turn that used it:
-the uniform `opencode_turn_failed` provider failure described below, carrying
-the native message.
+An unknown value surfaces on the turn that used it as the uniform
+`opencode_turn_failed` provider failure described below. The native diagnostic
+stays private.
 
-| Value | Native message |
+| Value | Host-visible classification |
 |---|---|
-| Unknown model | `Model not found: <provider>/<model>. Did you mean: ...` |
-| Unknown mode | `Agent not found: "<mode>". Available agents: ...` |
+| Unknown model | `cause: "provider"`, fixed provider-failure message |
+| Unknown mode | `cause: "provider"`, fixed provider-failure message |
 
-`statusCode` and `providerCode` are absent from both, because the native errors
-report neither and the adapter invents nothing.
+`statusCode` is absent from both because the native errors report none, and a
+provider code is never copied to the ACP failure surface.
 
 The two failures reach the host the same way but differ natively. An unknown
 model fails inside a run that started, so OpenCode idles the turn afterwards.
@@ -110,10 +110,10 @@ server's `/doc` advertises the `OutputFormatJsonSchema` component.
 When the selected model rejects structured output (the provider returns an
 assistant/provider error, common with free Zen models), the turn fails with a
 structured ACP internal error whose `data` carries
-`error: "opencode_turn_failed"`, `cause: "provider"`, the native `message`,
-and—when the provider reports them—`statusCode` (int) and `providerCode`
-(string). The
-`data` also carries `structuredOutputRequested: true` when this turn sent a
+`error: "opencode_turn_failed"`, `cause: "provider"`, a fixed closed `message`,
+and—when the provider reports it—a numeric `statusCode`. Native provider text
+and provider codes remain private. The `data` also carries
+`structuredOutputRequested: true` when this turn sent a
 native schema, letting a host detect that the structured-output turn was the
 trigger; slash-command turns always report `false`.
 

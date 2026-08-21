@@ -7,6 +7,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/lifecycle"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 // foregroundCycle is one foreground epoch of the session's lifecycle stream: a
@@ -20,6 +21,18 @@ type foregroundCycle struct {
 	id     string
 	turnID string
 	origin lifecycle.Cause
+	// turnNonce is the host-authenticated route of a submission-origin cycle.
+	// Agent-origin work carries none, so an event received before a later prompt
+	// can never borrow that prompt's route when dispatch holding delays delivery.
+	turnNonce string
+	// reserved makes prompt admission and agent-origin opening one atomic choice.
+	// It is installed before native POST and becomes accepted only when the POST
+	// acknowledges admission or a structurally addressed native event proves it.
+	reserved         bool
+	accepted         bool
+	dispatchProven   bool
+	dispatchEvidence chan struct{}
+	nativeMessageID  string
 	// blockers are the actions that stopped this cycle and have not
 	// terminalized. The cycle cannot move while one remains.
 	blockers map[string]struct{}
@@ -29,8 +42,9 @@ type foregroundCycle struct {
 	settled bool
 	// failure is the native turn failure this cycle carries, and assistantID the
 	// native assistant message it produced.
-	failure     error
-	assistantID string
+	failure           error
+	assistantID       string
+	assistantTerminal bool
 	// lost records that the cycle ended with no native terminal signal at all,
 	// and incarnationLost records that the reason was the death of the
 	// incarnation itself rather than a stop the harness declined to make. The
@@ -85,34 +99,47 @@ func (s *session) openLifecycleStream() {
 // caller owns the lifecycle mutex, or owns the session outright because it has not
 // been published yet.
 func (s *session) installLifecycleStream(facts lifecycle.Negotiated) {
-	if !facts.Present() {
-		return
+	registry := newActionRegistry()
+
+	var stream *lifecycle.Stream
+
+	if facts.Present() {
+		id, err := NewTurnNonce()
+		if err != nil {
+			s.lifecycleFailed = err
+		} else {
+			stream = lifecycle.NewStream(id, facts)
+		}
 	}
 
-	id, err := NewTurnNonce()
-	if err != nil {
-		s.lifecycleFailed = err
-
-		return
+	s.incarnation = &nativeIncarnationBinding{
+		client: s.client, generation: s.runtimeGeneration, stream: stream, registry: registry,
 	}
-
-	s.lifecycleStream = lifecycle.NewStream(id, facts)
 	s.lifecycleOpened = false
 	s.cycle = nil
+	s.pendingAgentObservations = 0
 }
 
-// reopenLifecycleStream replaces a fenced incarnation's stream with the recovered
-// incarnation's. The fenced stream can carry nothing further, and the recovered
-// native session's events belong to their own ordering, so the identity changes
-// with the incarnation rather than outliving it.
-func (s *session) reopenLifecycleStream() {
-	facts := s.agent.lifecycleNegotiated()
-
+// stampIncarnationGeneration completes the immutable binding assembled before a
+// newly created session is published. No action can exist yet; retaining the
+// fresh stream and registry while fixing the runtime identity avoids four
+// independently mutable authority fields.
+func (s *session) stampIncarnationGeneration(client opencode.Client, generation uint64) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	s.lifecycleFailed = nil
-	s.installLifecycleStream(facts)
+	if s.incarnation == nil {
+		s.incarnation = &nativeIncarnationBinding{
+			client: client, generation: generation, registry: newActionRegistry(),
+		}
+
+		return
+	}
+
+	s.incarnation = &nativeIncarnationBinding{
+		client: client, generation: generation,
+		stream: s.incarnation.stream, registry: s.incarnation.registry,
+	}
 }
 
 // publishLifecycleStream emits the opening snapshot. It states the whole truth
@@ -124,7 +151,8 @@ func (s *session) reopenLifecycleStream() {
 func (s *session) publishLifecycleStream(ctx context.Context) error {
 	s.lifecycleMu.Lock()
 
-	if s.lifecycleStream == nil || s.lifecycleOpened {
+	stream := s.lifecycleStreamLocked()
+	if stream == nil || s.lifecycleOpened {
 		err := s.lifecycleFailed
 		s.lifecycleMu.Unlock()
 
@@ -149,50 +177,94 @@ func (s *session) publishLifecycleStream(ctx context.Context) error {
 // pretending the stream is healthy would hide the gap behind an apparently
 // contiguous stream.
 func (s *session) emitLifecycle(ctx context.Context, event lifecycle.Event) error {
+	binding := s.currentIncarnation()
 	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
+	receipt, err := s.emitLifecycleLocked(ctx, event)
+	s.lifecycleMu.Unlock()
 
-	return s.emitLifecycleLocked(ctx, event)
+	if err == nil {
+		err = waitDelivery(ctx, receipt)
+	}
+
+	if err != nil {
+		s.failLifecycleDelivery(binding, err)
+	}
+
+	return err
 }
 
-func (s *session) emitLifecycleLocked(ctx context.Context, event lifecycle.Event) error {
-	if s.lifecycleStream == nil {
-		return s.lifecycleFailed
+func (s *session) emitLifecycleLocked(ctx context.Context, event lifecycle.Event) (deliveryReceipt, error) {
+	return s.emitLifecycleLockedWithFailure(ctx, event, true)
+}
+
+// emitLifecycleLockedWithFailure allows action admission to defer incarnation
+// retirement until it has rejected the exact native request that the failed
+// announcement would otherwise leave blocked. All other authoritative delivery
+// retains the worker's immediate fail-closed callback.
+func (s *session) emitLifecycleLockedWithFailure(
+	ctx context.Context,
+	event lifecycle.Event,
+	containOnFailure bool,
+) (deliveryReceipt, error) {
+	stream := s.lifecycleStreamLocked()
+	if stream == nil {
+		return nil, s.lifecycleFailed
 	}
 
 	if s.lifecycleFailed != nil {
-		return s.lifecycleFailed
+		return nil, s.lifecycleFailed
 	}
 
-	envelope, err := s.lifecycleStream.Emit(event) // claims before delivery
+	envelope, err := stream.Emit(event) // claims before delivery
 	if err != nil {
 		s.lifecycleFailed = err
 
-		return err
+		return nil, err
 	}
 
-	conn := s.agent.connection()
-	if conn == nil {
-		err = errors.New("lifecycle delivery has no ACP connection")
-		s.lifecycleFailed = err
+	binding := s.incarnation
 
-		return err
+	onFailures := []func(error){}
+	if containOnFailure {
+		onFailures = append(onFailures, func(err error) { s.failLifecycleDelivery(binding, err) })
 	}
 
-	err = conn.SessionUpdate(ctx, acp.SessionNotification{
+	receipt, err := s.delivery.enqueueUpdate(ctx, acp.SessionNotification{
 		SessionId: s.id,
 		Meta:      map[string]any{lifecycle.MetaKey: envelope},
 		Update: acp.SessionUpdate{SessionInfoUpdate: &acp.SessionSessionInfoUpdate{
 			SessionUpdate: string(lifecycle.CarrierSessionInfo),
 		}},
-	})
+	}, onFailures...)
 	if err != nil {
-		s.lifecycleFailed = fmt.Errorf("deliver lifecycle sequence: %w", err)
+		s.lifecycleFailed = errors.New("lifecycle delivery failed")
 
-		return s.lifecycleFailed
+		return nil, s.lifecycleFailed
 	}
 
-	return nil
+	return receipt, nil
+}
+
+func (s *session) failLifecycleDelivery(binding *nativeIncarnationBinding, err error) {
+	if err == nil || binding == nil {
+		return
+	}
+
+	s.lifecycleMu.Lock()
+	if s.incarnation != binding {
+		s.lifecycleMu.Unlock()
+
+		return
+	}
+
+	if s.lifecycleFailed == nil {
+		s.lifecycleFailed = errors.New("lifecycle delivery failed")
+	}
+
+	failure := s.lifecycleFailed
+	s.lifecycleMu.Unlock()
+
+	s.failNativeIncarnation(binding, failure)
 }
 
 // acceptPromptCycle opens the prompt-origin turn for a frame the native
@@ -206,51 +278,150 @@ func (s *session) emitLifecycleLocked(ctx context.Context, event lifecycle.Event
 // nonce, because the nonce is the host's anti-stale authenticator, not turn
 // identity — a host that reuses a nonce must never collide with a turn the
 // stream already introduced.
-func (s *session) acceptPromptCycle(ctx context.Context, submission lifecycle.Submission) (*foregroundCycle, error) {
+func (s *session) reservePromptCycle(
+	ctx context.Context,
+	nativeMessageID string,
+	submission lifecycle.Submission,
+) (*foregroundCycle, context.Context, error) {
 	s.lifecycleMu.Lock()
+	binding := s.incarnation
 
-	if s.cycle != nil {
-		cycle := s.cycle
+	if s.cycle != nil || s.pendingAgentObservations > 0 {
 		s.lifecycleMu.Unlock()
 
-		return nil, fmt.Errorf("OpenCode session already holds foreground cycle %s", cycle.id)
+		return nil, nil, acp.NewInvalidRequest(map[string]any{
+			jsonFieldError: errValueBackpressure,
+			jsonFieldLimit: limitSessionPrompt,
+		})
 	}
 
-	s.cycleCounter++
-	s.turnCounter++
+	nextCycle := s.cycleCounter + 1
+	nextTurn := s.turnCounter + 1
+
 	cycle := &foregroundCycle{
-		id:       fmt.Sprintf("cycle-%d", s.cycleCounter),
-		turnID:   fmt.Sprintf("turn-%d", s.turnCounter),
-		origin:   lifecycle.CauseSubmission,
-		blockers: map[string]struct{}{},
-		signal:   make(chan struct{}),
+		id:               fmt.Sprintf("cycle-%d", nextCycle),
+		turnID:           fmt.Sprintf("turn-%d", nextTurn),
+		origin:           lifecycle.CauseSubmission,
+		turnNonce:        turnNonceFromContext(ctx),
+		reserved:         true,
+		dispatchEvidence: make(chan struct{}),
+		nativeMessageID:  nativeMessageID,
+		blockers:         map[string]struct{}{},
+		signal:           make(chan struct{}),
 	}
-	s.cycle = cycle
+	if stream := s.lifecycleStreamLocked(); stream != nil {
+		if err := stream.Preflight(
+			lifecycle.AcceptedEvent(submission, cycle.turnID),
+			lifecycle.TransitionEvent(
+				lifecycle.ForegroundRunning, cycle.id, cycle.turnID, lifecycle.CauseSubmission,
+			),
+		); err != nil {
+			s.lifecycleFailed = err
+			s.lifecycleMu.Unlock()
+			s.failNativeIncarnation(binding, err)
 
-	err := s.emitLifecycleLocked(ctx, lifecycle.AcceptedEvent(submission, cycle.turnID))
+			return nil, nil, err
+		}
+	}
+
+	turnCtx, cancel := context.WithCancel(withNativeIncarnationBinding(ctx, binding))
+	turnCtx = withTurnRoute(turnCtx, cycle.turnNonce)
+	s.cycle = cycle
+	s.cancel = cancel
+	s.cancelled = false
+	s.pendingDispatchFailure = nil
+	s.turnNonce = cycle.turnNonce
+	s.submission = submission
+	s.lifecycleMu.Unlock()
+
+	return cycle, turnCtx, nil
+}
+
+func (s *session) acceptPromptCycle(
+	ctx context.Context,
+	cycle *foregroundCycle,
+	submission lifecycle.Submission,
+) error {
+	binding := s.nativeIncarnationForContext(ctx)
+	s.lifecycleMu.Lock()
+
+	if s.cycle != cycle || cycle == nil || !cycle.reserved {
+		s.lifecycleMu.Unlock()
+
+		return errors.New("OpenCode prompt reservation is no longer current")
+	}
+
+	cycle.reserved = false
+	cycle.accepted = true
+
+	receipts := make([]deliveryReceipt, 0, 2)
+
+	receipt, err := s.emitLifecycleLocked(ctx, lifecycle.AcceptedEvent(submission, cycle.turnID))
 	if err == nil {
-		err = s.emitLifecycleLocked(ctx, lifecycle.TransitionEvent(
+		receipts = append(receipts, receipt)
+	}
+
+	if err == nil {
+		receipt, err = s.emitLifecycleLocked(ctx, lifecycle.TransitionEvent(
 			lifecycle.ForegroundRunning, cycle.id, cycle.turnID, lifecycle.CauseSubmission,
 		))
+		if err == nil {
+			receipts = append(receipts, receipt)
+		}
 	}
 
 	if err != nil {
 		s.cycle = nil
 		s.lifecycleMu.Unlock()
+		s.failNativeIncarnation(binding, err)
 
-		return nil, err
+		return err
 	}
+
+	s.cycleCounter++
+	s.turnCounter++
 
 	s.lifecycleMu.Unlock()
 
-	return cycle, nil
+	for _, receipt := range receipts {
+		if err := waitDelivery(ctx, receipt); err != nil {
+			s.failLifecycleDelivery(binding, err)
+
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *session) abandonPromptCycle(cycle *foregroundCycle) {
+	s.lifecycleMu.Lock()
+
+	if cycle == nil || s.cycle != cycle || !cycle.reserved {
+		s.lifecycleMu.Unlock()
+
+		return
+	}
+
+	cycle.settled = true
+	s.cycle = nil
+	cancel := s.cancel
+	s.cancel = nil
+	s.pendingDispatchFailure = nil
+	s.turnNonce = ""
+	s.submission = lifecycle.Submission{}
+	s.lifecycleMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // openAgentCycle opens an agent-origin turn for native work no submission
 // caused. Its turn id is minted from the ordered stream rather than from a route
 // nonce, because no client turn authenticated it.
 func (s *session) openAgentCycleLocked(ctx context.Context) (*foregroundCycle, error) {
-	if s.lifecycleStream == nil {
+	if s.lifecycleStreamLocked() == nil {
 		return nil, s.lifecycleFailed
 	}
 
@@ -258,22 +429,31 @@ func (s *session) openAgentCycleLocked(ctx context.Context) (*foregroundCycle, e
 		return s.cycle, nil
 	}
 
-	s.cycleCounter++
-	s.turnCounter++
+	nextCycle := s.cycleCounter + 1
+	nextTurn := s.turnCounter + 1
 	cycle := &foregroundCycle{
-		id:       fmt.Sprintf("cycle-%d", s.cycleCounter),
-		turnID:   fmt.Sprintf("agent-turn-%d", s.turnCounter),
+		id:       fmt.Sprintf("cycle-%d", nextCycle),
+		turnID:   fmt.Sprintf("agent-turn-%d", nextTurn),
 		origin:   lifecycle.CauseActivity,
 		blockers: map[string]struct{}{},
 		signal:   make(chan struct{}),
 	}
 
-	if err := s.emitLifecycleLocked(ctx, lifecycle.TransitionEvent(
+	event := lifecycle.TransitionEvent(
 		lifecycle.ForegroundRunning, cycle.id, cycle.turnID, lifecycle.CauseActivity,
-	)); err != nil {
+	)
+	if err := s.lifecycleStreamLocked().Preflight(event); err != nil {
+		s.lifecycleFailed = err
+
 		return nil, err
 	}
 
+	if _, err := s.emitLifecycleLocked(ctx, event); err != nil {
+		return nil, err
+	}
+
+	s.cycleCounter++
+	s.turnCounter++
 	s.cycle = cycle
 
 	return cycle, nil
@@ -293,14 +473,27 @@ func (s *session) currentCycle() *foregroundCycle {
 // committed: this is the last lifecycle event of the turn, and the ACP prompt
 // response follows it.
 func (s *session) settleCycle(ctx context.Context, cycle *foregroundCycle, outcome lifecycle.Outcome, stopReason string) error {
+	binding := s.nativeIncarnationForContext(ctx)
 	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
 
 	if !s.retireCycleLocked(cycle) {
+		s.lifecycleMu.Unlock()
+
 		return nil
 	}
 
-	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(cycle.id, cycle.turnID, stopReason, outcome))
+	receipt, err := s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(cycle.id, cycle.turnID, stopReason, outcome))
+	s.lifecycleMu.Unlock()
+
+	if err == nil {
+		err = waitDelivery(ctx, receipt)
+	}
+
+	if err != nil {
+		s.failNativeIncarnation(binding, err)
+	}
+
+	return err
 }
 
 // settleCloseCycle ends the close boundary's foreground cycle. The emission rungs
@@ -319,19 +512,34 @@ func (s *session) settleCycle(ctx context.Context, cycle *foregroundCycle, outco
 // refuses to let the boundary claim one: the close fails with the latched error
 // rather than reporting a turn over on a stream that has already lost a sequence.
 func (s *session) settleCloseCycle(ctx context.Context, cycle *foregroundCycle) error {
+	binding := s.nativeIncarnationForContext(ctx)
 	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
 
 	if !s.retireCycleLocked(cycle) {
+		s.lifecycleMu.Unlock()
+
 		return nil
 	}
 
-	if s.lifecycleStream == nil || s.incarnationFencedLocked() {
+	if s.lifecycleStreamLocked() == nil || s.incarnationFencedLocked() {
+		s.lifecycleMu.Unlock()
+
 		return nil
 	}
 
-	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(
+	receipt, err := s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(
 		cycle.id, cycle.turnID, string(acp.StopReasonCancelled), lifecycle.OutcomeCancelled))
+	s.lifecycleMu.Unlock()
+
+	if err == nil {
+		err = waitDelivery(ctx, receipt)
+	}
+
+	if err != nil {
+		s.failNativeIncarnation(binding, err)
+	}
+
+	return err
 }
 
 // incarnationFencedLocked reports that this session's incarnation was fenced: the
@@ -347,7 +555,9 @@ func (s *session) settleCloseCycle(ctx context.Context, cycle *foregroundCycle) 
 // anything the native harness did — a close boundary installs one whether or not
 // it proved the stop — so no settlement decision is made from it.
 func (s *session) incarnationFencedLocked() bool {
-	return s.lifecycleStream != nil && s.lifecycleStream.State().Closed
+	stream := s.lifecycleStreamLocked()
+
+	return stream != nil && stream.State().Closed
 }
 
 // retireCycleLocked ends the cycle locally and reports whether this caller is the
@@ -386,18 +596,38 @@ func (s *session) blockCycleLocked(actionID string, cycle *foregroundCycle) {
 // mark travels on the cycle rather than on the stream, because the fence alone
 // says only that the stream is over — a close boundary installs one too.
 func (s *session) fenceLifecycle(cause string) {
+	s.latchLifecycleIncarnationLoss(cause, nil)
+}
+
+func (s *session) latchLifecycleIncarnationLoss(cause string, failure error) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if s.lifecycleStream == nil {
-		return
+	s.latchLifecycleIncarnationLossLocked(s.incarnation, cause, failure)
+}
+
+// latchLifecycleIncarnationLossLocked terminalizes only the exact incarnation
+// pointer the caller claimed while holding lifecycleMu.
+func (s *session) latchLifecycleIncarnationLossLocked(
+	binding *nativeIncarnationBinding,
+	cause string,
+	failure error,
+) bool {
+	if binding == nil || s.incarnation != binding {
+		return false
 	}
 
-	s.lifecycleStream.Close()
+	if binding.stream != nil {
+		binding.stream.Close()
+	}
 
 	loss := fmt.Errorf("active lifecycle incarnation lost: %s", cause)
 
 	if s.cycle != nil && !s.cycle.settled {
+		if failure != nil && s.cycle.failure == nil {
+			s.cycle.failure = failure
+		}
+
 		if s.cycle.lost == nil {
 			s.cycle.lost = loss
 		}
@@ -407,9 +637,11 @@ func (s *session) fenceLifecycle(cause string) {
 		s.cycle.wake()
 	}
 
-	if s.lifecycleFailed == nil {
+	if binding.stream != nil && s.lifecycleFailed == nil {
 		s.lifecycleFailed = loss
 	}
+
+	return true
 }
 
 // fenceBoundary installs the close boundary's end-of-emissions mark. The
@@ -426,27 +658,31 @@ func (s *session) fenceBoundary() {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if s.lifecycleStream == nil {
+	stream := s.lifecycleStreamLocked()
+	if stream == nil {
 		return
 	}
 
-	s.lifecycleStream.Close()
+	stream.Close()
 }
 
 // lifecycleActionMeta stamps one outbound permission or elicitation request with
 // its action correlation. The value names the emitting stream and the action, and
 // it never replaces the routing envelope a callback is authenticated by.
-func (s *session) lifecycleActionMeta(actionID string, owner lifecycle.Owner) map[string]any {
-	runID := s.currentSubmission().RunID
-
-	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-
-	if s.lifecycleStream == nil {
+func (s *session) lifecycleActionMeta(action *pendingAction) map[string]any {
+	if action == nil || action.binding == nil || action.binding.stream == nil {
 		return nil
 	}
 
 	return map[string]any{lifecycle.MetaKey: lifecycle.ActionCorrelation{
-		StreamID: s.lifecycleStream.ID(), ActionID: actionID, Owner: owner, RunID: runID,
+		StreamID: action.binding.stream.ID(), ActionID: action.id, Owner: action.owner, RunID: action.runID,
 	}.Value()}
+}
+
+func (s *session) lifecycleStreamLocked() *lifecycle.Stream {
+	if s.incarnation == nil {
+		return nil
+	}
+
+	return s.incarnation.stream
 }

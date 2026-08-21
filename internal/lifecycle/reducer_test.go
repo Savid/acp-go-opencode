@@ -2,10 +2,40 @@ package lifecycle
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestReducerTracksLargeSiblingSetsWithLiveOwnerCounters(t *testing.T) {
+	const siblings = 20_000
+
+	r := newReduction(fullyProven())
+	r.openTurn(t)
+	parent := ActivityUpdate{
+		ActivityID: "parent", Kind: ActivityTask, State: ActivityRunning,
+		Cause: CauseSubmission, OriginTurnID: "turn-1",
+	}
+	require.NoError(t, r.push(activityUpdateEvent(parent)))
+	for index := range siblings {
+		require.NoError(t, r.push(activityUpdateEvent(ActivityUpdate{
+			ActivityID: fmt.Sprintf("child-%d", index), ParentID: "parent",
+			Kind: ActivityTask, State: ActivityRunning, Cause: CauseSubmission, OriginTurnID: "turn-1",
+		})))
+	}
+	require.Equal(t, siblings, r.reducer.liveChildren["parent"])
+
+	for index := range siblings {
+		require.NoError(t, r.push(activityUpdateEvent(ActivityUpdate{
+			ActivityID: fmt.Sprintf("child-%d", index), State: ActivityCompleted,
+		})))
+	}
+	require.Zero(t, r.reducer.liveChildren["parent"])
+	require.NoError(t, r.push(activityUpdateEvent(ActivityUpdate{
+		ActivityID: "parent", State: ActivityCompleted,
+	})))
+}
 
 // reduction drives deliveries straight into a reducer, so a test can assert a
 // rule the wire decoder would have refused first and can reach the payload-shape

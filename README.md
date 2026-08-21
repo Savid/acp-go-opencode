@@ -98,12 +98,11 @@ OpenTelemetry providers.
   semantics fail closed before the native process starts.
 - Native sessions remain independently routed inside the shared runtime.
   Directory-scoped MCP is bound to one live session principal per canonical
-  working directory. Native prompt turns are serialized across the Agent so
-  cancel or timeout can retire the shared generation without killing unrelated
-  concurrent work.
-- Cancel and timeout send native abort only as an advisory hint, then await one
-  memoized containment result for the exact runtime generation. Fenced
-  stream/control failures use the same path. Linux helper-owned subreapers catch
+  working directory. Routine cancel and timeout interrupt only the addressed
+  session and await its native idle acknowledgement.
+- Native stream gaps, runtime exits, and host delivery failures fence and retire
+  the exact producing runtime generation before replacement admission. Linux
+  helper-owned subreapers catch
   `setsid` escapees. Omitting `WithProcessIsolation` is the ordinary default on
   every supported platform: native work runs as the adapter's current root or
   non-root identity, keeps the portable writable-home claim and liveness, and
@@ -115,9 +114,10 @@ OpenTelemetry providers.
 - A native-server crash fails the active turn, retains loaded logical
   sessions, and reconstructs a session from its last committed sync-event
   generation before a following prompt can reach the replacement runtime.
-- Native OpenCode REST calls and an SSE event stream mapped to ACP prompt
-  streaming for messages, reasoning, plans, tool calls, usage, and session
-  metadata.
+- Native OpenCode REST calls and a bounded, ordered, lossless SSE event/terminal
+  channel mapped to ACP streaming for messages, reasoning, plans, tool calls,
+  usage, and session metadata. EOF or delivery failure fences the exact native
+  generation; it is never hidden by reconnecting the same generation.
 - Prompt image and resource-blob input gated before a turn starts, with the
   effective per-image and per-prompt byte bounds advertised at initialize under
   `acp-go.dev/mediaEnvelope` so a host can pre-check against the exact numbers
@@ -142,10 +142,12 @@ OpenTelemetry providers.
 - Durable, credential-free native event snapshots through a host-provided
   `SessionStore`; stored rows use `opencode-sync-events-v1`, keyed by
   `{SessionID, Subpath}` and requiring OpenCode `1.18.3` or newer.
-- Versioned `acp-go.dev/route` envelopes bind each prompt, cancellation,
-  session update, raw event, and elicitation to one turn nonce. Permission
-  requests are fenced structurally by session id plus a tool-call id already
-  pending in that turn.
+- Versioned `acp-go.dev/route` envelopes bind each prompt and its causal updates,
+  raw events, and elicitations to one turn nonce. Agent-origin work between
+  prompts omits a route and never borrows a later nonce. Permission requests are
+  fenced structurally by session id plus a published tool-call id. Permission
+  and elicitation JSON-RPC requests are registered before their ordered pending
+  action update.
 - Optional raw native event notifications through `_opencode/rawEvent`.
 - OpenTelemetry adapter telemetry without recording prompt or tool secrets by
   default.

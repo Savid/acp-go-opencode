@@ -380,9 +380,12 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 
-	require.True(t, current.actions.claim(&pendingAction{id: "permission"}))
+	registry := testIncarnation(current).registry
+	claimed, err := registry.claim(&pendingAction{id: "permission"})
+	require.NoError(t, err)
+	require.True(t, claimed)
 	require.Equal(t, metaPermissionKey, current.snapshotBlockedReason())
-	_, held := current.actions.take("permission")
+	_, held := registry.take("permission")
 	require.True(t, held)
 	current.activeMessageIDs["message"] = struct{}{}
 	require.Equal(t, "generation", current.snapshotBlockedReason())
@@ -396,7 +399,7 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 	oldRead := restoreRandRead
 	restoreRandRead = func([]byte) (int, error) { return 0, errors.New("entropy failed") }
 	t.Cleanup(func() { restoreRandRead = oldRead })
-	_, err := newRestoreGeneration()
+	_, err = newRestoreGeneration()
 	require.ErrorContains(t, err, "entropy failed")
 	restoreRandRead = oldRead
 	generation, err := newRestoreGeneration()
@@ -415,7 +418,9 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	}
 
 	current, _ := newSnapshotSession()
-	require.True(t, current.actions.claim(&pendingAction{id: "permission"}))
+	claimed, err := testIncarnation(current).registry.claim(&pendingAction{id: "permission"})
+	require.NoError(t, err)
+	require.True(t, claimed)
 	require.ErrorContains(t, current.snapshotToStore(context.Background()), "permission")
 
 	current, client := newSnapshotSession()

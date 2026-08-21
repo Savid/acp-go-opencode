@@ -17,10 +17,16 @@ offers on `InitializeRequest._meta`, and the negotiated `acp-go.dev/lifecycle`
 answer is placed on `InitializeResponse._meta`. Version 1 correlates prompt
 submissions, ordered session updates, permission requests, and elicitation
 requests. It is rejected on every other method. OpenCode advertises
-out-of-prompt update delivery (`updatesOutsidePrompt: true` — the session-owned
-event pump routes native events with no prompt in flight), an empty
-activity-kind set, and no authoritative quiescence source; consumers requiring
-authoritative run settlement reject that configuration before dispatch.
+permanent out-of-prompt update delivery. `updatesOutsidePrompt: true` is a
+lossless, fail-closed claim: the session-owned pump routes native events even
+with no prompt in flight, never borrows a later prompt route, and never silently
+drops or reconnects across an unprovable gap. A native stream gap or a failed
+lifecycle or typed-update delivery fences the exact runtime generation and
+rejects later admission until an exact fresh generation is installed. Failed
+raw notifications consume no raw sequence and do not fence the prompt. OpenCode
+also advertises an empty activity-kind set and no
+authoritative quiescence source; consumers requiring authoritative run
+settlement reject that configuration before dispatch.
 
 ## Request input
 
@@ -82,10 +88,12 @@ preserved: clearing a variable is expressed by its empty value.
 non-empty `turnNonce` of at most 4096 bytes. The cancel nonce must equal the
 active prompt nonce.
 
-Every live-turn `session/update` and `_opencode/rawEvent` notification carries
-that same exact `{version, turnNonce}` object in its notification `_meta`;
-raw-event payloads also carry their structural `sessionId`. Lifecycle and
-load-history updates remain outside a turn epoch and omit the envelope.
+Every update caused by a prompt carries that same exact
+`{version, turnNonce}` object in its notification `_meta`; raw-event payloads
+also carry their structural `sessionId`. Agent-origin updates between prompts,
+lifecycle carriers, and load-history updates omit the route. An event captured
+before a later prompt keeps its original empty or prompt-bound route while it
+waits behind dispatch ordering; it never acquires the later prompt's nonce.
 
 ## Response output
 
@@ -149,11 +157,14 @@ The handoff advertisement appears **only** when the host set
 never reached this adapter, and every handoff-form block is then rejected
 `invalid_handoff`.
 
-Outbound elicitation requests preserve native metadata and add the reserved
-route envelope with `version`, `sessionId`, `turnNonce`, and exactly one of
-`toolCallId` or `requestId`. A native metadata collision with that reserved key
-is rejected. Permission requests instead use ACP's structural `sessionId` and
-`toolCallId`; the adapter accepts only tool calls published by the current turn.
+Submission-origin elicitation requests preserve native metadata and add the
+reserved route envelope with `version`, `sessionId`, the captured `turnNonce`,
+and exactly one of `toolCallId` or `requestId`. Agent-origin elicitation between
+prompts omits a route and uses its lifecycle stream/action correlation instead;
+it never borrows a later prompt nonce. A native metadata collision with either
+reserved key is rejected. Permission requests use ACP's structural `sessionId`
+and `toolCallId`. For both request families, the exact host JSON-RPC request is
+registered and answerable before the ordered pending `action_update` is emitted.
 
 ## Turn-failure error data
 
@@ -163,11 +174,14 @@ A failed turn returns an ACP internal error whose `data` carries:
 |---|---|
 | `error` | Always `opencode_turn_failed`. |
 | `cause` | `provider`, `transport`, or `timeout`; a shared-runtime exit is `transport`. |
-| `message` | The real native cause text. |
-| `statusCode` / `providerCode` | Included when the provider reports them. |
+| `message` | A fixed closed description for the selected `cause`; native/provider text is never copied here. |
+| `statusCode` | Included when a provider reports a positive numeric HTTP status. |
 | `structuredOutputRequested` | `true` when the turn sent a native output schema. |
 | `stage` / `reason` | Present on an image-output failure: `stage` is `image_output`; `reason` is always `storage_failed`, because the other image-output verdicts refuse the tool call without ending the turn. |
 | `sizeBytes` / `maxBytes` | Present when an image-output failure carries decoded sizes. |
+
+No native response body, SSE payload, tool failure body, panic value, or provider
+code crosses this error surface.
 
 ## Provider-auth error data
 

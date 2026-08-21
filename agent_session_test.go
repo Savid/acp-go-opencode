@@ -155,6 +155,7 @@ func TestLifecycleMCPRefreshesImmediatelyBeforeFirstNativePrompt(t *testing.T) {
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
 	))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	require.Empty(t, order, "lifecycle must not freeze the pre-arm catalog as prompt-ready")
 
 	_, err = agent.Prompt(ctx, TextPromptRequest(created.SessionId, "refresh-turn", "use the armed tool"))
@@ -197,9 +198,10 @@ func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T)
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
 	))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 
 	_, err = agent.Prompt(ctx, TextPromptRequest(created.SessionId, "failed-refresh", "do not run"))
-	require.ErrorContains(t, err, "refresh OpenCode MCP catalog")
+	assertTurnFailed(t, err, causeTransport, "")
 
 	_, err = agent.NewSession(ctx, NewSessionRequest(cwd,
 		WithSessionMCPServers(mcp),
@@ -281,6 +283,16 @@ func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *test
 	// The native session reports idle when the interrupt lands, which is the
 	// acknowledgement the cancelled turn settles on.
 	started := make(chan struct{})
+	accepted := make(chan struct{}, 1)
+	connection.mu.Lock()
+	connection.updateHook = func(notification acp.SessionNotification) {
+		envelope, _ := notification.Meta[lifecycle.MetaKey].(map[string]any)
+		event, _ := envelope["event"].(map[string]any)
+		if event["type"] == "prompt_accepted" {
+			signalTestHook(accepted)
+		}
+	}
+	connection.mu.Unlock()
 	client.hangsAfterDispatch(started)
 	client.abortFunc = func(id string) error {
 		client.publishSessionIdle(id)
@@ -288,17 +300,23 @@ func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *test
 		return nil
 	}
 
-	done := make(chan acp.PromptResponse, 1)
+	type promptResult struct {
+		response acp.PromptResponse
+		err      error
+	}
+	done := make(chan promptResult, 1)
 
 	go func() {
 		response, promptErr := current.Prompt(ctx, TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
-		require.NoError(t, promptErr)
-		done <- response
+		done <- promptResult{response: response, err: promptErr}
 	}()
 
 	<-started
+	<-accepted
 	require.NoError(t, agent.Cancel(ctx, CancelRequest(current.id, internalSeamTurnNonce)))
-	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
+	result := <-done
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonCancelled, result.response.StopReason)
 
 	require.Equal(t, []string{current.idmap.NativeSessionID}, client.abortedSessions())
 	require.NotNil(t, agent.runtime, "routine cancellation retired the shared runtime")
@@ -329,7 +347,8 @@ func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	store := NewInMemorySessionStore()
 	client := newFakeOpenCodeClient()
 	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
-	agent.setAgentClient(newRecordingAgentClient())
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
 	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 	require.NoError(t, current.establish(ctx))
@@ -344,6 +363,16 @@ func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	client.syncHistoryErr = errors.New("sync history unavailable")
 
 	started := make(chan struct{})
+	accepted := make(chan struct{}, 1)
+	connection.mu.Lock()
+	connection.updateHook = func(notification acp.SessionNotification) {
+		envelope, _ := notification.Meta[lifecycle.MetaKey].(map[string]any)
+		event, _ := envelope["event"].(map[string]any)
+		if event["type"] == "prompt_accepted" {
+			signalTestHook(accepted)
+		}
+	}
+	connection.mu.Unlock()
 	client.hangsAfterDispatch(started)
 	client.abortFunc = func(id string) error {
 		client.publishSessionIdle(id)
@@ -359,8 +388,10 @@ func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	}()
 
 	<-started
+	<-accepted
 	require.NoError(t, agent.Cancel(ctx, CancelRequest(current.id, internalSeamTurnNonce)))
-	require.ErrorContains(t, <-done, "sync history unavailable")
+	promptErr := <-done
+	require.ErrorContains(t, promptErr, "sync history unavailable")
 	require.NotNil(t, agent.runtime, "a commit failure retired the shared runtime")
 
 	retained, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
@@ -434,6 +465,7 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	close(first.runtimeExited)
 	require.Eventually(t, func() bool {
 		agent.mu.Lock()
@@ -485,6 +517,7 @@ func TestRecoverySkipsCrashedReplacementGenerationBeforePrompt(t *testing.T) {
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	close(first.runtimeExited)
 	require.Eventually(t, func() bool {
 		agent.mu.Lock()
@@ -526,6 +559,7 @@ func TestRuntimeCrashFailsInflightTurnThenRecoversBeforeFollowingPrompt(t *testi
 	})
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 
 	turnResult := make(chan error, 1)
 	go func() {
@@ -554,17 +588,16 @@ func (r *fanoutRuntime) Scope(_ context.Context, options opencode.ScopeOptions) 
 	return &fanoutScope{
 		Client: r.fakeOpenCodeClient, root: r.fakeOpenCodeClient,
 		directory: options.Directory, nativeID: id,
-		events: make(chan opencode.Event), errs: make(chan error),
+		eventStream: make(chan opencode.EventStreamItem),
 	}, nil
 }
 
 type fanoutScope struct {
 	opencode.Client
-	root      *fakeOpenCodeClient
-	directory string
-	nativeID  string
-	events    chan opencode.Event
-	errs      chan error
+	root        *fakeOpenCodeClient
+	directory   string
+	nativeID    string
+	eventStream chan opencode.EventStreamItem
 }
 
 func (s *fanoutScope) Close(context.Context) error { return nil }
@@ -594,23 +627,48 @@ func (s *fanoutScope) DispatchMessage(_ context.Context, id string, request open
 	}})
 	s.root.mu.Unlock()
 
-	s.events <- opencode.Event{
-		Type:       opencode.EventMessageUpdated,
-		Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": assistantID, "sessionID": id, "role": "assistant"}}),
+	userEvent := opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": request.MessageID, "sessionID": id, "role": roleUser,
+		}}),
 	}
-	s.events <- opencode.Event{
+	s.eventStream <- opencode.EventStreamItem{Event: &userEvent}
+	messageEvent := opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": assistantID, "sessionID": id, "role": "assistant",
+			"parentID": request.MessageID, "finish": "stop",
+		}}),
+	}
+	s.eventStream <- opencode.EventStreamItem{Event: &messageEvent}
+	idleEvent := opencode.Event{
 		Type:       opencode.EventSessionIdle,
 		Properties: mustJSONValue(map[string]any{"sessionID": id}),
 	}
+	s.eventStream <- opencode.EventStreamItem{Event: &idleEvent}
 
 	return nil
 }
 
-func (s *fanoutScope) Events() <-chan opencode.Event      { return s.events }
-func (s *fanoutScope) EventErrors() <-chan error          { return s.errs }
-func (s *fanoutScope) XDGDirs() opencode.XDGDirs          { return s.root.XDGDirs() }
-func (s *fanoutScope) RuntimeExited() <-chan struct{}     { return s.root.RuntimeExited() }
-func (s *fanoutScope) Shutdown(ctx context.Context) error { return s.root.Shutdown(ctx) }
+func (s *fanoutScope) EventStream() <-chan opencode.EventStreamItem { return s.eventStream }
+func (s *fanoutScope) XDGDirs() opencode.XDGDirs                    { return s.root.XDGDirs() }
+func (s *fanoutScope) RuntimeExited() <-chan struct{}               { return s.root.RuntimeExited() }
+func (s *fanoutScope) Shutdown(ctx context.Context) error           { return s.root.Shutdown(ctx) }
+
+func (s *fanoutScope) Messages(_ context.Context, id string) ([]opencode.NativeMessage, error) {
+	s.root.mu.Lock()
+	defer s.root.mu.Unlock()
+
+	messages := make([]opencode.NativeMessage, 0, len(s.root.messages))
+	for _, message := range s.root.messages {
+		if message.Info.SessionID == id {
+			messages = append(messages, message)
+		}
+	}
+
+	return messages, s.root.messagesErr
+}
 
 func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 	const sessionCount = 8
@@ -656,6 +714,9 @@ func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 	}
 	require.Len(t, agent.sessions, sessionCount)
 	require.EqualValues(t, 1, agent.runtimeGeneration)
+	for index := range cases {
+		establishCreatedSession(t, agent, cases[index].id)
+	}
 
 	var promptGroup sync.WaitGroup
 	promptErrors := make(chan error, sessionCount)
@@ -1459,6 +1520,7 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 		WithOpenCodeExtraPathDirs("/session/bin"),
 	))))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	close(first.runtimeExited)
 	require.Eventually(t, func() bool {
 		agent.mu.Lock()

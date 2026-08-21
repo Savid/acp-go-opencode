@@ -175,7 +175,8 @@ func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Optio
 	agent := newAgentForServe(opts...)
 	defer func() {
 		if closeErr := agent.Close(); closeErr != nil {
-			agent.log.DebugContext(context.Background(), "close OpenCode ACP agent failed", slog.String("error", closeErr.Error()))
+			agent.log.DebugContext(context.Background(), "close OpenCode ACP agent failed")
+
 			serveErr = closeErr
 		}
 	}()
@@ -236,7 +237,6 @@ func (a *Agent) Close() error {
 	}
 
 	a.closed = true
-	a.conn = nil
 	a.mu.Unlock()
 
 	err := stickyRuntimeErr
@@ -277,7 +277,10 @@ func (a *Agent) Close() error {
 		}
 	}
 
+	a.interruptConnection()
+
 	a.mu.Lock()
+	a.conn = nil
 	a.sessions = make(map[acp.SessionId]*session)
 	a.closeErr = err
 
@@ -285,6 +288,20 @@ func (a *Agent) Close() error {
 	a.mu.Unlock()
 
 	return err
+}
+
+func (a *Agent) interruptConnection() {
+	if a == nil {
+		return
+	}
+
+	a.mu.Lock()
+	conn := a.conn
+	a.mu.Unlock()
+
+	if interrupter, ok := conn.(interface{ InterruptWrites() }); ok {
+		interrupter.InterruptWrites()
+	}
 }
 
 func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
@@ -433,11 +450,11 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 	case ForkSessionMethod:
 		var req acp.UnstableForkSessionRequest
 		if err := json.Unmarshal(params, &req); err != nil {
-			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: "invalid request parameters"})
 		}
 
 		if err := req.Validate(); err != nil {
-			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: "request validation failed"})
 		}
 
 		return a.forkSession(ctx, req)

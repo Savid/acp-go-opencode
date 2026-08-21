@@ -10,6 +10,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
+	"github.com/stretchr/testify/require"
 )
 
 const rawBoundaryField = "rawBoundaryData"
@@ -50,6 +51,11 @@ func rawEventNotifications(conn *recordingAgentClient, sessionID acp.SessionId) 
 	return out
 }
 
+func flushRawEvents(t *testing.T, sess *session) {
+	t.Helper()
+	require.NoError(t, sess.delivery.flushRaw(context.Background()))
+}
+
 func rawEventSession(t *testing.T, id acp.SessionId, conn agentClient) *session {
 	t.Helper()
 	agent := NewAgent()
@@ -61,6 +67,7 @@ func rawEventSession(t *testing.T, id acp.SessionId, conn agentClient) *session 
 		Format:          SessionStoreFormat,
 	})
 	sess.rawMessages = rawMessageConfig{enabled: true}
+	t.Cleanup(sess.delivery.close)
 
 	return sess
 }
@@ -95,6 +102,7 @@ func TestRawEventOversizeEmitsFixedMarker(t *testing.T) {
 	if err := sess.emitRawOpenCodeEvent(ctx, oversizeRawEvent()); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
+	flushRawEvents(t, sess)
 	events := rawEventNotifications(conn, "session-1")
 	if len(events) != 1 {
 		t.Fatalf("emitted %d notifications, want 1", len(events))
@@ -137,6 +145,7 @@ func TestRawEventSequenceIsContiguous(t *testing.T) {
 			t.Fatalf("emit %d: %v", i, err)
 		}
 	}
+	flushRawEvents(t, sess)
 	events := rawEventNotifications(conn, "session-1")
 	if len(events) != total {
 		t.Fatalf("emitted %d notifications, want %d", len(events), total)
@@ -166,6 +175,7 @@ func TestRawEventNilPayloadSkippedWithoutSequence(t *testing.T) {
 			t.Fatalf("emit %d: %v", i, err)
 		}
 	}
+	flushRawEvents(t, sess)
 	emitted := rawEventNotifications(conn, "session-1")
 	if len(emitted) != 2 {
 		t.Fatalf("emitted %d notifications, want 2", len(emitted))
@@ -194,6 +204,8 @@ func TestRawEventCrossSessionSequenceIsolation(t *testing.T) {
 			t.Fatalf("emit b %d: %v", i, err)
 		}
 	}
+	flushRawEvents(t, sessA)
+	flushRawEvents(t, sessB)
 	for _, id := range []acp.SessionId{"session-a", "session-b"} {
 		events := rawEventNotifications(conn, id)
 		if len(events) != 3 {
@@ -218,6 +230,7 @@ func TestRawEventValidJSONInvariant(t *testing.T) {
 	if err := sess.emitRawOpenCodeEvent(context.Background(), oversizeRawEvent()); err != nil {
 		t.Fatalf("emit oversize: %v", err)
 	}
+	flushRawEvents(t, sess)
 	for _, payload := range rawEventNotifications(conn, "session-1") {
 		encoded, err := json.Marshal(payload[jsonFieldEvent])
 		if err != nil || !json.Valid(encoded) {
@@ -320,8 +333,8 @@ func TestRawEventFinalPayloadRejectsUnboundedInternalRoute(t *testing.T) {
 		!strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("emit with unbounded internal route error = %v", err)
 	}
-	if sess.rawSeq != 0 || len(rawEventNotifications(conn, "session-1")) != 0 {
-		t.Fatalf("failed cap changed sequence or emitted: sequence=%d events=%#v", sess.rawSeq, rawEventNotifications(conn, "session-1"))
+	if len(rawEventNotifications(conn, "session-1")) != 0 {
+		t.Fatalf("failed cap emitted: events=%#v", rawEventNotifications(conn, "session-1"))
 	}
 
 	payload["_meta"] = map[string]any{"bad": make(chan int)}
@@ -335,17 +348,38 @@ func TestRawEventFinalPayloadRejectsUnboundedInternalRoute(t *testing.T) {
 func TestRawEventEmitFailureDoesNotFailTurn(t *testing.T) {
 	conn := newRecordingAgentClient()
 	failing := &failThenRecordRawClient{recordingAgentClient: conn, failures: 1}
-	sess := rawEventSession(t, "session-1", failing)
-	sess.routeNativeEvent(context.Background(), normalRawEvent("boom"))
-	if sess.rawSeq != 0 {
-		t.Fatalf("failed delivery consumed sequence %d", sess.rawSeq)
+	agent := NewAgent()
+	agent.setAgentClient(failing)
+	client := newFakeOpenCodeClient()
+	sess := testSession(t, agent, client)
+	sess.rawMessages = rawMessageConfig{enabled: true}
+	client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+		client.stageAssistantMessage(id, "assistant-1")
+		client.publishEvent(opencode.Event{Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-1", "sessionID": id, "role": "assistant",
+				"parentID": request.MessageID, "finish": "stop",
+			}}),
+			Raw: json.RawMessage(`{"type":"message.updated","tag":"failed-raw"}`)})
+		client.publishEvent(opencode.Event{Type: opencode.EventMessagePartCreated,
+			Properties: mustJSONValue(map[string]any{"id": "part-1", "sessionID": id, "messageID": "assistant-1", "type": "text", "text": "typed-content"}),
+			Raw:        json.RawMessage(`{"type":"message.part.created","tag":"successful-raw"}`)})
+		client.publishSessionIdle(id)
+
+		return opencode.NativeMessage{}, nil
 	}
-	if err := sess.emitRawOpenCodeEvent(context.Background(), normalRawEvent("ok")); err != nil {
-		t.Fatalf("successful emit after failure: %v", err)
+
+	response, err := sess.Prompt(context.Background(), TextPromptRequest(sess.id, internalSeamTurnNonce, "hello"))
+	if err != nil || response.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("prompt after raw failure = %#v, %v", response, err)
 	}
+	flushRawEvents(t, sess)
 	events := rawEventNotifications(conn, "session-1")
 	if len(events) != 1 || events[0][jsonFieldSequence] != int64(1) {
 		t.Fatalf("successful events after failure = %#v", events)
+	}
+	if sess.lifecycleFailure() != nil {
+		t.Fatalf("raw failure fenced lifecycle: %v", sess.lifecycleFailure())
 	}
 }
 

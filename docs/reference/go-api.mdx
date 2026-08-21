@@ -38,7 +38,7 @@ runtime and its resources quarantined.
 | `WithSeedFiles` | Immutable files written into the shared config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
-| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions; native prompt turns are additionally serialized Agent-wide because cancellation retires their shared runtime. |
+| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions; routine cancellation remains scoped to the addressed native session. |
 | `WithTurnTimeout` | Per-turn deadline; `0` (default) disables it. |
 | `WithImageLimits` | Decoded-byte bounds for prompt and emitted image content (`ImageLimits`); each field defaults to 6 MiB, `0` disables that policy limit, and a negative value is rejected at construction. |
 | `WithInputHandoffRoot` | Absolute directory a prompt image may be read from in the handoff input form. Read-only, unset by default, and a relative value is rejected at construction. |

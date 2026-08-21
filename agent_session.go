@@ -85,6 +85,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
+	session.stampIncarnationGeneration(client, generation)
 
 	if err := a.storeStartedSession(session); err != nil {
 		return acp.NewSessionResponse{}, a.rollbackStartedSession(session, err)
@@ -232,6 +233,7 @@ func (a *Agent) loadOrResumeSession(
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
+	session.stampIncarnationGeneration(client, generation)
 	session.setImageArtifacts(artifacts)
 
 	if err := a.storeStartedSession(session); err != nil {
@@ -528,6 +530,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
+	session.stampIncarnationGeneration(client, generation)
 	session.setImageArtifacts(parent.cloneImageArtifacts())
 
 	if err := a.storeStartedSession(session); err != nil {

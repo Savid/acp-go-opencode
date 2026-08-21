@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,6 +51,105 @@ func correlatedPrompt(id acp.SessionId, nonce, text string) acp.PromptRequest {
 	return request
 }
 
+func fillEmitterTurnQuota(t *testing.T, current *session) {
+	t.Helper()
+	current.stopPump()
+	stream := testIncarnation(current).stream
+	require.NotNil(t, stream)
+	for index := 1; index <= lifecycle.EmitterTurnLimit; index++ {
+		turnID := fmt.Sprintf("turn-%d", index)
+		cycleID := fmt.Sprintf("quota-cycle-%d", index)
+		_, err := stream.Emit(lifecycle.AcceptedEvent(lifecycle.Submission{
+			SubmissionID: fmt.Sprintf("quota-submission-%d", index), ClientNonce: "quota-client",
+		}, turnID))
+		require.NoError(t, err)
+		_, err = stream.Emit(lifecycle.TransitionEvent(
+			lifecycle.ForegroundRunning, cycleID, turnID, lifecycle.CauseSubmission))
+		require.NoError(t, err)
+		_, err = stream.Emit(lifecycle.IdleEvent(
+			cycleID, turnID, string(acp.StopReasonEndTurn), lifecycle.OutcomeSuccess))
+		require.NoError(t, err)
+	}
+	current.lifecycleMu.Lock()
+	current.turnCounter = lifecycle.EmitterTurnLimit
+	current.cycleCounter = lifecycle.EmitterTurnLimit
+	current.lifecycleMu.Unlock()
+}
+
+func requireExactGenerationContained(t *testing.T, current *session, client *fakeOpenCodeClient, generation uint64) {
+	t.Helper()
+	requireSignal(t, client.closeSignal)
+	require.Nil(t, testIncarnation(current), "contained generation %d remained published", generation)
+	current.agent.mu.Lock()
+	require.Nil(t, current.agent.runtime)
+	current.agent.mu.Unlock()
+	current.mu.Lock()
+	require.Zero(t, current.runtimeGeneration)
+	current.mu.Unlock()
+}
+
+func TestEmitterTurnBoundContainsExactGenerationForPromptAndAgentOrigins(t *testing.T) {
+	for _, origin := range []string{"prompt", "agent"} {
+		t.Run(origin, func(t *testing.T) {
+			current, client, _ := lifecycleSession(t)
+			generation := current.runtimeGeneration
+			fillEmitterTurnQuota(t, current)
+
+			if origin == "prompt" {
+				var dispatches atomic.Int64
+				client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+					dispatches.Add(1)
+
+					return opencode.NativeMessage{}, nil
+				}
+				_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, "quota-overflow", "hello"))
+				assertTurnFailed(t, err, causeTransport, "")
+				require.ErrorIs(t, current.lifecycleFailure(), lifecycle.ErrEmitterTurnLimit)
+				require.Zero(t, dispatches.Load())
+			} else {
+				current.routeNativeEvent(context.Background(), opencode.Event{
+					Type: opencode.EventSessionStatus,
+					Properties: mustJSONValue(map[string]any{
+						"sessionID": current.idmap.NativeSessionID, "status": map[string]any{"type": "busy"},
+					}),
+				})
+				require.ErrorIs(t, current.lifecycleFailure(), lifecycle.ErrEmitterTurnLimit)
+			}
+
+			requireExactGenerationContained(t, current, client, generation)
+		})
+	}
+}
+
+func TestEmitterActionBoundContainsExactGenerationBeforeHostRegistration(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+	current.stopPump()
+	generation := current.runtimeGeneration
+
+	current.lifecycleMu.Lock()
+	cycle, err := current.openAgentCycleLocked(context.Background())
+	require.NoError(t, err)
+	stream := current.incarnation.stream
+	for index := range lifecycle.EmitterActionLimit {
+		actionID := fmt.Sprintf("quota-action-%d", index)
+		_, err = stream.Emit(lifecycle.ActionEvent(lifecycle.PendingAction(
+			actionID, lifecycle.ActionPermission, lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: cycle.turnID}, true)))
+		require.NoError(t, err)
+		_, err = stream.Emit(lifecycle.ActionEvent(lifecycle.ResolvedAction(actionID, lifecycle.ActionAccepted)))
+		require.NoError(t, err)
+	}
+	current.lifecycleMu.Unlock()
+
+	err = current.routeNativePermission(context.Background(), opencode.PermissionRequest{
+		ID: "quota-action-overflow", SessionID: current.idmap.NativeSessionID,
+	})
+	require.ErrorIs(t, err, lifecycle.ErrEmitterActionLimit)
+	require.Zero(t, connection.permissionRequestCount())
+	require.Equal(t, 1, client.permissionReplyCount(), "overflow left the exact native request waiting")
+	require.Equal(t, "quota-action-overflow", client.permissionReply(0).requestID)
+	requireExactGenerationContained(t, current, client, generation)
+}
+
 // TestStreamOpensWithASnapshotBeforeEveryOtherEnvelope proves the stream's first
 // lifecycle-bearing notification is its snapshot, that it rides the one legal
 // carrier, and that the whole emitted stream reduces under the family rules.
@@ -84,15 +185,41 @@ func TestStreamOpensWithASnapshotBeforeEveryOtherEnvelope(t *testing.T) {
 // is emitted next, and every event the frame caused is delivered after it.
 func TestAcceptanceFollowsNativeAdmissionAndPrecedesItsEvents(t *testing.T) {
 	current, client, connection := lifecycleSession(t)
+	accepted := make(chan struct{})
+	assistantObserved := make(chan struct{})
+	postRelease := make(chan struct{})
+	postReturned := make(chan struct{})
+	connection.mu.Lock()
+	connection.updateHook = func(notification acp.SessionNotification) {
+		envelope, _ := notification.Meta[lifecycle.MetaKey].(map[string]any)
+		event, _ := envelope["event"].(map[string]any)
+		if event["type"] == "prompt_accepted" {
+			signalTestHook(accepted)
+		}
+	}
+	connection.mu.Unlock()
+	current.mu.Lock()
+	current.pump.afterObserve = func(event opencode.Event, _ *nativeEventObservation) {
+		if info, ok := eventMessageInfo(event.Properties); ok && info.ID == "assistant-1" {
+			signalTestHook(assistantObserved)
+		}
+	}
+	current.mu.Unlock()
 
 	// The harness publishes a transcript part before its POST is even answered,
 	// which is the race the dispatch hold exists for.
-	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+		client.publishPromptEvidence(id, request.MessageID)
 		client.stageAssistantMessage(id, "assistant-1")
 		client.publishEvent(opencode.Event{
-			Type:       opencode.EventMessageUpdated,
-			Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": "assistant-1", "sessionID": id, "role": "assistant"}}),
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-1", "sessionID": id, "role": "assistant",
+				"parentID": request.MessageID, "finish": "stop",
+			}}),
 		})
+		<-assistantObserved
+		<-postRelease
 		client.publishEvent(opencode.Event{
 			Type: opencode.EventMessagePartCreated,
 			Properties: mustJSONValue(map[string]any{
@@ -100,23 +227,35 @@ func TestAcceptanceFollowsNativeAdmissionAndPrecedesItsEvents(t *testing.T) {
 			}),
 		})
 		client.publishSessionIdle(id)
+		close(postReturned)
 
 		return opencode.NativeMessage{}, nil
 	}
 
-	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() {
+		_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
+		done <- err
+	}()
+	requireSignal(t, accepted)
+	select {
+	case <-postReturned:
+		t.Fatal("native POST returned before prompt admission")
+	default:
+	}
+	close(postRelease)
+	require.NoError(t, <-done)
 
 	connection.mu.Lock()
 	defer connection.mu.Unlock()
 
-	accepted := -1
+	acceptedIndex := -1
 	chunk := -1
 
 	for index, notification := range connection.updates {
 		if envelope, ok := notification.Meta[lifecycle.MetaKey].(map[string]any); ok {
 			if event, _ := envelope["event"].(map[string]any); event["type"] == "prompt_accepted" {
-				accepted = index
+				acceptedIndex = index
 			}
 
 			continue
@@ -127,9 +266,16 @@ func TestAcceptanceFollowsNativeAdmissionAndPrecedesItsEvents(t *testing.T) {
 		}
 	}
 
-	require.GreaterOrEqual(t, accepted, 0, "the stream carried no acceptance")
+	require.GreaterOrEqual(t, acceptedIndex, 0, "the stream carried no acceptance")
 	require.GreaterOrEqual(t, chunk, 0, "the turn streamed no transcript")
-	require.Less(t, accepted, chunk, "an event caused by the frame preceded its acceptance")
+	require.Less(t, acceptedIndex, chunk, "an event caused by the frame preceded its acceptance")
+	for _, notification := range connection.updates {
+		if notification.Update.AgentMessageChunk == nil {
+			continue
+		}
+		route, _ := notification.Meta[routeEnvelopeKey].(map[string]any)
+		require.Equal(t, internalSeamTurnNonce, route[routeFieldTurnNonce])
+	}
 }
 
 // TestRefusedDispatchCreatesNeitherSubmissionNorTurn proves a frame the native
@@ -154,8 +300,24 @@ func TestNativeIdleSettlesTheTurnWithoutPolling(t *testing.T) {
 	current, client, connection := lifecycleSession(t)
 
 	release := make(chan struct{})
-	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	assistantObserved := make(chan struct{})
+	current.mu.Lock()
+	current.pump.afterObserve = func(event opencode.Event, _ *nativeEventObservation) {
+		if info, ok := eventMessageInfo(event.Properties); ok && info.ID == "assistant-1" {
+			signalTestHook(assistantObserved)
+		}
+	}
+	current.mu.Unlock()
+	client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
 		client.stageAssistantMessage(id, "assistant-1")
+		client.publishEvent(opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-1", "sessionID": id, "role": "assistant",
+				"parentID": request.MessageID, "finish": "stop",
+			}}),
+		})
+		<-assistantObserved
 
 		go func() {
 			<-release
@@ -191,7 +353,14 @@ func TestNativeErrorBeforeIdleFailsTheTurnOnce(t *testing.T) {
 	current, client, connection := lifecycleSession(t)
 
 	nativeErr := providerNativeError("provider exploded", 429, "rate_limit_exceeded")
-	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+		client.publishEvent(opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-1", "sessionID": id, "role": "assistant",
+				"parentID": request.MessageID, "finish": "error",
+			}}),
+		})
 		client.publishEvent(opencode.Event{
 			Type:       opencode.EventSessionError,
 			Properties: mustJSONValue(map[string]any{"sessionID": id, "error": nativeErr}),
@@ -206,7 +375,8 @@ func TestNativeErrorBeforeIdleFailsTheTurnOnce(t *testing.T) {
 	}
 
 	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-	require.ErrorContains(t, err, "provider exploded")
+	assertTurnFailed(t, err, causeProvider, "")
+	require.NotContains(t, err.Error(), "provider exploded")
 
 	requireLifecycleOutcome(t, connection, lifecycle.OutcomeFailed)
 
@@ -374,6 +544,165 @@ func TestBlockingActionOrdersPendingBeforeItsForegroundAndTerminalBeforeRunning(
 	requireLifecycleReduces(t, connection)
 }
 
+// TestHostRequestRegistrationPrecedesActionAnnouncement proves the request-first
+// linearization for both action families with explicit gates. While registration
+// is held, no request or action is visible. Releasing it installs the exact host
+// request before beginAction is allowed to publish the pending action.
+func TestHostRequestRegistrationPrecedesActionAnnouncement(t *testing.T) {
+	t.Run("permission", func(t *testing.T) {
+		current, client, connection := lifecycleSession(t)
+		current.markPublishedToolCall("call-1")
+
+		registrationStarted := make(chan struct{})
+		registrationRelease := make(chan struct{})
+		answerStarted := make(chan struct{})
+		answerRelease := make(chan struct{})
+		connection.mu.Lock()
+		connection.permissionRegistrationStarted = registrationStarted
+		connection.permissionRegistrationRelease = registrationRelease
+		connection.permissionStarted = answerStarted
+		connection.permissionRelease = answerRelease
+		connection.mu.Unlock()
+
+		done := make(chan error, 1)
+		go func() {
+			done <- current.routeNativePermission(context.Background(), opencode.PermissionRequest{
+				ID: "permission-register", SessionID: current.idmap.NativeSessionID,
+				Tool: opencode.PermissionTool{CallID: "call-1"},
+			})
+		}()
+
+		requireSignal(t, registrationStarted)
+		require.Zero(t, connection.permissionRequestCount())
+		require.Empty(t, connection.lifecycleEventsOfType(t, "action_update"))
+
+		close(registrationRelease)
+		requireSignal(t, answerStarted)
+		require.NoError(t, <-done)
+		require.Equal(t, 1, connection.permissionRequestCount())
+		require.Len(t, connection.lifecycleEventsOfType(t, "action_update"), 1)
+
+		current.cancelActions(context.Background())
+		close(answerRelease)
+		require.Equal(t, permissionReplyReject, client.permissionReply(0).reply)
+	})
+
+	t.Run("elicitation", func(t *testing.T) {
+		current, client, connection := lifecycleSession(t)
+		current.agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{
+			Form: &acp.ElicitationFormCapabilities{},
+		}
+
+		registrationStarted := make(chan struct{})
+		registrationRelease := make(chan struct{})
+		answerStarted := make(chan struct{})
+		answerRelease := make(chan struct{})
+		connection.mu.Lock()
+		connection.elicitationRegistrationStarted = registrationStarted
+		connection.elicitationRegistrationRelease = registrationRelease
+		connection.elicitationStarted = answerStarted
+		connection.elicitationRelease = answerRelease
+		connection.mu.Unlock()
+
+		done := make(chan error, 1)
+		go func() {
+			done <- current.routeNativeQuestion(context.Background(), opencode.QuestionRequest{
+				ID: "question-register", SessionID: current.idmap.NativeSessionID,
+				Questions: []opencode.QuestionInfo{{Question: "Continue?"}},
+			})
+		}()
+
+		requireSignal(t, registrationStarted)
+		connection.mu.Lock()
+		require.Empty(t, connection.elicitations)
+		connection.mu.Unlock()
+		require.Empty(t, connection.lifecycleEventsOfType(t, "action_update"))
+
+		close(registrationRelease)
+		requireSignal(t, answerStarted)
+		require.NoError(t, <-done)
+		connection.mu.Lock()
+		require.Len(t, connection.elicitations, 1)
+		connection.mu.Unlock()
+		require.Len(t, connection.lifecycleEventsOfType(t, "action_update"), 1)
+
+		current.cancelActions(context.Background())
+		close(answerRelease)
+		require.Equal(t, 1, client.questionRejectCount())
+	})
+}
+
+// TestActionRegistrationCancellationAndCloseDoNotLeak proves teardown can win
+// while the JSON-RPC registration itself is blocked. Both paths cancel the exact
+// request, answer OpenCode once, and publish no action that was never registered.
+func TestActionRegistrationCancellationAndCloseDoNotLeak(t *testing.T) {
+	for _, closeSession := range []bool{false, true} {
+		name := "cancel"
+		if closeSession {
+			name = "close"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			current, client, connection := lifecycleSession(t)
+			current.markPublishedToolCall("call-1")
+
+			registrationStarted := make(chan struct{})
+			registrationRelease := make(chan struct{})
+			connection.mu.Lock()
+			connection.permissionRegistrationStarted = registrationStarted
+			connection.permissionRegistrationRelease = registrationRelease
+			connection.mu.Unlock()
+
+			if closeSession {
+				client.abortFunc = func(id string) error {
+					client.publishSessionIdle(id)
+
+					return nil
+				}
+			}
+
+			routed := make(chan error, 1)
+			go func() {
+				routed <- current.routeNativePermission(context.Background(), opencode.PermissionRequest{
+					ID: "permission-teardown", SessionID: current.idmap.NativeSessionID,
+					Tool: opencode.PermissionTool{CallID: "call-1"},
+				})
+			}()
+
+			requireSignal(t, registrationStarted)
+			if closeSession {
+				require.NoError(t, current.closeSession(false))
+			} else {
+				require.NoError(t, current.cancelTurn(context.Background()))
+			}
+			require.NoError(t, <-routed)
+			require.Empty(t, connection.lifecycleEventsOfType(t, "action_update"))
+			require.Zero(t, connection.permissionRequestCount())
+			require.Equal(t, permissionReplyReject, client.permissionReply(0).reply)
+			require.Equal(t, reasonCancelled, client.permissionReply(0).message)
+		})
+	}
+}
+
+// TestActionRegistrationFailureContainsWithoutAnnouncement proves a registration
+// error is a stream-breaking delivery gap, not a permission decline. The native
+// request is rejected, the exact producer is contained, and no pending action is
+// fabricated on the lifecycle stream.
+func TestActionRegistrationFailureContainsWithoutAnnouncement(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+	current.markPublishedToolCall("call-1")
+	connection.mu.Lock()
+	connection.permissionRegistrationErr = errors.New("permission write failed")
+	connection.mu.Unlock()
+
+	client.publishEvent(permissionAskedEvent(current.idmap.NativeSessionID, "permission-register-failed", "call-1"))
+	requireSignal(t, client.closeSignal)
+	require.Equal(t, permissionReplyReject, client.permissionReply(0).reply)
+	require.Empty(t, connection.lifecycleEventsOfType(t, "action_update"))
+	require.Zero(t, connection.permissionRequestCount())
+	require.Error(t, current.lifecycleFailure())
+}
+
 // TestNativelyResolvedActionTerminalizesWithoutTheHostAnswer proves the
 // `*.replied` events are consumed: an action OpenCode resolved itself is reported
 // terminal and stops blocking the foreground, rather than waiting forever on a
@@ -421,9 +750,9 @@ func TestNativelyResolvedActionTerminalizesWithoutTheHostAnswer(t *testing.T) {
 	requireLifecycleReduces(t, connection)
 }
 
-// TestUnanswerableElicitationDeclinesInsteadOfBlockingForever proves the
-// unsupported-form path terminalizes: a host that cannot be asked declines the
-// question, OpenCode is answered, and the foreground is released.
+// TestUnanswerableElicitationDeclinesInsteadOfBlockingForever proves the hard
+// request-first rule: a host that cannot register a request is answered natively
+// without inventing a lifecycle action that was never answerable.
 func TestUnanswerableElicitationDeclinesInsteadOfBlockingForever(t *testing.T) {
 	current, client, connection := lifecycleSession(t)
 	native := current.idmap.NativeSessionID
@@ -438,16 +767,14 @@ func TestUnanswerableElicitationDeclinesInsteadOfBlockingForever(t *testing.T) {
 
 	requireEventually(t, func() bool { return client.questionRejectCount() == 1 }, "OpenCode was left blocked")
 	requireEventually(t, func() bool {
-		actions := connection.lifecycleEventsOfType(t, "action_update")
-		if len(actions) != 2 {
-			return false
-		}
-
-		terminal, _ := actions[1]["action"].(map[string]any)
-
-		return terminal["state"] == "declined"
-	}, "the unanswerable action never terminalized")
-
+		return len(connection.lifecycleEventsOfType(t, "action_update")) == 2
+	}, "synthetic decline never terminalized its lifecycle action")
+	actions := connection.lifecycleEventsOfType(t, "action_update")
+	require.Len(t, actions, 2)
+	pending, _ := actions[0]["action"].(map[string]any)
+	terminal, _ := actions[1]["action"].(map[string]any)
+	require.Equal(t, "pending", pending["state"])
+	require.Equal(t, "declined", terminal["state"])
 	require.Empty(t, connection.elicitations)
 	requireLifecycleReduces(t, connection)
 }
@@ -472,14 +799,29 @@ func TestCancelTerminalizesBlockersBeforeTheEndingIdle(t *testing.T) {
 	}
 
 	dispatched := make(chan struct{})
-	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	assistantObserved := make(chan struct{})
+	current.mu.Lock()
+	current.pump.afterObserve = func(event opencode.Event, _ *nativeEventObservation) {
+		if info, ok := eventMessageInfo(event.Properties); ok && info.ID == "assistant-1" {
+			signalTestHook(assistantObserved)
+		}
+	}
+	current.mu.Unlock()
+	client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(dispatched)
+		client.publishEvent(opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-1", "sessionID": id, "role": "assistant", "parentID": request.MessageID,
+			}}),
+		})
+		<-assistantObserved
 		client.publishEvent(opencode.Event{
 			Type: opencode.EventPermissionV2Asked,
 			Properties: mustJSONValue(map[string]any{
 				"id": "permission-1", "sessionID": id, "action": "edit",
 				"resources": []string{"file.go"},
-				"tool":      map[string]any{"callID": "call-1"},
+				"tool":      map[string]any{"callID": "call-1", "messageID": "assistant-1"},
 			}),
 		})
 
@@ -545,7 +887,12 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 		SessionID: "session-2", NativeSessionID: "native-2", Format: SessionStoreFormat,
 	})
 	second.runtimeGeneration = first.runtimeGeneration
+	second.stampIncarnationGeneration(clientB, first.runtimeGeneration)
 	clientB.ensureSyncAggregate("native-2")
+	agent.mu.Lock()
+	agent.sessions[second.id] = second
+	agent.mu.Unlock()
+	second.markEstablishmentResponseWritten()
 
 	agent.mu.Lock()
 	agent.sessions[first.id] = first
@@ -568,9 +915,16 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 
 	secondStarted := make(chan struct{})
 	secondRelease := make(chan struct{})
-	clientB.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	clientB.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(secondStarted)
 		clientB.stageAssistantMessage(id, "assistant-b")
+		clientB.publishEvent(opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-b", "sessionID": id, "role": "assistant",
+				"parentID": request.MessageID, "finish": "stop",
+			}}),
+		})
 
 		go func() {
 			<-secondRelease
@@ -580,26 +934,33 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 		return opencode.NativeMessage{}, nil
 	}
 
-	firstDone := make(chan acp.PromptResponse, 1)
-	secondDone := make(chan acp.PromptResponse, 1)
+	type promptResult struct {
+		response acp.PromptResponse
+		err      error
+	}
+	firstDone := make(chan promptResult, 1)
+	secondDone := make(chan promptResult, 1)
 
 	go func() {
 		response, err := first.Prompt(context.Background(), correlatedPrompt(first.id, "turn-a", "hello"))
-		require.NoError(t, err)
-		firstDone <- response
+		firstDone <- promptResult{response: response, err: err}
 	}()
 
 	go func() {
 		response, err := second.Prompt(context.Background(), correlatedPrompt(second.id, "turn-b", "hello"))
-		require.NoError(t, err)
-		secondDone <- response
+		secondDone <- promptResult{response: response, err: err}
 	}()
 
 	<-firstStarted
 	<-secondStarted
 
 	require.NoError(t, agent.Cancel(context.Background(), CancelRequest(first.id, "turn-a")))
-	require.Equal(t, acp.StopReasonCancelled, (<-firstDone).StopReason)
+	firstResult := <-firstDone
+	if firstResult.err != nil {
+		t.Fatalf("cancelled prompt failed: %v; lifecycle=%v; runtime=%v; aborts=%#v",
+			firstResult.err, first.lifecycleFailure(), first.runtimeFailure(), clientA.abortedSessions())
+	}
+	require.Equal(t, acp.StopReasonCancelled, firstResult.response.StopReason)
 
 	require.Empty(t, clientB.abortedSessions(), "cancelling one session interrupted a peer")
 	require.NotNil(t, agent.runtime, "cancelling one session retired the shared runtime")
@@ -610,7 +971,15 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 	require.Empty(t, peerLost, "cancelling one session detached a peer")
 
 	close(secondRelease)
-	require.Equal(t, acp.StopReasonEndTurn, (<-secondDone).StopReason)
+	secondResult := <-secondDone
+	if secondResult.err != nil {
+		clientB.mu.Lock()
+		messages := append([]opencode.NativeMessage(nil), clientB.messages...)
+		clientB.mu.Unlock()
+		t.Fatalf("peer prompt failed: %v; lifecycle=%v; runtime=%v; messages=%#v",
+			secondResult.err, second.lifecycleFailure(), second.runtimeFailure(), messages)
+	}
+	require.Equal(t, acp.StopReasonEndTurn, secondResult.response.StopReason)
 }
 
 // TestConcurrentSessionsPromptWithoutAGlobalGate proves two sessions run
@@ -627,7 +996,12 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 		SessionID: "session-2", NativeSessionID: "native-2", Format: SessionStoreFormat,
 	})
 	second.runtimeGeneration = first.runtimeGeneration
+	second.stampIncarnationGeneration(clientB, first.runtimeGeneration)
 	clientB.ensureSyncAggregate("native-2")
+	agent.mu.Lock()
+	agent.sessions[second.id] = second
+	agent.mu.Unlock()
+	second.markEstablishmentResponseWritten()
 
 	require.NoError(t, first.establish(context.Background()))
 	require.NoError(t, second.establish(context.Background()))
@@ -636,9 +1010,16 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 
 	held := make(chan struct{})
 	firstStarted := make(chan struct{})
-	clientA.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	clientA.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(firstStarted)
 		clientA.stageAssistantMessage(id, "assistant-a")
+		clientA.publishEvent(opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-a", "sessionID": id, "role": "assistant",
+				"parentID": request.MessageID, "finish": "stop",
+			}}),
+		})
 
 		go func() {
 			<-held
@@ -742,7 +1123,8 @@ func TestStreamFailureLatchesRatherThanHidingAGap(t *testing.T) {
 	connection.mu.Unlock()
 
 	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-	require.ErrorContains(t, err, "wire down")
+	assertTurnFailed(t, err, causeTransport, "")
+	require.NotContains(t, err.Error(), "wire down")
 
 	connection.mu.Lock()
 	connection.updateErr = nil
@@ -754,10 +1136,7 @@ func TestStreamFailureLatchesRatherThanHidingAGap(t *testing.T) {
 	)), "a latched stream emitted again")
 }
 
-// TestUnnegotiatedConnectionEmitsNoEnvelopeAndStillAnswersPermissions proves the
-// extension is the only thing the answer gates: a connection that negotiated
-// nothing carries no envelope, and its permission flow is unchanged.
-func TestUnnegotiatedConnectionEmitsNoEnvelopeAndStillAnswersPermissions(t *testing.T) {
+func TestUnnegotiatedConnectionRefusesActionsWithoutACompatibilityPath(t *testing.T) {
 	agent := NewAgent()
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
@@ -777,8 +1156,10 @@ func TestUnnegotiatedConnectionEmitsNoEnvelopeAndStillAnswersPermissions(t *test
 	})
 
 	requireEventually(t, func() bool { return client.permissionReplyCount() == 1 }, "OpenCode was never answered")
-	require.Equal(t, permissionReplyOnce, client.permissionReply(0).reply)
+	require.Equal(t, permissionReplyReject, client.permissionReply(0).reply)
+	require.Zero(t, connection.permissionRequestCount())
 	require.Empty(t, connection.lifecycleEnvelopes(t))
+	requireEventually(t, client.isClosed, "unnegotiated action did not contain its native incarnation")
 }
 
 // TestUnpublishedToolCallPermissionIsRefused proves the permission fence stays
@@ -883,22 +1264,102 @@ func TestHeldEventOverflowFailsClosed(t *testing.T) {
 	current.stopPump()
 
 	pump := &sessionPump{
-		session: current, client: client, released: make(chan struct{}, 1),
+		session: current, binding: testIncarnation(current), released: make(chan struct{}, 1),
 		done: make(chan struct{}),
 	}
-	pump.held = make([]opencode.Event, heldEventCapacity)
+	pump.held = make([]queuedNativeEvent, heldEventCapacity)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	current.dispatchGate.Lock()
-	client.publishEvent(opencode.Event{Type: opencode.EventSessionIdle, Properties: json.RawMessage(`{}`)})
+	client.publishEvent(opencode.Event{Type: opencode.EventSessionIdle, Properties: json.RawMessage(`{"sessionID":"native-1"}`)})
 
 	go pump.run(ctx)
 	<-pump.done
 	current.dispatchGate.Unlock()
 
-	require.ErrorContains(t, current.lifecycleFailure(), "held OpenCode event queue exceeded")
+	require.Error(t, current.lifecycleFailure())
+}
+
+func TestForeignEventsDoNotConsumeHeldCapacity(t *testing.T) {
+	current, client, _ := lifecycleSession(t)
+	current.stopPump()
+
+	ctx := withTurnRoute(context.Background(), "nonce-held")
+	cycle, _, err := current.reservePromptCycle(ctx, "native-held", lifecycle.Submission{
+		SubmissionID: "submission-held", ClientNonce: "nonce-held",
+	})
+	require.NoError(t, err)
+
+	pump := &sessionPump{
+		session: current, binding: testIncarnation(current), released: make(chan struct{}, 1),
+		done: make(chan struct{}),
+	}
+	pumpCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	current.dispatchGate.Lock()
+	go pump.run(pumpCtx)
+	for range heldEventCapacity + 1 {
+		client.publishEvent(opencode.Event{Type: opencode.EventSessionIdle,
+			Properties: json.RawMessage(`{"sessionID":"native-other"}`)})
+	}
+	client.publishPromptEvidence(current.idmap.NativeSessionID, "native-held")
+	<-cycle.dispatchEvidence
+	require.NoError(t, current.acceptPromptCycle(ctx, cycle,
+		lifecycle.Submission{SubmissionID: "submission-held", ClientNonce: "nonce-held"}))
+	current.dispatchGate.Unlock()
+	pump.wake()
+	client.publishEvent(opencode.Event{Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "assistant-held", "sessionID": current.idmap.NativeSessionID, "role": "assistant",
+			"parentID": "native-held", "finish": "stop",
+		}})})
+	client.publishSessionIdle(current.idmap.NativeSessionID)
+	<-cycle.signal
+	cancel()
+	<-pump.done
+
+	require.NoError(t, current.lifecycleFailure())
+}
+
+// TestStaleStreamTerminalCannotFenceAFreshGeneration proves terminal identity is
+// the exact immutable binding pointer. A delayed marker from a retired binding is a
+// no-op after replacement; the current binding's own marker still fences it.
+func TestStaleStreamTerminalCannotFenceAFreshGeneration(t *testing.T) {
+	current, _, _ := lifecycleSession(t)
+	current.stopPump()
+	oldGeneration := current.runtimeGeneration
+	oldBinding := testIncarnation(current)
+
+	replacement := newFakeOpenCodeClient()
+	replacement.ensureSyncAggregate(current.idmap.NativeSessionID)
+	current.agent.mu.Lock()
+	current.agent.runtime = replacement
+	current.agent.runtimeGeneration = oldGeneration + 1
+	current.agent.mu.Unlock()
+	current.mu.Lock()
+	current.client = replacement
+	current.runtimeGeneration = oldGeneration + 1
+	current.runtimeLostCause = ""
+	current.mu.Unlock()
+	current.reopenLifecycleStream()
+	replacementBinding := testIncarnation(current)
+
+	current.handleStreamError(oldBinding, errors.New("stale stream ended"))
+	require.True(t, current.incarnationIsCurrent(replacementBinding))
+	require.NoError(t, current.lifecycleFailure())
+	current.agent.mu.Lock()
+	require.Same(t, replacement, current.agent.runtime)
+	current.agent.mu.Unlock()
+
+	current.handleStreamError(replacementBinding, errors.New("current stream ended"))
+	require.ErrorContains(t, current.lifecycleFailure(), "native event stream failed")
+	require.NotContains(t, current.lifecycleFailure().Error(), "current stream ended")
+	current.agent.mu.Lock()
+	require.Nil(t, current.agent.runtime)
+	current.agent.mu.Unlock()
 }
 
 // TestAnEventTheStreamsOwnRulesRefuseLatchesIt proves emission is validated
@@ -929,8 +1390,8 @@ func TestLifecycleDeliveryWithoutAConnectionFailsTheEstablishingRequest(t *testi
 			SessionID: "session-1", NativeSessionID: "native-1", Format: SessionStoreFormat,
 		})
 
-	require.ErrorContains(t, current.establish(context.Background()), "no ACP connection")
-	require.ErrorContains(t, current.lifecycleFailure(), "no ACP connection")
+	require.ErrorContains(t, current.establish(context.Background()), "authoritative session update delivery failed")
+	require.ErrorContains(t, current.lifecycleFailure(), "lifecycle delivery failed")
 }
 
 // TestAgentOriginCycleThatCannotBeAnnouncedIsNeverOpened proves the agent-origin
@@ -960,24 +1421,242 @@ func TestASecondForegroundCycleIsRefused(t *testing.T) {
 	current, client, connection := lifecycleSession(t)
 	native := current.idmap.NativeSessionID
 
-	started := make(chan struct{})
-	client.hangsAfterDispatch(started)
+	var dispatches atomic.Int64
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatches.Add(1)
 
-	client.publishEvent(opencode.Event{
+		return opencode.NativeMessage{}, nil
+	}
+
+	current.routeNativeEvent(context.Background(), opencode.Event{
 		Type:       opencode.EventSessionStatus,
 		Properties: mustJSONValue(map[string]any{"sessionID": native, "status": map[string]any{"type": "busy"}}),
 	})
-	requireEventually(t, func() bool { return current.currentCycle() != nil }, "no agent-origin cycle opened")
+	require.NotNil(t, current.currentCycle(), "no agent-origin cycle opened")
 
 	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-	require.ErrorContains(t, err, "already holds foreground cycle")
+	require.ErrorContains(t, err, errValueBackpressure)
 
-	requireSignal(t, started)
+	require.Zero(t, dispatches.Load(), "the losing prompt reached native dispatch")
+	require.Zero(t, client.abortCount(), "the losing prompt acquired cancellation authority")
 	require.NotNil(t, current.currentCycle(), "the refused prompt ended the agent-origin turn")
 
-	client.publishSessionIdle(native)
-	requireEventually(t, func() bool { return current.currentCycle() == nil }, "the agent-origin turn never settled")
+	current.routeNativeEvent(context.Background(), opencode.Event{
+		Type: opencode.EventSessionIdle, Properties: mustJSONValue(map[string]any{"sessionID": native}),
+	})
+	require.Nil(t, current.currentCycle(), "the agent-origin turn never settled")
 	requireLifecycleReduces(t, connection)
+}
+
+func TestEitherConcurrentPromptWinnerLeavesTheLoserWithoutPostOrAbortAuthority(t *testing.T) {
+	for _, winner := range []string{"first", "second"} {
+		t.Run(winner, func(t *testing.T) {
+			current, client, _ := lifecycleSession(t)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			assistantObserved := make(chan struct{})
+			current.mu.Lock()
+			current.pump.afterObserve = func(event opencode.Event, _ *nativeEventObservation) {
+				if info, ok := eventMessageInfo(event.Properties); ok && info.ID == "winner-assistant" {
+					signalTestHook(assistantObserved)
+				}
+			}
+			current.mu.Unlock()
+			var posts atomic.Int64
+			client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+				posts.Add(1)
+				close(entered)
+				<-release
+				client.stageAssistantMessage(id, "winner-assistant")
+				client.publishEvent(opencode.Event{
+					Type: opencode.EventMessageUpdated,
+					Properties: mustJSONValue(map[string]any{"info": map[string]any{
+						"id": "winner-assistant", "sessionID": id, "role": "assistant",
+						"parentID": request.MessageID, "finish": "stop",
+					}}),
+				})
+
+				return opencode.NativeMessage{}, nil
+			}
+
+			winnerDone := make(chan error, 1)
+			go func() {
+				_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, winner+"-winner", "winner"))
+				winnerDone <- err
+			}()
+			<-entered
+
+			loserStarted := make(chan struct{})
+			loserDone := make(chan error, 1)
+			go func() {
+				close(loserStarted)
+				_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, winner+"-loser", "loser"))
+				loserDone <- err
+			}()
+			<-loserStarted
+			close(release)
+
+			require.ErrorContains(t, <-loserDone, errValueBackpressure)
+			require.EqualValues(t, 1, posts.Load())
+			require.Zero(t, client.abortCount())
+
+			requireSignal(t, assistantObserved)
+			client.publishSessionIdle(current.idmap.NativeSessionID)
+			require.NoError(t, <-winnerDone)
+		})
+	}
+}
+
+func TestObservationBeforePromptImmutablyWinsAgentOwnership(t *testing.T) {
+	current, client, _ := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+
+	event := opencode.Event{
+		Type: opencode.EventSessionStatus,
+		Properties: mustJSONValue(map[string]any{
+			"sessionID": current.idmap.NativeSessionID, "status": map[string]any{"type": "busy"},
+		}),
+	}
+	observation, ok := current.observeNativeEvent(binding, event)
+	require.True(t, ok)
+	require.Equal(t, nativeEventAgent, observation.ownership)
+
+	var dispatches atomic.Int64
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatches.Add(1)
+
+		return opencode.NativeMessage{}, nil
+	}
+	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, "losing-prompt", "hello"))
+	require.ErrorContains(t, err, errValueBackpressure)
+	require.Zero(t, dispatches.Load())
+	require.Zero(t, client.abortCount())
+
+	require.NoError(t, current.routeNativeEventForIncarnation(
+		context.Background(), binding, event, observation,
+	))
+	require.NotNil(t, current.currentCycle())
+}
+
+func TestReplacementClearsOnlyTheRetiredBindingsPendingObservations(t *testing.T) {
+	current, _, _ := lifecycleSession(t)
+	current.stopPump()
+	oldBinding := testIncarnation(current)
+	event := opencode.Event{
+		Type: opencode.EventSessionStatus,
+		Properties: mustJSONValue(map[string]any{
+			"sessionID": current.idmap.NativeSessionID, "status": map[string]any{"type": "busy"},
+		}),
+	}
+
+	observation, ok := current.observeNativeEvent(oldBinding, event)
+	require.True(t, ok)
+	require.Equal(t, nativeEventAgent, observation.ownership)
+
+	current.reopenLifecycleStream()
+	newBinding := testIncarnation(current)
+	require.NotSame(t, oldBinding, newBinding)
+
+	ctx := withTurnRoute(context.Background(), "replacement-prompt")
+	cycle, _, err := current.reservePromptCycle(ctx, "replacement-message", lifecycle.Submission{
+		SubmissionID: "replacement-submission", ClientNonce: "replacement-client",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, cycle)
+
+	require.NoError(t, current.routeNativeEventForIncarnation(
+		context.Background(), oldBinding, event, observation,
+	))
+	require.Same(t, cycle, current.currentCycle())
+}
+
+func TestOldIdleAndMessageCannotAcceptOrFinishReservedPrompt(t *testing.T) {
+	current, _, _ := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+	ctx := withTurnRoute(context.Background(), "new-prompt")
+	submission := lifecycle.Submission{SubmissionID: "new-submission", ClientNonce: "new-client"}
+	cycle, _, err := current.reservePromptCycle(ctx, "new-native-user", submission)
+	require.NoError(t, err)
+
+	oldMessage := opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "old-assistant", "sessionID": current.idmap.NativeSessionID, "role": "assistant",
+		}}),
+	}
+	oldIdle := opencode.Event{Type: opencode.EventSessionIdle,
+		Properties: mustJSONValue(map[string]any{"sessionID": current.idmap.NativeSessionID})}
+	for _, event := range []opencode.Event{oldMessage, oldIdle} {
+		observation, ok := current.observeNativeEvent(binding, event)
+		require.True(t, ok)
+		require.Equal(t, nativeEventPromptBeforeEvidence, observation.ownership)
+		require.NoError(t, current.routeNativeEventForIncarnation(
+			context.Background(), binding, event, observation,
+		))
+	}
+	select {
+	case <-cycle.dispatchEvidence:
+		t.Fatal("old same-session event accepted the new prompt")
+	default:
+	}
+	select {
+	case <-cycle.signal:
+		t.Fatal("old idle finished the new prompt")
+	default:
+	}
+
+	evidence := opencode.Event{Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "new-native-user", "sessionID": current.idmap.NativeSessionID, "role": roleUser,
+		}})}
+	observation, ok := current.observeNativeEvent(binding, evidence)
+	require.True(t, ok)
+	<-cycle.dispatchEvidence
+	require.NoError(t, current.acceptPromptCycle(ctx, cycle, submission))
+	require.NoError(t, current.routeNativeEventForIncarnation(
+		context.Background(), binding, evidence, observation,
+	))
+	select {
+	case <-cycle.signal:
+		t.Fatal("pre-accept idle became terminal after acceptance")
+	default:
+	}
+
+	observation, ok = current.observeNativeEvent(binding, oldIdle)
+	require.True(t, ok)
+	require.NoError(t, current.routeNativeEventForIncarnation(
+		context.Background(), binding, oldIdle, observation,
+	))
+	select {
+	case <-cycle.signal:
+		t.Fatal("replayed idle finished the accepted prompt without its assistant")
+	default:
+	}
+
+	assistant := opencode.Event{Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "new-assistant", "sessionID": current.idmap.NativeSessionID, "role": "assistant",
+			"parentID": "new-native-user", "finish": "stop",
+		}})}
+	observation, ok = current.observeNativeEvent(binding, assistant)
+	require.True(t, ok)
+	require.NoError(t, current.routeNativeEventForIncarnation(
+		context.Background(), binding, assistant, observation,
+	))
+	select {
+	case <-cycle.signal:
+		t.Fatal("assistant terminalized the prompt before native idle")
+	default:
+	}
+
+	observation, ok = current.observeNativeEvent(binding, oldIdle)
+	require.True(t, ok)
+	require.NoError(t, current.routeNativeEventForIncarnation(
+		context.Background(), binding, oldIdle, observation,
+	))
+	<-cycle.signal
 }
 
 // TestPanickingPermissionRequestFailsItsActionInstead proves a crashed outbound
@@ -1013,6 +1692,29 @@ func TestPanickingPermissionRequestFailsItsActionInstead(t *testing.T) {
 // panickingPermissionClient is a host whose permission request crashes.
 type panickingPermissionClient struct {
 	*recordingAgentClient
+}
+
+func (c *panickingPermissionClient) BeginRequestPermission(
+	ctx context.Context,
+	request acp.RequestPermissionRequest,
+	_ hostRequestKey,
+) registeredPermissionRequest {
+	registered := make(chan error, 1)
+	answered := make(chan permissionRequestResult, 1)
+	registered <- nil
+
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				answered <- permissionRequestResult{err: errors.New("host permission handler exploded")}
+			}
+		}()
+
+		response, err := c.RequestPermission(ctx, request)
+		answered <- permissionRequestResult{response: response, err: err}
+	}()
+
+	return registeredPermissionRequest{registered: registered, answered: answered}
 }
 
 func (c *panickingPermissionClient) RequestPermission(

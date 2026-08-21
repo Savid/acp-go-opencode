@@ -48,15 +48,26 @@ type Reducer struct {
 	fence uint64
 	// turnSeen and activitySeen record the sequence an identity was first seen
 	// at, which is what makes late causal work mechanically detectable.
-	turnSeen     map[string]uint64
-	activitySeen map[string]uint64
+	turnSeen        map[string]uint64
+	activitySeen    map[string]uint64
+	turnIndexes     map[string]int
+	activityIndexes map[string]int
+	actionIndexes   map[string]int
+	// liveChildren and liveActions make parent terminalization proportional to
+	// the update being reduced rather than to every sibling already projected.
+	// They count only direct, currently nonterminal owners; descendant ordering
+	// follows inductively because a child cannot terminalize while its own counts
+	// remain nonzero.
+	liveChildren map[string]int
+	liveActions  map[string]int
 	// blockedCycle is the cycle owing the accompanying foreground transition a
 	// blocking action requires.
 	blockedCycle string
 	// actionCycle records, per blocking action, the foreground cycle it stopped:
 	// a blocker blocks the cycle current at its first sight, and that cycle may
 	// not move again until the blocker terminalizes.
-	actionCycle map[string]string
+	actionCycle     map[string]string
+	blockingByCycle map[string]int
 	// retired remembers every stream identity a later incarnation superseded.
 	// Supersession fences an incarnation the same way close does, so a retired
 	// identity never opens again and its projection never resurrects.
@@ -202,8 +213,14 @@ func (r *Reducer) reset(streamID string) {
 	r.fence = 0
 	r.turnSeen = make(map[string]uint64)
 	r.activitySeen = make(map[string]uint64)
+	r.turnIndexes = make(map[string]int)
+	r.activityIndexes = make(map[string]int)
+	r.actionIndexes = make(map[string]int)
+	r.liveChildren = make(map[string]int)
+	r.liveActions = make(map[string]int)
 	r.blockedCycle = ""
 	r.actionCycle = make(map[string]string)
+	r.blockingByCycle = make(map[string]int)
 }
 
 func (r *Reducer) reduceFirst(delivery Delivery) error {

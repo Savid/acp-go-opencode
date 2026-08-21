@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +42,85 @@ func testNativeOwnedHome(t *testing.T) string {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+const internalSeamTurnNonce = "test-turn-nonce"
+
+var testPromptSubmissionCounter atomic.Uint64
+
+// Prompt keeps unit tests on the public admission path while allowing fixtures
+// to address the session they already hold.
+func (s *session) Prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
+	if request.Meta == nil {
+		request.Meta = map[string]any{}
+	}
+	if _, present := request.Meta[routeEnvelopeKey]; !present {
+		for key, value := range requestRouteCarrier(internalSeamTurnNonce) {
+			request.Meta[key] = value
+		}
+	}
+	if s.agent.lifecycleNegotiated().Present() {
+		if _, present := request.Meta[lifecycle.MetaKey]; !present {
+			identity := strconv.FormatUint(testPromptSubmissionCounter.Add(1), 10)
+			request.Meta[lifecycle.MetaKey] = map[string]any{
+				"version": 1,
+				"submission": map[string]any{
+					"submissionId": "test-submission-" + identity,
+					"clientNonce":  "test-client-" + identity,
+				},
+			}
+		}
+	}
+
+	return s.agent.Prompt(ctx, request)
+}
+
+func testIncarnation(s *session) *nativeIncarnationBinding {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	return s.incarnation
+}
+
+func (s *session) beginTurn(ctx context.Context, turnNonces ...string) context.Context {
+	turnNonce := ""
+	if len(turnNonces) > 0 {
+		turnNonce = turnNonces[0]
+	}
+
+	turnCtx, cancel := context.WithCancel(ctx)
+	turnCtx = withTurnRoute(turnCtx, turnNonce)
+	s.lifecycleMu.Lock()
+	s.cancel = cancel
+	s.turnDone = turnCtx.Done()
+	s.cancelled = false
+	s.pendingDispatchFailure = nil
+	s.turnEpoch++
+	s.turnNonce = turnNonce
+	s.lifecycleMu.Unlock()
+
+	return turnCtx
+}
+
+func (s *session) reopenLifecycleStream() {
+	facts := s.agent.lifecycleNegotiated()
+	s.lifecycleMu.Lock()
+	s.lifecycleFailed = nil
+	s.cycleCounter = 0
+	s.turnCounter = 0
+	s.installLifecycleStream(facts)
+	s.lifecycleMu.Unlock()
+}
+
+func establishCreatedSession(t *testing.T, agent *Agent, id acp.SessionId) *session {
+	t.Helper()
+
+	current, err := agent.session(id)
+	require.NoError(t, err)
+	current.markEstablishmentResponseWritten()
+	require.NoError(t, current.ensureEstablished(context.Background()))
+
+	return current
 }
 
 func fixtureImage(tb testing.TB, name string) []byte {
@@ -162,61 +241,66 @@ type fakeOpenCodeClient struct {
 
 	xdg opencode.XDGDirs
 
-	createSession opencode.NativeSession
-	getSession    opencode.NativeSession
-	listSessions  []opencode.NativeSession
-	forkSession   opencode.NativeSession
-	messages      []opencode.NativeMessage
-	todos         []opencode.NativeTodo
-	providers     opencode.ProvidersResponse
-	agents        []opencode.NativeAgent
-	commands      []opencode.NativeCommand
+	createSession    opencode.NativeSession
+	getSession       opencode.NativeSession
+	listSessions     []opencode.NativeSession
+	forkSession      opencode.NativeSession
+	messages         []opencode.NativeMessage
+	promptMessageIDs map[string]string
+	todos            []opencode.NativeTodo
+	providers        opencode.ProvidersResponse
+	agents           []opencode.NativeAgent
+	commands         []opencode.NativeCommand
 
 	pendingPermissions []opencode.PermissionRequest
 	permissionReplies  []fakePermissionReply
+	permissionReplied  chan struct{}
 	pendingQuestions   []opencode.QuestionRequest
 	questionReplies    []fakeQuestionReply
+	questionReplied    chan struct{}
 	questionRejects    []fakeQuestionReject
+	questionRejected   chan struct{}
 
-	createSessionFunc func(context.Context, string) (opencode.NativeSession, error)
-	dispatchMessage   func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
-	dispatchCommand   func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
-	abortFunc         func(string) error
-	syncHistoryFunc   func(context.Context, map[string]int64) ([]opencode.SyncEvent, error)
-	refreshMCPFunc    func(context.Context, []opencode.MCPServerConfig) error
+	createSessionFunc  func(context.Context, string) (opencode.NativeSession, error)
+	dispatchMessage    func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
+	dispatchCommand    func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
+	omitPromptEvidence bool
+	abortFunc          func(string) error
+	syncHistoryFunc    func(context.Context, map[string]int64) ([]opencode.SyncEvent, error)
+	refreshMCPFunc     func(context.Context, []opencode.MCPServerConfig) error
 	// closeHook runs inside the containment rung, which is the one point of the
 	// close ladder that sits between the capture and the durable commit.
 	closeHook func()
 
-	aborts         []string
-	deleted        []string
-	closed         bool
-	closeCalls     int
-	events         chan opencode.Event
-	errs           chan error
-	runtimeExited  chan struct{}
-	createErr      error
-	getErr         error
-	listErr        error
-	deleteErr      error
-	messagesErr    error
-	commandsErr    error
-	commandErr     error
-	abortErr       error
-	forkErr        error
-	todosErr       error
-	providersErr   error
-	agentsErr      error
-	permissionsErr error
-	questionsErr   error
-	replyErr       error
-	closeErr       error
-	scopeErr       error
-	syncHistoryErr error
-	syncReplayErr  error
-	refreshMCPErr  error
-	syncEvents     []opencode.SyncEvent
-	scopeOptions   []opencode.ScopeOptions
+	aborts              []string
+	deleted             []string
+	closed              bool
+	closeCalls          int
+	eventStream         chan opencode.EventStreamItem
+	runtimeExited       chan struct{}
+	createErr           error
+	getErr              error
+	listErr             error
+	deleteErr           error
+	messagesErr         error
+	commandsErr         error
+	commandErr          error
+	abortErr            error
+	forkErr             error
+	todosErr            error
+	providersErr        error
+	agentsErr           error
+	permissionsErr      error
+	questionsErr        error
+	replyErr            error
+	replyPermissionFunc func(context.Context, opencode.PermissionRequest, string, string) error
+	closeErr            error
+	scopeErr            error
+	syncHistoryErr      error
+	syncReplayErr       error
+	refreshMCPErr       error
+	syncEvents          []opencode.SyncEvent
+	scopeOptions        []opencode.ScopeOptions
 
 	providerCatalog        []opencode.ProviderCatalogEntry
 	providerCatalogErr     error
@@ -294,12 +378,12 @@ func newFakeOpenCodeClient() *fakeOpenCodeClient {
 	}
 
 	return &fakeOpenCodeClient{
-		xdg:           opencode.XDGDirs{Root: runtimeState, State: runtimeState},
-		providers:     testProviders(),
-		events:        make(chan opencode.Event, 16),
-		errs:          make(chan error, 16),
-		runtimeExited: make(chan struct{}),
-		closeSignal:   make(chan struct{}),
+		xdg:              opencode.XDGDirs{Root: runtimeState, State: runtimeState},
+		providers:        testProviders(),
+		eventStream:      make(chan opencode.EventStreamItem, 256),
+		runtimeExited:    make(chan struct{}),
+		closeSignal:      make(chan struct{}),
+		promptMessageIDs: make(map[string]string),
 	}
 }
 
@@ -427,19 +511,29 @@ func (c *fakeOpenCodeClient) Commands(context.Context) ([]opencode.NativeCommand
 func (c *fakeOpenCodeClient) DispatchCommand(ctx context.Context, id string, req opencode.CommandRequest) error {
 	if c.dispatchCommand != nil {
 		message, err := c.dispatchCommand(ctx, id, req)
+		if err == nil {
+			c.publishPromptEvidence(id, req.MessageID)
+		}
 
 		return c.completeFromHook(id, message, err)
 	}
+	if c.commandErr != nil {
+		return c.commandErr
+	}
 
+	c.publishPromptEvidence(id, req.MessageID)
 	c.publishTurnCompletion(id, "assistant-1")
 
-	return c.commandErr
+	return nil
 }
 
 // DispatchMessage mirrors the async prompt route: it acknowledges admission and
 // returns. The default publishes the events a completed native turn publishes, so
 // an ordinary prompt settles from the native stream exactly as it does live.
 func (c *fakeOpenCodeClient) DispatchMessage(ctx context.Context, id string, req opencode.MessageRequest) error {
+	if !c.omitPromptEvidence {
+		c.publishPromptEvidence(id, req.MessageID)
+	}
 	if c.dispatchMessage != nil {
 		message, err := c.dispatchMessage(ctx, id, req)
 
@@ -488,18 +582,25 @@ func (c *fakeOpenCodeClient) publishTurnCompletion(id string, assistantID string
 		}}}
 	}
 
+	finish := "stop"
 	for index := len(c.messages) - 1; index >= 0; index-- {
 		if c.messages[index].Info.Role == "assistant" {
 			assistantID = c.messages[index].Info.ID
+			if c.messages[index].Info.Finish != "" {
+				finish = c.messages[index].Info.Finish
+			}
 
 			break
 		}
 	}
+	parentID := c.promptMessageIDs[id]
 	c.mu.Unlock()
 
 	c.publishEvent(opencode.Event{
-		Type:       opencode.EventMessageUpdated,
-		Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": assistantID, "sessionID": id, "role": "assistant"}}),
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": assistantID, "sessionID": id, "role": "assistant", "parentID": parentID, "finish": finish,
+		}}),
 	})
 	c.publishSessionIdle(id)
 }
@@ -524,12 +625,24 @@ func (c *fakeOpenCodeClient) publishSessionIdle(id string) {
 	})
 }
 
+func (c *fakeOpenCodeClient) publishPromptEvidence(sessionID, messageID string) {
+	c.mu.Lock()
+	c.promptMessageIDs[sessionID] = messageID
+	c.mu.Unlock()
+
+	properties, _ := json.Marshal(map[string]any{"info": map[string]any{
+		"id": messageID, "sessionID": sessionID, "role": roleUser,
+	}})
+	c.publishEvent(opencode.Event{Type: opencode.EventMessageUpdated, Properties: properties})
+}
+
 // publishEvent delivers one native event to whichever consumer is attached.
 func (c *fakeOpenCodeClient) publishEvent(event opencode.Event) {
-	select {
-	case c.events <- event:
-	default:
-	}
+	c.eventStream <- opencode.EventStreamItem{Event: &event}
+}
+
+func (c *fakeOpenCodeClient) publishStreamTerminal(err error) {
+	c.eventStream <- opencode.EventStreamItem{Terminal: err}
 }
 
 func mustJSONValue(value any) json.RawMessage {
@@ -589,7 +702,11 @@ func (c *fakeOpenCodeClient) PendingPermissions(context.Context) ([]opencode.Per
 	return append([]opencode.PermissionRequest(nil), c.pendingPermissions...), c.permissionsErr
 }
 
-func (c *fakeOpenCodeClient) ReplyPermission(_ context.Context, req opencode.PermissionRequest, reply string, message string) error {
+func (c *fakeOpenCodeClient) ReplyPermission(ctx context.Context, req opencode.PermissionRequest, reply string, message string) error {
+	if c.replyPermissionFunc != nil {
+		return c.replyPermissionFunc(ctx, req, reply, message)
+	}
+
 	c.mu.Lock()
 	c.permissionReplies = append(c.permissionReplies, fakePermissionReply{
 		sessionID: req.SessionID,
@@ -598,7 +715,11 @@ func (c *fakeOpenCodeClient) ReplyPermission(_ context.Context, req opencode.Per
 		reply:     reply,
 		message:   message,
 	})
+	replied := c.permissionReplied
 	c.mu.Unlock()
+	if replied != nil {
+		replied <- struct{}{}
+	}
 
 	return c.replyErr
 }
@@ -614,7 +735,11 @@ func (c *fakeOpenCodeClient) ReplyQuestion(_ context.Context, req opencode.Quest
 	}
 	c.mu.Lock()
 	c.questionReplies = append(c.questionReplies, fakeQuestionReply{sessionID: req.SessionID, requestID: req.ID, route: req.Route(), answers: copied})
+	replied := c.questionReplied
 	c.mu.Unlock()
+	if replied != nil {
+		replied <- struct{}{}
+	}
 
 	return c.replyErr
 }
@@ -622,17 +747,17 @@ func (c *fakeOpenCodeClient) ReplyQuestion(_ context.Context, req opencode.Quest
 func (c *fakeOpenCodeClient) RejectQuestion(_ context.Context, req opencode.QuestionRequest) error {
 	c.mu.Lock()
 	c.questionRejects = append(c.questionRejects, fakeQuestionReject{sessionID: req.SessionID, requestID: req.ID, route: req.Route()})
+	rejected := c.questionRejected
 	c.mu.Unlock()
+	if rejected != nil {
+		rejected <- struct{}{}
+	}
 
 	return c.replyErr
 }
 
-func (c *fakeOpenCodeClient) Events() <-chan opencode.Event {
-	return c.events
-}
-
-func (c *fakeOpenCodeClient) EventErrors() <-chan error {
-	return c.errs
+func (c *fakeOpenCodeClient) EventStream() <-chan opencode.EventStreamItem {
+	return c.eventStream
 }
 
 func (c *fakeOpenCodeClient) RuntimeExited() <-chan struct{} {
@@ -760,18 +885,29 @@ type recordingAgentClient struct {
 	elicitations []acp.UnstableCreateElicitationRequest
 	scopes       []elicitationScope
 
-	permission               acp.RequestPermissionResponse
-	elicitation              acp.UnstableCreateElicitationResponse
-	permissionStarted        chan struct{}
-	permissionRelease        chan struct{}
-	permissionIgnoreContext  bool
-	elicitationStarted       chan struct{}
-	elicitationRelease       chan struct{}
-	elicitationIgnoreContext bool
-	permErr                  error
-	elicitErr                error
-	updateErr                error
-	notifyErr                error
+	permission                     acp.RequestPermissionResponse
+	elicitation                    acp.UnstableCreateElicitationResponse
+	permissionStarted              chan struct{}
+	permissionRelease              chan struct{}
+	permissionRegistrationStarted  chan struct{}
+	permissionRegistrationRelease  chan struct{}
+	permissionIgnoreContext        bool
+	permissionRegistrationErr      error
+	elicitationStarted             chan struct{}
+	elicitationRelease             chan struct{}
+	elicitationRegistrationStarted chan struct{}
+	elicitationRegistrationRelease chan struct{}
+	elicitationIgnoreContext       bool
+	elicitationRegistrationErr     error
+	permErr                        error
+	elicitErr                      error
+	updateErr                      error
+	notifyErr                      error
+	updateHook                     func(acp.SessionNotification)
+	updateStarted                  chan struct{}
+	updateRelease                  chan struct{}
+	notifyStarted                  chan struct{}
+	notifyRelease                  chan struct{}
 }
 
 type extensionNotification struct {
@@ -791,6 +927,142 @@ func newRecordingAgentClient() *recordingAgentClient {
 
 func (c *recordingAgentClient) Done() <-chan struct{} {
 	return c.done
+}
+
+func (c *recordingAgentClient) BeginRequestPermission(
+	ctx context.Context,
+	request acp.RequestPermissionRequest,
+	key hostRequestKey,
+) registeredPermissionRequest {
+	registered := make(chan error, 1)
+	answered := make(chan permissionRequestResult, 1)
+
+	go func() {
+		c.mu.Lock()
+		registrationErr := c.permissionRegistrationErr
+		registrationStarted := c.permissionRegistrationStarted
+		registrationRelease := c.permissionRegistrationRelease
+		c.mu.Unlock()
+
+		if registrationErr == nil && (key.streamID == "" || key.actionID == "") {
+			registrationErr = errors.New("permission registration correlation is incomplete")
+		}
+
+		signalTestHook(registrationStarted)
+		if registrationErr == nil && registrationRelease != nil {
+			select {
+			case <-registrationRelease:
+			case <-ctx.Done():
+				registrationErr = ctx.Err()
+			}
+		}
+
+		c.mu.Lock()
+		if registrationErr == nil {
+			c.permissions = append(c.permissions, request)
+		}
+		resp := c.permission
+		err := c.permErr
+		started := c.permissionStarted
+		release := c.permissionRelease
+		ignoreContext := c.permissionIgnoreContext
+		c.mu.Unlock()
+
+		registered <- registrationErr
+		if registrationErr != nil {
+			answered <- permissionRequestResult{err: registrationErr}
+
+			return
+		}
+
+		signalTestHook(started)
+		if release != nil {
+			if ignoreContext {
+				<-release
+			} else {
+				select {
+				case <-release:
+				case <-ctx.Done():
+					answered <- permissionRequestResult{err: ctx.Err()}
+
+					return
+				}
+			}
+		}
+
+		answered <- permissionRequestResult{response: resp, err: err}
+	}()
+
+	return registeredPermissionRequest{registered: registered, answered: answered}
+}
+
+func (c *recordingAgentClient) BeginCreateElicitation(
+	ctx context.Context,
+	request acp.UnstableCreateElicitationRequest,
+	scope elicitationScope,
+	key hostRequestKey,
+) registeredElicitationRequest {
+	registered := make(chan error, 1)
+	answered := make(chan elicitationRequestResult, 1)
+
+	go func() {
+		c.mu.Lock()
+		registrationErr := c.elicitationRegistrationErr
+		registrationStarted := c.elicitationRegistrationStarted
+		registrationRelease := c.elicitationRegistrationRelease
+		c.mu.Unlock()
+
+		if registrationErr == nil && (key.streamID == "" || key.actionID == "") {
+			registrationErr = errors.New("elicitation registration correlation is incomplete")
+		}
+
+		signalTestHook(registrationStarted)
+		if registrationErr == nil && registrationRelease != nil {
+			select {
+			case <-registrationRelease:
+			case <-ctx.Done():
+				registrationErr = ctx.Err()
+			}
+		}
+
+		c.mu.Lock()
+		if registrationErr == nil {
+			c.elicitations = append(c.elicitations, request)
+			c.scopes = append(c.scopes, scope)
+		}
+		resp := c.elicitation
+		err := c.elicitErr
+		started := c.elicitationStarted
+		release := c.elicitationRelease
+		ignoreContext := c.elicitationIgnoreContext
+		c.mu.Unlock()
+
+		registered <- registrationErr
+		if registrationErr != nil {
+			answered <- elicitationRequestResult{err: registrationErr}
+
+			return
+		}
+
+		signalTestHook(started)
+		if release != nil {
+			if ignoreContext {
+				<-release
+			} else {
+				select {
+				case <-release:
+				case <-ctx.Done():
+					answered <- elicitationRequestResult{err: ctx.Err()}
+
+					return
+				}
+			}
+		}
+
+		answered <- elicitationRequestResult{response: resp, err: err}
+	}()
+
+	return registeredElicitationRequest{registered: registered, answered: answered}
 }
 
 func (c *recordingAgentClient) UnstableCreateElicitation(
@@ -857,20 +1129,44 @@ func (c *recordingAgentClient) RequestPermission(ctx context.Context, request ac
 	return resp, err
 }
 
-func (c *recordingAgentClient) SessionUpdate(_ context.Context, notification acp.SessionNotification) error {
+func (c *recordingAgentClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
 	c.mu.Lock()
 	c.updates = append(c.updates, notification)
 	err := c.updateErr
+	hook := c.updateHook
+	started := c.updateStarted
+	release := c.updateRelease
 	c.mu.Unlock()
+	signalTestHook(started)
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if hook != nil {
+		hook(notification)
+	}
 
 	return err
 }
 
-func (c *recordingAgentClient) NotifyExtension(_ context.Context, method string, params any) error {
+func (c *recordingAgentClient) NotifyExtension(ctx context.Context, method string, params any) error {
 	c.mu.Lock()
 	c.extensions = append(c.extensions, extensionNotification{method: method, params: params})
 	err := c.notifyErr
+	started := c.notifyStarted
+	release := c.notifyRelease
 	c.mu.Unlock()
+	signalTestHook(started)
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 
 	return err
 }
@@ -905,14 +1201,20 @@ func (c *recordingAgentClient) permissionRequestCount() int {
 	return len(c.permissions)
 }
 
+var testHookClosers sync.Map
+
 func signalTestHook(ch chan struct{}) {
 	if ch == nil {
 		return
 	}
-	select {
-	case ch <- struct{}{}:
-	default:
+
+	closer, _ := testHookClosers.LoadOrStore(ch, &sync.Once{})
+	once, ok := closer.(*sync.Once)
+	if !ok {
+		panic("test hook closer has unexpected type")
 	}
+
+	once.Do(func() { close(ch) })
 }
 
 func requireSignal(t *testing.T, ch <-chan struct{}) {
@@ -974,9 +1276,9 @@ func requireInternalErrorData(t testingT, err error) map[string]any {
 
 // assertTurnFailed asserts err is the uniform OpenCode turn-failure error:
 // code -32603, data.error == "opencode_turn_failed", data.cause == wantCause,
-// and data.message contains wantMessageSubstr (skipped when empty). It returns
+// and data.message is the fixed classification for that cause. It returns
 // the decoded data map for any additional field assertions.
-func assertTurnFailed(t testingT, err error, wantCause string, wantMessageSubstr string) map[string]any {
+func assertTurnFailed(t testingT, err error, wantCause string, _ string) map[string]any {
 	t.Helper()
 	var reqErr *acp.RequestError
 	if !errors.As(err, &reqErr) {
@@ -995,9 +1297,13 @@ func assertTurnFailed(t testingT, err error, wantCause string, wantMessageSubstr
 	if data[jsonFieldCause] != wantCause {
 		t.Fatalf("data.cause = %#v, want %q", data[jsonFieldCause], wantCause)
 	}
-	message, _ := data[jsonFieldMessage].(string)
-	if wantMessageSubstr != "" && !strings.Contains(message, wantMessageSubstr) {
-		t.Fatalf("data.message = %q, want substring %q", message, wantMessageSubstr)
+	wantMessage := map[string]string{
+		causeProvider:  "OpenCode provider request failed",
+		causeTransport: "OpenCode transport failed",
+		causeTimeout:   "OpenCode turn timed out",
+	}[wantCause]
+	if data[jsonFieldMessage] != wantMessage {
+		t.Fatalf("data.message = %#v, want %q", data[jsonFieldMessage], wantMessage)
 	}
 
 	return data
@@ -1019,6 +1325,9 @@ func testNativeSession(id string) opencode.NativeSession {
 
 func testSession(t *testing.T, agent *Agent, client *fakeOpenCodeClient) *session {
 	t.Helper()
+	if agent.connection() == nil {
+		agent.setAgentClient(newRecordingAgentClient())
+	}
 
 	if client.xdg.Root == "" {
 		root, err := os.MkdirTemp("", "acp-go-opencode-test-*")
@@ -1043,14 +1352,22 @@ func testSession(t *testing.T, agent *Agent, client *fakeOpenCodeClient) *sessio
 		Format:          SessionStoreFormat,
 	})
 	session.runtimeGeneration = generation
+	session.stampIncarnationGeneration(client, generation)
+	agent.mu.Lock()
+	agent.sessions[session.id] = session
+	agent.mu.Unlock()
 
 	// The prompt path settles on the native event stream, so a test session is
 	// established exactly as a production session is: the opening snapshot (when
 	// the agent negotiated the lifecycle extension) and then the pump.
+	session.markEstablishmentResponseWritten()
 	if err := session.establish(context.Background()); err != nil {
 		t.Fatalf("establish test session: %v", err)
 	}
-	t.Cleanup(session.stopPump)
+	t.Cleanup(func() {
+		session.stopPump()
+		session.delivery.close()
+	})
 
 	return session
 }
@@ -1213,6 +1530,7 @@ func (c *fakeOpenCodeClient) hangsAfterDispatch(started chan struct{}) {
 // refusesDispatch makes the next dispatch refuse the frame, which creates neither
 // a submission nor a turn.
 func (c *fakeOpenCodeClient) refusesDispatch(err error) {
+	c.omitPromptEvidence = true
 	c.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
 		return opencode.NativeMessage{}, err
 	}

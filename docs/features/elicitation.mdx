@@ -15,6 +15,14 @@ turns on OpenCode's native question tool. When `opencode serve` then emits a
 question request, the adapter maps it to an ACP `elicitation/create` call using
 the stable ACP v1 form-elicitation shape.
 
+The exact JSON-RPC elicitation request, including its lifecycle stream/action
+correlation, is registered and answerable before the pending `action_update` is
+emitted. An immediate host answer cannot resolve the action before that first
+ordered sight. Cancellation, close, registration failure, or announcement
+failure cancels the exact request; an unannounced request never appears in a
+later prompt. Agent-origin questions between prompts omit a prompt route and use
+their lifecycle correlation instead of borrowing the next prompt's nonce.
+
 ## Capability gating
 
 The adapter records the client's capabilities during `initialize` and only sends

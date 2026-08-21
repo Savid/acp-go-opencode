@@ -76,13 +76,12 @@ func newFakeReadinessRoutesClient(t *testing.T) (*openCodeServer, *[]string) {
 	t.Cleanup(server.Close)
 
 	client := &openCodeServer{
-		httpClient: server.Client(),
-		baseURL:    server.URL,
-		username:   "opencode",
-		password:   "secret",
-		events:     make(chan Event, 8),
-		errs:       make(chan error, 8),
-		closed:     make(chan struct{}),
+		httpClient:  server.Client(),
+		baseURL:     server.URL,
+		username:    "opencode",
+		password:    "secret",
+		eventStream: make(chan EventStreamItem, 8),
+		closed:      make(chan struct{}),
 	}
 
 	return client, &seen
@@ -593,10 +592,6 @@ func TestOpenCodeDocFailClosedAndHelpers(t *testing.T) {
 	}
 	if got := envMapToSlice(map[string]string{"B": "2", "A": "1"}); !reflect.DeepEqual(got, []string{"A=1", "B=2"}) {
 		t.Fatalf("envMapToSlice = %#v", got)
-	}
-	wrapped := errors.New("wrapped")
-	if !errors.Is(StreamError{Epoch: 1, Err: wrapped}, wrapped) {
-		t.Fatal("StreamError did not unwrap")
 	}
 	if _, ok := openAPIOperation(map[string]any{}, "/missing", http.MethodGet); ok {
 		t.Fatal("missing OpenAPI path returned operation")

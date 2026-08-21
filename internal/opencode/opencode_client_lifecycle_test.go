@@ -28,6 +28,16 @@ import (
 
 const releaseGateRepetitions = 5
 
+func requireSignalClosed(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatal(message)
+	}
+}
+
 func testContainmentScratchReservation(context.Context) (func(), error) {
 	return func() {}, nil
 }
@@ -202,13 +212,12 @@ func newOpenCodeMethodsClient(t *testing.T) (*openCodeServer, *openCodeMethodsRe
 	t.Cleanup(server.Close)
 
 	client := &openCodeServer{
-		httpClient: server.Client(),
-		baseURL:    server.URL,
-		username:   "opencode",
-		password:   "secret",
-		events:     make(chan Event),
-		errs:       make(chan error),
-		closed:     make(chan struct{}),
+		httpClient:  server.Client(),
+		baseURL:     server.URL,
+		username:    "opencode",
+		password:    "secret",
+		eventStream: make(chan EventStreamItem),
+		closed:      make(chan struct{}),
 	}
 
 	return client, rec
@@ -349,8 +358,9 @@ func TestOpenCodeServerRawJSONErrors(t *testing.T) {
 	if err := client.getJSON(ctx, "/invalid-json", nil, &map[string]any{}); err == nil {
 		t.Fatal("invalid json unexpectedly succeeded")
 	}
-	if err := client.getJSON(ctx, "/status", nil, &map[string]any{}); err == nil || !strings.Contains(err.Error(), "short and stout") {
-		t.Fatalf("status error = %v", err)
+	if err := client.getJSON(ctx, "/status", nil, &map[string]any{}); err == nil ||
+		strings.Contains(err.Error(), "short and stout") || !strings.Contains(err.Error(), "418 I'm a teapot") {
+		t.Fatalf("status error was not classified and redacted: %v", err)
 	}
 	client.baseURL = ":// bad url"
 	if err := client.getJSON(ctx, "/bad", nil, &map[string]any{}); err == nil {
@@ -561,7 +571,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	if strings.Contains(string(configData), `"permission"`) {
 		t.Fatalf("runtime config contains session permission = %s", string(configData))
 	}
-	if server.Events() == nil || server.EventErrors() == nil || server.XDGDirs().Root == "" {
+	if server.EventStream() == nil || server.XDGDirs().Root == "" {
 		t.Fatalf("server channels/dirs not initialized: %#v", server)
 	}
 	if err := server.Shutdown(context.Background()); err != nil {
@@ -807,7 +817,7 @@ func TestOpenCodeServerReadinessGateAndStreamFailures(t *testing.T) {
 			}
 		})
 		defer closeServer()
-		if err := client.readEventStream(ctx); err == nil || !strings.Contains(err.Error(), "bad stream") {
+		if err := client.readEventStream(ctx); err == nil || strings.Contains(err.Error(), "bad stream") {
 			t.Fatalf("stream status error = %v", err)
 		}
 
@@ -951,12 +961,11 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 				Body:       errorReadCloser{err: errors.New("body read failed")},
 			}, nil
 		})},
-		baseURL:  "http://opencode.test",
-		username: "opencode",
-		password: "secret",
-		events:   make(chan Event),
-		errs:     make(chan error, 1),
-		closed:   make(chan struct{}),
+		baseURL:     "http://opencode.test",
+		username:    "opencode",
+		password:    "secret",
+		eventStream: make(chan EventStreamItem),
+		closed:      make(chan struct{}),
 	}
 	client.httpClient.Timeout = 30 * time.Second
 	if eventClient := client.eventHTTPClient(); eventClient.Timeout != 0 || eventClient == client.httpClient || eventClient.Transport == nil {
@@ -994,12 +1003,12 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	defer stream.Close()
 	client.httpClient = stream.Client()
 	client.baseURL = stream.URL
-	client.events = make(chan Event, 1)
+	client.eventStream = make(chan EventStreamItem, 1)
 	if err := client.readEventStream(ctx); !errors.Is(err, ErrSSEDisconnect) {
 		t.Fatalf("multi-line clean EOF readEventStream error = %v", err)
 	}
-	if event := <-client.events; event.Type != "server.connected" {
-		t.Fatalf("event = %#v", event)
+	if item := <-client.eventStream; item.Event == nil || item.Event.Type != "server.connected" {
+		t.Fatalf("event item = %#v", item)
 	}
 
 	unterminatedStream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1009,12 +1018,12 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	defer unterminatedStream.Close()
 	client.httpClient = unterminatedStream.Client()
 	client.baseURL = unterminatedStream.URL
-	client.events = make(chan Event, 1)
+	client.eventStream = make(chan EventStreamItem, 1)
 	if err := client.readEventStream(ctx); !errors.Is(err, ErrSSEDisconnect) {
 		t.Fatalf("unterminated clean EOF readEventStream error = %v", err)
 	}
-	if event := <-client.events; event.Type != "server.connected" {
-		t.Fatalf("unterminated event = %#v", event)
+	if item := <-client.eventStream; item.Event == nil || item.Event.Type != "server.connected" {
+		t.Fatalf("unterminated event item = %#v", item)
 	}
 
 	cancelOnEOF, cancelEOF := context.WithCancel(context.Background())
@@ -1027,7 +1036,7 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 		}, nil
 	})}
 	client.baseURL = "http://opencode.test"
-	client.events = make(chan Event, 1)
+	client.eventStream = make(chan EventStreamItem, 1)
 	if err := client.readEventStream(cancelOnEOF); !errors.Is(err, context.Canceled) {
 		t.Fatalf("post-EOF cancelled stream error = %v", err)
 	}
@@ -1039,7 +1048,7 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	defer closedFlushStream.Close()
 	client.httpClient = closedFlushStream.Client()
 	client.baseURL = closedFlushStream.URL
-	client.events = make(chan Event)
+	client.eventStream = make(chan EventStreamItem)
 	close(client.closed)
 	if err := client.readEventStream(ctx); !errors.Is(err, io.EOF) {
 		t.Fatalf("closed stream error = %v", err)
@@ -1054,13 +1063,12 @@ func TestOpenCodeHTTPAndSSEFaultBranches(t *testing.T) {
 	}))
 	defer cancelledStream.Close()
 	client = &openCodeServer{
-		httpClient: cancelledStream.Client(),
-		baseURL:    cancelledStream.URL,
-		username:   "opencode",
-		password:   "secret",
-		events:     make(chan Event),
-		errs:       make(chan error, 1),
-		closed:     make(chan struct{}),
+		httpClient:  cancelledStream.Client(),
+		baseURL:     cancelledStream.URL,
+		username:    "opencode",
+		password:    "secret",
+		eventStream: make(chan EventStreamItem),
+		closed:      make(chan struct{}),
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -1089,13 +1097,12 @@ func TestOpenCodeReadEventStreamReportsAClosedScopeAtCleanEnd(t *testing.T) {
 	defer emptyStream.Close()
 
 	client := &openCodeServer{
-		httpClient: emptyStream.Client(),
-		baseURL:    emptyStream.URL,
-		username:   "opencode",
-		password:   "secret",
-		events:     make(chan Event),
-		errs:       make(chan error, 1),
-		closed:     make(chan struct{}),
+		httpClient:  emptyStream.Client(),
+		baseURL:     emptyStream.URL,
+		username:    "opencode",
+		password:    "secret",
+		eventStream: make(chan EventStreamItem),
+		closed:      make(chan struct{}),
 	}
 	close(client.closed)
 
@@ -1104,10 +1111,10 @@ func TestOpenCodeReadEventStreamReportsAClosedScopeAtCleanEnd(t *testing.T) {
 	}
 }
 
-// TestOpenCodeReadEventsStopsWhenItsSubscriptionIsCancelled proves a cancelled
-// subscription stops reconnecting. The readiness handshake cancels its own
-// subscription once the handshake frame arrives, and a reader that kept
-// reconnecting on a dead context would hold an SSE connection nothing reads.
+// TestOpenCodeReadEventsStopsWhenItsSubscriptionIsCancelled proves an
+// intentionally cancelled subscription publishes no terminal gap. Cancellation
+// is the scope's own containment boundary, not evidence that a live transport
+// lost an event.
 func TestOpenCodeReadEventsStopsWhenItsSubscriptionIsCancelled(t *testing.T) {
 	restoreOpenCodeClientSeams(t)
 
@@ -1123,77 +1130,217 @@ func TestOpenCodeReadEventsStopsWhenItsSubscriptionIsCancelled(t *testing.T) {
 				Body:       io.NopCloser(strings.NewReader("")),
 			}, nil
 		})},
-		baseURL:  "http://opencode.test",
-		username: "opencode",
-		password: "secret",
-		events:   make(chan Event, 1),
-		errs:     make(chan error, 1),
-		closed:   make(chan struct{}),
+		baseURL:     "http://opencode.test",
+		username:    "opencode",
+		password:    "secret",
+		eventStream: make(chan EventStreamItem, 1),
+		closed:      make(chan struct{}),
 	}
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// The reconnect delay never fires, so the only way this returns at all is the
-	// cancelled subscription's own exit.
-	delays := 0
-	openCodeAfter = func(time.Duration) <-chan time.Time {
-		delays++
-
-		return make(chan time.Time)
-	}
-
 	client.readEvents(cancelled)
-
-	if delays != 1 {
-		t.Fatalf("reconnect delays = %d, want 1", delays)
-	}
 
 	if requests > 1 {
 		t.Fatalf("requests = %d, want at most 1", requests)
 	}
+
+	select {
+	case item := <-client.eventStream:
+		t.Fatalf("cancelled stream published %#v", item)
+	default:
+	}
 }
 
-func TestOpenCodeReadEventsDropsErrorWhenChannelFullAndReconnects(t *testing.T) {
-	restoreOpenCodeClientSeams(t)
+// TestOpenCodeReadEventsKeepsFinalEventsBeforeTheTerminalOnAFullChannel proves
+// the single bounded channel is ordered and lossless at EOF. With only one
+// retained item, the producer blocks instead of dropping either the final event
+// or the terminal marker behind it.
+func TestOpenCodeReadEventsKeepsFinalEventsBeforeTheTerminalOnAFullChannel(t *testing.T) {
 	requests := 0
-	var client *openCodeServer
-	client = &openCodeServer{
+	client := &openCodeServer{
 		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			requests++
-			if requests == 2 {
-				close(client.closed)
-			}
 
 			return &http.Response{
-				StatusCode: http.StatusInternalServerError,
-				Status:     "500 Internal Server Error",
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader("bad stream")),
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(
+					"data: {\"type\":\"first\",\"properties\":{}}\n\n" +
+						"data: {\"type\":\"final\",\"properties\":{}}\n\n",
+				)),
 			}, nil
 		})},
-		baseURL:  "http://opencode.test",
-		username: "opencode",
-		password: "secret",
-		events:   make(chan Event, 1),
-		errs:     make(chan error, 1),
-		closed:   make(chan struct{}),
+		baseURL:     "http://opencode.test",
+		eventStream: make(chan EventStreamItem, 1),
+		closed:      make(chan struct{}),
 	}
-	client.errs <- errors.New("already full")
-	delayCalls := 0
-	openCodeAfter = func(time.Duration) <-chan time.Time {
-		delayCalls++
-		if delayCalls > 1 {
-			return make(chan time.Time)
-		}
-		ch := make(chan time.Time, 1)
-		ch <- time.Now()
 
-		return ch
+	done := make(chan struct{})
+	go func() {
+		client.readEvents(context.Background())
+		close(done)
+	}()
+
+	first := <-client.eventStream
+	require.NotNil(t, first.Event)
+	require.Equal(t, "first", first.Event.Type)
+	require.NoError(t, first.Terminal)
+
+	final := <-client.eventStream
+	require.NotNil(t, final.Event)
+	require.Equal(t, "final", final.Event.Type)
+	require.NoError(t, final.Terminal)
+
+	terminal := <-client.eventStream
+	require.Nil(t, terminal.Event)
+	require.ErrorIs(t, terminal.Terminal, ErrSSEDisconnect)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event reader did not finish after publishing its terminal marker")
 	}
+	require.Equal(t, 1, requests, "a terminal gap opened another stream for the fenced generation")
+}
+
+func TestOpenCodeReadEventsKeepsFinalEventBeforeBodyErrorOnAFullChannel(t *testing.T) {
+	requests := 0
+	bodyErr := errors.New("SSE body failed")
+	client := &openCodeServer{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(io.MultiReader(
+					strings.NewReader("data: {\"type\":\"final\",\"properties\":{}}\n\n"),
+					errorReadCloser{err: bodyErr},
+				)),
+			}, nil
+		})},
+		baseURL:     "http://opencode.test",
+		eventStream: make(chan EventStreamItem, 1),
+		closed:      make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		client.readEvents(context.Background())
+		close(done)
+	}()
+
+	final := <-client.eventStream
+	require.NotNil(t, final.Event)
+	require.Equal(t, "final", final.Event.Type)
+	require.NoError(t, final.Terminal)
+
+	terminal := <-client.eventStream
+	require.Nil(t, terminal.Event)
+	require.ErrorIs(t, terminal.Terminal, bodyErr)
+	requireSignalClosed(t, done, "event reader did not finish after its body error")
+	require.Equal(t, 1, requests)
+}
+
+func TestOpenCodeReadEventsContainsBodyReaderPanicAsTerminal(t *testing.T) {
+	client := &openCodeServer{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       panicReadCloser{},
+			}, nil
+		})},
+		baseURL:     "http://opencode.test",
+		eventStream: make(chan EventStreamItem, 1),
+		closed:      make(chan struct{}),
+	}
+
 	client.readEvents(context.Background())
-	if requests != 2 {
-		t.Fatalf("requests = %d, want 2", requests)
+	item := <-client.eventStream
+	require.Nil(t, item.Event)
+	require.ErrorContains(t, item.Terminal, "SSE reader panicked")
+	require.NotContains(t, item.Terminal.Error(), "SECRET_BODY_READER_PANIC")
+}
+
+func TestOpenCodeReadEventsContainsProducerPanicAndCancelledPublication(t *testing.T) {
+	client := &openCodeServer{
+		eventStream: make(chan EventStreamItem, 1),
+		closed:      make(chan struct{}),
+		eventReader: func(context.Context) error { panic("SECRET_SSE_PRODUCER_PANIC") },
+	}
+
+	client.readEvents(context.Background())
+	item := <-client.eventStream
+	require.ErrorContains(t, item.Terminal, "SSE producer panicked")
+	require.NotContains(t, item.Terminal.Error(), "SECRET_SSE_PRODUCER_PANIC")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client.publishEventStreamTerminal(ctx, errors.New("ignored"))
+	require.Empty(t, client.eventStream)
+	client.publishEventStreamTerminal(context.Background(), nil)
+}
+
+func TestSSEAggregateLimitBoundsMultilineMalformedAndUnterminatedEvents(t *testing.T) {
+	for name, body := range map[string]string{
+		"multiline":    "data: 12345678901234567890\ndata: 12345678901234567890\n\n",
+		"malformed":    "data: {{{{{{{{{{{{{{{{{{{{\ndata: ]]]]]]]]]]]]]]]]]]]]\n\n",
+		"unterminated": "data: 12345678901234567890\ndata: 12345678901234567890\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &openCodeServer{
+				httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Status:     "200 OK",
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body:       io.NopCloser(strings.NewReader(body)),
+					}, nil
+				})},
+				baseURL:     "http://opencode.test",
+				eventStream: make(chan EventStreamItem, 1),
+				closed:      make(chan struct{}),
+			}
+
+			require.ErrorIs(t, client.readEventStreamWithLimit(context.Background(), 32), ErrSSEEventTooLarge)
+		})
+	}
+}
+
+func TestOpenCodeReadEventsPublishesNoTerminalForAnIntentionalClose(t *testing.T) {
+	client := &openCodeServer{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(
+					"data: {\"type\":\"blocked\",\"properties\":{}}\n\n",
+				)),
+			}, nil
+		})},
+		baseURL:     "http://opencode.test",
+		eventStream: make(chan EventStreamItem),
+		closed:      make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		client.readEvents(context.Background())
+		close(done)
+	}()
+	close(client.closed)
+	requireSignalClosed(t, done, "event reader did not stop with its scope")
+
+	select {
+	case item := <-client.eventStream:
+		t.Fatalf("intentional close published stream item %#v", item)
+	default:
 	}
 }
 
@@ -1286,7 +1433,12 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	if err != nil || env["A"] != "2" || env["B"] != "3" {
 		t.Fatalf("merged env = %#v, err = %v", env, err)
 	}
-	drainProcessPipe(slog.New(slog.DiscardHandler), "test", strings.NewReader("one\ntwo\n"))
+	var processLog bytes.Buffer
+	drainProcessPipe(slog.New(slog.NewTextHandler(&processLog, nil)), "test",
+		strings.NewReader("SECRET_SENTINEL\n"))
+	if strings.Contains(processLog.String(), "SECRET_SENTINEL") {
+		t.Fatalf("child output reached logs: %q", processLog.String())
+	}
 	for _, value := range []any{float64(-1), int(-1), json.Number("bad")} {
 		if got, ok := IntFromNumber(value); ok || got != 0 {
 			t.Fatalf("IntFromNumber(%#v) = %d, %v", value, got, ok)
@@ -1951,7 +2103,6 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	prepareRuntimeGeneration := openCodePrepareRuntimeGeneration
 	after := openCodeAfter
 	readyPoll := openCodeReadyPollInterval
-	reconnectDelay := openCodeEventReconnectDelay
 	shutdownTimeout := openCodeShutdownTimeout
 	containmentTimeout := openCodeContainmentTimeout
 	t.Cleanup(func() {
@@ -1973,7 +2124,6 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodePrepareRuntimeGeneration = prepareRuntimeGeneration
 		openCodeAfter = after
 		openCodeReadyPollInterval = readyPoll
-		openCodeEventReconnectDelay = reconnectDelay
 		openCodeShutdownTimeout = shutdownTimeout
 		openCodeContainmentTimeout = containmentTimeout
 	})
@@ -2026,6 +2176,11 @@ func (r *budgetReader) Read(p []byte) (int, error) {
 type errorReadCloser struct {
 	err error
 }
+
+type panicReadCloser struct{}
+
+func (panicReadCloser) Read([]byte) (int, error) { panic("SECRET_BODY_READER_PANIC") }
+func (panicReadCloser) Close() error             { return nil }
 
 func (r errorReadCloser) Read([]byte) (int, error) {
 	return 0, r.err
@@ -2085,13 +2240,12 @@ func readinessClient(t *testing.T, handler http.HandlerFunc) (*openCodeServer, f
 	t.Helper()
 	server := httptest.NewServer(handler)
 	client := &openCodeServer{
-		httpClient: server.Client(),
-		baseURL:    server.URL,
-		username:   "opencode",
-		password:   "secret",
-		events:     make(chan Event, 8),
-		errs:       make(chan error, 8),
-		closed:     make(chan struct{}),
+		httpClient:  server.Client(),
+		baseURL:     server.URL,
+		username:    "opencode",
+		password:    "secret",
+		eventStream: make(chan EventStreamItem, 8),
+		closed:      make(chan struct{}),
 	}
 
 	return client, func() {
@@ -2172,10 +2326,9 @@ func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
 					}, nil
 				}
 			})},
-			baseURL: "http://opencode.release-gate",
-			events:  make(chan Event, 8),
-			errs:    make(chan error, 8),
-			closed:  make(chan struct{}),
+			baseURL:     "http://opencode.release-gate",
+			eventStream: make(chan EventStreamItem, 8),
+			closed:      make(chan struct{}),
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

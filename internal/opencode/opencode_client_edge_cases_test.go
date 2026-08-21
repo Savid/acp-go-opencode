@@ -87,8 +87,7 @@ func TestStartServerHappyPathWithoutPrivilegedProcessLaunch(t *testing.T) {
 	require.NoError(t, err)
 	server, ok := client.(*openCodeServer)
 	require.True(t, ok)
-	require.NotNil(t, server.Events())
-	require.NotNil(t, server.EventErrors())
+	require.NotNil(t, server.EventStream())
 	require.Equal(t, server.xdg, server.XDGDirs())
 	require.NoError(t, server.Shutdown(context.Background()))
 }
@@ -370,9 +369,8 @@ func TestNativeOwnedXDGCanBeResolvedFromRootWithoutFilesystemWrites(t *testing.T
 }
 
 func TestOpenCodeServerAccessorsAndNilAssistantError(t *testing.T) {
-	server := &openCodeServer{events: make(chan Event), errs: make(chan error), xdg: XDGDirs{Root: "/runtime"}}
-	require.NotNil(t, server.Events())
-	require.NotNil(t, server.EventErrors())
+	server := &openCodeServer{eventStream: make(chan EventStreamItem), xdg: XDGDirs{Root: "/runtime"}}
+	require.NotNil(t, server.EventStream())
 	require.Equal(t, server.xdg, server.XDGDirs())
 	require.Equal(t, &AssistantError{}, AssistantErrorFromNativeError(nil))
 }

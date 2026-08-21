@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -16,7 +17,10 @@ import (
 // the JSON-RPC id its response will be written under. The id is what pairs the
 // request the handler answered with the line the transport wrote, and a handler
 // is not otherwise told which id it is answering.
-const establishmentHookParam = "_acp_go_opencode_establishment_hook"
+const (
+	establishmentHookParam = "_acp_go_opencode_establishment_hook"
+	jsonRPCVersion         = "2.0"
+)
 
 // establishmentHooks holds the work an established session owes its host until
 // the establishing response has actually been written to the transport. The
@@ -31,7 +35,9 @@ type establishmentHooks struct {
 
 type establishmentHook struct {
 	responseID string
+	admit      func()
 	run        func()
+	fail       func(error)
 }
 
 func newEstablishmentHooks(log *slog.Logger) *establishmentHooks {
@@ -43,32 +49,42 @@ func (h *establishmentHooks) wrap(writer io.Writer) io.Writer {
 	return &establishmentWriter{writer: writer, hooks: h}
 }
 
-func (h *establishmentHooks) queue(responseID string, run func()) {
+func (h *establishmentHooks) queue(responseID string, run func(), callbacks ...func()) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.all = append(h.all, establishmentHook{responseID: responseID, run: run})
+	hook := establishmentHook{responseID: responseID, run: run}
+	if len(callbacks) > 0 {
+		hook.admit = callbacks[0]
+	}
+
+	h.all = append(h.all, hook)
+}
+
+func (h *establishmentHooks) queueSession(
+	responseID string,
+	admit func(),
+	run func(),
+	fail func(error),
+) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.all = append(h.all, establishmentHook{
+		responseID: responseID, admit: admit, run: run, fail: fail,
+	})
 }
 
 // runAfterWrite releases the hook the written response answers. A frame with no
 // id is a notification and answers nothing; a frame carrying an error
 // established no session, so its hook is dropped rather than run.
-func (h *establishmentHooks) runAfterWrite(data []byte) {
-	var frame struct {
-		ID    *json.RawMessage `json:"id"`
-		Error *json.RawMessage `json:"error"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(data), &frame); err != nil {
-		h.log.Debug("read written ACP frame for session establishment failed", slog.String(jsonFieldError, err.Error()))
+func (h *establishmentHooks) finishWrite(data []byte, writeErr error, complete bool) {
+	responseID, success, response := establishmentResponseFrame(data)
+	if !response {
+		h.log.Debug("read written ACP frame for session establishment failed")
 
 		return
 	}
-
-	if frame.ID == nil {
-		return
-	}
-
-	responseID := establishmentResponseID(frame.ID)
 
 	h.mu.Lock()
 
@@ -80,19 +96,105 @@ func (h *establishmentHooks) runAfterWrite(data []byte) {
 		h.all = append(h.all[:index], h.all[index+1:]...)
 		h.mu.Unlock()
 
-		if frame.Error == nil {
-			go runEstablishmentHook(h.log, hook.run)
+		if !success {
+			return
 		}
+
+		if writeErr != nil || !complete {
+			if hook.fail != nil {
+				runEstablishmentFailure(h.log, hook.fail,
+					errors.New("establishing response was not fully written"))
+			}
+
+			return
+		}
+
+		if hook.admit != nil {
+			if err := runEstablishmentCallback(hook.admit); err != nil {
+				runEstablishmentFailure(h.log, hook.fail, err)
+
+				return
+			}
+		}
+		go runEstablishmentHook(h.log, hook)
 
 		return
 	}
 	h.mu.Unlock()
 }
 
-func runEstablishmentHook(log *slog.Logger, run func()) {
-	defer recoverAgentGoroutine(context.Background(), log, "OpenCode session establishment")
+func establishmentResponseFrame(data []byte) (string, bool, bool) {
+	var members map[string]json.RawMessage
+	if json.Unmarshal(bytes.TrimSpace(data), &members) != nil {
+		return "", false, false
+	}
 
-	run()
+	if len(members) != 3 {
+		return "", false, false
+	}
+
+	var version string
+	if json.Unmarshal(members["jsonrpc"], &version) != nil || version != jsonRPCVersion {
+		return "", false, false
+	}
+
+	id, hasID := members["id"]
+	_, hasResult := members["result"]
+
+	errorValue, hasError := members["error"]
+	if !hasID || hasResult == hasError || members["method"] != nil || members["params"] != nil {
+		return "", false, false
+	}
+
+	trimmedID := bytes.TrimSpace(id)
+
+	if hasError {
+		var rpcError struct {
+			Code    *int   `json:"code"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(errorValue, &rpcError) != nil || rpcError.Code == nil || rpcError.Message == "" {
+			return "", false, false
+		}
+	}
+
+	return string(trimmedID), hasResult, true
+}
+
+func (h *establishmentHooks) runAfterWrite(data []byte) {
+	h.finishWrite(data, nil, true)
+}
+
+func runEstablishmentHook(log *slog.Logger, hook establishmentHook) {
+	if err := runEstablishmentCallback(hook.run); err != nil {
+		runEstablishmentFailure(log, hook.fail, err)
+	}
+}
+
+func runEstablishmentCallback(callback func()) (err error) {
+	if callback == nil {
+		return nil
+	}
+
+	defer func() {
+		if recover() != nil {
+			err = errors.New("session establishment callback panicked")
+		}
+	}()
+
+	callback()
+
+	return nil
+}
+
+func runEstablishmentFailure(log *slog.Logger, fail func(error), err error) {
+	if fail == nil {
+		return
+	}
+
+	defer recoverAgentGoroutine(context.Background(), log, "OpenCode session establishment failure")
+
+	fail(err)
 }
 
 // establishmentWriter runs a queued hook once the response it waits on has left
@@ -103,10 +205,21 @@ type establishmentWriter struct {
 	hooks  *establishmentHooks
 }
 
-func (w *establishmentWriter) Write(data []byte) (int, error) {
-	written, err := w.writer.Write(data)
-	if err == nil && written == len(data) {
-		w.hooks.runAfterWrite(data)
+func (w *establishmentWriter) Write(data []byte) (written int, err error) {
+	defer func() {
+		if recover() != nil {
+			written = 0
+			err = errors.New("ACP transport writer panicked")
+			w.hooks.finishWrite(data, err, false)
+		}
+	}()
+
+	written, err = w.writer.Write(data)
+	complete := err == nil && written == len(data)
+	w.hooks.finishWrite(data, err, complete)
+
+	if err == nil && written != len(data) {
+		err = io.ErrShortWrite
 	}
 
 	return written, err
@@ -240,7 +353,17 @@ func (c *localAgentConnection) queueEstablishment(ctx context.Context, method st
 
 	hookCtx := context.WithoutCancel(ctx)
 
-	c.hooks.queue(responseID, func() { c.establishSession(hookCtx, method, sessionID) })
+	session, err := c.agent.session(sessionID)
+	if err != nil {
+		return
+	}
+
+	c.hooks.queueSession(
+		responseID,
+		session.markEstablishmentResponseWritten,
+		func() { c.establishSession(hookCtx, method, sessionID) },
+		func(err error) { session.failEstablishment(err) },
+	)
 }
 
 // establishSession opens the session's stream and publishes its first command
@@ -268,13 +391,12 @@ func (c *localAgentConnection) logEstablishmentFailure(
 	stage string,
 	method string,
 	sessionID acp.SessionId,
-	err error,
+	_ error,
 ) {
 	c.agent.log.ErrorContext(ctx, "post-response OpenCode session establishment failed",
 		slog.String("stage", stage),
 		slog.String(jsonFieldMethod, method),
 		slog.String("session_id", string(sessionID)),
-		slog.String(jsonFieldError, err.Error()),
 	)
 }
 

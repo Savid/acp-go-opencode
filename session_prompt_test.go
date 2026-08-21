@@ -24,6 +24,7 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 
 	t.Run("accept replies to native question", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
+		client.questionReplied = make(chan struct{}, 1)
 		conn := newRecordingAgentClient()
 		conn.elicitation = acp.UnstableCreateElicitationResponse{
 			Accept: &acp.UnstableCreateElicitationAccept{Action: "accept", Content: map[string]any{
@@ -31,15 +32,13 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 				"question_2": []any{"Red", "Blue"},
 			}},
 		}
-		agent := NewAgent()
+		agent := negotiatedAgent(t)
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
-		if _, err := agent.Initialize(ctx, acp.InitializeRequest{ClientCapabilities: acp.ClientCapabilities{
-			Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
-		}}); err != nil {
-			t.Fatalf("Initialize: %v", err)
-		}
 		session := testSession(t, agent, client)
 		session.markPublishedToolCall("call-1")
+		turnCtx := session.beginTurn(ctx, "question-accept")
+		defer session.finishTurn()
 
 		req := opencode.QuestionRequest{
 			ID:        "question-1",
@@ -65,7 +64,7 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 				},
 			},
 		}
-		if err := session.routeNativeQuestion(ctx, req); err != nil {
+		if err := session.routeNativeQuestion(turnCtx, req); err != nil {
 			t.Fatalf("routeNativeQuestion: %v", err)
 		}
 		if len(conn.elicitations) != 1 {
@@ -81,6 +80,7 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 		if len(got.Form.RequestedSchema.Required) != 2 {
 			t.Fatalf("schema required = %#v", got.Form.RequestedSchema.Required)
 		}
+		requireSignal(t, client.questionReplied)
 		reply := client.questionReply(0)
 		if reply.sessionID != "native-1" || reply.requestID != "question-1" {
 			t.Fatalf("reply target = %#v", reply)
@@ -92,19 +92,19 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 
 	t.Run("decline rejects native question", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
+		client.questionRejected = make(chan struct{}, 1)
 		conn := newRecordingAgentClient()
 		conn.elicitation = acp.NewUnstableCreateElicitationResponseDecline()
-		agent := NewAgent()
+		agent := negotiatedAgent(t)
+		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 		agent.setAgentClient(conn)
-		if _, err := agent.Initialize(ctx, acp.InitializeRequest{ClientCapabilities: acp.ClientCapabilities{
-			Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
-		}}); err != nil {
-			t.Fatalf("Initialize: %v", err)
-		}
 		session := testSession(t, agent, client)
-		if err := session.routeNativeQuestion(ctx, opencode.QuestionRequest{ID: "q", SessionID: "native-1"}); err != nil {
+		turnCtx := session.beginTurn(ctx, "question-decline")
+		defer session.finishTurn()
+		if err := session.routeNativeQuestion(turnCtx, opencode.QuestionRequest{ID: "q", SessionID: "native-1"}); err != nil {
 			t.Fatalf("routeNativeQuestion: %v", err)
 		}
+		requireSignal(t, client.questionRejected)
 		if client.questionRejectCount() != 1 {
 			t.Fatalf("question rejects = %d, want 1", client.questionRejectCount())
 		}
@@ -112,8 +112,9 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 
 	t.Run("missing capability rejects without ACP request", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
+		client.questionRejected = make(chan struct{}, 1)
 		conn := newRecordingAgentClient()
-		agent := NewAgent()
+		agent := negotiatedAgent(t)
 		agent.setAgentClient(conn)
 		session := testSession(t, agent, client)
 		if err := session.routeNativeQuestion(ctx, opencode.QuestionRequest{ID: "q", SessionID: "native-1"}); err != nil {
@@ -122,34 +123,19 @@ func TestQuestionToolElicitationAcceptDeclineAndNoCapability(t *testing.T) {
 		if len(conn.elicitations) != 0 {
 			t.Fatalf("elicitation sent without capability: %#v", conn.elicitations)
 		}
+		requireSignal(t, client.questionRejected)
 		if client.questionRejectCount() != 1 {
 			t.Fatalf("question rejects = %d, want 1", client.questionRejectCount())
 		}
 	})
 }
 
-// TestNativeActionReconciliationRoutesOnlyThisSession proves reconciliation reads
-// the native pending sets and admits exactly the requests that name this session's
-// native id.
-func TestNativeActionReconciliationRoutesOnlyThisSession(t *testing.T) {
+func TestPermissionRoutingReplies(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.pendingQuestions = []opencode.QuestionRequest{
-		{ID: "foreign", SessionID: "other"},
-		{ID: "q1", SessionID: "native-1"},
-	}
-	agent := NewAgent()
-	session := testSession(t, agent, client)
-
-	require.NoError(t, session.reconcileNativeActions(ctx))
-	require.Equal(t, 1, client.questionRejectCount(), "a foreign session's question was answered here")
-}
-
-func TestPermissionRoutingRepliesAndReconciles(t *testing.T) {
-	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client.permissionReplied = make(chan struct{}, 2)
 	conn := newRecordingAgentClient()
-	agent := NewAgent()
+	agent := negotiatedAgent(t)
 	agent.setAgentClient(conn)
 	session := testSession(t, agent, client)
 	session.markPublishedToolCall("tool-current")
@@ -162,6 +148,7 @@ func TestPermissionRoutingRepliesAndReconciles(t *testing.T) {
 		Metadata:  map[string]any{"path": "file.txt"},
 		Tool:      opencode.PermissionTool{CallID: "tool-current"},
 	}))
+	requireSignal(t, client.permissionReplied)
 
 	reply := client.permissionReply(0)
 	if reply.reply != "once" || reply.sessionID != "native-1" || reply.requestID != "perm-1" {
@@ -176,64 +163,23 @@ func TestPermissionRoutingRepliesAndReconciles(t *testing.T) {
 	require.NoError(t, session.routeNativePermission(ctx, opencode.PermissionRequest{
 		ID: "perm-2", SessionID: "native-1", Tool: opencode.PermissionTool{CallID: "tool-current"},
 	}))
+	requireSignal(t, client.permissionReplied)
 	require.Equal(t, "reject", client.permissionReply(1).reply)
-
-	client.pendingPermissions = []opencode.PermissionRequest{
-		{ID: "foreign", SessionID: "other"},
-		{ID: "perm-3", SessionID: "native-1", Tool: opencode.PermissionTool{CallID: "tool-current"}},
-	}
-	require.NoError(t, session.reconcileNativeActions(ctx))
-	require.Equal(t, "perm-3", client.permissionReply(2).requestID)
 }
 
-// TestDuplicateNativeRequestIDsAreFenced proves the registry claims each action id
-// once for the life of the session: a re-announced request is not asked twice and
-// not answered twice.
-func TestDuplicateNativeRequestIDsAreFenced(t *testing.T) {
-	ctx := context.Background()
-	client := newFakeOpenCodeClient()
-	conn := newRecordingAgentClient()
-	agent := NewAgent()
-	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
-	agent.setAgentClient(conn)
-	session := testSession(t, agent, client)
-	session.markPublishedToolCall("tool-current")
-
-	require.NoError(t, session.applyNativeEvent(ctx, opencode.Event{
-		Type:       opencode.EventPermissionV2Asked,
-		Properties: json.RawMessage(`{"id":"perm-dup","sessionID":"native-1","action":"edit","tool":{"callID":"tool-current"}}`),
-	}))
-	client.pendingPermissions = []opencode.PermissionRequest{
-		{ID: "perm-dup", SessionID: "native-1", Action: "edit", Tool: opencode.PermissionTool{CallID: "tool-current"}},
-	}
-	require.NoError(t, session.reconcileNativeActions(ctx))
-
-	if conn.permissionRequestCount() != 1 || client.permissionReplyCount() != 1 {
-		t.Fatalf("duplicate permission was not fenced requests=%d replies=%d", conn.permissionRequestCount(), client.permissionReplyCount())
-	}
-
-	require.NoError(t, session.applyNativeEvent(ctx, opencode.Event{
-		Type:       opencode.EventQuestionAsked,
-		Properties: json.RawMessage(`{"id":"question-dup","sessionID":"native-1","questions":[{"question":"Continue?"}]}`),
-	}))
-	client.pendingQuestions = []opencode.QuestionRequest{{ID: "question-dup", SessionID: "native-1"}}
-	require.NoError(t, session.reconcileNativeActions(ctx))
-
-	if len(conn.elicitations) != 1 || client.questionReplyCount() != 1 {
-		t.Fatalf("duplicate question was not fenced elicitations=%d replies=%d", len(conn.elicitations), client.questionReplyCount())
-	}
-}
 func TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	agent, _, wireClient, peer := newWireCoverageConnection(t)
-	_, err := peer.Initialize(ctx, acp.InitializeRequest{ClientCapabilities: acp.ClientCapabilities{
+	_, err := peer.Initialize(ctx, acp.InitializeRequest{Meta: lifecycleOffer(), ClientCapabilities: acp.ClientCapabilities{
 		Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
 	}})
 	require.NoError(t, err)
 
 	native := newFakeOpenCodeClient()
+	native.permissionReplied = make(chan struct{}, 1)
+	native.questionRejected = make(chan struct{}, 2)
 	session := testSession(t, agent, native)
 	turnCtx := session.beginTurn(ctx, "wire-turn")
 	defer session.finishTurn()
@@ -270,19 +216,22 @@ func TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire(t *testing.
 		),
 	}))
 
-	require.Eventually(t, func() bool {
-		wireClient.mu.Lock()
-		defer wireClient.mu.Unlock()
-
-		return len(wireClient.order) == 4
-	}, time.Second, time.Millisecond)
+	requireSignal(t, native.permissionReplied)
+	requireSignal(t, native.questionRejected)
 	wireClient.mu.Lock()
+	actionOrder := make([]string, 0, 4)
+	for _, entry := range wireClient.order {
+		if strings.HasPrefix(entry, "tool_call:") || strings.HasPrefix(entry, "permission:") ||
+			strings.HasPrefix(entry, "elicitation:") {
+			actionOrder = append(actionOrder, entry)
+		}
+	}
 	require.Equal(t, []string{
 		"tool_call:permission-tool",
 		"permission:permission-tool",
 		"tool_call:question-tool",
 		"elicitation:question-tool",
-	}, wireClient.order)
+	}, actionOrder)
 	wireClient.mu.Unlock()
 
 	err = session.applyNativeEvent(turnCtx, opencode.Event{
@@ -292,6 +241,7 @@ func TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire(t *testing.
 		),
 	})
 	require.ErrorContains(t, err, "does not target a tool call this session published")
+	requireSignal(t, native.questionRejected)
 	require.Equal(t, 2, native.questionRejectCount())
 	wireClient.mu.Lock()
 	require.Len(t, wireClient.elicitations, 1)
@@ -335,6 +285,7 @@ func TestEventMappingMessagePartToolTodoUsageAndRaw(t *testing.T) {
 	}, false); err != nil {
 		t.Fatalf("emitMessage: %v", err)
 	}
+	flushRawEvents(t, session)
 
 	if conn.updateCount() != 5 {
 		t.Fatalf("updates = %d, want 5: %#v", conn.updateCount(), conn.updates)
@@ -534,7 +485,7 @@ func TestToolPartUpdatesPreserveFailedErrorOutput(t *testing.T) {
 	if update.Status == nil || *update.Status != acp.ToolCallStatusFailed {
 		t.Fatalf("failed tool status = %#v", update.Status)
 	}
-	if !reflect.DeepEqual(update.RawOutput, map[string]any{"error": "exit status 1"}) {
+	if !reflect.DeepEqual(update.RawOutput, map[string]any{"error": "native tool failed"}) {
 		t.Fatalf("failed tool raw output = %#v", update.RawOutput)
 	}
 
@@ -546,12 +497,12 @@ func TestToolPartUpdatesPreserveFailedErrorOutput(t *testing.T) {
 	if replayed[0].ToolCall.Status != acp.ToolCallStatusFailed {
 		t.Fatalf("replayed failed status = %q", replayed[0].ToolCall.Status)
 	}
-	if !reflect.DeepEqual(replayed[0].ToolCall.RawOutput, map[string]any{"error": "exit status 1"}) {
+	if !reflect.DeepEqual(replayed[0].ToolCall.RawOutput, map[string]any{"error": "native tool failed"}) {
 		t.Fatalf("replayed failed raw output = %#v", replayed[0].ToolCall.RawOutput)
 	}
 }
 
-func TestUpdateReconciliationCommitsOnlyAfterDelivery(t *testing.T) {
+func TestUpdateReconciliationDoesNotCommitBeforeFailClosedDelivery(t *testing.T) {
 	ctx := context.Background()
 	conn := newRecordingAgentClient()
 	conn.updateErr = errors.New("delivery failed")
@@ -571,52 +522,12 @@ func TestUpdateReconciliationCommitsOnlyAfterDelivery(t *testing.T) {
 	if _, ok := session.emittedPartText[textPart.ID]; ok {
 		t.Fatal("failed text delivery committed reconciliation state")
 	}
-	conn.updateErr = nil
-	if err := session.emitPartUpdates(ctx, "assistant", textPart, "", false); err != nil {
-		t.Fatalf("text retry: %v", err)
-	}
-	if session.emittedPartText[textPart.ID] != textPart.Text {
-		t.Fatal("successful text retry did not commit reconciliation state")
-	}
-
-	toolPart := opencode.NativePart{
-		ID:     "tool-retry",
-		CallID: "call-retry",
-		Type:   partTypeTool,
-		Tool:   "bash",
-		State:  json.RawMessage(`{"status":"pending","input":{"command":"true"}}`),
-	}
-	conn.updateErr = errors.New("delivery failed")
-	if err := session.emitPartUpdates(ctx, "assistant", toolPart, "", false); err == nil {
-		t.Fatal("tool delivery unexpectedly succeeded")
-	}
-	if _, ok := session.emittedTools[toolPart.CallID]; ok {
-		t.Fatal("failed tool delivery committed reconciliation state")
-	}
-	conn.updateErr = nil
-	if err := session.emitPartUpdates(ctx, "assistant", toolPart, "", false); err != nil {
-		t.Fatalf("tool retry: %v", err)
-	}
-	lastUpdate := conn.updates[len(conn.updates)-1].Update
-	if lastUpdate.ToolCall == nil || lastUpdate.ToolCallUpdate != nil {
-		t.Fatalf("tool retry = %#v, want tool start", lastUpdate)
-	}
-
-	usageTokens := opencode.NativeTokens{Total: 42}
-	conn.updateErr = errors.New("delivery failed")
-	if err := session.emitUsageUpdate(ctx, "usage-retry", usageTokens, 100); err == nil {
-		t.Fatal("usage delivery unexpectedly succeeded")
-	}
-	if _, ok := session.emittedUsage["usage-retry"]; ok {
-		t.Fatal("failed usage delivery committed reconciliation state")
-	}
-	conn.updateErr = nil
-	if err := session.emitUsageUpdate(ctx, "usage-retry", usageTokens, 100); err != nil {
-		t.Fatalf("usage retry: %v", err)
-	}
-	if _, ok := session.emittedUsage["usage-retry"]; !ok {
-		t.Fatal("successful usage retry did not commit reconciliation state")
-	}
+	client, ok := session.currentClient().(*fakeOpenCodeClient)
+	require.True(t, ok)
+	requireSignal(t, client.closeSignal)
+	agent.mu.Lock()
+	require.Nil(t, agent.runtime, "authoritative delivery failure did not contain the incarnation")
+	agent.mu.Unlock()
 }
 
 func TestUpdateReconciliationEdgeBranches(t *testing.T) {
@@ -765,12 +676,19 @@ func TestLiveUserMessagePartsAreNotEchoed(t *testing.T) {
 	}
 }
 
-// TestStreamErrorFailsTheOpenTurnAndSuppressesItsEpoch proves a lost native event
-// stream fails the accepted turn with the transport cause, that the failed epoch's
-// late events are suppressed, and that the next prompt runs on the same runtime:
-// losing a stream is this session's problem, not the agent's.
-func TestStreamErrorFailsTheOpenTurnAndSuppressesItsEpoch(t *testing.T) {
+// TestStreamTerminalFencesTheExactGenerationAndOpenTurn proves a native gap is
+// terminal for the generation that produced it. The open turn reports the loss,
+// the shared producer is removed from admission, and a late delivery carrying
+// that exact old binding cannot reach the host.
+func TestStreamTerminalFencesTheExactGenerationAndOpenTurn(t *testing.T) {
 	current, client, connection := lifecycleSession(t)
+	current.agent.mu.Lock()
+	current.agent.runtime = client
+	current.agent.runtimeGeneration = 1
+	current.agent.mu.Unlock()
+	current.mu.Lock()
+	current.runtimeGeneration = 1
+	current.mu.Unlock()
 
 	started := make(chan struct{})
 	client.hangsAfterDispatch(started)
@@ -784,76 +702,47 @@ func TestStreamErrorFailsTheOpenTurnAndSuppressesItsEpoch(t *testing.T) {
 
 	<-started
 	client.publishEvent(opencode.Event{
-		Type:        opencode.EventMessagePartCreated,
-		StreamEpoch: 7,
-		Properties:  json.RawMessage(`{"id":"stream-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"stream"}`),
+		Type:       opencode.EventMessagePartCreated,
+		Properties: json.RawMessage(`{"id":"stream-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"stream"}`),
 	})
 	requireEventually(t, func() bool { return connection.updateCount() > 1 }, "the streamed part was not emitted")
 
-	client.errs <- opencode.StreamError{Epoch: 7, Err: errors.New("stream failed")}
-	assertTurnFailed(t, <-done, causeTransport, "stream failed")
-	require.NotNil(t, current.agent.runtime, "a stream error retired the shared runtime")
+	client.publishStreamTerminal(errors.New("stream failed"))
+	assertTurnFailed(t, <-done, causeTransport, "")
+	requireEventually(t, func() bool {
+		current.agent.mu.Lock()
+		defer current.agent.mu.Unlock()
+
+		return current.agent.runtime == nil
+	}, "the failed generation remained admissible")
 
 	before := connection.updateCount()
-	client.publishEvent(opencode.Event{
-		Type:        opencode.EventMessagePartCreated,
-		StreamEpoch: 7,
-		Properties:  json.RawMessage(`{"id":"late-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"late"}`),
-	})
-	client.publishSessionIdle(current.idmap.NativeSessionID)
-
-	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, current.routeNativeEventForIncarnation(context.Background(), testIncarnation(current), opencode.Event{
+		Type:       opencode.EventMessagePartCreated,
+		Properties: json.RawMessage(`{"id":"late-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"late"}`),
+	}))
 	require.Equal(t, before, connection.updateCount(), "a late event from the failed epoch was emitted")
 }
 
-// TestIdleStreamErrorLeavesTheNextTurnAlone proves a stream error with no open
-// turn interrupts nothing: there is no turn to fail, and the next prompt settles
-// normally.
-func TestIdleStreamErrorLeavesTheNextTurnAlone(t *testing.T) {
+// TestIdleStreamTerminalRejectsLaterAdmission proves a gap between prompts is
+// still terminal. With no durable generation to restore, the next prompt is
+// refused instead of borrowing a replacement route on the broken incarnation.
+func TestIdleStreamTerminalRejectsLaterAdmission(t *testing.T) {
 	current, client, _ := lifecycleSession(t)
+	current.agent.mu.Lock()
+	current.agent.runtime = client
+	current.agent.runtimeGeneration = 1
+	current.agent.mu.Unlock()
+	current.mu.Lock()
+	current.runtimeGeneration = 1
+	current.mu.Unlock()
 
-	client.errs <- errors.New("idle stream closed")
-	time.Sleep(10 * time.Millisecond)
+	client.publishStreamTerminal(errors.New("idle stream closed"))
+	requireEventually(t, func() bool { return current.runtimeFailure() != nil }, "the idle stream gap was not latched")
 
-	response, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
-	require.Zero(t, client.abortCount(), "an idle stream error interrupted the native session")
-}
-
-// TestServerReconnectReconcilesPendingActions proves the one moment an action can
-// be asked with no consumer attached is covered: on a reconnect the session re-reads
-// the native pending sets and routes both classes.
-func TestServerReconnectReconcilesPendingActions(t *testing.T) {
-	current, client, connection := lifecycleSession(t)
-	current.agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
-	current.markPublishedToolCall("tool-current")
-
-	client.pendingPermissions = []opencode.PermissionRequest{{
-		ID: "perm", SessionID: "native-1", Action: "edit", Tool: opencode.PermissionTool{CallID: "tool-current"},
-	}}
-	client.pendingQuestions = []opencode.QuestionRequest{{
-		ID:        "question",
-		SessionID: "native-1",
-		Questions: []opencode.QuestionInfo{{
-			Question: "Pick?", Header: "Pick",
-			Options: []opencode.QuestionOption{{Label: "A", Description: "A"}},
-		}},
-	}}
-
-	client.publishEvent(opencode.Event{Type: opencode.EventServerConnected})
-
-	requireEventually(t, func() bool {
-		return client.permissionReplyCount() == 1 && client.questionReplyCount() == 1
-	}, "the pending native sets were not reconciled")
-
-	requireEventually(t, func() bool {
-		return len(connection.lifecycleEventsOfType(t, "action_update")) == 4
-	}, "both actions were not reported")
-
-	client.publishSessionIdle(current.idmap.NativeSessionID)
-	requireEventually(t, func() bool { return current.currentCycle() == nil }, "the agent-origin turn never settled")
-	requireLifecycleReduces(t, connection)
+	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
+	assertTurnFailed(t, err, causeTransport, "")
+	require.NotContains(t, err.Error(), "idle stream closed")
 }
 
 // TestActionRequestFailureReportsFailedAndAnswersOpenCode proves an error path
@@ -932,11 +821,13 @@ func TestNativeReplyFailureReportsAFailedAction(t *testing.T) {
 // elicitation capability declines the question and OpenCode is answered.
 func TestQuestionWithoutFormSupportIsRejectedNatively(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	session := testSession(t, NewAgent(), client)
+	client.questionRejected = make(chan struct{}, 1)
+	session := testSession(t, negotiatedAgent(t), client)
 
 	require.NoError(t, session.routeNativeQuestion(context.Background(), opencode.QuestionRequest{
 		ID: "question", SessionID: "native-1",
 	}))
+	requireSignal(t, client.questionRejected)
 	require.Equal(t, 1, client.questionRejectCount())
 }
 
@@ -1198,7 +1089,7 @@ func TestPromptSlashCommandRouting(t *testing.T) {
 			if id != "native-1" {
 				t.Fatalf("native id = %q", id)
 			}
-			if req.MessageID != messageID || req.Agent != "build" || req.Model != "openai/gpt-test" ||
+			if req.MessageID == "" || req.MessageID == messageID || req.Agent != "build" || req.Model != "openai/gpt-test" ||
 				req.Command != "review" || req.Arguments != " inspect this" || len(req.Parts) != 0 {
 				t.Fatalf("command request = %#v", req)
 			}
@@ -1288,7 +1179,7 @@ func TestPromptSlashCommandRouting(t *testing.T) {
 		}
 
 		_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("/stale now")}})
-		if err == nil || !strings.Contains(err.Error(), "opencode_command_removed") || !strings.Contains(err.Error(), "stale") {
+		if err == nil || !strings.Contains(err.Error(), "opencode_command_removed") || strings.Contains(err.Error(), "stale") {
 			t.Fatalf("removed command error = %v", err)
 		}
 		if conn.updateCount() != 2 {
@@ -1320,6 +1211,36 @@ func TestPromptSlashCommandRouting(t *testing.T) {
 			t.Fatalf("Prompt: %v", err)
 		}
 	})
+}
+
+func TestNativePromptIdentityIsWrapperMintedPerRequest(t *testing.T) {
+	current, client, _ := lifecycleSession(t)
+	callerMessageID := "caller-reusable-message-id"
+	requests := make(chan string, 2)
+	client.dispatchMessage = func(_ context.Context, id string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
+		requests <- req.MessageID
+
+		return opencode.NativeMessage{Info: opencode.NativeMessageInfo{
+			ID: "assistant-" + req.MessageID, SessionID: id, Role: "assistant", Finish: "stop",
+		}}, nil
+	}
+
+	for _, nonce := range []string{"request-one", "request-two"} {
+		request := correlatedPrompt(current.id, nonce, "hello")
+		request.MessageId = &callerMessageID
+		response, err := current.Prompt(context.Background(), request)
+		require.NoError(t, err)
+		require.NotNil(t, response.UserMessageId)
+		require.Equal(t, callerMessageID, *response.UserMessageId)
+	}
+
+	first := <-requests
+	second := <-requests
+	require.NotEmpty(t, first)
+	require.NotEmpty(t, second)
+	require.NotEqual(t, callerMessageID, first)
+	require.NotEqual(t, callerMessageID, second)
+	require.NotEqual(t, first, second, "native acceptance identity was reused across requests")
 }
 
 func TestPromptSlashCommandMixedContent(t *testing.T) {
@@ -1528,9 +1449,10 @@ func TestPromptSlashCommandBadRequestMergesAssistantErrorFields(t *testing.T) {
 	if !ok {
 		t.Fatalf("Data = %#v", reqErr.Data)
 	}
-	if data["structuredOutputRequested"] != false || data["statusCode"] != 429 || data["providerCode"] != "rate_limit_exceeded" {
+	if data["structuredOutputRequested"] != false || data["statusCode"] != 429 {
 		t.Fatalf("assistant error data = %#v", data)
 	}
+	require.NotContains(t, data, jsonFieldProviderCode)
 }
 
 func TestPromptSlashCommandExclusiveTurn(t *testing.T) {
@@ -1623,7 +1545,7 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 		agent.mu.Unlock()
 		messageID := "user-message"
 		client.dispatchMessage = func(_ context.Context, id string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
-			if id != "native-1" || req.MessageID != messageID || len(req.Parts) != 1 {
+			if id != "native-1" || req.MessageID == "" || req.MessageID == messageID || len(req.Parts) != 1 {
 				t.Fatalf("DispatchMessage id=%q req=%#v", id, req)
 			}
 			msg := opencode.NativeMessage{Info: opencode.NativeMessageInfo{
@@ -1688,28 +1610,9 @@ func TestPromptSuccessCancelAndErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("pending permission error", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
-		client.permissionsErr = errors.New("permissions failed")
-		session := testSession(t, NewAgent(), client)
-		err := session.applyNativeEvent(ctx, opencode.Event{Type: opencode.EventServerConnected})
-		if err == nil || !strings.Contains(err.Error(), "permissions failed") {
-			t.Fatalf("permission reconcile error = %v", err)
-		}
-	})
-
-	t.Run("pending question error", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
-		client.questionsErr = errors.New("questions failed")
-		session := testSession(t, NewAgent(), client)
-		err := session.applyNativeEvent(ctx, opencode.Event{Type: opencode.EventServerConnected})
-		if err == nil || !strings.Contains(err.Error(), "questions failed") {
-			t.Fatalf("question reconcile error = %v", err)
-		}
-	})
-
 	t.Run("turn context cancellation", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
+		client.omitPromptEvidence = true
 		started := make(chan struct{})
 		client.dispatchMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 			close(started)
@@ -1949,11 +1852,11 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 			done <- err
 		}()
 		<-dispatched
-		client.events <- opencode.Event{Type: "server.connected"}
-		client.events <- opencode.Event{
+		client.publishEvent(opencode.Event{Type: "server.connected"})
+		client.publishEvent(opencode.Event{
 			Type:       "message.part.created",
 			Properties: json.RawMessage(`{"id":"event-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"stream"}`),
-		}
+		})
 		deadline := time.After(time.Second)
 		for conn.updateCount() == 0 {
 			select {
@@ -1991,16 +1894,12 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 			done <- err
 		}()
 		<-dispatched
-		client.events <- opencode.Event{
+		client.publishEvent(opencode.Event{
 			Type:       "message.part.created",
 			Properties: json.RawMessage(`{"id":"event-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"stream"}`),
-		}
-		if err := <-done; err == nil || !strings.Contains(err.Error(), "update failed") {
-			t.Fatalf("event error = %v", err)
-		}
-		if client.abortCount() != 1 {
-			t.Fatalf("event error aborts = %d, want 1", client.abortCount())
-		}
+		})
+		assertTurnFailed(t, <-done, causeTransport, "")
+		requireSignal(t, client.closeSignal)
 	})
 
 	t.Run("final message update error returns", func(t *testing.T) {
@@ -2016,10 +1915,9 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 				Parts: []opencode.NativePart{{ID: "final", SessionID: id, MessageID: "assistant", Type: "text", Text: "done", Raw: json.RawMessage(`{"id":"final"}`)}},
 			}, nil
 		}
-		if _, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}}); err == nil ||
-			!strings.Contains(err.Error(), "final update failed") {
-			t.Fatalf("final emit error = %v", err)
-		}
+		_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+		require.ErrorContains(t, err, "authoritative session update delivery failed")
+		require.NotContains(t, err.Error(), "final update failed")
 	})
 }
 
@@ -2027,9 +1925,10 @@ func TestReplayAndEventEdgeBranches(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	conn := newRecordingAgentClient()
-	agent := NewAgent()
+	agent := negotiatedAgent(t)
 	agent.setAgentClient(conn)
 	session := testSession(t, agent, client)
+	replayStart := conn.updateCount()
 
 	client.messages = []opencode.NativeMessage{{
 		Info: opencode.NativeMessageInfo{ID: "user-1", SessionID: "native-1", Role: "user"},
@@ -2043,7 +1942,7 @@ func TestReplayAndEventEdgeBranches(t *testing.T) {
 	if err := session.replayMessages(ctx); err != nil {
 		t.Fatalf("replayMessages: %v", err)
 	}
-	if conn.updateCount() != 1 || conn.updates[0].Update.UserMessageChunk == nil {
+	if conn.updateCount() != replayStart+1 || conn.updates[replayStart].Update.UserMessageChunk == nil {
 		t.Fatalf("replay updates = %#v", conn.updates)
 	}
 	client.messagesErr = errors.New("messages failed")
@@ -2062,35 +1961,44 @@ func TestReplayAndEventEdgeBranches(t *testing.T) {
 	}
 
 	noConnClient := newFakeOpenCodeClient()
-	noConnSession := testSession(t, NewAgent(), noConnClient)
+	noConnSession := testSession(t, negotiatedAgent(t), noConnClient)
+	noConnGeneration := noConnSession.runtimeGeneration
+	noConnSession.agent.setAgentClient(nil)
+	noConnClient.permissionReplied = make(chan struct{}, 1)
 	if err := noConnSession.routeNativePermission(ctx, opencode.PermissionRequest{}); err != nil {
 		t.Fatalf("empty permission: %v", err)
 	}
 
-	if err := noConnSession.routeNativePermission(ctx, opencode.PermissionRequest{ID: "p", SessionID: "native-1"}); err != nil {
-		t.Fatalf("nil conn permission: %v", err)
+	if err := noConnSession.routeNativePermission(ctx, opencode.PermissionRequest{ID: "p", SessionID: "native-1"}); err == nil {
+		t.Fatal("nil connection admitted an undeliverable lifecycle action")
 	}
-	if got := noConnClient.permissionReply(0).message; got != "client unavailable" {
-		t.Fatalf("nil conn permission reply = %q", got)
-	}
+	requireSignal(t, noConnClient.permissionReplied)
+	require.Equal(t, "p", noConnClient.permissionReply(0).requestID)
+	require.Equal(t, 1, noConnClient.permissionReplyCount())
+	noConnSession.agent.mu.Lock()
+	retirement := noConnSession.agent.runtimeRetirements[noConnGeneration]
+	noConnSession.agent.mu.Unlock()
+	require.NotNil(t, retirement)
+	<-retirement.done
+	require.True(t, noConnClient.isClosed())
 
 	if err := session.routeNativeQuestion(ctx, opencode.QuestionRequest{}); err != nil {
 		t.Fatalf("empty question: %v", err)
 	}
 	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
-	conn.elicitErr = errors.New("elicitation failed")
-	if err := session.routeNativeQuestion(ctx, opencode.QuestionRequest{ID: "q-error", SessionID: "native-1"}); err == nil {
-		t.Fatal("elicitation error was ignored")
-	}
-	conn.elicitErr = nil
-	if err := session.applyNativeEvent(ctx, opencode.Event{Type: "permission.v2.asked", Properties: json.RawMessage(`{`)}); err == nil {
+	malformedSession := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	if err := malformedSession.applyNativeEvent(ctx, opencode.Event{Type: "permission.v2.asked", Properties: json.RawMessage(`{`)}); err == nil {
 		t.Fatal("malformed permission event succeeded")
 	}
 	conn.permission = acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected("once")}
-	session.beginTurn(ctx)
+	client.permissionReplied = make(chan struct{}, 1)
+	client.questionReplied = make(chan struct{}, 1)
+	client.questionRejected = make(chan struct{}, 1)
+	acceptOpenTestTurn(t, session)
 	session.markPublishedToolCall("c1")
 	defer session.finishTurn()
-	if err := session.applyNativeEvent(ctx, opencode.Event{
+	actionCtx := withNativeIncarnationBinding(withTurnRoute(ctx, "nonce-1"), testIncarnation(session))
+	if err := session.applyNativeEvent(actionCtx, opencode.Event{
 		Type: "permission.asked",
 		Properties: json.RawMessage(`{
 			"id":"p-session",
@@ -2103,6 +2011,7 @@ func TestReplayAndEventEdgeBranches(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("permission.asked event: %v", err)
 	}
+	requireSignal(t, client.permissionReplied)
 	reply := client.permissionReply(client.permissionReplyCount() - 1)
 	if reply.route != opencode.PermissionRouteSession || reply.requestID != "p-session" || reply.reply != "once" {
 		t.Fatalf("permission.asked reply = %#v", reply)
@@ -2116,17 +2025,21 @@ func TestReplayAndEventEdgeBranches(t *testing.T) {
 	if len(resources) != 1 || resources[0] != "acp-permission-probe.txt" {
 		t.Fatalf("permission.asked resources = %#v", permissionReq.ToolCall.RawInput)
 	}
-	if err := session.applyNativeEvent(ctx, opencode.Event{
+	if err := session.applyNativeEvent(actionCtx, opencode.Event{
 		Type:       "question.v2.asked",
 		Properties: json.RawMessage(`{"id":"q-v2","sessionID":"native-1","questions":[{"question":"Continue?"}]}`),
 	}); err != nil {
 		t.Fatalf("question.v2.asked event: %v", err)
 	}
+	requireSignal(t, client.questionReplied)
 	questionReply := client.questionReply(client.questionReplyCount() - 1)
 	if questionReply.route != opencode.QuestionRouteAPI || questionReply.requestID != "q-v2" {
 		t.Fatalf("question.v2 reply = %#v", questionReply)
 	}
 	assertEventEdgeAndHelperBranches(t, ctx, session)
+	conn.elicitErr = errors.New("elicitation failed")
+	require.NoError(t, session.routeNativeQuestion(actionCtx, opencode.QuestionRequest{ID: "q-error", SessionID: "native-1"}))
+	requireSignal(t, client.questionRejected)
 }
 
 func assertEventEdgeAndHelperBranches(t *testing.T, ctx context.Context, session *session) {
@@ -2184,11 +2097,12 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 
 	t.Run("send error after cancelled state", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
+		client.omitPromptEvidence = true
 		session := testSession(t, NewAgent(), client)
 		client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
-			session.mu.Lock()
+			session.lifecycleMu.Lock()
 			session.cancelled = true
-			session.mu.Unlock()
+			session.lifecycleMu.Unlock()
 
 			return opencode.NativeMessage{}, errors.New("cancelled send")
 		}
@@ -2202,9 +2116,9 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		session := testSession(t, NewAgent(), client)
 		client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
-			session.mu.Lock()
+			session.lifecycleMu.Lock()
 			session.cancelled = true
-			session.mu.Unlock()
+			session.lifecycleMu.Unlock()
 
 			return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant", SessionID: "native-1", Role: "assistant", Finish: "stop"}}, nil
 		}
@@ -2266,16 +2180,20 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 		if err := session.emitMessage(ctx, opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant", Role: "assistant"}, Parts: []opencode.NativePart{part, part}}, false); err != nil {
 			t.Fatalf("duplicate emitMessage: %v", err)
 		}
-		// A raw-event emit failure is non-authoritative debug output and must
-		// not abort the turn: applyNativeEvent records it internally and continues.
+		// Raw delivery is observational and does not poison typed/lifecycle routing.
 		conn.notifyErr = errors.New("notify failed")
 		session.rawMessages = rawMessageConfig{enabled: true}
-		if err := session.applyNativeEvent(ctx, opencode.Event{Type: "unknown", Raw: json.RawMessage(`{"type":"unknown"}`)}); err != nil {
-			t.Fatalf("raw notify error aborted the turn: %v", err)
-		}
+		session.routeNativeEvent(ctx, opencode.Event{Type: "unknown", Properties: json.RawMessage(`{"sessionID":"native-1"}`), Raw: json.RawMessage(`{"type":"unknown"}`)})
+		require.NoError(t, session.delivery.flushRaw(ctx))
+		require.NoError(t, session.lifecycleFailure())
+		conn.notifyErr = nil
+		require.NoError(t, session.emitRawOpenCodeEvent(ctx, normalRawEvent("after-failure")))
+		require.NoError(t, session.delivery.flushRaw(ctx))
+		events := rawEventNotifications(conn, session.id)
+		require.Equal(t, int64(1), events[len(events)-1][jsonFieldSequence])
 	})
 
-	t.Run("same-session events and reconcile errors", func(t *testing.T) {
+	t.Run("same-session action errors", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		conn := newRecordingAgentClient()
 		agent := NewAgent()
@@ -2288,10 +2206,6 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 		}); err == nil {
 			t.Fatal("permission event ignored client error")
 		}
-		client.pendingPermissions = []opencode.PermissionRequest{{ID: "p2", SessionID: "native-1"}}
-		if err := session.reconcileNativeActions(ctx); err == nil {
-			t.Fatal("reconcileNativeActions ignored the permission failure")
-		}
 		conn.permErr = nil
 
 		agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
@@ -2301,10 +2215,6 @@ func TestPromptRemainingErrorBranches(t *testing.T) {
 			Properties: json.RawMessage(`{"id":"q","sessionID":"native-1"}`),
 		}); err == nil {
 			t.Fatal("question event ignored client error")
-		}
-		client.pendingQuestions = []opencode.QuestionRequest{{ID: "q2", SessionID: "native-1"}}
-		if err := session.reconcileNativeActions(ctx); err == nil {
-			t.Fatal("reconcileNativeActions ignored the question failure")
 		}
 		if req, ok := eventQuestion(json.RawMessage(`{"id":"direct","sessionID":"native-1"}`)); !ok || req.ID != "direct" {
 			t.Fatalf("direct eventQuestion = %#v ok=%v", req, ok)
@@ -2319,7 +2229,7 @@ func TestLifecycleMCPRefreshRemainingRuntimeBranches(t *testing.T) {
 		session.client = nil
 
 		err := session.refreshLifecycleMCP(context.Background())
-		require.ErrorContains(t, err, "no runtime client")
+		assertTurnFailed(t, err, causeTransport, "")
 		require.True(t, session.mcpRefreshPending)
 	})
 
@@ -2337,7 +2247,7 @@ func TestLifecycleMCPRefreshRemainingRuntimeBranches(t *testing.T) {
 		}
 
 		err := session.refreshLifecycleMCP(context.Background())
-		require.ErrorContains(t, err, "runtime changed during MCP refresh")
+		assertTurnFailed(t, err, causeTransport, "")
 		require.True(t, session.mcpRefreshPending)
 	})
 }
@@ -2508,9 +2418,7 @@ func TestPromptAssistantErrorStructured(t *testing.T) {
 			if data["statusCode"] != 400 {
 				t.Fatalf("statusCode = %#v", data["statusCode"])
 			}
-			if data["providerCode"] != "invalid_request_error" {
-				t.Fatalf("providerCode = %#v", data["providerCode"])
-			}
+			require.NotContains(t, data, jsonFieldProviderCode)
 		})
 	}
 
@@ -2615,9 +2523,23 @@ func TestPromptNativeTurnPanicIsRecovered(t *testing.T) {
 	if err == nil {
 		t.Fatalf("panicking native turn returned no error: %#v", resp)
 	}
-	if !strings.Contains(err.Error(), "panicked") {
-		t.Fatalf("panic error = %v", err)
-	}
+	assertTurnFailed(t, err, causeTransport, "")
+}
+
+func TestFailureFramesNeverCarryNativePayloads(t *testing.T) {
+	data := turnFailedData(causeTransport, "SECRET_SENTINEL", 503, "SECRET_SENTINEL")
+	encoded, err := json.Marshal(data)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "SECRET_SENTINEL")
+	handlerFrame, err := json.Marshal(requestError(context.Background(), errors.New("SECRET_SENTINEL")))
+	require.NoError(t, err)
+	require.NotContains(t, string(handlerFrame), "SECRET_SENTINEL")
+
+	part := opencode.NativePart{Tool: "handler", State: json.RawMessage(`{"status":"error","error":"SECRET_SENTINEL"}`)}
+	state := nativeToolPartState(part, "tool-1")
+	encoded, err = json.Marshal(state.output)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "SECRET_SENTINEL")
 }
 
 // T1 — a native provider error terminates the turn with the uniform
@@ -2655,9 +2577,7 @@ func TestPromptProviderErrorSurfacesTurnFailed(t *testing.T) {
 			if data["statusCode"] != tt.status {
 				t.Fatalf("statusCode = %#v, want %d", data["statusCode"], tt.status)
 			}
-			if data["providerCode"] != tt.code {
-				t.Fatalf("providerCode = %#v, want %q", data["providerCode"], tt.code)
-			}
+			require.NotContains(t, data, jsonFieldProviderCode)
 		})
 	}
 }
@@ -2669,6 +2589,7 @@ func TestPromptTransportErrorIsRetriable(t *testing.T) {
 	ctx := context.Background()
 
 	client := newFakeOpenCodeClient()
+	client.omitPromptEvidence = true
 	client.dispatchMessage = func(_ context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		return opencode.NativeMessage{}, io.ErrUnexpectedEOF
 	}
@@ -2682,6 +2603,7 @@ func TestPromptTransportErrorIsRetriable(t *testing.T) {
 	}
 
 	// The next turn re-drives successfully: the session stayed addressable.
+	client.omitPromptEvidence = false
 	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant-2", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
 	}
@@ -2719,7 +2641,7 @@ func TestPromptStreamErrorIsStructuredTransportFailure(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("Prompt did not start native send")
 	}
-	client.errs <- errors.New("connection reset by peer")
+	client.publishStreamTerminal(errors.New("connection reset by peer"))
 	select {
 	case err := <-done:
 		assertTurnFailed(t, err, causeTransport, "connection reset by peer")
@@ -2733,9 +2655,9 @@ func TestPromptStreamErrorIsStructuredTransportFailure(t *testing.T) {
 
 func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	dispatched := make(chan struct{})
-	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
-		close(dispatched)
+	dispatched := make(chan opencode.MessageRequest, 1)
+	client.dispatchMessage = func(_ context.Context, _ string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched <- request
 
 		return opencode.NativeMessage{}, nil
 	}
@@ -2752,34 +2674,43 @@ func TestPromptSessionErrorTerminatesTurn(t *testing.T) {
 		done <- err
 	}()
 
+	var request opencode.MessageRequest
 	select {
-	case <-dispatched:
+	case request = <-dispatched:
 	case <-ctx.Done():
 		t.Fatal("Prompt did not start")
 	}
+	client.publishEvent(opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSON(t, map[string]any{"info": map[string]any{
+			"id": "assistant-error", "sessionID": session.idmap.NativeSessionID,
+			"role": roleAssistant, "parentID": request.MessageID,
+		}}),
+	})
 
-	client.events <- opencode.Event{
+	client.publishEvent(opencode.Event{
 		Type: opencode.EventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: "foreign-session",
 			Error:     providerNativeError("foreign failure", 400, "foreign"),
 		}),
-	}
-	client.events <- opencode.Event{
+	})
+	client.publishEvent(opencode.Event{
 		Type: opencode.EventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: session.idmap.NativeSessionID,
 			Error:     providerNativeError("model rejected", 400, "invalid_model"),
 		}),
-	}
+	})
 	client.publishSessionIdle(session.idmap.NativeSessionID)
 
 	select {
 	case err := <-done:
 		data := assertTurnFailed(t, err, causeProvider, "model rejected")
-		if data[jsonFieldStatusCode] != 400 || data[jsonFieldProviderCode] != "invalid_model" {
+		if data[jsonFieldStatusCode] != 400 {
 			t.Fatalf("session error data = %#v", data)
 		}
+		require.NotContains(t, data, jsonFieldProviderCode)
 	case <-ctx.Done():
 		t.Fatal("Prompt did not return after session.error")
 	}
@@ -2799,14 +2730,35 @@ func TestPromptCancellationWinsSessionErrorEvent(t *testing.T) {
 
 		return nil
 	}
-	dispatched := make(chan struct{})
-	client.dispatchMessage = func(_ context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
-		close(dispatched)
+	dispatched := make(chan opencode.MessageRequest, 1)
+	client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+		client.publishEvent(opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-cancel", "sessionID": id, "role": roleAssistant,
+				"parentID": request.MessageID,
+			}}),
+		})
+		dispatched <- request
 
 		return opencode.NativeMessage{}, nil
 	}
 	agent := NewAgent()
 	session := testSession(t, agent, client)
+	assistantObserved := make(chan struct{})
+	errorObserved := make(chan struct{})
+	releaseError := make(chan struct{})
+	session.mu.Lock()
+	session.pump.afterObserve = func(event opencode.Event, _ *nativeEventObservation) {
+		if info, ok := eventMessageInfo(event.Properties); ok && info.ID == "assistant-cancel" {
+			signalTestHook(assistantObserved)
+		}
+		if event.Type == opencode.EventSessionError {
+			signalTestHook(errorObserved)
+			<-releaseError
+		}
+	}
+	session.mu.Unlock()
 	agent.mu.Lock()
 	agent.sessions[session.id] = session
 	agent.mu.Unlock()
@@ -2825,16 +2777,19 @@ func TestPromptCancellationWinsSessionErrorEvent(t *testing.T) {
 		}{response: response, err: err}
 	}()
 	<-dispatched
-	client.events <- opencode.Event{
+	requireSignal(t, assistantObserved)
+	client.publishEvent(opencode.Event{
 		Type: opencode.EventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: session.idmap.NativeSessionID,
 			Error:     providerNativeError("cancelled provider error", 400, "cancelled"),
 		}),
-	}
+	})
+	requireSignal(t, errorObserved)
 	if err := agent.Cancel(context.Background(), CancelRequest(session.id, internalSeamTurnNonce)); err != nil {
 		t.Fatalf("Cancel: %v", err)
 	}
+	close(releaseError)
 	result := <-done
 	require.NoError(t, result.err)
 	require.Equal(t, acp.StopReasonCancelled, result.response.StopReason)
@@ -2852,6 +2807,7 @@ func TestSessionErrorEventRejectsMalformedProperties(t *testing.T) {
 // PromptResponse to return.
 func TestPromptCancelSuppressesNativeError(t *testing.T) {
 	client := newFakeOpenCodeClient()
+	client.omitPromptEvidence = true
 	started := make(chan struct{})
 	client.dispatchMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(started)
@@ -2909,6 +2865,7 @@ func TestPromptCancelSuppressesNativeError(t *testing.T) {
 // "timeout" (not cancelled) after the exact shared runtime is retired.
 func TestPromptTurnTimeoutFailsWithTimeoutCause(t *testing.T) {
 	client := newFakeOpenCodeClient()
+	client.omitPromptEvidence = true
 	client.dispatchMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		<-ctx.Done()
 
@@ -2950,8 +2907,10 @@ func TestPromptCancelWinsCoincidentTimeout(t *testing.T) {
 		return nil
 	}
 	started := make(chan struct{})
+	releaseDispatch := make(chan struct{})
 	client.dispatchMessage = func(_ context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		close(started)
+		<-releaseDispatch
 
 		return opencode.NativeMessage{}, nil
 	}
@@ -2984,9 +2943,10 @@ func TestPromptCancelWinsCoincidentTimeout(t *testing.T) {
 	// Cancel is pending (flag set under lock, as cancelTurn does) at the instant
 	// the deadline fires; turnCtx stays live so the timeout branch is the case
 	// that must honor the cancel guard.
-	session.mu.Lock()
+	session.lifecycleMu.Lock()
 	session.cancelled = true
-	session.mu.Unlock()
+	session.lifecycleMu.Unlock()
+	close(releaseDispatch)
 
 	select {
 	case got := <-done:
@@ -3027,12 +2987,7 @@ func TestPromptDoubleTransportFailureNamesBoth(t *testing.T) {
 	_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hi")}})
 	data := assertTurnFailed(t, err, causeTransport, "unexpected EOF")
 
-	message, _ := data[jsonFieldMessage].(string)
-	for _, want := range []string{"opencode message POST", "unexpected EOF", "message re-fetch failed", "502"} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("data.message = %q, want substring %q (must name both failures)", message, want)
-		}
-	}
+	require.NotContains(t, fmt.Sprint(data), "unexpected EOF")
 }
 func TestPromptCancelAndLoadRejectRemainingRouteAndMCPBranches(t *testing.T) {
 	agent := NewAgent()
@@ -3327,11 +3282,9 @@ func TestCommandPromptPartsPropagatesBlobError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestSeamPromptRefusesAnUnreadableSubmissionCorrelation proves the internal
-// prompt seam decodes its correlation through the same helper the wire path uses:
-// a request carrying an unreadable lifecycle envelope is refused rather than
-// silently promoted to a seam-minted submission.
-func TestSeamPromptRefusesAnUnreadableSubmissionCorrelation(t *testing.T) {
+// TestPromptRefusesAnUnreadableSubmissionCorrelation proves the public prompt
+// path refuses an unreadable lifecycle envelope.
+func TestPromptRefusesAnUnreadableSubmissionCorrelation(t *testing.T) {
 	current, _, connection := lifecycleSession(t)
 
 	request := TextPromptRequest(current.id, internalSeamTurnNonce, "hello")
@@ -3474,11 +3427,13 @@ func TestCommandRunFailureAfterAcceptanceFailsTheAcceptedTurn(t *testing.T) {
 	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
 
 	hold := make(chan struct{})
-	client.dispatchCommand = func(_ context.Context, id string, _ opencode.CommandRequest) (opencode.NativeMessage, error) {
+	evidenceSent := make(chan struct{})
+	client.dispatchCommand = func(_ context.Context, id string, request opencode.CommandRequest) (opencode.NativeMessage, error) {
 		client.publishEvent(opencode.Event{
 			Type:       opencode.EventMessageUpdated,
-			Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": "assistant-1", "sessionID": id, "role": "assistant"}}),
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{"id": request.MessageID, "sessionID": id, "role": roleUser}}),
 		})
+		close(evidenceSent)
 		<-hold
 
 		return opencode.NativeMessage{}, errors.New("command run failed")
@@ -3491,9 +3446,11 @@ func TestCommandRunFailureAfterAcceptanceFailsTheAcceptedTurn(t *testing.T) {
 		done <- err
 	}()
 
-	requireEventually(t, func() bool {
-		return len(connection.lifecycleEventsOfType(t, "prompt_accepted")) == 1
-	}, "the admitted frame was never accepted")
+	<-evidenceSent
+	current.lifecycleMu.Lock()
+	dispatchEvidence := current.cycle.dispatchEvidence
+	current.lifecycleMu.Unlock()
+	<-dispatchEvidence
 
 	close(hold)
 	assertTurnFailed(t, <-done, causeTransport, "command run failed")
@@ -3506,25 +3463,62 @@ func TestCommandRunFailureAfterAcceptanceFailsTheAcceptedTurn(t *testing.T) {
 // the turn reports the terminal evidence its cycle already holds.
 func TestAcceptedTurnOutlivingItsCallerReadsTheEvidenceItAlreadyHas(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	started := make(chan struct{})
-	client.hangsAfterDispatch(started)
-	client.stageAssistantMessage("native-1", "assistant-1")
+	requestID := make(chan string, 1)
+	assistantObserved := make(chan struct{})
+	client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+		client.stageAssistantMessage(id, "assistant-1")
+		client.publishEvent(opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant-1", "sessionID": id, "role": roleAssistant,
+				"parentID": request.MessageID,
+			}}),
+		})
+		requestID <- request.MessageID
+
+		return opencode.NativeMessage{}, nil
+	}
 
 	current := testSession(t, NewAgent(), client)
+	current.mu.Lock()
+	current.pump.afterObserve = func(event opencode.Event, _ *nativeEventObservation) {
+		if info, ok := eventMessageInfo(event.Properties); ok && info.ID == "assistant-1" {
+			signalTestHook(assistantObserved)
+		}
+	}
+	current.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan acp.PromptResponse, 1)
+	type promptResult struct {
+		response acp.PromptResponse
+		err      error
+	}
+	done := make(chan promptResult, 1)
 
 	go func() {
 		response, err := current.Prompt(ctx, TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
-		require.NoError(t, err)
-		done <- response
+		done <- promptResult{response: response, err: err}
 	}()
 
-	<-started
+	messageID := <-requestID
+	requireSignal(t, assistantObserved)
+	current.lifecycleMu.Lock()
+	dispatchEvidence := current.cycle.dispatchEvidence
+	current.lifecycleMu.Unlock()
+	<-dispatchEvidence
 	cancel()
+	client.publishEvent(opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "assistant-1", "sessionID": current.idmap.NativeSessionID,
+			"role": roleAssistant, "parentID": messageID, "finish": "stop",
+		}}),
+	})
+	client.publishSessionIdle(current.idmap.NativeSessionID)
 
-	require.Equal(t, acp.StopReasonEndTurn, (<-done).StopReason)
+	result := <-done
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonEndTurn, result.response.StopReason)
 	require.False(t, current.wasCancelled(), "a released caller context was reported as a cancellation")
 }
 
@@ -3563,7 +3557,7 @@ func TestTimedOutTurnWhoseInterruptIsRefusedReportsAnUnprovenSettlement(t *testi
 
 	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
 	require.ErrorContains(t, err, "opencode_turn_settlement_unproven")
-	require.ErrorContains(t, err, "harness refused the interrupt")
+	require.NotContains(t, err.Error(), "harness refused the interrupt")
 }
 
 // TestCancelledTurnThatCannotReportItsEndSurfacesTheDeliveryFailure proves the
@@ -3592,10 +3586,16 @@ func TestCancelledTurnThatCannotReportItsEndSurfacesTheDeliveryFailure(t *testin
 	}()
 
 	<-started
+	current.lifecycleMu.Lock()
+	dispatchEvidence := current.cycle.dispatchEvidence
+	current.lifecycleMu.Unlock()
+	<-dispatchEvidence
 	require.NoError(t, current.agent.Cancel(context.Background(), CancelRequest(current.id, internalSeamTurnNonce)))
-	require.ErrorContains(t, <-done, "wire down")
+	turnErr := <-done
+	assertTurnFailed(t, turnErr, causeTransport, "")
+	require.NotContains(t, turnErr.Error(), "wire down")
 
-	require.ErrorContains(t, current.lifecycleFailure(), "deliver lifecycle sequence",
+	require.ErrorContains(t, current.lifecycleFailure(), "lifecycle delivery failed",
 		"an undeliverable ending transition left the stream unlatched")
 }
 
@@ -3621,6 +3621,8 @@ func TestTurnWithNoReadableTranscriptFails(t *testing.T) {
 		current := testSession(t, NewAgent(), client)
 
 		_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
-		assertTurnFailed(t, err, causeTransport, "no assistant message")
+		data := requireInternalErrorData(t, err)
+		require.Equal(t, "opencode_turn_assistant_identity_missing", data[jsonFieldError])
+		require.Equal(t, causeProvider, data[jsonFieldCause])
 	})
 }

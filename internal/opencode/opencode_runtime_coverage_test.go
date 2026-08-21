@@ -47,7 +47,7 @@ func TestScopedRuntimeMCPAndSyncMethods(t *testing.T) {
 
 	runtimeExited := make(chan struct{})
 	client := &openCodeServer{
-		httpClient: server.Client(), baseURL: server.URL, events: make(chan Event, 1), errs: make(chan error, 1),
+		httpClient: server.Client(), baseURL: server.URL, eventStream: make(chan EventStreamItem, 1),
 		closed: make(chan struct{}), runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}), runtimeExited: runtimeExited,
 		sessionCarrierBroker: testSessionCarrierBroker(),
 	}

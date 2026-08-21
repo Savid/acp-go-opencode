@@ -386,7 +386,8 @@ func (s *session) commitStateSnapshot(ctx context.Context, captured capturedStat
 }
 
 func (s *session) snapshotBlockedReason() string {
-	if s.actions.blocked() {
+	incarnation := s.currentIncarnation()
+	if incarnation != nil && incarnation.registry.blocked() {
 		return metaPermissionKey
 	}
 

@@ -247,8 +247,8 @@ func (o *Observer) StartACPRequest(ctx context.Context, method string) (context.
 		if err != nil {
 			attrs = append(attrs, attribute.String(attrOutcome, outcomeError))
 
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
+			span.RecordError(errors.New("operation failed"))
+			span.SetStatus(codes.Error, "operation failed")
 		} else {
 			attrs = append(attrs, attribute.String(attrOutcome, outcomeOK))
 
@@ -286,8 +286,8 @@ func (o *Observer) StartPrompt(ctx context.Context, meta map[string]any, model s
 		metricAttrs := append(cloneAttrs(finalAttrs), attribute.String(attrOutcome, outcome))
 
 		if result.Err != nil {
-			span.RecordError(result.Err)
-			span.SetStatus(codes.Error, result.Err.Error())
+			span.RecordError(errors.New("prompt failed"))
+			span.SetStatus(codes.Error, "prompt failed")
 		} else {
 			span.SetStatus(codes.Ok, "")
 		}

@@ -1,16 +1,131 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"runtime"
+	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 )
+
+type panickingEventStreamClient struct{ *fakeOpenCodeClient }
+
+func TestSessionPumpOwnershipHasNoLeak(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	current.stopPump()
+}
+
+func TestReceivedAutonomousEventOwnsBeforeLaterPromptCanReserve(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	current, client, _ := lifecycleSession(t)
+	current.mu.Lock()
+	pump := current.pump
+	current.mu.Unlock()
+	require.NotNil(t, pump)
+
+	received := make(chan struct{})
+	releaseReceive := make(chan struct{})
+	pauseRequested := make(chan struct{})
+	var receiveOnce sync.Once
+	var pauseOnce sync.Once
+	pump.afterReceive = func() {
+		receiveOnce.Do(func() { close(received) })
+		<-releaseReceive
+	}
+	pump.beforePause = func() { pauseOnce.Do(func() { close(pauseRequested) }) }
+
+	client.publishEvent(opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "assistant-a", "sessionID": current.idmap.NativeSessionID, "role": "assistant",
+			"parentID": "user-a", "finish": "stop",
+		}}),
+	})
+	requireSignal(t, received)
+
+	posted := make(chan struct{})
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		close(posted)
+
+		return opencode.NativeMessage{}, nil
+	}
+
+	promptDone := make(chan error, 1)
+	go func() {
+		_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, "prompt-b", "B"))
+		promptDone <- err
+	}()
+	requireSignal(t, pauseRequested)
+	select {
+	case <-posted:
+		t.Fatal("prompt B posted before the already-received A event fixed ownership")
+	default:
+	}
+
+	close(releaseReceive)
+	require.Error(t, <-promptDone)
+	select {
+	case <-posted:
+		t.Fatal("prompt B posted after autonomous A had already claimed the session")
+	default:
+	}
+
+	requireEventually(t, func() bool {
+		cycle := current.currentCycle()
+
+		return cycle != nil && cycle.origin == lifecycle.CauseActivity && cycle.assistantID == "assistant-a"
+	}, "received A did not open its autonomous turn")
+	client.publishSessionIdle(current.idmap.NativeSessionID)
+	requireEventually(t, func() bool { return current.currentCycle() == nil }, "autonomous A did not settle")
+	current.stopPump()
+	current.delivery.close()
+}
+
+func (c *panickingEventStreamClient) EventStream() <-chan opencode.EventStreamItem {
+	panic("SECRET_SENTINEL")
+}
+
+func TestPumpPanicContainsExactGenerationWithoutPayloadDisclosure(t *testing.T) {
+	current, base, _ := lifecycleSession(t)
+	current.stopPump()
+	client := &panickingEventStreamClient{fakeOpenCodeClient: base}
+	var logs bytes.Buffer
+	current.agent.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	current.mu.Lock()
+	current.client = client
+	generation := current.runtimeGeneration
+	current.mu.Unlock()
+	current.agent.mu.Lock()
+	current.agent.runtime = client
+	current.agent.runtimeGeneration = generation
+	current.agent.mu.Unlock()
+	oldBinding := testIncarnation(current)
+	binding := &nativeIncarnationBinding{
+		client: client, generation: generation, stream: oldBinding.stream, registry: oldBinding.registry,
+	}
+	current.lifecycleMu.Lock()
+	current.incarnation = binding
+	current.lifecycleMu.Unlock()
+
+	pump := &sessionPump{session: current, binding: binding,
+		done: make(chan struct{}), released: make(chan struct{}, 1)}
+	pump.run(context.Background())
+	<-pump.done
+	requireSignal(t, base.closeSignal)
+	require.Error(t, current.lifecycleFailure())
+	require.NotContains(t, logs.String(), "SECRET_SENTINEL")
+}
 
 // TestSettleAgentCycleSettlesTheRecordedOutcome proves an agent-origin cycle
 // settles as failed when it carries a failure, and that a prefix that cannot be
@@ -37,7 +152,7 @@ func TestSettleAgentCycleSettlesTheRecordedOutcome(t *testing.T) {
 	blocked.lifecycleMu.Lock()
 	blocked.cycle = open
 	blocked.lifecycleMu.Unlock()
-	blocked.markNativeTerminal(ctx)
+	require.ErrorContains(t, blocked.markNativeTerminal(ctx), "commit refused")
 	require.ErrorContains(t, blocked.cycleFailure(open), "commit refused")
 }
 
@@ -55,43 +170,6 @@ func TestNativeRepliedActionStateMapsEveryResolution(t *testing.T) {
 		nativeRepliedActionState(opencode.EventQuestionV2Replied, opencode.ActionRepliedEvent{}))
 }
 
-// TestReconcileNativeActionsWithoutARuntimeIsANoOp proves a session whose
-// runtime binding is gone reconciles nothing rather than failing.
-func TestReconcileNativeActionsWithoutARuntimeIsANoOp(t *testing.T) {
-	t.Parallel()
-
-	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
-	session.stopPump()
-	session.mu.Lock()
-	session.client = nil
-	session.mu.Unlock()
-
-	require.NoError(t, session.reconcileNativeActions(context.Background()))
-}
-
-// TestRecordNativeFailureAttributesToTheOpenCycle proves a pump-side failure is
-// recorded against the open cycle, and that a cycle already carrying a failure
-// keeps the first one.
-func TestRecordNativeFailureAttributesToTheOpenCycle(t *testing.T) {
-	t.Parallel()
-
-	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
-
-	session.lifecycleMu.Lock()
-	cycle := &foregroundCycle{id: "cycle-1"}
-	session.cycle = cycle
-	session.lifecycleMu.Unlock()
-
-	session.recordNativeFailure(nil)
-	require.NoError(t, session.cycleFailure(cycle))
-
-	session.recordNativeFailure(errors.New("late event failed"))
-	require.ErrorContains(t, session.cycleFailure(cycle), "late event failed")
-
-	session.recordNativeFailure(errors.New("second failure"))
-	require.ErrorContains(t, session.cycleFailure(cycle), "late event failed")
-}
-
 // TestForeignAndMalformedNativeEventsChangeNothing proves the structural reading
 // of the native event set: an event that names no session, decodes to no payload,
 // or reports a status this adapter draws no boundary from leaves the session
@@ -99,6 +177,21 @@ func TestRecordNativeFailureAttributesToTheOpenCycle(t *testing.T) {
 func TestForeignAndMalformedNativeEventsChangeNothing(t *testing.T) {
 	current, client, connection := lifecycleSession(t)
 	native := current.idmap.NativeSessionID
+	idleDelivered := make(chan struct{})
+	var idleOnce sync.Once
+	connection.mu.Lock()
+	connection.updateHook = func(notification acp.SessionNotification) {
+		envelope, ok := notification.Meta[lifecycle.MetaKey].(map[string]any)
+		if !ok {
+			return
+		}
+		event, _ := envelope["event"].(map[string]any)
+		state, _ := event["state"].(string)
+		if event["type"] == string(lifecycle.EventStateUpdate) && state == string(lifecycle.ForegroundIdle) {
+			idleOnce.Do(func() { close(idleDelivered) })
+		}
+	}
+	connection.mu.Unlock()
 
 	for _, event := range []opencode.Event{
 		// A status transition that is not busy opens no turn.
@@ -134,6 +227,7 @@ func TestForeignAndMalformedNativeEventsChangeNothing(t *testing.T) {
 	})
 	client.publishSessionIdle(native)
 	requireEventually(t, func() bool { return current.currentCycle() == nil }, "the agent-origin turn never settled")
+	requireSignal(t, idleDelivered)
 
 	require.Equal(t, []string{"lifecycle_snapshot", "state_update", "state_update"}, connection.lifecycleEvents(t))
 	require.NoError(t, current.cycleFailure(cycle))
@@ -155,85 +249,57 @@ func TestUndecodableQuestionFailsTheOpenCycle(t *testing.T) {
 	requireEventually(t, func() bool { return current.currentCycle() != nil }, "no agent-origin cycle opened")
 
 	cycle := current.currentCycle()
-	client.publishEvent(opencode.Event{Type: opencode.EventQuestionV2Asked, Properties: mustJSONValue(map[string]any{})})
+	client.publishEvent(opencode.Event{Type: opencode.EventQuestionV2Asked, Properties: mustJSONValue(map[string]any{
+		"sessionID": native, "questions": "malformed",
+	})})
 
 	requireEventually(t, func() bool { return current.currentCycle() == nil }, "the broken cycle never ended")
 	require.ErrorContains(t, current.cycleFailure(cycle), "invalid OpenCode question event")
-	require.Equal(t, []string{native}, client.abortedSessions(), "output the session cannot report was left running")
-	requireLifecycleOutcome(t, connection, lifecycle.OutcomeFailed)
+	requireEventually(t, client.isClosed, "the producer of output the session could not report was not contained")
+	require.Error(t, current.lifecycleFailure(), "the broken incarnation remained admissible")
 	requireLifecycleReduces(t, connection)
 }
 
-// TestNativeErrorBeforeAcceptanceFailsTheAwaitingDispatch proves an error the
-// harness published for the run a pending frame started answers that frame: the
-// route is released with the native failure rather than waiting out a run that
-// already died.
-func TestNativeErrorBeforeAcceptanceFailsTheAwaitingDispatch(t *testing.T) {
+// TestStreamTerminalBeforeAcceptanceFailsTheAwaitingDispatch proves loss of the
+// exact incarnation releases a reserved POST even though no request-specific
+// user-message evidence arrived.
+func TestStreamTerminalBeforeAcceptanceFailsTheAwaitingDispatch(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	current := testSession(t, NewAgent(), client)
-
-	current.mu.Lock()
-	current.mcpRefreshPending = true
-	current.mu.Unlock()
-
-	native := current.idmap.NativeSessionID
-	client.refreshMCPFunc = func(context.Context, []opencode.MCPServerConfig) error {
-		// The MCP refresh runs after the turn opens and before the dispatch hold,
-		// which is the one window a native event is routed against a live turn
-		// that has accepted nothing yet.
-		client.publishEvent(opencode.Event{
-			Type: opencode.EventSessionError,
-			Properties: mustJSONValue(map[string]any{
-				"sessionID": native,
-				"error":     providerNativeError("provider exploded", 429, "rate_limit_exceeded"),
-			}),
-		})
-
-		for current.takePendingDispatchFailure() == nil {
-			runtime.Gosched()
-		}
-
-		return nil
-	}
+	client.omitPromptEvidence = true
 	client.dispatchMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+		client.publishStreamTerminal(errors.New("SECRET_STREAM_FAILURE"))
+		<-ctx.Done()
+
 		return opencode.NativeMessage{}, ctx.Err()
 	}
 
 	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
-	require.ErrorContains(t, err, "provider exploded")
+	assertTurnFailed(t, err, causeTransport, "")
+	require.NotContains(t, err.Error(), "SECRET_STREAM_FAILURE")
 	require.Nil(t, current.currentCycle(), "a frame that was never accepted opened a turn")
 }
 
 // TestPumpWithoutARuntimeBindingRoutesNothing proves the pump belongs to one
-// runtime binding: a session with no binding starts none, and a dispatch that
-// releases the event gate with no pump to wake completes anyway.
+// runtime binding: a session with no binding starts none. A prompt is not
+// dispatched in this state because native idle would have no ordered consumer.
 func TestPumpWithoutARuntimeBindingRoutesNothing(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
-	current := testSession(t, NewAgent(), client)
+	agent := NewAgent()
+	agent.setAgentClient(newRecordingAgentClient())
+	current := testSession(t, agent, client)
 	current.stopPump()
 
-	current.mu.Lock()
-	bound := current.client
-	current.client = nil
-	current.mu.Unlock()
+	current.lifecycleMu.Lock()
+	bound := current.incarnation
+	current.incarnation = nil
+	current.lifecycleMu.Unlock()
 
 	current.startPump()
 
-	current.mu.Lock()
+	current.lifecycleMu.Lock()
 	require.Nil(t, current.pump, "a session with no runtime binding started a pump")
-	current.client = bound
-	current.mu.Unlock()
-
-	// The command route reports its own completion, so the turn settles with no
-	// pump to route events and no pump to wake when the gate is released.
-	client.dispatchCommand = func(_ context.Context, id string, _ opencode.CommandRequest) (opencode.NativeMessage, error) {
-		client.stageAssistantMessage(id, "assistant-1")
-
-		return opencode.NativeMessage{}, nil
-	}
-
-	response, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "/review"))
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	current.incarnation = bound
+	current.lifecycleMu.Unlock()
 }

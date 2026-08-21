@@ -52,6 +52,7 @@ const (
 	nativeStatusSuccess   = "success"
 	nativeStatusFailed    = "failed"
 	nativeStatusError     = "error"
+	nativeToolFailed      = "native tool failed"
 	toolNameRead          = "read"
 	toolNameEdit          = "edit"
 	toolNameDelete        = "delete"
@@ -59,6 +60,8 @@ const (
 	priorityHigh          = "high"
 	priorityLow           = "low"
 )
+
+var errTurnAssistantIdentityMissing = errors.New("OpenCode turn assistant identity is missing")
 
 const (
 	turnFailedErrorTag = "opencode_turn_failed"
@@ -68,11 +71,20 @@ const (
 )
 
 // turnFailedData builds the uniform ACP error Data payload for a native
-// OpenCode turn failure. cause is the machine-readable failure class
-// (provider/transport/timeout); message carries the real native cause text and
-// is never a fixed placeholder or bare transport string like "EOF".
-// statusCode/providerCode are included only when the harness supplies them.
-func turnFailedData(cause, message string, statusCode int, providerCode string) map[string]any {
+// OpenCode turn failure. Only closed classifications cross the ACP boundary;
+// native/provider bodies and arbitrary handler causes stay internal.
+func turnFailedData(cause, _ string, statusCode int, _ string) map[string]any {
+	message := "OpenCode turn failed"
+
+	switch cause {
+	case causeProvider:
+		message = "OpenCode provider request failed"
+	case causeTransport:
+		message = "OpenCode transport failed"
+	case causeTimeout:
+		message = "OpenCode turn timed out"
+	}
+
 	data := map[string]any{
 		jsonFieldError:   turnFailedErrorTag,
 		jsonFieldCause:   cause,
@@ -80,10 +92,6 @@ func turnFailedData(cause, message string, statusCode int, providerCode string) 
 	}
 	if statusCode > 0 {
 		data[jsonFieldStatusCode] = statusCode
-	}
-
-	if providerCode != "" {
-		data[jsonFieldProviderCode] = providerCode
 	}
 
 	return data
@@ -100,17 +108,12 @@ func assistantErrorData(err *opencode.AssistantError, structuredOutputRequested 
 	return data
 }
 
-// mergeAssistantErrorFields adds the optional machine-readable assistant-error
-// fields (statusCode, providerCode) and structuredOutputRequested onto an
-// existing ACP error Data map. Optional fields are included only when present.
+// mergeAssistantErrorFields adds the closed machine-readable assistant-error
+// status and structured-output marker onto an existing ACP error Data map.
 func mergeAssistantErrorFields(data map[string]any, err *opencode.AssistantError, structuredOutputRequested bool) {
 	data[jsonFieldStructuredOutputRequested] = structuredOutputRequested
 	if err.StatusCode() > 0 {
 		data[jsonFieldStatusCode] = err.StatusCode()
-	}
-
-	if err.ProviderCode() != "" {
-		data[jsonFieldProviderCode] = err.ProviderCode()
 	}
 }
 
@@ -208,54 +211,16 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 	return session.cancelTurn(cancelCtx)
 }
 
-// Prompt is the internal session seam used by deterministic unit tests. The
-// public Agent path always calls promptWithRoute after strict route validation.
-// A request carrying the lifecycle key is decoded through the same helper the
-// public path uses, so the seam can never accept a submission identity the wire
-// would refuse; a negotiated request without one plays the host's role and
-// mints the correlation itself.
-func (s *session) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
-	nonce := internalSeamTurnNonce
-	if route, err := parseInboundTurnRoute(params.Meta); err == nil {
-		nonce = route.TurnNonce
-	}
-
-	var submission lifecycle.Submission
-
-	if _, carries := params.Meta[lifecycle.MetaKey]; carries {
-		var err error
-
-		submission, err = s.agent.promptSubmission(params.Meta)
-		if err != nil {
-			return acp.PromptResponse{}, err
-		}
-	} else if s.agent.lifecycleNegotiated().Present() {
-		submission = s.mintSeamSubmission(nonce)
-	}
-
-	return s.promptWithRoute(ctx, params, nonce, submission)
-}
-
-// mintSeamSubmission mints the correlation a host would have supplied for one
-// seam-driven turn.
-func (s *session) mintSeamSubmission(nonce string) lifecycle.Submission {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.seamSubmissions++
-
-	return lifecycle.Submission{
-		SubmissionID: fmt.Sprintf("internal-seam-submission-%d", s.seamSubmissions),
-		ClientNonce:  nonce,
-	}
-}
-
 func (s *session) promptWithRoute(
 	ctx context.Context,
 	params acp.PromptRequest,
 	turnNonce string,
 	submission lifecycle.Submission,
 ) (acp.PromptResponse, error) {
+	if err := s.requireEstablished(ctx); err != nil {
+		return acp.PromptResponse{}, err
+	}
+
 	if err := s.ensureNotPoisoned(); err != nil {
 		return acp.PromptResponse{}, err
 	}
@@ -280,20 +245,9 @@ func (s *session) promptWithRoute(
 		return acp.PromptResponse{}, recoveryErr
 	}
 
-	// Establishment normally runs from the establishing request's post-response
-	// hook. A host driving this Agent in process never writes that response, so
-	// the turn opens the stream itself rather than accepting a submission on a
-	// stream nothing opened.
-	if establishErr := s.ensureEstablished(ctx); establishErr != nil {
-		return acp.PromptResponse{}, establishErr
-	}
+	prepareCtx := withTurnRoute(ctx, turnNonce)
 
-	turnCtx := s.beginTurn(ctx, turnNonce)
-	defer s.finishTurn()
-
-	s.recordSubmission(submission)
-
-	invocation, command, matchedCommand, err := s.resolvePromptCommand(turnCtx, params)
+	invocation, command, matchedCommand, err := s.resolvePromptCommand(prepareCtx, params)
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
@@ -301,20 +255,20 @@ func (s *session) promptWithRoute(
 	var dispatch nativeDispatch
 
 	if matchedCommand {
-		dispatch, err = s.commandDispatch(turnCtx, params, invocation, command)
+		dispatch, err = s.commandDispatch(prepareCtx, params, invocation, command)
 	} else {
-		dispatch, err = s.messageDispatch(turnCtx, params)
+		dispatch, err = s.messageDispatch(prepareCtx, params)
 	}
 
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
 
-	if err := s.refreshLifecycleMCP(turnCtx); err != nil {
+	if err := s.refreshLifecycleMCP(prepareCtx); err != nil {
 		return acp.PromptResponse{}, err
 	}
 
-	return s.runPromptTurn(ctx, turnCtx, params, submission, dispatch)
+	return s.runPromptTurn(ctx, params, turnNonce, submission, dispatch)
 }
 
 func (s *session) resolvePromptCommand(ctx context.Context, params acp.PromptRequest) (slashCommandPrompt, opencode.NativeCommand, bool, error) {
@@ -323,7 +277,7 @@ func (s *session) resolvePromptCommand(ctx context.Context, params acp.PromptReq
 	_, matchedBeforeRefresh := s.cachedCommand(invocation.name)
 	if slashCandidate {
 		if err := s.refreshCommands(ctx); err != nil && s.agent != nil && s.agent.log != nil {
-			s.agent.log.DebugContext(ctx, "refresh OpenCode commands before prompt failed", slog.String("session_id", string(s.id)), slog.String("error", err.Error()))
+			s.agent.log.DebugContext(ctx, "refresh OpenCode commands before prompt failed", slog.String("session_id", string(s.id)))
 		}
 	}
 
@@ -331,8 +285,7 @@ func (s *session) resolvePromptCommand(ctx context.Context, params acp.PromptReq
 	if slashCandidate && matchedBeforeRefresh && !matchedCommand {
 		return slashCommandPrompt{}, opencode.NativeCommand{}, false, acp.NewInvalidParams(map[string]any{
 			jsonFieldError:   "opencode_command_removed",
-			jsonFieldMessage: fmt.Sprintf("OpenCode command %q is no longer available", invocation.name),
-			jsonFieldCommand: invocation.name,
+			jsonFieldMessage: "The selected OpenCode command is no longer available",
 		})
 	}
 
@@ -352,6 +305,10 @@ type nativeDispatch struct {
 	// a route cannot acknowledge admission, so acceptance comes from the first
 	// native event the addressed session publishes for the frame.
 	reportsCompletion bool
+	// messageID is the exact native user-message identity carried by this
+	// request. Only an observed native event naming this identity can prove a
+	// completion-reporting route accepted this particular frame.
+	messageID string
 }
 
 func (s *session) commandDispatch(ctx context.Context, params acp.PromptRequest, invocation slashCommandPrompt, command opencode.NativeCommand) (nativeDispatch, error) {
@@ -374,9 +331,13 @@ func (s *session) commandDispatch(ctx context.Context, params acp.PromptRequest,
 		Arguments: invocation.arguments,
 		Parts:     parts,
 	}
-	if params.MessageId != nil {
-		req.MessageID = *params.MessageId
+
+	messageID, err := nativePromptMessageID()
+	if err != nil {
+		return nativeDispatch{}, err
 	}
+
+	req.MessageID = messageID
 
 	return nativeDispatch{
 		send: func(turnCtx context.Context) error {
@@ -385,6 +346,7 @@ func (s *session) commandDispatch(ctx context.Context, params acp.PromptRequest,
 		command:           command,
 		matched:           true,
 		reportsCompletion: true,
+		messageID:         messageID,
 	}, nil
 }
 
@@ -416,15 +378,28 @@ func (s *session) messageDispatch(ctx context.Context, params acp.PromptRequest)
 		req.Model = &modelSelector
 	}
 
-	if params.MessageId != nil {
-		req.MessageID = *params.MessageId
+	messageID, err := nativePromptMessageID()
+	if err != nil {
+		return nativeDispatch{}, err
 	}
+
+	req.MessageID = messageID
 
 	return nativeDispatch{
 		send: func(turnCtx context.Context) error {
 			return s.client.DispatchMessage(turnCtx, s.idmap.NativeSessionID, req)
 		},
+		messageID: messageID,
 	}, nil
+}
+
+func nativePromptMessageID() (string, error) {
+	id, err := NewTurnNonce()
+	if err != nil {
+		return "", fmt.Errorf("create native prompt message id: %w", err)
+	}
+
+	return id, nil
 }
 
 // nativeTurnEnd is the terminal evidence one prompt-origin turn ended on. Exactly
@@ -441,26 +416,32 @@ type nativeTurnEnd struct {
 
 func (s *session) runPromptTurn(
 	ctx context.Context,
-	turnCtx context.Context,
 	params acp.PromptRequest,
+	turnNonce string,
 	submission lifecycle.Submission,
 	dispatch nativeDispatch,
 ) (acp.PromptResponse, error) {
-	cycle, completion, err := s.dispatchAndAccept(turnCtx, submission, dispatch)
+	cycle, turnCtx, completion, err := s.dispatchAndAccept(ctx, turnNonce, submission, dispatch)
 	if err != nil {
 		// A dying host request context withdraws the frame before acceptance:
 		// there is nobody left to answer, and the withdrawal is reported as the
 		// cancellation it is rather than as a failure of the route.
-		if !s.wasCancelled() && s.takePendingDispatchFailure() == nil && turnCtx.Err() != nil {
-			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil //nolint:nilerr // the withdrawal is the answer, not the route's error
+		if !s.wasCancelled() && s.takePendingDispatchFailure() == nil && ctx.Err() != nil {
+			s.finishTurn()
+
+			return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}, nil
 		}
 
 		// Nothing was accepted, so no submission and no turn exist. The native
 		// refusal is reported as it is, and if the frame was in fact admitted
 		// without this call learning so, the session's own event stream opens an
 		// agent-origin turn for it rather than a silently accepted one.
-		return acp.PromptResponse{}, s.classifyDispatchFailure(turnCtx, err, dispatch)
+		classified := s.classifyDispatchFailure(turnCtx, err, dispatch)
+		s.finishTurn()
+
+		return acp.PromptResponse{}, classified
 	}
+	defer s.finishTurn()
 
 	end := s.awaitPromptTerminal(ctx, turnCtx, cycle, completion)
 
@@ -471,28 +452,56 @@ func (s *session) runPromptTurn(
 // held across both, so every native event caused by the frame is routed after the
 // acceptance that explains it and none is dropped waiting for it.
 func (s *session) dispatchAndAccept(
-	turnCtx context.Context,
+	ctx context.Context,
+	turnNonce string,
 	submission lifecycle.Submission,
 	dispatch nativeDispatch,
-) (*foregroundCycle, <-chan error, error) {
+) (*foregroundCycle, context.Context, <-chan error, error) {
 	s.dispatchGate.Lock()
 
-	completion, err := s.sendNativeFrame(turnCtx, dispatch)
+	s.mu.Lock()
+	pump := s.pump
+	s.mu.Unlock()
+
+	if err := pump.pauseForDispatch(ctx); err != nil {
+		s.releaseDispatchGate()
+
+		return nil, withTurnRoute(ctx, turnNonce), nil, err
+	}
+
+	reservationCtx := withTurnRoute(ctx, turnNonce)
+
+	cycle, turnCtx, err := s.reservePromptCycle(reservationCtx, dispatch.messageID, submission)
 	if err != nil {
 		s.releaseDispatchGate()
 
-		return nil, nil, err
+		return nil, reservationCtx, nil, err
 	}
 
-	cycle, acceptErr := s.acceptPromptCycle(turnCtx, submission)
+	// The reservation now owns every request-specific event the native POST can
+	// publish synchronously. Resume receiving while routing remains held behind
+	// dispatchGate, otherwise an unbuffered native stream could deadlock the POST
+	// before it acknowledges admission.
+	pump.wake()
 
+	completion, err := s.sendReservedNativeFrame(turnCtx, cycle, dispatch)
+	if err != nil {
+		s.abandonPromptCycle(cycle)
+		s.releaseDispatchGate()
+
+		return nil, turnCtx, nil, err
+	}
+
+	err = s.acceptPromptCycle(turnCtx, cycle, submission)
 	s.releaseDispatchGate()
 
-	if acceptErr != nil {
-		return nil, nil, acceptErr
+	if err != nil {
+		s.finishTurn()
+
+		return nil, turnCtx, nil, err
 	}
 
-	return cycle, completion, nil
+	return cycle, turnCtx, completion, nil
 }
 
 // releaseDispatchGate ends the hold and wakes the pump, so events held for the
@@ -507,29 +516,19 @@ func (s *session) releaseDispatchGate() {
 	pump.wake()
 }
 
-// sendNativeFrame posts the frame and returns once the harness has taken it. On a
-// completion-reporting route the post runs on its own goroutine and admission is
-// proven by the first native event the addressed session publishes; the returned
+// sendReservedNativeFrame posts the frame and returns once the harness has taken
+// it. On a completion-reporting route the post runs on its own goroutine and only
+// observation of the exact user-message identity proves admission; the returned
 // channel then carries that route's completion report.
-func (s *session) sendNativeFrame(turnCtx context.Context, dispatch nativeDispatch) (<-chan error, error) {
+func (s *session) sendReservedNativeFrame(
+	turnCtx context.Context,
+	cycle *foregroundCycle,
+	dispatch nativeDispatch,
+) (<-chan error, error) {
 	// The turn deadline bounds the dispatch boundary too: a route that never
 	// acknowledges admission would otherwise hold the prompt past the deadline
 	// the turn was configured with.
 	timeout := s.turnTimeout()
-
-	if !dispatch.reportsCompletion {
-		if timeout <= 0 {
-			return nil, sendRecoveringPanic(turnCtx, dispatch)
-		}
-
-		sendCtx, cancel := context.WithTimeout(turnCtx, timeout)
-		defer cancel()
-
-		return nil, sendRecoveringPanic(sendCtx, dispatch)
-	}
-
-	evidence := s.watchDispatchEvidence()
-	defer s.stopWatchingDispatchEvidence()
 
 	var timeoutC <-chan time.Time
 
@@ -540,34 +539,65 @@ func (s *session) sendNativeFrame(turnCtx context.Context, dispatch nativeDispat
 		timeoutC = timer.C
 	}
 
-	completion := make(chan error, 1)
+	result := make(chan error, 1)
 
 	go func() {
-		defer handleAgentGoroutinePanicRecover(turnCtx, agentLogger(s.agent), "OpenCode native command", func(recovered any) {
-			completion <- fmt.Errorf("opencode native command panicked: %v", recovered)
-		})
-
-		completion <- dispatch.send(turnCtx)
+		result <- sendRecoveringPanic(turnCtx, dispatch)
 	}()
 
-	select {
-	case err := <-completion:
-		if err != nil {
-			return nil, err
+	for {
+		select {
+		case err := <-result:
+			s.lifecycleMu.Lock()
+			proven := s.cycle == cycle && cycle.dispatchProven
+			s.lifecycleMu.Unlock()
+
+			if err != nil {
+				if proven {
+					completion := make(chan error, 1)
+					completion <- err
+
+					return completion, nil
+				}
+
+				return nil, err
+			}
+
+			if !dispatch.reportsCompletion {
+				// The async route's complete successful response is its durable
+				// admission acknowledgement. Native idle remains terminal authority.
+				return make(chan error), nil
+			}
+
+			// A command response is completion, never admission. If observation of
+			// its exact user-message identity lost the select race, use that already
+			// recorded proof; otherwise keep waiting for that request-specific event.
+			if proven {
+				completion := make(chan error, 1)
+				completion <- nil
+
+				return completion, nil
+			}
+
+			result = nil
+		case <-cycle.dispatchEvidence:
+			failures := make(chan error, 1)
+
+			if result != nil {
+				go func(result <-chan error, reportsCompletion bool) {
+					err := <-result
+					if err != nil || reportsCompletion {
+						failures <- err
+					}
+				}(result, dispatch.reportsCompletion)
+			}
+
+			return failures, nil
+		case <-turnCtx.Done():
+			return nil, turnCtx.Err()
+		case <-timeoutC:
+			return nil, fmt.Errorf("native dispatch acknowledged nothing before the turn deadline: %w", context.DeadlineExceeded)
 		}
-
-		// The route answered without error, so the run it started was admitted
-		// and has already finished. Acceptance and completion coincide.
-		settled := make(chan error, 1)
-		settled <- nil
-
-		return settled, nil
-	case <-evidence:
-		return completion, nil
-	case <-turnCtx.Done():
-		return nil, turnCtx.Err()
-	case <-timeoutC:
-		return nil, fmt.Errorf("native dispatch acknowledged nothing before the turn deadline: %w", context.DeadlineExceeded)
 	}
 }
 
@@ -577,48 +607,11 @@ func (s *session) sendNativeFrame(turnCtx context.Context, dispatch nativeDispat
 func sendRecoveringPanic(turnCtx context.Context, dispatch nativeDispatch) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("opencode native command panicked: %v", recovered)
+			err = errors.New("native dispatch panicked")
 		}
 	}()
 
 	return dispatch.send(turnCtx)
-}
-
-// watchDispatchEvidence arms the pump to report the first native event this
-// session publishes. The pump does not route the event while the gate is held; it
-// only reports that the harness has started speaking for this session, which is
-// what a completion-reporting route can prove about admission.
-func (s *session) watchDispatchEvidence() <-chan struct{} {
-	evidence := make(chan struct{}, 1)
-
-	s.mu.Lock()
-	s.dispatchEvidence = evidence
-	s.mu.Unlock()
-
-	return evidence
-}
-
-func (s *session) stopWatchingDispatchEvidence() {
-	s.mu.Lock()
-	s.dispatchEvidence = nil
-	s.mu.Unlock()
-}
-
-// noteDispatchEvidence reports one native event for this session to a dispatch
-// waiting for admission.
-func (s *session) noteDispatchEvidence() {
-	s.mu.Lock()
-	evidence := s.dispatchEvidence
-	s.mu.Unlock()
-
-	if evidence == nil {
-		return
-	}
-
-	select {
-	case evidence <- struct{}{}:
-	default:
-	}
 }
 
 // classifyDispatchFailure maps a pre-acceptance failure onto its ACP error. A
@@ -626,10 +619,15 @@ func (s *session) noteDispatchEvidence() {
 // after the host cancelled is reported as the cancellation: the interrupt is
 // what broke the dispatch, and the route's own error text merely describes how.
 func (s *session) classifyDispatchFailure(ctx context.Context, err error, dispatch nativeDispatch) error {
+	var requestErr *acp.RequestError
+	if errors.As(err, &requestErr) {
+		return err
+	}
+
 	if s.wasCancelled() {
 		return acp.NewInvalidRequest(map[string]any{
 			jsonFieldError:   "opencode_prompt_cancelled_before_dispatch",
-			jsonFieldMessage: err.Error(),
+			jsonFieldMessage: "OpenCode prompt was cancelled before dispatch",
 		})
 	}
 
@@ -663,7 +661,7 @@ func (s *session) classifyDispatchFailure(ctx context.Context, err error, dispat
 	if opencode.IsBadRequest(err) {
 		return acp.NewInvalidParams(map[string]any{
 			jsonFieldError:   "opencode_prompt_rejected",
-			jsonFieldMessage: err.Error(),
+			jsonFieldMessage: "OpenCode rejected the prompt",
 		})
 	}
 
@@ -737,6 +735,10 @@ func (s *session) observedCycleEnd(cycle *foregroundCycle) nativeTurnEnd {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
+	if cycle.failure != nil {
+		return nativeTurnEnd{}
+	}
+
 	return nativeTurnEnd{lost: cycle.lost}
 }
 
@@ -787,11 +789,11 @@ func (s *session) completePromptTurn(
 	s.cancelActions(settleCtx)
 
 	if end.lost != nil {
-		s.fenceLifecycle(end.lost.Error())
+		s.fenceLifecycle("native incarnation lost")
 
 		return acp.PromptResponse{}, acp.NewInternalError(map[string]any{
 			jsonFieldError: "opencode_turn_settlement_unproven",
-			jsonFieldCause: end.lost.Error(),
+			jsonFieldCause: "native_incarnation_lost",
 		})
 	}
 
@@ -804,7 +806,7 @@ func (s *session) completePromptTurn(
 	}
 
 	if settleErr := s.settleCycle(settleCtx, cycle, outcome, stopReason); settleErr != nil {
-		return acp.PromptResponse{}, errors.Join(turnErr, settleErr)
+		return acp.PromptResponse{}, s.classifyTurnFailure(settleCtx, settleErr, dispatch)
 	}
 
 	if turnErr != nil {
@@ -886,16 +888,12 @@ func (s *session) finalAssistantMessage(ctx context.Context, cycle *foregroundCy
 		return opencode.NativeMessage{}, fmt.Errorf("read OpenCode turn messages: %w", err)
 	}
 
-	var final, latest opencode.NativeMessage
+	var final opencode.NativeMessage
 
 	for index := len(messages) - 1; index >= 0; index-- {
 		message := messages[index]
 		if message.Info.Role != roleAssistant {
 			continue
-		}
-
-		if latest.Info.ID == "" {
-			latest = message
 		}
 
 		if message.Info.ID == assistantID {
@@ -905,17 +903,8 @@ func (s *session) finalAssistantMessage(ctx context.Context, cycle *foregroundCy
 		}
 	}
 
-	// The stream named the turn's assistant message, and the transcript read is
-	// the same session's. When the named message is absent from that read — a
-	// turn whose stream carried no assistant identity among them — the latest
-	// assistant message of this session is the only assistant record the turn
-	// could have produced.
-	if final.Info.ID == "" {
-		final = latest
-	}
-
-	if final.Info.ID == "" {
-		return opencode.NativeMessage{}, errors.New("OpenCode reported idle with no assistant message for the turn")
+	if assistantID == "" || final.Info.ID == "" {
+		return opencode.NativeMessage{}, errTurnAssistantIdentityMissing
 	}
 
 	return final, opencode.AssistantMessageError(final)
@@ -925,6 +914,13 @@ func (s *session) finalAssistantMessage(ctx context.Context, cycle *foregroundCy
 // A command whose route refused the frame reports the command error, and the
 // command catalog is re-read so a stale entry cannot be offered again.
 func (s *session) classifyTurnFailure(ctx context.Context, err error, dispatch nativeDispatch) error {
+	if errors.Is(err, errTurnAssistantIdentityMissing) {
+		return acp.NewInternalError(map[string]any{
+			jsonFieldError: "opencode_turn_assistant_identity_missing",
+			jsonFieldCause: causeProvider,
+		})
+	}
+
 	var assistantErr *opencode.AssistantError
 
 	isAssistantErr := errors.As(err, &assistantErr)
@@ -933,15 +929,14 @@ func (s *session) classifyTurnFailure(ctx context.Context, err error, dispatch n
 		refreshCtx, cancel := context.WithTimeout(ctx, closeTimeout)
 		if refreshErr := s.refreshCommands(refreshCtx); refreshErr != nil && s.agent != nil && s.agent.log != nil {
 			s.agent.log.DebugContext(refreshCtx, "refresh OpenCode commands after command bad request failed",
-				slog.String("session_id", string(s.id)), slog.String("error", refreshErr.Error()))
+				slog.String("session_id", string(s.id)))
 		}
 
 		cancel()
 
 		data := map[string]any{
 			jsonFieldError:   "opencode_command_bad_request",
-			jsonFieldMessage: err.Error(),
-			jsonFieldCommand: dispatch.command.Name,
+			jsonFieldMessage: "OpenCode rejected the command",
 		}
 		if isAssistantErr {
 			mergeAssistantErrorFields(data, assistantErr, false)
@@ -1333,17 +1328,37 @@ func (s *session) emitPartUpdates(
 	replay bool,
 ) error {
 	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
 
 	updates, commit, mapErr := s.partUpdates(ctx, role, part, nativeDelta, replay)
-	for _, update := range updates {
-		if err := s.emitUpdate(ctx, update); err != nil {
+	s.updateMu.Unlock()
+
+	receipts := make([]deliveryReceipt, 0, len(updates))
+	for index, update := range updates {
+		var delivered func()
+		if index == len(updates)-1 && commit != nil {
+			delivered = func() {
+				s.updateMu.Lock()
+				commit()
+				s.updateMu.Unlock()
+			}
+		}
+
+		receipt, err := s.enqueueUpdateCommitted(ctx, update, delivered)
+		if err != nil {
+			s.failUpdateDelivery(ctx, err)
+
 			return errors.Join(mapErr, err)
 		}
+
+		receipts = append(receipts, receipt)
 	}
 
-	if commit != nil {
-		commit()
+	for _, receipt := range receipts {
+		if err := waitDelivery(ctx, receipt); err != nil {
+			s.failUpdateDelivery(ctx, err)
+
+			return errors.Join(mapErr, err)
+		}
 	}
 
 	return mapErr
@@ -1739,7 +1754,7 @@ func nativeToolPartState(part opencode.NativePart, id acp.ToolCallId) nativeTool
 	state.output, state.hasOutput = values["output"]
 
 	if failure, ok := values[jsonFieldError]; ok && failure != nil {
-		state.output = map[string]any{jsonFieldError: failure}
+		state.output = map[string]any{jsonFieldError: nativeToolFailed}
 		state.hasOutput = true
 	}
 
@@ -2017,27 +2032,44 @@ func (s *session) emitPlan(ctx context.Context, todos []opencode.NativeTodo) err
 }
 
 func (s *session) emitUpdate(ctx context.Context, update acp.SessionUpdate) error {
-	s.agent.observe.ObserveFirstPromptUpdate(ctx)
-
-	conn := s.agent.connection()
-	if conn == nil {
-		return nil
+	receipt, err := s.enqueueUpdate(ctx, update)
+	if err == nil {
+		err = waitDelivery(ctx, receipt)
 	}
 
-	return conn.SessionUpdate(ctx, acp.SessionNotification{
+	if err != nil {
+		s.failUpdateDelivery(ctx, err)
+	}
+
+	return err
+}
+
+func (s *session) enqueueUpdate(ctx context.Context, update acp.SessionUpdate) (deliveryReceipt, error) {
+	return s.enqueueUpdateCommitted(ctx, update, nil)
+}
+
+func (s *session) enqueueUpdateCommitted(
+	ctx context.Context,
+	update acp.SessionUpdate,
+	onDelivered func(),
+) (deliveryReceipt, error) {
+	s.agent.observe.ObserveFirstPromptUpdate(ctx)
+	binding := s.nativeIncarnationForContext(ctx)
+
+	return s.delivery.enqueueUpdateCommitted(ctx, acp.SessionNotification{
 		Meta:      turnRouteMetaFromContext(ctx),
 		SessionId: s.id,
 		Update:    update,
-	})
+	}, onDelivered, func(err error) { s.failNativeIncarnation(binding, err) })
+}
+
+func (s *session) failUpdateDelivery(ctx context.Context, err error) {
+	binding := s.nativeIncarnationForContext(ctx)
+	s.failNativeIncarnation(binding, err)
 }
 
 func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event) error {
 	if !s.rawMessages.Enabled() || len(event.Raw) == 0 {
-		return nil
-	}
-
-	conn := s.agent.connection()
-	if conn == nil {
 		return nil
 	}
 
@@ -2054,14 +2086,8 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 
 	sanitizeRawEventValue(raw)
 
-	s.rawEventMu.Lock()
-	defer s.rawEventMu.Unlock()
-
-	sequence := s.rawSeq + 1
-
 	payload := map[string]any{
 		jsonFieldSessionID: s.id,
-		jsonFieldSequence:  sequence,
 		jsonFieldSource:    rawEventSource,
 		jsonFieldEvent:     raw,
 	}
@@ -2069,16 +2095,17 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 		payload["_meta"] = meta
 	}
 
-	capped, err := capRawEventPayload(payload)
-	if err != nil {
+	preflight := make(map[string]any, len(payload)+1)
+	for key, value := range payload {
+		preflight[key] = value
+	}
+
+	preflight[jsonFieldSequence] = int64(^uint64(0) >> 1)
+	if _, err := capRawEventPayload(preflight); err != nil {
 		return err
 	}
 
-	if err := conn.NotifyExtension(ctx, RawEventMethod, capped); err != nil {
-		return err
-	}
-
-	s.rawSeq = sequence
+	s.delivery.enqueueRaw(ctx, payload)
 
 	return nil
 }
@@ -2141,21 +2168,37 @@ func (s *session) emitUsageUpdate(
 	}
 
 	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
 
 	current := emittedUsageState{used: update.UsageUpdate.Used, size: update.UsageUpdate.Size}
 	if messageID != "" {
 		if previous, ok := s.emittedUsage[messageID]; ok && previous == current {
+			s.updateMu.Unlock()
+
 			return nil
 		}
 	}
+	s.updateMu.Unlock()
 
-	if err := s.emitUpdate(ctx, *update); err != nil {
+	var delivered func()
+	if messageID != "" {
+		delivered = func() {
+			s.updateMu.Lock()
+			s.emittedUsage[messageID] = current
+			s.updateMu.Unlock()
+		}
+	}
+
+	receipt, err := s.enqueueUpdateCommitted(ctx, *update, delivered)
+	if err != nil {
+		s.failUpdateDelivery(ctx, err)
+
 		return err
 	}
 
-	if messageID != "" {
-		s.emittedUsage[messageID] = current
+	if err := waitDelivery(ctx, receipt); err != nil {
+		s.failUpdateDelivery(ctx, err)
+
+		return err
 	}
 
 	return nil

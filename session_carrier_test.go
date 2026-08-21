@@ -292,6 +292,7 @@ func TestRecoveredSessionKeepsItsCarrier(t *testing.T) {
 		WithOpenCodeExtraPathDirs("/session/bin"),
 	))))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	close(first.runtimeExited)
 
 	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "recovery-turn", "continue after restart"))
@@ -332,6 +333,7 @@ func TestSecondTurnKeepsTheCarrier(t *testing.T) {
 		WithOpenCodeExtraPathDirs("/turns/bin"),
 	))))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 
 	for _, nonce := range []string{"turn-one", "turn-two"} {
 		response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, nonce, "work"))

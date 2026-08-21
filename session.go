@@ -18,11 +18,6 @@ import (
 
 const sessionUpdateAvailableCommands = "available_commands_update"
 
-// internalSeamTurnNonce authenticates a turn driven through the internal session
-// seam, which deterministic unit tests use in place of the wire. The public Agent
-// path never reaches it: both Prompt and Cancel hard-fail on a missing route.
-const internalSeamTurnNonce = "internal-seam-turn"
-
 type session struct {
 	agent                 *Agent
 	id                    acp.SessionId
@@ -44,14 +39,23 @@ type session struct {
 	carrier sessionCarrier
 
 	client            opencode.Client
+	delivery          *sessionDelivery
 	directoryRelease  func()
 	mcpServers        []opencode.MCPServerConfig
 	mcpRefreshPending bool
 	recoveryMu        sync.Mutex
-	// establishMu serializes establishment, so the post-response hook and a
-	// prompt racing it cannot open two pumps or emit two opening snapshots.
-	establishMu sync.Mutex
-	established bool
+	// establishMu serializes the short state transitions around establishment.
+	// The opening host notification runs without it held; establishing keeps a
+	// second caller waiting on the one immutable result.
+	establishMu              sync.Mutex
+	establishing             bool
+	establishmentAttempt     chan struct{}
+	establishmentAttemptErr  error
+	established              bool
+	establishmentWritten     bool
+	establishmentFailed      error
+	establishmentReady       chan struct{}
+	establishmentReadyClosed bool
 
 	turn chan struct{}
 	mu   sync.Mutex
@@ -62,43 +66,35 @@ type session struct {
 	// so no event caused by a frame reaches a host before the acceptance that
 	// explains it.
 	dispatchGate sync.Mutex
-	// dispatchEvidence is armed while a completion-reporting native route waits
-	// to learn that the harness admitted its frame.
-	dispatchEvidence chan struct{}
 	// lifecycleMu guards the lifecycle stream and the foreground cycle. Both the
 	// pump and a foreground prompt emit, so one mutex fixes one order.
-	lifecycleMu     sync.Mutex
-	lifecycleStream *lifecycle.Stream
-	lifecycleFailed error
-	lifecycleOpened bool
-	cycle           *foregroundCycle
-	cycleCounter    uint64
-	turnCounter     uint64
-	actions         *actionRegistry
-	updateMu        sync.Mutex
-	rawEventMu      sync.Mutex
-	cancel          context.CancelFunc
-	turnDone        <-chan struct{}
-	cancelled       bool
+	lifecycleMu              sync.Mutex
+	incarnation              *nativeIncarnationBinding
+	lifecycleFailed          error
+	lifecycleOpened          bool
+	cycle                    *foregroundCycle
+	pendingAgentObservations uint64
+	cycleCounter             uint64
+	turnCounter              uint64
+	updateMu                 sync.Mutex
+	cancel                   context.CancelFunc
+	turnDone                 <-chan struct{}
+	cancelled                bool
 	// pendingDispatchFailure carries a native failure that arrived while a
 	// frame was still awaiting acceptance, where no cycle exists to carry it.
 	pendingDispatchFailure  error
-	rawSeq                  int64
 	emittedPartText         map[string]string
 	emittedTools            map[string]emittedToolState
 	emittedUsage            map[string]emittedUsageState
 	turnEpoch               uint64
 	turnNonce               string
 	submission              lifecycle.Submission
-	seamSubmissions         uint64
 	imageArtifacts          map[string]imageArtifactRecord
 	imageArtifactIdentities map[string]string
 	emittedToolContent      map[string][]imageOutputItem
 	emittedFileParts        map[string]struct{}
 	activeMessageIDs        map[string]struct{}
 	publishedToolCalls      map[string]struct{}
-	failedStreamEpochs      map[uint64]struct{}
-	failedMessageIDs        map[string]struct{}
 	exclusiveTurn           bool
 	commandsByName          map[string]opencode.NativeCommand
 	availableCommands       []acp.AvailableCommand
@@ -186,6 +182,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		rawMessages:             meta.RawMessages,
 		carrier:                 newSessionCarrier(meta.Env, meta.ExtraPathDirs),
 		client:                  client,
+		delivery:                newSessionDelivery(agent, id),
 		emittedPartText:         map[string]string{},
 		emittedTools:            map[string]emittedToolState{},
 		emittedUsage:            map[string]emittedUsageState{},
@@ -195,9 +192,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		emittedFileParts:        map[string]struct{}{},
 		activeMessageIDs:        map[string]struct{}{},
 		publishedToolCalls:      map[string]struct{}{},
-		failedStreamEpochs:      map[uint64]struct{}{},
-		failedMessageIDs:        map[string]struct{}{},
-		actions:                 newActionRegistry(),
+		establishmentReady:      make(chan struct{}),
 	}
 
 	session.openLifecycleStream()
@@ -215,36 +210,151 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 // A recovered incarnation calls this directly: it has just reopened its stream
 // and owes a snapshot of its own whatever the previous one did.
 func (s *session) establish(ctx context.Context) error {
-	s.establishMu.Lock()
-	defer s.establishMu.Unlock()
-
-	return s.establishLocked(ctx)
+	return s.establishCurrentIncarnation(ctx, true)
 }
 
-// ensureEstablished establishes the session once. The establishing request's
-// post-response hook is what normally calls it — the opening snapshot may not be
-// written before the response it follows — and the prompt path calls it again so
-// a host driving this Agent in process still gets an opened stream before the
-// first turn is accepted rather than a delta on a stream nothing opened.
+// ensureEstablished establishes the session once after its complete response has
+// been written. The transport-owned post-response hook is the only production
+// caller; prompt admission merely observes the resulting establishment state.
 func (s *session) ensureEstablished(ctx context.Context) error {
-	s.establishMu.Lock()
-	defer s.establishMu.Unlock()
+	return s.establishCurrentIncarnation(ctx, false)
+}
 
-	if s.established {
+func (s *session) establishCurrentIncarnation(ctx context.Context, replace bool) error {
+	s.establishMu.Lock()
+	if s.established && !replace {
+		s.establishMu.Unlock()
+
 		return nil
 	}
 
-	return s.establishLocked(ctx)
-}
+	if s.establishmentFailed != nil {
+		failure := s.establishmentFailed
+		s.establishMu.Unlock()
 
-func (s *session) establishLocked(ctx context.Context) error {
+		return failure
+	}
+
+	if s.establishing {
+		attempt := s.establishmentAttempt
+		s.establishMu.Unlock()
+
+		select {
+		case <-attempt:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		s.establishMu.Lock()
+		attemptErr := s.establishmentAttemptErr
+		s.establishMu.Unlock()
+
+		return attemptErr
+	}
+
+	s.establishing = true
+
+	s.establishmentAttempt = make(chan struct{})
+	s.establishmentAttemptErr = nil
+
+	if replace {
+		s.established = false
+	}
+	s.establishMu.Unlock()
+
+	binding := s.currentIncarnation()
 	if err := s.publishLifecycleStream(ctx); err != nil {
+		failure := errors.New("session establishment failed")
+		s.failNativeIncarnationCause(binding, "session establishment failed", failure)
+
+		s.establishMu.Lock()
+
+		s.establishing = false
+		if s.establishmentFailed == nil {
+			s.establishmentFailed = failure
+		}
+
+		s.closeEstablishmentReadyLocked()
+		s.establishmentAttemptErr = s.establishmentFailed
+		close(s.establishmentAttempt)
+		s.establishMu.Unlock()
+
 		return err
 	}
 
-	s.established = true
-
 	s.startPump()
+
+	s.establishMu.Lock()
+
+	s.establishing = false
+	s.established = true
+	s.closeEstablishmentReadyLocked()
+	close(s.establishmentAttempt)
+	s.establishMu.Unlock()
+
+	return nil
+}
+
+func (s *session) markEstablishmentResponseWritten() {
+	s.establishMu.Lock()
+	s.establishmentWritten = true
+	s.establishMu.Unlock()
+}
+
+func (s *session) failEstablishment(_ error) {
+	s.establishMu.Lock()
+	if s.established || s.establishmentFailed != nil {
+		s.establishMu.Unlock()
+
+		return
+	}
+
+	failure := errors.New("session establishment response was not fully written")
+	s.establishmentFailed = failure
+	s.closeEstablishmentReadyLocked()
+	s.establishMu.Unlock()
+
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.latchLifecycleIncarnationLoss("establishing response was not delivered", failure)
+
+	go func() {
+		defer handleAgentGoroutinePanicRecover(context.Background(), agentLogger(s.agent), "failed session establishment close", nil)
+
+		_ = s.Close(context.Background())
+	}()
+}
+
+func (s *session) closeEstablishmentReadyLocked() {
+	if !s.establishmentReadyClosed {
+		close(s.establishmentReady)
+		s.establishmentReadyClosed = true
+	}
+}
+
+func (s *session) requireEstablished(ctx context.Context) error {
+	s.establishMu.Lock()
+	written := s.establishmentWritten
+	ready := s.establishmentReady
+	s.establishMu.Unlock()
+
+	if !written {
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "session establishment response not written"})
+	}
+
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	s.establishMu.Lock()
+	defer s.establishMu.Unlock()
+
+	if s.establishmentFailed != nil || !s.established {
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "session establishment failed"})
+	}
 
 	return nil
 }
@@ -355,37 +465,16 @@ func (s *session) turnQueue() chan struct{} {
 	return s.turn
 }
 
-func (s *session) beginTurn(ctx context.Context, turnNonces ...string) context.Context {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	turnNonce := internalSeamTurnNonce
-	if len(turnNonces) > 0 {
-		turnNonce = turnNonces[0]
-	}
-
-	turnCtx, cancel := context.WithCancel(ctx)
-	turnCtx = withTurnRoute(turnCtx, turnNonce)
-	s.cancel = cancel
-	s.turnDone = turnCtx.Done()
-	s.cancelled = false
-	s.pendingDispatchFailure = nil
-	s.turnEpoch++
-	s.turnNonce = turnNonce
-
-	return turnCtx
-}
-
 // failPendingDispatch fails a frame still awaiting acceptance. The failure is
 // recorded for the dispatch classification and the turn context is released, so
 // the blocked route answers instead of waiting out a run that already died.
 // With no turn in flight there is nothing to fail and the event is the pump's to
 // judge.
 func (s *session) failPendingDispatch(err error) {
-	s.mu.Lock()
+	s.lifecycleMu.Lock()
 
 	if s.cancel == nil {
-		s.mu.Unlock()
+		s.lifecycleMu.Unlock()
 
 		return
 	}
@@ -395,7 +484,7 @@ func (s *session) failPendingDispatch(err error) {
 	}
 
 	cancel := s.cancel
-	s.mu.Unlock()
+	s.lifecycleMu.Unlock()
 
 	cancel()
 }
@@ -403,14 +492,14 @@ func (s *session) failPendingDispatch(err error) {
 // takePendingDispatchFailure reports the failure recorded against the frame the
 // session was dispatching, if any.
 func (s *session) takePendingDispatchFailure() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
 	return s.pendingDispatchFailure
 }
 
 func (s *session) finishTurn() {
-	s.mu.Lock()
+	s.lifecycleMu.Lock()
 	cancel := s.cancel
 	s.cancel = nil
 
@@ -418,6 +507,9 @@ func (s *session) finishTurn() {
 	s.cancelled = false
 	s.turnNonce = ""
 	s.submission = lifecycle.Submission{}
+	s.lifecycleMu.Unlock()
+
+	s.mu.Lock()
 	s.updatedAt = time.Now().UTC().Format(time.RFC3339)
 	s.mu.Unlock()
 
@@ -426,27 +518,17 @@ func (s *session) finishTurn() {
 	}
 }
 
-// recordSubmission binds the prompt's submission identity to the turn the route
-// nonce authorized. Both envelopes name the same turn, and neither value is
-// derived from the other.
-func (s *session) recordSubmission(submission lifecycle.Submission) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.submission = submission
-}
-
 // currentSubmission reports the submission identity bound to the active turn.
 func (s *session) currentSubmission() lifecycle.Submission {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
 	return s.submission
 }
 
 func (s *session) currentTurnNonce() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
 	return s.turnNonce
 }
@@ -457,11 +539,29 @@ func (s *session) currentTurnNonce() string {
 // touched: routine cancellation is one session putting its own work down, not a
 // containment event.
 func (s *session) cancelTurn(ctx context.Context) error {
-	s.mu.Lock()
+	s.lifecycleMu.Lock()
 	cancel := s.cancel
 	alreadyCancelled := s.cancelled
 	s.cancelled = true
-	client := s.client
+	binding := s.incarnation
+
+	var client opencode.Client
+
+	if binding != nil {
+		client = binding.client
+	}
+
+	cycle := s.cycle
+	interrupt := cycle != nil && !cycle.interrupted && !cycle.settled
+
+	if cycle != nil {
+		cycle.interrupted = true
+	} else {
+		interrupt = !alreadyCancelled
+	}
+	s.lifecycleMu.Unlock()
+
+	s.mu.Lock()
 	nativeID := s.idmap.NativeSessionID
 	s.mu.Unlock()
 
@@ -475,16 +575,11 @@ func (s *session) cancelTurn(ctx context.Context) error {
 	// abort would interrupt whatever the session does next. Before acceptance
 	// no cycle exists to carry the claim, so the cancelled flag itself is the
 	// once-guard there.
-	s.lifecycleMu.Lock()
-	cycle := s.cycle
-	interrupt := cycle != nil && !cycle.interrupted && !cycle.settled
-
-	if cycle != nil {
-		cycle.interrupted = true
-	} else {
-		interrupt = !alreadyCancelled
-	}
-	s.lifecycleMu.Unlock()
+	// A request can be blocked in its registration handshake while the pump is
+	// therefore unable to route the native idle produced by Abort. Cancel those
+	// exact request contexts first; their admission handshakes will release
+	// without ever announcing an unanswerable action.
+	s.cancelActionAdmissions()
 
 	if !interrupt || client == nil || nativeID == "" {
 		return nil
@@ -520,8 +615,8 @@ func (s *session) interruptNativeWork(ctx context.Context) {
 // requireActiveTurn refuses a cancel that does not address the session's current
 // turn. A stale or absent route is never applied to a later turn.
 func (s *session) requireActiveTurn(turnNonce string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
 	if s.cancel == nil || turnNonce == "" || s.turnNonce != turnNonce {
 		return invalidRoute("cancel route is missing, stale, or does not target the active turn")
@@ -613,13 +708,141 @@ func (s *session) currentClient() opencode.Client {
 	return s.client
 }
 
+type nativeIncarnationContextKey struct{}
+
+// nativeIncarnationBinding is the immutable authority for one native session
+// incarnation. Actions retain this pointer, and every operation that can remove,
+// answer, fail, or terminalize one requires pointer identity with the session's
+// current binding. Recovery replaces the complete tuple in one lifecycle-locked
+// write; no action can observe a mixed client, generation, stream, and registry.
+type nativeIncarnationBinding struct {
+	client     opencode.Client
+	generation uint64
+	stream     *lifecycle.Stream
+	registry   *actionRegistry
+}
+
+func withNativeIncarnationBinding(ctx context.Context, binding *nativeIncarnationBinding) context.Context {
+	if binding == nil {
+		return ctx
+	}
+
+	return context.WithValue(ctx, nativeIncarnationContextKey{}, binding)
+}
+
+func (s *session) currentIncarnation() *nativeIncarnationBinding {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	return s.incarnation
+}
+
+func (s *session) incarnationIsCurrent(binding *nativeIncarnationBinding) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	return binding != nil && s.incarnation == binding
+}
+
+func (s *session) nativeIncarnationForContext(ctx context.Context) *nativeIncarnationBinding {
+	if binding, ok := ctx.Value(nativeIncarnationContextKey{}).(*nativeIncarnationBinding); ok && binding != nil {
+		return binding
+	}
+
+	return s.currentIncarnation()
+}
+
+// failNativeIncarnation latches a delivery or transport gap against only the
+// binding that produced it. The shared generation is removed from admission
+// before the caller returns; containment then runs asynchronously so a pump may
+// exit before retirement joins it. A stale failure from an older binding cannot
+// fence a replacement.
+func (s *session) failNativeIncarnation(binding *nativeIncarnationBinding, err error) {
+	if err == nil {
+		return
+	}
+
+	s.failNativeIncarnationCause(binding, "native lifecycle delivery failed", err)
+}
+
+func (s *session) failNativeIncarnationCause(
+	binding *nativeIncarnationBinding,
+	cause string,
+	err error,
+) {
+	if err == nil || binding == nil {
+		return
+	}
+
+	s.lifecycleMu.Lock()
+	if s.incarnation != binding {
+		s.lifecycleMu.Unlock()
+
+		return
+	}
+
+	// Claim the failure, cancellation authority, stream fence, and terminal
+	// cycle evidence in the same synchronization domain as the incarnation
+	// pointer. A recovery swap can therefore happen wholly before or wholly after
+	// this failure, never between its identity check and its mutation.
+	if s.cancel != nil && s.pendingDispatchFailure == nil {
+		s.pendingDispatchFailure = err
+	}
+
+	cancel := s.cancel
+
+	if binding.stream != nil {
+		binding.stream.Close()
+	}
+
+	loss := fmt.Errorf("active lifecycle incarnation lost: %s", cause)
+	cycle := s.cycle
+
+	if cycle != nil && !cycle.settled {
+		if cycle.failure == nil {
+			cycle.failure = err
+		}
+
+		if cycle.lost == nil {
+			cycle.lost = loss
+		}
+
+		cycle.incarnationLost = true
+		cycle.wake()
+	}
+
+	if binding.stream != nil && s.lifecycleFailed == nil {
+		s.lifecycleFailed = loss
+	}
+
+	agentOrigin := cycle != nil && cycle.origin != lifecycle.CauseSubmission
+	s.lifecycleMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	if s.agent != nil && binding.generation != 0 {
+		s.agent.containSharedRuntimeGeneration(binding.generation, cause)
+	}
+
+	if agentOrigin {
+		go func() {
+			ctx := context.Background()
+			defer recoverAgentGoroutine(ctx, agentLogger(s.agent), "failed OpenCode agent cycle settlement")
+
+			_ = s.settleAgentCycle(ctx, cycle)
+		}()
+	}
+}
+
 // lifecycleStreamAbsent reports that this session carries no lifecycle stream, so
 // nothing may be emitted or correlated on one.
 func (s *session) lifecycleStreamAbsent() bool {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	return s.lifecycleStream == nil
+	return s.lifecycleStreamLocked() == nil
 }
 
 // commitForegroundPrefix commits the native-safe prefix of the session's current
@@ -639,8 +862,8 @@ func (s *session) commitForegroundPrefix(ctx context.Context) error {
 	return s.commitStateSnapshot(ctx, captured)
 }
 func (s *session) wasCancelled() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
 	return s.cancelled
 }
@@ -775,46 +998,6 @@ func (s *session) messageRole(messageID string) string {
 	defer s.mu.Unlock()
 
 	return s.messageRoles[messageID]
-}
-
-func (s *session) markStreamFailed(epoch uint64) {
-	s.mu.Lock()
-	if s.failedMessageIDs == nil {
-		s.failedMessageIDs = map[string]struct{}{}
-	}
-
-	for messageID := range s.activeMessageIDs {
-		s.failedMessageIDs[messageID] = struct{}{}
-	}
-
-	if epoch > 0 {
-		if s.failedStreamEpochs == nil {
-			s.failedStreamEpochs = map[uint64]struct{}{}
-		}
-
-		s.failedStreamEpochs[epoch] = struct{}{}
-	}
-
-	s.mu.Unlock()
-}
-
-func (s *session) shouldSuppressEvent(event opencode.Event) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if event.StreamEpoch > 0 {
-		if _, ok := s.failedStreamEpochs[event.StreamEpoch]; ok {
-			return true
-		}
-	}
-
-	if part, ok := eventPart(event.Properties); ok && part.MessageID != "" {
-		_, ok := s.failedMessageIDs[part.MessageID]
-
-		return ok
-	}
-
-	return false
 }
 
 func (s *session) snapshot() sessionSnapshot {
@@ -1072,6 +1255,7 @@ func (s *session) closeSession(commitResumable bool) error {
 	err := s.closeBoundary(commitResumable)
 
 	s.fenceBoundary()
+	s.delivery.close()
 
 	if err != nil {
 		return err
@@ -1269,27 +1453,32 @@ func (s *session) detachRuntime(generation uint64, cause string) {
 		return
 	}
 
+	s.lifecycleMu.Lock()
+
+	binding := s.incarnation
+	if binding == nil || binding.generation != generation {
+		s.lifecycleMu.Unlock()
+		s.mu.Unlock()
+
+		return
+	}
+
 	s.runtimeGeneration = 0
 	s.runtimeLostCause = cause
-
 	cancel := s.cancel
 	s.cancel = nil
 	s.turnDone = nil
+	s.latchLifecycleIncarnationLossLocked(
+		binding,
+		cause,
+		acp.NewInternalError(turnFailedData(causeTransport, cause, 0, "")),
+	)
+	s.incarnation = nil
 	release := s.directoryRelease
 	s.directoryRelease = nil
-	client := s.client
-	s.mu.Unlock()
-
-	// The runtime that would have reported the open cycle's idle is gone, so
-	// that evidence can never arrive: the loss itself is the terminal evidence,
-	// recorded as the cycle's failure before its waiter is woken. The cancelled
-	// flag stays untouched — a lost runtime is not a cancellation.
-	s.lifecycleMu.Lock()
-	if s.cycle != nil && s.cycle.failure == nil && !s.cycle.settled {
-		s.cycle.failure = acp.NewInternalError(turnFailedData(causeTransport, cause, 0, ""))
-		s.cycle.wake()
-	}
+	client := binding.client
 	s.lifecycleMu.Unlock()
+	s.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
@@ -1310,8 +1499,6 @@ func (s *session) detachRuntime(generation uint64, cause string) {
 	if release != nil {
 		release()
 	}
-
-	s.fenceLifecycle(cause)
 }
 
 func (s *session) ensureRuntime(ctx context.Context) error {
@@ -1412,12 +1599,6 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 		if installed {
 			s.setImageArtifacts(artifacts)
 
-			// The recovered native session is a new incarnation: it gets its own
-			// stream identity, its own opening snapshot, and its own pump. A host
-			// therefore never reduces the new incarnation's events against the
-			// fenced one's ordering.
-			s.reopenLifecycleStream()
-
 			return s.establish(ctx)
 		}
 
@@ -1430,6 +1611,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 }
 
 func (s *session) installRecoveredRuntime(client opencode.Client, releaseDirectory func(), idmap idmapRecord, generation uint64) (bool, bool) {
+	facts := s.agent.lifecycleNegotiated()
 	s.agent.mu.Lock()
 	defer s.agent.mu.Unlock()
 
@@ -1462,8 +1644,17 @@ func (s *session) installRecoveredRuntime(client opencode.Client, releaseDirecto
 	s.contextWindows = nil
 	s.messageRoles = nil
 	s.publishedToolCalls = map[string]struct{}{}
-	s.actions = newActionRegistry()
 	s.commandCatalogPublished = false
+
+	// Recovery publishes the complete action authority as one immutable tuple.
+	// The session is still held out of admission by recoveryMu, and both runtime
+	// identity and lifecycle identity become visible before that fence opens.
+	s.lifecycleMu.Lock()
+	s.lifecycleFailed = nil
+	s.cycleCounter = 0
+	s.turnCounter = 0
+	s.installLifecycleStream(facts)
+	s.lifecycleMu.Unlock()
 
 	return true, false
 }

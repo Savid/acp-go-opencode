@@ -2,7 +2,6 @@ package opencodeacp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -17,33 +16,16 @@ import (
 
 func TestTurnFenceHelperBranches(t *testing.T) {
 	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
-	require.True(t, session.actions.claim(&pendingAction{id: "perm"}))
-	require.False(t, session.actions.claim(&pendingAction{id: "perm"}), "an id is claimed once for the life of the session")
+	registry := testIncarnation(session).registry
+	claimed, err := registry.claim(&pendingAction{id: "perm"})
+	require.NoError(t, err)
+	require.True(t, claimed)
+	claimed, err = registry.claim(&pendingAction{id: "perm"})
+	require.ErrorContains(t, err, "native action id was reused")
+	require.False(t, claimed, "a reused id was claimed twice")
 	session.markActiveMessageID("")
 	session.activeMessageIDs = nil
 	session.markActiveMessageID("message-1")
-	session.failedMessageIDs = nil
-	session.failedStreamEpochs = nil
-	session.markStreamFailed(9)
-	if !session.shouldSuppressEvent(opencode.Event{StreamEpoch: 9}) {
-		t.Fatal("failed stream epoch was not suppressed")
-	}
-	if !session.shouldSuppressEvent(opencode.Event{
-		Properties: json.RawMessage(`{"sessionID":"native-1","messageID":"message-1","type":"text","text":"late"}`),
-	}) {
-		t.Fatal("failed message id was not suppressed")
-	}
-	if session.shouldSuppressEvent(opencode.Event{
-		Properties: json.RawMessage(`{"sessionID":"native-1","messageID":"message-2","type":"text","text":"ok"}`),
-	}) {
-		t.Fatal("unfailed message id was suppressed")
-	}
-	if err := session.applyNativeEvent(context.Background(), opencode.Event{
-		StreamEpoch: 9,
-		Properties:  json.RawMessage(`{"sessionID":"native-1","messageID":"message-1","type":"text","text":"late"}`),
-	}); err != nil {
-		t.Fatalf("suppressed applyNativeEvent: %v", err)
-	}
 }
 
 func TestSessionContextWindow(t *testing.T) {
@@ -191,7 +173,8 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 	current.detachRuntime(current.runtimeGeneration, "runtime exited")
 	require.True(t, released)
 	require.NoError(t, current.ensureNotPoisoned())
-	require.ErrorContains(t, current.runtimeFailure(), "runtime exited")
+	assertTurnFailed(t, current.runtimeFailure(), causeTransport, "")
+	require.NotContains(t, current.runtimeFailure().Error(), "runtime exited")
 
 	// A session whose binding is already gone has no native session to delete,
 	// so deletion is the containment boundary alone.
@@ -339,8 +322,11 @@ func openTestCycle(current *session, terminal bool) *foregroundCycle {
 func acceptOpenTestTurn(t *testing.T, current *session) *foregroundCycle {
 	t.Helper()
 
-	cycle, err := current.acceptPromptCycle(context.Background(),
-		lifecycle.Submission{SubmissionID: "submission-1", ClientNonce: "nonce-1"})
+	ctx := withTurnRoute(context.Background(), "nonce-1")
+	submission := lifecycle.Submission{SubmissionID: "submission-1", ClientNonce: "nonce-1"}
+	cycle, _, err := current.reservePromptCycle(ctx, "native-message-1", submission)
+	require.NoError(t, err)
+	err = current.acceptPromptCycle(ctx, cycle, submission)
 	require.NoError(t, err)
 
 	return cycle
@@ -362,14 +348,15 @@ func acceptTestTurn(t *testing.T, current *session) *foregroundCycle {
 	return cycle
 }
 
-// lifecycleFenced reports whether this session's incarnation is fenced, which is
-// the one thing that excuses a boundary from its terminal transition — and, on
-// its own, says nothing about what that boundary proved.
+// lifecycleFenced reports whether this session has no live incarnation capable
+// of emitting: either its stream is fenced or the exact failed binding has
+// already been unpublished. On its own that says nothing about what the native
+// boundary proved.
 func lifecycleFenced(current *session) bool {
 	current.lifecycleMu.Lock()
 	defer current.lifecycleMu.Unlock()
 
-	return current.incarnationFencedLocked()
+	return current.incarnation == nil || current.incarnationFencedLocked()
 }
 
 // lifecycleFailure reports the latched stream failure, if any. A latched stream
@@ -391,11 +378,11 @@ func (s *session) lifecycleStreamID() string {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if s.lifecycleStream == nil {
+	if s.incarnation == nil || s.incarnation.stream == nil {
 		return ""
 	}
 
-	return s.lifecycleStream.ID()
+	return s.incarnation.stream.ID()
 }
 
 // testRuntimeGeneration reports the runtime binding this session holds, which the
@@ -665,19 +652,12 @@ func TestCloseOnAFencedIncarnationEmitsNothingAndKeepsItsDurableRecord(t *testin
 	})
 }
 
-// TestCloseOnALatchedLiveStreamFailsWithTheLatchedError proves only a fence
-// excuses the close boundary from its terminal transition. An incarnation that
-// merely dropped an update is still live and still owes the boundary that
-// transition; the latch is what refuses to let it claim one, so the close answers
-// with the latched error instead of ending the turn in silence on a stream that
-// has already lost a sequence.
-//
-// The terminal transition is the rung before the durable commit, so a boundary
-// that cannot make the transition writes no generation either — each rung is a
-// precondition of the next. Nothing is lost by that: the close failed, the
-// session stays addressable, and the retry across the fence runs the durable rung
-// the failed boundary owed.
-func TestCloseOnALatchedLiveStreamFailsWithTheLatchedError(t *testing.T) {
+// TestCloseAfterALatchedLiveStreamContainsAndRemovesSession proves an
+// authoritative delivery failure immediately retires the exact incarnation.
+// A later close therefore contains the already-lost cycle without attempting to
+// write another transition on the gapped stream, closes the native scope, and
+// removes the session.
+func TestCloseAfterALatchedLiveStreamContainsAndRemovesSession(t *testing.T) {
 	t.Parallel()
 
 	client := newFakeOpenCodeClient()
@@ -700,36 +680,20 @@ func TestCloseOnALatchedLiveStreamFailsWithTheLatchedError(t *testing.T) {
 
 	require.ErrorContains(t, current.emitLifecycle(context.Background(), lifecycle.TransitionEvent(
 		lifecycle.ForegroundRunning, cycle.id, cycle.turnID, lifecycle.CauseSubmission,
-	)), "wire down")
+	)), "authoritative session update delivery failed")
 
 	// Delivery is restored: the connection is healthy again and the gap is not.
 	connection.mu.Lock()
 	connection.updateErr = nil
 	connection.mu.Unlock()
 
-	require.ErrorContains(t, current.lifecycleFailure(), "wire down")
-	require.False(t, lifecycleFenced(current), "a dropped update fenced the incarnation")
-
-	var committed int
-
-	store.onReplace = func(SessionKey) error {
-		committed++
-
-		return nil
-	}
+	require.ErrorContains(t, current.lifecycleFailure(), "lifecycle delivery failed")
+	require.NotContains(t, current.lifecycleFailure().Error(), "wire down")
+	require.True(t, lifecycleFenced(current), "the delivery failure left the exact incarnation published")
 
 	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
-	require.ErrorContains(t, err, "wire down", "close reported a turn over on a stream that lost a sequence")
-	require.True(t, client.isClosed(), "the latched stream stopped the containment proof")
-	require.Zero(t, committed, "the boundary committed a generation over a transition it never made")
-	require.Contains(t, agent.sessions, current.id, "the session was released on an unproven boundary")
-
-	// The retry runs against the fence the failed boundary left, so the rung the
-	// latch refused is skipped rather than retried, and the durable rung behind it
-	// lands.
-	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
 	require.NoError(t, err)
-	require.Positive(t, committed, "the retry answered success with no durable commit")
+	require.True(t, client.isClosed(), "the latched stream stopped the containment proof")
 	require.NotContains(t, agent.sessions, current.id, "the completed boundary kept the session addressable")
 }
 

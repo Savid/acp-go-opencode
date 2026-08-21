@@ -186,11 +186,12 @@ func assertConfigOptionBuilders(t *testing.T, client *fakeOpenCodeClient) {
 	}
 }
 
-// TestUnknownModelReachesOpenCodeAndCarriesItsNativeError proves the adapter
+// TestUnknownModelReachesOpenCodeAndFailsClosedWithoutExactAssistant proves the adapter
 // never judges a model name against the advertised catalog: a model that catalog
-// does not list still opens a session, travels to the native runtime exactly as
-// the host asked for it, and fails the turn with the words OpenCode itself used.
-func TestUnknownModelReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
+// does not list still opens a session and travels to the native runtime exactly as
+// the host asked for it, but no unrelated native error can replace the missing
+// request-specific assistant identity.
+func TestUnknownModelReachesOpenCodeAndFailsClosedWithoutExactAssistant(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	client.createSession = testNativeSession("native-unknown-model")
@@ -221,6 +222,7 @@ func TestUnknownModelReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("anthropic/claude-sonnet-4-6"))),
 	))
 	require.NoError(t, err, "an unlisted model must not refuse session creation")
+	establishCreatedSession(t, agent, created.SessionId)
 
 	done := make(chan error, 1)
 
@@ -243,27 +245,21 @@ func TestUnknownModelReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
 	nativeErr := &opencode.NativeError{Name: "UnknownError"}
 	nativeErr.Data.Message = "Model not found: anthropic/claude-sonnet-4-6. Did you mean: claude-sonnet-4-6?"
 
-	client.events <- opencode.Event{
+	event := opencode.Event{
 		Type: opencode.EventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: "native-unknown-model",
 			Error:     nativeErr,
 		}),
 	}
+	client.publishEvent(event)
 	client.publishSessionIdle("native-unknown-model")
 
 	select {
 	case promptErr := <-done:
-		data := assertTurnFailed(t, promptErr, causeProvider,
-			"Model not found: anthropic/claude-sonnet-4-6. Did you mean: claude-sonnet-4-6?")
-		// The native error names no status and no provider code, and the adapter
-		// invents neither.
-		if _, present := data[jsonFieldStatusCode]; present {
-			t.Fatalf("status code was invented: %#v", data)
-		}
-		if _, present := data[jsonFieldProviderCode]; present {
-			t.Fatalf("provider code was invented: %#v", data)
-		}
+		data := requireInternalErrorData(t, promptErr)
+		require.Equal(t, "opencode_turn_assistant_identity_missing", data[jsonFieldError])
+		require.Equal(t, causeProvider, data[jsonFieldCause])
 	case <-time.After(2 * time.Second):
 		t.Fatal("prompt did not return the native model error")
 	}
@@ -274,12 +270,12 @@ func TestUnknownModelReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
 // session stream then carries this error naming the agents it does know.
 const nativeAgentNotFoundMessage = `Agent not found: "does-not-exist-mode". Available agents: build, explore, general, plan`
 
-// TestUnadvertisedModeReachesOpenCodeAndCarriesItsNativeError proves the mode
+// TestUnadvertisedModeReachesOpenCodeAndFailsClosedWithoutExactAssistant proves the mode
 // door is no narrower than the model one. A mode the advertisement does not list
 // is set rather than refused, it is what the session then advertises as current,
-// it travels to the native runtime on the frame's own agent field, and the turn
-// fails with the words OpenCode itself used.
-func TestUnadvertisedModeReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
+// and it travels to the native runtime on the frame's own agent field, but no
+// unrelated native error can replace the missing request-specific assistant.
+func TestUnadvertisedModeReachesOpenCodeAndFailsClosedWithoutExactAssistant(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	client.createSession = testNativeSession("native-unknown-mode")
@@ -305,6 +301,7 @@ func TestUnadvertisedModeReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 
 	set, err := agent.SetSessionConfigOption(ctx,
 		SetConfigOptionRequest(created.SessionId, configMode, "does-not-exist-mode"))
@@ -338,20 +335,21 @@ func TestUnadvertisedModeReachesOpenCodeAndCarriesItsNativeError(t *testing.T) {
 	trace.Data.Message = "UnknownError: UnknownError\n    at SessionPrompt.createUserMessage"
 
 	for _, nativeErr := range []*opencode.NativeError{notFound, trace} {
-		client.events <- opencode.Event{
+		event := opencode.Event{
 			Type: opencode.EventSessionError,
 			Properties: mustJSON(t, opencode.SessionError{
 				SessionID: "native-unknown-mode",
 				Error:     nativeErr,
 			}),
 		}
+		client.publishEvent(event)
 	}
 
 	select {
 	case promptErr := <-done:
-		data := assertTurnFailed(t, promptErr, causeProvider, nativeAgentNotFoundMessage)
-		require.NotContains(t, data[jsonFieldMessage], "createUserMessage",
-			"the first error names the cause; the stack that followed it must not overwrite it")
+		data := requireInternalErrorData(t, promptErr)
+		require.Equal(t, "opencode_turn_assistant_identity_missing", data[jsonFieldError])
+		require.Equal(t, causeProvider, data[jsonFieldCause])
 	case <-time.After(5 * time.Second):
 		t.Fatal("prompt did not return the native agent error")
 	}
@@ -387,6 +385,7 @@ func TestUnknownModelSetThroughConfigOptionReachesOpenCode(t *testing.T) {
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 
 	set, err := agent.SetSessionConfigOption(ctx,
 		SetConfigOptionRequest(created.SessionId, configModel, "anthropic/claude-sonnet-4-6"))
@@ -413,18 +412,21 @@ func TestUnknownModelSetThroughConfigOptionReachesOpenCode(t *testing.T) {
 	nativeErr := &opencode.NativeError{Name: "UnknownError"}
 	nativeErr.Data.Message = "Model not found: anthropic/claude-sonnet-4-6. Did you mean: claude-sonnet-4-6?"
 
-	client.events <- opencode.Event{
+	event := opencode.Event{
 		Type: opencode.EventSessionError,
 		Properties: mustJSON(t, opencode.SessionError{
 			SessionID: "native-config-model",
 			Error:     nativeErr,
 		}),
 	}
+	client.publishEvent(event)
 	client.publishSessionIdle("native-config-model")
 
 	select {
 	case promptErr := <-done:
-		assertTurnFailed(t, promptErr, causeProvider, "Model not found: anthropic/claude-sonnet-4-6")
+		data := requireInternalErrorData(t, promptErr)
+		require.Equal(t, "opencode_turn_assistant_identity_missing", data[jsonFieldError])
+		require.Equal(t, causeProvider, data[jsonFieldCause])
 	case <-time.After(5 * time.Second):
 		t.Fatal("prompt did not return the native model error")
 	}
@@ -502,7 +504,8 @@ func TestConfigOptionCatalogFailureIsReported(t *testing.T) {
 	record := logs.String()
 	require.Contains(t, record, "OpenCode config option is unavailable")
 	require.Contains(t, record, `"config_id":"model"`)
-	require.Contains(t, record, "providers unreachable")
+	require.Contains(t, record, "operation failed")
+	require.NotContains(t, record, "providers unreachable")
 
 	// The rule is per option, not per catalog: the agent read states its own
 	// failure the same way.
@@ -519,7 +522,8 @@ func TestConfigOptionCatalogFailureIsReported(t *testing.T) {
 
 	record = logs.String()
 	require.Contains(t, record, `"config_id":"mode"`)
-	require.Contains(t, record, "agents unreachable")
+	require.Contains(t, record, "operation failed")
+	require.NotContains(t, record, "agents unreachable")
 }
 
 func containsStringAny(value any, want string) bool {

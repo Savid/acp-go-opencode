@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/lifecycle"
@@ -25,24 +24,54 @@ const heldEventCapacity = 4096
 // ends, so events arriving between prompts are routed rather than queued behind a
 // prompt that may never come.
 type sessionPump struct {
-	session    *session
-	client     opencode.Client
-	generation uint64
-	cancel     context.CancelFunc
-	done       chan struct{}
+	session *session
+	binding *nativeIncarnationBinding
+	cancel  context.CancelFunc
+	done    chan struct{}
 	// released wakes the loop when a dispatch hold ends, so held events are
 	// routed as soon as the boundary they were held for has passed.
 	released chan struct{}
-	held     []opencode.Event
+	// hold is the dispatch barrier. The pump acknowledges it only after every
+	// event it has already received has immutable ownership, then stops receiving
+	// until the dispatch gate is released.
+	hold chan chan error
+	held []queuedNativeEvent
+	// afterReceive is a deterministic test barrier at the only scheduler gap the
+	// dispatch barrier is required to close.
+	afterReceive func()
+	afterObserve func(opencode.Event, *nativeEventObservation)
+	beforePause  func()
+}
+
+type queuedNativeEvent struct {
+	event       opencode.Event
+	observation *nativeEventObservation
+}
+
+type nativeEventOwnership uint8
+
+const (
+	nativeEventAgent nativeEventOwnership = iota
+	nativeEventPromptBeforeEvidence
+	nativeEventCycle
+)
+
+// nativeEventObservation fixes ownership at the instant the pump accepts an
+// event from the native stream. Later prompt admission can never rewrite an
+// agent-owned observation, and an event seen before request-specific dispatch
+// evidence cannot finish the newly reserved prompt.
+type nativeEventObservation struct {
+	ownership nativeEventOwnership
+	binding   *nativeIncarnationBinding
+	cycle     *foregroundCycle
 }
 
 // startPump binds a pump to the session's current runtime client. Each runtime
 // generation gets its own pump: a recovered session installs a new client, a new
 // lifecycle incarnation, and a new pump together.
 func (s *session) startPump() {
+	binding := s.currentIncarnation()
 	s.mu.Lock()
-	client := s.client
-	generation := s.runtimeGeneration
 	previous := s.pump
 	s.mu.Unlock()
 
@@ -50,14 +79,15 @@ func (s *session) startPump() {
 		previous.stop()
 	}
 
-	if client == nil {
+	if binding == nil || binding.client == nil {
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	pump := &sessionPump{
-		session: s, client: client, generation: generation,
+		session: s, binding: binding,
 		cancel: cancel, done: make(chan struct{}), released: make(chan struct{}, 1),
+		hold: make(chan chan error),
 	}
 
 	s.mu.Lock()
@@ -99,24 +129,82 @@ func (p *sessionPump) wake() {
 	}
 }
 
+// pauseForDispatch establishes the receive-side half of prompt admission. Its
+// acknowledgement means every event the pump received earlier has already
+// fixed its owner, and the pump will receive nothing else until wake.
+func (p *sessionPump) pauseForDispatch(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+
+	if p.beforePause != nil {
+		p.beforePause()
+	}
+
+	ack := make(chan error, 1)
+	select {
+	case p.hold <- ack:
+	case <-p.done:
+		return errors.New("native event pump stopped before dispatch")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case err := <-ack:
+		return err
+	case <-p.done:
+		return errors.New("native event pump stopped during dispatch barrier")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // run drains the native stream for the life of the binding. Draining and routing
 // are separate: the channel is always read, so a dispatch hold never stalls the
 // native connection, and held events are routed in arrival order the moment the
 // hold ends.
 func (p *sessionPump) run(ctx context.Context) {
-	defer close(p.done)
-	defer recoverAgentGoroutine(ctx, agentLogger(p.session.agent), "OpenCode session pump")
+	defer func() {
+		close(p.done)
 
-	events := p.client.Events()
-	errs := p.client.EventErrors()
+		if recover() != nil {
+			failure := acp.NewInternalError(turnFailedData(causeTransport, "native event pump panicked", 0, ""))
+			p.session.failNativeIncarnationCause(
+				p.binding, "native event pump panicked", failure,
+			)
+		}
+	}()
+
+	stream := p.binding.client.EventStream()
+	paused := false
 
 	for {
+		if paused {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.released:
+				paused = false
+			}
+
+			continue
+		}
+
 		if len(p.held) > 0 && p.session.dispatchGate.TryLock() {
 			event := p.held[0]
 			p.held = p.held[1:]
 
-			p.session.routeNativeEvent(ctx, event)
+			err := p.session.routeNativeEventForIncarnation(
+				ctx, p.binding, event.event, event.observation,
+			)
 			p.session.dispatchGate.Unlock()
+
+			if err != nil {
+				p.session.failNativeIncarnation(p.binding, err)
+
+				return
+			}
 
 			continue
 		}
@@ -125,57 +213,65 @@ func (p *sessionPump) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-p.released:
-		case event := <-events:
-			if len(p.held) >= heldEventCapacity {
-				p.session.failStream(fmt.Errorf("held OpenCode event queue exceeded %d events", heldEventCapacity))
+		case ack := <-p.hold:
+			paused = true
+
+			ack <- nil
+		case item := <-stream:
+			if p.afterReceive != nil {
+				p.afterReceive()
+			}
+
+			if item.Terminal != nil {
+				p.session.handleStreamError(p.binding, item.Terminal)
 
 				return
 			}
 
-			p.held = append(p.held, event)
+			if item.Event == nil {
+				p.session.handleStreamError(p.binding, errors.New("OpenCode event stream delivered an empty item"))
 
-			// A dispatch waiting on a completion-reporting route learns from
-			// this that the harness has started speaking for the session, which
-			// is the admission it cannot read off that route's response. The
-			// event itself is still routed in order, after the acceptance.
-			if sessionID, named := opencode.EventSessionID(event); named && sessionID == p.session.idmap.NativeSessionID {
-				p.session.noteDispatchEvidence()
+				return
 			}
-		case err := <-errs:
-			p.session.handleStreamError(ctx, err)
+
+			event := *item.Event
+
+			sessionID, named := opencode.EventSessionID(event)
+			if !named || sessionID != p.session.idmap.NativeSessionID {
+				continue
+			}
+
+			observation, current := p.session.observeNativeEvent(p.binding, event)
+			if !current {
+				continue
+			}
+
+			if p.afterObserve != nil {
+				p.afterObserve(event, observation)
+			}
+
+			if len(p.held) >= heldEventCapacity {
+				p.session.failNativeIncarnation(p.binding,
+					fmt.Errorf("held OpenCode event queue exceeded %d events", heldEventCapacity))
+
+				return
+			}
+
+			p.held = append(p.held, queuedNativeEvent{event: event, observation: observation})
+
+			// Observation already claimed any authority this event carries. Only
+			// the exact user-message identity can release a completion-reporting
+			// dispatch; unrelated events merely remain ordered for later routing.
 		}
 	}
 }
 
-// handleStreamError records one native stream failure. The epoch it names is
-// suppressed so a reconnected stream cannot replay the failed epoch's parts, and
-// an open cycle fails: the transport that would have proven its completion is
-// gone.
-func (s *session) handleStreamError(ctx context.Context, err error) {
-	s.markStreamFailed(opencode.StreamErrorEpoch(err))
-
-	s.lifecycleMu.Lock()
-	cycle := s.cycle
-
-	if cycle != nil && cycle.failure == nil {
-		cycle.failure = acp.NewInternalError(turnFailedData(causeTransport, err.Error(), 0, ""))
-	}
-	s.lifecycleMu.Unlock()
-
-	if cycle == nil {
-		s.failPendingDispatch(acp.NewInternalError(turnFailedData(causeTransport, err.Error(), 0, "")))
-
-		return
-	}
-
-	s.markNativeTerminal(ctx)
-}
-
-// failStream latches a delivery failure this session cannot report as an ordered
-// event. It fences the incarnation, because a stream that lost an event can no
-// longer prove its own contiguity.
-func (s *session) failStream(err error) {
-	s.fenceLifecycle(err.Error())
+// handleStreamError fences the exact native incarnation whose ordered channel
+// ended. A terminal marker follows every event the SSE reader accepted, so the
+// marker proves where delivery stopped but never that the native work settled.
+func (s *session) handleStreamError(binding *nativeIncarnationBinding, _ error) {
+	failure := acp.NewInternalError(turnFailedData(causeTransport, "native event stream failed", 0, ""))
+	s.failNativeIncarnationCause(binding, "native event stream failed", failure)
 }
 
 // routeNativeEvent routes one native event. Every event is filtered by the
@@ -183,63 +279,210 @@ func (s *session) failStream(err error) {
 // stream from delivering another session's work — including a forked child in the
 // same directory.
 func (s *session) routeNativeEvent(ctx context.Context, event opencode.Event) {
-	if s.shouldSuppressEvent(event) {
+	binding := s.currentIncarnation()
+
+	observation, current := s.observeNativeEvent(binding, event)
+	if !current {
 		return
 	}
 
-	// A notification caused by work a prompt submitted carries that prompt's
-	// route envelope, which is the host's anti-stale turn authenticator. Work no
-	// prompt submitted carries none: there is no client turn to authenticate
-	// against, and inventing one would name a turn the host never opened.
-	ctx = withTurnRoute(ctx, s.currentTurnNonce())
-
-	// Raw events are non-authoritative debug output: a failed emit is recorded
-	// internally and the authoritative session stream continues regardless.
-	if err := s.emitRawOpenCodeEvent(ctx, event); err != nil && s.agent != nil && s.agent.log != nil {
-		s.agent.log.DebugContext(ctx, "emit opencode raw event failed",
-			slog.String("session_id", string(s.id)),
-			slog.String("error", err.Error()),
-		)
-	}
-
-	if sessionID, named := opencode.EventSessionID(event); named && sessionID != s.idmap.NativeSessionID {
-		return
-	}
-
-	if err := s.applyNativeEvent(ctx, event); err != nil {
-		s.failCycleDelivery(ctx, err)
+	if err := s.routeNativeEventForIncarnation(ctx, binding, event, observation); err != nil {
+		s.failNativeIncarnation(binding, err)
 	}
 }
 
-// failCycleDelivery ends the open cycle on an event the session could not apply
-// or deliver. The ordered representation of the turn is broken at that point:
-// the native work is interrupted, because output the session cannot report is
-// work nobody asked to continue, and the failure is the cycle's terminal
-// evidence rather than an idle the broken order would misreport.
-func (s *session) failCycleDelivery(ctx context.Context, err error) {
+func (s *session) routeNativeEventForIncarnation(
+	ctx context.Context,
+	binding *nativeIncarnationBinding,
+	event opencode.Event,
+	observations ...*nativeEventObservation,
+) error {
+	if !s.incarnationIsCurrent(binding) {
+		return nil
+	}
+
+	var observation *nativeEventObservation
+	if len(observations) > 0 {
+		observation = observations[0]
+	} else {
+		observation, _ = s.observeNativeEvent(binding, event)
+	}
+
+	ctx = context.WithValue(withNativeIncarnationBinding(ctx, binding), nativeEventObservationKey{}, observation)
+	if observation != nil && observation.cycle != nil && observation.cycle.origin == lifecycle.CauseSubmission {
+		ctx = withTurnRoute(ctx, observation.cycle.turnNonce)
+	}
+
+	if observation != nil && observation.ownership == nativeEventAgent {
+		defer s.completeAgentObservation(observation)
+	}
+
+	if sessionID, named := opencode.EventSessionID(event); named && sessionID != s.idmap.NativeSessionID {
+		return nil
+	}
+
+	_ = s.emitRawOpenCodeEvent(ctx, event)
+
+	if err := s.applyNativeEvent(ctx, event); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type nativeEventObservationKey struct{}
+
+func (s *session) observeNativeEvent(
+	binding *nativeIncarnationBinding,
+	event opencode.Event,
+) (*nativeEventObservation, bool) {
 	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if binding == nil || s.incarnation != binding {
+		return nil, false
+	}
+
+	observation := &nativeEventObservation{binding: binding}
+
 	cycle := s.cycle
+	if cycle == nil {
+		observation.ownership = nativeEventAgent
+		s.pendingAgentObservations++
 
-	if cycle == nil || cycle.settled {
-		s.lifecycleMu.Unlock()
-		s.recordNativeFailure(err)
-
-		return
+		return observation, true
 	}
 
-	if cycle.failure == nil {
-		cycle.failure = err
+	if cycle.origin == lifecycle.CauseSubmission && nativeEventProvesPrompt(event, cycle.nativeMessageID) &&
+		!cycle.dispatchProven {
+		cycle.dispatchProven = true
+		close(cycle.dispatchEvidence)
 	}
 
-	interrupt := !cycle.interrupted
-	cycle.interrupted = true
-	s.lifecycleMu.Unlock()
+	if cycle.origin != lifecycle.CauseSubmission {
+		observation.ownership = nativeEventCycle
+		observation.cycle = cycle
 
-	if interrupt {
-		s.interruptNativeWork(ctx)
+		return observation, true
 	}
 
-	s.markNativeTerminal(ctx)
+	if nativeEventCausallyMatchesCycleLocked(event, cycle) {
+		observation.ownership = nativeEventCycle
+		observation.cycle = cycle
+
+		return observation, true
+	}
+
+	if cycle.reserved {
+		observation.ownership = nativeEventPromptBeforeEvidence
+
+		return observation, true
+	}
+
+	// A same-session event with no request-specific user, parent, assistant, or
+	// action identity is autonomous. It may be delivered while a prompt is open,
+	// but it cannot mutate or settle that prompt's cycle.
+	observation.ownership = nativeEventAgent
+	s.pendingAgentObservations++
+
+	return observation, true
+}
+
+func nativeEventProvesPrompt(event opencode.Event, messageID string) bool {
+	if messageID == "" || event.Type != opencode.EventMessageUpdated {
+		return false
+	}
+
+	info, ok := eventMessageInfo(event.Properties)
+
+	return ok && info.Role == roleUser && info.ID == messageID
+}
+
+func nativeEventCausallyMatchesCycleLocked(event opencode.Event, cycle *foregroundCycle) bool {
+	if cycle == nil || cycle.origin != lifecycle.CauseSubmission {
+		return false
+	}
+
+	if nativeEventProvesPrompt(event, cycle.nativeMessageID) {
+		return true
+	}
+
+	switch event.Type {
+	case opencode.EventMessageUpdated:
+		info, ok := eventMessageInfo(event.Properties)
+		if !ok || info.Role != roleAssistant ||
+			(info.ParentID != cycle.nativeMessageID && (cycle.assistantID == "" || info.ID != cycle.assistantID)) {
+			return false
+		}
+
+		if cycle.assistantID != "" && cycle.assistantID != info.ID {
+			return false
+		}
+
+		cycle.assistantID = info.ID
+		if info.Finish != "" || info.Time.Completed > 0 {
+			cycle.assistantTerminal = true
+		}
+
+		return true
+	case opencode.EventMessagePartCreated, opencode.EventMessagePartUpdated:
+		part, _, ok := eventPartUpdate(event.Properties)
+
+		return ok && cycle.assistantID != "" && part.MessageID == cycle.assistantID
+	case opencode.EventSessionIdle:
+		return cycle.assistantTerminal || cycle.interrupted
+	case opencode.EventSessionError:
+		return cycle.assistantID != ""
+	case opencode.EventPermissionV2Asked, opencode.EventPermissionAsked:
+		var request opencode.PermissionRequest
+		if json.Unmarshal(event.Properties, &request) != nil {
+			return false
+		}
+
+		messageID := request.ToolCall().MessageID
+
+		return messageID != "" && messageID == cycle.assistantID
+	case opencode.EventQuestionV2Asked, opencode.EventQuestionAsked:
+		request, ok := eventQuestion(event.Properties)
+
+		return ok && request.Tool.MessageID != "" && request.Tool.MessageID == cycle.assistantID
+	case opencode.EventPermissionV2Replied, opencode.EventPermissionReplied,
+		opencode.EventQuestionV2Replied, opencode.EventQuestionReplied,
+		opencode.EventQuestionV2Rejected, opencode.EventQuestionRejected:
+		replied, ok := opencode.DecodeActionReplied(event.Properties)
+		if !ok || cycle == nil {
+			return false
+		}
+
+		return cycleOwnsAction(cycle, replied.RequestID)
+	default:
+		return false
+	}
+}
+
+func cycleOwnsAction(cycle *foregroundCycle, actionID string) bool {
+	if cycle == nil || actionID == "" {
+		return false
+	}
+
+	_, ok := cycle.blockers[actionID]
+
+	return ok
+}
+
+func (s *session) completeAgentObservation(observation *nativeEventObservation) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if observation != nil && observation.binding == s.incarnation && s.pendingAgentObservations > 0 {
+		s.pendingAgentObservations--
+	}
+}
+
+func nativeObservation(ctx context.Context) *nativeEventObservation {
+	observation, _ := ctx.Value(nativeEventObservationKey{}).(*nativeEventObservation)
+
+	return observation
 }
 
 // applyNativeEvent is the session's structured reading of the native event set.
@@ -247,20 +490,14 @@ func (s *session) failCycleDelivery(ctx context.Context, err error) {
 // status poll: the native idle event is the only completion authority.
 func (s *session) applyNativeEvent(ctx context.Context, event opencode.Event) error {
 	switch event.Type {
-	case opencode.EventServerConnected:
-		return s.reconcileNativeActions(ctx)
 	case opencode.EventSessionIdle:
-		s.markNativeTerminal(ctx)
-
-		return nil
+		return s.markNativeTerminal(ctx)
 	case opencode.EventSessionStatus:
 		return s.applyNativeStatus(ctx, event)
 	case opencode.EventSessionError:
-		return s.applyNativeError(event)
+		return s.applyNativeError(ctx, event)
 	case opencode.EventMessageUpdated:
-		s.applyNativeMessageInfo(event)
-
-		return nil
+		return s.applyNativeMessageInfo(ctx, event)
 	case opencode.EventMessagePartCreated, opencode.EventMessagePartUpdated:
 		return s.applyNativePart(ctx, event)
 	case opencode.EventTodoUpdated:
@@ -290,27 +527,30 @@ func (s *session) applyNativeStatus(ctx context.Context, event opencode.Event) e
 	}
 
 	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
 
-	if s.cycle != nil {
-		s.cycle.runStarted = true
+	cycle, err := s.observedCycleLocked(ctx, true)
+	if err != nil {
+		s.lifecycleMu.Unlock()
+
+		return err
+	}
+
+	if cycle != nil {
+		cycle.runStarted = true
+		s.lifecycleMu.Unlock()
 
 		return nil
 	}
+	s.lifecycleMu.Unlock()
 
-	cycle, err := s.openAgentCycleLocked(ctx)
-	if cycle != nil {
-		cycle.runStarted = true
-	}
-
-	return err
+	return nil
 }
 
 // applyNativeError records one native turn failure against the open cycle. A
 // failure arriving with no open cycle names no turn to fail, and the native stream
 // re-publishes a turn's error after its idle, so a settled cycle keeps the outcome
 // it already reported.
-func (s *session) applyNativeError(event opencode.Event) error {
+func (s *session) applyNativeError(ctx context.Context, event opencode.Event) error {
 	var nativeError opencode.SessionError
 	if err := json.Unmarshal(event.Properties, &nativeError); err != nil {
 		return err
@@ -322,7 +562,9 @@ func (s *session) applyNativeError(event opencode.Event) error {
 
 	s.lifecycleMu.Lock()
 
-	if s.cycle == nil {
+	cycle, _ := s.observedCycleLocked(ctx, false)
+
+	if cycle == nil {
 		s.lifecycleMu.Unlock()
 
 		// The error precedes acceptance: the run the pending frame started is
@@ -334,11 +576,11 @@ func (s *session) applyNativeError(event opencode.Event) error {
 
 	defer s.lifecycleMu.Unlock()
 
-	if s.cycle.settled || s.cycle.failure != nil {
+	if cycle.settled || cycle.failure != nil {
 		return nil
 	}
 
-	s.cycle.failure = opencode.AssistantErrorFromNativeError(nativeError.Error)
+	cycle.failure = opencode.AssistantErrorFromNativeError(nativeError.Error)
 
 	// A failure against a run the native session never started is the whole of
 	// that frame's story. OpenCode refuses an agent it cannot resolve before it
@@ -347,10 +589,8 @@ func (s *session) applyNativeError(event opencode.Event) error {
 	// would hold the turn open forever, so the cycle ends on the evidence it has.
 	// This is not a boundary read out of silence — the native runtime spoke, and
 	// what it said was that nothing is running.
-	if !s.cycle.runStarted {
-		s.cycle.refused = true
-		s.cycle.wake()
-	}
+	cycle.refused = true
+	cycle.wake()
 
 	return nil
 }
@@ -358,40 +598,60 @@ func (s *session) applyNativeError(event opencode.Event) error {
 // markCycleRunning records that the native session has begun speaking for the
 // open cycle: the frame became a message, or the run it scheduled reported
 // itself busy. Either one proves there is a run for a later failure to name.
-func (s *session) markCycleRunning() {
+func (s *session) markCycleRunning(ctx context.Context) error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if s.cycle != nil {
-		s.cycle.runStarted = true
+	cycle, err := s.observedCycleLocked(ctx, true)
+	if err != nil {
+		return err
 	}
+
+	if cycle != nil {
+		cycle.runStarted = true
+	}
+
+	return nil
 }
 
 // applyNativeMessageInfo records the role a message declared and, for an
 // assistant message, the identity the settling turn reads its usage and stop
 // reason from. OpenCode publishes this before any part event for that message.
-func (s *session) applyNativeMessageInfo(event opencode.Event) {
+func (s *session) applyNativeMessageInfo(ctx context.Context, event opencode.Event) error {
 	info, ok := eventMessageInfo(event.Properties)
 	if !ok || info.SessionID != s.idmap.NativeSessionID {
-		return
+		return nil
 	}
 
 	s.recordMessageRole(info)
 
 	// The message OpenCode created for the frame is the first proof that the
 	// frame became a run.
-	s.markCycleRunning()
+	if err := s.markCycleRunning(ctx); err != nil {
+		return err
+	}
 
 	if info.Role != roleAssistant {
-		return
+		return nil
 	}
 
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if s.cycle != nil {
-		s.cycle.assistantID = info.ID
+	cycle, _ := s.observedCycleLocked(ctx, false)
+
+	if cycle != nil {
+		if cycle.assistantID != "" && cycle.assistantID != info.ID {
+			return errors.New("OpenCode turn published conflicting assistant identities")
+		}
+
+		cycle.assistantID = info.ID
+		if info.Finish != "" || info.Time.Completed > 0 {
+			cycle.assistantTerminal = true
+		}
 	}
+
+	return nil
 }
 
 func (s *session) applyNativePart(ctx context.Context, event opencode.Event) error {
@@ -424,6 +684,10 @@ func (s *session) applyNativeTodos(ctx context.Context, event opencode.Event) er
 }
 
 func (s *session) applyNativePermissionAsked(ctx context.Context, event opencode.Event) error {
+	if observation := nativeObservation(ctx); observation != nil && observation.ownership == nativeEventPromptBeforeEvidence {
+		return invalidRoute("permission arrived before request-specific prompt dispatch evidence")
+	}
+
 	var req opencode.PermissionRequest
 	if err := json.Unmarshal(event.Properties, &req); err != nil {
 		return err
@@ -439,6 +703,10 @@ func (s *session) applyNativePermissionAsked(ctx context.Context, event opencode
 }
 
 func (s *session) applyNativeQuestionAsked(ctx context.Context, event opencode.Event) error {
+	if observation := nativeObservation(ctx); observation != nil && observation.ownership == nativeEventPromptBeforeEvidence {
+		return invalidRoute("question arrived before request-specific prompt dispatch evidence")
+	}
+
 	req, ok := eventQuestion(event.Properties)
 	if !ok {
 		return errors.New("invalid OpenCode question event")
@@ -484,51 +752,18 @@ func nativeRepliedActionState(eventType string, replied opencode.ActionRepliedEv
 	}
 }
 
-// reconcileNativeActions re-reads the native pending sets. It runs when a stream
-// connects, which is the one moment an action may have been asked while no
-// consumer was attached.
-func (s *session) reconcileNativeActions(ctx context.Context) error {
-	client := s.currentClient()
-	if client == nil {
-		return nil
-	}
-
-	permissions, err := client.PendingPermissions(ctx)
-	if err != nil {
-		return err
-	}
-
-	for i := range permissions {
-		if routeErr := s.routeNativePermission(ctx, permissions[i]); routeErr != nil {
-			return routeErr
-		}
-	}
-
-	questions, err := client.PendingQuestions(ctx)
-	if err != nil {
-		return err
-	}
-
-	for i := range questions {
-		if err := s.routeNativeQuestion(ctx, questions[i]); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // markNativeTerminal records the terminal native evidence for the open cycle and
 // hands settlement to whoever owns it: a foreground prompt settles its own turn
 // after committing its prefix, and an agent-origin turn is settled here.
-func (s *session) markNativeTerminal(ctx context.Context) {
+func (s *session) markNativeTerminal(ctx context.Context) error {
 	s.lifecycleMu.Lock()
-	cycle := s.cycle
+
+	cycle, _ := s.observedCycleLocked(ctx, false)
 
 	if cycle == nil || cycle.settled {
 		s.lifecycleMu.Unlock()
 
-		return
+		return nil
 	}
 
 	cycle.idle = true
@@ -537,11 +772,65 @@ func (s *session) markNativeTerminal(ctx context.Context) {
 	s.lifecycleMu.Unlock()
 
 	if origin == lifecycle.CauseSubmission {
-		return
+		return nil
 	}
 
 	if err := s.settleAgentCycle(ctx, cycle); err != nil {
-		s.recordNativeFailure(err)
+		s.recordCycleFailure(cycle, err)
+
+		return err
+	}
+
+	return nil
+}
+
+//nolint:nilnil // A fixed observation may intentionally own no foreground cycle.
+func (s *session) observedCycleLocked(ctx context.Context, openAgent bool) (*foregroundCycle, error) {
+	observation := nativeObservation(ctx)
+	if observation == nil {
+		return s.cycle, nil
+	}
+
+	if observation.binding != s.incarnation {
+		return nil, nil
+	}
+
+	switch observation.ownership {
+	case nativeEventPromptBeforeEvidence:
+		return nil, nil
+	case nativeEventCycle:
+		if observation.cycle != nil && s.cycle == observation.cycle {
+			return observation.cycle, nil
+		}
+
+		return nil, nil
+	case nativeEventAgent:
+		if observation.cycle != nil {
+			if s.cycle == observation.cycle {
+				return observation.cycle, nil
+			}
+
+			return nil, nil
+		}
+
+		if !openAgent {
+			return nil, nil
+		}
+
+		if s.cycle != nil {
+			return nil, nil
+		}
+
+		cycle, err := s.openAgentCycleLocked(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		observation.cycle = cycle
+
+		return cycle, nil
+	default:
+		return nil, nil
 	}
 }
 
@@ -563,30 +852,4 @@ func (s *session) settleAgentCycle(ctx context.Context, cycle *foregroundCycle) 
 	}
 
 	return s.settleCycle(ctx, cycle, outcome, stopReason)
-}
-
-// recordNativeFailure records a pump-side failure. The pump has no caller to
-// answer, so a failure it cannot attribute to an open cycle is logged and a
-// failure it can attribute settles that cycle as failed.
-func (s *session) recordNativeFailure(err error) {
-	if err == nil {
-		return
-	}
-
-	s.lifecycleMu.Lock()
-	cycle := s.cycle
-
-	if cycle != nil && cycle.failure == nil {
-		cycle.failure = err
-	}
-	s.lifecycleMu.Unlock()
-
-	if cycle != nil || s.agent == nil || s.agent.log == nil {
-		return
-	}
-
-	s.agent.log.DebugContext(context.Background(), "OpenCode session event failed outside a turn",
-		slog.String("session_id", string(s.id)),
-		slog.String("error", err.Error()),
-	)
 }

@@ -6,6 +6,13 @@ description: The session/update notification variants the adapter emits and what
 During a session the adapter emits ACP `session/update` notifications. This
 table lists every variant and its native source.
 
+Updates remain deliverable between prompts. Native events and their terminal
+marker share one bounded ordered channel, so pressure blocks the producer rather
+than dropping or overtaking an item. If any typed update or lifecycle carrier
+cannot be delivered, the adapter fences and contains the exact native generation.
+Raw notifications are observational: failure consumes no candidate raw sequence
+and typed routing continues.
+
 ## Update variants
 
 | Variant | Emitted from |
@@ -21,8 +28,8 @@ table lists every variant and its native source.
 | `session_info_update` | The negotiated lifecycle stream, identity-only and carrying its envelope in `_meta`. See [Prompt streaming](/docs/core/prompt-streaming). |
 
 `usage_update` notifications may carry `_meta.opencode.messageId`; identical
-snapshots for the same message are suppressed. Tool failures carry the native
-error as structured `rawOutput`. A tool first observed in a terminal state uses
+snapshots for the same message are suppressed. Tool failures carry only a fixed
+failure classification as structured `rawOutput`, never native handler text. A tool first observed in a terminal state uses
 one terminal-status `tool_call` and does not fabricate a following
 `tool_call_update`. See
 [Prompt streaming](/docs/core/prompt-streaming) for how the message parts map

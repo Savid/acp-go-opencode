@@ -305,7 +305,7 @@ func vendorOptionsMetaError(err error) error {
 		return reqErr
 	}
 
-	return acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+	return acp.NewInvalidParams(map[string]any{jsonFieldError: "OpenCode option validation failed"})
 }
 
 func validateOpenCodePermission(permission string) error {

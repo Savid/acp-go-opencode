@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -99,13 +100,11 @@ func TestIsBadRequest(t *testing.T) {
 	}
 }
 
-func TestStreamErrorEpoch(t *testing.T) {
-	if got := StreamErrorEpoch(StreamError{Epoch: 5, Err: errors.New("x")}); got != 5 {
-		t.Fatalf("StreamErrorEpoch = %d, want 5", got)
-	}
-
-	if got := StreamErrorEpoch(errors.New("plain")); got != 0 {
-		t.Fatalf("StreamErrorEpoch plain = %d, want 0", got)
+func TestHTTPErrorDoesNotRenderResponseBody(t *testing.T) {
+	err := (&HTTPError{Method: "POST", Path: "/session", Status: "503 Service Unavailable",
+		StatusCode: http.StatusServiceUnavailable, Body: "SECRET_SENTINEL"}).Error()
+	if strings.Contains(err, "SECRET_SENTINEL") {
+		t.Fatalf("HTTP error rendered response body: %q", err)
 	}
 }
 

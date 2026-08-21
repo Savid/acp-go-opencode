@@ -1,6 +1,27 @@
 package lifecycle
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
+
+const (
+	// EmitterFrameLimit bounds the canonical frames retained by one emitter for
+	// exact retransmission validation. Consumer reducers remain unbounded because
+	// the family contract requires them to recognize a retransmission at any
+	// earlier sequence in the incarnation.
+	EmitterFrameLimit = 8192
+	// EmitterTurnLimit bounds turn identities minted by one incarnation.
+	EmitterTurnLimit = 1024
+	// EmitterActionLimit bounds action identities announced by one incarnation.
+	EmitterActionLimit = 1024
+)
+
+var (
+	ErrEmitterFrameLimit  = errors.New("lifecycle emitter frame limit exceeded")
+	ErrEmitterTurnLimit   = errors.New("lifecycle emitter turn limit exceeded")
+	ErrEmitterActionLimit = errors.New("lifecycle emitter action limit exceeded")
+)
 
 // Stream is one incarnation's ordered emitter. It claims a sequence before
 // delivery is attempted, so a lost or refused event leaves a detectable gap
@@ -8,19 +29,30 @@ import "encoding/json"
 // the same reducer the fixture battery drives, so a stream this adapter could not
 // support fails at the point of emission instead of at its consumers.
 //
-// A Stream is not safe for concurrent use; one prompt owns its incarnation and
-// emits from the goroutine that settles it.
+// A Stream is not safe for concurrent use; its session serializes all emission
+// for the native source lifetime it represents.
 type Stream struct {
 	id       string
 	reducer  *Reducer
 	sequence uint64
+	failed   error
+	turns    map[string]struct{}
+	actions  map[string]struct{}
+}
+
+type retentionReservation struct {
+	turns   []string
+	actions []string
 }
 
 // NewStream opens an incarnation identified by id. The identity names one native
 // lifecycle source lifetime: it never rotates while that source survives, and it
 // never outlives it.
 func NewStream(id string, negotiated Negotiated) *Stream {
-	return &Stream{id: id, reducer: NewReducer(Options{Negotiated: negotiated})}
+	return &Stream{
+		id: id, reducer: NewReducer(Options{Negotiated: negotiated}),
+		turns: map[string]struct{}{}, actions: map[string]struct{}{},
+	}
 }
 
 // ID reports the incarnation this stream speaks for.
@@ -36,6 +68,33 @@ func (s *Stream) Negotiated() Negotiated { return s.reducer.Negotiated() }
 // boundary proved. No later event may be emitted from the native source.
 func (s *Stream) Close() { s.reducer.Close() }
 
+// Preflight checks whether event can reserve the emitter identities it would
+// introduce without claiming a sequence or consuming any quota. Emit repeats
+// the check and commits those identities only after the rendered delivery is
+// accepted by the reducer.
+func (s *Stream) Preflight(events ...Event) error {
+	if s.failed != nil {
+		return s.failed
+	}
+
+	for index, event := range events {
+		if !event.payloadMatchesType() {
+			sequence := s.sequence + uint64(index) + 1
+			if !knownEventType(event.Type) {
+				return violation(ViolationUnknownEventType, s.id, sequence,
+					"event type "+string(event.Type))
+			}
+
+			return violation(ViolationMalformedEnvelope, s.id, sequence,
+				"event payload does not match type "+string(event.Type))
+		}
+	}
+
+	_, err := s.preflightRetention(events...)
+
+	return err
+}
+
 // Emit claims the next sequence, renders the envelope for the notification's
 // `_meta`, and validates what it rendered. A refused event is never handed back
 // and its sequence stays consumed, which is exactly the detectable gap the
@@ -49,6 +108,10 @@ func (s *Stream) Close() { s.reducer.Close() }
 // a dropped member, a mistyped one, a patch rendered as a first sight — to be
 // discovered by the host.
 func (s *Stream) Emit(event Event) (map[string]any, error) {
+	if s.failed != nil {
+		return nil, s.failed
+	}
+
 	// The payload is judged before the sequence claim, so a caller defect
 	// neither burns a sequence nor dereferences a payload that is not there.
 	// The verdicts mirror the decoder's: an unknown discriminant is the
@@ -61,6 +124,13 @@ func (s *Stream) Emit(event Event) (map[string]any, error) {
 
 		return nil, violation(ViolationMalformedEnvelope, s.id, s.sequence+1,
 			"event payload does not match type "+string(event.Type))
+	}
+
+	reservation, err := s.preflightRetention(event)
+	if err != nil {
+		s.failed = err
+
+		return nil, err
 	}
 
 	s.sequence++
@@ -89,7 +159,95 @@ func (s *Stream) Emit(event Event) (map[string]any, error) {
 		return nil, err
 	}
 
+	s.commitRetention(reservation)
+
 	return envelope, nil
+}
+
+// checkRetention applies emitter-only resource bounds before a sequence is
+// claimed. The consumer reducer intentionally has no corresponding window: its
+// exact-retransmission semantics remain valid for the whole incarnation.
+func (s *Stream) preflightRetention(events ...Event) (retentionReservation, error) {
+	if uint64(len(events)) > uint64(EmitterFrameLimit)-s.sequence {
+		return retentionReservation{}, ErrEmitterFrameLimit
+	}
+
+	newTurns := make(map[string]struct{})
+	newActions := make(map[string]struct{})
+
+	addTurn := func(id string) {
+		if id == "" {
+			return
+		}
+
+		if _, known := s.turns[id]; !known {
+			newTurns[id] = struct{}{}
+		}
+	}
+	addAction := func(id string) {
+		if id == "" {
+			return
+		}
+
+		if _, known := s.actions[id]; !known {
+			newActions[id] = struct{}{}
+		}
+	}
+
+	for _, event := range events {
+		switch event.Type {
+		case EventSnapshot:
+			addTurn(event.Snapshot.Foreground.TurnID)
+
+			for index := range event.Snapshot.Activities {
+				addTurn(event.Snapshot.Activities[index].OriginTurnID)
+			}
+
+			for index := range event.Snapshot.Actions {
+				addAction(event.Snapshot.Actions[index].ActionID)
+			}
+		case EventPromptAccepted:
+			addTurn(event.PromptAccepted.TurnID)
+		case EventStateUpdate:
+			if event.State.State == ForegroundRunning && event.State.Cause == CauseActivity {
+				addTurn(event.State.TurnID)
+			}
+		case EventActionUpdate:
+			addAction(event.Action.ActionID)
+		}
+	}
+
+	if len(s.turns)+len(newTurns) > EmitterTurnLimit {
+		return retentionReservation{}, ErrEmitterTurnLimit
+	}
+
+	if len(s.actions)+len(newActions) > EmitterActionLimit {
+		return retentionReservation{}, ErrEmitterActionLimit
+	}
+
+	reservation := retentionReservation{
+		turns:   make([]string, 0, len(newTurns)),
+		actions: make([]string, 0, len(newActions)),
+	}
+	for id := range newTurns {
+		reservation.turns = append(reservation.turns, id)
+	}
+
+	for id := range newActions {
+		reservation.actions = append(reservation.actions, id)
+	}
+
+	return reservation, nil
+}
+
+func (s *Stream) commitRetention(reservation retentionReservation) {
+	for _, id := range reservation.turns {
+		s.turns[id] = struct{}{}
+	}
+
+	for _, id := range reservation.actions {
+		s.actions[id] = struct{}{}
+	}
 }
 
 // knownEventType reports membership of the closed set of six.

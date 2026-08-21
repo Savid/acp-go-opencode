@@ -142,6 +142,7 @@ func (r *Reducer) projectSnapshot(delivery Delivery, snapshot Snapshot) {
 			Origin:  foreground.Origin,
 			CycleID: foreground.CycleID,
 		})
+		r.turnIndexes[foreground.TurnID] = len(r.state.Turns) - 1
 		r.seeTurn(foreground.TurnID, delivery.Sequence)
 	}
 
@@ -233,6 +234,7 @@ func (r *Reducer) applyPromptAccepted(delivery Delivery) error {
 		ClientNonce:  accepted.ClientNonce,
 		RunID:        accepted.RunID,
 	})
+	r.turnIndexes[accepted.TurnID] = len(r.state.Turns) - 1
 	r.seeTurn(accepted.TurnID, delivery.Sequence)
 	r.invalidateQuiescence(delivery.Sequence)
 	r.lastTransition = delivery.Sequence
@@ -312,13 +314,7 @@ func (r *Reducer) checkBlockedCycle(delivery Delivery, transition StateTransitio
 
 // blocked reports whether an action that stopped this cycle is still nonterminal.
 func (r *Reducer) blocked(cycleID string) bool {
-	for _, action := range r.state.Actions {
-		if action.BlocksForeground && !action.State.Terminal() && r.actionCycle[action.ActionID] == cycleID {
-			return true
-		}
-	}
-
-	return false
+	return r.blockingByCycle[cycleID] > 0
 }
 
 // applyLive reduces a running or requires-action transition. Exactly two events
@@ -339,6 +335,7 @@ func (r *Reducer) applyLive(delivery Delivery, transition StateTransition) error
 		}
 
 		r.state.Turns = append(r.state.Turns, TurnRecord{TurnID: transition.TurnID, Origin: CauseActivity})
+		r.turnIndexes[transition.TurnID] = len(r.state.Turns) - 1
 		r.seeTurn(transition.TurnID, delivery.Sequence)
 
 		index = len(r.state.Turns) - 1
@@ -469,9 +466,14 @@ func (r *Reducer) checkActivityIdentity(delivery Delivery, update ActivityUpdate
 
 func (r *Reducer) recordActivity(delivery Delivery, update ActivityUpdate) {
 	r.state.Activities = append(r.state.Activities, ActivityRecord(update))
+	r.activityIndexes[update.ActivityID] = len(r.state.Activities) - 1
 	r.seeActivity(update.ActivityID, delivery.Sequence)
 
 	if !update.State.Terminal() {
+		if update.ParentID != "" {
+			r.liveChildren[update.ParentID]++
+		}
+
 		r.invalidateQuiescence(delivery.Sequence)
 	}
 }
@@ -527,6 +529,10 @@ func (r *Reducer) patchActivity(delivery Delivery, index int, update ActivityUpd
 	r.lastTransition = delivery.Sequence
 	r.state.Activities[index].State = update.State
 
+	if update.State.Terminal() && existing.ParentID != "" && r.liveChildren[existing.ParentID] > 0 {
+		r.liveChildren[existing.ParentID]--
+	}
+
 	if update.Progress != nil {
 		r.state.Activities[index].Progress = update.Progress
 	}
@@ -560,16 +566,12 @@ func terminalActivityDifference(existing ActivityRecord, update ActivityUpdate) 
 // checkDescendantsTerminal refuses a parent that would terminalize while part of
 // the subtree it claims to have finished is still live.
 func (r *Reducer) checkDescendantsTerminal(delivery Delivery, activityID string) error {
-	for index := range r.state.Activities {
-		if child := &r.state.Activities[index]; child.ParentID == activityID && !child.State.Terminal() {
-			return r.fail(delivery, ViolationParentTerminalBeforeChild, "child "+child.ActivityID+" is live")
-		}
+	if r.liveChildren[activityID] > 0 {
+		return r.fail(delivery, ViolationParentTerminalBeforeChild, "activity has a live child")
 	}
 
-	for _, action := range r.state.Actions {
-		if action.Owner.Type == OwnerActivity && action.Owner.ID == activityID && !action.State.Terminal() {
-			return r.fail(delivery, ViolationParentTerminalBeforeChild, "action "+action.ActionID+" is unresolved")
-		}
+	if r.liveActions[activityID] > 0 {
+		return r.fail(delivery, ViolationParentTerminalBeforeChild, "activity has an unresolved action")
 	}
 
 	return nil
@@ -664,9 +666,14 @@ func (r *Reducer) recordAction(delivery Delivery, update ActionUpdate) {
 		RunID:            update.RunID,
 		BlocksForeground: *update.BlocksForeground,
 	})
+	r.actionIndexes[update.ActionID] = len(r.state.Actions) - 1
 
 	if update.State.Terminal() {
 		return
+	}
+
+	if update.Owner.Type == OwnerActivity {
+		r.liveActions[update.Owner.ID]++
 	}
 
 	r.blockForeground(update)
@@ -682,6 +689,7 @@ func (r *Reducer) blockForeground(update ActionUpdate) {
 	}
 
 	r.actionCycle[update.ActionID] = r.state.Foreground.CycleID
+	r.blockingByCycle[r.state.Foreground.CycleID]++
 
 	if r.state.Foreground.State != ForegroundRequiresAction {
 		r.blockedCycle = r.state.Foreground.CycleID
@@ -708,7 +716,18 @@ func (r *Reducer) patchAction(delivery Delivery, index int, update ActionUpdate)
 	}
 
 	r.lastTransition = delivery.Sequence
+
 	r.state.Actions[index].State = update.State
+	if update.State.Terminal() && existing.Owner.Type == OwnerActivity && r.liveActions[existing.Owner.ID] > 0 {
+		r.liveActions[existing.Owner.ID]--
+	}
+
+	if update.State.Terminal() && existing.BlocksForeground {
+		cycleID := r.actionCycle[existing.ActionID]
+		if r.blockingByCycle[cycleID] > 0 {
+			r.blockingByCycle[cycleID]--
+		}
+	}
 
 	if !update.State.Terminal() {
 		r.invalidateQuiescence(delivery.Sequence)
@@ -835,13 +854,25 @@ func (r *Reducer) activityKnown(activityID string) bool {
 }
 
 func (r *Reducer) turnIndex(turnID string) int {
-	return indexOf(r.state.Turns, turnID, TurnRecord.identity)
+	if index, ok := r.turnIndexes[turnID]; ok {
+		return index
+	}
+
+	return -1
 }
 
 func (r *Reducer) activityIndex(activityID string) int {
-	return indexOf(r.state.Activities, activityID, ActivityRecord.identity)
+	if index, ok := r.activityIndexes[activityID]; ok {
+		return index
+	}
+
+	return -1
 }
 
 func (r *Reducer) actionIndex(actionID string) int {
-	return indexOf(r.state.Actions, actionID, ActionRecord.identity)
+	if index, ok := r.actionIndexes[actionID]; ok {
+		return index
+	}
+
+	return -1
 }

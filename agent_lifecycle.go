@@ -21,9 +21,11 @@ const metaMember = "_meta"
 //     stream is consumed by a session-owned pump that runs from session start to
 //     session close, so a transcript part, a plan change, a permission, or a
 //     foreground transition arriving with no prompt in flight is routed to the
-//     host rather than queued or refused. The pump drains the native channel
-//     unconditionally and holds nothing but the events of one dispatch
-//     acknowledgement, which it then routes in arrival order.
+//     host rather than queued for a later prompt or refused. Native events and
+//     the stream's terminal marker share one bounded ordered channel: a full
+//     channel blocks the producer instead of dropping an item, and any transport
+//     gap or host delivery failure permanently fences that exact native
+//     generation before later admission.
 //   - `authoritativeQuiescence` is false on every platform because no boundary
 //     here proves whole-tree vacancy for the addressed session. The native idle
 //     event proves the session's own agent loop stopped, which settles a

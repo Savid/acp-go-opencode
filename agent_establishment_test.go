@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -198,18 +199,45 @@ func TestEstablishmentHookIgnoresWhatItCannotEstablish(t *testing.T) {
 
 	// A queued hook whose response was written as an error is dropped rather
 	// than run: nothing was established for it to speak for.
-	connection.queueEstablishment(context.Background(), acp.AgentMethodSessionLoad, tagged, acp.LoadSessionResponse{})
+	hooks.queue("7", func() {})
 	require.Len(t, hooks.all, 1)
-	hooks.runAfterWrite([]byte(`{"jsonrpc":"2.0","id":7,"error":{"code":-32603}}`))
+	hooks.runAfterWrite([]byte(`{"jsonrpc":"2.0","id":7,"error":{"code":-32603,"message":"Internal error"}}`))
 	require.Empty(t, hooks.all)
 
 	// A frame that is not a response releases nothing: an unreadable line, a
 	// notification with no id, and a response no queued hook is waiting for.
-	connection.queueEstablishment(context.Background(), acp.AgentMethodSessionLoad, tagged, acp.LoadSessionResponse{})
+	hooks.queue("7", func() {})
 	hooks.runAfterWrite([]byte(`{not json`))
 	hooks.runAfterWrite([]byte(`{"jsonrpc":"2.0","method":"session/update"}`))
 	hooks.runAfterWrite([]byte(`{"jsonrpc":"2.0","id":9,"result":{}}`))
 	require.Len(t, hooks.all, 1)
+}
+
+func TestEstablishmentHookAcceptsOnlyAnActualJSONRPCResponse(t *testing.T) {
+	hooks := newEstablishmentHooks(NewAgent().log)
+	ran := make(chan struct{}, 1)
+	hooks.queue("7", func() { ran <- struct{}{} })
+
+	for _, frame := range []string{
+		`{"jsonrpc":"2.0","id":7,"method":"session/new","params":{}}`,
+		`{"jsonrpc":"2.0","id":7,"method":"session/resume","result":{}}`,
+		`{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-32603,"message":"failed"}}`,
+		`{"jsonrpc":"2.0","id":7}`,
+		`{"jsonrpc":"1.0","id":7,"result":{}}`,
+		`{"jsonrpc":"2.0","id":7,"error":{"code":-32603}}`,
+	} {
+		hooks.runAfterWrite([]byte(frame))
+		require.Len(t, hooks.all, 1, "non-response frame admitted lifecycle: %s", frame)
+		select {
+		case <-ran:
+			t.Fatalf("non-response frame ran establishment: %s", frame)
+		default:
+		}
+	}
+
+	hooks.runAfterWrite([]byte(`{"jsonrpc":"2.0","id":7,"result":{}}`))
+	require.Empty(t, hooks.all)
+	requireSignal(t, ran)
 }
 
 // TestEstablishedSessionIDReadsEachRouteWhereItCarriesIt proves the four routes
@@ -310,8 +338,10 @@ func TestEstablishmentWriterReleasesNothingOnAFailedWrite(t *testing.T) {
 	writer := hooks.wrap(shortWriter{})
 	count, err := writer.Write([]byte(`{"jsonrpc":"2.0","id":11,"result":{}}`))
 	require.Zero(t, count)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.Empty(t, hooks.all)
 
+	hooks.queue("11", func() { close(ran) })
 	failing := hooks.wrap(failingWriter{err: errors.New("transport gone")})
 	_, err = failing.Write([]byte(`{"jsonrpc":"2.0","id":11,"result":{}}`))
 	require.ErrorContains(t, err, "transport gone")
@@ -322,7 +352,60 @@ func TestEstablishmentWriterReleasesNothingOnAFailedWrite(t *testing.T) {
 	default:
 	}
 
-	require.Len(t, hooks.all, 1)
+	require.Empty(t, hooks.all)
+}
+
+func TestIncompleteEstablishingResponsePermanentlyFencesExactSession(t *testing.T) {
+	for index, method := range []string{
+		acp.AgentMethodSessionNew, acp.AgentMethodSessionLoad, acp.AgentMethodSessionResume,
+	} {
+		t.Run(method, func(t *testing.T) {
+			agent := NewAgent()
+			client := newFakeOpenCodeClient()
+			id := acp.SessionId(fmt.Sprintf("session-%d", index))
+			current := newSession(agent, id, "/repo", nil, testNativeSession("native-1"), client,
+				sessionMeta{}, idmapRecord{SessionID: string(id), NativeSessionID: "native-1", Format: SessionStoreFormat})
+			current.runtimeGeneration = 1
+			current.stampIncarnationGeneration(client, 1)
+			agent.mu.Lock()
+			agent.sessions[id] = current
+			agent.runtime = client
+			agent.runtimeGeneration = 1
+			agent.mu.Unlock()
+
+			hooks := newEstablishmentHooks(agent.log)
+			local := &localAgentConnection{agent: agent, hooks: hooks}
+			params := mustJSON(t, map[string]any{
+				"sessionId": id, establishmentHookParam: "17",
+			})
+			var result any = acp.LoadSessionResponse{}
+			if method == acp.AgentMethodSessionNew {
+				result = acp.NewSessionResponse{SessionId: id}
+			}
+			local.queueEstablishment(context.Background(), method, params, result)
+			require.Len(t, hooks.all, 1)
+
+			_, err := hooks.wrap(shortWriter{}).Write([]byte(`{"jsonrpc":"2.0","id":17,"result":{}}`))
+			require.ErrorIs(t, err, io.ErrShortWrite)
+			current.establishMu.Lock()
+			require.Error(t, current.establishmentFailed)
+			current.establishMu.Unlock()
+			current.mu.Lock()
+			require.True(t, current.closed)
+			current.mu.Unlock()
+
+			dispatched := false
+			client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+				dispatched = true
+
+				return opencode.NativeMessage{}, nil
+			}
+			_, promptErr := agent.Prompt(context.Background(), TextPromptRequest(id, "after-failed-response", "hello"))
+			require.Error(t, promptErr)
+			require.False(t, dispatched)
+			<-client.closeSignal
+		})
+	}
 }
 
 type shortWriter struct{}
@@ -332,6 +415,44 @@ func (shortWriter) Write([]byte) (int, error) { return 0, nil }
 type failingWriter struct{ err error }
 
 func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+type panickingWriter struct{}
+
+func (panickingWriter) Write([]byte) (int, error) { panic("SECRET_ESTABLISHMENT_WRITER_PANIC") }
+
+func TestEstablishmentWriterAndCallbacksContainPanics(t *testing.T) {
+	t.Run("writer", func(t *testing.T) {
+		hooks := newEstablishmentHooks(NewAgent().log)
+		failed := make(chan error, 1)
+		hooks.queueSession("17", nil, func() {}, func(err error) { failed <- err })
+
+		_, err := hooks.wrap(panickingWriter{}).Write([]byte(`{"jsonrpc":"2.0","id":17,"result":{}}`))
+		require.ErrorContains(t, err, "transport writer panicked")
+		require.Error(t, <-failed)
+		require.Empty(t, hooks.all)
+	})
+
+	for name, tc := range map[string]struct {
+		admit func()
+		run   func()
+	}{
+		"admit": {admit: func() { panic("SECRET_ADMIT_PANIC") }, run: func() { t.Fatal("run followed panicking admit") }},
+		"run":   {run: func() { panic("SECRET_RUN_PANIC") }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			hooks := newEstablishmentHooks(NewAgent().log)
+			failed := make(chan error, 1)
+			hooks.queueSession("17", tc.admit, tc.run, func(err error) { failed <- err })
+			hooks.runAfterWrite([]byte(`{"jsonrpc":"2.0","id":17,"result":{}}`))
+			require.Error(t, <-failed)
+			require.Empty(t, hooks.all)
+		})
+	}
+
+	require.NotPanics(t, func() {
+		runEstablishmentFailure(NewAgent().log, func(error) { panic("SECRET_FAIL_PANIC") }, errors.New("failed"))
+	})
+}
 
 // TestEstablishmentReportsEveryStageItCannotComplete proves each stage of the
 // post-response work is diagnostic on its own: a session that is already gone, a
@@ -363,18 +484,41 @@ func TestEstablishmentReportsEveryStageItCannotComplete(t *testing.T) {
 	broken := lifecycleSessionWithBrokenStream(t)
 	local = &localAgentConnection{agent: broken.agent, hooks: newEstablishmentHooks(broken.agent.log)}
 	local.establishSession(context.Background(), acp.AgentMethodSessionResume, broken.id)
-	require.ErrorContains(t, broken.lifecycleFailure(), "wire down")
+	require.ErrorContains(t, broken.lifecycleFailure(), "lifecycle delivery failed")
+	require.NotContains(t, broken.lifecycleFailure().Error(), "wire down")
 }
 
-// TestPromptEstablishesTheSessionItCannotAssumeWasEstablished proves the prompt
-// path opens the stream itself for a host driving this Agent in process, and
-// refuses the turn when that stream cannot be opened rather than accepting a
-// submission on a stream nothing opened.
-func TestPromptEstablishesTheSessionItCannotAssumeWasEstablished(t *testing.T) {
+// TestPromptNeverSubstitutesForTheEstablishingResponse proves an in-process
+// caller cannot bypass the transport-write prerequisite.
+func TestPromptNeverSubstitutesForTheEstablishingResponse(t *testing.T) {
 	current := lifecycleSessionWithBrokenStream(t)
 
 	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
-	require.ErrorContains(t, err, "wire down")
+	require.ErrorContains(t, err, "session establishment response not written")
+}
+
+func TestFailedLifecycleEstablishmentPermanentlyFencesLaterPrompt(t *testing.T) {
+	current := lifecycleSessionWithBrokenStream(t)
+	client, ok := current.client.(*fakeOpenCodeClient)
+	require.True(t, ok)
+	dispatched := false
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched = true
+
+		return opencode.NativeMessage{}, nil
+	}
+
+	current.markEstablishmentResponseWritten()
+	require.Error(t, current.ensureEstablished(context.Background()))
+	select {
+	case <-current.establishmentReady:
+	default:
+		t.Fatal("failed establishment left its readiness fence open")
+	}
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, "after-failed-establishment", "hello"))
+	require.ErrorContains(t, err, "session establishment failed")
+	require.False(t, dispatched)
 }
 
 // lifecycleSessionWithBrokenStream builds a negotiated session whose host cannot

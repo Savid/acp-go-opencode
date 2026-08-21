@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -10,6 +11,10 @@ import (
 	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
+
+const maxACPFrameBytes = 10 * 1024 * 1024
+
+var actionSettlementTimeout = closeTimeout
 
 // actionKind names the two native request classes this adapter routes to a host.
 type actionKind int
@@ -39,11 +44,23 @@ type nativeActionOutcome struct {
 // this adapter cannot answer and OpenCode is never left blocked on one this
 // adapter already reported finished.
 type pendingAction struct {
-	id     string
-	kind   actionKind
-	cycle  *foregroundCycle
-	owner  lifecycle.Owner
-	cancel context.CancelFunc
+	id        string
+	kind      actionKind
+	turnNonce string
+	cycle     *foregroundCycle
+	owner     lifecycle.Owner
+	cancel    context.CancelFunc
+	binding   *nativeIncarnationBinding
+	runID     string
+	// admissionDone closes after registration either fails or the pending
+	// action has been announced. Settlement waits for it, so neither an
+	// immediate host response nor cancellation can resolve an action before its
+	// first ordered sight.
+	admissionMu        sync.Mutex
+	admissionDone      chan struct{}
+	admissionOnce      sync.Once
+	admissionCancelled bool
+	announced          bool
 	// terminal fires once. The winner of response-versus-cancellation
 	// arbitration writes the outcome and closes it.
 	terminal sync.Once
@@ -69,18 +86,22 @@ func newActionRegistry() *actionRegistry {
 }
 
 // claim registers one action id exactly once for the life of the session.
-func (r *actionRegistry) claim(action *pendingAction) bool {
+func (r *actionRegistry) claim(action *pendingAction) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, seen := r.claimed[action.id]; seen {
-		return false
+		return false, errors.New("native action id was reused in one incarnation")
+	}
+
+	if len(r.claimed) >= lifecycle.EmitterActionLimit {
+		return false, errors.New("native action registry capacity exceeded")
 	}
 
 	r.claimed[action.id] = struct{}{}
 	r.pending[action.id] = action
 
-	return true
+	return true, nil
 }
 
 // take removes one pending action and reports whether this caller is the one that
@@ -95,6 +116,23 @@ func (r *actionRegistry) take(id string) (*pendingAction, bool) {
 	}
 
 	return action, ok
+}
+
+// takeIf removes id only when it is still the exact action incarnation the
+// caller observed. Reusing an id on a replacement registry can never let a late
+// resolver remove the replacement's request.
+func (r *actionRegistry) takeIf(id string, expected *pendingAction) (*pendingAction, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	action, ok := r.pending[id]
+	if !ok || action != expected {
+		return nil, false
+	}
+
+	delete(r.pending, id)
+
+	return action, true
 }
 
 // snapshot lists every pending action.
@@ -123,54 +161,213 @@ func (r *actionRegistry) blocked() bool {
 // names a tool call this session never published is refused rather than shown to
 // a host that could not attribute it.
 func (s *session) routeNativePermission(ctx context.Context, req opencode.PermissionRequest) error {
-	if req.ID == "" || req.SessionID == "" {
-		return nil
-	}
-
 	if req.SessionID != s.idmap.NativeSessionID {
 		return nil
 	}
 
+	action := &pendingAction{
+		id: req.ID, kind: actionPermission, turnNonce: turnNonceFromContext(ctx), permission: req,
+		binding: s.nativeIncarnationForContext(ctx),
+	}
 	if callID := req.ToolCall().CallID; callID != "" && !s.publishedToolCall(callID) {
-		replyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
-		replyErr := s.client.ReplyPermission(replyCtx, req, permissionReplyReject, "unpublished tool call")
-
-		cancel()
-
-		return errors.Join(
-			invalidRoute("permission request does not target a tool call this session published"),
-			replyErr,
-		)
+		return s.refuseNativeAction(ctx, action, true,
+			invalidRoute("permission request does not target a tool call this session published"))
 	}
 
-	return s.beginAction(ctx, &pendingAction{id: req.ID, kind: actionPermission, permission: req})
+	if err := s.prepareAction(ctx, action); err != nil {
+		return s.refuseNativeAction(ctx, action, true, err)
+	}
+
+	if answered, err := s.beginAction(ctx, action); err != nil {
+		return s.refuseNativeAction(ctx, action, !answered, err)
+	}
+
+	return nil
 }
 
 // routeNativeQuestion admits one native question. A question without a tool call
 // is a session-level prompt and carries no tool-call fence; one that names a tool
 // call is held to the same published-call rule as a permission.
 func (s *session) routeNativeQuestion(ctx context.Context, req opencode.QuestionRequest) error {
-	if req.ID == "" || req.SessionID == "" {
-		return nil
-	}
-
 	if req.SessionID != s.idmap.NativeSessionID {
 		return nil
 	}
 
+	action := &pendingAction{
+		id: req.ID, kind: actionElicitation, turnNonce: turnNonceFromContext(ctx), question: req,
+		binding: s.nativeIncarnationForContext(ctx),
+	}
 	if callID := req.Tool.CallID; callID != "" && !s.publishedToolCall(callID) {
-		rejectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
-		rejectErr := s.client.RejectQuestion(rejectCtx, req)
-
-		cancel()
-
-		return errors.Join(
-			invalidRoute("question request does not target a tool call this session published"),
-			rejectErr,
-		)
+		return s.refuseNativeAction(ctx, action, true,
+			invalidRoute("question request does not target a tool call this session published"))
 	}
 
-	return s.beginAction(ctx, &pendingAction{id: req.ID, kind: actionElicitation, question: req})
+	if err := s.prepareAction(ctx, action); err != nil {
+		return s.refuseNativeAction(ctx, action, true, err)
+	}
+
+	if answered, err := s.beginAction(ctx, action); err != nil {
+		return s.refuseNativeAction(ctx, action, !answered, err)
+	}
+
+	return nil
+}
+
+func (s *session) prepareAction(ctx context.Context, action *pendingAction) error {
+	s.lifecycleMu.Lock()
+
+	binding := s.incarnation
+	if binding == nil || action.binding == nil || action.binding != binding {
+		s.lifecycleMu.Unlock()
+
+		return errors.New("native action incarnation binding is stale")
+	}
+
+	cycle, _ := s.observedCycleLocked(ctx, false)
+
+	ownerID := ""
+	if cycle != nil {
+		ownerID = cycle.turnID
+	} else {
+		ownerID = fmt.Sprintf("agent-turn-%d", s.turnCounter+1)
+	}
+
+	action.owner = lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: ownerID}
+	action.runID = s.submission.RunID
+
+	if err := validateActionIdentifiers(action); err != nil {
+		s.lifecycleMu.Unlock()
+
+		return err
+	}
+
+	if binding.stream != nil {
+		kind := lifecycle.ActionPermission
+		if action.kind == actionElicitation {
+			kind = lifecycle.ActionElicitation
+		}
+
+		if err := binding.stream.Preflight(lifecycle.ActionEvent(lifecycle.PendingAction(
+			action.id, kind, action.owner, true,
+		))); err != nil {
+			s.lifecycleMu.Unlock()
+
+			return err
+		}
+	}
+	s.lifecycleMu.Unlock()
+
+	if !s.hostCanAnswerAction(action) {
+		return nil
+	}
+
+	return s.validateHostActionFrame(action)
+}
+
+func validateActionIdentifiers(action *pendingAction) error {
+	identifier := func(name, value string, required bool) error {
+		if value == "" {
+			if required {
+				return fmt.Errorf("%s is empty", name)
+			}
+
+			return nil
+		}
+
+		if len(value) > lifecycle.IdentifierBound {
+			return fmt.Errorf("%s exceeds %d bytes", name, lifecycle.IdentifierBound)
+		}
+
+		return nil
+	}
+
+	if err := identifier("action id", action.id, true); err != nil {
+		return err
+	}
+
+	if err := identifier("action owner id", action.owner.ID, true); err != nil {
+		return err
+	}
+
+	tool := action.permission.ToolCall()
+	if action.kind == actionElicitation {
+		tool = opencode.PermissionTool{CallID: action.question.Tool.CallID, MessageID: action.question.Tool.MessageID}
+	}
+
+	if err := identifier("action tool-call id", tool.CallID, false); err != nil {
+		return err
+	}
+
+	return identifier("action tool message id", tool.MessageID, false)
+}
+
+func (s *session) validateHostActionFrame(action *pendingAction) error {
+	method := acp.ClientMethodSessionRequestPermission
+
+	var params any = s.permissionHostRequest(action)
+
+	if action.kind == actionElicitation {
+		method = acp.ClientMethodElicitationCreate
+		request, _, scope := s.elicitationHostRequest(action)
+
+		raw, err := scopedElicitationParams(request, scope)
+		if err != nil {
+			return fmt.Errorf("marshal complete host action request: %w", err)
+		}
+
+		params = raw
+	}
+
+	frame := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Params  any             `json:"params"`
+	}{
+		JSONRPC: jsonRPCVersion,
+		ID:      json.RawMessage("18446744073709551615"),
+		Method:  method,
+		Params:  params,
+	}
+
+	encoded, err := json.Marshal(frame)
+	if err != nil {
+		return fmt.Errorf("marshal complete host action request: %w", err)
+	}
+
+	if len(encoded)+1 > maxACPFrameBytes {
+		return fmt.Errorf("complete host action request exceeds %d bytes", maxACPFrameBytes)
+	}
+
+	return nil
+}
+
+func (s *session) refuseNativeAction(
+	ctx context.Context,
+	action *pendingAction,
+	answerNative bool,
+	err error,
+) error {
+	if err == nil {
+		return nil
+	}
+
+	binding := action.binding
+	if binding == nil {
+		binding = s.nativeIncarnationForContext(ctx)
+	}
+
+	if answerNative && binding != nil && binding.client != nil && s.incarnationIsCurrent(binding) {
+		if action.kind == actionPermission {
+			_ = binding.client.ReplyPermission(ctx, action.permission, permissionReplyReject, "invalid native action")
+		} else {
+			_ = binding.client.RejectQuestion(ctx, action.question)
+		}
+	}
+
+	s.failNativeIncarnation(binding, err)
+
+	return err
 }
 
 // beginAction runs the one ordered admission sequence for every action: register
@@ -179,94 +376,215 @@ func (s *session) routeNativeQuestion(ctx context.Context, req opencode.Question
 // announced action is always one that is already in flight, and the arbitration
 // that terminalizes it runs on its own goroutine so a blocked action never stalls
 // the session's event pump.
-func (s *session) beginAction(ctx context.Context, action *pendingAction) error {
-	if !s.agent.lifecycleNegotiated().Present() && s.lifecycleStreamAbsent() {
-		return s.resolveActionRequest(ctx, action)
-	}
+func (s *session) beginAction(ctx context.Context, action *pendingAction) (bool, error) {
+	requestCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	action.cancel = cancel
+	action.admissionDone = make(chan struct{})
 
 	s.lifecycleMu.Lock()
+	if action.binding == nil || s.incarnation != action.binding {
+		s.lifecycleMu.Unlock()
+		cancel()
+
+		return false, errors.New("native action incarnation binding is stale")
+	}
 
 	cycle, err := s.openAgentCycleLocked(ctx)
 	if err != nil {
 		s.lifecycleMu.Unlock()
+		cancel()
 
-		return err
+		return false, err
+	}
+
+	if cycle == nil {
+		s.lifecycleMu.Unlock()
+		cancel()
+
+		return false, errors.New("native action requires an active lifecycle incarnation")
 	}
 
 	action.cycle = cycle
-	action.owner = lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: cycle.turnID}
-
-	if !s.actions.claim(action) {
+	if action.owner.ID != cycle.turnID {
 		s.lifecycleMu.Unlock()
+		cancel()
 
-		return nil
+		return false, errors.New("native action owner changed before admission")
+	}
+
+	if stream := action.binding.stream; stream != nil {
+		kind := lifecycle.ActionPermission
+		if action.kind == actionElicitation {
+			kind = lifecycle.ActionElicitation
+		}
+
+		if err := stream.Preflight(
+			lifecycle.ActionEvent(lifecycle.PendingAction(action.id, kind, action.owner, true)),
+			lifecycle.TransitionEvent(
+				lifecycle.ForegroundRequiresAction, cycle.id, cycle.turnID, cycle.origin,
+			),
+		); err != nil {
+			s.lifecycleMu.Unlock()
+			cancel()
+
+			return false, err
+		}
+	}
+
+	if _, claimErr := action.binding.registry.claim(action); claimErr != nil {
+		s.lifecycleMu.Unlock()
+		cancel()
+
+		return false, claimErr
 	}
 
 	s.blockCycleLocked(action.id, cycle)
 	s.lifecycleMu.Unlock()
 
-	requestCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	action.cancel = cancel
+	var registrationErr error
 
-	answered := make(chan nativeActionOutcome, 1)
+	request := s.beginHostActionRequest(requestCtx, action)
+	select {
+	case registrationErr = <-request.registered:
+	case <-requestCtx.Done():
+		registrationErr = requestCtx.Err()
+	}
 
-	go func() {
-		defer handleAgentGoroutinePanicRecover(requestCtx, agentLogger(s.agent), "OpenCode action request", func(recovered any) {
-			answered <- nativeActionOutcome{state: lifecycle.ActionFailed}
+	if registrationErr != nil {
+		cancelled := action.admissionIsCancelled()
+		state := lifecycle.ActionFailed
 
-			s.recordActionFailure(fmt.Errorf("opencode action request panicked: %v", recovered))
-		})
+		action.completeAdmission(false)
+		cancel()
 
-		outcome, err := s.askHost(requestCtx, action)
-		// An ask this adapter abandoned is not a failure of the turn. The two
-		// paths that abandon one — OpenCode resolving the action itself, and a
-		// cycle ending under it — cancel this context first and then record
-		// whatever actually went wrong, and a cancellation racing them to the
-		// cycle's single failure slot would report the abandonment instead of
-		// the reason for it.
-		if err != nil && requestCtx.Err() == nil {
-			s.recordActionFailure(err)
+		if cancelled {
+			state = lifecycle.ActionCancelled
 		}
 
-		answered <- outcome
-	}()
+		s.finishAction(action, nativeActionOutcome{state: state})
 
-	announceErr := s.announceAction(ctx, action, cycle)
+		if cancelled {
+			return true, nil
+		}
+
+		return true, fmt.Errorf("register host action request: %w", registrationErr)
+	}
+
+	action.admissionMu.Lock()
+	if action.admissionCancelled {
+		action.completeAdmissionLocked(false)
+		action.admissionMu.Unlock()
+		s.finishAction(action, nativeActionOutcome{state: lifecycle.ActionCancelled})
+
+		return true, nil
+	}
+
+	announced, announceErr := s.announceAction(ctx, action, cycle)
+	action.completeAdmissionLocked(announced)
+	action.admissionMu.Unlock()
+
 	if announceErr != nil {
 		cancel()
-		<-answered
-		s.settleActionNatively(ctx, action, nativeActionOutcome{state: lifecycle.ActionFailed})
+		s.finishAction(action, nativeActionOutcome{state: lifecycle.ActionFailed})
+		s.failNativeIncarnation(action.binding, announceErr)
 
-		return announceErr
+		return true, announceErr
 	}
 
 	go func() {
 		defer handleAgentGoroutinePanicRecover(requestCtx, agentLogger(s.agent), "OpenCode action settlement", nil)
 
-		s.awaitActionOutcome(action, answered)
+		s.awaitActionOutcome(action, request.answered)
 	}()
 
-	return nil
+	return false, nil
 }
 
 // announceAction emits the action's first sight and the foreground state it
 // blocks. The two are one step: a blocking action that announced no transition
 // would leave a host unable to explain why the foreground stopped.
-func (s *session) announceAction(ctx context.Context, action *pendingAction, cycle *foregroundCycle) error {
+func (s *session) announceAction(ctx context.Context, action *pendingAction, cycle *foregroundCycle) (bool, error) {
 	kind := lifecycle.ActionPermission
 	if action.kind == actionElicitation {
 		kind = lifecycle.ActionElicitation
 	}
 
-	if err := s.emitLifecycle(ctx, lifecycle.ActionEvent(lifecycle.PendingAction(
-		action.id, kind, action.owner, true,
-	))); err != nil {
-		return err
+	s.lifecycleMu.Lock()
+
+	if s.incarnation != action.binding {
+		s.lifecycleMu.Unlock()
+
+		return false, errors.New("action lifecycle binding is stale")
 	}
 
-	return s.emitLifecycle(ctx, lifecycle.TransitionEvent(
+	receipts := make([]deliveryReceipt, 0, 2)
+
+	receipt, err := s.emitLifecycleLockedWithFailure(ctx, lifecycle.ActionEvent(lifecycle.PendingAction(
+		action.id, kind, action.owner, true,
+	)), false)
+	if err != nil {
+		s.lifecycleMu.Unlock()
+
+		return false, err
+	}
+
+	receipts = append(receipts, receipt)
+
+	receipt, err = s.emitLifecycleLockedWithFailure(ctx, lifecycle.TransitionEvent(
 		lifecycle.ForegroundRequiresAction, cycle.id, cycle.turnID, cycle.origin,
-	))
+	), false)
+	if err == nil {
+		receipts = append(receipts, receipt)
+	}
+
+	s.lifecycleMu.Unlock()
+
+	if err != nil {
+		return true, err
+	}
+
+	for _, receipt := range receipts {
+		if err := waitDelivery(ctx, receipt); err != nil {
+			return true, err
+		}
+	}
+
+	return true, nil
+}
+
+func (a *pendingAction) completeAdmission(announced bool) {
+	a.admissionMu.Lock()
+	defer a.admissionMu.Unlock()
+
+	a.completeAdmissionLocked(announced)
+}
+
+func (a *pendingAction) completeAdmissionLocked(announced bool) {
+	a.announced = announced
+	a.admissionOnce.Do(func() { close(a.admissionDone) })
+}
+
+func (a *pendingAction) cancelAdmission() {
+	a.admissionMu.Lock()
+
+	a.admissionCancelled = true
+	if a.cancel != nil {
+		a.cancel()
+	}
+	a.admissionMu.Unlock()
+}
+
+func (a *pendingAction) admissionIsCancelled() bool {
+	a.admissionMu.Lock()
+	defer a.admissionMu.Unlock()
+
+	return a.admissionCancelled
+}
+
+func (a *pendingAction) waitForAdmission() {
+	if a.admissionDone != nil {
+		<-a.admissionDone
+	}
 }
 
 // awaitActionOutcome arbitrates the host answer against cancellation. Cancellation
@@ -275,10 +593,24 @@ func (s *session) announceAction(ctx context.Context, action *pendingAction, cyc
 func (s *session) awaitActionOutcome(action *pendingAction, answered <-chan nativeActionOutcome) {
 	select {
 	case outcome := <-answered:
+		if action.admissionIsCancelled() {
+			s.finishAction(action, nativeActionOutcome{state: lifecycle.ActionCancelled})
+
+			return
+		}
+
+		select {
+		case <-action.cycle.signal:
+			action.cancelAdmission()
+			s.finishAction(action, nativeActionOutcome{state: lifecycle.ActionCancelled})
+
+			return
+		default:
+		}
+
 		s.finishAction(action, outcome)
 	case <-action.cycle.signal:
-		action.cancel()
-		<-answered
+		action.cancelAdmission()
 		s.finishAction(action, nativeActionOutcome{state: lifecycle.ActionCancelled})
 	}
 }
@@ -287,12 +619,14 @@ func (s *session) awaitActionOutcome(action *pendingAction, answered <-chan nati
 // OpenCode, obtain its acknowledgement, then emit exactly one terminal action
 // state and the transition that unblocks the cycle.
 func (s *session) finishAction(action *pendingAction, outcome nativeActionOutcome) {
-	action.terminal.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	defer cancel()
 
-		s.settleActionNatively(ctx, action, outcome)
-	})
+	s.finishActionWithContext(ctx, action, outcome)
+}
+
+func (s *session) finishActionWithContext(ctx context.Context, action *pendingAction, outcome nativeActionOutcome) {
+	action.terminal.Do(func() { s.settleActionNatively(ctx, action, outcome) })
 }
 
 // settleActionNatively answers OpenCode and then reports the action terminal. The
@@ -300,27 +634,68 @@ func (s *session) finishAction(action *pendingAction, outcome nativeActionOutcom
 // before it would report an action finished while the harness still waits on it,
 // and a failed acknowledgement is reported as a failed action rather than hidden.
 func (s *session) settleActionNatively(ctx context.Context, action *pendingAction, outcome nativeActionOutcome) {
-	if _, held := s.actions.take(action.id); !held {
+	if action.binding == nil {
 		return
 	}
+
+	s.lifecycleMu.Lock()
+
+	if s.incarnation != action.binding {
+		s.lifecycleMu.Unlock()
+
+		return
+	}
+
+	_, held := action.binding.registry.takeIf(action.id, action)
+	s.lifecycleMu.Unlock()
+
+	if !held {
+		return
+	}
+
+	action.waitForAdmission()
 
 	state := outcome.state
 	if err := s.replyNative(ctx, action, outcome); err != nil {
 		state = lifecycle.ActionFailed
 
-		s.recordActionFailure(err)
+		s.recordActionFailure(action, err)
+	}
+
+	if !action.announced {
+		s.releaseUnannouncedAction(action)
+
+		return
 	}
 
 	if err := s.terminalizeAction(ctx, action, state); err != nil {
-		s.recordActionFailure(err)
+		s.recordActionFailure(action, err)
+		s.failNativeIncarnation(action.binding, err)
+	}
+}
+
+func (s *session) releaseUnannouncedAction(action *pendingAction) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if action.cycle != nil {
+		delete(action.cycle.blockers, action.id)
 	}
 }
 
 // replyNative sends the answer OpenCode is blocked on.
 func (s *session) replyNative(ctx context.Context, action *pendingAction, outcome nativeActionOutcome) error {
-	client := s.currentClient()
+	if action == nil || action.binding == nil {
+		return errors.New("OpenCode action reply has no incarnation binding")
+	}
+
+	client := action.binding.client
 	if client == nil {
 		return errors.New("OpenCode action reply has no runtime client")
+	}
+
+	if !s.actionBindingCurrent(action) {
+		return nil
 	}
 
 	if action.kind == actionPermission {
@@ -350,51 +725,156 @@ func (s *session) replyNative(ctx context.Context, action *pendingAction, outcom
 // terminal idle from the settlement path instead.
 func (s *session) terminalizeAction(ctx context.Context, action *pendingAction, state lifecycle.ActionState) error {
 	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
+
+	if s.incarnation != action.binding {
+		s.lifecycleMu.Unlock()
+
+		return nil
+	}
 
 	cycle := action.cycle
 	if cycle == nil {
+		s.lifecycleMu.Unlock()
+
 		return nil
 	}
 
 	delete(cycle.blockers, action.id)
 
-	if err := s.emitLifecycleLocked(ctx, lifecycle.ActionEvent(
+	receipts := make([]deliveryReceipt, 0, 2)
+
+	receipt, err := s.emitLifecycleLocked(ctx, lifecycle.ActionEvent(
 		lifecycle.ResolvedAction(action.id, state),
-	)); err != nil {
+	))
+	if err != nil {
+		s.lifecycleMu.Unlock()
+
 		return err
 	}
 
+	receipts = append(receipts, receipt)
+
 	if len(cycle.blockers) > 0 || cycle.settled || cycle.terminalEvidence() {
-		return nil
+		s.lifecycleMu.Unlock()
+
+		return waitDelivery(ctx, receipt)
 	}
 
-	return s.emitLifecycleLocked(ctx, lifecycle.TransitionEvent(
+	receipt, err = s.emitLifecycleLocked(ctx, lifecycle.TransitionEvent(
 		lifecycle.ForegroundRunning, cycle.id, cycle.turnID, cycle.origin,
 	))
-}
-
-// askHost issues the outbound request and maps its answer onto one native
-// outcome. It never replies to OpenCode itself: settlement is one path.
-func (s *session) askHost(ctx context.Context, action *pendingAction) (nativeActionOutcome, error) {
-	if action.kind == actionPermission {
-		return s.askPermission(ctx, action)
+	if err == nil {
+		receipts = append(receipts, receipt)
 	}
 
-	return s.askElicitation(ctx, action)
+	s.lifecycleMu.Unlock()
+
+	if err != nil {
+		return err
+	}
+
+	for _, receipt := range receipts {
+		if err := waitDelivery(ctx, receipt); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func (s *session) askPermission(ctx context.Context, action *pendingAction) (nativeActionOutcome, error) {
+type registeredActionRequest struct {
+	registered <-chan error
+	answered   <-chan nativeActionOutcome
+}
+
+func (s *session) hostCanAnswerAction(action *pendingAction) bool {
+	if s.agent == nil || s.agent.connection() == nil {
+		return false
+	}
+
+	return action.kind != actionElicitation || s.agent.clientSupportsFormElicitation()
+}
+
+func (s *session) beginRegisteredHostRequest(ctx context.Context, action *pendingAction) registeredActionRequest {
 	conn := s.agent.connection()
-	if conn == nil {
-		// A host that cannot be asked declines the permission, exactly as an
-		// unanswerable elicitation declines: an error here would fail a turn
-		// over a condition the native session can simply be answered about.
-		return nativeActionOutcome{
-			state: lifecycle.ActionDeclined, permissionReply: permissionReplyReject, message: "client unavailable",
-		}, nil
+	answered := make(chan nativeActionOutcome, 1)
+
+	if action.kind == actionPermission {
+		request := s.permissionHostRequest(action)
+		pending := conn.BeginRequestPermission(ctx, request,
+			s.hostRequestKey(acp.ClientMethodSessionRequestPermission, action))
+
+		go func() {
+			result := <-pending.answered
+
+			outcome := permissionHostOutcome(result.response)
+			if result.err != nil {
+				outcome = nativeActionOutcome{state: lifecycle.ActionFailed, permissionReply: permissionReplyReject}
+
+				if ctx.Err() == nil {
+					s.recordActionFailure(action, result.err)
+				}
+			}
+
+			answered <- outcome
+		}()
+
+		return registeredActionRequest{registered: pending.registered, answered: answered}
 	}
 
+	request, propertyIDs, scope := s.elicitationHostRequest(action)
+	pending := conn.BeginCreateElicitation(ctx, request, scope,
+		s.hostRequestKey(acp.ClientMethodElicitationCreate, action))
+
+	go func() {
+		result := <-pending.answered
+		outcome := elicitationHostOutcome(result.response, propertyIDs)
+
+		if result.err != nil {
+			outcome = nativeActionOutcome{state: lifecycle.ActionFailed}
+
+			if ctx.Err() == nil {
+				s.recordActionFailure(action, result.err)
+			}
+		}
+
+		answered <- outcome
+	}()
+
+	return registeredActionRequest{registered: pending.registered, answered: answered}
+}
+
+func (s *session) beginHostActionRequest(ctx context.Context, action *pendingAction) registeredActionRequest {
+	if s.hostCanAnswerAction(action) {
+		return s.beginRegisteredHostRequest(ctx, action)
+	}
+
+	registered := make(chan error, 1)
+	answered := make(chan nativeActionOutcome, 1)
+
+	registered <- nil
+
+	if action.kind == actionPermission {
+		answered <- nativeActionOutcome{
+			state: lifecycle.ActionDeclined, permissionReply: permissionReplyReject, message: "client unavailable",
+		}
+	} else {
+		answered <- nativeActionOutcome{state: lifecycle.ActionDeclined}
+	}
+
+	return registeredActionRequest{registered: registered, answered: answered}
+}
+
+func (s *session) hostRequestKey(method string, action *pendingAction) hostRequestKey {
+	streamID := ""
+	if action.binding != nil && action.binding.stream != nil {
+		streamID = action.binding.stream.ID()
+	}
+
+	return hostRequestKey{method: method, streamID: streamID, actionID: action.id}
+}
+
+func (s *session) permissionHostRequest(action *pendingAction) acp.RequestPermissionRequest {
 	req := action.permission
 	title := req.ActionName()
 
@@ -406,7 +886,7 @@ func (s *session) askPermission(ctx context.Context, action *pendingAction) (nat
 	kind := acp.ToolKindOther
 	tool := req.ToolCall()
 
-	resp, err := conn.RequestPermission(ctx, acp.RequestPermissionRequest{
+	return acp.RequestPermissionRequest{
 		SessionId: s.id,
 		ToolCall: acp.ToolCallUpdate{
 			ToolCallId: acp.ToolCallId(tool.CallID),
@@ -431,17 +911,14 @@ func (s *session) askPermission(ctx context.Context, action *pendingAction) (nat
 		},
 		Meta: mergeMeta(
 			map[string]any{opencodeMetaKey: map[string]any{routeFieldRequestID: req.ID, opencodeNativeIDMetaKey: req.SessionID}},
-			s.lifecycleActionMeta(req.ID, action.owner),
+			s.lifecycleActionMeta(action),
 		),
-	})
-	if err != nil {
-		// The request itself failed: the host never decided, so the action
-		// failed — it was not declined.
-		return nativeActionOutcome{state: lifecycle.ActionFailed, permissionReply: permissionReplyReject}, err
 	}
+}
 
+func permissionHostOutcome(resp acp.RequestPermissionResponse) nativeActionOutcome {
 	if resp.Outcome.Cancelled != nil {
-		return nativeActionOutcome{state: lifecycle.ActionCancelled, permissionReply: permissionReplyReject}, nil
+		return nativeActionOutcome{state: lifecycle.ActionCancelled, permissionReply: permissionReplyReject}
 	}
 
 	reply := permissionReplyReject
@@ -458,24 +935,18 @@ func (s *session) askPermission(ctx context.Context, action *pendingAction) (nat
 		state = lifecycle.ActionAccepted
 	}
 
-	return nativeActionOutcome{state: state, permissionReply: reply}, nil
+	return nativeActionOutcome{state: state, permissionReply: reply}
 }
 
-func (s *session) askElicitation(ctx context.Context, action *pendingAction) (nativeActionOutcome, error) {
-	conn := s.agent.connection()
-	if conn == nil || !s.agent.clientSupportsFormElicitation() {
-		// A host that cannot be asked declines the question. Reporting the
-		// action declined rather than leaving it pending is what keeps an
-		// unanswerable elicitation from blocking the foreground forever.
-		return nativeActionOutcome{state: lifecycle.ActionDeclined}, nil
-	}
-
+func (s *session) elicitationHostRequest(
+	action *pendingAction,
+) (acp.UnstableCreateElicitationRequest, []string, elicitationScope) {
 	request, propertyIDs := questionElicitationRequest(action.question)
 	if request.Form != nil {
-		request.Form.Meta = mergeMeta(request.Form.Meta, s.lifecycleActionMeta(action.id, action.owner))
+		request.Form.Meta = mergeMeta(request.Form.Meta, s.lifecycleActionMeta(action))
 	}
 
-	scope := elicitationScope{SessionID: s.id, TurnNonce: s.currentTurnNonce()}
+	scope := elicitationScope{SessionID: s.id, TurnNonce: action.turnNonce}
 	if action.question.Tool.CallID != "" {
 		scope.ToolCallID = acp.ToolCallId(action.question.Tool.CallID)
 	} else {
@@ -484,19 +955,21 @@ func (s *session) askElicitation(ctx context.Context, action *pendingAction) (na
 		scope.RequestID = &requestID
 	}
 
-	resp, err := conn.CreateElicitation(ctx, request, scope)
-	if err != nil {
-		return nativeActionOutcome{state: lifecycle.ActionFailed}, err
-	}
+	return request, propertyIDs, scope
+}
 
+func elicitationHostOutcome(
+	resp acp.UnstableCreateElicitationResponse,
+	propertyIDs []string,
+) nativeActionOutcome {
 	if resp.Accept == nil {
-		return nativeActionOutcome{state: lifecycle.ActionDeclined}, nil
+		return nativeActionOutcome{state: lifecycle.ActionDeclined}
 	}
 
 	return nativeActionOutcome{
 		state:   lifecycle.ActionAccepted,
 		answers: questionAnswersFromContent(resp.Accept.Content, propertyIDs),
-	}, nil
+	}
 }
 
 // nativeActionResolved terminalizes an action OpenCode resolved on its own — a
@@ -504,18 +977,35 @@ func (s *session) askElicitation(ctx context.Context, action *pendingAction) (na
 // cancelled and the action reports the state the harness recorded, because the
 // harness is no longer waiting for an answer this adapter has not sent.
 func (s *session) nativeActionResolved(ctx context.Context, replied opencode.ActionRepliedEvent, state lifecycle.ActionState) {
-	action, held := s.actions.take(replied.RequestID)
+	s.lifecycleMu.Lock()
+
+	binding := s.incarnation
+	if binding == nil {
+		s.lifecycleMu.Unlock()
+
+		return
+	}
+
+	action, held := binding.registry.take(replied.RequestID)
+	s.lifecycleMu.Unlock()
+
 	if !held {
 		return
 	}
 
 	action.terminal.Do(func() {
-		if action.cancel != nil {
-			action.cancel()
+		action.cancelAdmission()
+		action.waitForAdmission()
+
+		if !action.announced {
+			s.releaseUnannouncedAction(action)
+
+			return
 		}
 
 		if err := s.terminalizeAction(ctx, action, state); err != nil {
-			s.recordActionFailure(err)
+			s.recordActionFailure(action, err)
+			s.failNativeIncarnation(action.binding, err)
 		}
 	})
 }
@@ -524,46 +1014,49 @@ func (s *session) nativeActionResolved(ctx context.Context, replied opencode.Act
 // cycle's ending transition, so OpenCode is answered and the stream reports every
 // blocker terminal before the foreground moves.
 func (s *session) cancelActions(ctx context.Context) {
-	for _, action := range s.actions.snapshot() {
-		if action.cancel != nil {
-			action.cancel()
-		}
-
-		s.finishAction(action, nativeActionOutcome{state: lifecycle.ActionCancelled})
+	binding := s.currentIncarnation()
+	if binding == nil {
+		return
 	}
 
-	_ = ctx
-}
-
-// resolveActionRequest answers OpenCode when this connection carries no lifecycle
-// stream. The permission flow is unchanged by the absence of the extension: the
-// host is still asked, and a host that cannot be asked still declines.
-func (s *session) resolveActionRequest(ctx context.Context, action *pendingAction) error {
-	if !s.actions.claim(action) {
-		return nil
+	actions := binding.registry.snapshot()
+	for _, action := range actions {
+		action.cancelAdmission()
 	}
 
-	outcome, err := s.askHost(ctx, action)
-
-	replyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), actionSettlementTimeout)
 	defer cancel()
 
-	if _, held := s.actions.take(action.id); !held {
-		return err
+	for _, action := range actions {
+		s.finishActionWithContext(settleCtx, action, nativeActionOutcome{state: lifecycle.ActionCancelled})
+	}
+}
+
+func (s *session) cancelActionAdmissions() {
+	binding := s.currentIncarnation()
+	if binding == nil {
+		return
 	}
 
-	return errors.Join(err, s.replyNative(replyCtx, action, outcome))
+	for _, action := range binding.registry.snapshot() {
+		action.cancelAdmission()
+	}
 }
 
 // recordActionFailure latches an action failure onto the session's lifecycle
 // state. A failure here is not a prompt's own failure — the action may belong to
 // an agent-origin turn — so it is recorded where the owning cycle settles. Every
 // caller reports a failure it already holds, so there is no nil error to guard.
-func (s *session) recordActionFailure(err error) {
+func (s *session) recordActionFailure(action *pendingAction, _ error) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if s.cycle != nil && s.cycle.failure == nil {
-		s.cycle.failure = err
+	if action != nil && s.incarnation == action.binding &&
+		s.cycle == action.cycle && s.cycle != nil && s.cycle.failure == nil {
+		s.cycle.failure = errors.New("native action settlement failed")
 	}
+}
+
+func (s *session) actionBindingCurrent(action *pendingAction) bool {
+	return action != nil && action.binding != nil && s.incarnationIsCurrent(action.binding)
 }

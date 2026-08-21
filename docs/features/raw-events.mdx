@@ -6,6 +6,10 @@ description: Opt a session in to receive OpenCode's raw native events as ACP not
 For debugging and observability, a session can opt in to receive OpenCode's raw
 native SSE events, forwarded verbatim as ACP notifications. This is off by
 default — raw event bodies are never emitted unless a session enables them.
+Raw delivery is observational and uses a candidate sequence: a failed
+notification consumes no sequence, does not fail or fence the prompt, and the
+next successful raw notification reuses that candidate. Typed updates and the
+lifecycle carrier remain lossless and fail closed independently.
 
 ## Enabling raw events
 

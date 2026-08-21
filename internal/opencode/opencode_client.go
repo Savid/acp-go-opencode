@@ -104,8 +104,14 @@ const openAPITypeArray = "array"
 // the wrapper-owned loopback server, far above any configured image limit.
 const sseEventLineLimitBytes = 64 * 1024 * 1024
 
+// One SSE event may span multiple data lines. The aggregate is bounded by the
+// same ceiling as an individual line so a peer cannot bypass the parser's memory
+// bound by splitting one malformed or unterminated event into legal-size lines.
+const sseEventLimitBytes = sseEventLineLimitBytes
+
 var (
 	ErrSSEDisconnect         = errors.New("opencode SSE disconnected")
+	ErrSSEEventTooLarge      = errors.New("opencode SSE event exceeds size limit")
 	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
 	ErrScopeRuntimeShutdown  = errors.New("directory-scoped OpenCode client cannot shut down the shared runtime")
 	ErrRuntimeScratchCleanup = errors.New("OpenCode runtime scratch cleanup incomplete")
@@ -141,8 +147,7 @@ type Client interface {
 	PendingQuestions(context.Context) ([]QuestionRequest, error)
 	ReplyQuestion(context.Context, QuestionRequest, [][]string) error
 	RejectQuestion(context.Context, QuestionRequest) error
-	Events() <-chan Event
-	EventErrors() <-chan error
+	EventStream() <-chan EventStreamItem
 	RuntimeExited() <-chan struct{}
 	XDGDirs() XDGDirs
 	NativeVersion() string
@@ -420,8 +425,8 @@ type openCodeServer struct {
 	sessionQuestionListSupport   bool
 	nativeVersion                string
 
-	events                       chan Event
-	errs                         chan error
+	eventStream                  chan EventStreamItem
+	eventReader                  func(context.Context) error
 	closed                       chan struct{}
 	directory                    string
 	scopeCancel                  context.CancelFunc
@@ -441,9 +446,6 @@ type openCodeServer struct {
 	sessionCarrierBroker         *sessionCarrierBroker
 	sessionCarrierReference      string
 	pure                         bool
-
-	streamMu    sync.Mutex
-	streamEpoch uint64
 }
 
 type runtimeShutdownState struct {
@@ -662,11 +664,19 @@ type NativeCommand struct {
 }
 
 type Event struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	Properties  json.RawMessage `json:"properties"`
-	Raw         json.RawMessage `json:"-"`
-	StreamEpoch uint64          `json:"-"`
+	ID         string          `json:"id"`
+	Type       string          `json:"type"`
+	Properties json.RawMessage `json:"properties"`
+	Raw        json.RawMessage `json:"-"`
+}
+
+// EventStreamItem is one ordered delivery from a directory-scoped native
+// stream. Exactly one of Event and Terminal is set. The terminal marker shares
+// the bounded channel with events, so it cannot be dropped when the channel is
+// full and cannot overtake the final event accepted from the SSE body.
+type EventStreamItem struct {
+	Event    *Event
+	Terminal error
 }
 
 func (e *Event) UnmarshalJSON(data []byte) error {
@@ -887,7 +897,6 @@ var (
 	openCodePrepareRuntimeGeneration           = prepareDarwinRuntimeGeneration
 	openCodeAfter                              = time.After
 	openCodeReadyPollInterval                  = 100 * time.Millisecond
-	openCodeEventReconnectDelay                = 250 * time.Millisecond
 	openCodeShutdownTimeout                    = 5 * time.Second
 	openCodeContainmentTimeout                 = 15 * time.Second
 )
@@ -1354,8 +1363,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		cancel:                       cancel,
 		xdg:                          xdg,
 		log:                          options.Logger,
-		events:                       make(chan Event, 256),
-		errs:                         make(chan error, 8),
+		eventStream:                  make(chan EventStreamItem, 256),
 		closed:                       make(chan struct{}),
 		runtimeShutdown:              newRuntimeShutdownState(),
 		runtimeClosed:                make(chan struct{}),
@@ -1519,12 +1527,19 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 	go s.readEvents(handshakeCtx)
 
 	select {
-	case event := <-s.events:
-		if event.Type != eventTypeServerConnected {
-			return fmt.Errorf("first opencode event was %q, want server.connected", event.Type)
+	case item := <-s.eventStream:
+		if item.Terminal != nil {
+			return fmt.Errorf("opencode event stream failed during readiness: %w", item.Terminal)
 		}
-	case err := <-s.errs:
-		return fmt.Errorf("opencode event stream failed during readiness: %w", err)
+
+		if item.Event == nil || item.Event.Type != eventTypeServerConnected {
+			eventType := ""
+			if item.Event != nil {
+				eventType = item.Event.Type
+			}
+
+			return fmt.Errorf("first opencode event was %q, want server.connected", eventType)
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -1691,7 +1706,7 @@ func waitForOpenCodeRuntimeShutdown(
 		select {
 		case waitErr := <-done:
 			if waitErr != nil && server.log != nil {
-				server.log.DebugContext(proofCtx, "opencode exited during shutdown", slog.Any("error", waitErr))
+				server.log.DebugContext(proofCtx, "opencode exited during shutdown")
 			}
 
 			return true, false, nil
@@ -1768,8 +1783,8 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		log: s.log, sessionPermissionListSupport: s.sessionPermissionListSupport,
 		sessionQuestionListSupport: s.sessionQuestionListSupport,
 		nativeVersion:              s.nativeVersion,
-		events:                     make(chan Event, 256), errs: make(chan error, 8),
-		closed: make(chan struct{}), directory: options.Directory,
+		eventStream:                make(chan EventStreamItem, 256),
+		closed:                     make(chan struct{}), directory: options.Directory,
 		scopeCancel: cancel, runtimeShutdown: s.runtimeShutdown, runtimeClosed: s.runtimeClosed,
 		runtimeExited:           s.runtimeExited,
 		sessionCarrierBroker:    s.sessionCarrierBroker,
@@ -1784,24 +1799,26 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		return nil, err
 	}
 
-	// Capture package-level reconnect seams before the goroutine starts. Tests
-	// may restore those seams as soon as Scope returns.
-	after := openCodeAfter
-
-	reconnectDelay := openCodeEventReconnectDelay
-	go scope.readEventsWithTiming(scopeCtx, after, reconnectDelay)
+	go scope.readEvents(scopeCtx)
 
 	select {
-	case event := <-scope.events:
-		if event.Type != eventTypeServerConnected {
+	case item := <-scope.eventStream:
+		if item.Terminal != nil {
 			closeErr := scope.Close(context.Background())
 
-			return nil, errors.Join(fmt.Errorf("first directory-scoped event was %q", event.Type), closeErr)
+			return nil, errors.Join(fmt.Errorf("opencode directory event stream failed: %w", item.Terminal), closeErr)
 		}
-	case err := <-scope.errs:
-		closeErr := scope.Close(context.Background())
 
-		return nil, errors.Join(fmt.Errorf("opencode directory event stream failed: %w", err), closeErr)
+		if item.Event == nil || item.Event.Type != eventTypeServerConnected {
+			closeErr := scope.Close(context.Background())
+			eventType := ""
+
+			if item.Event != nil {
+				eventType = item.Event.Type
+			}
+
+			return nil, errors.Join(fmt.Errorf("first directory-scoped event was %q", eventType), closeErr)
+		}
 	case <-ctx.Done():
 		closeErr := scope.Close(context.Background())
 
@@ -1890,12 +1907,8 @@ func (s *openCodeServer) disconnectMCP(ctx context.Context) error {
 	return s.unregisterMCP(disconnectCtx)
 }
 
-func (s *openCodeServer) Events() <-chan Event {
-	return s.events
-}
-
-func (s *openCodeServer) EventErrors() <-chan error {
-	return s.errs
+func (s *openCodeServer) EventStream() <-chan EventStreamItem {
+	return s.eventStream
 }
 
 func (s *openCodeServer) RuntimeExited() <-chan struct{} {
@@ -2477,7 +2490,7 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("opencode %s %s returned %s: %s", e.Method, e.Path, e.Status, e.Body)
+	return fmt.Sprintf("opencode %s %s returned %s", e.Method, e.Path, e.Status)
 }
 
 func IsBadRequest(err error) bool {
@@ -2502,65 +2515,56 @@ func (s *openCodeServer) blockingHTTPClient() *http.Client {
 }
 
 func (s *openCodeServer) readEvents(ctx context.Context) {
-	s.readEventsWithTiming(ctx, openCodeAfter, openCodeEventReconnectDelay)
-}
+	var err error
 
-func (s *openCodeServer) readEventsWithTiming(ctx context.Context, after func(time.Duration) <-chan time.Time, reconnectDelay time.Duration) {
-	for {
-		epoch := s.nextStreamEpoch()
-		if err := s.readEventStream(ctx, epoch); err != nil {
-			select {
-			case s.errs <- StreamError{Epoch: epoch, Err: err}:
-			default:
-			}
+	defer func() {
+		if recover() != nil {
+			err = errors.New("opencode SSE producer panicked")
 		}
 
-		select {
-		case <-s.closed:
-			return
-		case <-ctx.Done():
-			return
-		case <-after(reconnectDelay):
+		s.publishEventStreamTerminal(ctx, err)
+	}()
+
+	read := s.readEventStream
+	if s.eventReader != nil {
+		read = s.eventReader
+	}
+
+	err = read(ctx)
+}
+
+func (s *openCodeServer) publishEventStreamTerminal(ctx context.Context, err error) {
+	defer func() { _ = recover() }()
+
+	if err == nil {
+		return
+	}
+
+	select {
+	case <-s.closed:
+		return
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	select {
+	case s.eventStream <- EventStreamItem{Terminal: err}:
+	case <-s.closed:
+	case <-ctx.Done():
+	}
+}
+
+func (s *openCodeServer) readEventStream(ctx context.Context) error {
+	return s.readEventStreamWithLimit(ctx, sseEventLimitBytes)
+}
+
+func (s *openCodeServer) readEventStreamWithLimit(ctx context.Context, eventLimit int) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("opencode SSE reader panicked")
 		}
-	}
-}
-
-func (s *openCodeServer) nextStreamEpoch() uint64 {
-	s.streamMu.Lock()
-	defer s.streamMu.Unlock()
-
-	s.streamEpoch++
-
-	return s.streamEpoch
-}
-
-type StreamError struct {
-	Epoch uint64
-	Err   error
-}
-
-func (e StreamError) Error() string {
-	return e.Err.Error()
-}
-
-func (e StreamError) Unwrap() error {
-	return e.Err
-}
-
-func StreamErrorEpoch(err error) uint64 {
-	var streamErr StreamError
-	if errors.As(err, &streamErr) {
-		return streamErr.Epoch
-	}
-
-	return 0
-}
-
-func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) error {
-	var epoch uint64
-	if len(epochs) > 0 {
-		epoch = epochs[0]
-	}
+	}()
 
 	eventURL := s.baseURL + routeEvent
 	if s.directory != "" {
@@ -2582,9 +2586,9 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
-		return fmt.Errorf("opencode event stream returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return fmt.Errorf("opencode event stream returned %s", resp.Status)
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -2605,9 +2609,8 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 			return err
 		}
 
-		event.StreamEpoch = epoch
 		select {
-		case s.events <- event:
+		case s.eventStream <- EventStreamItem{Event: &event}:
 		case <-s.closed:
 			return io.EOF
 		case <-ctx.Done():
@@ -2628,11 +2631,22 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 		}
 
 		if strings.HasPrefix(line, "data:") {
+			fragment := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+
+			separator := 0
 			if data.Len() > 0 {
+				separator = 1
+			}
+
+			if eventLimit <= 0 || data.Len()+separator > eventLimit || len(fragment) > eventLimit-data.Len()-separator {
+				return ErrSSEEventTooLarge
+			}
+
+			if separator != 0 {
 				data.WriteByte('\n')
 			}
 
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			data.WriteString(fragment)
 		}
 	}
 
@@ -3499,10 +3513,10 @@ func drainProcessPipe(log *slog.Logger, name string, reader io.Reader) {
 	scanner.Buffer(make([]byte, 0, 4096), 64*1024)
 
 	for scanner.Scan() {
-		if log != nil {
-			log.Debug("opencode process output", slog.String("pipe", name), slog.String("line", scanner.Text()))
-		}
 	}
+
+	_ = log
+	_ = name
 }
 
 func IntFromNumber(value any) (int, bool) {

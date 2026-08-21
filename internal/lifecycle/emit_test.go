@@ -2,6 +2,8 @@ package lifecycle
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -71,6 +73,126 @@ func TestEmittedPromptStreamReducesThroughItsOwnValidator(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, ActionAccepted, action.State)
 	require.True(t, state.Vacant())
+}
+
+func TestEmitterTurnAndActionRegistriesFailAtTheirExactBounds(t *testing.T) {
+	t.Run("frames", func(t *testing.T) {
+		stream := NewStream("stream-frames", fullyProven())
+		_, err := stream.Emit(SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "cycle-0"}, nil, QuiescenceFact{}))
+		require.NoError(t, err)
+		for index := 1; index < EmitterFrameLimit; index++ {
+			_, err = stream.Emit(QuiescenceEvent(QuiescenceFact{}))
+			require.NoError(t, err)
+		}
+		_, err = stream.Emit(QuiescenceEvent(QuiescenceFact{}))
+		require.ErrorIs(t, err, ErrEmitterFrameLimit)
+		require.Equal(t, uint64(EmitterFrameLimit), stream.State().ReducedThrough)
+	})
+
+	t.Run("frame batch preflight", func(t *testing.T) {
+		stream := NewStream("stream-frame-batch", fullyProven())
+		_, err := stream.Emit(SnapshotEvent(
+			Foreground{State: ForegroundIdle, CycleID: "cycle-0"}, nil, QuiescenceFact{},
+		))
+		require.NoError(t, err)
+
+		for index := 1; index < EmitterFrameLimit-1; index++ {
+			_, err = stream.Emit(QuiescenceEvent(QuiescenceFact{}))
+			require.NoError(t, err)
+		}
+
+		before := stream.State().ReducedThrough
+		err = stream.Preflight(
+			QuiescenceEvent(QuiescenceFact{}),
+			QuiescenceEvent(QuiescenceFact{}),
+		)
+		require.ErrorIs(t, err, ErrEmitterFrameLimit)
+		require.Equal(t, before, stream.State().ReducedThrough)
+
+		_, err = stream.Emit(QuiescenceEvent(QuiescenceFact{}))
+		require.NoError(t, err, "batch preflight consumed the last frame")
+	})
+
+	t.Run("turns", func(t *testing.T) {
+		stream := NewStream("stream-turns", promptContained())
+		_, err := stream.Emit(SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "cycle-0"}, nil, QuiescenceFact{}))
+		require.NoError(t, err)
+		for index := 0; index < EmitterTurnLimit; index++ {
+			turnID := fmt.Sprintf("turn-%d", index)
+			cycleID := fmt.Sprintf("cycle-%d", index)
+			_, err = stream.Emit(AcceptedEvent(Submission{SubmissionID: fmt.Sprintf("submission-%d", index), ClientNonce: "nonce"}, turnID))
+			require.NoError(t, err)
+			_, err = stream.Emit(TransitionEvent(ForegroundRunning, cycleID, turnID, CauseSubmission))
+			require.NoError(t, err)
+			_, err = stream.Emit(IdleEvent(cycleID, turnID, StopReasonEndTurn, OutcomeSuccess))
+			require.NoError(t, err)
+		}
+		before := stream.State().ReducedThrough
+		for range 10 {
+			err = stream.Preflight(AcceptedEvent(
+				Submission{SubmissionID: "overflow", ClientNonce: "nonce"}, "turn-overflow"))
+			require.ErrorIs(t, err, ErrEmitterTurnLimit)
+		}
+		require.Equal(t, before, stream.State().ReducedThrough)
+		require.Len(t, stream.turns, EmitterTurnLimit)
+		_, err = stream.Emit(AcceptedEvent(Submission{SubmissionID: "overflow", ClientNonce: "nonce"}, "turn-overflow"))
+		require.ErrorIs(t, err, ErrEmitterTurnLimit)
+		require.Len(t, stream.turns, EmitterTurnLimit)
+	})
+
+	t.Run("actions", func(t *testing.T) {
+		stream := NewStream("stream-actions", promptContained())
+		_, err := stream.Emit(SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "cycle-0"}, nil, QuiescenceFact{}))
+		require.NoError(t, err)
+		_, err = stream.Emit(AcceptedEvent(Submission{SubmissionID: "submission", ClientNonce: "nonce"}, "turn-1"))
+		require.NoError(t, err)
+		_, err = stream.Emit(TransitionEvent(ForegroundRunning, "cycle-1", "turn-1", CauseSubmission))
+		require.NoError(t, err)
+		for index := 0; index < EmitterActionLimit; index++ {
+			actionID := fmt.Sprintf("action-%d", index)
+			_, err = stream.Emit(ActionEvent(PendingAction(actionID, ActionPermission, Owner{Type: OwnerTurn, ID: "turn-1"}, false)))
+			require.NoError(t, err)
+			_, err = stream.Emit(ActionEvent(ResolvedAction(actionID, ActionAccepted)))
+			require.NoError(t, err)
+		}
+		before := stream.State().ReducedThrough
+		for range 10 {
+			err = stream.Preflight(ActionEvent(PendingAction(
+				"action-overflow", ActionPermission, Owner{Type: OwnerTurn, ID: "turn-1"}, false,
+			)))
+			require.ErrorIs(t, err, ErrEmitterActionLimit)
+		}
+		require.Equal(t, before, stream.State().ReducedThrough)
+		require.Len(t, stream.actions, EmitterActionLimit)
+		_, err = stream.Emit(ActionEvent(PendingAction("action-overflow", ActionPermission, Owner{Type: OwnerTurn, ID: "turn-1"}, false)))
+		require.ErrorIs(t, err, ErrEmitterActionLimit)
+		require.Len(t, stream.actions, EmitterActionLimit)
+	})
+}
+
+func TestEmitterPreflightRejectsFailedAndMalformedBatchesWithoutRetention(t *testing.T) {
+	failed := NewStream("failed", fullyProven())
+	failed.failed = errors.New("latched")
+	require.ErrorContains(t, failed.Preflight(QuiescenceEvent(QuiescenceFact{})), "latched")
+	_, err := failed.Emit(QuiescenceEvent(QuiescenceFact{}))
+	require.ErrorContains(t, err, "latched")
+
+	stream := NewStream("malformed", fullyProven())
+	require.ErrorIs(t, stream.Preflight(Event{Type: EventType("unknown")}),
+		&ViolationError{Kind: ViolationUnknownEventType})
+	require.ErrorIs(t, stream.Preflight(Event{Type: EventSnapshot}),
+		&ViolationError{Kind: ViolationMalformedEnvelope})
+
+	require.NoError(t, stream.Preflight(
+		Event{Type: EventSnapshot, Snapshot: &Snapshot{
+			Foreground: Foreground{},
+			Activities: []ActivityUpdate{{OriginTurnID: ""}, {OriginTurnID: "activity-turn"}},
+			Actions:    []ActionUpdate{{ActionID: ""}, {ActionID: "snapshot-action"}},
+		}},
+		Event{Type: EventStateUpdate, State: &StateTransition{
+			State: ForegroundRunning, Cause: CauseActivity, TurnID: "agent-turn",
+		}},
+	))
 }
 
 // TestEmittedEndingIdleRecordsHowItSettled proves the emitter is held to the same

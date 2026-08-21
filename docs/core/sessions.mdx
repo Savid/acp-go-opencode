@@ -105,9 +105,11 @@ which is the first lifecycle-bearing notification of that session's stream, and
 then the initial `available_commands_update` carrying native slash-command
 discovery. Neither can arrive before the response that names the session it
 speaks for, and a failure to publish either is logged rather than turned into a
-failed lifecycle response. Both updates are lifecycle-scoped and omit a turn
-route. Command refresh caused by a slash-command prompt is turn-scoped and
-carries that prompt's exact route envelope.
+failed response whose frame was already delivered. The failed update still
+fences and contains the exact native generation; it is never treated as a
+successful log-and-continue delivery. Both updates are lifecycle-scoped and omit
+a turn route. Command refresh caused by a slash-command prompt is turn-scoped
+and carries that prompt's exact route envelope.
 
 A session start that fails on a caller-supplied option — a seeded file the
 runtime home cannot accept, a start path that is not absolute, an unusable
@@ -127,9 +129,10 @@ Only a session fenced to that current runtime generation can publish its route
 and send the prompt; a replacement that crashes during reconstruction is
 discarded without routing the user prompt to it.
 
-Cancel and turn timeout retire the exact runtime generation used by that turn;
-stream/control failures use the same fence when native work may remain. All
-concurrent observers join one
+Routine cancel and turn timeout interrupt only the addressed session and wait
+for its native idle acknowledgement. A native stream gap, runtime exit, or host
+delivery failure instead retires the exact runtime generation that produced the
+unprovable sequence. All concurrent observers join one
 memoized base-runtime shutdown result. Retirement detaches every directory
 scope on that generation, completes the selected native containment boundary,
 and only then permits a replacement generation. The authoritative Linux

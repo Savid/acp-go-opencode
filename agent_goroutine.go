@@ -27,10 +27,10 @@ func handleAgentGoroutinePanic(ctx context.Context, log *slog.Logger, name strin
 		log = slog.Default()
 	}
 
-	log.ErrorContext(ctx, "agent goroutine panic", slog.String("goroutine", name), slog.Any("panic", recovered))
+	log.ErrorContext(ctx, "agent goroutine panic", slog.String("goroutine", name))
 
 	if shutdown != nil {
-		shutdown(recovered)
+		shutdown("agent goroutine panicked")
 	}
 }
 
