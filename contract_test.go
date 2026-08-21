@@ -237,7 +237,7 @@ func TestLifecycleMetaStrictAllowlist(t *testing.T) {
 	}{
 		{name: "foreign ignored", meta: map[string]any{"codex": map[string]any{"deleted": true}}},
 		{name: "trace ignored", meta: map[string]any{"traceparent": "00-abc"}},
-		{name: "own unknown rejected", meta: map[string]any{opencodeMetaKey: map[string]any{"goals": []any{}}}, err: true},
+		{name: "own unknown rejected", meta: map[string]any{opencodeMetaKey: map[string]any{"unknown": []any{}}}, err: true},
 		{name: "own option unknown rejected", meta: map[string]any{opencodeMetaKey: map[string]any{"options": map[string]any{"foo": "bar"}}}, err: true},
 	}
 	for _, tt := range tests {

@@ -922,3 +922,22 @@ func TestCorrectionActionAdmissionAndSettlementBranches(t *testing.T) {
 	_ = client
 	_ = connection
 }
+
+// TestUnroutableNativeActionsAreDroppedOnARetiredIncarnation proves the courtesy
+// answer to a request this session cannot route is addressed to the incarnation
+// that asked for it. Once that incarnation is retired, the answer is dropped
+// rather than sent down a stream this session no longer speaks for.
+func TestUnroutableNativeActionsAreDroppedOnARetiredIncarnation(t *testing.T) {
+	current, client, _ := lifecycleSession(t)
+	current.stopPump()
+
+	native := current.idmap.NativeSessionID
+	retired := &nativeIncarnationBinding{client: client, registry: newActionRegistry()}
+	ctx := withNativeIncarnationBinding(context.Background(), retired)
+
+	current.declineNativePermission(ctx, opencode.PermissionRequest{ID: "permission-1", SessionID: native})
+	current.declineNativeQuestion(ctx, opencode.QuestionRequest{ID: "question-1", SessionID: native})
+
+	require.Zero(t, client.permissionReplyCount(), "a retired incarnation answered a permission")
+	require.Zero(t, client.questionRejectCount(), "a retired incarnation answered a question")
+}

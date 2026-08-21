@@ -497,8 +497,10 @@ func nativeObservation(ctx context.Context) *nativeEventObservation {
 // single turn is punctuated by session.updated, and the bus also publishes
 // session, project, catalog and integration notifications — so membership here is
 // what separates an event that can name an owner from one that only passes
-// through. A type this adapter starts reading and forgets to name here stays
-// inert, which is the harmless direction.
+// through. A type applyNativeEvent reads without naming here is observed inert,
+// so its reading runs against no cycle — for a settle-shaped type that silently
+// discards the evidence that ends a turn. The two sets are therefore held equal
+// by test rather than by care.
 func nativeEventDecoded(eventType string) bool {
 	switch eventType {
 	case opencode.EventSessionIdle, opencode.EventSessionStatus, opencode.EventSessionError,

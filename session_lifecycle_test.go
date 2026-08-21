@@ -1411,7 +1411,12 @@ func TestAgentOriginCycleThatCannotBeAnnouncedIsNeverOpened(t *testing.T) {
 	})
 
 	requireEventually(t, func() bool { return current.lifecycleFailure() != nil }, "the transition failure was swallowed")
-	require.Nil(t, current.currentCycle(), "an unannounced cycle was opened anyway")
+
+	// The containment that answers the undeliverable transition retires the cycle
+	// after latching the failure, so the retirement is what this waits on. Reading
+	// the cycle pointer under the lifecycle mutex — never formatting the struct
+	// behind it — keeps the wait off the fields that containment still writes.
+	requireEventually(t, func() bool { return current.currentCycle() == nil }, "an unannounced cycle was opened anyway")
 }
 
 // TestASecondForegroundCycleIsRefused proves the foreground is single-occupancy:

@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
+	"sort"
 	"sync"
 	"testing"
 
@@ -817,4 +821,114 @@ func TestCorrectionObservedOwnershipAndNativeFailureBranches(t *testing.T) {
 	nilCycleCtx := context.WithValue(context.Background(), nativeEventObservationKey{},
 		&nativeEventObservation{binding: binding, ownership: nativeEventPromptBeforeEvidence})
 	require.NoError(t, current.applyNativeStatus(nilCycleCtx, busy))
+}
+
+// nativeEventSwitchTypes reads the opencode event constants that one function's
+// own dispatch switch in session_pump.go names. A switch nested inside another
+// statement — applyNativeEvent's ownership gate — is deliberately not one of them.
+func nativeEventSwitchTypes(t *testing.T, function string) []string {
+	t.Helper()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "session_pump.go", nil, parser.SkipObjectResolution)
+	require.NoError(t, err)
+
+	types := make([]string, 0, 24)
+	found := false
+
+	for _, declaration := range file.Decls {
+		declared, ok := declaration.(*ast.FuncDecl)
+		if !ok || declared.Name.Name != function {
+			continue
+		}
+
+		for _, statement := range declared.Body.List {
+			dispatch, isSwitch := statement.(*ast.SwitchStmt)
+			if !isSwitch {
+				continue
+			}
+
+			require.False(t, found, "%s declares more than one dispatch switch", function)
+			found = true
+
+			for _, entry := range dispatch.Body.List {
+				clause, isClause := entry.(*ast.CaseClause)
+				require.True(t, isClause, "%s dispatches on something other than cases", function)
+
+				for _, expression := range clause.List {
+					selector, isSelector := expression.(*ast.SelectorExpr)
+					require.True(t, isSelector, "%s names a case that is not an opencode event constant", function)
+					types = append(types, selector.Sel.Name)
+				}
+			}
+		}
+	}
+
+	require.True(t, found, "%s declares no dispatch switch", function)
+	sort.Strings(types)
+
+	return types
+}
+
+// TestEveryReadNativeEventTypeIsNamedDecoded binds the two hand-written type sets
+// that decide a native event's fate. nativeEventDecoded settles ownership and
+// applyNativeEvent settles the reading, so a type read without being named
+// decoded is observed inert and read against no cycle — for a settle-shaped type,
+// that silently discards the evidence that ends a turn.
+func TestEveryReadNativeEventTypeIsNamedDecoded(t *testing.T) {
+	t.Parallel()
+
+	decoded := nativeEventSwitchTypes(t, "nativeEventDecoded")
+	require.NotEmpty(t, decoded)
+	require.Equal(t, decoded, nativeEventSwitchTypes(t, "applyNativeEvent"))
+}
+
+// TestUnidentifiedNativeStepsNameNoCycle proves cycle membership is decided by a
+// native id and nothing else: a message carrying none is neither owned nor
+// adopted, and a part frame this adapter cannot read addresses no cycle even
+// while that cycle's dispatch is already proven.
+func TestUnidentifiedNativeStepsNameNoCycle(t *testing.T) {
+	t.Parallel()
+
+	cycle := &foregroundCycle{
+		origin: lifecycle.CauseSubmission, nativeMessageID: "msg_user", dispatchProven: true,
+	}
+
+	require.False(t, cycle.ownsAssistant(""))
+
+	cycle.adoptAssistant(opencode.NativeMessageInfo{Finish: "stop"})
+	require.Empty(t, cycle.assistantIDs)
+	require.Empty(t, cycle.assistantID)
+	require.False(t, cycle.assistantTerminal)
+
+	require.False(t, nativeEventCausallyMatchesCycleLocked(opencode.Event{
+		Type:       opencode.EventMessagePartUpdated,
+		Properties: mustJSONValue(map[string]any{"sessionID": "native-1", "part": map[string]any{"id": "prt_text"}}),
+	}, cycle))
+}
+
+// TestPumpDropsAnEventReceivedForARetiredBinding proves the pump drains for
+// exactly one incarnation: an event this session's binding no longer speaks for
+// is read off the stream and dropped rather than queued for a routing pass that
+// would attribute it to whatever replaced that binding.
+func TestPumpDropsAnEventReceivedForARetiredBinding(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeOpenCodeClient()
+	retired := &nativeIncarnationBinding{client: client, registry: newActionRegistry()}
+	replaced := &session{idmap: idmapRecord{NativeSessionID: "native"}}
+	pump := &sessionPump{
+		session: replaced, binding: retired,
+		hold: make(chan chan error), released: make(chan struct{}, 1), done: make(chan struct{}),
+	}
+
+	client.eventStream <- opencode.EventStreamItem{Event: &opencode.Event{
+		Type:       opencode.EventSessionIdle,
+		Properties: mustJSONValue(map[string]any{"sessionID": "native"}),
+	}}
+	client.eventStream <- opencode.EventStreamItem{Terminal: errors.New("stream over")}
+
+	pump.run(context.Background())
+	<-pump.done
+
+	require.Empty(t, pump.held, "an event for a retired binding was queued for routing")
 }
