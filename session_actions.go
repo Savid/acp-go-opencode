@@ -342,6 +342,31 @@ func (s *session) validateHostActionFrame(action *pendingAction) error {
 	return nil
 }
 
+// declineNativePermission answers a permission this session cannot route and
+// forgets it. A request that arrives before the prompt it might belong to has
+// proved its own dispatch names no turn here, and leaving it unanswered would
+// strand the harness waiting on a decision nobody will make. Nothing about an
+// unroutable request is a fact about the runtime's health.
+func (s *session) declineNativePermission(ctx context.Context, req opencode.PermissionRequest) {
+	binding := s.nativeIncarnationForContext(ctx)
+	if binding == nil || binding.client == nil || !s.incarnationIsCurrent(binding) {
+		return
+	}
+
+	_ = binding.client.ReplyPermission(ctx, req, permissionReplyReject, "unroutable native permission")
+}
+
+// declineNativeQuestion is declineNativePermission for a question: the harness is
+// answered, the request is dropped, and the incarnation lives on.
+func (s *session) declineNativeQuestion(ctx context.Context, req opencode.QuestionRequest) {
+	binding := s.nativeIncarnationForContext(ctx)
+	if binding == nil || binding.client == nil || !s.incarnationIsCurrent(binding) {
+		return
+	}
+
+	_ = binding.client.RejectQuestion(ctx, req)
+}
+
 func (s *session) refuseNativeAction(
 	ctx context.Context,
 	action *pendingAction,

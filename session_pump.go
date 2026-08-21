@@ -54,6 +54,9 @@ const (
 	nativeEventAgent nativeEventOwnership = iota
 	nativeEventPromptBeforeEvidence
 	nativeEventCycle
+	// nativeEventInert marks an event this adapter has no structured reading
+	// for. It is still delivered raw, but it owns nothing and settles nothing.
+	nativeEventInert
 )
 
 // nativeEventObservation fixes ownership at the instant the pump accepts an
@@ -315,17 +318,6 @@ func (s *session) routeNativeEventForIncarnation(
 
 	if observation != nil && observation.ownership == nativeEventAgent {
 		defer s.completeAgentObservation(observation)
-
-		if event.Type != opencode.EventSessionError && event.Type != opencode.EventSessionIdle {
-			s.lifecycleMu.Lock()
-			blocked := observation.binding == s.incarnation && observation.cycle == nil &&
-				s.cycle != nil && s.cycle.origin == lifecycle.CauseSubmission
-			s.lifecycleMu.Unlock()
-
-			if blocked {
-				return errors.New("agent-owned native event reached routing before lifecycle ownership")
-			}
-		}
 	}
 
 	if sessionID, named := opencode.EventSessionID(event); named && sessionID != s.idmap.NativeSessionID {
@@ -355,6 +347,12 @@ func (s *session) observeNativeEvent(
 	}
 
 	observation := &nativeEventObservation{binding: binding}
+
+	if !nativeEventDecoded(event.Type) {
+		observation.ownership = nativeEventInert
+
+		return observation, true
+	}
 
 	cycle := s.cycle
 	if cycle == nil {
@@ -423,24 +421,23 @@ func nativeEventCausallyMatchesCycleLocked(event opencode.Event, cycle *foregrou
 	case opencode.EventMessageUpdated:
 		info, ok := eventMessageInfo(event.Properties)
 		if !ok || info.Role != roleAssistant ||
-			(info.ParentID != cycle.nativeMessageID && (cycle.assistantID == "" || info.ID != cycle.assistantID)) {
+			(info.ParentID != cycle.nativeMessageID && !cycle.ownsAssistant(info.ID)) {
 			return false
 		}
 
-		if cycle.assistantID != "" && cycle.assistantID != info.ID {
-			return false
-		}
-
-		cycle.assistantID = info.ID
-		if info.Finish != "" || info.Time.Completed > 0 {
-			cycle.assistantTerminal = true
-		}
+		cycle.adoptAssistant(info)
 
 		return true
 	case opencode.EventMessagePartCreated, opencode.EventMessagePartUpdated:
 		part, _, ok := eventPartUpdate(event.Properties)
+		if !ok {
+			return false
+		}
 
-		return ok && cycle.assistantID != "" && part.MessageID == cycle.assistantID
+		// OpenCode echoes the parts of the dispatched user message back over the
+		// stream, so the prompt's own message is one of the identities its cycle
+		// owns.
+		return part.MessageID == cycle.nativeMessageID || cycle.ownsAssistant(part.MessageID)
 	case opencode.EventSessionIdle:
 		return cycle.assistantTerminal || cycle.interrupted
 	case opencode.EventSessionError:
@@ -451,13 +448,11 @@ func nativeEventCausallyMatchesCycleLocked(event opencode.Event, cycle *foregrou
 			return false
 		}
 
-		messageID := request.ToolCall().MessageID
-
-		return messageID != "" && messageID == cycle.assistantID
+		return cycle.claimsRequest(request.ToolCall().MessageID)
 	case opencode.EventQuestionV2Asked, opencode.EventQuestionAsked:
 		request, ok := eventQuestion(event.Properties)
 
-		return ok && request.Tool.MessageID != "" && request.Tool.MessageID == cycle.assistantID
+		return ok && cycle.claimsRequest(request.Tool.MessageID)
 	case opencode.EventPermissionV2Replied, opencode.EventPermissionReplied,
 		opencode.EventQuestionV2Replied, opencode.EventQuestionReplied,
 		opencode.EventQuestionV2Rejected, opencode.EventQuestionRejected:
@@ -495,6 +490,29 @@ func nativeObservation(ctx context.Context) *nativeEventObservation {
 	observation, _ := ctx.Value(nativeEventObservationKey{}).(*nativeEventObservation)
 
 	return observation
+}
+
+// nativeEventDecoded reports whether one native event type has a structured
+// reading below. OpenCode's bus carries far more than an ACP adapter reads — a
+// single turn is punctuated by session.updated, and the bus also publishes
+// session, project, catalog and integration notifications — so membership here is
+// what separates an event that can name an owner from one that only passes
+// through. A type this adapter starts reading and forgets to name here stays
+// inert, which is the harmless direction.
+func nativeEventDecoded(eventType string) bool {
+	switch eventType {
+	case opencode.EventSessionIdle, opencode.EventSessionStatus, opencode.EventSessionError,
+		opencode.EventMessageUpdated, opencode.EventMessagePartCreated, opencode.EventMessagePartUpdated,
+		opencode.EventTodoUpdated,
+		opencode.EventPermissionV2Asked, opencode.EventPermissionAsked,
+		opencode.EventQuestionV2Asked, opencode.EventQuestionAsked,
+		opencode.EventPermissionV2Replied, opencode.EventPermissionReplied,
+		opencode.EventQuestionV2Replied, opencode.EventQuestionReplied,
+		opencode.EventQuestionV2Rejected, opencode.EventQuestionRejected:
+		return true
+	default:
+		return false
+	}
 }
 
 // applyNativeEvent is the session's structured reading of the native event set.
@@ -641,8 +659,8 @@ func (s *session) markCycleRunning(ctx context.Context) error {
 }
 
 // applyNativeMessageInfo records the role a message declared and, for an
-// assistant message, the identity the settling turn reads its usage and stop
-// reason from. OpenCode publishes this before any part event for that message.
+// assistant message, adopts it as a step of the open cycle. OpenCode publishes
+// this before any part event for that message.
 func (s *session) applyNativeMessageInfo(ctx context.Context, event opencode.Event) error {
 	info, ok := eventMessageInfo(event.Properties)
 	if !ok || info.SessionID != s.idmap.NativeSessionID {
@@ -667,14 +685,7 @@ func (s *session) applyNativeMessageInfo(ctx context.Context, event opencode.Eve
 	cycle, _ := s.observedCycleLocked(ctx, false)
 
 	if cycle != nil {
-		if cycle.assistantID != "" && cycle.assistantID != info.ID {
-			return errors.New("OpenCode turn published conflicting assistant identities")
-		}
-
-		cycle.assistantID = info.ID
-		if info.Finish != "" || info.Time.Completed > 0 {
-			cycle.assistantTerminal = true
-		}
+		cycle.adoptAssistant(info)
 	}
 
 	return nil
@@ -710,10 +721,6 @@ func (s *session) applyNativeTodos(ctx context.Context, event opencode.Event) er
 }
 
 func (s *session) applyNativePermissionAsked(ctx context.Context, event opencode.Event) error {
-	if observation := nativeObservation(ctx); observation != nil && observation.ownership == nativeEventPromptBeforeEvidence {
-		return invalidRoute("permission arrived before request-specific prompt dispatch evidence")
-	}
-
 	var req opencode.PermissionRequest
 	if err := json.Unmarshal(event.Properties, &req); err != nil {
 		return err
@@ -725,14 +732,16 @@ func (s *session) applyNativePermissionAsked(ctx context.Context, event opencode
 		req.ReplyRoute = opencode.PermissionRouteSession
 	}
 
+	if observation := nativeObservation(ctx); observation != nil && observation.ownership == nativeEventPromptBeforeEvidence {
+		s.declineNativePermission(ctx, req)
+
+		return nil
+	}
+
 	return s.routeNativePermission(ctx, req)
 }
 
 func (s *session) applyNativeQuestionAsked(ctx context.Context, event opencode.Event) error {
-	if observation := nativeObservation(ctx); observation != nil && observation.ownership == nativeEventPromptBeforeEvidence {
-		return invalidRoute("question arrived before request-specific prompt dispatch evidence")
-	}
-
 	req, ok := eventQuestion(event.Properties)
 	if !ok {
 		return errors.New("invalid OpenCode question event")
@@ -742,6 +751,12 @@ func (s *session) applyNativeQuestionAsked(ctx context.Context, event opencode.E
 		req.ReplyRoute = opencode.QuestionRouteAPI
 	} else {
 		req.ReplyRoute = opencode.QuestionRouteSession
+	}
+
+	if observation := nativeObservation(ctx); observation != nil && observation.ownership == nativeEventPromptBeforeEvidence {
+		s.declineNativeQuestion(ctx, req)
+
+		return nil
 	}
 
 	return s.routeNativeQuestion(ctx, req)
@@ -822,7 +837,7 @@ func (s *session) observedCycleLocked(ctx context.Context, openAgent bool) (*for
 	}
 
 	switch observation.ownership {
-	case nativeEventPromptBeforeEvidence:
+	case nativeEventPromptBeforeEvidence, nativeEventInert:
 		return nil, nil
 	case nativeEventCycle:
 		if observation.cycle != nil && s.cycle == observation.cycle {

@@ -40,9 +40,12 @@ type foregroundCycle struct {
 	// that the one ending transition has been emitted.
 	idle    bool
 	settled bool
-	// failure is the native turn failure this cycle carries, and assistantID the
-	// native assistant message it produced.
+	// failure is the native turn failure this cycle carries. OpenCode answers one
+	// turn with a new assistant message per step, so assistantIDs holds every step
+	// this cycle owns and assistantID names the newest of them — the step whose
+	// stop reason and usage settle the turn.
 	failure           error
+	assistantIDs      map[string]struct{}
 	assistantID       string
 	assistantTerminal bool
 	// lost records that the cycle ended with no native terminal signal at all,
@@ -65,6 +68,52 @@ type foregroundCycle struct {
 	refused bool
 	// signal closes exactly once, when the cycle acquires terminal evidence.
 	signal chan struct{}
+}
+
+// ownsAssistant reports whether one native assistant message is a step of this
+// cycle.
+func (c *foregroundCycle) ownsAssistant(id string) bool {
+	if id == "" {
+		return false
+	}
+
+	_, ok := c.assistantIDs[id]
+
+	return ok
+}
+
+// claimsRequest reports whether a native request naming this assistant message
+// concerns this cycle. OpenCode asks session-level questions with no tool and so
+// no message to correlate on; such a request names no other work either, so a
+// cycle whose dispatch is already proven is the only thing it can concern.
+func (c *foregroundCycle) claimsRequest(messageID string) bool {
+	if messageID == "" {
+		return c.dispatchProven
+	}
+
+	return c.ownsAssistant(messageID)
+}
+
+// adoptAssistant records one native assistant message as a step of this cycle.
+// assistantID follows the order the steps were created in, so it names the last
+// step rather than the first, and a re-published earlier step never displaces it.
+func (c *foregroundCycle) adoptAssistant(info opencode.NativeMessageInfo) {
+	if info.ID == "" {
+		return
+	}
+
+	if _, known := c.assistantIDs[info.ID]; !known {
+		if c.assistantIDs == nil {
+			c.assistantIDs = make(map[string]struct{}, 1)
+		}
+
+		c.assistantIDs[info.ID] = struct{}{}
+		c.assistantID = info.ID
+	}
+
+	if info.Finish != "" || info.Time.Completed > 0 {
+		c.assistantTerminal = true
+	}
 }
 
 // terminalEvidence reports whether the cycle has native terminal evidence: the

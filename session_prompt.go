@@ -871,12 +871,18 @@ func (s *session) cycleFailure(cycle *foregroundCycle) error {
 	return cycle.failure
 }
 
-// finalAssistantMessage reads the native assistant message this turn produced.
-// The identity comes from the ordered stream rather than from a guess, and the
+// finalAssistantMessage reads the native assistant message this turn ends on.
+// OpenCode answers one turn in steps, each its own assistant message, and only
+// the last of them carries the turn's stop reason, usage and structured output.
+// The identities come from the ordered stream rather than from a guess, and the
 // read happens once, after the native idle event, rather than on a poll.
 func (s *session) finalAssistantMessage(ctx context.Context, cycle *foregroundCycle) (opencode.NativeMessage, error) {
 	s.lifecycleMu.Lock()
-	assistantID := cycle.assistantID
+	steps := make(map[string]struct{}, len(cycle.assistantIDs))
+
+	for id := range cycle.assistantIDs {
+		steps[id] = struct{}{}
+	}
 	s.lifecycleMu.Unlock()
 
 	client := s.currentClient()
@@ -897,14 +903,14 @@ func (s *session) finalAssistantMessage(ctx context.Context, cycle *foregroundCy
 			continue
 		}
 
-		if message.Info.ID == assistantID {
+		if _, owned := steps[message.Info.ID]; owned {
 			final = message
 
 			break
 		}
 	}
 
-	if assistantID == "" || final.Info.ID == "" {
+	if len(steps) == 0 || final.Info.ID == "" {
 		return opencode.NativeMessage{}, errTurnAssistantIdentityMissing
 	}
 

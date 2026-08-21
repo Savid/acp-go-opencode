@@ -94,31 +94,193 @@ func TestReceivedAutonomousEventOwnsBeforeLaterPromptCanReserve(t *testing.T) {
 	current.delivery.close()
 }
 
-func TestAgentEventCannotRouteBeforeDeferredOwnership(t *testing.T) {
+// nativeMessageUpdated builds a `message.updated` payload in the shape OpenCode
+// 1.18 publishes: the session named at the top level and again inside the message,
+// a step's parent naming the user message that caused the turn, and a finish
+// reason paired with a completion timestamp.
+func nativeMessageUpdated(sessionID, id, role, parentID, finish string) opencode.Event {
+	info := map[string]any{
+		"id": id, "sessionID": sessionID, "role": role,
+		"time": map[string]any{"created": 1786587079919},
+	}
+	if parentID != "" {
+		info["parentID"] = parentID
+	}
+
+	if finish != "" {
+		info["finish"] = finish
+		info["time"] = map[string]any{"created": 1786587079919, "completed": 1786587081000}
+	}
+
+	return opencode.Event{
+		Type:       opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"sessionID": sessionID, "info": info}),
+	}
+}
+
+// nativePartUpdated builds a `message.part.updated` payload. OpenCode addresses
+// every part to the message it belongs to, which for the echo of a dispatched
+// prompt is the user message itself.
+func nativePartUpdated(sessionID, messageID, partID, partType string) opencode.Event {
+	return opencode.Event{
+		Type: opencode.EventMessagePartUpdated,
+		Properties: mustJSONValue(map[string]any{"sessionID": sessionID, "part": map[string]any{
+			"id": partID, "sessionID": sessionID, "messageID": messageID,
+			"type": partType, "text": "step text",
+		}}),
+	}
+}
+
+// nativeSessionUpdated builds a `session.updated` payload. OpenCode publishes it
+// repeatedly inside a turn as cost, tokens and title move, and this adapter has no
+// structured reading for it.
+func nativeSessionUpdated(sessionID string) opencode.Event {
+	return opencode.Event{
+		Type: "session.updated",
+		Properties: mustJSONValue(map[string]any{"sessionID": sessionID, "info": map[string]any{
+			"id": sessionID, "slug": "curious-garden", "projectID": "global",
+			"title": "New session", "version": "1.18.18",
+		}}),
+	}
+}
+
+// TestPromptOwnsEveryStepOfOneNativeTurn walks the events one ordinary OpenCode
+// turn publishes. The harness answers a single prompt with a new assistant message
+// per step, echoes the prompt's own parts back, and punctuates the whole thing with
+// session.updated. Every frame here belongs to the prompt that caused it or to
+// nothing at all, and none of it is evidence against the runtime.
+func TestPromptOwnsEveryStepOfOneNativeTurn(t *testing.T) {
 	current, _, _ := lifecycleSession(t)
 	current.stopPump()
 	binding := testIncarnation(current)
+	native := current.idmap.NativeSessionID
 	ctx := withTurnRoute(context.Background(), "prompt")
-	cycle, _, err := current.reservePromptCycle(ctx, "prompt-message", lifecycle.Submission{
-		SubmissionID: "submission", ClientNonce: "client",
-	})
+	submission := lifecycle.Submission{SubmissionID: "submission", ClientNonce: "client"}
+	cycle, _, err := current.reservePromptCycle(ctx, "msg_user", submission)
 	require.NoError(t, err)
-	cycle.reserved = false
-	cycle.dispatchProven = true
+	require.NoError(t, current.acceptPromptCycle(ctx, cycle, submission))
 
-	event := opencode.Event{
-		Type: opencode.EventMessageUpdated,
-		Properties: mustJSONValue(map[string]any{"info": map[string]any{
-			"id": "autonomous", "sessionID": current.idmap.NativeSessionID, "role": "assistant",
-		}}),
+	for _, frame := range []struct {
+		name      string
+		event     opencode.Event
+		ownership nativeEventOwnership
+	}{
+		{"dispatched user message", nativeMessageUpdated(native, "msg_user", roleUser, "", ""), nativeEventCycle},
+		{"echoed prompt part", nativePartUpdated(native, "msg_user", "prt_user", "text"), nativeEventCycle},
+		{"mid-turn session update", nativeSessionUpdated(native), nativeEventInert},
+		{"first step", nativeMessageUpdated(native, "msg_step1", roleAssistant, "msg_user", "tool-calls"), nativeEventCycle},
+		{"first step tool part", nativePartUpdated(native, "msg_step1", "prt_tool", "tool"), nativeEventCycle},
+		{"second step", nativeMessageUpdated(native, "msg_step2", roleAssistant, "msg_user", "stop"), nativeEventCycle},
+		{"second step text part", nativePartUpdated(native, "msg_step2", "prt_text", "text"), nativeEventCycle},
+		{
+			"idle",
+			opencode.Event{Type: opencode.EventSessionIdle, Properties: mustJSONValue(map[string]any{"sessionID": native})},
+			nativeEventCycle,
+		},
+	} {
+		observation, ok := current.observeNativeEvent(binding, frame.event)
+		require.True(t, ok, frame.name)
+		require.Equal(t, frame.ownership, observation.ownership, frame.name)
+		require.NoError(t, current.routeNativeEventForIncarnation(ctx, binding, frame.event, observation), frame.name)
 	}
-	observation, currentBinding := current.observeNativeEvent(binding, event)
-	require.True(t, currentBinding)
-	require.Equal(t, nativeEventAgent, observation.ownership)
-	require.EqualError(t, current.routeNativeEventForIncarnation(
-		context.Background(), binding, event, observation,
-	), "agent-owned native event reached routing before lifecycle ownership")
-	require.Empty(t, current.messageRole("autonomous"))
+
+	require.Same(t, cycle, current.currentCycle())
+	require.True(t, cycle.ownsAssistant("msg_step1"))
+	require.Equal(t, "msg_step2", cycle.assistantID)
+	require.True(t, cycle.idle)
+	current.delivery.close()
+}
+
+// TestPromptOwnsRequestsFromAnyOfItsSteps proves the correlation a native request
+// carries is read against every step of the turn, not just its first, and that a
+// request naming no tool at all still belongs to the only cycle open.
+func TestPromptOwnsRequestsFromAnyOfItsSteps(t *testing.T) {
+	current, _, _ := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+	native := current.idmap.NativeSessionID
+	ctx := withTurnRoute(context.Background(), "prompt")
+	submission := lifecycle.Submission{SubmissionID: "submission", ClientNonce: "client"}
+	cycle, _, err := current.reservePromptCycle(ctx, "msg_user", submission)
+	require.NoError(t, err)
+	require.NoError(t, current.acceptPromptCycle(ctx, cycle, submission))
+
+	for _, event := range []opencode.Event{
+		nativeMessageUpdated(native, "msg_user", roleUser, "", ""),
+		nativeMessageUpdated(native, "msg_step1", roleAssistant, "msg_user", "tool-calls"),
+		nativeMessageUpdated(native, "msg_step2", roleAssistant, "msg_user", ""),
+	} {
+		observation, ok := current.observeNativeEvent(binding, event)
+		require.True(t, ok)
+		require.Equal(t, nativeEventCycle, observation.ownership)
+	}
+
+	for _, request := range []struct {
+		name  string
+		event opencode.Event
+	}{
+		{"permission from the second step", opencode.Event{
+			Type: opencode.EventPermissionV2Asked,
+			Properties: mustJSONValue(map[string]any{
+				"id": "per_1", "sessionID": native, "permission": "bash",
+				"tool": map[string]any{"messageID": "msg_step2", "callID": "call_1"},
+			}),
+		}},
+		{"question with no tool", opencode.Event{
+			Type: opencode.EventQuestionV2Asked,
+			Properties: mustJSONValue(map[string]any{
+				"id": "que_1", "sessionID": native,
+				"questions": []map[string]any{{"question": "which branch?"}},
+			}),
+		}},
+	} {
+		observation, ok := current.observeNativeEvent(binding, request.event)
+		require.True(t, ok, request.name)
+		require.Equal(t, nativeEventCycle, observation.ownership, request.name)
+		require.Same(t, cycle, observation.cycle, request.name)
+	}
+}
+
+// TestActionBeforeDispatchEvidenceIsDeclinedNotFatal proves an action this session
+// cannot route is answered and dropped. The harness is never left waiting, and the
+// runtime every peer session shares keeps running.
+func TestActionBeforeDispatchEvidenceIsDeclinedNotFatal(t *testing.T) {
+	current, client, _ := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+	native := current.idmap.NativeSessionID
+	ctx := withTurnRoute(context.Background(), "prompt")
+	submission := lifecycle.Submission{SubmissionID: "submission", ClientNonce: "client"}
+	cycle, _, err := current.reservePromptCycle(ctx, "msg_user", submission)
+	require.NoError(t, err)
+	require.NoError(t, current.acceptPromptCycle(ctx, cycle, submission))
+
+	permission := opencode.Event{
+		Type: opencode.EventPermissionV2Asked,
+		Properties: mustJSONValue(map[string]any{
+			"id": "per_1", "sessionID": native, "permission": "bash",
+			"tool": map[string]any{"messageID": "msg_earlier", "callID": "call_earlier"},
+		}),
+	}
+	question := opencode.Event{
+		Type: opencode.EventQuestionV2Asked,
+		Properties: mustJSONValue(map[string]any{
+			"id": "que_1", "sessionID": native,
+			"questions": []map[string]any{{"question": "which branch?"}},
+		}),
+	}
+
+	for _, event := range []opencode.Event{permission, question} {
+		observation, ok := current.observeNativeEvent(binding, event)
+		require.True(t, ok)
+		require.Equal(t, nativeEventPromptBeforeEvidence, observation.ownership)
+		require.NoError(t, current.routeNativeEventForIncarnation(ctx, binding, event, observation))
+	}
+
+	require.Equal(t, 1, client.permissionReplyCount())
+	require.Equal(t, permissionReplyReject, client.permissionReply(0).reply)
+	require.Equal(t, 1, client.questionRejectCount())
+	require.True(t, current.incarnationIsCurrent(binding))
 	require.Same(t, cycle, current.currentCycle())
 }
 
@@ -626,16 +788,19 @@ func TestCorrectionObservedOwnershipAndNativeFailureBranches(t *testing.T) {
 
 	current.lifecycleMu.Lock()
 	current.incarnation = binding
-	conflictCycle := &foregroundCycle{assistantID: "assistant-a"}
-	current.cycle = conflictCycle
+	stepCycle := &foregroundCycle{}
+	stepCycle.adoptAssistant(opencode.NativeMessageInfo{ID: "assistant-a"})
+	current.cycle = stepCycle
 	current.lifecycleMu.Unlock()
-	conflictCtx := context.WithValue(context.Background(), nativeEventObservationKey{},
-		&nativeEventObservation{binding: binding, ownership: nativeEventCycle, cycle: conflictCycle})
-	require.ErrorContains(t, current.applyNativeMessageInfo(conflictCtx, opencode.Event{
+	stepCtx := context.WithValue(context.Background(), nativeEventObservationKey{},
+		&nativeEventObservation{binding: binding, ownership: nativeEventCycle, cycle: stepCycle})
+	require.NoError(t, current.applyNativeMessageInfo(stepCtx, opencode.Event{
 		Properties: mustJSONValue(map[string]any{"info": map[string]any{
 			"id": "assistant-b", "sessionID": current.idmap.NativeSessionID, "role": roleAssistant,
 		}}),
-	}), "conflicting assistant")
+	}))
+	require.True(t, stepCycle.ownsAssistant("assistant-a"))
+	require.Equal(t, "assistant-b", stepCycle.assistantID)
 
 	current.lifecycleMu.Lock()
 	current.cycle = &foregroundCycle{}
