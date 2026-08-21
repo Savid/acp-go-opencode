@@ -46,19 +46,20 @@ const (
 	schemaTypeString        = "string"
 	questionFallbackMessage = "OpenCode needs input"
 
-	finishReasonLength    = "length"
-	nativeStatusPending   = "pending"
-	nativeStatusCompleted = "completed"
-	nativeStatusSuccess   = "success"
-	nativeStatusFailed    = "failed"
-	nativeStatusError     = "error"
-	nativeToolFailed      = "native tool failed"
-	toolNameRead          = "read"
-	toolNameEdit          = "edit"
-	toolNameDelete        = "delete"
-	toolNameBash          = "bash"
-	priorityHigh          = "high"
-	priorityLow           = "low"
+	finishReasonLength     = "length"
+	nativeStatusPending    = "pending"
+	nativeStatusInProgress = "in_progress"
+	nativeStatusCompleted  = "completed"
+	nativeStatusSuccess    = "success"
+	nativeStatusFailed     = "failed"
+	nativeStatusError      = "error"
+	nativeToolFailed       = "native tool failed"
+	toolNameRead           = "read"
+	toolNameEdit           = "edit"
+	toolNameDelete         = "delete"
+	toolNameBash           = "bash"
+	priorityHigh           = "high"
+	priorityLow            = "low"
 )
 
 var errTurnAssistantIdentityMissing = errors.New("OpenCode turn assistant identity is missing")
@@ -2312,7 +2313,7 @@ func planStatus(value string) acp.PlanEntryStatus {
 	switch strings.ToLower(value) {
 	case nativeStatusCompleted, "done":
 		return acp.PlanEntryStatusCompleted
-	case "in_progress", "running":
+	case nativeStatusInProgress, "running":
 		return acp.PlanEntryStatusInProgress
 	default:
 		return acp.PlanEntryStatusPending

@@ -321,6 +321,7 @@ func (s *session) routeNativeEventForIncarnation(
 			blocked := observation.binding == s.incarnation && observation.cycle == nil &&
 				s.cycle != nil && s.cycle.origin == lifecycle.CauseSubmission
 			s.lifecycleMu.Unlock()
+
 			if blocked {
 				return errors.New("agent-owned native event reached routing before lifecycle ownership")
 			}
@@ -837,6 +838,7 @@ func (s *session) observedCycleLocked(ctx context.Context, openAgent bool) (*for
 
 			return nil, nil
 		}
+
 		if s.cycle != nil && s.cycle.origin == lifecycle.CauseActivity {
 			observation.cycle = s.cycle
 
