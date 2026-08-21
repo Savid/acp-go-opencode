@@ -561,10 +561,10 @@ func TestQuiescenceProjectionShape(t *testing.T) {
 	t.Parallel()
 
 	certified, err := json.Marshal(QuiescenceState{
-		Certified: true, Source: ProofClassNativeSettledBarrier, Watermark: 3,
+		Certified: true, Source: ProofClassProcessContainment, Watermark: 3,
 	})
 	require.NoError(t, err)
-	require.JSONEq(t, `{"certified":true,"source":"native-settled-barrier","watermark":3}`, string(certified))
+	require.JSONEq(t, `{"certified":true,"source":"process-containment","watermark":3}`, string(certified))
 
 	fresh, err := json.Marshal(QuiescenceState{})
 	require.NoError(t, err)
@@ -665,7 +665,7 @@ func TestQuiescenceRefusesAnUnclaimedProofClass(t *testing.T) {
 	r.open(t)
 
 	require.ErrorIs(t, r.push(QuiescenceEvent(QuiescenceFact{
-		Quiescent: true, Source: ProofClassNativeSettledBarrier, Watermark: 1,
+		Quiescent: true, Source: ProofClass("prompt-return"), Watermark: 1,
 	})), &ViolationError{Kind: ViolationUnnegotiatedFact})
 }
 
