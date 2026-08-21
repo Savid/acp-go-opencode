@@ -81,7 +81,9 @@ func TestReceivedAutonomousEventOwnsBeforeLaterPromptCanReserve(t *testing.T) {
 	}
 
 	requireEventually(t, func() bool {
-		cycle := current.currentCycle()
+		current.lifecycleMu.Lock()
+		defer current.lifecycleMu.Unlock()
+		cycle := current.cycle
 
 		return cycle != nil && cycle.origin == lifecycle.CauseActivity && cycle.assistantID == "assistant-a"
 	}, "received A did not open its autonomous turn")
@@ -89,6 +91,168 @@ func TestReceivedAutonomousEventOwnsBeforeLaterPromptCanReserve(t *testing.T) {
 	requireEventually(t, func() bool { return current.currentCycle() == nil }, "autonomous A did not settle")
 	current.stopPump()
 	current.delivery.close()
+}
+
+func TestAgentEventCannotRouteBeforeDeferredOwnership(t *testing.T) {
+	current, _, _ := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+	ctx := withTurnRoute(context.Background(), "prompt")
+	cycle, _, err := current.reservePromptCycle(ctx, "prompt-message", lifecycle.Submission{
+		SubmissionID: "submission", ClientNonce: "client",
+	})
+	require.NoError(t, err)
+	cycle.reserved = false
+	cycle.dispatchProven = true
+
+	event := opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": "autonomous", "sessionID": current.idmap.NativeSessionID, "role": "assistant",
+		}}),
+	}
+	observation, currentBinding := current.observeNativeEvent(binding, event)
+	require.True(t, currentBinding)
+	require.Equal(t, nativeEventAgent, observation.ownership)
+	require.EqualError(t, current.routeNativeEventForIncarnation(
+		context.Background(), binding, event, observation,
+	), "agent-owned native event reached routing before lifecycle ownership")
+	require.Empty(t, current.messageRole("autonomous"))
+	require.Same(t, cycle, current.currentCycle())
+}
+
+func TestPromptOwnsStatusAndTodoAfterExactDispatchEvidence(t *testing.T) {
+	current, _, _ := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+	ctx := withTurnRoute(context.Background(), "prompt")
+	submission := lifecycle.Submission{SubmissionID: "submission", ClientNonce: "client"}
+	cycle, _, err := current.reservePromptCycle(ctx, "prompt-message", submission)
+	require.NoError(t, err)
+
+	evidence := opencode.Event{Type: opencode.EventMessageUpdated, Properties: mustJSONValue(map[string]any{
+		"info": map[string]any{
+			"id": "prompt-message", "sessionID": current.idmap.NativeSessionID, "role": roleUser,
+		},
+	})}
+	observation, ok := current.observeNativeEvent(binding, evidence)
+	require.True(t, ok)
+	require.Equal(t, nativeEventCycle, observation.ownership)
+	require.Same(t, cycle, observation.cycle)
+	require.NoError(t, current.acceptPromptCycle(ctx, cycle, submission))
+	require.NoError(t, current.routeNativeEventForIncarnation(ctx, binding, evidence, observation))
+
+	for _, event := range []opencode.Event{
+		{
+			Type: opencode.EventSessionStatus,
+			Properties: mustJSONValue(map[string]any{
+				"sessionID": current.idmap.NativeSessionID, "status": map[string]any{"type": "busy"},
+			}),
+		},
+		{
+			Type: opencode.EventTodoUpdated,
+			Properties: mustJSONValue(map[string]any{
+				"sessionID": current.idmap.NativeSessionID,
+				"todos":     []map[string]any{{"content": "finish", "status": "in_progress", "priority": "high"}},
+			}),
+		},
+	} {
+		observation, ok = current.observeNativeEvent(binding, event)
+		require.True(t, ok)
+		require.Equal(t, nativeEventCycle, observation.ownership)
+		require.Same(t, cycle, observation.cycle)
+		require.NoError(t, current.routeNativeEventForIncarnation(ctx, binding, event, observation))
+	}
+
+	require.True(t, cycle.runStarted)
+	require.Same(t, cycle, current.currentCycle())
+}
+
+func TestAcceptedPromptIsolatesEventsBeforeExactDispatchEvidence(t *testing.T) {
+	current, _, connection := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+	ctx := withTurnRoute(context.Background(), "prompt")
+	submission := lifecycle.Submission{SubmissionID: "submission", ClientNonce: "client"}
+	cycle, _, err := current.reservePromptCycle(ctx, "prompt-message", submission)
+	require.NoError(t, err)
+	require.NoError(t, current.acceptPromptCycle(ctx, cycle, submission))
+	updatesBefore := connection.updateCount()
+
+	for _, event := range []opencode.Event{
+		{
+			Type: opencode.EventSessionStatus,
+			Properties: mustJSONValue(map[string]any{
+				"sessionID": current.idmap.NativeSessionID, "status": map[string]any{"type": "busy"},
+			}),
+		},
+		{
+			Type: opencode.EventTodoUpdated,
+			Properties: mustJSONValue(map[string]any{
+				"sessionID": current.idmap.NativeSessionID,
+				"todos":     []map[string]any{{"content": "earlier", "status": "completed", "priority": "low"}},
+			}),
+		},
+		{
+			Type:       opencode.EventSessionIdle,
+			Properties: mustJSONValue(map[string]any{"sessionID": current.idmap.NativeSessionID}),
+		},
+	} {
+		observation, ok := current.observeNativeEvent(binding, event)
+		require.True(t, ok)
+		require.Equal(t, nativeEventPromptBeforeEvidence, observation.ownership)
+		require.NoError(t, current.routeNativeEventForIncarnation(ctx, binding, event, observation))
+	}
+
+	require.Equal(t, updatesBefore, connection.updateCount())
+	require.False(t, cycle.runStarted)
+	require.False(t, cycle.idle)
+	require.Same(t, cycle, current.currentCycle())
+}
+
+func TestObservedAutonomousBurstSharesOneCycleAndSettles(t *testing.T) {
+	current, _, connection := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+	events := []opencode.Event{
+		{
+			Type: opencode.EventSessionStatus,
+			Properties: mustJSONValue(map[string]any{
+				"sessionID": current.idmap.NativeSessionID, "status": map[string]any{"type": "busy"},
+			}),
+		},
+		{
+			Type: opencode.EventTodoUpdated,
+			Properties: mustJSONValue(map[string]any{
+				"sessionID": current.idmap.NativeSessionID,
+				"todos":     []map[string]any{{"content": "background", "status": "in_progress", "priority": "medium"}},
+			}),
+		},
+		{
+			Type:       opencode.EventSessionIdle,
+			Properties: mustJSONValue(map[string]any{"sessionID": current.idmap.NativeSessionID}),
+		},
+	}
+
+	observations := make([]*nativeEventObservation, 0, len(events))
+	for _, event := range events {
+		observation, ok := current.observeNativeEvent(binding, event)
+		require.True(t, ok)
+		require.Equal(t, nativeEventAgent, observation.ownership)
+		observations = append(observations, observation)
+	}
+
+	for index, event := range events {
+		require.NoError(t, current.routeNativeEventForIncarnation(
+			context.Background(), binding, event, observations[index],
+		))
+	}
+
+	require.Nil(t, current.currentCycle())
+	require.Equal(t, []string{
+		"lifecycle_snapshot", "state_update", "state_update",
+	}, connection.lifecycleEvents(t))
+	requireLifecycleReduces(t, connection)
 }
 
 func (c *panickingEventStreamClient) EventStream() <-chan opencode.EventStreamItem {

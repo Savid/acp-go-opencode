@@ -1840,19 +1840,25 @@ func TestPromptEventLoopAndEmitErrorBranches(t *testing.T) {
 		agent := NewAgent()
 		agent.setAgentClient(conn)
 		session := testSession(t, agent, client)
-		dispatched := make(chan struct{})
-		client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
-			close(dispatched)
+		dispatched := make(chan string, 1)
+		client.dispatchMessage = func(_ context.Context, _ string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
+			dispatched <- req.MessageID
 
-			return opencode.NativeMessage{Info: opencode.NativeMessageInfo{ID: "assistant", SessionID: id, Role: "assistant", Finish: "stop"}}, nil
+			return opencode.NativeMessage{}, nil
 		}
 		done := make(chan error, 1)
 		go func() {
 			_, err := session.Prompt(ctx, acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 			done <- err
 		}()
-		<-dispatched
+		messageID := <-dispatched
 		client.publishEvent(opencode.Event{Type: "server.connected"})
+		client.publishEvent(opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: mustJSONValue(map[string]any{"info": map[string]any{
+				"id": "assistant", "sessionID": "native-1", "role": "assistant", "parentID": messageID,
+			}}),
+		})
 		client.publishEvent(opencode.Event{
 			Type:       "message.part.created",
 			Properties: json.RawMessage(`{"id":"event-part","sessionID":"native-1","messageID":"assistant","type":"text","text":"stream"}`),

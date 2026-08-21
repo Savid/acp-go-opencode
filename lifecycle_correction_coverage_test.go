@@ -835,12 +835,12 @@ func TestCorrectionPromptDispatchAndEmissionFailureBranches(t *testing.T) {
 	donePump := &sessionPump{done: make(chan struct{}), hold: make(chan chan error), released: make(chan struct{}, 1)}
 	close(donePump.done)
 	dispatchSession := &session{pump: donePump}
-	completionResult, acceptedCycle, turnCtx, err := dispatchSession.dispatchAndAccept(
+	acceptedCycle, turnCtx, completionResult, err := dispatchSession.dispatchAndAccept(
 		context.Background(), "turn", lifecycle.Submission{}, nativeDispatch{},
 	)
 	require.Nil(t, completionResult)
 	require.Nil(t, acceptedCycle)
-	require.Nil(t, turnCtx)
+	require.Equal(t, "turn", turnNonceFromContext(turnCtx))
 	require.ErrorContains(t, err, "pump stopped")
 
 	cycle := &foregroundCycle{dispatchProven: true, dispatchEvidence: make(chan struct{})}

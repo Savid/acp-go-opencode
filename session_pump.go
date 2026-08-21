@@ -315,6 +315,16 @@ func (s *session) routeNativeEventForIncarnation(
 
 	if observation != nil && observation.ownership == nativeEventAgent {
 		defer s.completeAgentObservation(observation)
+
+		if event.Type != opencode.EventSessionError && event.Type != opencode.EventSessionIdle {
+			s.lifecycleMu.Lock()
+			blocked := observation.binding == s.incarnation && observation.cycle == nil &&
+				s.cycle != nil && s.cycle.origin == lifecycle.CauseSubmission
+			s.lifecycleMu.Unlock()
+			if blocked {
+				return errors.New("agent-owned native event reached routing before lifecycle ownership")
+			}
+		}
 	}
 
 	if sessionID, named := opencode.EventSessionID(event); named && sessionID != s.idmap.NativeSessionID {
@@ -373,15 +383,14 @@ func (s *session) observeNativeEvent(
 		return observation, true
 	}
 
-	if cycle.reserved {
+	if !cycle.dispatchProven {
 		observation.ownership = nativeEventPromptBeforeEvidence
 
 		return observation, true
 	}
 
-	// A same-session event with no request-specific user, parent, assistant, or
-	// action identity is autonomous. It may be delivered while a prompt is open,
-	// but it cannot mutate or settle that prompt's cycle.
+	// Every remaining same-session event has no identity tying it to the active
+	// prompt and therefore cannot mutate or settle that prompt's cycle.
 	observation.ownership = nativeEventAgent
 	s.pendingAgentObservations++
 
@@ -408,6 +417,8 @@ func nativeEventCausallyMatchesCycleLocked(event opencode.Event, cycle *foregrou
 	}
 
 	switch event.Type {
+	case opencode.EventSessionStatus, opencode.EventTodoUpdated:
+		return cycle.dispatchProven
 	case opencode.EventMessageUpdated:
 		info, ok := eventMessageInfo(event.Properties)
 		if !ok || info.Role != roleAssistant ||
@@ -489,6 +500,20 @@ func nativeObservation(ctx context.Context) *nativeEventObservation {
 // Nothing here infers a foreground boundary from silence, elapsed time, or a
 // status poll: the native idle event is the only completion authority.
 func (s *session) applyNativeEvent(ctx context.Context, event opencode.Event) error {
+	if observation := nativeObservation(ctx); observation != nil &&
+		observation.ownership == nativeEventPromptBeforeEvidence {
+		switch event.Type {
+		case opencode.EventSessionError,
+			opencode.EventPermissionV2Asked, opencode.EventPermissionAsked,
+			opencode.EventQuestionV2Asked, opencode.EventQuestionAsked,
+			opencode.EventPermissionV2Replied, opencode.EventPermissionReplied,
+			opencode.EventQuestionV2Replied, opencode.EventQuestionReplied,
+			opencode.EventQuestionV2Rejected, opencode.EventQuestionRejected:
+		default:
+			return nil
+		}
+	}
+
 	switch event.Type {
 	case opencode.EventSessionIdle:
 		return s.markNativeTerminal(ctx)
@@ -811,6 +836,11 @@ func (s *session) observedCycleLocked(ctx context.Context, openAgent bool) (*for
 			}
 
 			return nil, nil
+		}
+		if s.cycle != nil && s.cycle.origin == lifecycle.CauseActivity {
+			observation.cycle = s.cycle
+
+			return s.cycle, nil
 		}
 
 		if !openAgent {
