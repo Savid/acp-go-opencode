@@ -55,7 +55,7 @@ func TestProcessIsolationEnvironmentIsReplacementAndOverlay(t *testing.T) {
 	withLinuxProcessIsolation(t)
 	t.Setenv("ACP_PROCESS_AMBIENT_CANARY", "must-not-leak")
 	policy := &ProcessIsolation{UID: 123, GID: 456, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin", "BASE": "yes", "OVERLAY": "base"}, StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test"}
-	env, err := buildProcessEnvironment(policy, map[string]string{"OVERLAY": "option", "ONLY_OPTION": "yes"})
+	env, err := buildProcessEnvironmentFrom(policy, nil, map[string]string{"OVERLAY": "option", "ONLY_OPTION": "yes"})
 	require.NoError(t, err)
 	require.NotContains(t, env, "ACP_PROCESS_AMBIENT_CANARY")
 	require.Equal(t, "yes", env["BASE"])
@@ -78,9 +78,9 @@ func TestManagedRuntimeRootsCannotBeOverlaid(t *testing.T) {
 
 func TestProcessIsolationFailsClosedAndClearsGroups(t *testing.T) {
 	withLinuxProcessIsolation(t)
-	_, err := buildProcessEnvironment(&ProcessIsolation{UID: 0, GID: 2, BaseEnvironment: map[string]string{}})
+	_, err := buildProcessEnvironmentFrom(&ProcessIsolation{UID: 0, GID: 2, BaseEnvironment: map[string]string{}}, nil)
 	require.ErrorContains(t, err, "nonzero")
-	_, err = buildProcessEnvironment(&ProcessIsolation{UID: 1, GID: 2, BaseEnvironment: map[string]string{"PATH": "relative"}, StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test"})
+	_, err = buildProcessEnvironmentFrom(&ProcessIsolation{UID: 1, GID: 2, BaseEnvironment: map[string]string{"PATH": "relative"}, StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test"}, nil)
 	require.ErrorContains(t, err, "non-absolute")
 	cmd := exec.Command("/usr/bin/true")
 	policy := &ProcessIsolation{UID: 123, GID: 456, BaseEnvironment: map[string]string{}, StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test"}
@@ -97,7 +97,7 @@ func TestImplicitProcessEnvironmentIsCapturedAndScrubbed(t *testing.T) {
 		return []string{"PATH=/usr/bin:/bin", "AMBIENT=present", supervisorModeEnv + "=" + supervisorModeGuardian}
 	}
 
-	env, err := buildProcessEnvironment(nil)
+	env, err := buildProcessEnvironmentFrom(nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, "present", env["AMBIENT"])
 	require.NotContains(t, env, supervisorModeEnv)
@@ -109,7 +109,7 @@ func TestProcessIsolationValidationAndExecutableResolutionBranches(t *testing.T)
 	require.ErrorContains(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 2}), "base environment")
 	require.Error(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 2, BaseEnvironment: map[string]string{"BAD=KEY": "x"}}))
 	require.Error(t, validateEnvironmentMap(map[string]string{"OK": "bad\x00value"}))
-	_, err := buildProcessEnvironment(valid, map[string]string{"BAD=KEY": "x"})
+	_, err := buildProcessEnvironmentFrom(valid, nil, map[string]string{"BAD=KEY": "x"})
 	require.Error(t, err)
 	require.NoError(t, validateProcessSearchPath(""))
 
@@ -246,7 +246,7 @@ func TestAdapterOwnedStateNeverReachesANativeEnvironment(t *testing.T) {
 		}
 	}
 
-	env, err := buildProcessEnvironment(nil, map[string]string{
+	env, err := buildProcessEnvironmentFrom(nil, nil, map[string]string{
 		"OVERLAY":                             "kept",
 		privateAdapterEnvPrefix + "OVERLAY":   "leaked",
 		"opencode_db":                         "/leaked/overlay.db",

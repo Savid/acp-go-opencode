@@ -1,17 +1,20 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -62,6 +65,62 @@ func TestScopedElicitationStampsExactRouteAndRejectsCollision(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestHostRequestRegistrationRequiresTheExactFullyWrittenFrame(t *testing.T) {
+	frame := func(method, streamID, actionID string) []byte {
+		return []byte(fmt.Sprintf(
+			`{"jsonrpc":"2.0","id":1,"method":%q,"params":{"_meta":{%q:{"version":1,"streamId":%q,"action":{"actionId":%q}}}}}`,
+			method, lifecycle.MetaKey, streamID, actionID,
+		))
+	}
+
+	for _, method := range []string{acp.ClientMethodSessionRequestPermission, acp.ClientMethodElicitationCreate} {
+		t.Run(method, func(t *testing.T) {
+			registrations := newHostRequestRegistrations()
+			oldKey := hostRequestKey{method: method, streamID: "stream-old", actionID: "action-1"}
+			freshKey := hostRequestKey{method: method, streamID: "stream-fresh", actionID: "action-1"}
+			oldRegistered := registrations.expect(oldKey)
+			freshRegistered := registrations.expect(freshKey)
+
+			var output bytes.Buffer
+			written, err := registrations.wrap(&output).Write(frame(method, oldKey.streamID, oldKey.actionID))
+			require.NoError(t, err)
+			require.Equal(t, output.Len(), written)
+			require.NoError(t, <-oldRegistered)
+			select {
+			case err := <-freshRegistered:
+				t.Fatalf("old frame released fresh registration: %v", err)
+			default:
+			}
+
+			registrations.failIfPending(freshKey, errors.New("test cleanup"))
+			require.ErrorContains(t, <-freshRegistered, "test cleanup")
+		})
+	}
+
+	for name, writer := range map[string]io.Writer{
+		"short write": shortWriter{},
+		"write error": failingWriter{err: errors.New("transport gone")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			registrations := newHostRequestRegistrations()
+			key := hostRequestKey{
+				method: acp.ClientMethodSessionRequestPermission, streamID: "stream-1", actionID: "action-1",
+			}
+			registered := registrations.expect(key)
+			_, writeErr := registrations.wrap(writer).Write(frame(key.method, key.streamID, key.actionID))
+			require.Error(t, writeErr)
+			select {
+			case err := <-registered:
+				t.Fatalf("incomplete transport write released registration: %v", err)
+			default:
+			}
+
+			registrations.failIfPending(key, errors.New("transport incomplete"))
+			require.ErrorContains(t, <-registered, "transport incomplete")
+		})
+	}
+}
+
 func TestLocalConnectionRequiresInitializeAndStrictCancelRoute(t *testing.T) {
 	agent := NewAgent()
 	conn := newLocalAgentConnection(agent, io.Discard, strings.NewReader(""))
@@ -102,6 +161,39 @@ func TestLocalConnectionRejectsClosedBeforeDispatchOrDecode(t *testing.T) {
 			require.Equal(t, map[string]any{jsonFieldError: errValueAgentClosed}, reqErr.Data)
 		})
 	}
+}
+
+func TestSDKTransportDiagnosticsAreClosedAndRedacted(t *testing.T) {
+	const (
+		frameSecret  = "FRAME_SECRET_SENTINEL"
+		readerSecret = "READER_SECRET_SENTINEL"
+		writerSecret = "WRITER_SECRET_SENTINEL"
+	)
+
+	var logs bytes.Buffer
+	agent := NewAgent()
+	agent.log = slog.New(slog.NewTextHandler(&logs, nil))
+	input := io.MultiReader(
+		strings.NewReader("{\"broken\":\""+frameSecret+"\"\n"+
+			`{"jsonrpc":"2.0","params":{"payload":"`+frameSecret+`"}}`+"\n"+
+			`{"jsonrpc":"2.0","id":1,"params":{"payload":"`+frameSecret+`"}}`+"\n"),
+		errorReader{err: errors.New(readerSecret)},
+	)
+	var wire bytes.Buffer
+	connection := newLocalAgentConnection(agent, &wire, input)
+	<-connection.Done()
+
+	require.NotContains(t, logs.String(), frameSecret)
+	require.NotContains(t, logs.String(), readerSecret)
+	require.NotContains(t, wire.String(), frameSecret)
+	require.NotContains(t, wire.String(), readerSecret)
+
+	connection = newLocalAgentConnection(agent,
+		failingWriter{err: errors.New(writerSecret)},
+		strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}`+"\n"),
+	)
+	<-connection.Done()
+	require.NotContains(t, logs.String(), writerSecret)
 }
 
 type wireCoverageClient struct {
@@ -203,7 +295,7 @@ func TestLocalAgentConnectionOutboundClientMethods(t *testing.T) {
 
 	form := acp.NewUnstableCreateElicitationRequestForm(acp.UnstableElicitationSchema{})
 	_, err := local.UnstableCreateElicitation(ctx, form)
-	require.ErrorContains(t, err, "incomplete")
+	require.ErrorContains(t, err, "out-of-prompt elicitation requires lifecycle correlation")
 	requestIDValue := acp.RequestIdStr("request")
 	response, err := local.CreateElicitation(ctx, form, elicitationScope{
 		SessionID: "session", TurnNonce: "nonce", RequestID: &acp.RequestId{Str: &requestIDValue},
@@ -257,7 +349,7 @@ func TestLocalAgentConnectionOutboundClientMethods(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestLifecycleUpdatesFinishBeforeImmediatePromptAndTurnUpdatesCarryExactRoute(t *testing.T) {
+func TestCommandCatalogFollowsTheResponseAndTurnUpdatesCarryExactRoute(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -272,59 +364,55 @@ func TestLifecycleUpdatesFinishBeforeImmediatePromptAndTurnUpdatesCarryExactRout
 	created, err := peer.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
 
+	// The initial catalog is owed to the host only once the establishing
+	// response has been written, so it lands after session/new returns rather
+	// than before it.
+	require.Eventually(t, func() bool {
+		wireClient.mu.Lock()
+		defer wireClient.mu.Unlock()
+
+		return len(wireClient.updates) == 1
+	}, time.Second, time.Millisecond, "the command catalog never followed session/new")
+
 	wireClient.mu.Lock()
-	require.Len(t, wireClient.updates, 1, "lifecycle command discovery must finish before session/new returns")
 	require.Nil(t, wireClient.updates[0].Meta)
 	require.NotNil(t, wireClient.updates[0].Update.AvailableCommandsUpdate)
 	wireClient.mu.Unlock()
 
 	turn := 0
-	nativeClient.sendMessage = func(ctx context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	nativeClient.dispatchMessage = func(ctx context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
 		turn++
 		messageID := fmt.Sprintf("assistant-%d", turn)
 		partID := fmt.Sprintf("part-%d", turn)
 		streamed := fmt.Sprintf("stream-%d", turn)
-		nativeClient.events <- opencode.Event{
-			Type:       eventMessageUpdated,
-			Properties: json.RawMessage(fmt.Sprintf(`{"info":{"id":%q,"sessionID":%q,"role":"assistant"}}`, messageID, id)),
+		event := opencode.Event{
+			Type: opencode.EventMessageUpdated,
+			Properties: json.RawMessage(fmt.Sprintf(
+				`{"info":{"id":%q,"sessionID":%q,"role":"assistant","parentID":%q,"finish":"stop"}}`,
+				messageID, id, request.MessageID,
+			)),
 		}
-		nativeClient.events <- opencode.Event{
-			Type: eventMessagePartCreated,
+		nativeClient.publishEvent(event)
+		event = opencode.Event{
+			Type: opencode.EventMessagePartCreated,
 			Properties: json.RawMessage(fmt.Sprintf(
 				`{"id":%q,"sessionID":%q,"messageID":%q,"type":"text","text":%q}`,
 				partID, id, messageID, streamed,
 			)),
 		}
+		nativeClient.publishEvent(event)
 
-		for {
-			wireClient.mu.Lock()
-			seen := false
-			for _, notification := range wireClient.updates {
-				chunk := notification.Update.AgentMessageChunk
-				if chunk != nil && chunk.MessageId != nil && *chunk.MessageId == messageID {
-					seen = true
-
-					break
-				}
-			}
-			wireClient.mu.Unlock()
-			if seen {
-				break
-			}
-
-			select {
-			case <-ctx.Done():
-				return opencode.NativeMessage{}, ctx.Err()
-			case <-time.After(time.Millisecond):
-			}
-		}
-
-		return opencode.NativeMessage{
+		nativeClient.mu.Lock()
+		nativeClient.messages = []opencode.NativeMessage{{
 			Info: opencode.NativeMessageInfo{ID: messageID, SessionID: id, Role: "assistant", Finish: "stop"},
 			Parts: []opencode.NativePart{{
 				ID: partID, SessionID: id, MessageID: messageID, Type: partTypeText, Text: streamed + "-terminal",
 			}},
-		}, nil
+		}}
+		nativeClient.mu.Unlock()
+		nativeClient.publishSessionIdle(id)
+
+		return opencode.NativeMessage{}, ctx.Err()
 	}
 
 	for index, nonce := range []string{"route-turn-one", "route-turn-two"} {
@@ -341,7 +429,7 @@ func TestLifecycleUpdatesFinishBeforeImmediatePromptAndTurnUpdatesCarryExactRout
 		wireClient.mu.Unlock()
 		require.NotEmpty(t, turnUpdates)
 		for _, notification := range turnUpdates {
-			require.Len(t, notification.Meta, 1)
+			require.Len(t, notification.Meta, 1, "unexpected unscoped turn notification: %#v", notification.Update)
 			route, ok := notification.Meta[routeEnvelopeKey].(map[string]any)
 			require.True(t, ok)
 			require.Len(t, route, 2)

@@ -367,6 +367,14 @@ func (s *session) commitStateSnapshot(ctx context.Context, captured capturedStat
 		return nil
 	}
 
+	// A tombstoned session writes nothing. A replacement unlists the tombstone
+	// for every key it writes, so a settlement racing the delete that already
+	// succeeded would recreate the row and make a deleted session listable and
+	// loadable again.
+	if s.tombstoned() {
+		return nil
+	}
+
 	storeCtx, cancel := context.WithTimeout(ctx, sessionStateReplaceTimeout)
 	defer cancel()
 
@@ -378,19 +386,19 @@ func (s *session) commitStateSnapshot(ctx context.Context, captured capturedStat
 }
 
 func (s *session) snapshotBlockedReason() string {
+	incarnation := s.currentIncarnation()
+	if incarnation != nil && incarnation.registry.blocked() {
+		return metaPermissionKey
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	switch {
-	case len(s.pending) > 0:
-		return metaPermissionKey
-	case len(s.questions) > 0:
-		return "elicitation"
-	case len(s.activeMessageIDs) > 0:
+	if len(s.activeMessageIDs) > 0 {
 		return snapshotBlockGeneration
-	default:
-		return ""
 	}
+
+	return ""
 }
 
 func (a *Agent) adoptedGraph(selected *session) []*session {

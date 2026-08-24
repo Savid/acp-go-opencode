@@ -38,7 +38,7 @@ func newAuthAgent(t *testing.T) authHarness {
 	require.NotNil(t, agent.providerAuth)
 
 	client := newFakeOpenCodeClient()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 
 	agent.mu.Lock()
 	agent.sessions[session.id] = session
@@ -401,7 +401,7 @@ func TestGoSafeRecoversPanics(t *testing.T) {
 func TestLoggableError(t *testing.T) {
 	attr := loggableError(errors.New("failure"))
 	require.Equal(t, jsonFieldError, attr.Key)
-	require.Equal(t, "failure", attr.Value.String())
+	require.Equal(t, "operation failed", attr.Value.String())
 }
 
 func TestValidateProviderAuthOptionsRejectsDirectHome(t *testing.T) {

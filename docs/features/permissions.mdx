@@ -25,12 +25,12 @@ Any other value is rejected with the uniform unsupported-field error.
 ## Runtime permission prompts
 
 When the policy is `ask`, OpenCode emits native permission events
-(`permission.v2.asked` / `permission.asked`) during a turn. The adapter maps
-each to an ACP `session/request_permission` request only after the native tool
-call has been published to ACP in the current turn. The request carries the
-same ACP session id and tool-call id plus native metadata. Permission routing
-is structural: the host accepts it only while that tool-call id is pending in
-the addressed session's current turn epoch. It offers three options:
+(`permission.v2.asked` / `permission.asked`). The adapter maps each to an ACP
+`session/request_permission` request only after the native tool call has been
+published to ACP for the addressed session. The request carries the same ACP
+session id and tool-call id plus native metadata. Permission routing is
+structural: an unpublished or cross-session tool-call id is rejected. It offers
+three options:
 
 | Option id | ACP kind | Meaning |
 |---|---|---|
@@ -40,6 +40,12 @@ the addressed session's current turn epoch. It offers three options:
 
 The client's selection is relayed back to OpenCode. If the client cancels or the
 request otherwise fails, the adapter replies `reject` to the native prompt.
+The exact JSON-RPC permission request and lifecycle action correlation are
+registered first. Only after that request is answerable does the adapter emit
+the pending `action_update`; only then may an immediate response resolve it. A
+registration or announcement failure cancels that exact request, rejects the
+native permission, and fences the producing generation rather than leaking the
+request into a later prompt.
 
 <Warning>
 The permission flow is load-bearing for user trust: the adapter never silently

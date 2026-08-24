@@ -11,6 +11,44 @@ message completes, when the stream fails, when a deadline elapses, or when the
 host cancels. Every prompt carries a fresh route-envelope turn nonce; an active
 cancel must carry that same nonce.
 
+## Negotiated lifecycle stream
+
+When the client offers `acp-go.dev/lifecycle` version 1 during initialize,
+OpenCode emits a session-incarnation stream on identity-only
+`session_info_update` notifications. Its first notification is a complete
+snapshot. Prompt acceptance, foreground state, permissions, and elicitations
+then use contiguous, claimed-before-delivery sequence numbers. Interactive
+requests carry the same stream and action identity in `_meta`.
+
+The stream is session-owned rather than prompt-owned. Delivery failure,
+ordering conflict, native-incarnation loss, or an event after a terminal fence
+fails closed. Native events and the terminal marker occupy one bounded ordered
+channel; channel pressure blocks the reader rather than dropping an event or
+terminal, and the terminal cannot overtake the final accepted event. EOF or any
+other unprovable transport gap permanently fences that exact native generation;
+the adapter does not reconnect it and pretend the sequence remained complete.
+A lifecycle or typed-update delivery failure applies the same generation fence
+and contains its producer. One exception governs the answer rather than the
+fence: a turn's ending transition is emitted only after the turn's own answer is
+decided, and when that transition reported success and was handed to the
+transport, the prompt answers what it said. A notification whose send reported an
+error never proves the client did not receive it, so the client may hold durable
+success evidence for that turn, and the response never contradicts it. The
+generation is still fenced and contained. The hand-off is the predicate, not the
+enqueue: an ending transition the delivery lane drained without sending — the
+lane stopped, or a preceding write failed first — reached nobody, so that turn
+fails. An ending transition that reported failure or cancellation binds nothing,
+so an undeliverable one always fails the prompt. Raw notifications are observational: failed delivery
+does not consume their candidate sequence or affect the prompt. Prompt completion proves only
+foreground idle. OpenCode does not advertise authoritative background
+quiescence because native status polling cannot prove it.
+
+One lifecycle incarnation retains at most 8,192 emitted frames, 1,024 turn
+identities, and 1,024 action identities. Reaching the next frame or identity
+fails and contains that exact incarnation. These are emitter-only ownership
+bounds; a canonical consumer reducer retains the full incarnation history so
+exact retransmission checks never weaken with age.
+
 ## Stream mapping
 
 Native part events map onto ACP update variants:
@@ -163,7 +201,8 @@ and is not appended as corrupt duplicate text.
 
 Each native tool part produces exactly one `tool_call`. Later pending,
 in-progress, completed, or failed states for the same call produce
-`tool_call_update`; failed states preserve the native error in `rawOutput`.
+`tool_call_update`; failed states carry only a fixed classification in
+`rawOutput`, never a provider error body or arbitrary handler cause.
 If the first observed state is already terminal, the initial `tool_call`
 carries that terminal status and no follow-up update is fabricated.
 Identical message-level and step-level token snapshots produce one
@@ -184,35 +223,31 @@ any concurrent failure:
 - **Cancelled** — the host cancelled, or a coinciding deadline resolves as
   cancelled rather than timeout; the prompt returns `cancelled`.
 - **Failure** — the turn returns one terminal ACP internal error carrying a
-  uniform `opencode_turn_failed` payload. Transport/provider failures leave the
-  session usable.
+  uniform `opencode_turn_failed` payload. A provider failure can leave the
+  current incarnation usable; a transport or delivery gap fences it and requires
+  an exact fresh generation before admission resumes.
 
 The failure payload's `cause` names the failure class:
 
 | `cause` | Meaning |
 |---|---|
-| `provider` | The model or provider raised an assistant error; carries the native `message`, plus `statusCode`/`providerCode` when reported. |
-| `transport` | The SSE stream or REST call failed, or the shared `opencode serve` runtime exited; carries the real detail, never a bare `EOF`. |
+| `provider` | The model or provider raised an assistant error. The payload carries a fixed message and may carry the numeric HTTP `statusCode`; native text and provider bodies stay private. |
+| `transport` | The SSE stream or REST call failed, or the shared `opencode serve` runtime exited. The payload carries a fixed transport classification, never native response text. |
 | `timeout` | The turn exceeded the deadline set by `WithTurnTimeout`. |
 
-By default there is no deadline. `WithTurnTimeout` bounds a single turn; when it
-elapses the adapter sends native abort as a best-effort hint, retires that
-turn's exact shared-runtime generation, and waits for the one memoized
-containment result before reopening turn admission. Native `idle` status is
-never accepted as process containment. Failure to complete the selected
-boundary poisons the affected session and quarantines the runtime resources.
-Darwin best-effort completes only the captured original process group plus
-direct-child reap and never claims escaped descendants are absent.
-The same fence is used for host cancellation and stream/control failures that
-can leave native work running. See
+By default there is no deadline. `WithTurnTimeout` bounds a single turn and, like
+host cancellation, interrupts only that session's native work and waits for its
+native idle acknowledgement. A transport or delivery gap is different: it
+removes the exact shared runtime generation from admission and runs the selected
+containment boundary before recovery may install a replacement. Native `idle`
+settles a session turn but is never accepted as process containment. See
 [Models and config](/docs/features/models-config) for the
 provider-error and structured-output details, and
 [Metadata](/docs/reference/meta) for the full error payload.
 
-Because cancellation containment retires a shared runtime, an Agent admits at
-most one native prompt turn at a time across all of its logical sessions.
-Queued prompts remain context-cancellable. Lifecycle calls and bounded REST
-calls retain their separate concurrency limit.
+Routine cancellation and timeout do not retire peer sessions or the shared
+runtime. Queued prompts remain context-cancellable. Lifecycle calls and bounded
+REST calls retain their separate concurrency limit.
 
 A shared-runtime exit fails the in-flight turn with this same
 `opencode_turn_failed` transport shape; an overlapping cancel still resolves

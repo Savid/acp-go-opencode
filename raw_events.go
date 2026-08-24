@@ -21,9 +21,11 @@ const (
 	structuredOutputPath    = "_meta.opencode.structuredOutput"
 	configModel             = "model"
 	configMode              = "mode"
+	// defaultMode is the native agent OpenCode runs when no other is named. It
+	// is a starting value only: what a session addresses its frames with is
+	// whatever it was last told, judged by OpenCode rather than by this adapter.
+	defaultMode             = "build"
 	configTypeSelect        = "select"
-	modelFieldSessionMeta   = "_meta.opencode.options.model"
-	modelFieldPrompt        = "model"
 	openCodePermissionAsk   = "ask"
 	openCodePermissionAllow = "allow"
 	openCodePermissionDeny  = "deny"
@@ -36,6 +38,8 @@ const (
 	jsonFieldSequence       = "sequence"
 	jsonFieldEvent          = "event"
 	jsonFieldSource         = "source"
+	jsonFieldAction         = "action"
+	jsonFieldResources      = "resources"
 	jsonFieldCause          = "cause"
 	jsonFieldStatusCode     = "statusCode"
 	jsonFieldProviderCode   = "providerCode"

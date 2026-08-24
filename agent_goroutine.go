@@ -11,6 +11,13 @@ func recoverAgentGoroutine(ctx context.Context, log *slog.Logger, name string) {
 	handleAgentGoroutinePanic(ctx, log, name, nil, recover())
 }
 
+// handleAgentGoroutinePanicRecover is deferred directly: it recovers, logs, and
+// hands the panic to a caller that has to publish a result in place of the work
+// that died.
+func handleAgentGoroutinePanicRecover(ctx context.Context, log *slog.Logger, name string, shutdown func(any)) {
+	handleAgentGoroutinePanic(ctx, log, name, shutdown, recover())
+}
+
 func handleAgentGoroutinePanic(ctx context.Context, log *slog.Logger, name string, shutdown func(any), recovered any) {
 	if recovered == nil {
 		return
@@ -20,10 +27,10 @@ func handleAgentGoroutinePanic(ctx context.Context, log *slog.Logger, name strin
 		log = slog.Default()
 	}
 
-	log.ErrorContext(ctx, "agent goroutine panic", slog.String("goroutine", name), slog.Any("panic", recovered))
+	log.ErrorContext(ctx, "agent goroutine panic", slog.String("goroutine", name))
 
 	if shutdown != nil {
-		shutdown(recovered)
+		shutdown("agent goroutine panicked")
 	}
 }
 

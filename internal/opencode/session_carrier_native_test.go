@@ -521,8 +521,8 @@ command -v ` + carrierProbeTool + ` >/dev/null 2>&1 && ` + carrierProbeTool + ` 
 
 // nativeScopeShells names one workspace scope's own configured shell.
 //
-// The two login shells are the collision the review proved. The custom one is a
-// third login shell at a path of its own, which is what proves the exact
+// The two login shells are the collision this suite exists for. The custom one
+// is a third login shell at a path of its own, which is what proves the exact
 // configured executable reaches the boundary rather than merely the right kind.
 // The colon one is that same proof at a path the search-path separator runs
 // straight through — a path OpenCode accepts and configures, and the one a
@@ -943,9 +943,9 @@ func TestNativeCarrierLeavesANonLoginShellToOpenCode(t *testing.T) {
 }
 
 // TestNativeCarrierKeepsTwoWorkspaceScopesApartUnderLoad runs both scopes at
-// once rather than in turn. Interleaving in time is the shape the review
-// proved; overlapping in time is the shape a shared runtime actually serves,
-// and it is the one a per-operation channel has to survive.
+// once rather than in turn. Interleaving in time is the weaker shape the case
+// above covers; overlapping in time is the shape a shared runtime actually
+// serves, and it is the one a per-operation channel has to survive.
 func TestNativeCarrierKeepsTwoWorkspaceScopesApartUnderLoad(t *testing.T) {
 	probe := startNativeScopeShellRuntime(t)
 

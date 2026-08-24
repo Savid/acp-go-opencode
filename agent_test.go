@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -13,13 +14,14 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-opencode/internal/homelock"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
 func TestOutputSchemaAccepted(t *testing.T) {
 	schema := map[string]any{"type": "object"}
-	meta, err := sessionMetaFromLifecycle(OpenCodeOptions{OutputSchema: schema}.Meta())
+	meta, err := sessionMetaFromVendorOptions(OpenCodeOptions{OutputSchema: schema}.Meta())
 	if err != nil {
 		t.Fatalf("outputSchema rejected: %v", err)
 	}
@@ -33,7 +35,7 @@ func TestOutputSchemaAccepted(t *testing.T) {
 }
 
 func TestOutputSchemaInvalidRejected(t *testing.T) {
-	_, err := sessionMetaFromLifecycle(map[string]any{
+	_, err := sessionMetaFromVendorOptions(map[string]any{
 		opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: "not-an-object"}},
 	})
 	if err == nil {
@@ -46,7 +48,7 @@ func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.closeErr = errors.Join(errors.New("close failed"), opencode.ErrProcessContainmentIncomplete)
 	agent := NewAgent()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
 	oldNewAgent := newAgentForServe
@@ -84,7 +86,7 @@ func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
 	agent := NewAgent()
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.mu.Lock()
 	agent.sessions[session.id] = session
 	agent.mu.Unlock()
@@ -127,17 +129,6 @@ func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	}
 }
 
-func TestAcquireNativeTurnHonorsQueuedCallerCancellation(t *testing.T) {
-	agent := NewAgent()
-	release, err := agent.acquireNativeTurn(context.Background())
-	require.NoError(t, err)
-	defer release()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = agent.acquireNativeTurn(ctx)
-	require.ErrorIs(t, err, context.Canceled)
-}
 func TestAgentAndRouteRemainingPublicBranches(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -159,7 +150,7 @@ func TestAgentAndRouteRemainingPublicBranches(t *testing.T) {
 	client.getSession = testNativeSession("native-child")
 	client.ensureSyncAggregate("native-child")
 	agent.runtime = client
-	parent := testSession(agent, client)
+	parent := testSession(t, agent, client)
 	agent.sessions[parent.id] = parent
 	request := ForkSessionRequest(parent.id, t.TempDir())
 	value, err := agent.HandleExtensionMethod(context.Background(), ForkSessionMethod, mustJSON(t, request))
@@ -219,7 +210,7 @@ func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
 	client.agents = []opencode.NativeAgent{{Name: "build"}, {Name: "plan"}}
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
 	boolean := true
@@ -298,4 +289,85 @@ func requireExplicitPolicyReachesTheRuntime(t *testing.T, policy ProcessIsolatio
 	require.Equal(t, uint32(65534), launched.UID)
 	require.Equal(t, "deployment-1", launched.StandaloneOwnerID)
 	require.Equal(t, home, launched.StandaloneStateRoot)
+}
+
+// TestAgentCloseRunsTheDurableRungAWireCloseOwes proves the durable rung travels
+// with the ladder. An embedded shutdown closes each session through the same
+// committing boundary a wire `session/close` runs, so state the session took on
+// since its last turn — the model set through a config option here — reaches the
+// store instead of being dropped with the wrapper. A later load restores what the
+// host last saw rather than what the last turn happened to leave behind.
+func TestAgentCloseRunsTheDurableRungAWireCloseOwes(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-shutdown")
+	client.getSession = testNativeSession("native-shutdown")
+	client.agents = []opencode.NativeAgent{{Name: "build"}, {Name: "plan"}}
+
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	stored := func(t *testing.T) stateSnapshot {
+		t.Helper()
+
+		entries, loadErr := store.Load(ctx,
+			SessionKey{SessionID: string(created.SessionId), Subpath: SessionStoreMainSubpath})
+		require.NoError(t, loadErr)
+		require.Len(t, entries, 1)
+
+		var bundle stateSnapshot
+
+		require.NoError(t, json.Unmarshal(entries[0], &bundle))
+
+		return bundle
+	}
+
+	require.Equal(t, "build", stored(t).Session.Model.Agent)
+
+	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(created.SessionId, configMode, "plan"))
+	require.NoError(t, err)
+	require.Equal(t, "build", stored(t).Session.Model.Agent,
+		"the config option committed on its own, so this test proves nothing about the boundary")
+
+	require.NoError(t, agent.Close())
+
+	require.Equal(t, "plan", stored(t).Session.Model.Agent,
+		"the embedded shutdown dropped state a wire close would have committed")
+}
+
+// TestRuntimeConstructionFailsWithThePublicUnsupportedLockSentinel proves the
+// platform gate reaches a host through the exported name. A runtime home nobody
+// can claim exclusively is not a lock somebody else is holding: the second is
+// worth retrying and the first never is, so the refusal has to be classifiable
+// rather than a message to match, and it has to be classifiable from outside
+// this module.
+func TestRuntimeConstructionFailsWithThePublicUnsupportedLockSentinel(t *testing.T) {
+	require.ErrorIs(t, ErrRuntimeLockUnsupported, homelock.ErrRuntimeLockUnsupported)
+
+	originalStart := runtimeStartServer
+	runtimeStartServer = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+		return nil, fmt.Errorf("claim OpenCode writable home: %w", homelock.ErrRuntimeLockUnsupported)
+	}
+
+	t.Cleanup(func() { runtimeStartServer = originalStart })
+
+	agent := NewAgent(WithHome(t.TempDir()))
+	agent.options.clientFactory = nil
+
+	runtime, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
+	require.ErrorIs(t, err, ErrRuntimeLockUnsupported,
+		"an unsupported platform failed construction with something a host cannot classify")
+	require.Nil(t, runtime)
+	require.Nil(t, nativeRelease)
+	require.Nil(t, scratchRelease)
+
+	_, err = agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
+	require.ErrorIs(t, err, ErrRuntimeLockUnsupported,
+		"the public session surface hid the construction refusal")
 }

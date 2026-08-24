@@ -18,7 +18,7 @@ func carrierOptions(meta map[string]any) map[string]any {
 }
 
 func TestSessionEnvMetaAcceptsBothShapesAndPreservesValues(t *testing.T) {
-	meta, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{
+	meta, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 		metaEnvKey: map[string]any{"WAGIE_API_TOKEN": "bearer", "CLEARED": ""},
 	}))
 	require.NoError(t, err)
@@ -26,20 +26,20 @@ func TestSessionEnvMetaAcceptsBothShapesAndPreservesValues(t *testing.T) {
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer", "CLEARED": ""}, meta.Env)
 
 	// An in-process host hands the map over already typed.
-	meta, err = sessionMetaFromLifecycle(carrierOptions(map[string]any{
+	meta, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 		metaEnvKey: map[string]string{"WAGIE_API_TOKEN": "bearer"},
 	}))
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer"}, meta.Env)
 
 	// An empty map is a value, not an omission: it clears the environment.
-	meta, err = sessionMetaFromLifecycle(carrierOptions(map[string]any{metaEnvKey: map[string]any{}}))
+	meta, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{metaEnvKey: map[string]any{}}))
 	require.NoError(t, err)
 	require.True(t, meta.EnvSet)
 	require.Empty(t, meta.Env)
 
 	// An absent option leaves the recorded value in place.
-	meta, err = sessionMetaFromLifecycle(carrierOptions(map[string]any{}))
+	meta, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{}))
 	require.NoError(t, err)
 	require.False(t, meta.EnvSet)
 	require.Nil(t, meta.Env)
@@ -66,7 +66,7 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{metaEnvKey: test.value}))
+			_, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{metaEnvKey: test.value}))
 			require.Equal(t, unsupportedField(test.field), err)
 		})
 	}
@@ -77,7 +77,7 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 // so Path is PATH there and an ordinary variable of its own everywhere else.
 func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T) {
 	for _, spelling := range []string{"path", "Path", "PaTh"} {
-		meta, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{
+		meta, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 			metaEnvKey: map[string]any{spelling: "/attacker/bin"},
 		}))
 
@@ -93,13 +93,13 @@ func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T)
 }
 
 func TestLifecycleMetaAllowsTheCarrierOptionsOnly(t *testing.T) {
-	_, err := sessionMetaFromLifecycle(carrierOptions(map[string]any{
+	_, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 		metaEnvKey:           map[string]any{"WAGIE_API_TOKEN": "bearer"},
 		metaExtraPathDirsKey: []any{"/session/bin"},
 	}))
 	require.NoError(t, err)
 
-	_, err = sessionMetaFromLifecycle(carrierOptions(map[string]any{"envs": map[string]any{}}))
+	_, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{"envs": map[string]any{}}))
 	require.Equal(t, unsupportedField("_meta.opencode.options.envs"), err)
 }
 
@@ -107,7 +107,7 @@ func TestCarrierFromMetaReplacesOnlyThePresentHalf(t *testing.T) {
 	recorded := newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "old"}, []string{"/old/bin"})
 
 	unchanged := carrierFromMeta(sessionMeta{}, recorded)
-	require.True(t, unchanged.equal(recorded))
+	require.Equal(t, recorded, unchanged)
 
 	rotated := carrierFromMeta(sessionMeta{
 		EnvSet: true, Env: map[string]string{"WAGIE_API_TOKEN": "new"},
@@ -115,7 +115,7 @@ func TestCarrierFromMetaReplacesOnlyThePresentHalf(t *testing.T) {
 	}, recorded)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "new"}, rotated.Env)
 	require.Equal(t, []string{"/new/bin"}, rotated.ExtraPathDirs)
-	require.False(t, rotated.equal(recorded), "the recorded carrier must not be mutated in place")
+	require.NotEqual(t, recorded, rotated, "the recorded carrier must not be mutated in place")
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "old"}, recorded.Env)
 
 	cleared := carrierFromMeta(sessionMeta{EnvSet: true, ExtraPathDirsSet: true}, recorded)
@@ -129,7 +129,7 @@ func TestCarrierFromMetaReplacesOnlyThePresentHalf(t *testing.T) {
 	copied.ExtraPathDirs[0] = "/other"
 	require.Equal(t, map[string]string{"A": "1"}, source.Env)
 	require.Equal(t, []string{"/bin"}, source.ExtraPathDirs)
-	require.False(t, source.equal(copied))
+	require.NotEqual(t, source, copied)
 }
 
 func TestCarrierScopeOptionsClone(t *testing.T) {
@@ -192,9 +192,9 @@ func TestConcurrentSessionsCarryDistinctBearersAndDirectories(t *testing.T) {
 	require.NoError(t, agent.Close())
 }
 
-// TestRebindRotatesOneSessionAndLeavesItsPeerAlone covers the rotation the
-// review requires: a live peer keeps its bearer while the rebound session's
-// previous bearer disappears entirely.
+// TestRebindRotatesOneSessionAndLeavesItsPeerAlone covers what a rebind owes a
+// peer: a live peer keeps its bearer while the rebound session's previous
+// bearer disappears entirely.
 func TestRebindRotatesOneSessionAndLeavesItsPeerAlone(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
@@ -292,6 +292,7 @@ func TestRecoveredSessionKeepsItsCarrier(t *testing.T) {
 		WithOpenCodeExtraPathDirs("/session/bin"),
 	))))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	close(first.runtimeExited)
 
 	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "recovery-turn", "continue after restart"))
@@ -332,6 +333,7 @@ func TestSecondTurnKeepsTheCarrier(t *testing.T) {
 		WithOpenCodeExtraPathDirs("/turns/bin"),
 	))))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 
 	for _, nonce := range []string{"turn-one", "turn-two"} {
 		response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, nonce, "work"))
@@ -349,7 +351,7 @@ func TestCarrierBearerIsRedactedFromTheDurableSnapshot(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
 	agent.runtime = client
-	member := testSession(agent, client)
+	member := testSession(t, agent, client)
 	member.carrier = newSessionCarrier(map[string]string{
 		"WAGIE_API_TOKEN": "bearer-secret",
 		"OPERATION_NAME":  "ordinary",

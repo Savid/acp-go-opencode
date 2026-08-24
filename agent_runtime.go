@@ -31,19 +31,34 @@ var (
 	runtimeJSONMarshal       = json.Marshal
 	runtimeStartServer       = opencode.StartServer
 	runtimeRemoveAll         = os.RemoveAll
+	runtimeRemoveAllMu       sync.RWMutex
 	errRuntimeScratchCleanup = errors.New("adapter-created OpenCode runtime scratch cleanup failed")
 )
+
+func removeRuntimeAll(path string) error {
+	runtimeRemoveAllMu.RLock()
+	defer runtimeRemoveAllMu.RUnlock()
+
+	return runtimeRemoveAll(path)
+}
+
+func replaceRuntimeRemoveAll(replacement func(string) error) func() {
+	runtimeRemoveAllMu.Lock()
+	original := runtimeRemoveAll
+	runtimeRemoveAll = replacement
+	runtimeRemoveAllMu.Unlock()
+
+	return func() {
+		runtimeRemoveAllMu.Lock()
+		runtimeRemoveAll = original
+		runtimeRemoveAllMu.Unlock()
+	}
+}
 
 func fatalRuntimeCleanup(err error) bool {
 	return errors.Is(err, opencode.ErrProcessContainmentIncomplete) ||
 		errors.Is(err, opencode.ErrRuntimeScratchCleanup) ||
 		errors.Is(err, errRuntimeScratchCleanup)
-}
-
-func (a *Agent) sharedRuntime(ctx context.Context) (opencode.Client, error) {
-	runtime, _, err := a.sharedRuntimeBinding(ctx)
-
-	return runtime, err
 }
 
 func (a *Agent) sharedRuntimeBinding(
@@ -184,18 +199,50 @@ func (a *Agent) handleSharedRuntimeExit(runtime opencode.Client, generation uint
 	}
 
 	if err := a.retireSharedRuntime(generation, "shared OpenCode runtime exited"); err != nil && a.log != nil {
-		a.log.ErrorContext(context.Background(), "clean up exited shared OpenCode runtime", slog.Any("error", err))
+		a.log.ErrorContext(context.Background(), "clean up exited shared OpenCode runtime")
 	}
 }
 
 // retireSharedRuntime is the sole exact-generation process-containment fence.
 // Every caller for one generation observes the same shutdown/proof result, and
 // no replacement runtime can start until that result has been published.
-func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...*session) error {
+func (a *Agent) retireSharedRuntime(generation uint64, cause string) error {
+	return a.retireSharedRuntimeStarted(generation, cause, nil)
+}
+
+// containSharedRuntimeGeneration starts the exact-generation retirement and
+// returns once admission has been fenced. Cleanup continues asynchronously so a
+// session pump can leave its own goroutine before retirement waits for that pump
+// to stop.
+func (a *Agent) containSharedRuntimeGeneration(generation uint64, cause string) {
+	started := make(chan struct{})
+
+	go func() {
+		err := a.retireSharedRuntimeStarted(generation, cause, started)
+		if err != nil && a.log != nil {
+			a.log.ErrorContext(context.Background(), "contain failed OpenCode runtime generation",
+				slog.Uint64("generation", generation))
+		}
+	}()
+
+	<-started
+}
+
+func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, started chan<- struct{}) error {
+	var signalOnce sync.Once
+
+	signalStarted := func() {
+		if started != nil {
+			signalOnce.Do(func() { close(started) })
+		}
+	}
+	defer signalStarted()
+
 	a.mu.Lock()
 	if retirement := a.runtimeRetirements[generation]; retirement != nil {
 		done := retirement.done
 		a.mu.Unlock()
+		signalStarted()
 		<-done
 
 		return retirement.err
@@ -204,6 +251,7 @@ func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...
 	if a.runtime == nil || a.runtimeGeneration != generation {
 		err := a.runtimeFatalErr
 		a.mu.Unlock()
+		signalStarted()
 
 		if err != nil {
 			return err
@@ -218,23 +266,8 @@ func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...
 	runtime := a.runtime
 	sessions := make([]*session, 0, len(a.sessions))
 
-	seenSessions := make(map[*session]struct{}, len(a.sessions)+len(targets))
 	for _, current := range a.sessions {
 		sessions = append(sessions, current)
-		seenSessions[current] = struct{}{}
-	}
-
-	for _, target := range targets {
-		if target == nil {
-			continue
-		}
-
-		if _, exists := seenSessions[target]; exists {
-			continue
-		}
-
-		sessions = append(sessions, target)
-		seenSessions[target] = struct{}{}
 	}
 
 	retirement := &runtimeRetirement{generation: generation, done: make(chan struct{})}
@@ -247,6 +280,7 @@ func (a *Agent) retireSharedRuntime(generation uint64, cause string, targets ...
 	xdgScratchRelease := a.runtimeXDGScratchRelease
 	a.runtimeXDGScratchRelease = nil
 	a.mu.Unlock()
+	signalStarted()
 
 	cleanupErr := a.settleSharedRuntimeRetirement(
 		runtime,
@@ -286,7 +320,7 @@ func (a *Agent) settleSharedRuntimeRetirement(
 		if recovered := recover(); recovered != nil {
 			cleanupErr = errors.Join(
 				opencode.ErrProcessContainmentIncomplete,
-				fmt.Errorf("retire OpenCode runtime generation %d: %v", generation, recovered),
+				fmt.Errorf("retire OpenCode runtime generation %d panicked", generation),
 			)
 		}
 	}()
@@ -314,7 +348,7 @@ func (a *Agent) settleSharedRuntimeRetirement(
 				detachErr = errors.Join(
 					detachErr,
 					opencode.ErrProcessContainmentIncomplete,
-					fmt.Errorf("detach OpenCode session from runtime generation %d: %v", generation, recovered),
+					fmt.Errorf("detach OpenCode session from runtime generation %d panicked", generation),
 				)
 				detachErrMu.Unlock()
 			}()
@@ -512,7 +546,7 @@ func (a *Agent) cleanupRuntimeResources(shutdownErr error, nativeRelease, xdgScr
 	var cleanupErr error
 
 	if a.options.Home == "" {
-		if err := errors.Join(runtimeRemoveAll(a.homeRoot()), runtimeRemoveAll(opencode.ControlRootForXDG(a.homeRoot()))); err != nil {
+		if err := errors.Join(removeRuntimeAll(a.homeRoot()), removeRuntimeAll(opencode.ControlRootForXDG(a.homeRoot()))); err != nil {
 			cleanupErr = errors.Join(
 				errRuntimeScratchCleanup,
 				fmt.Errorf("remove adapter-created OpenCode runtime scratch: %w", err),

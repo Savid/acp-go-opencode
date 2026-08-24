@@ -63,15 +63,53 @@ extension for fork:
 - `session/load` — recreate a stored session and replay its history.
 - `session/resume` — restore a stored session without replaying history.
 - `session/list` — enumerate stored sessions.
-- `session/close` — end a session and take a final snapshot.
+- `session/close` — end a session at its containment boundary and commit the
+  final snapshot.
 - `session/delete` — remove a stored session, leaving a tombstone.
 - `_opencode/session/fork` — branch a session's native state into a new session.
 
-Native slash-command discovery and any resulting
-`available_commands_update` complete inside new, load, resume, and fork before
-the lifecycle response returns. Those updates are lifecycle-scoped and omit a
-turn route. Command refresh caused by a slash-command prompt is turn-scoped and
-carries that prompt's exact route envelope.
+`session/close` is a ladder and runs in one order: the session's native work is
+interrupted and acknowledged, the state a reload restores from is read while the
+loopback API can still answer it, the session's native scope is proven
+contained, and only then is the open turn reported over and that state
+committed. A boundary that does not complete commits nothing new, ends no turn on
+the stream, and answers with the containment error, leaving the handle addressable
+for a retry. It still fences: the fence marks where this incarnation stopped
+speaking, not what the boundary proved. The retry therefore runs the whole ladder
+again — the still-owed durable commit included — and loses only the emission
+rungs a fenced stream cannot carry, answering silently on success because the
+failure was already reported to the caller of the close that failed.
+
+`Agent.Close` runs the same ladder per session, and the same durable rung with
+it, before the shared native runtime is retired. An embedded shutdown commits
+what a wire close would have committed rather than dropping it with the wrapper.
+
+`session/delete` writes its durable tombstone first and hides the id with it, so
+a teardown that fails afterwards is reported to the caller without leaving the
+session listable, loadable, or resumable. Hiding an id is a wire fact and not a
+bookkeeping one: a teardown that could not contain the native scope leaves the
+agent holding that scope internally, so a later `session/delete` retries the
+cleanup and `Agent.Close` sweeps it, while the id itself stays gone from every
+method. A settlement still in flight when the
+tombstone lands commits nothing: the store itself refuses an append or a
+replacement addressed to a tombstoned key, writing nothing, clearing nothing, and
+answering success. A `session/load` or `session/resume` already past its entry
+check re-reads the tombstone under the lock that installs the session, so a
+delete that completes during preparation wins — the prepared replacement is torn
+down and the id stays gone. Deleting an unknown or already-deleted session
+succeeds silently.
+
+New, load, resume, and fork publish two notifications after their own response
+has been written to the transport: the session's opening lifecycle snapshot,
+which is the first lifecycle-bearing notification of that session's stream, and
+then the initial `available_commands_update` carrying native slash-command
+discovery. Neither can arrive before the response that names the session it
+speaks for, and a failure to publish either is logged rather than turned into a
+failed response whose frame was already delivered. The failed update still
+fences and contains the exact native generation; it is never treated as a
+successful log-and-continue delivery. Both updates are lifecycle-scoped and omit
+a turn route. Command refresh caused by a slash-command prompt is turn-scoped
+and carries that prompt's exact route envelope.
 
 A session start that fails on a caller-supplied option — a seeded file the
 runtime home cannot accept, a start path that is not absolute, an unusable
@@ -91,9 +129,10 @@ Only a session fenced to that current runtime generation can publish its route
 and send the prompt; a replacement that crashes during reconstruction is
 discarded without routing the user prompt to it.
 
-Cancel and turn timeout retire the exact runtime generation used by that turn;
-stream/control failures use the same fence when native work may remain. All
-concurrent observers join one
+Routine cancel and turn timeout interrupt only the addressed session and wait
+for its native idle acknowledgement. A native stream gap, runtime exit, or host
+delivery failure instead retires the exact runtime generation that produced the
+unprovable sequence. All concurrent observers join one
 memoized base-runtime shutdown result. Retirement detaches every directory
 scope on that generation, completes the selected native containment boundary,
 and only then permits a replacement generation. The authoritative Linux

@@ -132,36 +132,6 @@ func (c *recordingClient) elicitationCount() int {
 	return len(c.elicitations)
 }
 
-func (c *recordingClient) hasUserText(text string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, update := range c.updates {
-		chunk := update.Update.UserMessageChunk
-		if chunk != nil && chunk.Content.Text != nil && chunk.Content.Text.Text == text {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *recordingClient) hasAgentText(text string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, update := range c.updates {
-		chunk := update.Update.AgentMessageChunk
-		if chunk != nil && chunk.Content.Text != nil && chunk.Content.Text.Text == text {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *recordingClient) updatesSnapshot() []acp.SessionNotification {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]acp.SessionNotification(nil), c.updates...)
-}
-
 type safeBuffer struct {
 	mu sync.Mutex
 	b  []byte

@@ -12,22 +12,22 @@ import (
 )
 
 func TestSessionMetaLifecycleBranches(t *testing.T) {
-	if err := validateLifecycleMeta(map[string]any{opencodeMetaKey: "bad"}); err == nil {
+	if err := validateVendorOptionsMeta(map[string]any{opencodeMetaKey: "bad"}); err == nil {
 		t.Fatal("bad opencode meta accepted")
 	}
-	if err := validateLifecycleMeta(map[string]any{"github.com/savid/acp-go-opencode": map[string]any{}}); err != nil {
+	if err := validateVendorOptionsMeta(map[string]any{"github.com/savid/acp-go-opencode": map[string]any{}}); err != nil {
 		t.Fatalf("foreign module-path meta not ignored: %v", err)
 	}
-	if err := validateLifecycleMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: "bad"}}); err == nil {
+	if err := validateVendorOptionsMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: "bad"}}); err == nil {
 		t.Fatal("bad options meta accepted")
 	}
-	if err := validateLifecycleMeta(map[string]any{opencodeMetaKey: map[string]any{rawEventKey: "bad"}}); err == nil {
+	if err := validateVendorOptionsMeta(map[string]any{opencodeMetaKey: map[string]any{rawEventKey: "bad"}}); err == nil {
 		t.Fatal("bad raw event object accepted")
 	}
-	if err := validateLifecycleMeta(map[string]any{opencodeMetaKey: map[string]any{rawEventKey: map[string]any{"unknown": true}}}); err == nil {
+	if err := validateVendorOptionsMeta(map[string]any{opencodeMetaKey: map[string]any{rawEventKey: map[string]any{"unknown": true}}}); err == nil {
 		t.Fatal("unknown raw event key accepted")
 	}
-	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{rawEventKey: map[string]any{rawEventEnabledKey: "bad"}}}); err == nil {
+	if _, err := sessionMetaFromVendorOptions(map[string]any{opencodeMetaKey: map[string]any{rawEventKey: map[string]any{rawEventEnabledKey: "bad"}}}); err == nil {
 		t.Fatal("bad raw event meta accepted")
 	}
 	assertSessionMetaAndSchemaHelpers(t)
@@ -35,7 +35,7 @@ func TestSessionMetaLifecycleBranches(t *testing.T) {
 
 func assertSessionMetaAndSchemaHelpers(t *testing.T) {
 	t.Helper()
-	meta, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{
+	meta, err := sessionMetaFromVendorOptions(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{
 		metaModelKey:      "p/m",
 		metaModeKey:       "plan",
 		metaPermissionKey: "ask",
@@ -43,14 +43,14 @@ func assertSessionMetaAndSchemaHelpers(t *testing.T) {
 	if err != nil || meta.Model != "p/m" || meta.Mode != "plan" || meta.Permission != "ask" {
 		t.Fatalf("session meta = %#v err=%v", meta, err)
 	}
-	meta, err = sessionMetaFromLifecycle(map[string]any{})
+	meta, err = sessionMetaFromVendorOptions(map[string]any{})
 	if err != nil || meta.Permission != "ask" {
 		t.Fatalf("default permission meta = %#v err=%v", meta, err)
 	}
 	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: 1}}}); err == nil {
 		t.Fatal("non-string permission meta accepted")
 	}
-	if _, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "maybe"}}}); err == nil {
+	if _, err := sessionMetaFromVendorOptions(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "maybe"}}}); err == nil {
 		t.Fatal("unsupported permission meta accepted")
 	}
 	if _, err := opencodeOptionsFromMeta(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"bad": func() {}}}}}); err == nil {
@@ -83,7 +83,7 @@ func TestSessionMetaWrongTypedKnownOptionsRejected(t *testing.T) {
 		"permission": {value: map[string]any{metaPermissionKey: 1}, field: "_meta.opencode.options.permission"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := sessionMetaFromLifecycle(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: tc.value}})
+			_, err := sessionMetaFromVendorOptions(map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: tc.value}})
 			if err == nil {
 				t.Fatalf("wrong-typed %s option accepted", name)
 			}
@@ -95,11 +95,11 @@ func TestSessionMetaWrongTypedKnownOptionsRejected(t *testing.T) {
 // Malformed lifecycle _meta surfaces as invalid params (-32602) on every
 // lifecycle route, never as an internal error.
 func TestLifecycleMetaErrorsAreInvalidParams(t *testing.T) {
-	if got := lifecycleMetaError(unsupportedField("_meta.opencode.x")); !reflect.DeepEqual(got, unsupportedField("_meta.opencode.x")) {
+	if got := vendorOptionsMetaError(unsupportedField("_meta.opencode.x")); !reflect.DeepEqual(got, unsupportedField("_meta.opencode.x")) {
 		t.Fatalf("request error not passed through: %#v", got)
 	}
 
-	wrapped := lifecycleMetaError(errors.New("_meta.opencode must be an object"))
+	wrapped := vendorOptionsMetaError(errors.New("_meta.opencode must be an object"))
 
 	var reqErr *acp.RequestError
 	if !errors.As(wrapped, &reqErr) || reqErr.Code != -32602 {
@@ -134,14 +134,14 @@ func TestSessionExtraPathDirsMeta(t *testing.T) {
 		return map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: values}}
 	}
 
-	meta, err := sessionMetaFromLifecycle(options(map[string]any{
+	meta, err := sessionMetaFromVendorOptions(options(map[string]any{
 		metaExtraPathDirsKey: []any{"/session/bin", "/tools/bin"},
 	}))
 	require.NoError(t, err)
 	require.Equal(t, []string{"/session/bin", "/tools/bin"}, meta.ExtraPathDirs)
 	require.True(t, meta.ExtraPathDirsSet)
 
-	meta, err = sessionMetaFromLifecycle(options(map[string]any{
+	meta, err = sessionMetaFromVendorOptions(options(map[string]any{
 		metaExtraPathDirsKey: []string{"/session/bin"},
 	}))
 	require.NoError(t, err)
@@ -158,12 +158,12 @@ func TestSessionExtraPathDirsMeta(t *testing.T) {
 
 	for _, test := range rejected {
 		t.Run(test.name, func(t *testing.T) {
-			_, rejectErr := sessionMetaFromLifecycle(options(test.values))
+			_, rejectErr := sessionMetaFromVendorOptions(options(test.values))
 			require.Equal(t, unsupportedField(test.field), rejectErr)
 		})
 	}
 
-	_, err = sessionMetaFromLifecycle(options(map[string]any{
+	_, err = sessionMetaFromVendorOptions(options(map[string]any{
 		metaExtraPathDirsKey: []any{"/session/bin", "tools/bin"},
 	}))
 	require.Equal(t, acp.NewInvalidParams(map[string]any{
@@ -172,7 +172,7 @@ func TestSessionExtraPathDirsMeta(t *testing.T) {
 	}), err)
 
 	for _, value := range []string{"", "/session/bin" + string(os.PathListSeparator) + "/tools/bin"} {
-		_, err = sessionMetaFromLifecycle(options(map[string]any{metaExtraPathDirsKey: []any{value}}))
+		_, err = sessionMetaFromVendorOptions(options(map[string]any{metaExtraPathDirsKey: []any{value}}))
 		require.Equal(t, acp.NewInvalidParams(map[string]any{
 			jsonFieldError: errValueAbsolutePathRequired,
 			jsonFieldField: extraPathDirsOptionPath + "[0]",

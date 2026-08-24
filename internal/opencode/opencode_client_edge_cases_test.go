@@ -87,8 +87,7 @@ func TestStartServerHappyPathWithoutPrivilegedProcessLaunch(t *testing.T) {
 	require.NoError(t, err)
 	server, ok := client.(*openCodeServer)
 	require.True(t, ok)
-	require.NotNil(t, server.Events())
-	require.NotNil(t, server.EventErrors())
+	require.NotNil(t, server.EventStream())
 	require.Equal(t, server.xdg, server.XDGDirs())
 	require.NoError(t, server.Shutdown(context.Background()))
 }
@@ -370,9 +369,8 @@ func TestNativeOwnedXDGCanBeResolvedFromRootWithoutFilesystemWrites(t *testing.T
 }
 
 func TestOpenCodeServerAccessorsAndNilAssistantError(t *testing.T) {
-	server := &openCodeServer{events: make(chan Event), errs: make(chan error), xdg: XDGDirs{Root: "/runtime"}}
-	require.NotNil(t, server.Events())
-	require.NotNil(t, server.EventErrors())
+	server := &openCodeServer{eventStream: make(chan EventStreamItem), xdg: XDGDirs{Root: "/runtime"}}
+	require.NotNil(t, server.EventStream())
 	require.Equal(t, server.xdg, server.XDGDirs())
 	require.Equal(t, &AssistantError{}, AssistantErrorFromNativeError(nil))
 }
@@ -708,47 +706,6 @@ func TestScopeRegisterFailureCreatePolicyAndDirectoryQueryClone(t *testing.T) {
 	require.NoError(t, client.doJSON(context.Background(), http.MethodGet, "/query", query, nil, &result))
 	require.Empty(t, query.Get("directory"), "caller query must not be mutated")
 }
-
-func TestSendMessagePollingSkipsAndAssistantFailure(t *testing.T) {
-	reads := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		switch {
-		case request.Method == http.MethodPost && request.URL.Path == "/session/s/prompt_async":
-			writer.WriteHeader(http.StatusNoContent)
-		case request.Method == http.MethodGet && request.URL.Path == "/session/s/message":
-			reads++
-			switch reads {
-			case 1:
-				writeJSON(t, writer, []map[string]any{{"info": map[string]any{"id": "old", "role": "assistant"}}})
-			case 2:
-				writeJSON(t, writer, []map[string]any{{"info": map[string]any{"id": "user", "role": "user", "finish": "stop"}}})
-			case 3:
-				writeJSON(t, writer, []map[string]any{{"info": map[string]any{"id": "old", "role": "assistant", "finish": "stop"}}})
-			case 4:
-				writeJSON(t, writer, []map[string]any{{"info": map[string]any{"id": "new", "role": "assistant"}}})
-			default:
-				writeJSON(t, writer, []map[string]any{{"info": map[string]any{
-					"id": "new", "role": "assistant", "finish": "error", "error": map[string]any{"message": "provider failed"},
-				}}})
-			}
-		case request.Method == http.MethodGet && request.URL.Path == "/session/status":
-			writeJSON(t, writer, map[string]any{"s": map[string]any{"type": "idle"}})
-		default:
-			writer.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(server.Close)
-	client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL}
-	_, err := client.SendMessage(context.Background(), "s", MessageRequest{})
-	require.ErrorContains(t, err, "provider failed")
-	require.GreaterOrEqual(t, reads, 5)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = client.SendMessage(ctx, "s", MessageRequest{})
-	require.Error(t, err)
-}
-
 func TestRuntimeConfigForbiddenSeedsAndDeepMerge(t *testing.T) {
 	for _, field := range []string{fieldPermission, fieldMCP} {
 		t.Run(field, func(t *testing.T) {
@@ -960,23 +917,6 @@ func TestStartServerSupervisedReadinessSuccess(t *testing.T) {
 	server, ok := client.(*openCodeServer)
 	require.True(t, ok)
 	require.NoError(t, server.Shutdown(context.Background()))
-}
-
-func TestSendMessagePollContextCancellation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		switch request.Method {
-		case http.MethodGet:
-			writeJSON(t, writer, []map[string]any{})
-		case http.MethodPost:
-			writer.WriteHeader(http.StatusNoContent)
-		}
-	}))
-	t.Cleanup(server.Close)
-	client := &openCodeServer{httpClient: server.Client(), baseURL: server.URL}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-	_, err := client.SendMessage(ctx, "s", MessageRequest{})
-	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 // TestStartServerRefusesAnExplicitPolicyBeforeAnySideEffect proves the launch

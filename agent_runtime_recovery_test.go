@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -108,7 +109,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent := NewAgent()
 		agent.runtime = newFakeOpenCodeClient()
 		agent.runtimeGeneration = 2
-		current := testSession(agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient())
 		current.runtimeGeneration = 1
 		require.ErrorContains(t, agent.storeStartedSession(current), "runtime generation changed")
 	})
@@ -149,7 +150,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent = NewAgent()
 		agent.runtime = exited
 		agent.runtimeGeneration = 1
-		current := testSession(agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient())
 		installed, closed := current.installRecoveredRuntime(exited, func() {}, current.idmap, 1)
 		require.False(t, installed)
 		require.False(t, closed)
@@ -198,17 +199,17 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("store error", func(t *testing.T) {
 		store := &errorSessionStore{err: errors.New("store failed")}
 		agent := NewAgent(WithSessionStore(store))
-		current := testSession(agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient())
 		current.runtimeLostCause = "runtime exited"
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), "store failed")
 	})
 
-	t.Run("missing committed generation reaches prompt", func(t *testing.T) {
+	t.Run("missing committed generation reaches prompt as the loss", func(t *testing.T) {
 		agent := NewAgent()
-		current := testSession(agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient())
 		current.runtimeLostCause = "runtime exited"
-		_, err := current.promptWithRoute(context.Background(), TextPromptRequest(current.id, "turn", "hello"), "turn")
-		require.ErrorContains(t, err, "opencode_recovery_generation_missing")
+		_, err := current.promptWithRoute(context.Background(), TextPromptRequest(current.id, "turn", "hello"), "turn", lifecycle.Submission{})
+		assertTurnFailed(t, err, causeTransport, "runtime exited")
 	})
 
 	t.Run("cancelled after successful store load", func(t *testing.T) {
@@ -223,11 +224,11 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("cancelled between recovery attempts", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		crashed := readyRecoveryClient()
-		crashed.providersFunc = func(context.Context) (opencode.ProvidersResponse, error) {
+		crashed.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
 			close(crashed.runtimeExited)
 			cancel()
 
-			return opencode.ProvidersResponse{}, errors.New("generation exited")
+			return nil, errors.New("generation exited")
 		}
 		agent, current := recoveryFixture(t, nil, crashed)
 		require.ErrorIs(t, current.ensureRuntime(ctx), context.Canceled)
@@ -237,28 +238,6 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("runtime construction error", func(t *testing.T) {
 		agent, current := recoveryFixture(t, nil)
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), "unexpected recovery factory call")
-		require.NoError(t, agent.Close())
-	})
-
-	t.Run("model validation error on live generation", func(t *testing.T) {
-		candidate := readyRecoveryClient()
-		candidate.providersErr = errors.New("providers failed")
-		agent, current := recoveryFixture(t, nil, candidate)
-		require.ErrorContains(t, current.ensureRuntime(context.Background()), "providers failed")
-		require.NoError(t, agent.Close())
-	})
-
-	t.Run("model validation discards exited generation", func(t *testing.T) {
-		crashed := readyRecoveryClient()
-		crashed.providersFunc = func(context.Context) (opencode.ProvidersResponse, error) {
-			close(crashed.runtimeExited)
-
-			return opencode.ProvidersResponse{}, errors.New("generation exited")
-		}
-		replacement := readyRecoveryClient()
-		agent, current := recoveryFixture(t, nil, crashed, replacement)
-		require.NoError(t, current.ensureRuntime(context.Background()))
-		require.EqualValues(t, 2, current.runtimeGeneration)
 		require.NoError(t, agent.Close())
 	})
 
@@ -307,30 +286,28 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	})
 }
 
-func TestCrashGenerationCancellationAndPromptFailureBranches(t *testing.T) {
+// TestLostRuntimeFailsAPromptBeforeItIsAccepted proves a session whose runtime
+// generation was lost fails its prompt with the transport cause and never
+// dispatches: the loss is the answer, and no turn is accepted against a runtime
+// this session no longer holds.
+func TestLostRuntimeFailsAPromptBeforeItIsAccepted(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	current := testSession(NewAgent(), client)
-	current.cancelling = true
-	current.cancellationEpoch = 1
-	current.runtimeLostCause = "runtime exited"
-	require.NoError(t, current.resolveCancellation(context.Background(), 1))
+	current := testSession(t, NewAgent(), client)
 
-	request := TextPromptRequest(current.id, "turn", "hello")
-	turnCtx := current.beginTurn(context.Background(), "turn")
-	current.pending["permission"] = opencode.PermissionRequest{ID: "permission", SessionID: "native-1"}
-	client.permissionsErr = errors.New("pending failed")
-	_, err := current.runPromptTurn(context.Background(), turnCtx, request, func(context.Context) (opencode.NativeMessage, error) {
-		return opencode.NativeMessage{}, nil
-	}, opencode.NativeCommand{}, false)
-	assertTurnFailed(t, err, causeTransport, "runtime retired after turn cancellation")
+	dispatched := false
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched = true
 
-	current = testSession(NewAgent(), newFakeOpenCodeClient())
-	turnCtx = current.beginTurn(context.Background(), "turn")
-	current.runtimeLostCause = "runtime exited"
-	_, err = current.runPromptTurn(context.Background(), turnCtx, request, func(context.Context) (opencode.NativeMessage, error) {
 		return opencode.NativeMessage{}, nil
-	}, opencode.NativeCommand{}, false)
+	}
+
+	current.mu.Lock()
+	current.runtimeLostCause = "runtime exited"
+	current.mu.Unlock()
+
+	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
 	assertTurnFailed(t, err, causeTransport, "runtime exited")
+	require.False(t, dispatched, "a lost runtime still received a frame")
 }
 
 func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {

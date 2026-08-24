@@ -6,15 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 )
 
 type agentClient interface {
 	Done() <-chan struct{}
+	BeginCreateElicitation(context.Context, acp.UnstableCreateElicitationRequest, elicitationScope, hostRequestKey) registeredElicitationRequest
+	BeginRequestPermission(context.Context, acp.RequestPermissionRequest, hostRequestKey) registeredPermissionRequest
 	CreateElicitation(context.Context, acp.UnstableCreateElicitationRequest, elicitationScope) (acp.UnstableCreateElicitationResponse, error)
 	UnstableCreateElicitation(context.Context, acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error)
 	RequestPermission(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error)
@@ -30,9 +34,42 @@ type elicitationScope struct {
 }
 
 type localAgentConnection struct {
-	agent       *Agent
-	conn        *acp.Connection
-	initialized atomic.Bool
+	agent         *Agent
+	conn          *acp.Connection
+	initialized   atomic.Bool
+	hooks         *establishmentHooks
+	registrations *hostRequestRegistrations
+	transport     *connectionTransport
+}
+
+type connectionTransport struct {
+	output io.Writer
+	input  io.Reader
+	once   sync.Once
+}
+
+func newConnectionTransport(output io.Writer, input io.Reader) *connectionTransport {
+	return &connectionTransport{output: output, input: input}
+}
+
+func (t *connectionTransport) Write(p []byte) (int, error) {
+	return t.output.Write(p)
+}
+
+func (t *connectionTransport) interrupt() {
+	if t == nil {
+		return
+	}
+
+	t.once.Do(func() {
+		if closer, ok := t.output.(io.Closer); ok {
+			_ = closer.Close()
+		}
+
+		if closer, ok := t.input.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	})
 }
 
 type localAgentHandler func(context.Context, *Agent, json.RawMessage) (any, *acp.RequestError)
@@ -63,13 +100,27 @@ var (
 )
 
 func newLocalAgentConnection(agent *Agent, output io.Writer, input io.Reader) *localAgentConnection {
-	conn := &localAgentConnection{agent: agent}
-	inputGate := newConnectionInputGate(input)
-	conn.conn = acp.NewConnection(conn.handle, output, inputGate)
-	conn.conn.SetLogger(agent.log)
+	hooks := newEstablishmentHooks(agent.log)
+	registrations := newHostRequestRegistrations()
+	transport := newConnectionTransport(output, input)
+	conn := &localAgentConnection{
+		agent: agent, hooks: hooks, registrations: registrations, transport: transport,
+	}
+	inputGate := newConnectionInputGate(newEstablishmentTagReader(input))
+	conn.conn = acp.NewConnection(conn.handle, registrations.wrap(hooks.wrap(transport)), inputGate)
+	// The SDK sees malformed frames and transport failures before the adapter can
+	// classify their fields. Keep that boundary closed: diagnostics above it are
+	// structured and redacted by this package.
+	conn.conn.SetLogger(slog.New(slog.DiscardHandler))
 	inputGate.open()
 
 	return conn
+}
+
+func (c *localAgentConnection) InterruptWrites() {
+	if c != nil {
+		c.transport.interrupt()
+	}
 }
 
 type connectionInputGate struct {
@@ -124,7 +175,11 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 
 	if strings.HasPrefix(method, "_") {
 		extensionResult, err := c.agent.HandleExtensionMethod(ctx, method, params)
+
 		reqErr = requestError(ctx, err)
+		if reqErr == nil {
+			c.queueEstablishment(ctx, method, params, extensionResult)
+		}
 
 		return extensionResult, reqErr
 	}
@@ -139,6 +194,10 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 	result, reqErr = handler(ctx, c.agent, params)
 	if method == acp.AgentMethodInitialize && reqErr == nil {
 		c.initialized.Store(true)
+	}
+
+	if reqErr == nil {
+		c.queueEstablishment(ctx, method, params, result)
 	}
 
 	return result, reqErr
@@ -182,11 +241,11 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 func decodeLocalAgentParams[Req any, ReqPtr localAgentParams[Req]](params json.RawMessage) (Req, *acp.RequestError) {
 	var value Req
 	if err := json.Unmarshal(params, &value); err != nil {
-		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: "invalid request parameters"})
 	}
 
 	if err := ReqPtr(&value).Validate(); err != nil {
-		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: "request validation failed"})
 	}
 
 	return value, nil
@@ -269,7 +328,7 @@ func requestError(ctx context.Context, err error) *acp.RequestError {
 	}
 
 	if context.Cause(ctx) == context.Canceled {
-		return acp.NewRequestCancelled(map[string]any{jsonFieldError: err.Error()})
+		return acp.NewRequestCancelled(map[string]any{jsonFieldError: "request cancelled"})
 	}
 
 	var reqErr *acp.RequestError
@@ -277,7 +336,7 @@ func requestError(ctx context.Context, err error) *acp.RequestError {
 		return reqErr
 	}
 
-	return acp.NewInternalError(map[string]any{jsonFieldError: err.Error()})
+	return acp.NewInternalError(map[string]any{jsonFieldError: "handler failed"})
 }
 
 func scopedElicitationParams(
@@ -319,12 +378,17 @@ func scopedElicitationParams(
 		return nil, fmt.Errorf("native elicitation metadata used reserved key %q", routeEnvelopeKey)
 	}
 
-	route, err := outboundRoute(scope)
-	if err != nil {
-		return nil, err
+	if scope.TurnNonce != "" {
+		route, err := outboundRoute(scope)
+		if err != nil {
+			return nil, err
+		}
+
+		meta[routeEnvelopeKey] = route
+	} else if _, correlated := meta[lifecycle.MetaKey]; !correlated {
+		return nil, errors.New("out-of-prompt elicitation requires lifecycle correlation")
 	}
 
-	meta[routeEnvelopeKey] = route
 	payload["_meta"] = meta
 
 	return json.Marshal(payload)

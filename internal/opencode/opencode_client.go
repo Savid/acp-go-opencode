@@ -56,14 +56,13 @@ const (
 	routeCommand              = "/command"
 	routeEvent                = "/event"
 	routeSession              = "/session"
-	routeSessionStatus        = "/session/status"
+	routePromptAsync          = "/prompt_async"
 	routePermission           = "/permission"
 	routeQuestion             = "/question"
 	routeAPIPermissionRequest = "/api/permission/request"
 	routeAPIQuestionRequest   = "/api/question/request"
 
-	roleAssistant           = "assistant"
-	nativeSessionStatusIdle = "idle"
+	roleAssistant = "assistant"
 )
 
 // Native OpenCode /doc path templates validated during readiness.
@@ -91,6 +90,9 @@ const (
 	fieldReply                = "reply"
 	fieldRequestID            = "requestID"
 	fieldSessionID            = "sessionID"
+	fieldMessageID            = "messageID"
+	fieldCallID               = "callID"
+	fieldStatus               = "status"
 )
 
 // openAPITypeArray is the OpenAPI schema "type" value for arrays.
@@ -102,8 +104,14 @@ const openAPITypeArray = "array"
 // the wrapper-owned loopback server, far above any configured image limit.
 const sseEventLineLimitBytes = 64 * 1024 * 1024
 
+// One SSE event may span multiple data lines. The aggregate is bounded by the
+// same ceiling as an individual line so a peer cannot bypass the parser's memory
+// bound by splitting one malformed or unterminated event into legal-size lines.
+const sseEventLimitBytes = sseEventLineLimitBytes
+
 var (
 	ErrSSEDisconnect         = errors.New("opencode SSE disconnected")
+	ErrSSEEventTooLarge      = errors.New("opencode SSE event exceeds size limit")
 	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
 	ErrScopeRuntimeShutdown  = errors.New("directory-scoped OpenCode client cannot shut down the shared runtime")
 	ErrRuntimeScratchCleanup = errors.New("OpenCode runtime scratch cleanup incomplete")
@@ -120,10 +128,15 @@ type Client interface {
 	ListSessions(context.Context, string) ([]NativeSession, error)
 	DeleteSession(context.Context, string) error
 	Commands(context.Context) ([]NativeCommand, error)
-	RunCommand(context.Context, string, CommandRequest) (NativeMessage, error)
-	SendMessage(context.Context, string, MessageRequest) (NativeMessage, error)
+	// DispatchCommand posts one resolved native command. The native command
+	// route answers only when the agent loop it started has finished, so its
+	// return is a completion report and never the dispatch acknowledgement.
+	DispatchCommand(context.Context, string, CommandRequest) error
+	// DispatchMessage posts one prompt frame and returns when the native
+	// dispatcher has accepted durable ownership of it. It waits for nothing
+	// else: the turn's transcript and its completion arrive as native events.
+	DispatchMessage(context.Context, string, MessageRequest) error
 	Messages(context.Context, string) ([]NativeMessage, error)
-	SessionStatus(context.Context) (map[string]NativeSessionStatus, error)
 	Abort(context.Context, string) error
 	Fork(context.Context, string, string) (NativeSession, error)
 	Todos(context.Context, string) ([]NativeTodo, error)
@@ -134,8 +147,7 @@ type Client interface {
 	PendingQuestions(context.Context) ([]QuestionRequest, error)
 	ReplyQuestion(context.Context, QuestionRequest, [][]string) error
 	RejectQuestion(context.Context, QuestionRequest) error
-	Events() <-chan Event
-	EventErrors() <-chan error
+	EventStream() <-chan EventStreamItem
 	RuntimeExited() <-chan struct{}
 	XDGDirs() XDGDirs
 	NativeVersion() string
@@ -413,8 +425,8 @@ type openCodeServer struct {
 	sessionQuestionListSupport   bool
 	nativeVersion                string
 
-	events                       chan Event
-	errs                         chan error
+	eventStream                  chan EventStreamItem
+	eventReader                  func(context.Context) error
 	closed                       chan struct{}
 	directory                    string
 	scopeCancel                  context.CancelFunc
@@ -434,9 +446,6 @@ type openCodeServer struct {
 	sessionCarrierBroker         *sessionCarrierBroker
 	sessionCarrierReference      string
 	pure                         bool
-
-	streamMu    sync.Mutex
-	streamEpoch uint64
 }
 
 type runtimeShutdownState struct {
@@ -655,11 +664,19 @@ type NativeCommand struct {
 }
 
 type Event struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	Properties  json.RawMessage `json:"properties"`
-	Raw         json.RawMessage `json:"-"`
-	StreamEpoch uint64          `json:"-"`
+	ID         string          `json:"id"`
+	Type       string          `json:"type"`
+	Properties json.RawMessage `json:"properties"`
+	Raw        json.RawMessage `json:"-"`
+}
+
+// EventStreamItem is one ordered delivery from a directory-scoped native
+// stream. Exactly one of Event and Terminal is set. The terminal marker shares
+// the bounded channel with events, so it cannot be dropped when the channel is
+// full and cannot overtake the final event accepted from the SSE body.
+type EventStreamItem struct {
+	Event    *Event
+	Terminal error
 }
 
 func (e *Event) UnmarshalJSON(data []byte) error {
@@ -713,6 +730,21 @@ func (r PermissionRequest) Route() PermissionRoute {
 	}
 
 	return PermissionRouteSession
+}
+
+// ToolCall reports the tool call this permission request holds up. The two native
+// shapes carry that correlation in different members — the session route names a
+// `tool` object and the API route names a `source` of type tool — and a reader
+// outside this package must not have to know which arrived.
+func (r PermissionRequest) ToolCall() PermissionTool {
+	if r.Tool.CallID != "" {
+		return r.Tool
+	}
+
+	messageID, _ := r.Source[fieldMessageID].(string)
+	callID, _ := r.Source[fieldCallID].(string)
+
+	return PermissionTool{MessageID: messageID, CallID: callID}
 }
 
 func (r PermissionRequest) ActionName() string {
@@ -772,7 +804,6 @@ type MessageRequest struct {
 	MessageID string           `json:"messageID,omitempty"`
 	Model     *ModelSelector   `json:"model,omitempty"`
 	Agent     string           `json:"agent,omitempty"`
-	NoReply   bool             `json:"noReply,omitempty"`
 	Parts     []map[string]any `json:"parts"`
 	Format    *OutputFormat    `json:"format,omitempty"`
 }
@@ -866,7 +897,6 @@ var (
 	openCodePrepareRuntimeGeneration           = prepareDarwinRuntimeGeneration
 	openCodeAfter                              = time.After
 	openCodeReadyPollInterval                  = 100 * time.Millisecond
-	openCodeEventReconnectDelay                = 250 * time.Millisecond
 	openCodeShutdownTimeout                    = 5 * time.Second
 	openCodeContainmentTimeout                 = 15 * time.Second
 )
@@ -1333,8 +1363,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		cancel:                       cancel,
 		xdg:                          xdg,
 		log:                          options.Logger,
-		events:                       make(chan Event, 256),
-		errs:                         make(chan error, 8),
+		eventStream:                  make(chan EventStreamItem, 256),
 		closed:                       make(chan struct{}),
 		runtimeShutdown:              newRuntimeShutdownState(),
 		runtimeClosed:                make(chan struct{}),
@@ -1487,15 +1516,30 @@ func (s *openCodeServer) waitReady(ctx context.Context, eventCtx context.Context
 
 	s.sessionQuestionListSupport = docCapabilities.sessionQuestionList
 
-	go s.readEvents(eventCtx)
+	// The readiness handshake is the whole purpose of the runtime-wide event
+	// subscription: every session consumes its own directory-scoped stream, so
+	// nothing reads this one again. The subscription is cancelled the moment the
+	// handshake frame arrives rather than left running with no reader, where a
+	// full buffer would hold an SSE connection open for the process's whole life.
+	handshakeCtx, endHandshake := context.WithCancel(eventCtx)
+	defer endHandshake()
+
+	go s.readEvents(handshakeCtx)
 
 	select {
-	case event := <-s.events:
-		if event.Type != eventTypeServerConnected {
-			return fmt.Errorf("first opencode event was %q, want server.connected", event.Type)
+	case item := <-s.eventStream:
+		if item.Terminal != nil {
+			return fmt.Errorf("opencode event stream failed during readiness: %w", item.Terminal)
 		}
-	case err := <-s.errs:
-		return fmt.Errorf("opencode event stream failed during readiness: %w", err)
+
+		if item.Event == nil || item.Event.Type != eventTypeServerConnected {
+			eventType := ""
+			if item.Event != nil {
+				eventType = item.Event.Type
+			}
+
+			return fmt.Errorf("first opencode event was %q, want server.connected", eventType)
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -1662,7 +1706,7 @@ func waitForOpenCodeRuntimeShutdown(
 		select {
 		case waitErr := <-done:
 			if waitErr != nil && server.log != nil {
-				server.log.DebugContext(proofCtx, "opencode exited during shutdown", slog.Any("error", waitErr))
+				server.log.DebugContext(proofCtx, "opencode exited during shutdown")
 			}
 
 			return true, false, nil
@@ -1739,8 +1783,8 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		log: s.log, sessionPermissionListSupport: s.sessionPermissionListSupport,
 		sessionQuestionListSupport: s.sessionQuestionListSupport,
 		nativeVersion:              s.nativeVersion,
-		events:                     make(chan Event, 256), errs: make(chan error, 8),
-		closed: make(chan struct{}), directory: options.Directory,
+		eventStream:                make(chan EventStreamItem, 256),
+		closed:                     make(chan struct{}), directory: options.Directory,
 		scopeCancel: cancel, runtimeShutdown: s.runtimeShutdown, runtimeClosed: s.runtimeClosed,
 		runtimeExited:           s.runtimeExited,
 		sessionCarrierBroker:    s.sessionCarrierBroker,
@@ -1755,24 +1799,26 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		return nil, err
 	}
 
-	// Capture package-level reconnect seams before the goroutine starts. Tests
-	// may restore those seams as soon as Scope returns.
-	after := openCodeAfter
-
-	reconnectDelay := openCodeEventReconnectDelay
-	go scope.readEventsWithTiming(scopeCtx, after, reconnectDelay)
+	go scope.readEvents(scopeCtx)
 
 	select {
-	case event := <-scope.events:
-		if event.Type != eventTypeServerConnected {
+	case item := <-scope.eventStream:
+		if item.Terminal != nil {
 			closeErr := scope.Close(context.Background())
 
-			return nil, errors.Join(fmt.Errorf("first directory-scoped event was %q", event.Type), closeErr)
+			return nil, errors.Join(fmt.Errorf("opencode directory event stream failed: %w", item.Terminal), closeErr)
 		}
-	case err := <-scope.errs:
-		closeErr := scope.Close(context.Background())
 
-		return nil, errors.Join(fmt.Errorf("opencode directory event stream failed: %w", err), closeErr)
+		if item.Event == nil || item.Event.Type != eventTypeServerConnected {
+			closeErr := scope.Close(context.Background())
+			eventType := ""
+
+			if item.Event != nil {
+				eventType = item.Event.Type
+			}
+
+			return nil, errors.Join(fmt.Errorf("first directory-scoped event was %q", eventType), closeErr)
+		}
 	case <-ctx.Done():
 		closeErr := scope.Close(context.Background())
 
@@ -1861,12 +1907,8 @@ func (s *openCodeServer) disconnectMCP(ctx context.Context) error {
 	return s.unregisterMCP(disconnectCtx)
 }
 
-func (s *openCodeServer) Events() <-chan Event {
-	return s.events
-}
-
-func (s *openCodeServer) EventErrors() <-chan error {
-	return s.errs
+func (s *openCodeServer) EventStream() <-chan EventStreamItem {
+	return s.eventStream
 }
 
 func (s *openCodeServer) RuntimeExited() <-chan struct{} {
@@ -2067,78 +2109,30 @@ func (s *openCodeServer) Commands(ctx context.Context) ([]NativeCommand, error) 
 	return out, err
 }
 
-func (s *openCodeServer) RunCommand(ctx context.Context, id string, req CommandRequest) (NativeMessage, error) {
+// DispatchCommand posts one resolved native command. The native route expands
+// the command template and then runs the agent loop to completion before it
+// answers, so this call reports the run's outcome rather than its admission; the
+// caller takes admission and completion from the session's own native events.
+func (s *openCodeServer) DispatchCommand(ctx context.Context, id string, req CommandRequest) error {
 	var out NativeMessage
 	if err := s.doJSONWithClient(ctx, s.blockingHTTPClient(), http.MethodPost, "/session/"+url.PathEscape(id)+routeCommand, nil, req, &out); err != nil {
-		return s.recoverBlockingTurnFailure(ctx, id, err)
+		_, recovered := s.recoverBlockingTurnFailure(ctx, id, err)
+
+		return recovered
 	}
 
-	if err := AssistantMessageError(out); err != nil {
-		return NativeMessage{}, err
-	}
-
-	return out, nil
+	return AssistantMessageError(out)
 }
 
-func (s *openCodeServer) SendMessage(ctx context.Context, id string, req MessageRequest) (NativeMessage, error) {
-	client := s.blockingHTTPClient()
-
-	before, err := s.messagesWithClient(ctx, client, id)
-	if err != nil {
-		return NativeMessage{}, fmt.Errorf("load opencode messages before prompt: %w", err)
-	}
-
-	beforeAssistant := ""
-
-	for index := len(before) - 1; index >= 0; index-- {
-		if before[index].Info.Role == roleAssistant {
-			beforeAssistant = before[index].Info.ID
-
-			break
-		}
-	}
-
-	if err := s.doJSONWithClient(ctx, client, http.MethodPost, "/session/"+url.PathEscape(id)+"/prompt_async", nil, req, nil); err != nil {
-		return s.recoverBlockingTurnFailure(ctx, id, err)
-	}
-
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	var candidate NativeMessage
-
-	for {
-		messages, err := s.messagesWithClient(ctx, client, id)
-		if err == nil {
-			for index := len(messages) - 1; index >= 0; index-- {
-				message := messages[index]
-				if message.Info.Role != roleAssistant || message.Info.ID == beforeAssistant || message.Info.Finish == "" {
-					continue
-				}
-
-				candidate = message
-
-				break
-			}
-		}
-
-		statuses, statusErr := s.sessionStatusWithClient(ctx, client)
-		status, active := statuses[id]
-
-		if candidate.Info.ID != "" && statusErr == nil && (!active || status.Type == nativeSessionStatusIdle) {
-			if err := AssistantMessageError(candidate); err != nil {
-				return NativeMessage{}, err
-			}
-
-			return candidate, nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return NativeMessage{}, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+// DispatchMessage posts one prompt frame to the native async prompt route. That
+// route resolves the addressed session, schedules the agent loop, and answers
+// `204 No Content` — the native dispatcher's own acknowledgement that it holds
+// the frame. A refusal answers with a status instead, and a transport failure
+// leaves admission unknown, so both are reported as a refusal: an admitted frame
+// this call could not confirm still announces itself on the session's event
+// stream, where it opens an agent-origin turn rather than a silently accepted one.
+func (s *openCodeServer) DispatchMessage(ctx context.Context, id string, req MessageRequest) error {
+	return s.doJSON(ctx, http.MethodPost, "/session/"+url.PathEscape(id)+routePromptAsync, nil, req, nil)
 }
 
 // recoverBlockingTurnFailure resolves the real cause of a transport failure on
@@ -2229,19 +2223,6 @@ func (s *openCodeServer) messagesWithClient(ctx context.Context, client *http.Cl
 	var out []NativeMessage
 
 	err := s.doJSONWithClient(ctx, client, http.MethodGet, "/session/"+url.PathEscape(id)+"/message", nil, nil, &out)
-
-	return out, err
-}
-
-func (s *openCodeServer) SessionStatus(ctx context.Context) (map[string]NativeSessionStatus, error) {
-	return s.sessionStatusWithClient(ctx, s.httpClient)
-}
-
-func (s *openCodeServer) sessionStatusWithClient(
-	ctx context.Context, client *http.Client,
-) (map[string]NativeSessionStatus, error) {
-	out := map[string]NativeSessionStatus{}
-	err := s.doJSONWithClient(ctx, client, http.MethodGet, routeSessionStatus, nil, nil, &out)
 
 	return out, err
 }
@@ -2509,7 +2490,7 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("opencode %s %s returned %s: %s", e.Method, e.Path, e.Status, e.Body)
+	return fmt.Sprintf("opencode %s %s returned %s", e.Method, e.Path, e.Status)
 }
 
 func IsBadRequest(err error) bool {
@@ -2534,63 +2515,56 @@ func (s *openCodeServer) blockingHTTPClient() *http.Client {
 }
 
 func (s *openCodeServer) readEvents(ctx context.Context) {
-	s.readEventsWithTiming(ctx, openCodeAfter, openCodeEventReconnectDelay)
-}
+	var err error
 
-func (s *openCodeServer) readEventsWithTiming(ctx context.Context, after func(time.Duration) <-chan time.Time, reconnectDelay time.Duration) {
-	for {
-		epoch := s.nextStreamEpoch()
-		if err := s.readEventStream(ctx, epoch); err != nil {
-			select {
-			case s.errs <- StreamError{Epoch: epoch, Err: err}:
-			default:
-			}
+	defer func() {
+		if recover() != nil {
+			err = errors.New("opencode SSE producer panicked")
 		}
 
-		select {
-		case <-s.closed:
-			return
-		case <-after(reconnectDelay):
+		s.publishEventStreamTerminal(ctx, err)
+	}()
+
+	read := s.readEventStream
+	if s.eventReader != nil {
+		read = s.eventReader
+	}
+
+	err = read(ctx)
+}
+
+func (s *openCodeServer) publishEventStreamTerminal(ctx context.Context, err error) {
+	defer func() { _ = recover() }()
+
+	if err == nil {
+		return
+	}
+
+	select {
+	case <-s.closed:
+		return
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	select {
+	case s.eventStream <- EventStreamItem{Terminal: err}:
+	case <-s.closed:
+	case <-ctx.Done():
+	}
+}
+
+func (s *openCodeServer) readEventStream(ctx context.Context) error {
+	return s.readEventStreamWithLimit(ctx, sseEventLimitBytes)
+}
+
+func (s *openCodeServer) readEventStreamWithLimit(ctx context.Context, eventLimit int) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("opencode SSE reader panicked")
 		}
-	}
-}
-
-func (s *openCodeServer) nextStreamEpoch() uint64 {
-	s.streamMu.Lock()
-	defer s.streamMu.Unlock()
-
-	s.streamEpoch++
-
-	return s.streamEpoch
-}
-
-type StreamError struct {
-	Epoch uint64
-	Err   error
-}
-
-func (e StreamError) Error() string {
-	return e.Err.Error()
-}
-
-func (e StreamError) Unwrap() error {
-	return e.Err
-}
-
-func StreamErrorEpoch(err error) uint64 {
-	var streamErr StreamError
-	if errors.As(err, &streamErr) {
-		return streamErr.Epoch
-	}
-
-	return 0
-}
-
-func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) error {
-	var epoch uint64
-	if len(epochs) > 0 {
-		epoch = epochs[0]
-	}
+	}()
 
 	eventURL := s.baseURL + routeEvent
 	if s.directory != "" {
@@ -2612,9 +2586,9 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
-		return fmt.Errorf("opencode event stream returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return fmt.Errorf("opencode event stream returned %s", resp.Status)
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -2635,9 +2609,8 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 			return err
 		}
 
-		event.StreamEpoch = epoch
 		select {
-		case s.events <- event:
+		case s.eventStream <- EventStreamItem{Event: &event}:
 		case <-s.closed:
 			return io.EOF
 		case <-ctx.Done():
@@ -2658,11 +2631,22 @@ func (s *openCodeServer) readEventStream(ctx context.Context, epochs ...uint64) 
 		}
 
 		if strings.HasPrefix(line, "data:") {
+			fragment := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+
+			separator := 0
 			if data.Len() > 0 {
+				separator = 1
+			}
+
+			if eventLimit <= 0 || data.Len()+separator > eventLimit || len(fragment) > eventLimit-data.Len()-separator {
+				return ErrSSEEventTooLarge
+			}
+
+			if separator != 0 {
 				data.WriteByte('\n')
 			}
 
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			data.WriteString(fragment)
 		}
 	}
 
@@ -2689,12 +2673,6 @@ type openCodeDocCapabilities struct {
 	sessionQuestionList   bool
 }
 
-func validateOpenCodeDoc(doc map[string]any) error {
-	_, err := inspectOpenCodeDoc(doc)
-
-	return err
-}
-
 func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 	rawPaths, _ := doc["paths"].(map[string]any)
 
@@ -2703,7 +2681,6 @@ func inspectOpenCodeDoc(doc map[string]any) (openCodeDocCapabilities, error) {
 		routeConfigProviders,
 		routeCommand,
 		routeEvent,
-		routeSessionStatus,
 		routeSession,
 		"/session/{sessionID}",
 		docPathSessionCommand,
@@ -2802,6 +2779,14 @@ type openCodeEventContract struct {
 
 func validateOpenCodeEventSchemas(doc map[string]any) error {
 	for _, contract := range []openCodeEventContract{
+		// The idle event is this adapter's completion authority for a native
+		// turn, and the status event is how a session reports that it took work
+		// on. A build that publishes neither cannot report a foreground
+		// boundary at all, so readiness refuses it rather than falling back to
+		// a poll.
+		{schema: "EventSessionIdle", event: EventSessionIdle, requiredProperties: []string{fieldSessionID}},
+		{schema: "EventSessionStatus", event: EventSessionStatus, requiredProperties: []string{fieldSessionID, fieldStatus}},
+		{schema: "EventSessionError", event: EventSessionError},
 		{schema: "EventPermissionV2Asked", event: "permission.v2.asked", requiredProperties: []string{fieldID, fieldSessionID, fieldAction, "resources"}},
 		{schema: "EventPermissionV2Replied", event: "permission.v2.replied", requiredProperties: []string{fieldSessionID, fieldRequestID, fieldReply}},
 		{schema: "EventPermissionAsked", event: "permission.asked", requiredProperties: []string{fieldID, fieldSessionID, fieldPermission, "patterns"}},
@@ -3528,49 +3513,10 @@ func drainProcessPipe(log *slog.Logger, name string, reader io.Reader) {
 	scanner.Buffer(make([]byte, 0, 4096), 64*1024)
 
 	for scanner.Scan() {
-		if log != nil {
-			log.Debug("opencode process output", slog.String("pipe", name), slog.String("line", scanner.Text()))
-		}
-	}
-}
-
-func compareSemver(got string, want string) int {
-	g := parseSemver(got)
-
-	w := parseSemver(want)
-	for i := range g {
-		if g[i] < w[i] {
-			return -1
-		}
-
-		if g[i] > w[i] {
-			return 1
-		}
 	}
 
-	return 0
-}
-
-func parseSemver(value string) [3]int {
-	value = strings.TrimPrefix(strings.TrimSpace(value), "v")
-	parts := strings.Split(value, ".")
-
-	var out [3]int
-	for i := 0; i < len(parts) && i < len(out); i++ {
-		part := parts[i]
-		for j, r := range part {
-			if r < '0' || r > '9' {
-				part = part[:j]
-
-				break
-			}
-		}
-
-		n, _ := strconv.Atoi(part)
-		out[i] = n
-	}
-
-	return out
+	_ = log
+	_ = name
 }
 
 func IntFromNumber(value any) (int, bool) {

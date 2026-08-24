@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/observer"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
@@ -49,9 +50,9 @@ type Agent struct {
 	sessions                 map[acp.SessionId]*session
 	deleted                  map[acp.SessionId]struct{}
 	clientCalls              chan struct{}
-	nativeTurns              chan struct{}
 	clientCapabilities       acp.ClientCapabilities
 	positionEncoding         acp.PositionEncodingKind
+	lifecycle                lifecycle.Negotiated
 	runtime                  opencode.Client
 	runtimeGeneration        uint64
 	runtimeStarting          chan struct{}
@@ -147,7 +148,6 @@ func NewAgent(opts ...Option) *Agent {
 		directories:        make(map[string]directoryBinding),
 		runtimeRetirements: make(map[uint64]*runtimeRetirement),
 		clientCalls:        make(chan struct{}, limits.MaxConcurrentClientCalls),
-		nativeTurns:        make(chan struct{}, 1),
 	}
 	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
 		agent.optionsErr = errors.Join(agent.optionsErr, fmt.Errorf("create runtime fingerprint key: %w", err))
@@ -175,7 +175,8 @@ func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Optio
 	agent := newAgentForServe(opts...)
 	defer func() {
 		if closeErr := agent.Close(); closeErr != nil {
-			agent.log.DebugContext(context.Background(), "close OpenCode ACP agent failed", slog.String("error", closeErr.Error()))
+			agent.log.DebugContext(context.Background(), "close OpenCode ACP agent failed")
+
 			serveErr = closeErr
 		}
 	}()
@@ -236,10 +237,27 @@ func (a *Agent) Close() error {
 	}
 
 	a.closed = true
-	a.conn = nil
 	a.mu.Unlock()
 
 	err := stickyRuntimeErr
+
+	// The ladder runs per logical session first and closes the shared native
+	// tree exactly once afterwards, and the order is load-bearing rather than
+	// tidy. Each session owes the same durable commit a wire `session/close`
+	// owes, that commit reads the native scope through the loopback API, and
+	// retiring the shared runtime first would destroy the material every
+	// still-owed commit needs — an embedded shutdown would then drop state a
+	// wire close would have committed, which is the same lost generation
+	// however the process ended.
+	for _, session := range sessions {
+		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+		err = errors.Join(err, session.CloseAndCommit(ctx))
+
+		cancel()
+	}
+
+	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
+
 	if runtime != nil {
 		err = errors.Join(err, a.retireSharedRuntime(generation, "shared OpenCode runtime retired while closing agent"))
 	} else if waiting != nil {
@@ -259,16 +277,10 @@ func (a *Agent) Close() error {
 		}
 	}
 
-	for _, session := range sessions {
-		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
-		err = errors.Join(err, session.Close(ctx))
-
-		cancel()
-	}
-
-	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
+	a.interruptConnection()
 
 	a.mu.Lock()
+	a.conn = nil
 	a.sessions = make(map[acp.SessionId]*session)
 	a.closeErr = err
 
@@ -278,9 +290,28 @@ func (a *Agent) Close() error {
 	return err
 }
 
+func (a *Agent) interruptConnection() {
+	if a == nil {
+		return
+	}
+
+	a.mu.Lock()
+	conn := a.conn
+	a.mu.Unlock()
+
+	if interrupter, ok := conn.(interface{ InterruptWrites() }); ok {
+		interrupter.InterruptWrites()
+	}
+}
+
 func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
 	if a.optionsErr != nil {
 		return acp.InitializeResponse{}, a.optionsError()
+	}
+
+	lifecycleAnswer, err := a.negotiateLifecycle(params.Meta)
+	if err != nil {
+		return acp.InitializeResponse{}, err
 	}
 
 	title := a.options.AgentTitle
@@ -337,6 +368,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 	}
 
 	return acp.InitializeResponse{
+		Meta:            lifecycleAnswerMeta(lifecycleAnswer),
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
 			Name:    a.options.AgentName,
@@ -367,14 +399,36 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 }
 
 func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
+	// This adapter advertises no auth method, but "the key is not read here" and
+	// "there is no such method id" are different answers and a host that got the
+	// reserved literal wrong is owed the first one.
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.AuthenticateResponse{}, refusal
+	}
+
 	return acp.AuthenticateResponse{}, acp.NewInvalidParams(map[string]any{"methodId": params.MethodId})
 }
 
-func (a *Agent) Logout(context.Context, acp.LogoutRequest) (acp.LogoutResponse, error) {
+func (a *Agent) Logout(_ context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.LogoutResponse{}, refusal
+	}
+
 	return acp.LogoutResponse{}, nil
 }
 
-func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+// SetSessionMode is not implemented by this adapter, but the family literal is
+// refused before the method verdict is given. The reserved key has no meaning on
+// any inbound surface the pinned SDK dispatches, and a surface that answers
+// method-not-found without reading it would let a host stamp the key anywhere
+// unimplemented and be told the key was fine. The refusal is the one every other
+// inbound surface gives, so the verdict does not depend on which method carried
+// the key.
+func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.SetSessionModeResponse{}, refusal
+	}
+
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
 
@@ -383,15 +437,24 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 		return nil, err
 	}
 
+	// The reserved family literal is refused before the method is resolved. The
+	// key belongs to the family on every inbound surface, so an extension name
+	// this adapter does not implement is not a place a host may stamp it and be
+	// told the key was fine: "the key is not read here" outranks "there is no
+	// such method".
+	if refusal := refuseLifecycleRawMeta(params); refusal != nil {
+		return nil, refusal
+	}
+
 	switch method {
 	case ForkSessionMethod:
 		var req acp.UnstableForkSessionRequest
 		if err := json.Unmarshal(params, &req); err != nil {
-			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: "invalid request parameters"})
 		}
 
 		if err := req.Validate(); err != nil {
-			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: "request validation failed"})
 		}
 
 		return a.forkSession(ctx, req)
@@ -461,18 +524,6 @@ func (a *Agent) acquireClientCall(ctx context.Context) (func(), error) {
 	}
 }
 
-// acquireNativeTurn serializes prompts across every logical session sharing
-// this Agent's native runtime. Cancellation retires that whole runtime, so a
-// second active native turn could otherwise be killed as collateral work.
-func (a *Agent) acquireNativeTurn(ctx context.Context) (func(), error) {
-	select {
-	case a.nativeTurns <- struct{}{}:
-		return func() { <-a.nativeTurns }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 func (a *Agent) session(id acp.SessionId) (*session, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -489,12 +540,23 @@ func (a *Agent) session(id acp.SessionId) (*session, error) {
 	return session, nil
 }
 
+// storeStartedSession installs a fully prepared session into the active set. The
+// tombstone check is not once-at-entry: a delete that completed while this
+// session was being prepared wins, however far the preparation got, so the
+// marker is re-read under the very lock that installs — and never cleared as a
+// side effect of installing. Clearing it would unhide an id the host has already
+// been told is gone, and the caller tears the prepared replacement down on the
+// refusal it gets back.
 func (a *Agent) storeStartedSession(session *session) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.closed {
 		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+	}
+
+	if _, deleted := a.deleted[session.id]; deleted {
+		return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	if a.runtime == nil {
@@ -510,7 +572,6 @@ func (a *Agent) storeStartedSession(session *session) error {
 	}
 
 	a.sessions[session.id] = session
-	delete(a.deleted, session.id)
 
 	if a.providerAuth != nil {
 		a.providerAuth.reopenSession(session.id)

@@ -38,7 +38,7 @@ runtime and its resources quarantined.
 | `WithSeedFiles` | Immutable files written into the shared config root before launch. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
-| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions; native prompt turns are additionally serialized Agent-wide because cancellation retires their shared runtime. |
+| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions; routine cancellation remains scoped to the addressed native session. |
 | `WithTurnTimeout` | Per-turn deadline; `0` (default) disables it. |
 | `WithImageLimits` | Decoded-byte bounds for prompt and emitted image content (`ImageLimits`); each field defaults to 6 MiB, `0` disables that policy limit, and a negative value is rejected at construction. |
 | `WithInputHandoffRoot` | Absolute directory a prompt image may be read from in the handoff input form. Read-only, unset by default, and a relative value is rejected at construction. |
@@ -170,6 +170,14 @@ vocabulary already populated:
 | `SetConfigOptionRequest` / `SetModelRequest` | `session/set_config_option`. |
 | `StdioMCPServer` / `HTTPMCPServer` | MCP server definitions. |
 
+Two exported sentinels classify a native-runtime failure.
+`ErrProcessContainmentIncomplete` means the selected containment boundary did
+not complete, so the runtime stays quarantined.
+`ErrRuntimeLockUnsupported` means the platform has no advisory-lock primitive
+for the runtime home's single-writer fence: construction fails with it rather
+than proceeding unlocked, and it is distinct from a lock another process is
+holding — that one is worth retrying and this one never is.
+
 `PromptRequest`, `TextPromptRequest`, and `CancelRequest` stamp route metadata
 only for a non-empty `turnNonce` of at most 4096 bytes. An invalid nonce leaves
 the request without a route envelope, so the adapter rejects it rather than
@@ -178,6 +186,13 @@ sending an invalid or unbounded route.
 Session-scoped request options include `WithSessionMCPServers`,
 `WithSessionAdditionalDirectories`, `WithSessionMeta`, `WithSessionOutputSchema`,
 `WithSessionRawEvents`, and `WithSessionOpenCodeOptions`.
+
+`WithSessionMeta` and `WithListSessionsMeta` take host-supplied metadata. A
+caller key naming a reserved `acp-go.dev/*` literal — `route`, `mediaEnvelope`,
+`handoff`, or `lifecycle` — is refused rather than merged or overwritten: those
+values are minted by the adapter on the surfaces that carry them, so a collision
+is a defect in the calling code and the builder panics rather than putting an
+unvalidated reserved value on the wire.
 
 `OpenCodeOptions` (built with `NewOpenCodeOptions` and `WithOpenCodeModel`,
 `WithOpenCodeOutputSchema`, `WithOpenCodeMode`,

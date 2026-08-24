@@ -14,7 +14,8 @@ The model selector is an ACP config option with id `model` and category
 `provider/model`.
 
 Mode selection uses config id `mode` and category `mode` when OpenCode agents
-are enumerable.
+are enumerable. The mode is the native agent name carried on the `agent` field
+of every frame the session sends.
 
 | Option | Config id | Category | Values |
 |---|---|---|---|
@@ -23,6 +24,68 @@ are enumerable.
 
 Set either at session start via `_meta.opencode.options` or on a running session
 with `session/set_config_option`.
+
+The advertised `currentValue` of each option is what the session will actually
+send, listed or not. An option never renames a host's selection to a value the
+list happens to carry.
+
+### Values are passed through, never gated
+
+The adapter checks neither a model nor a mode value against the advertised set.
+Both are carried to OpenCode exactly as the host asked for them, at session
+start, on `session/set_config_option`, and on every prompt; OpenCode owns model
+and agent resolution and answers for a name it does not know. Both doors behave
+the same way — there is no value the session-start route accepts and
+`session/set_config_option` refuses.
+
+The advertisement is why. `GET /config/providers` and `GET /agent` report what
+the `opencode serve` process resolved when it started, and that answer does not
+change for the life of that process: a credential added afterwards is invisible
+to the running runtime until it restarts. A value missing from the advertised
+set is therefore not evidence it is unusable, and refusing on it would turn a
+per-turn condition into a failed `session/new`.
+
+An unknown value surfaces on the turn that used it as the uniform
+`opencode_turn_failed` provider failure described below. The native diagnostic
+stays private.
+
+| Value | Host-visible classification |
+|---|---|
+| Unknown model | `cause: "provider"`, fixed provider-failure message |
+| Unknown mode | `cause: "provider"`, fixed provider-failure message |
+
+`statusCode` is absent from both because the native errors report none, and a
+provider code is never copied to the ACP failure surface.
+
+The two failures reach the host the same way but differ natively. An unknown
+model fails inside a run that started, so OpenCode idles the turn afterwards.
+An unknown mode is refused before the run exists — OpenCode publishes no
+message and no status for it, and never idles it — so that turn ends on the
+refusal itself rather than on an idle that will not come.
+
+### A model value with no provider selects nothing
+
+A model value is a `provider/model` pair. A value carrying no `/` — or an empty
+half on either side — names no provider, so the frame is sent with no model
+selector at all and OpenCode runs the turn on its own default. The turn
+succeeds; nothing reports that the requested value was not the one used. Send
+the full `provider/model` spelling, as advertised in the `model` option, to be
+sure of what runs.
+
+### A failed catalog read is reported, not hidden
+
+Each config option is built from its own native read. When
+`GET /config/providers` fails, the model option is left out of the advertised
+set, the options that read successfully are still advertised, and the session
+is not refused — the next call repeats the read. The omission is never silent:
+its cause is logged on `stderr` as `OpenCode config option is unavailable` with
+the session id, the config id, and the native error. The mode option follows
+the same rule for `GET /agent`.
+
+A failed read withholds only the advertisement. Because no read stands between
+a host's value and the session, `session/set_config_option` still sets a model
+or a mode while the option it would be listed under cannot be advertised at
+all.
 
 The selected model also gates image prompts. The adapter reads the model's
 authenticated provider `capabilities.input.image`: `true` accepts image blocks,
@@ -47,10 +110,10 @@ server's `/doc` advertises the `OutputFormatJsonSchema` component.
 When the selected model rejects structured output (the provider returns an
 assistant/provider error, common with free Zen models), the turn fails with a
 structured ACP internal error whose `data` carries
-`error: "opencode_turn_failed"`, `cause: "provider"`, the native `message`,
-and—when the provider reports them—`statusCode` (int) and `providerCode`
-(string). The
-`data` also carries `structuredOutputRequested: true` when this turn sent a
+`error: "opencode_turn_failed"`, `cause: "provider"`, a fixed closed `message`,
+and—when the provider reports it—a numeric `statusCode`. Native provider text
+and provider codes remain private. The `data` also carries
+`structuredOutputRequested: true` when this turn sent a
 native schema, letting a host detect that the structured-output turn was the
 trigger; slash-command turns always report `false`.
 

@@ -1,6 +1,3 @@
-// Family contract pins: capability hard cutover, the stable-fork -32601
-// route, and lifecycle _meta strictness. These assertions guard wire behavior
-// that hosts depend on across adapter releases.
 package opencodeacp
 
 import (
@@ -13,6 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestInitializeCapabilitiesHardCutover pins the capabilities this adapter
+// advertises and the ones it never will: a removed surface stays removed, and a
+// host reads support off the advertisement alone.
 func TestInitializeCapabilitiesHardCutover(t *testing.T) {
 	agent := NewAgent()
 	resp, err := agent.Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
@@ -156,7 +156,7 @@ func TestMediaEnvelopeAdvertisesTheBoundTheGateReports(t *testing.T) {
 				declaration[handoffFieldSizeBytes] = tt.want + 1
 
 				block := handoffBlock(mimePNG, path, declaration)
-				requireInvalidParamsData(t, validatePromptMediaError(testSession(agent, newFakeOpenCodeClient()), block), map[string]any{
+				requireInvalidParamsData(t, validatePromptMediaError(testSession(t, agent, newFakeOpenCodeClient()), block), map[string]any{
 					jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 					jsonFieldSizeBytes: tt.want + 1, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxBytes],
 				})
@@ -182,7 +182,7 @@ func TestMediaEnvelopeAdvertisesTheBoundTheGateReports(t *testing.T) {
 		require.Equal(t, perPrompt, envelope[mediaEnvelopeFieldMaxPromptBytes])
 
 		block := handoffBlock(mimePNG, path, handoffEnvelope(decoded))
-		requireInvalidParamsData(t, validatePromptMediaError(testSession(agent, newFakeOpenCodeClient()), block, block), map[string]any{
+		requireInvalidParamsData(t, validatePromptMediaError(testSession(t, agent, newFakeOpenCodeClient()), block, block), map[string]any{
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
 			jsonFieldSizeBytes: 2 * perImage, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxPromptBytes],
 		})
@@ -212,6 +212,8 @@ func TestInitializeAdvertisesHandoffOnlyWhenConfigured(t *testing.T) {
 	require.Equal(t, map[string]any{metaFieldVersions: []int{routeEnvelopeVersion}}, with.AgentCapabilities.Meta[routeEnvelopeKey])
 }
 
+// TestStableForkRouteMethodNotFound pins that the stable fork route does not
+// exist here: forking is the namespaced extension method and nothing else.
 func TestStableForkRouteMethodNotFound(t *testing.T) {
 	agent := NewAgent()
 	conn := &localAgentConnection{agent: agent}
@@ -225,6 +227,8 @@ func TestStableForkRouteMethodNotFound(t *testing.T) {
 	}
 }
 
+// TestLifecycleMetaStrictAllowlist pins the strictness of the reserved lifecycle
+// key: an unknown member of the offer is refused rather than ignored.
 func TestLifecycleMetaStrictAllowlist(t *testing.T) {
 	tests := []struct {
 		name string
@@ -233,12 +237,12 @@ func TestLifecycleMetaStrictAllowlist(t *testing.T) {
 	}{
 		{name: "foreign ignored", meta: map[string]any{"codex": map[string]any{"deleted": true}}},
 		{name: "trace ignored", meta: map[string]any{"traceparent": "00-abc"}},
-		{name: "own unknown rejected", meta: map[string]any{opencodeMetaKey: map[string]any{"goals": []any{}}}, err: true},
+		{name: "own unknown rejected", meta: map[string]any{opencodeMetaKey: map[string]any{"unknown": []any{}}}, err: true},
 		{name: "own option unknown rejected", meta: map[string]any{opencodeMetaKey: map[string]any{"options": map[string]any{"foo": "bar"}}}, err: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := sessionMetaFromLifecycle(tt.meta)
+			_, err := sessionMetaFromVendorOptions(tt.meta)
 			if tt.err && err == nil {
 				t.Fatal("expected error")
 			}

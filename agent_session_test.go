@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -128,7 +129,7 @@ func TestLifecycleMCPRefreshesImmediatelyBeforeFirstNativePrompt(t *testing.T) {
 
 		return nil
 	}
-	client.sendMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(_ context.Context, id string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
 		orderMu.Lock()
 		order = append(order, "prompt")
 		orderMu.Unlock()
@@ -154,6 +155,7 @@ func TestLifecycleMCPRefreshesImmediatelyBeforeFirstNativePrompt(t *testing.T) {
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
 	))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	require.Empty(t, order, "lifecycle must not freeze the pre-arm catalog as prompt-ready")
 
 	_, err = agent.Prompt(ctx, TextPromptRequest(created.SessionId, "refresh-turn", "use the armed tool"))
@@ -177,7 +179,7 @@ func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T)
 	client.createSession = testNativeSession("native-refresh-failure")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 	client.refreshMCPErr = errors.Join(opencode.ErrMCPDisconnectUnproven, errors.New("delete failed"))
-	client.sendMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+	client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
 		t.Fatal("native prompt ran with a stale MCP catalog")
 
 		return opencode.NativeMessage{}, nil
@@ -196,9 +198,10 @@ func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T)
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test"))),
 	))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 
 	_, err = agent.Prompt(ctx, TextPromptRequest(created.SessionId, "failed-refresh", "do not run"))
-	require.ErrorContains(t, err, "refresh OpenCode MCP catalog")
+	assertTurnFailed(t, err, causeTransport, "")
 
 	_, err = agent.NewSession(ctx, NewSessionRequest(cwd,
 		WithSessionMCPServers(mcp),
@@ -216,7 +219,7 @@ func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T)
 func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	releases := 0
 	current.directoryRelease = func() { releases++ }
 	agent.sessions[current.id] = current
@@ -234,13 +237,20 @@ func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T)
 	require.Equal(t, 1, releases)
 }
 
-func TestCancellationPublishesInterruptedCheckpointBeforeRetiredClose(t *testing.T) {
+// TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime proves
+// routine cancellation is session-scoped: the addressed native session is
+// interrupted, its interrupted prefix is committed durably before the turn
+// settles, and the shared runtime keeps running.
+func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemorySessionStore()
 	client := newFakeOpenCodeClient()
-	agent := NewAgent(WithHome(t.TempDir()), WithSessionStore(store))
-	current := testSession(agent, client)
+	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
+	require.NoError(t, current.establish(ctx))
 
 	committed := validSyncSnapshot(string(current.id), current.idmap.NativeSessionID, current.cwd)
 	committedAssistant := terminalMessageEvent(
@@ -270,64 +280,78 @@ func TestCancellationPublishesInterruptedCheckpointBeforeRetiredClose(t *testing
 		Entries: []SessionStoreEntry{entry},
 	}}))
 
-	turnCtx := current.beginTurn(ctx, "interrupted-turn")
-	current.mu.Lock()
-	current.activeMessageIDs["assistant-interrupted"] = struct{}{}
-	current.mu.Unlock()
-	epoch, err := current.beginCancellation("interrupted-turn", true, true)
-	require.NoError(t, err)
-	require.NoError(t, current.resolveCancellation(ctx, epoch))
-	current.finishTurn()
-	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
-	require.Equal(t, "shared OpenCode runtime retired after turn cancellation", current.runtimeLostCause)
+	// The native session reports idle when the interrupt lands, which is the
+	// acknowledgement the cancelled turn settles on.
+	started := make(chan struct{})
+	accepted := make(chan struct{}, 1)
+	connection.mu.Lock()
+	connection.updateHook = func(notification acp.SessionNotification) {
+		envelope, _ := notification.Meta[lifecycle.MetaKey].(map[string]any)
+		event, _ := envelope["event"].(map[string]any)
+		if event["type"] == "prompt_accepted" {
+			signalTestHook(accepted)
+		}
+	}
+	connection.mu.Unlock()
+	client.hangsAfterDispatch(started)
+	client.abortFunc = func(id string) error {
+		client.publishSessionIdle(id)
+
+		return nil
+	}
+
+	type promptResult struct {
+		response acp.PromptResponse
+		err      error
+	}
+	done := make(chan promptResult, 1)
+
+	go func() {
+		response, promptErr := current.Prompt(ctx, TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+		done <- promptResult{response: response, err: promptErr}
+	}()
+
+	<-started
+	<-accepted
+	require.NoError(t, agent.Cancel(ctx, CancelRequest(current.id, internalSeamTurnNonce)))
+	result := <-done
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonCancelled, result.response.StopReason)
+
+	require.Equal(t, []string{current.idmap.NativeSessionID}, client.abortedSessions())
+	require.NotNil(t, agent.runtime, "routine cancellation retired the shared runtime")
+	require.NoError(t, current.ensureNotPoisoned())
 
 	captured, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
 	require.NoError(t, err)
 	require.Len(t, captured, 1)
 	require.NotEqual(t, SessionStoreEntry(entry), captured[0])
+
 	var interrupted stateSnapshot
 	require.NoError(t, json.Unmarshal(captured[0], &interrupted))
 	require.Equal(t, []opencode.SyncEvent{
 		client.syncEvents[0], client.syncEvents[1], interruptedUser, interruptedAssistant,
 	}, interrupted.Events[current.idmap.NativeSessionID])
-	terminal, err := InspectSessionStoreTerminalState(string(current.id), captured)
-	require.NoError(t, err)
-	require.Equal(t, "assistant-before-interrupt", terminal.MessageID)
 
-	restored := newFakeOpenCodeClient()
-	restored.xdg = client.xdg
-	restored.getSession = testNativeSession(current.idmap.NativeSessionID)
-	_, err = restoreSyncState(ctx, restored, interrupted, current.idmap.NativeSessionID, current.cwd)
-	require.NoError(t, err)
-	require.Equal(t, interrupted.Events[current.idmap.NativeSessionID], restored.syncEvents)
-
-	var historyCalls atomic.Int64
-	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
-		historyCalls.Add(1)
-
-		return nil, errors.New("Post http://127.0.0.1:1/sync/history: connect: connection refused")
-	}
-
-	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: current.id})
-	require.NoError(t, err)
-	require.Zero(t, historyCalls.Load(), "a retired generation must never be contacted during close")
-	require.NotContains(t, agent.sessions, current.id)
-
-	retained, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
-	require.NoError(t, err)
-	require.Equal(t, captured, retained)
-	terminal, err = InspectSessionStoreTerminalState(string(current.id), retained)
-	require.NoError(t, err)
-	require.Equal(t, "assistant-before-interrupt", terminal.MessageID)
+	// The terminal idle is the last lifecycle event of the cancelled turn, and it
+	// is emitted after the commit above.
+	requireLifecycleOutcome(t, connection, lifecycle.OutcomeCancelled)
 }
 
-func TestCancellationCaptureFailureStillRetiresAndPreservesPriorCheckpoint(t *testing.T) {
+// TestCancellationCaptureFailureFencesInsteadOfSettling proves a cancelled turn
+// whose native-safe prefix cannot be committed reports a settlement failure
+// instead of an idle the store cannot back, keeps the prior checkpoint, and still
+// leaves the shared runtime alone.
+func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemorySessionStore()
 	client := newFakeOpenCodeClient()
-	agent := NewAgent(WithHome(t.TempDir()), WithSessionStore(store))
-	current := testSession(agent, client)
+	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
+	connection := newRecordingAgentClient()
+	agent.setAgentClient(connection)
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
+	require.NoError(t, current.establish(ctx))
 
 	committed := validSyncSnapshot(string(current.id), current.idmap.NativeSessionID, current.cwd)
 	entry, err := json.Marshal(committed)
@@ -338,24 +362,42 @@ func TestCancellationCaptureFailureStillRetiresAndPreservesPriorCheckpoint(t *te
 	}}))
 	client.syncHistoryErr = errors.New("sync history unavailable")
 
-	current.beginTurn(ctx, "interrupted-turn")
-	epoch, err := current.beginCancellation("interrupted-turn", true, true)
-	require.NoError(t, err)
-	err = current.resolveCancellation(ctx, epoch)
-	require.ErrorContains(t, err, "sync history unavailable")
-	retryEpoch, err := current.beginCancellation("", false, true)
-	require.NoError(t, err)
-	require.Equal(t, epoch, retryEpoch)
-	require.ErrorContains(t, current.resolveCancellation(ctx, retryEpoch), "sync history unavailable")
-	require.Equal(t, "shared OpenCode runtime retired after turn cancellation", current.runtimeLostCause)
-	require.Nil(t, agent.runtime)
-	require.Error(t, current.ensureNotPoisoned())
+	started := make(chan struct{})
+	accepted := make(chan struct{}, 1)
+	connection.mu.Lock()
+	connection.updateHook = func(notification acp.SessionNotification) {
+		envelope, _ := notification.Meta[lifecycle.MetaKey].(map[string]any)
+		event, _ := envelope["event"].(map[string]any)
+		if event["type"] == "prompt_accepted" {
+			signalTestHook(accepted)
+		}
+	}
+	connection.mu.Unlock()
+	client.hangsAfterDispatch(started)
+	client.abortFunc = func(id string) error {
+		client.publishSessionIdle(id)
+
+		return nil
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, promptErr := current.Prompt(ctx, TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
+		done <- promptErr
+	}()
+
+	<-started
+	<-accepted
+	require.NoError(t, agent.Cancel(ctx, CancelRequest(current.id, internalSeamTurnNonce)))
+	promptErr := <-done
+	require.ErrorContains(t, promptErr, "sync history unavailable")
+	require.NotNil(t, agent.runtime, "a commit failure retired the shared runtime")
 
 	retained, err := store.Load(ctx, SessionKey{SessionID: string(current.id), Subpath: SessionStoreMainSubpath})
 	require.NoError(t, err)
 	require.Equal(t, []SessionStoreEntry{entry}, retained)
 }
-
 func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
@@ -389,7 +431,7 @@ func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
 	rejected := NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
 		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) { return nil, errors.New("pool full") },
 	}))
-	_, err = rejected.sharedRuntime(ctx)
+	_, _, err = rejected.sharedRuntimeBinding(ctx)
 	require.ErrorContains(t, err, "pool full")
 }
 
@@ -423,6 +465,7 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	close(first.runtimeExited)
 	require.Eventually(t, func() bool {
 		agent.mu.Lock()
@@ -474,6 +517,7 @@ func TestRecoverySkipsCrashedReplacementGenerationBeforePrompt(t *testing.T) {
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	close(first.runtimeExited)
 	require.Eventually(t, func() bool {
 		agent.mu.Lock()
@@ -496,12 +540,7 @@ func TestRuntimeCrashFailsInflightTurnThenRecoversBeforeFollowingPrompt(t *testi
 	first.createSession = testNativeSession("native-first")
 	first.agents = []opencode.NativeAgent{{Name: "build"}}
 	started := make(chan struct{})
-	first.sendMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
-		close(started)
-		<-ctx.Done()
-
-		return opencode.NativeMessage{}, ctx.Err()
-	}
+	first.hangsAfterDispatch(started)
 
 	second := newFakeOpenCodeClient()
 	second.xdg = first.xdg
@@ -520,6 +559,7 @@ func TestRuntimeCrashFailsInflightTurnThenRecoversBeforeFollowingPrompt(t *testi
 	})
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 
 	turnResult := make(chan error, 1)
 	go func() {
@@ -548,17 +588,16 @@ func (r *fanoutRuntime) Scope(_ context.Context, options opencode.ScopeOptions) 
 	return &fanoutScope{
 		Client: r.fakeOpenCodeClient, root: r.fakeOpenCodeClient,
 		directory: options.Directory, nativeID: id,
-		events: make(chan opencode.Event), errs: make(chan error),
+		eventStream: make(chan opencode.EventStreamItem),
 	}, nil
 }
 
 type fanoutScope struct {
 	opencode.Client
-	root      *fakeOpenCodeClient
-	directory string
-	nativeID  string
-	events    chan opencode.Event
-	errs      chan error
+	root        *fakeOpenCodeClient
+	directory   string
+	nativeID    string
+	eventStream chan opencode.EventStreamItem
 }
 
 func (s *fanoutScope) Close(context.Context) error { return nil }
@@ -571,26 +610,65 @@ func (s *fanoutScope) CreateSessionWithPolicy(context.Context, string, []opencod
 	return native, nil
 }
 
-func (s *fanoutScope) SendMessage(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
+func (s *fanoutScope) DispatchMessage(_ context.Context, id string, request opencode.MessageRequest) error {
 	if id != s.nativeID {
-		return opencode.NativeMessage{}, fmt.Errorf("scope %q received native session %q", s.nativeID, id)
+		return fmt.Errorf("scope %q received native session %q", s.nativeID, id)
 	}
 
 	text, _ := request.Parts[0][partTypeText].(string)
 	if err := os.WriteFile(filepath.Join(s.directory, "native-cwd-proof.txt"), []byte(text), 0o600); err != nil {
-		return opencode.NativeMessage{}, err
+		return err
 	}
 
-	return opencode.NativeMessage{Info: opencode.NativeMessageInfo{
-		ID: "assistant-" + id, SessionID: id, Role: "assistant", Finish: "stop",
-	}}, nil
+	assistantID := "assistant-" + id
+	s.root.mu.Lock()
+	s.root.messages = append(s.root.messages, opencode.NativeMessage{Info: opencode.NativeMessageInfo{
+		ID: assistantID, SessionID: id, Role: "assistant", Finish: "stop",
+	}})
+	s.root.mu.Unlock()
+
+	userEvent := opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": request.MessageID, "sessionID": id, "role": roleUser,
+		}}),
+	}
+	s.eventStream <- opencode.EventStreamItem{Event: &userEvent}
+	messageEvent := opencode.Event{
+		Type: opencode.EventMessageUpdated,
+		Properties: mustJSONValue(map[string]any{"info": map[string]any{
+			"id": assistantID, "sessionID": id, "role": "assistant",
+			"parentID": request.MessageID, "finish": "stop",
+		}}),
+	}
+	s.eventStream <- opencode.EventStreamItem{Event: &messageEvent}
+	idleEvent := opencode.Event{
+		Type:       opencode.EventSessionIdle,
+		Properties: mustJSONValue(map[string]any{"sessionID": id}),
+	}
+	s.eventStream <- opencode.EventStreamItem{Event: &idleEvent}
+
+	return nil
 }
 
-func (s *fanoutScope) Events() <-chan opencode.Event      { return s.events }
-func (s *fanoutScope) EventErrors() <-chan error          { return s.errs }
-func (s *fanoutScope) XDGDirs() opencode.XDGDirs          { return s.root.XDGDirs() }
-func (s *fanoutScope) RuntimeExited() <-chan struct{}     { return s.root.RuntimeExited() }
-func (s *fanoutScope) Shutdown(ctx context.Context) error { return s.root.Shutdown(ctx) }
+func (s *fanoutScope) EventStream() <-chan opencode.EventStreamItem { return s.eventStream }
+func (s *fanoutScope) XDGDirs() opencode.XDGDirs                    { return s.root.XDGDirs() }
+func (s *fanoutScope) RuntimeExited() <-chan struct{}               { return s.root.RuntimeExited() }
+func (s *fanoutScope) Shutdown(ctx context.Context) error           { return s.root.Shutdown(ctx) }
+
+func (s *fanoutScope) Messages(_ context.Context, id string) ([]opencode.NativeMessage, error) {
+	s.root.mu.Lock()
+	defer s.root.mu.Unlock()
+
+	messages := make([]opencode.NativeMessage, 0, len(s.root.messages))
+	for _, message := range s.root.messages {
+		if message.Info.SessionID == id {
+			messages = append(messages, message)
+		}
+	}
+
+	return messages, s.root.messagesErr
+}
 
 func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 	const sessionCount = 8
@@ -636,6 +714,9 @@ func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 	}
 	require.Len(t, agent.sessions, sessionCount)
 	require.EqualValues(t, 1, agent.runtimeGeneration)
+	for index := range cases {
+		establishCreatedSession(t, agent, cases[index].id)
+	}
 
 	var promptGroup sync.WaitGroup
 	promptErrors := make(chan error, sessionCount)
@@ -670,7 +751,7 @@ func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 func TestForkPermissionMustInherit(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	agent := NewAgent()
-	parent := testSession(agent, client)
+	parent := testSession(t, agent, client)
 	parent.permission = openCodePermissionDeny
 	agent.sessions[parent.id] = parent
 	_, err := agent.forkSession(context.Background(), ForkSessionRequest(parent.id, t.TempDir(),
@@ -869,7 +950,7 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 	agent := NewAgent()
 	agent.options.SessionStore = nil
 	require.NotNil(t, agent.sessionStore())
-	current := testSession(agent, newFakeOpenCodeClient())
+	current := testSession(t, agent, newFakeOpenCodeClient())
 	agent.runtime = nil
 	require.Error(t, agent.storeStartedSession(current), "missing runtime must reject publication")
 	agent.runtime = newFakeOpenCodeClient()
@@ -1028,7 +1109,6 @@ func TestNewSessionRemainingFailureStages(t *testing.T) {
 
 	for name, configure := range map[string]func(*fakeOpenCodeClient, *Agent){
 		"scope":  func(client *fakeOpenCodeClient, _ *Agent) { client.scopeErr = errors.New("scope failed") },
-		"model":  func(client *fakeOpenCodeClient, _ *Agent) { client.providersErr = errors.New("providers failed") },
 		"create": func(client *fakeOpenCodeClient, _ *Agent) { client.createErr = errors.New("create failed") },
 		"snapshot history": func(client *fakeOpenCodeClient, _ *Agent) {
 			client.syncHistoryErr = errors.New("history failed")
@@ -1052,7 +1132,7 @@ func TestNewSessionRemainingFailureStages(t *testing.T) {
 	client.createSession = testNativeSession("native")
 	limited := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
 	limited.runtime = client
-	limited.sessions["existing"] = testSession(limited, client)
+	limited.sessions["existing"] = testSession(t, limited, client)
 	_, err = limited.NewSession(ctx, NewSessionRequest(t.TempDir()))
 	require.ErrorContains(t, err, "backpressure")
 }
@@ -1078,7 +1158,6 @@ func TestLoadResumeRemainingFailureStages(t *testing.T) {
 
 	for name, configure := range map[string]func(*fakeOpenCodeClient){
 		"scope":       func(client *fakeOpenCodeClient) { client.scopeErr = errors.New("scope failed") },
-		"model":       func(client *fakeOpenCodeClient) { client.providersErr = errors.New("providers failed") },
 		"history":     func(client *fakeOpenCodeClient) { client.syncHistoryErr = errors.New("history failed") },
 		"replay":      func(client *fakeOpenCodeClient) { client.syncReplayErr = errors.New("replay failed") },
 		"get session": func(client *fakeOpenCodeClient) { client.getErr = errors.New("get failed") },
@@ -1110,7 +1189,7 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 		client.ensureSyncAggregate("native-child")
 		agent := NewAgent()
 		agent.runtime = client
-		parent := testSession(agent, client)
+		parent := testSession(t, agent, client)
 		agent.sessions[parent.id] = parent
 
 		return agent, client, parent
@@ -1124,7 +1203,6 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 	for name, configure := range map[string]func(*Agent, *fakeOpenCodeClient){
 		"native fork": func(_ *Agent, client *fakeOpenCodeClient) { client.forkErr = errors.New("fork failed") },
 		"scope":       func(_ *Agent, client *fakeOpenCodeClient) { client.scopeErr = errors.New("scope failed") },
-		"model":       func(_ *Agent, client *fakeOpenCodeClient) { client.providersErr = errors.New("providers failed") },
 		"get":         func(_ *Agent, client *fakeOpenCodeClient) { client.getErr = errors.New("get failed") },
 		"snapshot": func(_ *Agent, client *fakeOpenCodeClient) {
 			client.syncHistoryErr = errors.New("snapshot failed")
@@ -1161,7 +1239,7 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 		client.ensureSyncAggregate("native-child")
 		agent := NewAgent()
 		agent.runtime = client
-		parent := testSession(agent, client)
+		parent := testSession(t, agent, client)
 		parent.carrier = newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "parent-token"}, []string{"/parent/bin"})
 		agent.sessions[parent.id] = parent
 
@@ -1228,13 +1306,6 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 	_, err = agent.LoadSession(ctx, LoadSessionRequest("session", cwd))
 	require.ErrorContains(t, err, "messages failed")
 
-	client = newFakeOpenCodeClient()
-	client.commandsErr = errors.New("commands failed")
-	agent = NewAgent()
-	session := testSession(agent, client)
-	agent.sessions[session.id] = session
-	agent.refreshLifecycleCommands(ctx, session)
-
 	closed := storedAgent(newFakeOpenCodeClient())
 	closed.closed = true
 	_, err = closed.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
@@ -1252,15 +1323,8 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 	client = newFakeOpenCodeClient()
 	client.getSession = testNativeSession("native")
 	agent = storedAgent(client)
-	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd,
-		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("missing/model")))))
-	require.Error(t, err)
-
-	client = newFakeOpenCodeClient()
-	client.getSession = testNativeSession("native")
-	agent = storedAgent(client)
 	agent.options.ConcurrencyLimits.MaxActiveSessions = 1
-	agent.sessions["occupied"] = testSession(agent, client)
+	agent.sessions["occupied"] = testSession(t, agent, client)
 	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
 	require.ErrorContains(t, err, "backpressure")
 }
@@ -1278,10 +1342,10 @@ func TestListSessionsRemainingFilteringSortingAndCloseBranches(t *testing.T) {
 	}}
 	agent := NewAgent(WithSessionStore(store))
 	client := newFakeOpenCodeClient()
-	active := testSession(agent, client)
+	active := testSession(t, agent, client)
 	active.id = "seen"
 	active.cwd = cwd
-	filtered := testSession(agent, client)
+	filtered := testSession(t, agent, client)
 	filtered.id = "filtered-active"
 	filtered.cwd = otherCwd
 	agent.sessions[active.id] = active
@@ -1305,7 +1369,7 @@ func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing
 	client.ensureSyncAggregate("native-child")
 	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
 	agent.runtime = client
-	parent := testSession(agent, client)
+	parent := testSession(t, agent, client)
 	agent.sessions[parent.id] = parent
 
 	_, err := agent.forkSession(context.Background(), acp.UnstableForkSessionRequest{
@@ -1456,6 +1520,7 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 		WithOpenCodeExtraPathDirs("/session/bin"),
 	))))
 	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
 	close(first.runtimeExited)
 	require.Eventually(t, func() bool {
 		agent.mu.Lock()
@@ -1473,4 +1538,387 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	startedMu.Unlock()
 	require.Equal(t, []string{"/session/bin"}, second.scopes()[0].ExtraPathDirs)
 	require.NoError(t, agent.Close())
+}
+
+// TestEstablishingHandlersPublishNothingBeforeTheyReturn proves the opening
+// lifecycle snapshot and the initial command catalog leave none of the four
+// establishing handlers. Both are owed to the host only after the establishing
+// response has been written to the transport, so a handler that has returned has
+// published neither.
+func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
+	ctx := context.Background()
+
+	requireNothingPublished := func(t *testing.T, connection *recordingAgentClient) {
+		t.Helper()
+
+		require.Empty(t, connection.lifecycleEnvelopes(t), "the opening snapshot left the establishing handler")
+		require.Empty(t, connection.availableCommandUpdates(), "the command catalog left the establishing handler")
+	}
+
+	t.Run("new", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.createSession = testNativeSession("native")
+		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
+		agent := negotiatedAgent(t)
+		connection := newRecordingAgentClient()
+		agent.setAgentClient(connection)
+		agent.runtime = client
+
+		_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+		require.NoError(t, err)
+		requireNothingPublished(t, connection)
+	})
+
+	stored := func(t *testing.T, cwd string) (*Agent, *recordingAgentClient) {
+		t.Helper()
+
+		snapshot := validSyncSnapshot("session", "native", cwd)
+		snapshot.Session.Model = stateSnapshotModel{ProviderID: "openai", ModelID: "gpt-test"}
+		encoded, err := json.Marshal(snapshot)
+		require.NoError(t, err)
+
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+			Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{encoded},
+		}}))
+
+		client := newFakeOpenCodeClient()
+		client.getSession = testNativeSession("native")
+		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
+		agent := negotiatedAgent(t, WithSessionStore(store))
+		connection := newRecordingAgentClient()
+		agent.setAgentClient(connection)
+		agent.runtime = client
+
+		return agent, connection
+	}
+
+	t.Run("load", func(t *testing.T) {
+		cwd := t.TempDir()
+		agent, connection := stored(t, cwd)
+		_, err := agent.LoadSession(ctx, LoadSessionRequest("session", cwd))
+		require.NoError(t, err)
+		requireNothingPublished(t, connection)
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		cwd := t.TempDir()
+		agent, connection := stored(t, cwd)
+		_, err := agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
+		require.NoError(t, err)
+		requireNothingPublished(t, connection)
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		client.forkSession = testNativeSession("native-child")
+		client.getSession = testNativeSession("native-child")
+		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
+		client.ensureSyncAggregate("native-child")
+
+		agent := negotiatedAgent(t)
+		connection := newRecordingAgentClient()
+		agent.setAgentClient(connection)
+		agent.runtime = client
+		parent := testSession(t, agent, client)
+		agent.sessions[parent.id] = parent
+
+		// The parent was established by the test helper; only what the fork
+		// itself publishes is at stake.
+		connection.mu.Lock()
+		connection.updates = nil
+		connection.mu.Unlock()
+
+		_, err := agent.forkSession(ctx, ForkSessionRequest(parent.id, t.TempDir()))
+		require.NoError(t, err)
+		requireNothingPublished(t, connection)
+	})
+}
+
+// TestCloseSessionRefusesWithoutADurableSnapshot proves close is store-backed:
+// a session whose snapshot cannot be committed stays addressable for a retry
+// rather than being released with state no reload could restore. The commit is
+// the last rung of the ladder, so a store that is offline never costs the
+// containment proof that runs ahead of it.
+func TestCloseSessionRefusesWithoutADurableSnapshot(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	agent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("store offline")}))
+	current := testSession(t, agent, client)
+	agent.sessions[current.id] = current
+
+	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
+	require.ErrorContains(t, err, "store offline")
+	require.True(t, client.isClosed(), "an uncommittable snapshot skipped the containment boundary")
+	require.Contains(t, agent.sessions, current.id, "the session was released without a durable snapshot")
+}
+
+// TestDeleteHidesTheSessionEvenWhenTeardownFails proves the delete order and
+// what hiding an id does and does not mean. The durable tombstone is written
+// first and the id is hidden with it, so a teardown that fails afterwards is
+// reported to the caller without leaving a session that delete already answered
+// for still listable, loadable, or resumable.
+//
+// Hidden is a wire fact, not a bookkeeping fact. The failed teardown left a live
+// native scope, so this agent keeps internal ownership of it: dropping the handle
+// would leave a scope nothing in this process could reach again. The retained
+// handle is what a later delete retries the cleanup through, and only a teardown
+// that proved containment releases it.
+func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.closeErr = errors.Join(errors.New("scope refused to close"), opencode.ErrProcessContainmentIncomplete)
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithSessionStore(store))
+	current := testSession(t, agent, client)
+	agent.sessions[current.id] = current
+	require.NoError(t, current.snapshotToStore(ctx))
+
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.True(t, agent.isDeleted(current.id), "a failed teardown left the deleted id addressable")
+	require.Contains(t, agent.sessions, current.id, "the failed teardown abandoned the native scope it left running")
+
+	listed, err := agent.ListSessions(ctx, ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, listed.Sessions, "a deleted session was still listable")
+
+	stored, err := store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the tombstone was cleared by the failed teardown")
+
+	_, err = agent.LoadSession(ctx, LoadSessionRequest(current.id, t.TempDir()))
+	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+
+	_, err = agent.ResumeSession(ctx, ResumeSessionRequest(current.id, t.TempDir()))
+	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+
+	// The scope the failed teardown left behind is reclaimed by the next delete,
+	// which runs the same containment again rather than answering for a session
+	// it never contained.
+	client.closeErr = nil
+	attempts := client.containmentAttempts()
+
+	_, err = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.NoError(t, err)
+	require.Greater(t, client.containmentAttempts(), attempts, "the retried delete never reached the scope again")
+	require.NotContains(t, agent.sessions, current.id, "the proven teardown kept the handle")
+
+	stored, err = store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the retried delete resurrected the tombstoned row")
+}
+
+// TestAgentCloseSweepsTheScopeAFailedDeleteLeftBehind proves the other half of
+// that retained ownership: an agent shutting down closes the native scope of a
+// session whose delete could not contain it, exactly as it closes every other
+// session's. A handle dropped at the tombstone would have left that scope running
+// past the process that owned it.
+func TestAgentCloseSweepsTheScopeAFailedDeleteLeftBehind(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	client.closeErr = errors.Join(errors.New("scope refused to close"), opencode.ErrProcessContainmentIncomplete)
+	agent := NewAgent(WithSessionStore(NewInMemorySessionStore()))
+	current := testSession(t, agent, client)
+	agent.sessions[current.id] = current
+
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+
+	client.closeErr = nil
+	attempts := client.containmentAttempts()
+
+	require.NoError(t, agent.Close())
+	require.Greater(t, client.containmentAttempts(), attempts,
+		"the shutdown swept every scope but the one the failed delete left behind")
+}
+
+// TestACommitRacingASucceededDeleteRecreatesNothing proves the write barrier a
+// late settlement meets: a turn that was still in flight when delete tombstoned
+// the id commits nothing afterwards, because a replacement unlists the tombstone
+// for every key it writes.
+func TestACommitRacingASucceededDeleteRecreatesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithSessionStore(store))
+	current := testSession(t, agent, newFakeOpenCodeClient())
+	agent.sessions[current.id] = current
+	require.NoError(t, current.snapshotToStore(ctx))
+
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.NoError(t, err)
+
+	require.NoError(t, current.commitForegroundPrefix(ctx))
+
+	stored, err := store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "a settlement after the delete recreated the row")
+}
+
+// TestDeleteLeavesNoWriteThatRecreatesTheRow proves the tombstone survives the
+// teardown it precedes: the settlement that follows a successful delete writes
+// nothing, because a replacement unlists the tombstone for every key it writes
+// and would resurrect a session already reported gone.
+func TestDeleteLeavesNoWriteThatRecreatesTheRow(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := NewAgent(WithSessionStore(store))
+	current := testSession(t, agent, client)
+	agent.sessions[current.id] = current
+	require.NoError(t, current.snapshotToStore(ctx))
+
+	openTestCycle(current, true)
+
+	var wroteAfterTombstone bool
+
+	store.onDelete = func(key SessionKey) error {
+		store.onReplace = func(SessionKey) error {
+			wroteAfterTombstone = true
+
+			return nil
+		}
+
+		return store.InMemorySessionStore.Delete(ctx, key)
+	}
+
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
+	require.NoError(t, err)
+	require.False(t, wroteAfterTombstone, "a write after the tombstone recreated the deleted row")
+
+	stored, err := store.ListSessions(ctx)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the deleted session is listable again")
+
+	entries, err := store.Load(ctx, SessionKey{SessionID: string(current.id)})
+	require.NoError(t, err)
+	require.Empty(t, entries, "the deleted session's row was recreated")
+}
+
+// TestLoadRacingDeleteInstallsNothingAndResurrectsNothing proves the tombstone
+// check is not once-at-entry. A load that passed its entry check and prepared a
+// complete replacement re-reads the deletion marker under the very lock that
+// installs, so a delete that completed inside that window wins however far the
+// preparation got: the replacement is torn down, the marker is left set rather
+// than cleared as an install side effect, and neither the active map nor the
+// store carries the deleted id afterwards.
+func TestLoadRacingDeleteInstallsNothingAndResurrectsNothing(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cwd := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-race")
+	client.getSession = testNativeSession("native-race")
+
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	store.onLoad = func(key SessionKey) ([]SessionStoreEntry, error) {
+		entries, loadErr := store.InMemorySessionStore.Load(ctx, key)
+
+		once.Do(func() {
+			close(reached)
+			<-release
+		})
+
+		return entries, loadErr
+	}
+
+	var (
+		wg      sync.WaitGroup
+		loadErr error
+	)
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		_, loadErr = agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the load never reached the store read")
+	}
+
+	// The delete completes entirely inside the load's preparation window.
+	_, delErr := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
+	require.NoError(t, delErr)
+	require.True(t, agent.isDeleted(created.SessionId), "the tombstone did not hide the id")
+
+	close(release)
+	wg.Wait()
+
+	store.onLoad = nil
+
+	requireInvalidParamsData(t, loadErr, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	require.True(t, agent.isDeleted(created.SessionId),
+		"installing the replacement cleared the deletion marker")
+
+	agent.mu.Lock()
+	_, mapped := agent.sessions[created.SessionId]
+	agent.mu.Unlock()
+	require.False(t, mapped, "the losing replacement was installed anyway")
+
+	listed, listErr := agent.ListSessions(ctx, ListSessionsRequest())
+	require.NoError(t, listErr)
+	require.Empty(t, listed.Sessions, "the deleted session is listable again")
+
+	rows, rowErr := store.ListSessions(ctx)
+	require.NoError(t, rowErr)
+	require.Empty(t, rows, "the deleted session's durable row came back")
+
+	_, reloadErr := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
+	requireInvalidParamsData(t, reloadErr, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+}
+
+// TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes proves the answer to a
+// refused installation is the refusal itself. A load that lost its race with a
+// delete owes the host the uniform unknown-session invalid params, and wrapping
+// that in a join would turn it into an internal error; only a teardown that
+// itself failed has anything to add.
+func TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes(t *testing.T) {
+	t.Parallel()
+
+	refusal := acp.NewInvalidParams(map[string]any{
+		jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID,
+	})
+
+	t.Run("clean teardown", func(t *testing.T) {
+		t.Parallel()
+
+		agent := NewAgent()
+		current := testSession(t, agent, newFakeOpenCodeClient())
+
+		requireInvalidParamsData(t, agent.rollbackStartedSession(current, refusal),
+			map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	})
+
+	t.Run("teardown that failed too", func(t *testing.T) {
+		t.Parallel()
+
+		client := newFakeOpenCodeClient()
+		client.closeErr = errors.New("disconnect failed")
+		agent := NewAgent()
+		current := testSession(t, agent, client)
+
+		err := agent.rollbackStartedSession(current, refusal)
+		require.ErrorIs(t, err, refusal)
+		require.ErrorContains(t, err, "disconnect failed")
+	})
 }

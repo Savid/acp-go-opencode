@@ -141,3 +141,37 @@ func TestAcquireInjectedChmodAndPlatformFailures(t *testing.T) {
 	_, err = AcquireClaim(t.TempDir())
 	require.ErrorIs(t, err, os.ErrInvalid)
 }
+
+// TestConstructionFailsWithTheUnsupportedLockSentinel proves the platform gate is
+// a sentinel a caller can test for rather than a message it has to match. A
+// platform with no advisory-lock primitive fails construction with
+// ErrRuntimeLockUnsupported: the runtime home is single-writer by that lock
+// alone, and one nobody can claim exclusively would let two runtimes write one
+// native database and call it ownership.
+func TestConstructionFailsWithTheUnsupportedLockSentinel(t *testing.T) {
+	originalLock := lockPlatform
+	originalFS := validateFS
+
+	t.Cleanup(func() {
+		lockPlatform = originalLock
+		validateFS = originalFS
+	})
+
+	home := t.TempDir()
+
+	lockPlatform = func(*os.File) error { return ErrRuntimeLockUnsupported }
+
+	claim, err := AcquireClaim(home)
+	require.Nil(t, claim, "an unsupported platform handed back a lock anyway")
+	require.ErrorIs(t, err, ErrRuntimeLockUnsupported)
+
+	_, err = Acquire(home)
+	require.ErrorIs(t, err, ErrRuntimeLockUnsupported, "the paired acquisition swallowed the sentinel")
+
+	lockPlatform = originalLock
+	validateFS = func(*os.File) error { return ErrRuntimeLockUnsupported }
+
+	_, err = AcquireLiveness(home)
+	require.ErrorIs(t, err, ErrRuntimeLockUnsupported,
+		"a filesystem the lock primitive cannot cover reported something else")
+}

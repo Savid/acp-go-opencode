@@ -60,12 +60,22 @@ func withTurnRoute(ctx context.Context, turnNonce string) context.Context {
 	return context.WithValue(ctx, turnRouteContextKey{}, turnNonce)
 }
 
+func turnNonceFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+
+	turnNonce, _ := ctx.Value(turnRouteContextKey{}).(string)
+
+	return turnNonce
+}
+
 func turnRouteMetaFromContext(ctx context.Context) map[string]any {
 	if ctx == nil {
 		return nil
 	}
 
-	turnNonce, _ := ctx.Value(turnRouteContextKey{}).(string)
+	turnNonce := turnNonceFromContext(ctx)
 	if turnNonce == "" {
 		return nil
 	}

@@ -57,14 +57,6 @@ func TestSessionStartHTTPFailuresNameTheRouteAndNeverTheBody(t *testing.T) {
 			},
 		},
 		{
-			name:   "provider catalog",
-			method: http.MethodGet,
-			path:   "/config/providers",
-			arrange: func(client *fakeOpenCodeClient, _ *Options, httpErr *opencode.HTTPError) {
-				client.providersErr = httpErr
-			},
-		},
-		{
 			name:   "native session create",
 			method: http.MethodPost,
 			path:   "/session",
@@ -99,8 +91,7 @@ func TestSessionStartHTTPFailuresNameTheRouteAndNeverTheBody(t *testing.T) {
 
 			data, ok := reqErr.Data.(map[string]any)
 			require.True(t, ok, "error data = %#v", reqErr.Data)
-			require.Contains(t, data[jsonFieldError],
-				fmt.Sprintf("opencode %s %s returned %s", test.method, test.path, httpErr.Status))
+			require.Equal(t, "handler failed", data[jsonFieldError])
 
 			encoded, marshalErr := json.Marshal(reqErr)
 			require.NoError(t, marshalErr)

@@ -177,7 +177,7 @@ func TestBundleCredentialScan(t *testing.T) {
 func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierReference(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 	client.syncEvents[0].Data[syncFieldInfo] = json.RawMessage(`{
 		"id":"native-1",
@@ -377,15 +377,16 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 		"API_TOKEN": "token", "PASSWORD": "password", "COOKIE": "cookie", "EMPTY_TOKEN": "", "NORMAL": "ignored",
 	}))
 	client := newFakeOpenCodeClient()
-	current := testSession(agent, client)
+	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 
-	current.pending["permission"] = opencode.PermissionRequest{}
+	registry := testIncarnation(current).registry
+	claimed, err := registry.claim(&pendingAction{id: "permission"})
+	require.NoError(t, err)
+	require.True(t, claimed)
 	require.Equal(t, metaPermissionKey, current.snapshotBlockedReason())
-	delete(current.pending, "permission")
-	current.questions["question"] = opencode.QuestionRequest{}
-	require.Equal(t, "elicitation", current.snapshotBlockedReason())
-	delete(current.questions, "question")
+	_, held := registry.take("permission")
+	require.True(t, held)
 	current.activeMessageIDs["message"] = struct{}{}
 	require.Equal(t, "generation", current.snapshotBlockedReason())
 	delete(current.activeMessageIDs, "message")
@@ -398,7 +399,7 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 	oldRead := restoreRandRead
 	restoreRandRead = func([]byte) (int, error) { return 0, errors.New("entropy failed") }
 	t.Cleanup(func() { restoreRandRead = oldRead })
-	_, err := newRestoreGeneration()
+	_, err = newRestoreGeneration()
 	require.ErrorContains(t, err, "entropy failed")
 	restoreRandRead = oldRead
 	generation, err := newRestoreGeneration()
@@ -410,14 +411,16 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	newSnapshotSession := func() (*session, *fakeOpenCodeClient) {
 		agent := NewAgent()
 		client := newFakeOpenCodeClient()
-		current := testSession(agent, client)
+		current := testSession(t, agent, client)
 		agent.sessions[current.id] = current
 
 		return current, client
 	}
 
 	current, _ := newSnapshotSession()
-	current.pending["permission"] = opencode.PermissionRequest{}
+	claimed, err := testIncarnation(current).registry.claim(&pendingAction{id: "permission"})
+	require.NoError(t, err)
+	require.True(t, claimed)
 	require.ErrorContains(t, current.snapshotToStore(context.Background()), "permission")
 
 	current, client := newSnapshotSession()
@@ -552,7 +555,7 @@ func TestCaptureStateSnapshotArtifactReplacementError(t *testing.T) {
 	conn := newRecordingAgentClient()
 	agent := NewAgent()
 	agent.setAgentClient(conn)
-	session := testSession(agent, client)
+	session := testSession(t, agent, client)
 	session.cwd = t.TempDir()
 
 	png := fixtureImage(t, "valid.png")
@@ -572,7 +575,7 @@ func TestCaptureStateSnapshotRetriesUnstableSyncGeneration(t *testing.T) {
 	newSnapshotSession := func() (*session, *fakeOpenCodeClient) {
 		agent := NewAgent()
 		client := newFakeOpenCodeClient()
-		current := testSession(agent, client)
+		current := testSession(t, agent, client)
 		agent.sessions[current.id] = current
 
 		return current, client

@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -22,6 +21,10 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
+	if err := refuseLifecycleMeta(params.Meta); err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+
 	if err := validateProviderAuthOptions(a.options); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -34,9 +37,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
-	meta, err := sessionMetaFromLifecycle(params.Meta)
+	meta, err := sessionMetaFromVendorOptions(params.Meta)
 	if err != nil {
-		return acp.NewSessionResponse{}, lifecycleMetaError(err)
+		return acp.NewSessionResponse{}, vendorOptionsMetaError(err)
 	}
 
 	if meta.Model == "" {
@@ -57,12 +60,6 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, carrier)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
-	}
-
-	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return acp.NewSessionResponse{}, errors.Join(validateErr, closeErr)
 	}
 
 	sessionStarted := time.Now()
@@ -88,11 +85,10 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
+	session.stampIncarnationGeneration(client, generation)
 
 	if err := a.storeStartedSession(session); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
+		return acp.NewSessionResponse{}, a.rollbackStartedSession(session, err)
 	}
 
 	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
@@ -100,8 +96,6 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
 	}
-
-	a.refreshLifecycleCommands(ctx, session)
 
 	return acp.NewSessionResponse{
 		SessionId:     id,
@@ -122,8 +116,6 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 		return acp.LoadSessionResponse{}, err
 	}
 
-	a.refreshLifecycleCommands(ctx, session)
-
 	return acp.LoadSessionResponse{
 		Meta:          sessionResponseMeta(session.snapshot()),
 		ConfigOptions: session.configOptions(ctx),
@@ -141,21 +133,10 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 		return acp.ResumeSessionResponse{}, err
 	}
 
-	a.refreshLifecycleCommands(ctx, session)
-
 	return acp.ResumeSessionResponse{
 		Meta:          sessionResponseMeta(session.snapshot()),
 		ConfigOptions: session.configOptions(ctx),
 	}, nil
-}
-
-func (a *Agent) refreshLifecycleCommands(ctx context.Context, session *session) {
-	if err := session.refreshCommands(ctx); err != nil {
-		a.log.DebugContext(ctx, "refresh OpenCode commands during session lifecycle failed",
-			slog.String("session_id", string(session.id)),
-			slog.String("error", err.Error()),
-		)
-	}
 }
 
 func (a *Agent) loadOrResumeSession(
@@ -166,6 +147,10 @@ func (a *Agent) loadOrResumeSession(
 	mcpServers []acp.McpServer,
 	metaMap map[string]any,
 ) (*session, error) {
+	if err := refuseLifecycleMeta(metaMap); err != nil {
+		return nil, err
+	}
+
 	if err := a.ensureOpen(); err != nil {
 		return nil, err
 	}
@@ -190,9 +175,9 @@ func (a *Agent) loadOrResumeSession(
 		return nil, err
 	}
 
-	meta, err := sessionMetaFromLifecycle(metaMap)
+	meta, err := sessionMetaFromVendorOptions(metaMap)
 	if err != nil {
-		return nil, lifecycleMetaError(err)
+		return nil, vendorOptionsMetaError(err)
 	}
 
 	storeCtx, cancel := a.sessionStoreContext(ctx)
@@ -231,12 +216,6 @@ func (a *Agent) loadOrResumeSession(
 		return nil, err
 	}
 
-	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return nil, errors.Join(validateErr, closeErr)
-	}
-
 	a.restoreMu.Lock()
 	native, err := restoreSyncState(ctx, client, snapshot, idmap.NativeSessionID, cwd)
 	a.restoreMu.Unlock()
@@ -254,18 +233,25 @@ func (a *Agent) loadOrResumeSession(
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
+	session.stampIncarnationGeneration(client, generation)
 	session.setImageArtifacts(artifacts)
 
 	if err := a.storeStartedSession(session); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return nil, errors.Join(err, closeErr)
+		// A delete that completed while this replacement was being prepared
+		// wins, however far the preparation got: the prepared session is torn
+		// down and the uniform unknown-session refusal reaches the host as it
+		// was raised.
+		return nil, a.rollbackStartedSession(session, err)
 	}
 
 	return session, nil
 }
 
 func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.ListSessionsResponse{}, refusal
+	}
+
 	if err := a.ensureOpen(); err != nil {
 		return acp.ListSessionsResponse{}, err
 	}
@@ -277,7 +263,16 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 	a.mu.Lock()
 
 	active := make([]*session, 0, len(a.sessions))
-	for _, session := range a.sessions {
+
+	for id, session := range a.sessions {
+		// A tombstoned id is hidden however this agent's own bookkeeping stands.
+		// A delete whose teardown failed keeps the handle so the scope it left
+		// running is still reachable for cleanup, and that retained ownership is
+		// this process's business: the host was already told the session is gone.
+		if _, deleted := a.deleted[id]; deleted {
+			continue
+		}
+
 		if params.Cwd != nil && session.cwd != *params.Cwd {
 			continue
 		}
@@ -345,27 +340,55 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 }
 
 func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.CloseSessionResponse{}, refusal
+	}
+
 	session, err := a.session(params.SessionId)
 	if err != nil {
 		return acp.CloseSessionResponse{}, err
 	}
 
-	snapshotErr := session.snapshotToStore(context.WithoutCancel(ctx))
-
+	// Close is the containment-proving boundary and it owns the whole ladder:
+	// the containment proof runs first, the durable commit and the terminal
+	// transition follow only a proof that completed, and the stream is fenced
+	// either way. A boundary that did not complete answers with its containment
+	// error and keeps the handle addressable for a retry.
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-	closeErr := session.Close(closeCtx)
+	closeErr := session.CloseAndCommit(closeCtx)
 
 	closeCancel()
 
-	if closeErr == nil && a.removeSessionIf(params.SessionId, session) {
+	if closeErr != nil {
+		return acp.CloseSessionResponse{}, closeErr
+	}
+
+	if a.removeSessionIf(params.SessionId, session) {
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
-	return acp.CloseSessionResponse{}, errors.Join(snapshotErr, closeErr)
+	return acp.CloseSessionResponse{}, nil
+}
+
+// rollbackStartedSession answers a refused installation. The refusal is the
+// answer the request owes and it survives the rollback intact — a load that lost
+// its race with a delete gets the uniform unknown-session invalid params rather
+// than an internal error wrapped around it — so only a teardown that itself
+// failed is joined onto it.
+func (a *Agent) rollbackStartedSession(session *session, refusal error) error {
+	if closeErr := a.closeFailedSession(session); closeErr != nil {
+		return errors.Join(refusal, closeErr)
+	}
+
+	return refusal
 }
 
 func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
 	ctx = a.observe.Extract(ctx, params.Meta)
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.UnstableDeleteSessionResponse{}, refusal
+	}
+
 	if params.SessionId == "" {
 		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
@@ -374,6 +397,13 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	session := a.sessions[params.SessionId]
 	a.mu.Unlock()
 
+	// The durable tombstone is written before anything is torn down, and the id
+	// is hidden with it. A teardown that fails afterwards is reported to the
+	// caller, but it never leaves a session that delete already answered for
+	// still listable, loadable, or resumable: a deleted session is
+	// wire-indistinguishable from one that never existed. A store that could not
+	// record the tombstone is the one failure that leaves the handle exactly as
+	// it was, because nothing was promised.
 	storeCtx, cancel := a.sessionStoreContext(ctx)
 	err := a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
 
@@ -384,23 +414,34 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	}
 
 	a.mu.Lock()
-	if session == nil || a.sessions[params.SessionId] == session {
-		delete(a.sessions, params.SessionId)
-	}
-
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
 
-	if session != nil {
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-		err = session.DeleteNativeAndClose(closeCtx)
+	if session == nil {
+		return acp.UnstableDeleteSessionResponse{}, nil
+	}
 
-		closeCancel()
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+	teardownErr := session.DeleteNativeAndClose(closeCtx)
 
+	closeCancel()
+
+	// Hidden is a wire fact, not a bookkeeping one. The tombstone above is what
+	// hides the id, and it hides it whatever happens here; the handle is released
+	// only once this session's native scope is proven contained. A teardown that
+	// failed leaves a live native scope, and dropping the only reference to it
+	// would leave nothing in this process able to reach it again: the retained
+	// handle is what a later delete retries the cleanup through and what
+	// `Agent.Close` sweeps on the way out.
+	if teardownErr != nil {
+		return acp.UnstableDeleteSessionResponse{}, teardownErr
+	}
+
+	if a.removeSessionIf(params.SessionId, session) {
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
-	return acp.UnstableDeleteSessionResponse{}, err
+	return acp.UnstableDeleteSessionResponse{}, nil
 }
 
 func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
@@ -417,9 +458,9 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		return acp.UnstableForkSessionResponse{}, err
 	}
 
-	meta, err := sessionMetaFromLifecycle(params.Meta)
+	meta, err := sessionMetaFromVendorOptions(params.Meta)
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, lifecycleMetaError(err)
+		return acp.UnstableForkSessionResponse{}, vendorOptionsMetaError(err)
 	}
 
 	parent, err := a.session(params.SessionId)
@@ -467,12 +508,6 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		return acp.UnstableForkSessionResponse{}, err
 	}
 
-	if validateErr := validateStartupModel(ctx, client, meta.Model, modelFieldSessionMeta); validateErr != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return acp.UnstableForkSessionResponse{}, errors.Join(validateErr, closeErr)
-	}
-
 	native, err := client.GetSession(ctx, nativeChild.ID)
 	if err != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
@@ -495,12 +530,11 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
 	session.mcpRefreshPending = len(mcpConfigs) > 0
 	session.runtimeGeneration = generation
+	session.stampIncarnationGeneration(client, generation)
 	session.setImageArtifacts(parent.cloneImageArtifacts())
 
 	if err := a.storeStartedSession(session); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
+		return acp.UnstableForkSessionResponse{}, a.rollbackStartedSession(session, err)
 	}
 
 	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
@@ -508,8 +542,6 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
 	}
-
-	a.refreshLifecycleCommands(ctx, session)
 
 	return acp.UnstableForkSessionResponse{
 		SessionId:     id,

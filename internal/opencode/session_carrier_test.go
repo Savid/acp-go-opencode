@@ -693,8 +693,8 @@ func TestSessionCarrierShellWrapperRunsTheShellTheOperationNamed(t *testing.T) {
 }
 
 // TestSessionCarrierShellWrapperKeepsConcurrentOperationsApart drives the two
-// scopes at once. Interleaving in time is the shape the review proved; running
-// them together is the shape a shared runtime actually serves.
+// scopes at once. Interleaving in time is the weaker shape the case above
+// covers; running them together is the shape a shared runtime actually serves.
 //
 // Half the scopes configure their shell at a path the search-path separator
 // runs through, so the address has to stay lossless while it is being read back

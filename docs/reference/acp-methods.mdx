@@ -19,8 +19,8 @@ extension. This page lists each method and its behavior.
 | `session/list` | Enumerate stored sessions. Pages carry an opaque base64 cursor; a cursor past the end is invalid params. |
 | `session/prompt` | Run a prompt turn; requires route version 1 and a fresh turn nonce. |
 | `session/cancel` | Cancel only the running turn whose nonce exactly matches. |
-| `session/close` | End the session and take a final snapshot. |
-| `session/delete` | Remove a stored session, leaving a tombstone. |
+| `session/close` | Prove the session's native scope contained, then commit its final snapshot. |
+| `session/delete` | Write the tombstone first, hide the id, then tear the session down. |
 | `session/set_config_option` | Change the `model` or `mode` option live. |
 
 ## Extensions and unsupported methods
@@ -40,10 +40,15 @@ extension. This page lists each method and its behavior.
   `_opencode/auth/credential` leg and no injection key: a completed login is
   installed into OpenCode's own durable store and never crosses back out.
 - `session/set_mode` — returns method-not-found; mode is a config option set
-  through `session/set_config_option`, not a dedicated method.
+  through `session/set_config_option`, not a dedicated method. The reserved
+  `_meta["acp-go.dev/lifecycle"]` key is still refused with invalid params
+  first: the key has no meaning on any inbound route, and a method-not-found
+  answer would tell a host the key was accepted.
 
 Unknown methods and foreign `_meta` namespaces are rejected or ignored per the
-ACP contract.
+ACP contract. The reserved key is not foreign on any of them: an unknown
+extension method whose params carry `_meta["acp-go.dev/lifecycle"]` is refused
+with invalid params, because the key is read before the method is resolved.
 
 After `Agent.Close`, the connection rejects every incoming request with
 invalid-request (`-32600`) before initialization gating, method lookup,
