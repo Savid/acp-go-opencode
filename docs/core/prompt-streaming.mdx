@@ -30,13 +30,15 @@ the adapter does not reconnect it and pretend the sequence remained complete.
 A lifecycle or typed-update delivery failure applies the same generation fence
 and contains its producer. One exception governs the answer rather than the
 fence: a turn's ending transition is emitted only after the turn's own answer is
-decided, and when that transition reported success and had already been handed to
-the transport, the prompt answers what it said. A notification whose send
-reported an error never proves the client did not receive it, so the client may
-hold durable success evidence for that turn, and the response never contradicts
-it. The generation is still fenced and contained. An ending transition that
-reported failure or cancellation binds nothing, so an undeliverable one still
-fails the prompt. Raw notifications are observational: failed delivery
+decided, and when that transition reported success and was handed to the
+transport, the prompt answers what it said. A notification whose send reported an
+error never proves the client did not receive it, so the client may hold durable
+success evidence for that turn, and the response never contradicts it. The
+generation is still fenced and contained. The hand-off is the predicate, not the
+enqueue: an ending transition the delivery lane drained without sending — the
+lane stopped, or a preceding write failed first — reached nobody, so that turn
+fails. An ending transition that reported failure or cancellation binds nothing,
+so an undeliverable one always fails the prompt. Raw notifications are observational: failed delivery
 does not consume their candidate sequence or affect the prompt. Prompt completion proves only
 foreground idle. OpenCode does not advertise authoritative background
 quiescence because native status polling cannot prove it.

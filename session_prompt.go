@@ -818,15 +818,40 @@ func (s *session) completePromptTurn(
 		return acp.PromptResponse{}, errors.Join(turnErr, commitErr)
 	}
 
-	if settled := s.settleCycle(settleCtx, cycle, outcome, stopReason); settled.failsTurn() {
+	settled := s.settleCycle(settleCtx, cycle, outcome, stopReason)
+	if settled.failsTurn() {
 		return acp.PromptResponse{}, s.classifyTurnFailure(settleCtx, settled.err, dispatch)
 	}
+
+	s.reportAffirmedSettlementFailure(settleCtx, cycle, settled)
 
 	if turnErr != nil {
 		return acp.PromptResponse{}, turnErr
 	}
 
 	return response, nil
+}
+
+// reportAffirmedSettlementFailure records the one delivery failure this adapter
+// answers past. An affirmed end binds the response, so its send error is neither
+// returned nor joined anywhere, and without this it would leave no trace at all:
+// an operator reading a successful turn would have no way to know the success
+// answer stood on a send that reported failure and fenced the generation. The
+// error itself is not logged, only that it happened and to which turn.
+func (s *session) reportAffirmedSettlementFailure(
+	ctx context.Context,
+	cycle *foregroundCycle,
+	settled cycleSettlement,
+) {
+	if settled.err == nil || s.agent == nil || s.agent.log == nil {
+		return
+	}
+
+	s.agent.log.WarnContext(ctx, "OpenCode turn answered success on an errored settlement delivery",
+		slog.String("session_id", string(s.id)),
+		slog.String("turn_id", cycle.turnID),
+		slog.String("cycle_id", cycle.id),
+	)
 }
 
 // promptOutcome decides what this turn ended as. Cancellation wins over every

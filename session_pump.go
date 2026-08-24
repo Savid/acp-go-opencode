@@ -900,5 +900,8 @@ func (s *session) settleAgentCycle(ctx context.Context, cycle *foregroundCycle) 
 		return err
 	}
 
+	// An agent-origin turn takes the whole error, not only the part that fails a
+	// prompt: no ACP response answers this turn, so there is no answer an
+	// affirmative end could contradict and nothing to hold back from the pump.
 	return s.settleCycle(ctx, cycle, outcome, stopReason).err
 }

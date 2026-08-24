@@ -529,12 +529,18 @@ func (s *session) currentCycle() *foregroundCycle {
 type cycleSettlement struct {
 	err error
 	// affirmed records that the ending transition claimed the turn succeeded and
-	// reached the ordered carrier, so a host may already hold success evidence for
+	// was handed to the transport, so a host may already hold success evidence for
 	// it. Nothing may contradict such a settlement afterwards: durable success
 	// evidence for a turn answered with an error is the one settlement pair a
 	// reducer can never repair, because both halves are terminal and each denies
 	// the other. A failed or cancelled end binds nothing — it and an error answer
 	// say the same thing about the turn — so an undeliverable one still fails it.
+	//
+	// It is the hand-off that affirms, never the enqueue. An ending transition the
+	// delivery lane drained without ever sending — the worker stopped, or a
+	// preceding write failed first — provably reached nobody, and answering such a
+	// turn with success would leave a host holding no end at all for a turn it was
+	// told had finished: a consumer waiting on the idle would wait for good.
 	affirmed bool
 }
 
@@ -574,12 +580,14 @@ func (s *session) settleCycle(
 		return cycleSettlement{err: err}
 	}
 
-	affirmed := receipt != nil && outcome == lifecycle.OutcomeSuccess
+	delivered := waitDeliveryOutcome(ctx, receipt)
+	if delivered.err != nil {
+		s.failNativeIncarnation(binding, delivered.err)
 
-	if err := waitDelivery(ctx, receipt); err != nil {
-		s.failNativeIncarnation(binding, err)
-
-		return cycleSettlement{err: err, affirmed: affirmed}
+		return cycleSettlement{
+			err:      delivered.err,
+			affirmed: delivered.handed && outcome == lifecycle.OutcomeSuccess,
+		}
 	}
 
 	return cycleSettlement{}

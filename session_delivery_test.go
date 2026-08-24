@@ -92,6 +92,81 @@ func TestAuthoritativeWriterCloseInterruptsAndJoins(t *testing.T) {
 	<-closed
 }
 
+// TestADrainedQueueReportsNothingHandedToTheTransport proves the lane tells its
+// callers which of two very different failures they suffered. The notification
+// the worker was sending when its context ended may have reached the client, and
+// the one still queued behind it provably did not: nothing ever handed it over.
+// A caller that treats the second as sent would report a fact to nobody.
+func TestADrainedQueueReportsNothingHandedToTheTransport(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	connection := newRecordingAgentClient()
+	connection.updateStarted = make(chan struct{})
+	connection.updateRelease = make(chan struct{})
+	agent := NewAgent()
+	agent.setAgentClient(connection)
+	delivery := newSessionDelivery(agent, "session-1")
+
+	sending, err := delivery.enqueueUpdate(context.Background(), acp.SessionNotification{
+		SessionId: "session-1", Update: acp.UpdateAgentMessageText("sending"),
+	})
+	require.NoError(t, err)
+	<-connection.updateStarted
+
+	queued, err := delivery.enqueueUpdate(context.Background(), acp.SessionNotification{
+		SessionId: "session-1", Update: acp.UpdateAgentMessageText("queued"),
+	})
+	require.NoError(t, err)
+	requireEventually(t, func() bool { return len(delivery.typed) == 1 },
+		"the second notification never reached the queue")
+
+	delivery.mu.Lock()
+	cancel := delivery.cancel
+	delivery.mu.Unlock()
+	cancel()
+
+	inFlight := waitDeliveryOutcome(context.Background(), sending)
+	require.Error(t, inFlight.err)
+	require.True(t, inFlight.handed,
+		"a notification already in the send was reported as never sent")
+
+	drained := waitDeliveryOutcome(context.Background(), queued)
+	require.Error(t, drained.err)
+	require.False(t, drained.handed,
+		"a notification the stopping worker drained was reported as sent")
+
+	connection.mu.Lock()
+	require.Len(t, connection.updates, 1, "the drained notification reached the transport")
+	connection.mu.Unlock()
+
+	delivery.close()
+}
+
+// TestTheStoppingDrainReportsNothingHandedOver covers the drain the worker runs
+// when its own context ends before it dequeues anything at all. Both of the
+// lane's stopping triggers empty the queue through this one path, and neither
+// hands a byte to the transport on the way.
+func TestTheStoppingDrainReportsNothingHandedOver(t *testing.T) {
+	agent := NewAgent()
+	agent.setAgentClient(newRecordingAgentClient())
+
+	delivery := newSessionDelivery(agent, "session-1")
+	// No worker runs, so nothing can dequeue what this enqueues.
+	delivery.started = true
+
+	receipt, err := delivery.enqueueUpdate(context.Background(), acp.SessionNotification{
+		SessionId: "session-1", Update: acp.UpdateAgentMessageText("never sent"),
+	})
+	require.NoError(t, err)
+
+	delivery.failQueued(context.Canceled)
+
+	drained := waitDeliveryOutcome(context.Background(), receipt)
+	require.ErrorIs(t, drained.err, context.Canceled)
+	require.False(t, drained.handed,
+		"a notification drained by the stopping worker was reported as sent")
+}
+
 func TestRealBlockedSDKWriterIsInterruptedAndJoinedWithoutReaderRelease(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
@@ -225,7 +300,7 @@ func TestCorrectionDeliveryDefensiveBranches(t *testing.T) {
 	full := newSessionDelivery(agent, "session")
 	full.started = true
 	for range authoritativeDeliveryCapacity {
-		full.typed <- authoritativeDelivery{done: make(chan error, 1)}
+		full.typed <- authoritativeDelivery{done: make(chan deliveryOutcome, 1)}
 	}
 	_, err := full.enqueueUpdate(context.Background(), acp.SessionNotification{})
 	require.ErrorContains(t, err, "queue is full")

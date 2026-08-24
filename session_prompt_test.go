@@ -3697,6 +3697,113 @@ func TestSucceededTurnWhoseEndFailedDeliveryIsNotContradicted(t *testing.T) {
 		"the lost ending transition left the stream unlatched")
 }
 
+// blockedSendTurn parks a succeeding turn at the exact instant its ending
+// transition is queued behind a notification the delivery lane is still sending.
+//
+// It is the only arrangement in which the lane holds two authoritative jobs at
+// once: every emitter waits for its own delivery before emitting again, so the
+// job ahead of the ending transition has to come from outside the turn. The turn
+// is otherwise ordinary and about to succeed — the native work is over, the
+// transcript is readable, and the prefix is committed — so the ending transition
+// is the only thing left between it and an end_turn answer.
+//
+// The returned channels are the answer the prompt gives and the release of the
+// send that is holding the lane.
+func blockedSendTurn(t *testing.T) (*session, *recordingAgentClient, chan error, chan struct{}) {
+	t.Helper()
+
+	current, client, connection := lifecycleSession(t)
+
+	dispatched := make(chan struct{})
+	client.hangsAfterDispatch(dispatched)
+
+	answer := make(chan error, 1)
+
+	go func() {
+		_, err := current.Prompt(
+			context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
+		answer <- err
+	}()
+
+	requireSignal(t, dispatched)
+	requireEventually(t, func() bool {
+		return len(connection.lifecycleEventsOfType(t, "state_update")) == 1
+	}, "the turn never opened")
+
+	connection.mu.Lock()
+	connection.updateStarted = make(chan struct{})
+	connection.updateRelease = make(chan struct{})
+	connection.updateErr = errors.New("wire down")
+	sending, release := connection.updateStarted, connection.updateRelease
+	connection.mu.Unlock()
+
+	// Occupy the lane with a notification of no consequence, then let the turn
+	// finish natively so its ending transition queues up behind that send.
+	_, err := current.delivery.enqueueUpdate(context.Background(), acp.SessionNotification{
+		SessionId: current.id,
+		Update:    acp.UpdateAgentMessageText("holding the lane"),
+	})
+	require.NoError(t, err)
+	requireSignal(t, sending)
+
+	client.publishTurnCompletion(current.idmap.NativeSessionID, "assistant")
+
+	requireEventually(t, func() bool { return len(current.delivery.typed) == 1 },
+		"the ending transition never reached the queue")
+
+	return current, connection, answer, release
+}
+
+// requireNoEndingIdle asserts the stream carried no ending transition at all. It
+// is the observable that separates an end the client may hold from one that
+// provably reached nobody.
+func requireNoEndingIdle(t *testing.T, connection *recordingAgentClient) {
+	t.Helper()
+
+	for _, transition := range connection.lifecycleEventsOfType(t, "state_update") {
+		require.NotEqual(t, "idle", transition["state"],
+			"an ending transition the lane never sent reached the client")
+	}
+}
+
+// TestSucceededTurnWhoseEndWasDrainedByALatchedLaneFails proves the hand-off is
+// the predicate, not the enqueue. A write ahead of the ending transition fails
+// and latches the lane, which then empties without ever sending what it held, so
+// the success this turn was about to report reached nobody. Answering end_turn
+// here would be the mirror of the contradiction the affirmed case avoids, and a
+// worse one: the client would hold no end for a turn it was told had finished,
+// and a consumer waiting on the idle would wait for good.
+func TestSucceededTurnWhoseEndWasDrainedByALatchedLaneFails(t *testing.T) {
+	current, connection, answer, release := blockedSendTurn(t)
+
+	// The send that is holding the lane now fails, which latches the lane and
+	// drains the ending transition queued behind it.
+	close(release)
+
+	assertTurnFailed(t, <-answer, causeTransport, "")
+	requireNoEndingIdle(t, connection)
+	requireEventually(t, func() bool { return current.lifecycleFailure() != nil },
+		"the drained ending transition left the stream unlatched")
+}
+
+// TestSucceededTurnWhoseEndWasDrainedByAnEndingLaneFails proves the same of the
+// lane's other way of stopping. Here nothing was refused: the delivery worker's
+// own context ends while it is mid-send, and the queue behind it is emptied
+// unsent. The ending transition never reached the transport, so the turn fails.
+func TestSucceededTurnWhoseEndWasDrainedByAnEndingLaneFails(t *testing.T) {
+	current, connection, answer, _ := blockedSendTurn(t)
+
+	current.delivery.mu.Lock()
+	cancel := current.delivery.cancel
+	current.delivery.mu.Unlock()
+
+	require.NotNil(t, cancel, "the delivery worker never started")
+	cancel()
+
+	assertTurnFailed(t, <-answer, causeTransport, "")
+	requireNoEndingIdle(t, connection)
+}
+
 // TestTurnWithNoReadableTranscriptFails proves the settling read is not optional:
 // a transcript this session cannot read, and a transcript holding no assistant
 // message for the turn, both fail the turn rather than answering end_turn with

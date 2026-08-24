@@ -18,11 +18,25 @@ const (
 
 var errAuthoritativeDeliveryPanic = errors.New("authoritative session delivery panicked")
 
-type deliveryReceipt <-chan error
+// deliveryOutcome is what became of one authoritative notification.
+//
+// handed is the difference between a fact that may be in the client's hands and
+// one that provably never left this process. The worker sets it immediately
+// before the transport send, so a job it drained without ever reaching that send
+// — a queue emptied behind a preceding write failure, or the worker's own context
+// ending — reports the failure with handed false. Only the send itself is
+// ambiguous: it may reach the client and still report an error, so a handed
+// notification is one this process can no longer take back.
+type deliveryOutcome struct {
+	err    error
+	handed bool
+}
+
+type deliveryReceipt <-chan deliveryOutcome
 
 type authoritativeDelivery struct {
 	notification acp.SessionNotification
-	done         chan error
+	done         chan deliveryOutcome
 	onFailure    func(error)
 	onDelivered  func()
 }
@@ -103,7 +117,7 @@ func (d *sessionDelivery) enqueueUpdateCommitted(
 
 	d.startLocked()
 
-	done := make(chan error, 1)
+	done := make(chan deliveryOutcome, 1)
 
 	job := authoritativeDelivery{notification: notification, done: done, onDelivered: onDelivered}
 	if len(onFailures) > 0 {
@@ -118,9 +132,16 @@ func (d *sessionDelivery) enqueueUpdateCommitted(
 	}
 }
 
-func waitDelivery(_ context.Context, receipt deliveryReceipt) error {
+func waitDelivery(ctx context.Context, receipt deliveryReceipt) error {
+	return waitDeliveryOutcome(ctx, receipt).err
+}
+
+// waitDeliveryOutcome waits for the whole outcome rather than only its failure.
+// It exists for the one caller that must know whether a failed notification was
+// handed to the transport: everything else only ever acts on the error.
+func waitDeliveryOutcome(_ context.Context, receipt deliveryReceipt) deliveryOutcome {
 	if receipt == nil {
-		return nil
+		return deliveryOutcome{}
 	}
 
 	// Once a fact is accepted, caller cancellation cannot withdraw its ordered
@@ -138,11 +159,11 @@ func (d *sessionDelivery) runTyped(ctx context.Context) {
 
 			return
 		case job := <-d.typed:
-			err := d.deliverAuthoritative(ctx, job)
+			handed, err := d.deliverAuthoritative(ctx, job)
 			if err != nil {
 				failure := d.latchFailure(err)
 
-				job.done <- failure
+				job.done <- deliveryOutcome{err: failure, handed: handed}
 
 				d.runFailureCallback(job.onFailure, failure)
 
@@ -151,12 +172,20 @@ func (d *sessionDelivery) runTyped(ctx context.Context) {
 				return
 			}
 
-			job.done <- nil
+			job.done <- deliveryOutcome{handed: true}
 		}
 	}
 }
 
-func (d *sessionDelivery) deliverAuthoritative(ctx context.Context, job authoritativeDelivery) (err error) {
+// deliverAuthoritative writes one notification and reports whether it reached the
+// transport. handed is a named return set through the write itself so that a
+// panic raised inside the send is still reported as handed: the transport had the
+// notification before it exploded, and claiming otherwise would let the turn deny
+// a fact the client may hold.
+func (d *sessionDelivery) deliverAuthoritative(
+	ctx context.Context,
+	job authoritativeDelivery,
+) (handed bool, err error) {
 	defer func() {
 		if recover() != nil {
 			err = errAuthoritativeDeliveryPanic
@@ -165,15 +194,15 @@ func (d *sessionDelivery) deliverAuthoritative(ctx context.Context, job authorit
 		}
 	}()
 
-	if err := d.writeUpdate(ctx, job); err != nil {
-		return err
+	if err := d.writeUpdate(ctx, job, &handed); err != nil {
+		return handed, err
 	}
 
 	if job.onDelivered != nil {
 		job.onDelivered()
 	}
 
-	return nil
+	return true, nil
 }
 
 func (d *sessionDelivery) latchFailure(cause error) error {
@@ -229,7 +258,14 @@ func (d *sessionDelivery) terminalizePanic(cause string) {
 	current.failNativeIncarnation(binding, errors.New(cause))
 }
 
-func (d *sessionDelivery) writeUpdate(ctx context.Context, job authoritativeDelivery) error {
+// writeUpdate hands one notification to the transport. It marks handed at the
+// last instruction before the send, so a session with no connection left to send
+// on reports a failure nothing could have received.
+func (d *sessionDelivery) writeUpdate(
+	ctx context.Context,
+	job authoritativeDelivery,
+	handed *bool,
+) error {
 	conn := d.agent.connection()
 	if conn == nil {
 		return errors.New("session update delivery has no ACP connection")
@@ -238,14 +274,20 @@ func (d *sessionDelivery) writeUpdate(ctx context.Context, job authoritativeDeli
 	writeCtx, cancel := context.WithTimeout(ctx, closeTimeout)
 	defer cancel()
 
+	*handed = true
+
 	return conn.SessionUpdate(writeCtx, job.notification)
 }
 
+// failQueued empties the queue behind a worker that is stopping. Not one of these
+// jobs was ever handed to the transport — the worker's context ended, or a
+// preceding write failed and latched the lane — so each reports a failure whose
+// notification provably never left this process.
 func (d *sessionDelivery) failQueued(err error) {
 	for {
 		select {
 		case job := <-d.typed:
-			job.done <- err
+			job.done <- deliveryOutcome{err: err}
 
 			d.runFailureCallback(job.onFailure, err)
 		default:
