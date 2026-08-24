@@ -1738,16 +1738,16 @@ func TestACycleSettlesExactlyOnce(t *testing.T) {
 	cycle := acceptTestTurn(t, current)
 
 	require.NoError(t, current.settleCycle(
-		context.Background(), cycle, lifecycle.OutcomeSuccess, string(acp.StopReasonEndTurn)))
+		context.Background(), cycle, lifecycle.OutcomeSuccess, string(acp.StopReasonEndTurn)).err)
 
 	settled := len(connection.lifecycleEventsOfType(t, "state_update"))
 
 	require.NoError(t, current.settleCycle(
-		context.Background(), cycle, lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled)))
+		context.Background(), cycle, lifecycle.OutcomeCancelled, string(acp.StopReasonCancelled)).err)
 	require.Len(t, connection.lifecycleEventsOfType(t, "state_update"), settled,
 		"a retired cycle reported a second ending")
 	require.NoError(t, current.settleCycle(
-		context.Background(), nil, lifecycle.OutcomeSuccess, string(acp.StopReasonEndTurn)))
+		context.Background(), nil, lifecycle.OutcomeSuccess, string(acp.StopReasonEndTurn)).err)
 }
 
 func TestCorrectionAcceptPromptDeliveryFailure(t *testing.T) {

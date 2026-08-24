@@ -517,32 +517,72 @@ func (s *session) currentCycle() *foregroundCycle {
 	return s.cycle
 }
 
+// cycleSettlement reports how one cycle's ending transition fared, and with it
+// whether the turn is still free to answer anything other than what that
+// transition said.
+//
+// The distinction is not cosmetic. A notification that failed on its way out was
+// still handed to the carrier, and an error from a JSON-RPC notification never
+// proves the peer did not receive it: the host may hold that ending transition
+// for good. So an affirmative end that reached the carrier binds the answer, and
+// an end that never got that far leaves the turn free to report the failure.
+type cycleSettlement struct {
+	err error
+	// affirmed records that the ending transition claimed the turn succeeded and
+	// reached the ordered carrier, so a host may already hold success evidence for
+	// it. Nothing may contradict such a settlement afterwards: durable success
+	// evidence for a turn answered with an error is the one settlement pair a
+	// reducer can never repair, because both halves are terminal and each denies
+	// the other. A failed or cancelled end binds nothing — it and an error answer
+	// say the same thing about the turn — so an undeliverable one still fails it.
+	affirmed bool
+}
+
+// failsTurn reports that the ending transition failed without leaving any host
+// able to hold an affirmative end, so the turn answers with that failure rather
+// than with a completion the stream never carried.
+func (settlement cycleSettlement) failsTurn() bool {
+	return settlement.err != nil && !settlement.affirmed
+}
+
 // settleCycle emits the one ending transition for the open cycle. Every blocking
-// action must already be terminal, and the native-safe prefix must already be
-// committed: this is the last lifecycle event of the turn, and the ACP prompt
-// response follows it.
-func (s *session) settleCycle(ctx context.Context, cycle *foregroundCycle, outcome lifecycle.Outcome, stopReason string) error {
+// action must already be terminal, the native-safe prefix must already be
+// committed, and the turn's own answer must already be decided: this is the last
+// lifecycle event of the turn, nothing after it may change what the turn answers,
+// and the ACP prompt response follows it.
+func (s *session) settleCycle(
+	ctx context.Context,
+	cycle *foregroundCycle,
+	outcome lifecycle.Outcome,
+	stopReason string,
+) cycleSettlement {
 	binding := s.nativeIncarnationForContext(ctx)
 	s.lifecycleMu.Lock()
 
 	if !s.retireCycleLocked(cycle) {
 		s.lifecycleMu.Unlock()
 
-		return nil
+		return cycleSettlement{}
 	}
 
 	receipt, err := s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(cycle.id, cycle.turnID, stopReason, outcome))
 	s.lifecycleMu.Unlock()
 
-	if err == nil {
-		err = waitDelivery(ctx, receipt)
-	}
-
 	if err != nil {
 		s.failNativeIncarnation(binding, err)
+
+		return cycleSettlement{err: err}
 	}
 
-	return err
+	affirmed := receipt != nil && outcome == lifecycle.OutcomeSuccess
+
+	if err := waitDelivery(ctx, receipt); err != nil {
+		s.failNativeIncarnation(binding, err)
+
+		return cycleSettlement{err: err, affirmed: affirmed}
+	}
+
+	return cycleSettlement{}
 }
 
 // settleCloseCycle ends the close boundary's foreground cycle. The emission rungs

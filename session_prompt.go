@@ -783,6 +783,12 @@ func (s *session) recordCycleFailure(cycle *foregroundCycle, err error) {
 // out, and only then does the ACP response or error follow. A prefix that cannot
 // be committed fences the stream instead of reporting an idle the store cannot
 // back.
+//
+// The answer is decided before the ending transition is emitted, and no step
+// after that emission may change it. That is what keeps the response and the
+// settlement one account of the same turn: an affirmative end that reached the
+// carrier may be durable at the host even if its delivery reported failure, so
+// the turn answers what it said rather than contradicting it with an error.
 func (s *session) completePromptTurn(
 	ctx context.Context,
 	turnCtx context.Context,
@@ -812,8 +818,8 @@ func (s *session) completePromptTurn(
 		return acp.PromptResponse{}, errors.Join(turnErr, commitErr)
 	}
 
-	if settleErr := s.settleCycle(settleCtx, cycle, outcome, stopReason); settleErr != nil {
-		return acp.PromptResponse{}, s.classifyTurnFailure(settleCtx, settleErr, dispatch)
+	if settled := s.settleCycle(settleCtx, cycle, outcome, stopReason); settled.failsTurn() {
+		return acp.PromptResponse{}, s.classifyTurnFailure(settleCtx, settled.err, dispatch)
 	}
 
 	if turnErr != nil {

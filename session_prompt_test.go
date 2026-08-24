@@ -3628,6 +3628,75 @@ func TestCancelledTurnThatCannotReportItsEndSurfacesTheDeliveryFailure(t *testin
 		"an undeliverable ending transition left the stream unlatched")
 }
 
+// affirmativeEndFailingClient is a host that receives every notification and then
+// reports transport failure on the one carrying an affirmative end. It is the
+// exact shape the wire has: a JSON-RPC notification whose send reports an error
+// never proves the peer did not receive it, so the host can hold an end the
+// emitter believes it never delivered.
+type affirmativeEndFailingClient struct {
+	*recordingAgentClient
+
+	failure error
+}
+
+func (c *affirmativeEndFailingClient) SessionUpdate(
+	ctx context.Context,
+	notification acp.SessionNotification,
+) error {
+	if err := c.recordingAgentClient.SessionUpdate(ctx, notification); err != nil {
+		return err
+	}
+
+	if carriesAffirmativeEnd(notification) {
+		return c.failure
+	}
+
+	return nil
+}
+
+func carriesAffirmativeEnd(notification acp.SessionNotification) bool {
+	envelope, ok := notification.Meta[lifecycle.MetaKey].(map[string]any)
+	if !ok {
+		return false
+	}
+
+	event, ok := envelope["event"].(map[string]any)
+	if !ok || event["type"] != "state_update" {
+		return false
+	}
+
+	return event["state"] == "idle" && event["outcome"] == string(lifecycle.OutcomeSuccess)
+}
+
+// TestSucceededTurnWhoseEndFailedDeliveryIsNotContradicted proves the ending
+// transition and the prompt answer are one account of the same turn. The host
+// received the affirmative end and holds durable success evidence for the turn,
+// and the delivery error that followed proves nothing about what the host holds,
+// so the turn answers what its settlement said. Answering with an error instead
+// would leave a host holding success evidence for a turn it was told had failed —
+// two terminal facts about one turn, each denying the other, and no later event
+// can repair the pair. The stream is still latched and its incarnation still
+// contained, because a lost notification is a real gap in a contiguous stream.
+func TestSucceededTurnWhoseEndFailedDeliveryIsNotContradicted(t *testing.T) {
+	current, _, connection := lifecycleSession(t)
+
+	current.agent.setAgentClient(&affirmativeEndFailingClient{
+		recordingAgentClient: connection,
+		failure:              errors.New("wire down"),
+	})
+
+	response, err := current.Prompt(
+		context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
+
+	requireLifecycleOutcome(t, connection, lifecycle.OutcomeSuccess)
+	require.NoError(t, err,
+		"a turn whose success the host already holds was answered with a failure")
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+
+	requireEventually(t, func() bool { return current.lifecycleFailure() != nil },
+		"the lost ending transition left the stream unlatched")
+}
+
 // TestTurnWithNoReadableTranscriptFails proves the settling read is not optional:
 // a transcript this session cannot read, and a transcript holding no assistant
 // message for the turn, both fail the turn rather than answering end_turn with

@@ -28,7 +28,15 @@ terminal, and the terminal cannot overtake the final accepted event. EOF or any
 other unprovable transport gap permanently fences that exact native generation;
 the adapter does not reconnect it and pretend the sequence remained complete.
 A lifecycle or typed-update delivery failure applies the same generation fence
-and contains its producer. Raw notifications are observational: failed delivery
+and contains its producer. One exception governs the answer rather than the
+fence: a turn's ending transition is emitted only after the turn's own answer is
+decided, and when that transition reported success and had already been handed to
+the transport, the prompt answers what it said. A notification whose send
+reported an error never proves the client did not receive it, so the client may
+hold durable success evidence for that turn, and the response never contradicts
+it. The generation is still fenced and contained. An ending transition that
+reported failure or cancellation binds nothing, so an undeliverable one still
+fails the prompt. Raw notifications are observational: failed delivery
 does not consume their candidate sequence or affect the prompt. Prompt completion proves only
 foreground idle. OpenCode does not advertise authoritative background
 quiescence because native status polling cannot prove it.

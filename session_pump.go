@@ -900,5 +900,5 @@ func (s *session) settleAgentCycle(ctx context.Context, cycle *foregroundCycle) 
 		return err
 	}
 
-	return s.settleCycle(ctx, cycle, outcome, stopReason)
+	return s.settleCycle(ctx, cycle, outcome, stopReason).err
 }
