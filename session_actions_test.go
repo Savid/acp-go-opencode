@@ -390,6 +390,65 @@ func TestAnnouncementFailureSettlesTheActionNatively(t *testing.T) {
 	require.ErrorContains(t, current.lifecycleFailure(), "lifecycle delivery failed")
 }
 
+// TestActionOpeningFailureDefersContainmentUntilNativeRefusal proves the first
+// event of an agent-origin action obeys the same ordering as the action's own
+// announcement. A delivery failure may fence new host traffic immediately, but
+// it must not unpublish the native binding while the admitted request is still
+// waiting for registration; refusal runs first, and containment follows it.
+func TestActionOpeningFailureDefersContainmentUntilNativeRefusal(t *testing.T) {
+	current, client, connection := lifecycleSession(t)
+	binding := testIncarnation(current)
+	generation := testRuntimeGeneration(current)
+
+	connection.mu.Lock()
+	connection.updateErr = errors.New("wire down")
+	connection.updateStarted = make(chan struct{})
+	connection.updateRelease = make(chan struct{})
+	connection.permissionRegistrationStarted = make(chan struct{})
+	connection.permissionRegistrationRelease = make(chan struct{})
+	updateStarted, updateRelease := connection.updateStarted, connection.updateRelease
+	registrationStarted, registrationRelease := connection.permissionRegistrationStarted,
+		connection.permissionRegistrationRelease
+	connection.mu.Unlock()
+
+	closeOnce := func(channel chan struct{}) {
+		select {
+		case <-channel:
+		default:
+			close(channel)
+		}
+	}
+	t.Cleanup(func() {
+		closeOnce(updateRelease)
+		closeOnce(registrationRelease)
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		result <- current.routeNativePermission(context.Background(), opencode.PermissionRequest{
+			ID: "permission-1", SessionID: current.idmap.NativeSessionID,
+		})
+	}()
+
+	requireSignal(t, registrationStarted)
+	requireSignal(t, updateStarted)
+	close(updateRelease)
+	requireSignal(t, current.delivery.typedDone)
+
+	current.agent.mu.Lock()
+	runtimeStillPublished := current.agent.runtime != nil
+	current.agent.mu.Unlock()
+	require.True(t, runtimeStillPublished, "opening delivery failure contained before native refusal")
+	require.True(t, current.incarnationIsCurrent(binding), "opening delivery failure unpublished the admitted request")
+	require.False(t, client.isClosed(), "opening delivery failure closed the scope before native refusal")
+
+	close(registrationRelease)
+	require.Error(t, <-result)
+	require.Equal(t, 1, client.permissionReplyCount(), "OpenCode was left blocked")
+	require.Equal(t, permissionReplyReject, client.permissionReply(0).reply)
+	requireExactGenerationContained(t, current, client, generation)
+}
+
 // TestNativeResolutionFailureIsRecordedAgainstTheCycle proves a natively resolved
 // action whose terminal state cannot be delivered records the delivery failure
 // instead of reporting the action resolved on a stream that never carried it.

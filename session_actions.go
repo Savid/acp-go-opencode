@@ -414,7 +414,7 @@ func (s *session) beginAction(ctx context.Context, action *pendingAction) (bool,
 		return false, errors.New("native action incarnation binding is stale")
 	}
 
-	cycle, err := s.openAgentCycleLocked(ctx)
+	cycle, err := s.openActionCycleLocked(ctx)
 	if err != nil {
 		s.lifecycleMu.Unlock()
 		cancel()

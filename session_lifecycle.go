@@ -470,6 +470,20 @@ func (s *session) abandonPromptCycle(cycle *foregroundCycle) {
 // caused. Its turn id is minted from the ordered stream rather than from a route
 // nonce, because no client turn authenticated it.
 func (s *session) openAgentCycleLocked(ctx context.Context) (*foregroundCycle, error) {
+	return s.openAgentCycleLockedWithFailure(ctx, true)
+}
+
+// openActionCycleLocked defers containment of an opening-delivery failure until
+// action admission has answered the exact native request. The action path owns
+// that ordering; every other agent-origin cycle retains immediate containment.
+func (s *session) openActionCycleLocked(ctx context.Context) (*foregroundCycle, error) {
+	return s.openAgentCycleLockedWithFailure(ctx, false)
+}
+
+func (s *session) openAgentCycleLockedWithFailure(
+	ctx context.Context,
+	containOnFailure bool,
+) (*foregroundCycle, error) {
 	if s.lifecycleStreamLocked() == nil {
 		return nil, s.lifecycleFailed
 	}
@@ -497,7 +511,7 @@ func (s *session) openAgentCycleLocked(ctx context.Context) (*foregroundCycle, e
 		return nil, err
 	}
 
-	if _, err := s.emitLifecycleLocked(ctx, event); err != nil {
+	if _, err := s.emitLifecycleLockedWithFailure(ctx, event, containOnFailure); err != nil {
 		return nil, err
 	}
 
