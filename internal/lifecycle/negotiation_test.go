@@ -43,7 +43,6 @@ func TestDecodeCapabilityStrictness(t *testing.T) {
 		{"version not an integer", map[string]any{"version": "1"}, MetaPath + ".version"},
 		{"version fractional", map[string]any{"version": 1.5}, MetaPath + ".version"},
 		{"version boolean", map[string]any{"version": true}, MetaPath + ".version"},
-		{"version array", map[string]any{"version": []any{1}}, MetaPath + ".version"},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()

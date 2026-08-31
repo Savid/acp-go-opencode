@@ -42,15 +42,6 @@ func (s *BrowserShim) Dir() string {
 	return s.dir
 }
 
-// Handoff transfers the adapter-created shim to the isolated native identity.
-func (s *BrowserShim) Handoff(isolation *ProcessIsolation) error {
-	if s == nil {
-		return nil
-	}
-
-	return handoffGeneratedNativeTree(s.dir, isolation)
-}
-
 // environ returns env with the shim ahead of PATH and BROWSER pointed at one of
 // its no-ops.
 func (s *BrowserShim) environ(env []string) []string {

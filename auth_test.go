@@ -177,6 +177,28 @@ func TestInitializeAdvertisesProviderAuthOnlyWhenEnabled(t *testing.T) {
 	require.NotContains(t, plainVendor, providerAuthCapabilityKey)
 }
 
+func TestManagedAuthorityWithholdsProviderAuth(t *testing.T) {
+	agent := NewAgent(
+		WithHome(t.TempDir()),
+		WithProviderAuthRoot(t.TempDir()),
+		WithHostAuthority(optionTestAuthority{}),
+	)
+	require.Nil(t, agent.providerAuth)
+
+	response, err := agent.Initialize(context.Background(), acp.InitializeRequest{})
+	require.NoError(t, err)
+	vendor, ok := response.AgentCapabilities.Meta[opencodeMetaKey].(map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, vendor, providerAuthCapabilityKey)
+
+	for _, method := range authMethodNames() {
+		_, methodErr := agent.HandleExtensionMethod(context.Background(), method, json.RawMessage(`{}`))
+		var requestErr *acp.RequestError
+		require.ErrorAs(t, methodErr, &requestErr)
+		require.Equal(t, -32601, requestErr.Code)
+	}
+}
+
 func TestUnadvertisedAuthLegsReturnMethodNotFound(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 

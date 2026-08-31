@@ -46,7 +46,7 @@ func TestSessionEnvMetaAcceptsBothShapesAndPreservesValues(t *testing.T) {
 }
 
 func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
-	managedOpenCodeRoot, managedXDGRoot := managedEnvOpenCodeConfigDir, managedEnvXDGDataHome
+	managedOpenCodeRoot, managedXDGRoot := "OPENCODE_CONFIG_DIR", "XDG_DATA_HOME"
 
 	tests := []struct {
 		name  string

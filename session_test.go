@@ -485,7 +485,7 @@ func TestAnIncompleteContainmentTerminalizesNothingAndStillFences(t *testing.T) 
 	t.Parallel()
 
 	client := newFakeOpenCodeClient()
-	client.closeErr = errors.Join(errors.New("close failed"), opencode.ErrProcessContainmentIncomplete)
+	client.closeErr = errors.Join(errors.New("close failed"), ErrContainmentIncomplete)
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
 	connection := newRecordingAgentClient()
@@ -507,7 +507,7 @@ func TestAnIncompleteContainmentTerminalizesNothingAndStillFences(t *testing.T) 
 	}
 
 	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.False(t, committed, "an unproven containment committed a resumable snapshot anyway")
 	require.False(t, cycle.settled, "an unproven containment terminalized the turn anyway")
 
@@ -975,7 +975,7 @@ func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
 	cycle := acceptTestTurn(t, current)
 
 	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.ErrorContains(t, err, "harness refused the interrupt")
 	require.True(t, lifecycleFenced(current), "the failed close left the incarnation speaking after it had stopped")
 	require.NoError(t, current.lifecycleFailure(), "the failed close latched a stream it said nothing on")
@@ -987,10 +987,10 @@ func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
 		"the failed close turned a refused interrupt into accepted terminal evidence")
 
 	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 
 	_, err = agent.UnstableDeleteSession(context.Background(), DeleteSessionRequest(current.id))
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.Empty(t, client.deleted, "delete removed native state over a stop nobody proved")
 }
 

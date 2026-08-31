@@ -58,10 +58,9 @@ func TestInitializeAnswersOnTheResponsesOwnMeta(t *testing.T) {
 	require.NotContains(t, vendor, "lifecycle")
 }
 
-// TestInitializeOmitsTheKeyWithoutACommonVersion proves the key is omitted whole
-// rather than answered with an empty array, and that an absent offer is the host
-// asking for nothing.
-func TestInitializeOmitsTheKeyWithoutACommonVersion(t *testing.T) {
+// TestInitializeOmitsLifecycleWithoutOffer proves an absent offer is the host
+// asking for no lifecycle capability.
+func TestInitializeOmitsLifecycleWithoutOffer(t *testing.T) {
 	t.Parallel()
 
 	for _, row := range []struct {
@@ -114,37 +113,13 @@ func TestInitializeRefusesAMalformedOfferByPath(t *testing.T) {
 	}
 }
 
-// TestLifecycleAnswerIsTheSameOnEveryContainmentMode proves the answer states
-// only what this adapter proves, and that no containment mode changes it. The
-// mode decides how the native process boundary is enforced; it decides nothing
-// about out-of-prompt delivery, quiescence, or activity kinds, so a host reading
-// the answer learns the same degenerate row however the runtime is contained —
-// including the quiescence source, which an answer proving no class never states.
-func TestLifecycleAnswerIsTheSameOnEveryContainmentMode(t *testing.T) {
-	t.Parallel()
-
-	for _, mode := range []RuntimeContainmentMode{
-		RuntimeContainmentAuthoritative,
-		RuntimeContainmentBestEffort,
-		RuntimeContainmentSharedIdentity,
-		RuntimeContainmentUnavailable,
-		RuntimeContainmentMode("unnamed"),
-	} {
-		agent := NewAgent()
-		agent.containmentMode = mode
-
-		response, err := agent.Initialize(context.Background(), acp.InitializeRequest{Meta: lifecycleOffer()})
-		require.NoError(t, err)
-
-		facts := agent.lifecycleNegotiated()
-		require.True(t, facts.UpdatesOutsidePrompt, mode)
-		require.False(t, facts.AuthoritativeQuiescence, mode)
-		require.Empty(t, facts.QuiescenceSource, mode)
-		require.Equal(t, []lifecycle.ActivityKind{}, facts.ActivityKinds, mode)
-
-		answer, ok := response.Meta[lifecycle.MetaKey].(map[string]any)
-		require.True(t, ok, mode)
-		require.NotContains(t, answer, "quiescenceSource", mode)
+func TestLifecycleCapabilityStrictScalar(t *testing.T) {
+	for _, raw := range []string{`"1"`, `1.0`, `1.5`, `null`, `true`, `{}`, `[]`, `2`} {
+		t.Run(raw, func(t *testing.T) {
+			var capability lifecycle.Negotiated
+			err := json.Unmarshal([]byte(`{"version":`+raw+`}`), &capability)
+			require.Error(t, err)
+		})
 	}
 }
 

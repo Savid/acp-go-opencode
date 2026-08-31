@@ -1136,7 +1136,7 @@ func TestStreamFailureLatchesRatherThanHidingAGap(t *testing.T) {
 	)), "a latched stream emitted again")
 }
 
-func TestUnnegotiatedConnectionRefusesActionsWithoutACompatibilityPath(t *testing.T) {
+func TestUnnegotiatedConnectionRefusesActions(t *testing.T) {
 	agent := NewAgent()
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)

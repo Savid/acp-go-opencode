@@ -26,3 +26,33 @@ func ensureScratchParent(dir string) (string, error) {
 
 	return parent, nil
 }
+
+func (a *Agent) scratchParent() string {
+	return scratchParent(a.options.ScratchDir)
+}
+
+func (a *Agent) ensureScratchParent() (string, error) {
+	return ensureScratchParent(a.options.ScratchDir)
+}
+
+func (a *Agent) newRuntimeRoot() (string, bool, error) {
+	if a.options.Home != "" {
+		return a.options.Home, false, nil
+	}
+
+	parent, err := ensureScratchParent(a.options.ScratchDir)
+	if err != nil {
+		return "", false, err
+	}
+
+	root, err := os.MkdirTemp(parent, "acp-go-opencode-runtime-")
+	if err != nil {
+		return "", false, fmt.Errorf("create OpenCode runtime root: %w", err)
+	}
+
+	if err := os.Chmod(root, 0o700); err != nil {
+		return "", false, fmt.Errorf("protect OpenCode runtime root: %w", err)
+	}
+
+	return root, true, nil
+}

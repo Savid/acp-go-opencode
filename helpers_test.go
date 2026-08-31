@@ -24,22 +24,6 @@ func boolPtr(value bool) *bool {
 	return &value
 }
 
-// testNativeOwnedHome builds a durable native home the ownership predicate can
-// actually admit. t.TempDir is unusable here: its leaf is created 0777&^umask,
-// so it lands on 0755 under the fleet's umask 022 while the predicate requires
-// exactly 0700. The home is also a direct child of the temp root so its
-// ancestry stays traversable by a foreign target identity, which keeps a
-// wrong-owner refusal about the owner rather than about the walk.
-func testNativeOwnedHome(t *testing.T) string {
-	t.Helper()
-	home, err := os.MkdirTemp("", "acp-go-opencode-native-home-")
-	require.NoError(t, err)
-	require.NoError(t, os.Chmod(home, 0o700))
-	t.Cleanup(func() { _ = os.RemoveAll(home) })
-
-	return home
-}
-
 func stringPtr(value string) *string {
 	return &value
 }
@@ -161,8 +145,9 @@ func narrowedOutsideRoot(t *testing.T, sess *session) string {
 	t.Helper()
 
 	base := t.TempDir()
-	sess.agent.options.ScratchDir = filepath.Join(base, "scratch")
-	require.NoError(t, os.Mkdir(sess.agent.options.ScratchDir, 0o700))
+	scratch := filepath.Join(base, "scratch")
+	WithScratchDir(scratch)(&sess.agent.options)
+	require.NoError(t, os.Mkdir(scratch, 0o700))
 
 	tempRoot := filepath.Join(base, "tmp")
 	require.NoError(t, os.Mkdir(tempRoot, 0o700))

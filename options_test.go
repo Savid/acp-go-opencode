@@ -1,6 +1,8 @@
 package opencodeacp
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -44,8 +46,8 @@ func TestApplyOptions(t *testing.T) {
 		opts.Env["A"] != "1" || !opts.Pure || !opts.QuestionTool || opts.SessionStore != store {
 		t.Fatalf("options = %#v", opts)
 	}
-	if opts.Home != "/tmp/home" || opts.ScratchDir != "/tmp/scratch" {
-		t.Fatalf("home/scratch options = %q / %q", opts.Home, opts.ScratchDir)
+	if scratch := (&Agent{options: opts}).scratchParent(); opts.Home != "/tmp/home" || scratch != "/tmp/scratch" {
+		t.Fatalf("home/scratch options = %q / %q", opts.Home, scratch)
 	}
 	if opts.SeedFiles["opencode.json"] != `{"provider":{}}` {
 		t.Fatalf("seed files = %#v", opts.SeedFiles)
@@ -56,11 +58,19 @@ func TestApplyOptions(t *testing.T) {
 	}
 }
 
-func TestWithProcessIsolationClonesBaseEnvironment(t *testing.T) {
-	base := map[string]string{"PATH": "/policy/bin", "ONLY_POLICY": "present"}
-	options := applyOptions([]Option{WithProcessIsolation(ProcessIsolation{UID: 12, GID: 34, BaseEnvironment: base})})
-	base["ONLY_POLICY"] = "mutated"
-	if options.ProcessIsolation == nil || options.ProcessIsolation.BaseEnvironment["ONLY_POLICY"] != "present" {
-		t.Fatal("WithProcessIsolation did not clone the base environment")
+type optionTestAuthority struct{}
+
+func (optionTestAuthority) NativeEnvironment() map[string]string            { return map[string]string{} }
+func (optionTestAuthority) PrepareNativeTree(context.Context, string) error { return nil }
+func (optionTestAuthority) ReclaimNativeTree(context.Context, string) error { return nil }
+func (optionTestAuthority) StartNative(context.Context, NativeRequest) (NativeProcess, error) {
+	return nil, errors.New("unused authority")
+}
+
+func TestWithHostAuthorityMarksTheManagedBoundary(t *testing.T) {
+	authority := optionTestAuthority{}
+	options := applyOptions([]Option{WithHostAuthority(authority)})
+	if !options.hostAuthorityConfigured || options.HostAuthority != authority {
+		t.Fatal("WithHostAuthority did not retain the authority boundary")
 	}
 }

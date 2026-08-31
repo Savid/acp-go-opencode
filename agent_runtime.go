@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -31,32 +30,12 @@ var (
 	runtimeJSONMarshal       = json.Marshal
 	runtimeStartServer       = opencode.StartServer
 	runtimeRemoveAll         = os.RemoveAll
-	runtimeRemoveAllMu       sync.RWMutex
 	errRuntimeScratchCleanup = errors.New("adapter-created OpenCode runtime scratch cleanup failed")
 )
 
-func removeRuntimeAll(path string) error {
-	runtimeRemoveAllMu.RLock()
-	defer runtimeRemoveAllMu.RUnlock()
-
-	return runtimeRemoveAll(path)
-}
-
-func replaceRuntimeRemoveAll(replacement func(string) error) func() {
-	runtimeRemoveAllMu.Lock()
-	original := runtimeRemoveAll
-	runtimeRemoveAll = replacement
-	runtimeRemoveAllMu.Unlock()
-
-	return func() {
-		runtimeRemoveAllMu.Lock()
-		runtimeRemoveAll = original
-		runtimeRemoveAllMu.Unlock()
-	}
-}
-
 func fatalRuntimeCleanup(err error) bool {
-	return errors.Is(err, opencode.ErrProcessContainmentIncomplete) ||
+	return errors.Is(err, ErrHostAuthorityUnavailable) ||
+		errors.Is(err, ErrContainmentIncomplete) ||
 		errors.Is(err, opencode.ErrRuntimeScratchCleanup) ||
 		errors.Is(err, errRuntimeScratchCleanup)
 }
@@ -116,15 +95,13 @@ func (a *Agent) sharedRuntimeBinding(
 		a.runtimeStarting = starting
 		a.mu.Unlock()
 
-		runtime, nativeRelease, xdgScratchRelease, err := a.startSharedRuntime(context.WithoutCancel(ctx))
+		runtime, err := a.startSharedRuntime(context.WithoutCancel(ctx))
 
 		a.mu.Lock()
 		if err == nil && !a.closed {
 			a.runtimeGeneration++
 			generation = a.runtimeGeneration
 			a.runtime = runtime
-			a.runtimeNativeRelease = nativeRelease
-			a.runtimeXDGScratchRelease = xdgScratchRelease
 			a.runtimeStartErr = nil
 			a.runtimeStarting = nil
 
@@ -152,10 +129,7 @@ func (a *Agent) sharedRuntimeBinding(
 			shutdownCancel()
 		}
 
-		cleanupErr := shutdownErr
-		if runtime != nil || nativeRelease != nil || xdgScratchRelease != nil {
-			cleanupErr = a.cleanupRuntimeResources(shutdownErr, nativeRelease, xdgScratchRelease)
-		}
+		cleanupErr := a.finishRuntimeShutdown(shutdownErr)
 
 		startErr := errors.Join(err, cleanupErr)
 
@@ -203,7 +177,7 @@ func (a *Agent) handleSharedRuntimeExit(runtime opencode.Client, generation uint
 	}
 }
 
-// retireSharedRuntime is the sole exact-generation process-containment fence.
+// retireSharedRuntime is the sole exact-generation retirement fence.
 // Every caller for one generation observes the same shutdown/proof result, and
 // no replacement runtime can start until that result has been published.
 func (a *Agent) retireSharedRuntime(generation uint64, cause string) error {
@@ -258,7 +232,7 @@ func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, star
 		}
 
 		return errors.Join(
-			opencode.ErrProcessContainmentIncomplete,
+			ErrContainmentIncomplete,
 			fmt.Errorf("OpenCode runtime generation %d has no containment result", generation),
 		)
 	}
@@ -275,10 +249,6 @@ func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, star
 	a.directories = make(map[string]directoryBinding)
 	a.runtime = nil
 	a.runtimeStarting = retirement.done
-	nativeRelease := a.runtimeNativeRelease
-	a.runtimeNativeRelease = nil
-	xdgScratchRelease := a.runtimeXDGScratchRelease
-	a.runtimeXDGScratchRelease = nil
 	a.mu.Unlock()
 	signalStarted()
 
@@ -287,8 +257,6 @@ func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, star
 		generation,
 		cause,
 		sessions,
-		nativeRelease,
-		xdgScratchRelease,
 	)
 
 	a.mu.Lock()
@@ -313,13 +281,11 @@ func (a *Agent) settleSharedRuntimeRetirement(
 	generation uint64,
 	cause string,
 	sessions []*session,
-	nativeRelease func(),
-	xdgScratchRelease func(),
 ) (cleanupErr error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			cleanupErr = errors.Join(
-				opencode.ErrProcessContainmentIncomplete,
+				ErrContainmentIncomplete,
 				fmt.Errorf("retire OpenCode runtime generation %d panicked", generation),
 			)
 		}
@@ -347,7 +313,7 @@ func (a *Agent) settleSharedRuntimeRetirement(
 				detachErrMu.Lock()
 				detachErr = errors.Join(
 					detachErr,
-					opencode.ErrProcessContainmentIncomplete,
+					ErrContainmentIncomplete,
 					fmt.Errorf("detach OpenCode session from runtime generation %d panicked", generation),
 				)
 				detachErrMu.Unlock()
@@ -364,7 +330,7 @@ func (a *Agent) settleSharedRuntimeRetirement(
 
 	shutdownErr := errors.Join(runtime.Shutdown(ctx), detachErr)
 
-	return a.cleanupRuntimeResources(shutdownErr, nativeRelease, xdgScratchRelease)
+	return a.finishRuntimeShutdown(shutdownErr)
 }
 
 func (a *Agent) runtimeGenerationIsCurrent(generation uint64) bool {
@@ -428,48 +394,68 @@ func (a *Agent) closeFailedSession(session *session) error {
 	return closeErr
 }
 
-func (a *Agent) startSharedRuntime(
-	ctx context.Context,
-) (opencode.Client, func(), func(), error) {
-	hooks := a.options.RuntimeResourceHooks
+func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error) {
+	var managedEnvironment map[string]string
 
-	nativeOwnedXDG := a.options.Home != "" && a.options.ProcessIsolation != nil
-	if nativeOwnedXDG {
-		if err := validateNativeOwnedDirectory(a.options.Home, a.options.ProcessIsolation); err != nil {
-			return nil, nil, nil, err
-		}
-
-		// A native-owned home is the runtime's own directory, so the wrapper
-		// authors nothing there beyond the config file it already merges.
-		for path := range a.options.SeedFiles {
-			if path != "opencode.json" {
-				return nil, nil, nil, unsupportedField(fmt.Sprintf("seedFiles[%s]", path))
-			}
-		}
-	}
-
-	var xdgScratchRelease func()
-
-	if a.options.Home == "" {
+	if a.options.hostAuthorityConfigured {
 		var err error
 
-		xdgScratchRelease, err = acquireRuntimeResource(ctx, hooks.ReserveScratchRoot, RuntimeResourceRuntime)
+		managedEnvironment, err = hostAuthorityEnvironment(a.options.HostAuthority)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 	}
 
-	nativeRelease, err := acquireRuntimeResource(ctx, hooks.AcquireNativeRoot, RuntimeResourceRuntime)
+	root, generated, err := a.newRuntimeRoot()
 	if err != nil {
-		return nil, nil, nil, errors.Join(err, a.cleanupRuntimeResources(nil, nil, xdgScratchRelease))
+		return nil, err
 	}
 
-	xdg := opencode.RuntimeXDGDirs(a.homeRoot())
-	if !nativeOwnedXDG {
-		xdg, err = opencode.CreateRuntimeXDGDirs(a.homeRoot())
-		if err != nil {
-			return nil, nil, nil, errors.Join(err, a.cleanupRuntimeResources(nil, nativeRelease, xdgScratchRelease))
+	startOptions := opencode.StartOptions{
+		Root: root, ControlRoot: opencode.ControlRootForXDG(root), RemoveRoot: generated,
+		ScratchParent: a.scratchParent(), ExecutablePath: a.options.ExecutablePath,
+		Env: a.observe.InjectTraceEnv(ctx, cloneStringMap(a.options.Env)),
+		NativeEnvironment: func() map[string]string {
+			return cloneStringMap(a.options.implicitEnvironment)
+		},
+		Pure: a.options.Pure, QuestionTool: a.options.QuestionTool,
+		LogLevel: a.options.LogLevel, MinVersion: minNativeVersion,
+		HealthTimeout: a.options.HealthCheckTimeout, Logger: a.log,
+		SeedFiles: a.options.SeedFiles,
+	}
+
+	if a.options.hostAuthorityConfigured {
+		authority := a.options.HostAuthority
+		startOptions.NativeEnvironment = func() map[string]string {
+			return cloneStringMap(managedEnvironment)
 		}
+		startOptions.PrepareTree = func(prepareCtx context.Context, path string) (err error) {
+			defer func() {
+				if recover() != nil {
+					err = ErrHostAuthorityUnavailable
+				}
+			}()
+
+			if err := authority.PrepareNativeTree(prepareCtx, path); err != nil {
+				return errors.Join(ErrHostAuthorityUnavailable, err)
+			}
+
+			return nil
+		}
+		startOptions.ReclaimTree = func(reclaimCtx context.Context, path string) (err error) {
+			defer func() {
+				if recover() != nil {
+					err = ErrContainmentIncomplete
+				}
+			}()
+
+			if err := authority.ReclaimNativeTree(reclaimCtx, path); err != nil {
+				return errors.Join(ErrContainmentIncomplete, err)
+			}
+
+			return nil
+		}
+		startOptions.StartProcess = authorityProcessStarter(authority)
 	}
 
 	factory := a.options.clientFactory
@@ -479,92 +465,20 @@ func (a *Agent) startSharedRuntime(
 
 	a.observe.RecordOpenCodeProcessStart(ctx)
 
-	runtime, err := factory(ctx, opencode.StartOptions{
-		Root: a.homeRoot(), ControlRoot: opencode.ControlRootForXDG(a.homeRoot()), ScratchParent: scratchParent(a.options.ScratchDir),
-		ContainmentScratchParent: scratchParent(a.options.ScratchDir),
-		DarwinBestEffort:         a.containmentMode == RuntimeContainmentBestEffort,
-		ReserveContainmentScratch: func(reservationCtx context.Context) (func(), error) {
-			return acquireRuntimeResource(
-				reservationCtx,
-				hooks.ReserveScratchRoot,
-				RuntimeResourceRuntime,
-			)
-		},
-		ExecutablePath:      a.options.ExecutablePath,
-		Env:                 a.observe.InjectTraceEnv(ctx, cloneStringMap(a.options.Env)),
-		ImplicitEnvironment: cloneStringMap(a.options.implicitEnvironment),
-		ProcessIsolation:    openCodeProcessIsolation(a.options.ProcessIsolation),
-		Pure:                a.options.Pure, QuestionTool: a.options.QuestionTool,
-		LogLevel: a.options.LogLevel, MinVersion: minNativeVersion,
-		HealthTimeout: a.options.HealthCheckTimeout, Logger: a.log,
-		ExistingXDG: xdg, NativeOwnedXDG: nativeOwnedXDG,
-		HandoffXDG: a.options.Home == "", SeedFiles: a.options.SeedFiles,
-		ObserveProcess: func(processCtx context.Context, kind string, delta int64) {
-			observeRuntimeProcess(processCtx, hooks, RuntimeProcessKind(kind), delta)
-		},
-		ObserveProcessSnapshot: func(processCtx context.Context, kind string, count int) {
-			observeRuntimeProcessSnapshot(processCtx, hooks, RuntimeProcessKind(kind), count)
-		},
-		ObserveStartupStage: func(stageCtx context.Context, lifecycle, stage string, elapsed time.Duration, stageErr error) {
-			observe := hooks.ObserveStartupStage
-			if observe != nil {
-				observe(stageCtx, RuntimeResourceKind(lifecycle), RuntimeStartupStage(stage), elapsed, stageErr)
-			}
-		},
-	})
+	runtime, err := factory(ctx, startOptions)
 	if err != nil {
-		return nil, nil, nil, startupFailure(a.cleanupRuntimeResources(err, nativeRelease, xdgScratchRelease))
-	}
-
-	return runtime, nativeRelease, xdgScratchRelease, nil
-}
-
-func openCodeProcessIsolation(value *ProcessIsolation) *opencode.ProcessIsolation {
-	if value == nil {
-		return nil
-	}
-
-	return &opencode.ProcessIsolation{
-		UID: value.UID, GID: value.GID, BaseEnvironment: cloneStringMap(value.BaseEnvironment),
-		StandaloneOwnerID: value.StandaloneOwnerID, StandaloneStateRoot: value.StandaloneStateRoot,
-		IdentityLock: value.IdentityLock, AuthorityDomain: value.AuthorityDomain,
-	}
-}
-
-// cleanupRuntimeResources preserves permit ownership whenever the selected
-// native containment boundary does not complete. After the selected boundary
-// completes, the adapter-created XDG root is removed before its own reservation
-// is released. Its deletion gate is independent from the Darwin generation's
-// deletion gate inside the runtime client. A failed XDG removal retains only
-// the XDG reservation while allowing the native permit to return to the
-// worker-global pool.
-func (a *Agent) cleanupRuntimeResources(shutdownErr error, nativeRelease, xdgScratchRelease func()) error {
-	if errors.Is(shutdownErr, opencode.ErrProcessContainmentIncomplete) {
-		return shutdownErr
-	}
-
-	var cleanupErr error
-
-	if a.options.Home == "" {
-		if err := errors.Join(removeRuntimeAll(a.homeRoot()), removeRuntimeAll(opencode.ControlRootForXDG(a.homeRoot()))); err != nil {
-			cleanupErr = errors.Join(
-				errRuntimeScratchCleanup,
-				fmt.Errorf("remove adapter-created OpenCode runtime scratch: %w", err),
-			)
-		} else if xdgScratchRelease != nil {
-			xdgScratchRelease()
+		if generated && !fatalRuntimeCleanup(err) {
+			err = errors.Join(err, runtimeRemoveAll(root), runtimeRemoveAll(opencode.ControlRootForXDG(root)))
 		}
-	} else if xdgScratchRelease != nil {
-		// Explicit homes do not acquire XDG scratch, but release an unexpected
-		// caller-supplied reservation rather than leak it.
-		xdgScratchRelease()
+
+		return nil, startupFailure(err)
 	}
 
-	if nativeRelease != nil {
-		nativeRelease()
-	}
+	return runtime, nil
+}
 
-	return errors.Join(shutdownErr, cleanupErr)
+func (a *Agent) finishRuntimeShutdown(shutdownErr error) error {
+	return shutdownErr
 }
 
 func (a *Agent) bindDirectory(id acp.SessionId, cwd string, servers []opencode.MCPServerConfig) (func(), error) {

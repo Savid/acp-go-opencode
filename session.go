@@ -1396,11 +1396,11 @@ func (s *session) settleBeforeContainment(
 // reads like an ordinary failure. An error already carrying the sentinel is
 // returned as it is, so the classification never nests.
 func containmentFailure(err error) error {
-	if err == nil || errors.Is(err, opencode.ErrProcessContainmentIncomplete) {
+	if err == nil || errors.Is(err, ErrContainmentIncomplete) {
 		return err
 	}
 
-	return errors.Join(opencode.ErrProcessContainmentIncomplete, err)
+	return errors.Join(ErrContainmentIncomplete, err)
 }
 
 // containNativeScope proves this session's native scope gone: the pump stops

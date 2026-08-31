@@ -32,15 +32,6 @@ type panickingRuntimeShutdownClient struct {
 	*fakeOpenCodeClient
 }
 
-// TestAgentSessionDefaultsToOrdinaryExecution proves an Agent built with no
-// process options at all reaches a real session and a native launch as the
-// current identity. Nothing is manufactured on the way: the runtime is handed a
-// nil policy, the ambient snapshot taken at construction rather than whatever
-// os.Environ drifted to since, and the adapter-private carriers already
-// scrubbed. The Agent reports the non-authoritative shared identity and
-// publishes no provider-descendant inventory. The executed root and non-root
-// halves of this launch live beside the supervisor, in
-// TestProcessIsolationOmissionAllowsRoot and its ordinary-user peer.
 func TestAgentSessionDefaultsToOrdinaryExecution(t *testing.T) {
 	const (
 		canary        = "ACP_GO_OPENCODE_TEST_ACTUAL_AMBIENT"
@@ -57,10 +48,7 @@ func TestAgentSessionDefaultsToOrdinaryExecution(t *testing.T) {
 		return testNativeSession("ordinary-native-session"), nil
 	}
 
-	snapshots := 0
-	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) { snapshots++ },
-	}))
+	agent := NewAgent(WithScratchDir(t.TempDir()))
 	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
 		launched = options
 
@@ -69,16 +57,17 @@ func TestAgentSessionDefaultsToOrdinaryExecution(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, agent.Close()) })
 	t.Setenv(canary, "mutated")
 
-	require.Equal(t, RuntimeContainmentSharedIdentity, agent.ContainmentMode())
-
 	_, err := agent.NewSession(t.Context(), acp.NewSessionRequest{Cwd: t.TempDir()})
 	require.NoError(t, err)
-	require.Nil(t, launched.ProcessIsolation, "omission must never manufacture a policy")
-	require.Equal(t, "captured", launched.ImplicitEnvironment[canary])
-	require.NotContains(t, launched.ImplicitEnvironment, privateCanary)
-	require.Equal(t, 0, snapshots, "ordinary execution publishes no provider-descendant inventory")
+	require.Nil(t, launched.StartProcess)
+	require.Nil(t, launched.PrepareTree)
+	require.Nil(t, launched.ReclaimTree)
+	require.NotNil(t, launched.NativeEnvironment)
+	environment := launched.NativeEnvironment()
+	require.Equal(t, "captured", environment[canary])
+	require.NotContains(t, environment, privateCanary)
 
-	launched.ImplicitEnvironment[canary] = "caller mutation"
+	environment[canary] = "caller mutation"
 	require.Equal(t, "captured", agent.options.implicitEnvironment[canary])
 }
 
@@ -94,7 +83,12 @@ func TestImplicitRuntimeHomeIsDirectChildOfScratch(t *testing.T) {
 	scratch := t.TempDir()
 	agent := NewAgent(WithScratchDir(scratch))
 
-	require.Equal(t, filepath.Join(scratch, defaultAgentName), agent.homeRoot())
+	root, generated, err := agent.newRuntimeRoot()
+	require.NoError(t, err)
+	require.True(t, generated)
+	require.Equal(t, scratch, filepath.Dir(root))
+	require.True(t, filepath.Base(root) != defaultAgentName)
+	require.NoError(t, os.RemoveAll(root))
 }
 
 func (client *proofFailureRuntimeClient) Shutdown(context.Context) error {
@@ -107,7 +101,7 @@ func (client *proofFailureRuntimeClient) Shutdown(context.Context) error {
 }
 
 func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
-	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessContainmentIncomplete)
+	containmentErr := errors.Join(errors.New("containment failed"), ErrContainmentIncomplete)
 	client := &proofFailureRuntimeClient{
 		fakeOpenCodeClient: newFakeOpenCodeClient(),
 		entered:            make(chan struct{}),
@@ -139,7 +133,7 @@ func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 	require.True(t, first == agent.retireSharedRuntime(1, "late first-generation waiter"))
 
 	missing := NewAgent()
-	require.ErrorIs(t, missing.retireSharedRuntime(9, "missing"), opencode.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, missing.retireSharedRuntime(9, "missing"), ErrContainmentIncomplete)
 	missing.runtimeFatalErr = containmentErr
 	require.ErrorIs(t, missing.retireSharedRuntime(9, "fatal"), containmentErr)
 
@@ -170,19 +164,17 @@ func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {
 	require.NotPanics(t, func() {
 		err = agent.retireSharedRuntime(1, "runtime exited")
 	})
-	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
-	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+	require.ErrorIs(t, agent.runtimeFatalErr, ErrContainmentIncomplete)
 	require.Zero(t, current.runtimeGeneration)
 	require.Equal(t, "runtime exited", current.runtimeLostCause)
 }
 
 func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
 	shutdownBase := newFakeOpenCodeClient()
-	releaseBase := newFakeOpenCodeClient()
 	tests := []struct {
 		name      string
 		client    opencode.Client
-		release   func()
 		exitCh    chan struct{}
 		panicText string
 	}{
@@ -194,15 +186,6 @@ func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
 			exitCh:    shutdownBase.runtimeExited,
 			panicText: "runtime shutdown panic",
 		},
-		{
-			name:   "resource release",
-			client: releaseBase,
-			release: func() {
-				panic("runtime release panic")
-			},
-			exitCh:    releaseBase.runtimeExited,
-			panicText: "runtime release panic",
-		},
 	}
 
 	for _, test := range tests {
@@ -210,8 +193,6 @@ func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
 			agent := NewAgent(WithHome(t.TempDir()))
 			agent.runtime = test.client
 			agent.runtimeGeneration = 1
-			agent.runtimeNativeRelease = test.release
-
 			go agent.watchSharedRuntime(context.Background(), test.client, 1)
 			close(test.exitCh)
 
@@ -235,17 +216,17 @@ func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
 			retirement := agent.runtimeRetirements[1]
 			fatalErr := agent.runtimeFatalErr
 			agent.mu.Unlock()
-			require.ErrorIs(t, retirement.err, opencode.ErrProcessContainmentIncomplete)
+			require.ErrorIs(t, retirement.err, ErrContainmentIncomplete)
 			require.ErrorContains(t, retirement.err, "panicked")
 			require.NotContains(t, retirement.err.Error(), test.panicText)
-			require.ErrorIs(t, fatalErr, opencode.ErrProcessContainmentIncomplete)
+			require.ErrorIs(t, fatalErr, ErrContainmentIncomplete)
 			require.True(t, retirement.err == agent.retireSharedRuntime(1, "late waiter"))
 		})
 	}
 }
 
 func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.T) {
-	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessContainmentIncomplete)
+	containmentErr := errors.Join(errors.New("containment failed"), ErrContainmentIncomplete)
 	client := &proofFailureRuntimeClient{
 		fakeOpenCodeClient: newFakeOpenCodeClient(),
 		entered:            make(chan struct{}),
@@ -284,7 +265,7 @@ func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.
 }
 
 func TestAgentCloseWaitsForConstructionCleanupAndReturnsContainmentFailure(t *testing.T) {
-	containmentErr := errors.Join(errors.New("containment failed"), opencode.ErrProcessContainmentIncomplete)
+	containmentErr := errors.Join(errors.New("containment failed"), ErrContainmentIncomplete)
 	client := &proofFailureRuntimeClient{
 		fakeOpenCodeClient: newFakeOpenCodeClient(),
 		entered:            make(chan struct{}),
@@ -357,15 +338,7 @@ func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
 	require.NoError(t, err)
 	require.Same(t, client, got)
 
-	var nativeReleased, scratchReleased atomic.Bool
-	duringStart := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { nativeReleased.Store(true) }, nil
-		},
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { scratchReleased.Store(true) }, nil
-		},
-	}))
+	duringStart := NewAgent(WithScratchDir(t.TempDir()))
 	duringStart.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 		duringStart.mu.Lock()
 		duringStart.closed = true
@@ -376,8 +349,6 @@ func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
 	_, _, err = duringStart.sharedRuntimeBinding(context.Background())
 	require.Error(t, err)
 	require.True(t, client.closed)
-	require.True(t, nativeReleased.Load())
-	require.True(t, scratchReleased.Load())
 }
 
 func TestWatchSharedRuntimeRemainingBranches(t *testing.T) {
@@ -403,88 +374,25 @@ func TestWatchSharedRuntimeRemainingBranches(t *testing.T) {
 }
 
 func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
-	var observedProcess RuntimeProcessKind
-	var observedDelta int64
-	var observedSnapshot int
-	var observedLifecycle RuntimeResourceKind
-	var observedStage RuntimeStartupStage
-	observedClient := newFakeOpenCodeClient()
-	observed := NewAgent(WithHome(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		ObserveProcess: func(_ context.Context, kind RuntimeProcessKind, delta int64) {
-			observedProcess = kind
-			observedDelta = delta
-		},
-		ObserveProcessSnapshot: func(_ context.Context, kind RuntimeProcessKind, count int) {
-			require.Equal(t, RuntimeProcessProviderDescendant, kind)
-			observedSnapshot = count
-		},
-		ObserveStartupStage: func(_ context.Context, lifecycle RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-			observedLifecycle = lifecycle
-			observedStage = stage
-		},
-	}))
-	observed.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		options.ObserveProcess(ctx, string(RuntimeProcessHomeLockSupervisor), 2)
-		options.ObserveProcessSnapshot(ctx, string(RuntimeProcessProviderDescendant), 3)
-		options.ObserveStartupStage(ctx, string(RuntimeResourceRuntime), string(RuntimeStartupReadiness), time.Second, nil)
+	home := t.TempDir()
+	client := newFakeOpenCodeClient()
+	var handed opencode.StartOptions
+	agent := NewAgent(WithHome(home))
+	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		handed = options
 
-		return observedClient, nil
+		return client, nil
 	}
-	runtime, nativeRelease, scratchRelease, err := observed.startSharedRuntime(context.Background())
+
+	runtime, err := agent.startSharedRuntime(context.Background())
 	require.NoError(t, err)
-	require.Same(t, observedClient, runtime)
-	require.NotNil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
-	require.Equal(t, RuntimeProcessHomeLockSupervisor, observedProcess)
-	require.EqualValues(t, 2, observedDelta)
-	require.Equal(t, 0, observedSnapshot,
-		"ordinary execution reports its own supervisors and never a provider-descendant inventory")
-	require.Equal(t, RuntimeResourceRuntime, observedLifecycle)
-	require.Equal(t, RuntimeStartupReadiness, observedStage)
-	nativeRelease()
-
-	scratchFailure := NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return nil, errors.New("scratch denied")
-		},
-	}))
-	runtime, nativeRelease, scratchRelease, err = scratchFailure.startSharedRuntime(context.Background())
-	require.ErrorContains(t, err, "scratch denied")
-	require.Nil(t, runtime)
-	require.Nil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
-
-	var scratchReleased atomic.Bool
-	nativeFailure := NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { scratchReleased.Store(true) }, nil
-		},
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return nil, errors.New("native denied")
-		},
-	}))
-	runtime, nativeRelease, scratchRelease, err = nativeFailure.startSharedRuntime(context.Background())
-	require.ErrorContains(t, err, "native denied")
-	require.Nil(t, runtime)
-	require.Nil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
-	require.True(t, scratchReleased.Load())
-
-	root := t.TempDir()
-	notDirectory := filepath.Join(root, "file")
-	require.NoError(t, os.WriteFile(notDirectory, []byte("x"), 0o600))
-	var nativeReleased atomic.Bool
-	xdgFailure := NewAgent(WithHome(filepath.Join(notDirectory, "child")), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { nativeReleased.Store(true) }, nil
-		},
-	}))
-	runtime, nativeRelease, scratchRelease, err = xdgFailure.startSharedRuntime(context.Background())
-	require.Error(t, err)
-	require.Nil(t, runtime)
-	require.Nil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
-	require.True(t, nativeReleased.Load())
+	require.Same(t, client, runtime)
+	require.Equal(t, home, handed.Root)
+	require.Equal(t, opencode.ControlRootForXDG(home), handed.ControlRoot)
+	require.False(t, handed.RemoveRoot)
+	require.Nil(t, handed.StartProcess)
+	require.Nil(t, handed.PrepareTree)
+	require.Nil(t, handed.ReclaimTree)
 
 	originalStart := runtimeStartServer
 	runtimeStartServer = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
@@ -493,11 +401,23 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	t.Cleanup(func() { runtimeStartServer = originalStart })
 	defaultFactory := NewAgent(WithHome(t.TempDir()))
 	defaultFactory.options.clientFactory = nil
-	runtime, nativeRelease, scratchRelease, err = defaultFactory.startSharedRuntime(context.Background())
+	runtime, err = defaultFactory.startSharedRuntime(context.Background())
 	require.ErrorContains(t, err, "default factory failed")
 	require.Nil(t, runtime)
-	require.Nil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
+
+	generated := NewAgent(WithScratchDir(t.TempDir()))
+	var generatedRoot string
+	generated.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		generatedRoot = options.Root
+
+		return nil, errors.New("launch failed")
+	}
+	runtime, err = generated.startSharedRuntime(context.Background())
+	require.ErrorContains(t, err, "launch failed")
+	require.Nil(t, runtime)
+	require.NotEmpty(t, generatedRoot)
+	require.NoDirExists(t, generatedRoot)
+	require.NoDirExists(t, opencode.ControlRootForXDG(generatedRoot))
 }
 
 func TestDirectoryBindingRemainingOSHashAndReleaseBranches(t *testing.T) {
@@ -582,11 +502,8 @@ func TestDirectoryScopeCloseFailureQuarantinesWithoutRelease(t *testing.T) {
 	require.Zero(t, releases)
 	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrMCPDisconnectUnproven)
 
-	// The session boundary answered with the containment sentinel, so the
-	// quarantined configuration now carries it and the Agent's own shutdown
-	// reports it rather than swallowing an unproven containment on the way out.
 	client.closeErr = nil
-	require.ErrorIs(t, agent.Close(), opencode.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 }
 
 func TestDirectoryBindingIncarnationSkipsZeroAfterWrap(t *testing.T) {
@@ -594,459 +511,6 @@ func TestDirectoryBindingIncarnationSkipsZeroAfterWrap(t *testing.T) {
 	agent.directoryIncarnation = ^directoryBindingIncarnation(0)
 
 	require.Equal(t, directoryBindingIncarnation(1), agent.nextDirectoryBindingIncarnationLocked())
-}
-
-func TestRuntimeResourceCleanupProofAndDeletionGates(t *testing.T) {
-	t.Run("ordinary post-proof error releases both permits after deletion", func(t *testing.T) {
-		root := t.TempDir()
-		agent := NewAgent(WithScratchDir(root))
-		require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
-		require.NoError(t, os.WriteFile(filepath.Join(agent.homeRoot(), "runtime-state"), []byte("state"), 0o600))
-
-		var nativeReleased, scratchReleased atomic.Bool
-		ordinary := errors.New("ordinary post-proof shutdown error")
-		err := agent.cleanupRuntimeResources(
-			ordinary,
-			func() { nativeReleased.Store(true) },
-			func() { scratchReleased.Store(true) },
-		)
-		require.ErrorIs(t, err, ordinary)
-		require.True(t, nativeReleased.Load())
-		require.True(t, scratchReleased.Load())
-		_, statErr := os.Stat(agent.homeRoot())
-		require.ErrorIs(t, statErr, os.ErrNotExist)
-	})
-
-	t.Run("unproven tree retains both permits and scratch", func(t *testing.T) {
-		root := t.TempDir()
-		agent := NewAgent(WithScratchDir(root))
-		require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
-
-		var nativeReleased, scratchReleased atomic.Bool
-		unproven := errors.Join(errors.New("shutdown failed"), opencode.ErrProcessContainmentIncomplete)
-		err := agent.cleanupRuntimeResources(
-			unproven,
-			func() { nativeReleased.Store(true) },
-			func() { scratchReleased.Store(true) },
-		)
-		require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
-		require.False(t, nativeReleased.Load())
-		require.False(t, scratchReleased.Load())
-		_, statErr := os.Stat(agent.homeRoot())
-		require.NoError(t, statErr)
-	})
-
-	t.Run("XDG delete failure releases native but retains XDG reservation", func(t *testing.T) {
-		root := t.TempDir()
-		agent := NewAgent(WithScratchDir(root))
-		removeErr := errors.New("remove failed")
-		t.Cleanup(replaceRuntimeRemoveAll(func(string) error { return removeErr }))
-
-		var nativeReleased, scratchReleased atomic.Bool
-		err := agent.cleanupRuntimeResources(
-			nil,
-			func() { nativeReleased.Store(true) },
-			func() { scratchReleased.Store(true) },
-		)
-		require.ErrorIs(t, err, removeErr)
-		require.ErrorIs(t, err, errRuntimeScratchCleanup)
-		require.True(t, nativeReleased.Load())
-		require.False(t, scratchReleased.Load())
-	})
-
-	t.Run("explicit home is preserved", func(t *testing.T) {
-		home := t.TempDir()
-		agent := NewAgent(WithHome(home))
-		var nativeReleased, scratchReleased atomic.Bool
-		require.NoError(t, agent.cleanupRuntimeResources(
-			nil,
-			func() { nativeReleased.Store(true) },
-			func() { scratchReleased.Store(true) },
-		))
-		require.True(t, nativeReleased.Load())
-		require.True(t, scratchReleased.Load())
-		_, statErr := os.Stat(home)
-		require.NoError(t, statErr)
-	})
-
-	t.Run("generation delete failure independently releases XDG after deletion", func(t *testing.T) {
-		agent := NewAgent(WithScratchDir(t.TempDir()))
-		require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
-		var nativeReleased, xdgReleased atomic.Bool
-		cleanupFailure := errors.Join(errors.New("generation removal failed"), opencode.ErrRuntimeScratchCleanup)
-		err := agent.cleanupRuntimeResources(
-			cleanupFailure,
-			func() { nativeReleased.Store(true) },
-			func() { xdgReleased.Store(true) },
-		)
-		require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
-		require.True(t, nativeReleased.Load())
-		require.True(t, xdgReleased.Load())
-		_, statErr := os.Stat(agent.homeRoot())
-		require.ErrorIs(t, statErr, os.ErrNotExist)
-		require.True(t, fatalRuntimeCleanup(err))
-	})
-
-	t.Run("dual generation and XDG delete failures retain both scratch reservations", func(t *testing.T) {
-		agent := NewAgent(WithScratchDir(t.TempDir()))
-		xdgRemoveErr := errors.New("XDG removal failed")
-		t.Cleanup(replaceRuntimeRemoveAll(func(string) error { return xdgRemoveErr }))
-
-		var nativeReleased, xdgReleased atomic.Bool
-		generationRemoveErr := errors.New("generation removal failed")
-		err := agent.cleanupRuntimeResources(
-			errors.Join(opencode.ErrRuntimeScratchCleanup, generationRemoveErr),
-			func() { nativeReleased.Store(true) },
-			func() { xdgReleased.Store(true) },
-		)
-		require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
-		require.ErrorIs(t, err, generationRemoveErr)
-		require.ErrorIs(t, err, errRuntimeScratchCleanup)
-		require.ErrorIs(t, err, xdgRemoveErr)
-		require.True(t, nativeReleased.Load())
-		require.False(t, xdgReleased.Load())
-		require.True(t, fatalRuntimeCleanup(err))
-	})
-}
-
-func TestDarwinBestEffortScratchReservationCardinality(t *testing.T) {
-	client := newFakeOpenCodeClient()
-
-	t.Run("adapter XDG and containment generation each hold one live reservation", func(t *testing.T) {
-		var acquired, live, released atomic.Int64
-		agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-			ReserveScratchRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
-				require.Equal(t, RuntimeResourceRuntime, kind)
-				acquired.Add(1)
-				live.Add(1)
-
-				return func() {
-					released.Add(1)
-					live.Add(-1)
-				}, nil
-			},
-		}))
-		agent.containmentMode = RuntimeContainmentBestEffort
-
-		var generationRelease func()
-		agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
-			require.EqualValues(t, 1, acquired.Load(), "XDG must be the only reservation before generation creation")
-			require.EqualValues(t, 1, live.Load())
-			require.DirExists(t, agent.homeRoot())
-			require.NotNil(t, options.ReserveContainmentScratch)
-
-			var err error
-			generationRelease, err = options.ReserveContainmentScratch(ctx)
-			require.NoError(t, err)
-			require.EqualValues(t, 2, acquired.Load())
-			require.EqualValues(t, 2, live.Load(), "both roots must have independent live reservations")
-
-			return client, nil
-		}
-
-		runtime, nativeRelease, xdgRelease, err := agent.startSharedRuntime(context.Background())
-		require.NoError(t, err)
-		require.Same(t, client, runtime)
-		require.NotNil(t, xdgRelease)
-		require.EqualValues(t, 2, live.Load())
-
-		generationRelease()
-		require.EqualValues(t, 1, live.Load())
-		require.NoError(t, agent.cleanupRuntimeResources(nil, nativeRelease, xdgRelease))
-		require.EqualValues(t, 0, live.Load())
-		require.EqualValues(t, 2, released.Load())
-	})
-
-	t.Run("explicit home reserves only containment generation", func(t *testing.T) {
-		var acquired, live, released atomic.Int64
-		home := t.TempDir()
-		agent := NewAgent(WithHome(home), WithRuntimeResourceHooks(RuntimeResourceHooks{
-			ReserveScratchRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
-				require.Equal(t, RuntimeResourceRuntime, kind)
-				acquired.Add(1)
-				live.Add(1)
-
-				return func() {
-					released.Add(1)
-					live.Add(-1)
-				}, nil
-			},
-		}))
-		agent.containmentMode = RuntimeContainmentBestEffort
-
-		var generationRelease func()
-		agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
-			require.Zero(t, acquired.Load(), "explicit Home must not reserve adapter XDG scratch")
-			require.True(t, options.DarwinBestEffort)
-
-			var err error
-			generationRelease, err = options.ReserveContainmentScratch(ctx)
-			require.NoError(t, err)
-			require.EqualValues(t, 1, acquired.Load())
-			require.EqualValues(t, 1, live.Load())
-
-			return client, nil
-		}
-
-		runtime, nativeRelease, xdgRelease, err := agent.startSharedRuntime(context.Background())
-		require.NoError(t, err)
-		require.Same(t, client, runtime)
-		require.Nil(t, xdgRelease)
-		require.EqualValues(t, 1, live.Load())
-
-		generationRelease()
-		require.NoError(t, agent.cleanupRuntimeResources(nil, nativeRelease, xdgRelease))
-		require.EqualValues(t, 0, live.Load())
-		require.EqualValues(t, 1, acquired.Load())
-		require.EqualValues(t, 1, released.Load())
-		_, statErr := os.Stat(home)
-		require.NoError(t, statErr)
-	})
-}
-
-func TestNativeOwnedDurableRuntimeHomeIsNeverMaterializedByTheAdapter(t *testing.T) {
-	home := testNativeOwnedHome(t)
-	client := newFakeOpenCodeClient()
-	agent := NewAgent(
-		WithProcessIsolation(ProcessIsolation{
-			UID:                 uint32(os.Geteuid()),
-			GID:                 uint32(os.Getegid()),
-			StandaloneOwnerID:   "runtime-owner",
-			StandaloneStateRoot: home,
-		}),
-	)
-	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		require.True(t, options.NativeOwnedXDG)
-		require.Equal(t, opencode.RuntimeXDGDirs(home), options.ExistingXDG)
-		entries, err := os.ReadDir(home)
-		require.NoError(t, err)
-		require.Empty(t, entries)
-
-		return client, nil
-	}
-
-	runtime, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
-	require.NoError(t, err)
-	require.Same(t, client, runtime)
-	require.NotNil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
-	nativeRelease()
-}
-
-func TestNativeOwnedDurableRuntimeHomeRejectsSeedFilesBeforeLaunch(t *testing.T) {
-	home := testNativeOwnedHome(t)
-	agent := NewAgent(
-		WithProcessIsolation(ProcessIsolation{
-			UID:                 uint32(os.Geteuid()),
-			GID:                 uint32(os.Getegid()),
-			StandaloneOwnerID:   "runtime-owner",
-			StandaloneStateRoot: home,
-		}),
-		WithSeedFiles(map[string]string{"provider.json": `{}`}),
-	)
-	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-		t.Fatal("native runtime started")
-
-		return nil, errors.New("unreachable native runtime start")
-	}
-
-	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
-	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "seedFiles[provider.json]"})
-	require.Nil(t, client)
-	require.Nil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
-}
-
-func TestNativeOwnedDurableRuntimeHomeRejectsWrongOwnerBeforeLaunch(t *testing.T) {
-	home := testNativeOwnedHome(t)
-	agent := NewAgent(
-		WithHome(home),
-		WithProcessIsolation(ProcessIsolation{UID: uint32(os.Geteuid()) + 1, GID: uint32(os.Getegid()) + 1}),
-	)
-	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-		t.Fatal("native runtime started")
-
-		return nil, errors.New("unreachable native runtime start")
-	}
-
-	client, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
-	require.ErrorContains(t, err, nativeOwnedHomeRefusal)
-	require.Nil(t, client)
-	require.Nil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
-}
-
-func TestRuntimeExitWatcherLatchesUnprovenTree(t *testing.T) {
-	base := newFakeOpenCodeClient()
-	client := &proofFailureRuntimeClient{
-		fakeOpenCodeClient: base,
-		entered:            make(chan struct{}),
-		resume:             make(chan struct{}),
-		err:                errors.Join(errors.New("containment proof missing"), opencode.ErrProcessContainmentIncomplete),
-	}
-	var nativeReleased, scratchReleased atomic.Bool
-	var replacementStarts atomic.Int32
-	agent := NewAgent(WithScratchDir(t.TempDir()))
-	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-		replacementStarts.Add(1)
-
-		return newFakeOpenCodeClient(), nil
-	}
-	agent.runtime = client
-	agent.runtimeGeneration = 1
-	agent.runtimeNativeRelease = func() { nativeReleased.Store(true) }
-	agent.runtimeXDGScratchRelease = func() { scratchReleased.Store(true) }
-	require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
-
-	go agent.watchSharedRuntime(context.Background(), client, 1)
-	close(base.runtimeExited)
-	<-client.entered
-
-	agent.mu.Lock()
-	cleanupDone := agent.runtimeStarting
-	agent.mu.Unlock()
-	require.NotNil(t, cleanupDone)
-	close(client.resume)
-	<-cleanupDone
-
-	require.False(t, nativeReleased.Load())
-	require.False(t, scratchReleased.Load())
-	_, _, err := agent.sharedRuntimeBinding(context.Background())
-	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
-	require.EqualValues(t, 0, replacementStarts.Load())
-}
-
-func TestRuntimeExitWatcherLatchesScratchCleanupFailure(t *testing.T) {
-	removeErr := errors.New("remove failed")
-	t.Cleanup(replaceRuntimeRemoveAll(func(string) error { return removeErr }))
-
-	base := newFakeOpenCodeClient()
-	client := &proofFailureRuntimeClient{
-		fakeOpenCodeClient: base,
-		entered:            make(chan struct{}),
-		resume:             make(chan struct{}),
-	}
-	var nativeReleased, scratchReleased atomic.Bool
-	var replacementStarts atomic.Int32
-	agent := NewAgent(WithScratchDir(t.TempDir()))
-	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-		replacementStarts.Add(1)
-
-		return newFakeOpenCodeClient(), nil
-	}
-	agent.runtime = client
-	agent.runtimeGeneration = 1
-	agent.runtimeNativeRelease = func() { nativeReleased.Store(true) }
-	agent.runtimeXDGScratchRelease = func() { scratchReleased.Store(true) }
-	require.NoError(t, os.MkdirAll(agent.homeRoot(), 0o700))
-
-	go agent.watchSharedRuntime(context.Background(), client, 1)
-	close(base.runtimeExited)
-	<-client.entered
-
-	agent.mu.Lock()
-	cleanupDone := agent.runtimeStarting
-	agent.mu.Unlock()
-	require.NotNil(t, cleanupDone)
-	close(client.resume)
-	<-cleanupDone
-
-	require.True(t, nativeReleased.Load())
-	require.False(t, scratchReleased.Load())
-	_, _, err := agent.sharedRuntimeBinding(context.Background())
-	require.ErrorIs(t, err, removeErr)
-	require.ErrorIs(t, err, errRuntimeScratchCleanup)
-	require.EqualValues(t, 0, replacementStarts.Load())
-}
-
-func TestRuntimeStartLatchesUnprovenTree(t *testing.T) {
-	var starts atomic.Int32
-	var nativeReleased, scratchReleased atomic.Bool
-	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { nativeReleased.Store(true) }, nil
-		},
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { scratchReleased.Store(true) }, nil
-		},
-	}))
-	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-		starts.Add(1)
-
-		return nil, errors.Join(errors.New("start containment failed"), opencode.ErrProcessContainmentIncomplete)
-	}
-
-	_, _, err := agent.sharedRuntimeBinding(context.Background())
-	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
-	_, _, err = agent.sharedRuntimeBinding(context.Background())
-	require.ErrorIs(t, err, opencode.ErrProcessContainmentIncomplete)
-	require.EqualValues(t, 1, starts.Load())
-	require.False(t, nativeReleased.Load())
-	require.False(t, scratchReleased.Load())
-}
-
-func TestRuntimeStartLatchesScratchCleanupFailure(t *testing.T) {
-	removeErr := errors.New("remove failed")
-	t.Cleanup(replaceRuntimeRemoveAll(func(string) error { return removeErr }))
-
-	var starts atomic.Int32
-	var nativeReleased, scratchReleased atomic.Bool
-	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { nativeReleased.Store(true) }, nil
-		},
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { scratchReleased.Store(true) }, nil
-		},
-	}))
-	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-		starts.Add(1)
-
-		return nil, errors.New("start failed after scratch creation")
-	}
-
-	_, _, err := agent.sharedRuntimeBinding(context.Background())
-	require.ErrorIs(t, err, removeErr)
-	require.ErrorIs(t, err, errRuntimeScratchCleanup)
-	_, _, err = agent.sharedRuntimeBinding(context.Background())
-	require.ErrorIs(t, err, errRuntimeScratchCleanup)
-	require.EqualValues(t, 1, starts.Load())
-	require.True(t, nativeReleased.Load())
-	require.False(t, scratchReleased.Load())
-}
-
-func TestRuntimeStartLatchesGenerationScratchCleanupFailure(t *testing.T) {
-	var starts, scratchAcquired atomic.Int32
-	var nativeReleased, generationReleased atomic.Bool
-	agent := NewAgent(WithHome(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { nativeReleased.Store(true) }, nil
-		},
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			scratchAcquired.Add(1)
-
-			return func() { generationReleased.Store(true) }, nil
-		},
-	}))
-	agent.containmentMode = RuntimeContainmentBestEffort
-	generationRemoveErr := errors.New("generation removal failed")
-	agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		starts.Add(1)
-		_, err := options.ReserveContainmentScratch(ctx)
-		require.NoError(t, err)
-
-		return nil, errors.Join(opencode.ErrRuntimeScratchCleanup, generationRemoveErr)
-	}
-
-	_, _, err := agent.sharedRuntimeBinding(context.Background())
-	require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
-	require.ErrorIs(t, err, generationRemoveErr)
-	_, _, err = agent.sharedRuntimeBinding(context.Background())
-	require.ErrorIs(t, err, opencode.ErrRuntimeScratchCleanup)
-	require.EqualValues(t, 1, starts.Load())
-	require.EqualValues(t, 1, scratchAcquired.Load())
-	require.True(t, nativeReleased.Load())
-	require.False(t, generationReleased.Load())
 }
 
 // TestReadySharedRuntimeSessionReleaseGate times each logical session from the

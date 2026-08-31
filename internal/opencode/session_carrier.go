@@ -15,12 +15,6 @@ const (
 	// carrier from the adapter's in-memory broker.
 	sessionCarrierPluginFileName = "session-carrier.mjs"
 
-	// sessionCarrierProofFileName is the marker the plugin writes as OpenCode
-	// instantiates it. OpenCode treats a plugin it cannot load as non-fatal, so
-	// this file is the only evidence the adapter has that the hooks the whole
-	// fail-closed design rests on are actually installed.
-	sessionCarrierProofFileName = "session-carrier.loaded"
-
 	// sessionCarrierProbeDirName is the directory the startup proof addresses.
 	// OpenCode instantiates a plugin lazily, with the first directory-scoped
 	// request, so the proof needs a directory of its own that carries no
@@ -56,18 +50,19 @@ const (
 // instantiates it, the exact content that marker has to carry, and the
 // directory whose first scoped request forces that instantiation.
 type sessionCarrierProof struct {
-	Path      string
-	Token     string
 	Directory string
+	Ready     <-chan struct{}
 }
 
 // sessionCarrierPlugin is the generated native plugin the runtime registers
 // together with the proof the runtime requires before it hands a session out.
 type sessionCarrierPlugin struct {
-	URL    string
-	Path   string
-	Proof  sessionCarrierProof
-	Broker *sessionCarrierBroker
+	URL     string
+	Path    string
+	Root    string
+	Proof   sessionCarrierProof
+	Broker  *sessionCarrierBroker
+	Cleanup func() error
 }
 
 // sessionCarrierPluginSource renders the native plugin that carries one
@@ -89,14 +84,11 @@ type sessionCarrierPlugin struct {
 func sessionCarrierPluginSource(
 	shellWrapper string,
 	pathMark string,
-	proof sessionCarrierProof,
 	broker *sessionCarrierBroker,
 ) string {
 	return fmt.Sprintf(sessionCarrierPluginTemplate,
 		jsStringLiteral(shellWrapper),
 		jsStringLiteral(pathMark),
-		jsStringLiteral(proof.Path),
-		jsStringLiteral(proof.Token),
 		jsStringLiteral(broker.endpoint),
 		jsStringLiteral(broker.token),
 		jsStringLiteral(sessionCarrierMetadataKey),
@@ -113,12 +105,10 @@ func jsStringLiteral(value string) string {
 	return string(encoded)
 }
 
-const sessionCarrierPluginTemplate = `import { accessSync, constants, statSync, writeFileSync } from "node:fs"
+const sessionCarrierPluginTemplate = `import { accessSync, constants, statSync } from "node:fs"
 
 const SHELL_WRAPPER = %s
 const PATH_MARK = %s
-const PROOF_PATH = %s
-const PROOF_TOKEN = %s
 const BROKER_ENDPOINT = %s
 const BROKER_TOKEN = %s
 const NAMESPACE = %s
@@ -190,11 +180,13 @@ const fail = (reason) => {
 }
 
 export const AcpGoOpenCodeSessionCarrier = async ({ client, directory }) => {
-  // OpenCode logs a plugin it cannot load and serves every shell operation
-  // anyway, so nothing below runs unless this module was really instantiated.
-  // The adapter refuses to start a runtime that cannot show this marker.
   if (proofPending) {
-    writeFileSync(PROOF_PATH, PROOF_TOKEN)
+    const proofResponse = await fetch(BROKER_ENDPOINT + "/ready", {
+      method: "POST",
+      cache: "no-store",
+      headers: { Authorization: "Bearer " + BROKER_TOKEN },
+    })
+    if (!proofResponse.ok) fail("startup proof failed")
     proofPending = false
   }
 
@@ -307,23 +299,14 @@ var (
 	sessionCarrierMkdirTemp = os.MkdirTemp
 	sessionCarrierMkdirAll  = os.MkdirAll
 	sessionCarrierWriteFile = os.WriteFile
-	sessionCarrierRemove    = os.Remove
-	sessionCarrierHandoff   = handoffSessionCarrierGeneratedTree
 )
 
-func eraseSessionCarrierBootstrap(plugin sessionCarrierPlugin) error {
-	return errors.Join(
-		sessionCarrierRemove(plugin.Path),
-		sessionCarrierRemove(plugin.Proof.Path),
-	)
-}
-
-func materializeSessionCarrierPlugin(runtimeRoot string, isolation *ProcessIsolation) (sessionCarrierPlugin, func() error, error) {
+func materializeSessionCarrierPlugin(runtimeRoot string) (sessionCarrierPlugin, error) {
 	parent := filepath.Dir(runtimeRoot)
 
 	root, err := sessionCarrierMkdirTemp(parent, ".acp-go-opencode-session-carrier-")
 	if err != nil {
-		return sessionCarrierPlugin{}, nil, fmt.Errorf("create OpenCode session carrier root: %w", err)
+		return sessionCarrierPlugin{}, fmt.Errorf("create OpenCode session carrier root: %w", err)
 	}
 
 	var broker *sessionCarrierBroker
@@ -332,24 +315,19 @@ func materializeSessionCarrierPlugin(runtimeRoot string, isolation *ProcessIsola
 		return errors.Join(broker.Close(), openCodeRemoveAll(root))
 	}
 
-	token, err := randomPassword()
-	if err != nil {
-		return sessionCarrierPlugin{}, nil, errors.Join(fmt.Errorf("generate OpenCode session carrier proof: %w", err), cleanup())
-	}
-
 	proof := sessionCarrierProof{
-		Path:      filepath.Join(root, sessionCarrierProofFileName),
-		Token:     token,
 		Directory: filepath.Join(root, sessionCarrierProbeDirName),
 	}
 
 	broker, err = startSessionCarrierBroker()
 	if err != nil {
-		return sessionCarrierPlugin{}, nil, errors.Join(err, cleanup())
+		return sessionCarrierPlugin{}, errors.Join(err, cleanup())
 	}
 
+	proof.Ready = broker.ready
+
 	if err := sessionCarrierMkdirAll(proof.Directory, 0o700); err != nil {
-		return sessionCarrierPlugin{}, nil, errors.Join(fmt.Errorf("create OpenCode session carrier probe: %w", err), cleanup())
+		return sessionCarrierPlugin{}, errors.Join(fmt.Errorf("create OpenCode session carrier probe: %w", err), cleanup())
 	}
 
 	wrapper := ""
@@ -358,18 +336,17 @@ func materializeSessionCarrierPlugin(runtimeRoot string, isolation *ProcessIsola
 	if source := sessionCarrierShellWrapperSource(mark); source != "" {
 		wrapper = filepath.Join(root, sessionCarrierShellName)
 		if err := sessionCarrierWriteFile(wrapper, []byte(source), 0o700); err != nil {
-			return sessionCarrierPlugin{}, nil, errors.Join(fmt.Errorf("write OpenCode session carrier shell: %w", err), cleanup())
+			return sessionCarrierPlugin{}, errors.Join(fmt.Errorf("write OpenCode session carrier shell: %w", err), cleanup())
 		}
 	}
 
 	path := filepath.Join(root, sessionCarrierPluginFileName)
-	if err := sessionCarrierWriteFile(path, []byte(sessionCarrierPluginSource(wrapper, mark, proof, broker)), 0o600); err != nil {
-		return sessionCarrierPlugin{}, nil, errors.Join(fmt.Errorf("write OpenCode session carrier: %w", err), cleanup())
+	if err := sessionCarrierWriteFile(path, []byte(sessionCarrierPluginSource(wrapper, mark, broker)), 0o600); err != nil {
+		return sessionCarrierPlugin{}, errors.Join(fmt.Errorf("write OpenCode session carrier: %w", err), cleanup())
 	}
 
-	if err := sessionCarrierHandoff(root, isolation); err != nil {
-		return sessionCarrierPlugin{}, nil, errors.Join(fmt.Errorf("handoff OpenCode session carrier: %w", err), cleanup())
-	}
-
-	return sessionCarrierPlugin{URL: sessionCarrierFileURL(path), Path: path, Proof: proof, Broker: broker}, cleanup, nil
+	return sessionCarrierPlugin{
+		URL: sessionCarrierFileURL(path), Path: path, Root: root,
+		Proof: proof, Broker: broker, Cleanup: cleanup,
+	}, nil
 }

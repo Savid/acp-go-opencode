@@ -51,7 +51,7 @@ func TestAllowlistedSyncEventsRejectsCrossAggregateAndUnknownSchema(t *testing.T
 func TestSyncSnapshotHardRejectsOldAndIncompleteFormats(t *testing.T) {
 	store := NewInMemorySessionStore()
 	require.NoError(t, store.Append(context.Background(), SessionKey{SessionID: "s"}, []SessionStoreEntry{
-		json.RawMessage(`{"format":"removed-format"}`),
+		json.RawMessage(`{"format":"unknown-format"}`),
 	}))
 	idmap, hydrated, found, err := hydrateStateFromStore(context.Background(), store, "s")
 	require.Empty(t, idmap)

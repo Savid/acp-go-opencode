@@ -7,7 +7,7 @@ Shared instructions for automated coding agents working in this repository.
 This project is a Go implementation of an ACP agent for OpenCode. Each Agent
 owns one shared `opencode serve` runtime and builds directly on
 `github.com/coder/acp-go-sdk`. OpenCode owns model execution and native state;
-this package owns ACP dispatch, supervised runtime/XDG ownership,
+this package owns ACP dispatch, shared runtime/XDG coordination,
 directory/session/turn routing, REST/SSE event mapping, permission requests,
 config options, and `opencode-sync-events-v1` session storage.
 
@@ -46,8 +46,8 @@ Organized by domain. The public surface lives in the root package
   `_opencode/rawEvent` notification config.
 - **Native OpenCode client** (`internal/opencode`, package `opencode`): launch
   and readiness of the loopback `opencode serve` process, native REST and
-  directory-scoped SSE, dynamic MCP scopes, portable home locking, and the
-  per-GOOS dual-supervisor process-tree fence.
+  directory-scoped SSE, dynamic MCP scopes, portable home locking, ordinary
+  process execution, and host-authority launch adapters.
 - **Observability** (`internal/observer`): OpenTelemetry instrumentation
   helpers (trace/metric definitions, trace-context propagation) and the
   instrumentation name.
@@ -69,9 +69,8 @@ gate, vulnerability scan, modernization check, docs audit, and module tidy and
 verification. `make lint`, `make fmt`, and `make vuln` are available
 individually. Lint details live in `.golangci.yml`.
 
-`make docs-audit` checks that the required docs files exist, that every CLI
-flag is registered in both `docs/reference/cli.mdx` and the command source,
-and that public docs and examples do not reintroduce removed public terms.
+`make docs-audit` checks that the required docs files exist and that every CLI
+flag is registered in both `docs/reference/cli.mdx` and the command source.
 Keep `stdout` reserved for ACP JSON-RPC in the CLI; logs and diagnostics
 belong on `stderr`.
 
@@ -150,6 +149,9 @@ Unless explicitly requested, ask before:
 - Keep the shared XDG root single-writer and never open the live native
   database directly. Portable state moves only through allowlisted online sync
   events.
+- When `WithHostAuthority` is supplied, route every native launch through it,
+  treat prepared trees as inaccessible until reclaim succeeds, and never fall
+  back to ordinary execution.
 - Route every prompt, active cancellation, session update, raw event, and
   elicitation with the versioned turn envelope. Fence permissions structurally
   by session id plus a tool-call id pending in the current turn; never infer an

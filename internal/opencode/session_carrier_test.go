@@ -27,28 +27,27 @@ import (
 func preserveSessionCarrierSeams(t *testing.T) {
 	t.Helper()
 	mkdirTemp, mkdirAll := sessionCarrierMkdirTemp, sessionCarrierMkdirAll
-	writeFile, remove, handoff, randReader := sessionCarrierWriteFile, sessionCarrierRemove, sessionCarrierHandoff, openCodeRandReader
+	writeFile, randReader := sessionCarrierWriteFile, openCodeRandReader
 	listen := sessionCarrierListen
 	t.Cleanup(func() {
 		sessionCarrierMkdirTemp, sessionCarrierMkdirAll = mkdirTemp, mkdirAll
-		sessionCarrierWriteFile, sessionCarrierHandoff, openCodeRandReader = writeFile, handoff, randReader
-		sessionCarrierRemove = remove
+		sessionCarrierWriteFile, openCodeRandReader = writeFile, randReader
 		sessionCarrierListen = listen
 	})
 }
 
-func materializedCarrier(t *testing.T) (string, string, sessionCarrierProof) {
+func materializedCarrier(t *testing.T) (string, string, sessionCarrierPlugin) {
 	t.Helper()
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
-	plugin, cleanup, err := materializeSessionCarrierPlugin(runtimeRoot, nil)
+	plugin, err := materializeSessionCarrierPlugin(runtimeRoot)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = cleanup() })
+	t.Cleanup(func() { _ = plugin.Cleanup() })
 	parsed, err := url.Parse(plugin.URL)
 	require.NoError(t, err)
 	content, err := os.ReadFile(parsed.Path)
 	require.NoError(t, err)
 
-	return parsed.Path, string(content), plugin.Proof
+	return parsed.Path, string(content), plugin
 }
 
 // carrierMarkFor names the generated search-path component the plugin and the
@@ -116,18 +115,15 @@ func carrierLoginShellShim(t *testing.T, dir string, identity string, loginShell
 
 func TestMaterializeSessionCarrierPlugin(t *testing.T) {
 	preserveSessionCarrierSeams(t)
-	path, content, proof := materializedCarrier(t)
+	path, content, plugin := materializedCarrier(t)
 	require.Equal(t, sessionCarrierPluginFileName, filepath.Base(path))
 
-	// The proof the runtime demands is generated per launch, addresses a
-	// directory of its own, and is what the module publishes as it loads.
-	require.Equal(t, filepath.Join(filepath.Dir(path), sessionCarrierProofFileName), proof.Path)
-	require.Equal(t, filepath.Join(filepath.Dir(path), sessionCarrierProbeDirName), proof.Directory)
-	require.DirExists(t, proof.Directory)
-	require.NotEmpty(t, proof.Token)
-	require.NoFileExists(t, proof.Path, "only the native process may publish the proof")
-	require.Contains(t, content, `writeFileSync(PROOF_PATH, PROOF_TOKEN)`)
-	require.Contains(t, content, `const PROOF_TOKEN = "`+proof.Token+`"`)
+	require.Equal(t, filepath.Join(filepath.Dir(path), sessionCarrierProbeDirName), plugin.Proof.Directory)
+	require.DirExists(t, plugin.Proof.Directory)
+	require.NotNil(t, plugin.Proof.Ready)
+	require.Contains(t, content, `fetch(BROKER_ENDPOINT + "/ready"`)
+	require.Contains(t, content, `method: "POST"`)
+	require.Contains(t, content, `const BROKER_TOKEN = "`+plugin.Broker.token+`"`)
 
 	root := filepath.Dir(path)
 	mark := carrierMarkFor(root)
@@ -183,39 +179,39 @@ func TestMaterializeSessionCarrierPluginReportsEveryFailure(t *testing.T) {
 	preserveSessionCarrierSeams(t)
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
 
-	_, cleanup, err := materializeSessionCarrierPlugin(runtimeRoot, nil)
+	plugin, err := materializeSessionCarrierPlugin(runtimeRoot)
 	require.NoError(t, err)
-	require.NoError(t, cleanup())
+	require.NoError(t, plugin.Cleanup())
 
 	want := errors.New("carrier seam")
 
 	sessionCarrierMkdirTemp = func(string, string) (string, error) { return "", want }
-	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
+	_, err = materializeSessionCarrierPlugin(runtimeRoot)
 	require.ErrorIs(t, err, want)
 
 	sessionCarrierMkdirTemp = os.MkdirTemp
 
 	randReader := openCodeRandReader
 	openCodeRandReader = iotest.ErrReader(want)
-	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
+	_, err = materializeSessionCarrierPlugin(runtimeRoot)
 	require.ErrorIs(t, err, want)
-	require.ErrorContains(t, err, "generate OpenCode session carrier proof")
+	require.ErrorContains(t, err, "authorization")
 	openCodeRandReader = randReader
 
 	sessionCarrierListen = func(string, string) (net.Listener, error) { return nil, want }
-	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
+	_, err = materializeSessionCarrierPlugin(runtimeRoot)
 	require.ErrorIs(t, err, want)
 	require.ErrorContains(t, err, "listen for OpenCode session carrier")
 	sessionCarrierListen = net.Listen
 
 	sessionCarrierMkdirAll = func(string, os.FileMode) error { return want }
-	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
+	_, err = materializeSessionCarrierPlugin(runtimeRoot)
 	require.ErrorIs(t, err, want)
 	require.ErrorContains(t, err, "create OpenCode session carrier probe")
 	sessionCarrierMkdirAll = os.MkdirAll
 
 	sessionCarrierWriteFile = func(string, []byte, os.FileMode) error { return want }
-	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
+	_, err = materializeSessionCarrierPlugin(runtimeRoot)
 	require.ErrorIs(t, err, want)
 
 	// The wrapper is written first, so faulting only the plugin write proves
@@ -229,38 +225,44 @@ func TestMaterializeSessionCarrierPluginReportsEveryFailure(t *testing.T) {
 
 		return os.WriteFile(path, data, mode)
 	}
-	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
+	_, err = materializeSessionCarrierPlugin(runtimeRoot)
 	require.ErrorIs(t, err, want)
 	require.ErrorContains(t, err, "write OpenCode session carrier")
-
-	sessionCarrierWriteFile = os.WriteFile
-	sessionCarrierHandoff = func(string, *ProcessIsolation) error { return want }
-	_, _, err = materializeSessionCarrierPlugin(runtimeRoot, nil)
-	require.ErrorIs(t, err, want)
 }
 
-func TestSessionCarrierBootstrapUsesSeparateAuthorizationAndErasesIt(t *testing.T) {
+func TestSessionCarrierReadinessRequiresBrokerAuthorization(t *testing.T) {
 	preserveSessionCarrierSeams(t)
-	plugin, cleanup, err := materializeSessionCarrierPlugin(filepath.Join(t.TempDir(), "runtime"), nil)
+	plugin, err := materializeSessionCarrierPlugin(filepath.Join(t.TempDir(), "runtime"))
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, cleanup()) })
-	require.NotEqual(t, plugin.Proof.Token, plugin.Broker.token)
+	t.Cleanup(func() { require.NoError(t, plugin.Cleanup()) })
 
-	require.NoError(t, os.WriteFile(plugin.Proof.Path, []byte(plugin.Proof.Token), 0o600))
-	require.NoError(t, eraseSessionCarrierBootstrap(plugin))
-	require.NoFileExists(t, plugin.Path)
-	require.NoFileExists(t, plugin.Proof.Path)
+	request, err := http.NewRequest(http.MethodPost, plugin.Broker.endpoint+"/ready", nil)
+	require.NoError(t, err)
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusUnauthorized, response.StatusCode)
+	select {
+	case <-plugin.Proof.Ready:
+		t.Fatal("unauthorized readiness closed the proof")
+	default:
+	}
+
+	request, err = http.NewRequest(http.MethodPost, plugin.Broker.endpoint+"/ready", nil)
+	require.NoError(t, err)
+	request.Header.Set("Authorization", "Bearer "+plugin.Broker.token)
+	response, err = http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusNoContent, response.StatusCode)
+	requireSignalClosed(t, plugin.Proof.Ready, "authorized readiness did not close the proof")
 }
 
 func TestSessionCarrierPluginSourceRendersConstants(t *testing.T) {
 	source := sessionCarrierPluginSource(`/carrier/"quoted"/shell`, `/carrier/"quoted"/mark`,
-		sessionCarrierProof{
-			Path: `/carrier/"quoted"/loaded`, Token: "proof-token",
-		}, &sessionCarrierBroker{endpoint: "http://127.0.0.1:1234", token: "broker-token"})
+		&sessionCarrierBroker{endpoint: "http://127.0.0.1:1234", token: "broker-token"})
 	require.Contains(t, source, `const SHELL_WRAPPER = "/carrier/\"quoted\"/shell"`)
 	require.Contains(t, source, `const PATH_MARK = "/carrier/\"quoted\"/mark"`)
-	require.Contains(t, source, `const PROOF_PATH = "/carrier/\"quoted\"/loaded"`)
-	require.Contains(t, source, `const PROOF_TOKEN = "proof-token"`)
 	require.Contains(t, source, `const BROKER_ENDPOINT = "http://127.0.0.1:1234"`)
 	require.Contains(t, source, `const BROKER_TOKEN = "broker-token"`)
 	require.Contains(t, source, `const NAMESPACE = "acp-go-opencode"`)
@@ -288,7 +290,6 @@ func TestSessionCarrierPluginSourceRendersConstants(t *testing.T) {
 // directories into a no-op.
 func TestSessionCarrierPluginResolvesThePathVariableByEnvironmentIdentity(t *testing.T) {
 	source := sessionCarrierPluginSource("/carrier/shell", "/carrier/mark",
-		sessionCarrierProof{Path: "/carrier/loaded", Token: "proof-token"},
 		&sessionCarrierBroker{endpoint: "http://127.0.0.1:1234", token: "broker-token"})
 
 	require.Contains(t, strings.Join(strings.Fields(source), " "),
@@ -324,19 +325,14 @@ func TestRuntimeConfigRegistersSessionCarrierLast(t *testing.T) {
 	require.ErrorContains(t, err, "plugin must be an array")
 }
 
-// TestProveSessionCarrierLoadedRequiresTheMarkerThePluginPublishes covers the
-// startup gate that stands between a runtime and its first session. OpenCode
-// loads a plugin lazily and survives one it cannot load, so a runtime is only
-// carrying sessions once the module has proven it ran.
-func TestProveSessionCarrierLoadedRequiresTheMarkerThePluginPublishes(t *testing.T) {
+func TestProveSessionCarrierLoadedRequiresBrokerReadiness(t *testing.T) {
 	newProof := func(t *testing.T) sessionCarrierProof {
 		t.Helper()
 		root := t.TempDir()
 
 		return sessionCarrierProof{
-			Path:      filepath.Join(root, sessionCarrierProofFileName),
-			Token:     "carrier-proof-token",
 			Directory: filepath.Join(root, sessionCarrierProbeDirName),
+			Ready:     make(chan struct{}),
 		}
 	}
 
@@ -355,8 +351,6 @@ func TestProveSessionCarrierLoadedRequiresTheMarkerThePluginPublishes(t *testing
 	t.Run("a plugin that never ran refuses the runtime", func(t *testing.T) {
 		proof := newProof(t)
 		native := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-			// A stale marker from an earlier launch is not this launch's proof.
-			require.NoError(t, os.WriteFile(proof.Path, []byte("someone-elses-token"), 0o600))
 			writeJSON(t, writer, map[string]any{})
 		}))
 		t.Cleanup(native.Close)
@@ -368,15 +362,17 @@ func TestProveSessionCarrierLoadedRequiresTheMarkerThePluginPublishes(t *testing
 		require.ErrorContains(t, server.proveSessionCarrierLoaded(ctx, proof), "did not load")
 	})
 
-	t.Run("the marker the addressed probe directory produced is the proof", func(t *testing.T) {
+	t.Run("the addressed probe publishes readiness", func(t *testing.T) {
 		proof := newProof(t)
+		ready := make(chan struct{})
+		proof.Ready = ready
 
 		var addressed string
 
 		native := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			addressed = request.URL.Query().Get("directory")
 
-			require.NoError(t, os.WriteFile(proof.Path, []byte(proof.Token), 0o600))
+			close(ready)
 			writeJSON(t, writer, map[string]any{})
 		}))
 		t.Cleanup(native.Close)
@@ -419,43 +415,14 @@ func TestStartServerRefusesARuntimeWhoseCarrierNeverLoaded(t *testing.T) {
 		return write(path, data, mode)
 	}
 
-	// The launched process gets its own wait owner, and that goroutine reads
-	// the wait seam. Nothing else in the suite orders that read against the
-	// next test restoring the seam, so this test joins it explicitly rather
-	// than leaving an unsynchronized read behind.
-	waiting := make(chan struct{}, 1)
-	wait := openCodeWaitCommand
-	openCodeWaitCommand = func(cmd *exec.Cmd) error {
-		waiting <- struct{}{}
-
-		return wait(cmd)
-	}
-
-	// The carrier proof closes the readiness stage rather than opening one of
-	// its own, so a runtime whose plugin never loaded reports exactly one
-	// failed stage, and it is readiness.
-	var failedStages []string
-
-	_, err := StartServer(t.Context(), platformStartOptions(t, StartOptions{
-		Root:            testGeneratedTempDir(t),
+	_, err := StartServer(t.Context(), ordinaryStartOptions(StartOptions{
+		Root:            t.TempDir(),
 		ExecutablePath:  fakeOpenCodeExecutable(t),
 		MinVersion:      "1.18.3",
 		HealthTimeout:   2 * time.Second,
 		SkipVersionGate: false,
-		ObserveStartupStage: func(_ context.Context, _ string, stage string, _ time.Duration, stageErr error) {
-			if stageErr != nil {
-				failedStages = append(failedStages, stage)
-			}
-		},
 	}))
 	require.ErrorContains(t, err, "did not load")
-	require.Equal(t, []string{"readiness"}, failedStages)
-
-	select {
-	case <-waiting:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the launched process never got a wait owner")
-	}
 }
 
 func TestPureScopeRejectsSessionCarrier(t *testing.T) {
@@ -1101,7 +1068,7 @@ func TestSessionCarrierKeepsNoShellStateOfItsOwn(t *testing.T) {
 	loginShell := availableLoginShell(t)
 
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
-	plugin, cleanup, err := materializeSessionCarrierPlugin(runtimeRoot, nil)
+	plugin, err := materializeSessionCarrierPlugin(runtimeRoot)
 	require.NoError(t, err)
 
 	parsed, err := url.Parse(plugin.URL)
@@ -1125,7 +1092,7 @@ func TestSessionCarrierKeepsNoShellStateOfItsOwn(t *testing.T) {
 	require.Equal(t, before, carrierTreeEntries(t, root),
 		"a shell operation must leave no state of its own inside the carrier tree")
 
-	require.NoError(t, cleanup())
+	require.NoError(t, plugin.Cleanup())
 	require.NoDirExists(t, root)
 }
 

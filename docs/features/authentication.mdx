@@ -3,23 +3,22 @@ title: Authentication
 description: The empty ACP auth-method list, the loopback runtime credentials, and the brokered provider-login surface.
 ---
 
-The adapter advertises no ACP auth method of its own, and it brokers provider
-logins through a session-scoped extension surface when a host configures a
-durable ledger root and a durable home.
+The adapter advertises no ACP auth method of its own. During ordinary execution
+it brokers provider logins through a session-scoped extension surface when a
+host configures a durable ledger root and home. Supplying `WithHostAuthority`
+withholds that entire provider-auth surface.
 
-## Explicit-isolation credential input
+## Native credential input
 
-The explicit-isolation root supervisor never forwards its ambient environment.
-To pass provider API-key variables, name each variable explicitly in the
-`inheritEnvironment` array of the root-owned
-`-process-isolation-config` policy. The value must be set in the supervisor
-environment or startup fails; identity, path, loader, XDG/native-home, and
-adapter-private variables cannot be inherited. File-backed or provider-broker
-credentials must live only in the explicit target-owned native home described
-by the adapter. No standalone path reads root `HOME`, root native config, or
-an unlisted root credential. When isolation is omitted, the agent and its
-short-lived provider-auth brokers instead use the environment captured at
-construction, after managed-root precedence and private-variable scrubbing.
+Ordinary execution starts from the environment captured when the agent is
+constructed, applies `WithEnv`, strips adapter-private and managed-root keys,
+and then installs the generated OpenCode/XDG values. Provider API-key variables
+may be supplied with `WithEnv` or inherited from that captured environment.
+
+Managed execution starts from the exact map returned by
+`HostAuthority.NativeEnvironment`; ambient adapter state is not mixed into it.
+`WithEnv` overlays ordinary variables after the same validation and root-key
+filtering. Provider-auth brokers are not started in managed mode.
 
 ## No ACP auth methods
 
@@ -54,7 +53,8 @@ acts as an OAuth client.
 
 ### Turning the surface on
 
-Seven legs are advertised when **both** of these are configured:
+Seven legs are advertised only during ordinary execution when **both** of these
+are configured:
 
 - `WithProviderAuthRoot` (`-provider-auth-root`) — an absolute, durable,
   host-owned directory holding the adapter's values-free ledger. It sits
@@ -64,9 +64,10 @@ Seven legs are advertised when **both** of these are configured:
   runtime teardown, so a login completed without a durable home would report
   success and leave nothing resident.
 
-With either missing, `agentCapabilities._meta.opencode.providerAuth` is absent
-and every leg returns method-not-found. The same holds for a configured root
-that cannot be created, is not a directory, or is not writable.
+With either missing, or whenever `WithHostAuthority` was supplied,
+`agentCapabilities._meta.opencode.providerAuth` is absent and every leg returns
+method-not-found. The same holds for a configured root that cannot be created,
+is not a directory, or is not writable.
 
 `WithProviderAuthDirectHome` (`-provider-auth-direct-home`) is declared for
 configuration symmetry and is **rejected** here: a set value fails session start
@@ -153,7 +154,7 @@ A device or paste-back flow runs against a dedicated short-lived
 `acp-go-opencode-auth-broker-*`. On native completion the adapter reads the
 finished credential out of that broker home's own store, performs one fenced
 install into the durable runtime store, and destroys the home — terminating the
-process first, then removing the directory. Destruction happens on every
+ordinary process first, waiting for exit, then removing the directory. Destruction happens on every
 terminal transition, including expiry, cancellation, and failure, and a
 superseding `authorize` destroys the abandoned home without installing anything
 from it. Removal is retried while descendants of the closed server are still

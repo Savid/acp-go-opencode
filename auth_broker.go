@@ -13,7 +13,6 @@ import (
 )
 
 var (
-	brokerReapHomes      = opencode.ReapAbandonedHomes
 	brokerMkdirTemp      = os.MkdirTemp
 	brokerChmod          = os.Chmod
 	brokerCreateXDG      = opencode.CreateRuntimeXDGDirs
@@ -38,9 +37,8 @@ type authBroker struct {
 	log    *slog.Logger
 
 	// removeShim replaces shim deletion. Destruction must report a shim it
-	// failed to delete, and no directory permission denies a privileged
-	// identity that deletion, so the failure is injected per broker. A
-	// package-level seam would race with the flow goroutines that call destroy.
+	// failed to delete, so the failure is injected per broker. A package-level
+	// seam would race with the flow goroutines that call destroy.
 	removeShim func() error
 }
 
@@ -54,18 +52,13 @@ func (b *authBroker) removeBrowserShim() error {
 }
 
 // startBroker creates the broker home under the adapter-supplied scratch
-// parent, reaps any home a crashed predecessor left behind there, and starts
-// the broker server inside it.
+// parent and starts the broker server inside it.
 func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 	agent := p.agent
 
-	parent, err := ensureScratchParent(agent.options.ScratchDir)
+	parent, err := agent.ensureScratchParent()
 	if err != nil {
 		return nil, err
-	}
-
-	if reapErr := brokerReapHomes(parent, authBrokerPrefix); reapErr != nil {
-		agent.log.DebugContext(ctx, "reap abandoned provider auth broker homes failed", loggableError(reapErr))
 	}
 
 	home, err := brokerMkdirTemp(parent, authBrokerPrefix)
@@ -98,36 +91,25 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 		factory = runtimeStartServer
 	}
 
-	// StartServer protects ControlRoot as 0700. Keep it below the 0711 broker
-	// home so isolation can still traverse to the handed-off XDG tree.
+	// StartServer protects ControlRoot as 0700. Keep it below the broker home.
 	controlRoot := filepath.Join(home, "control")
 
 	client, err := factory(ctx, opencode.StartOptions{
-		Root:                     nativeHome,
-		ControlRoot:              controlRoot,
-		ScratchParent:            parent,
-		ContainmentScratchParent: parent,
-		DarwinBestEffort:         agent.containmentMode == RuntimeContainmentBestEffort,
-		ReserveContainmentScratch: func(reservationCtx context.Context) (func(), error) {
-			return acquireRuntimeResource(
-				reservationCtx,
-				agent.options.RuntimeResourceHooks.ReserveScratchRoot,
-				RuntimeResourceDiscovery,
-			)
+		Root:          nativeHome,
+		ControlRoot:   controlRoot,
+		ScratchParent: parent,
+		NativeEnvironment: func() map[string]string {
+			return cloneStringMap(agent.options.implicitEnvironment)
 		},
-		ExecutablePath:      agent.options.ExecutablePath,
-		LeaseDir:            home,
-		BrowserShim:         shim,
-		Env:                 cloneStringMap(agent.options.Env),
-		ImplicitEnvironment: cloneStringMap(agent.options.implicitEnvironment),
-		ProcessIsolation:    openCodeProcessIsolation(agent.options.ProcessIsolation),
-		Pure:                agent.options.Pure,
-		LogLevel:            agent.options.LogLevel,
-		HealthTimeout:       agent.options.HealthCheckTimeout,
-		Logger:              agent.log,
-		ExistingXDG:         xdg,
-		HandoffXDG:          true,
-		SkipVersionGate:     true,
+		ExecutablePath:  agent.options.ExecutablePath,
+		BrowserShim:     shim,
+		Env:             cloneStringMap(agent.options.Env),
+		Pure:            agent.options.Pure,
+		LogLevel:        agent.options.LogLevel,
+		HealthTimeout:   agent.options.HealthCheckTimeout,
+		Logger:          agent.log,
+		ExistingXDG:     xdg,
+		SkipVersionGate: true,
 	})
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start provider auth broker: %w", err), shim.Remove(), brokerRemoveAll(home))
@@ -153,7 +135,7 @@ func (b *authBroker) destroy(ctx context.Context) {
 		return
 	}
 
-	if err := b.client.Shutdown(ctx); err != nil {
+	if err := b.client.Shutdown(context.Background()); err != nil {
 		b.log.WarnContext(ctx, "shutdown provider auth broker failed", loggableError(err))
 	}
 

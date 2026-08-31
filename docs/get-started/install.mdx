@@ -46,33 +46,8 @@ opencode --version
 Integration smoke tests that do not spend model tokens run under
 `make test-integration-smoke`.
 
-## Provision explicit Linux identity authority
-
-Installations that supply a Linux process-isolation policy must persist the
-shared identity-lock root:
-
-```sh
-sudo install -d -o root -g root -m 0700 \
-  /var/lib/acp-go /var/lib/acp-go/agent-identities
-```
-
-Mount that exact local-lock volume into every service or container that can use
-the same numeric UID pool, with identical user-namespace UID/GID mappings and
-authoritative PID visibility. Otherwise use disjoint pools. Network, FUSE,
-pseudo, read-only, and unknown authority filesystems are rejected. Files named
-`<uid>.lock` are permanent and must never be unlinked, renamed, or replaced.
-
-Provision a dedicated durable provider state root such as `/var/lib/acp-go-opencode`,
-outside and not beneath the authority root. Its ancestors must be root-owned
-and not group/world writable; the final directory must be owned by the target
-UID:GID with mode `0700`. Keep its device/inode stable.
-Set that exact path as both `standaloneStateRoot` in the isolation policy and
-the native `-home`; assign a stable nonsecret deployment identity as
-`standaloneOwnerId`. The authority's `domain.lock`, `owners.lock`, UID
-locks, affinity locks, and owner records are permanent coordination state.
-Deleting or reconstructing one beside retained records is corruption, not
-routine cleanup.
-The adapter does not create, inspect, seed, or remove entries beneath this
-target-owned root. OpenCode creates and owns its XDG subdirectories. The
-root-owned adjacent `<home>.control` holds adapter locks and must not be created
-or modified by the target identity.
+The command binary always uses ordinary same-identity execution. Managed hosts
+embed the Go package and provide `WithHostAuthority`; provisioning that
+authority and its process boundary belongs to the host. No authority daemon,
+policy file, operating-system account, or persistent coordination directory is
+installed by this module.

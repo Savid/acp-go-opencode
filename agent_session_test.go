@@ -398,42 +398,6 @@ func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []SessionStoreEntry{entry}, retained)
 }
-func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
-	ctx := context.Background()
-	client := newFakeOpenCodeClient()
-	client.createSession = testNativeSession("native-1")
-	client.agents = []opencode.NativeAgent{{Name: "build"}}
-	var nativeAcquire, scratchAcquire, nativeRelease, scratchRelease atomic.Int64
-	hooks := RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			nativeAcquire.Add(1)
-
-			return func() { nativeRelease.Add(1) }, nil
-		},
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			scratchAcquire.Add(1)
-
-			return func() { scratchRelease.Add(1) }, nil
-		},
-	}
-	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(hooks), func(options *Options) {
-		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) { return client, nil }
-	})
-	_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(),
-		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test")))))
-	require.NoError(t, err)
-	require.EqualValues(t, 1, nativeAcquire.Load())
-	require.EqualValues(t, 1, scratchAcquire.Load())
-	require.NoError(t, agent.Close())
-	require.EqualValues(t, 1, nativeRelease.Load())
-	require.EqualValues(t, 1, scratchRelease.Load())
-
-	rejected := NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) { return nil, errors.New("pool full") },
-	}))
-	_, _, err = rejected.sharedRuntimeBinding(ctx)
-	require.ErrorContains(t, err, "pool full")
-}
 
 func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *testing.T) {
 	ctx := context.Background()
@@ -445,15 +409,8 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 	second.getSession = testNativeSession("native-first")
 	second.agents = []opencode.NativeAgent{{Name: "build"}}
 
-	var factoryCalls, nativeReleases, scratchReleases atomic.Int64
-	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { nativeReleases.Add(1) }, nil
-		},
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { scratchReleases.Add(1) }, nil
-		},
-	}), func(options *Options) {
+	var factoryCalls atomic.Int64
+	agent := NewAgent(WithScratchDir(t.TempDir()), func(options *Options) {
 		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 			if factoryCalls.Add(1) == 1 {
 				return first, nil
@@ -472,10 +429,8 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 		retained := agent.runtime == nil && len(agent.sessions) == 1
 		agent.mu.Unlock()
 
-		return retained && nativeReleases.Load() == 1 && scratchReleases.Load() == 1
+		return retained
 	}, time.Second, 10*time.Millisecond)
-	require.EqualValues(t, 1, nativeReleases.Load())
-	require.EqualValues(t, 1, scratchReleases.Load())
 
 	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "recovery-turn", "continue after restart"))
 	require.NoError(t, err)
@@ -484,8 +439,6 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 	require.Len(t, agent.sessions, 1)
 	require.NoError(t, agent.sessions[created.SessionId].runtimeFailure())
 	require.NoError(t, agent.Close())
-	require.EqualValues(t, 2, nativeReleases.Load())
-	require.EqualValues(t, 2, scratchReleases.Load())
 }
 
 func TestRecoverySkipsCrashedReplacementGenerationBeforePrompt(t *testing.T) {
@@ -1666,7 +1619,7 @@ func TestCloseSessionRefusesWithoutADurableSnapshot(t *testing.T) {
 func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.closeErr = errors.Join(errors.New("scope refused to close"), opencode.ErrProcessContainmentIncomplete)
+	client.closeErr = errors.Join(errors.New("scope refused to close"), ErrContainmentIncomplete)
 	store := NewInMemorySessionStore()
 	agent := NewAgent(WithSessionStore(store))
 	current := testSession(t, agent, client)
@@ -1674,7 +1627,7 @@ func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	require.NoError(t, current.snapshotToStore(ctx))
 
 	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.True(t, agent.isDeleted(current.id), "a failed teardown left the deleted id addressable")
 	require.Contains(t, agent.sessions, current.id, "the failed teardown abandoned the native scope it left running")
 
@@ -1716,13 +1669,13 @@ func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 func TestAgentCloseSweepsTheScopeAFailedDeleteLeftBehind(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.closeErr = errors.Join(errors.New("scope refused to close"), opencode.ErrProcessContainmentIncomplete)
+	client.closeErr = errors.Join(errors.New("scope refused to close"), ErrContainmentIncomplete)
 	agent := NewAgent(WithSessionStore(NewInMemorySessionStore()))
 	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 
 	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 
 	client.closeErr = nil
 	attempts := client.containmentAttempts()

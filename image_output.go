@@ -423,7 +423,7 @@ func (s *session) allowedImageRoots() []string {
 	roots = append(roots, s.additionalDirectories...)
 
 	if s.agent != nil {
-		roots = append(roots, scratchParent(s.agent.options.ScratchDir))
+		roots = append(roots, s.agent.scratchParent())
 	}
 
 	// The harness sandbox already permits writing to the OS temp directory, so

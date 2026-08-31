@@ -35,36 +35,33 @@ var (
 
 // Agent exposes OpenCode through ACP.
 type Agent struct {
-	options         Options
-	log             *slog.Logger
-	observe         *observer.Observer
-	optionsErr      error
-	containmentMode RuntimeContainmentMode
-	providerAuth    *providerAuth
+	options      Options
+	log          *slog.Logger
+	observe      *observer.Observer
+	optionsErr   error
+	providerAuth *providerAuth
 
-	mu                       sync.Mutex
-	closed                   bool
-	conn                     agentClient
-	closeDone                chan struct{}
-	closeErr                 error
-	sessions                 map[acp.SessionId]*session
-	deleted                  map[acp.SessionId]struct{}
-	clientCalls              chan struct{}
-	clientCapabilities       acp.ClientCapabilities
-	positionEncoding         acp.PositionEncodingKind
-	lifecycle                lifecycle.Negotiated
-	runtime                  opencode.Client
-	runtimeGeneration        uint64
-	runtimeStarting          chan struct{}
-	runtimeStartErr          error
-	runtimeFatalErr          error
-	runtimeNativeRelease     func()
-	runtimeXDGScratchRelease func()
-	runtimeRetirements       map[uint64]*runtimeRetirement
-	directories              map[string]directoryBinding
-	directoryIncarnation     directoryBindingIncarnation
-	fingerprintKey           [32]byte
-	restoreMu                sync.Mutex
+	mu                   sync.Mutex
+	closed               bool
+	conn                 agentClient
+	closeDone            chan struct{}
+	closeErr             error
+	sessions             map[acp.SessionId]*session
+	deleted              map[acp.SessionId]struct{}
+	clientCalls          chan struct{}
+	clientCapabilities   acp.ClientCapabilities
+	positionEncoding     acp.PositionEncodingKind
+	lifecycle            lifecycle.Negotiated
+	runtime              opencode.Client
+	runtimeGeneration    uint64
+	runtimeStarting      chan struct{}
+	runtimeStartErr      error
+	runtimeFatalErr      error
+	runtimeRetirements   map[uint64]*runtimeRetirement
+	directories          map[string]directoryBinding
+	directoryIncarnation directoryBindingIncarnation
+	fingerprintKey       [32]byte
+	restoreMu            sync.Mutex
 }
 
 type directoryBinding struct {
@@ -81,10 +78,12 @@ var (
 
 func NewAgent(opts ...Option) *Agent {
 	options := applyOptions(opts)
-	homeErr := normalizeStandaloneHome(&options)
 	limits, optionsErr := normalizeConcurrencyLimits(options.ConcurrencyLimits)
-	optionsErr = errors.Join(optionsErr, homeErr)
-	optionsErr = errors.Join(optionsErr, validateContainmentOptions(options))
+
+	optionsErr = errors.Join(optionsErr, validateRuntimeOptions(options))
+	if options.hostAuthorityConfigured && options.HostAuthority == nil {
+		optionsErr = errors.Join(optionsErr, ErrHostAuthorityUnavailable)
+	}
 
 	options.ConcurrencyLimits = limits
 
@@ -115,33 +114,11 @@ func NewAgent(opts ...Option) *Agent {
 		TracerProvider: options.TracerProvider,
 		Version:        options.AgentVersion,
 	})
-	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe)
-
-	mode := containmentMode(options)
-	if options.RuntimeResourceHooks.ObserveContainment != nil {
-		options.RuntimeResourceHooks.ObserveContainment(context.Background(), mode)
-	}
-
-	// Only the authoritative backend can enumerate the provider descendants it
-	// contains. Ordinary same-identity execution and Darwin best effort both
-	// know the count they would report is not the count that exists, and a
-	// terminal zero from either would read as a quiescence proof neither one
-	// performed, so the snapshot hook is withheld for the Agent's whole life.
-	if mode != RuntimeContainmentAuthoritative {
-		options.RuntimeResourceHooks.ObserveProcessSnapshot = nil
-	}
-
-	if mode == RuntimeContainmentBestEffort {
-		log.Warn("Darwin best-effort process containment is enabled; escaped descendants may survive, numeric PGID reuse can cause collateral signalling, marker correlation is not ownership, markers can be scrubbed, and native-root permits do not bound escaped provider work",
-			slog.String("containment", string(mode)),
-		)
-	}
 
 	agent := &Agent{
 		options:            options,
 		log:                log,
 		optionsErr:         optionsErr,
-		containmentMode:    mode,
 		observe:            observe,
 		sessions:           make(map[acp.SessionId]*session),
 		deleted:            make(map[acp.SessionId]struct{}),
@@ -156,15 +133,6 @@ func NewAgent(opts ...Option) *Agent {
 	agent.providerAuth = newProviderAuth(agent)
 
 	return agent
-}
-
-// ContainmentMode reports the effective native process boundary.
-func (a *Agent) ContainmentMode() RuntimeContainmentMode {
-	if a == nil {
-		return RuntimeContainmentUnavailable
-	}
-
-	return a.containmentMode
 }
 
 func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) (serveErr error) {
@@ -331,7 +299,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		},
 		"elicitation": map[string]any{
 			"unstable":     true,
-			jsonFieldScope: string(RuntimeResourceSession),
+			jsonFieldScope: string(lifecycle.CauseSession),
 			"tracks":       "ACP v1 elicitation",
 		},
 		rawEventCapabilityKey: map[string]any{
@@ -493,7 +461,10 @@ func (a *Agent) ensureOpen() error {
 // The data carries only the joined prose because no wire field is at fault to
 // name, and that text is all an operator has to find the bad option.
 func (a *Agent) optionsError() error {
-	return acp.NewInternalError(map[string]any{jsonFieldError: a.optionsErr.Error()})
+	return errors.Join(
+		a.optionsErr,
+		acp.NewInternalError(map[string]any{jsonFieldError: a.optionsErr.Error()}),
+	)
 }
 
 func (a *Agent) sessionStore() SessionStore {

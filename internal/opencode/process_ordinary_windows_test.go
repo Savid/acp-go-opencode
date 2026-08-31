@@ -52,11 +52,11 @@ func TestOrdinaryWindowsExecutableAndEnvironmentBehavior(t *testing.T) {
 	)
 	require.NoError(t, err)
 	entries := envMapToSlice(environment)
-	resolved, err := resolveProcessExecutable("opencode", entries, false)
+	resolved, err := resolveOrdinaryProcessExecutable("opencode", entries)
 	require.NoError(t, err)
-	require.Equal(t, targetPath, resolved.Path)
+	require.Equal(t, targetPath, resolved)
 
-	command := exec.Command(resolved.Path,
+	command := exec.Command(resolved,
 		"-test.run=^TestOrdinaryWindowsExecutableAndEnvironmentBehavior$",
 		"--", windowsEnvironmentChildMarker,
 	)
@@ -85,10 +85,8 @@ func TestOrdinaryWindowsExecutableAndEnvironmentBehavior(t *testing.T) {
 // same value on every run is not.
 func TestWindowsEnvironmentCollapsesRepeatedSpellingsDeterministically(t *testing.T) {
 	require.Equal(t, "selected", environmentValue([]string{"Path=discarded", "PATH=selected"}, pathEnv))
-	require.Equal(t, "selected", environmentMapValue(
-		composeEnvironment(map[string]string{"Path": "discarded"}, map[string]string{"PATH": "selected"}),
-		pathEnv,
-	))
+	require.Equal(t, "selected",
+		composeEnvironment(map[string]string{"Path": "discarded"}, map[string]string{"PATH": "selected"})[pathEnv])
 
 	within := map[string]string{"PATH": "sorts-first", "Path": "sorts-last"}
 	require.Equal(t, []string{"PATH=sorts-last"}, envMapToSlice(composeEnvironment(within)),

@@ -44,9 +44,9 @@ func TestEnsureRuntimeControlRootRefusesRedirectsAndUnsafeExistingPaths(t *testi
 }
 
 func TestEnsureRuntimeControlRootReportsCreationAndInspectionFailures(t *testing.T) {
-	originalLstat, originalMkdir, originalValidate := runtimeControlLstat, runtimeControlMkdir, runtimeControlValidateOwner
+	originalLstat, originalMkdir := runtimeControlLstat, runtimeControlMkdir
 	t.Cleanup(func() {
-		runtimeControlLstat, runtimeControlMkdir, runtimeControlValidateOwner = originalLstat, originalMkdir, originalValidate
+		runtimeControlLstat, runtimeControlMkdir = originalLstat, originalMkdir
 	})
 	want := errors.New("filesystem")
 	runtimeControlLstat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
@@ -64,10 +64,4 @@ func TestEnsureRuntimeControlRootReportsCreationAndInspectionFailures(t *testing
 	}
 	runtimeControlMkdir = func(string, os.FileMode) error { return nil }
 	require.ErrorIs(t, ensureRuntimeControlRoot("/control"), want)
-
-	runtimeControlLstat, runtimeControlMkdir = originalLstat, originalMkdir
-	root := t.TempDir()
-	require.NoError(t, os.Chmod(root, 0o700))
-	runtimeControlValidateOwner = func(os.FileInfo) error { return want }
-	require.ErrorIs(t, ensureRuntimeControlRoot(root), want)
 }

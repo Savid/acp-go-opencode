@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -30,9 +29,7 @@ import (
 )
 
 const (
-	opencodeDefaultUsername          = "opencode"
-	runtimeProcessHomeLockSupervisor = "home_lock_supervisor"
-	runtimeProcessProviderDescendant = "provider_descendant"
+	opencodeDefaultUsername = "opencode"
 
 	// opencodeExecutableName is the OpenCode program name: the default
 	// executable and the per-XDG config directory.
@@ -205,190 +202,25 @@ type StartOptions struct {
 	// directory itself. It is used only as the fallback root when Root is empty.
 	ScratchParent  string
 	ExecutablePath string
-	// LeaseDir names the directory a server lease is written into before the
-	// server starts. It is set for a per-flow broker home, which is the one
-	// server whose home a later startup has to tell apart from an abandoned
-	// one; an empty value writes no lease.
-	LeaseDir string
 	// BrowserShim shadows every browser launcher on the child's PATH for the
 	// lifetime of a login leg. The caller owns the directory; leaving it nil
 	// leaves the child free to open the operator's desktop browser.
-	BrowserShim         *BrowserShim
-	Env                 map[string]string
-	ImplicitEnvironment map[string]string
-	ProcessIsolation    *ProcessIsolation
-	Pure                bool
-	QuestionTool        bool
-	LogLevel            string
-	MinVersion          string
-	HealthTimeout       time.Duration
-	Logger              *slog.Logger
-	ExistingXDG         XDGDirs
-	// NativeOwnedXDG means the runtime identity owns Root. StartServer must not
-	// create, inspect, or write any path beneath it before launching OpenCode.
-	NativeOwnedXDG           bool
-	HandoffXDG               bool
-	SkipVersionGate          bool
-	SeedFiles                map[string]string
-	skipSupervisor           bool
-	DarwinBestEffort         bool
-	ContainmentScratchParent string
-	// ReserveContainmentScratch reserves one adapter-created Darwin generation
-	// root. DarwinBestEffort requires this callback; StartServer invokes it
-	// immediately before creating the generation root and owns the returned
-	// release until that exact root has been deleted.
-	ReserveContainmentScratch func(context.Context) (func(), error)
-	ObserveProcess            func(context.Context, string, int64)
-	ObserveProcessSnapshot    func(context.Context, string, int)
-	ObserveStartupStage       func(context.Context, string, string, time.Duration, error)
-}
-
-type runtimeProcessObservation struct {
-	mu                  sync.Mutex
-	exited              bool
-	supervisorsObserved bool
-	descendantsObserved bool
-	descendantsQuiesced bool
-	observe             func(context.Context, string, int64)
-	observeSnapshot     func(context.Context, string, int)
-	publishing          bool
-	pending             []func()
-}
-
-func (o *runtimeProcessObservation) markSupervisorsReady(ctx context.Context) {
-	if o == nil || o.observe == nil {
-		return
-	}
-
-	o.mu.Lock()
-	if o.exited || o.supervisorsObserved {
-		o.mu.Unlock()
-
-		return
-	}
-
-	o.supervisorsObserved = true
-	startPublishing := o.enqueueLocked(func() {
-		o.observe(ctx, runtimeProcessHomeLockSupervisor, 2)
-	})
-	o.mu.Unlock()
-
-	if startPublishing {
-		o.publish()
-	}
-}
-
-func (o *runtimeProcessObservation) markDescendantsReady(ctx context.Context, inventory func() (int, bool)) {
-	if o == nil || o.observeSnapshot == nil || inventory == nil {
-		return
-	}
-
-	o.mu.Lock()
-	if o.exited || o.descendantsObserved || o.descendantsQuiesced {
-		o.mu.Unlock()
-
-		return
-	}
-
-	count, available := inventory()
-	if !available || count < 0 {
-		o.mu.Unlock()
-
-		return
-	}
-
-	o.descendantsObserved = true
-	startPublishing := o.enqueueLocked(func() {
-		o.observeSnapshot(ctx, runtimeProcessProviderDescendant, count)
-	})
-	o.mu.Unlock()
-
-	if startPublishing {
-		o.publish()
-	}
-}
-
-func (o *runtimeProcessObservation) markDescendantsQuiesced(ctx context.Context) {
-	if o == nil || o.observeSnapshot == nil {
-		return
-	}
-
-	o.mu.Lock()
-
-	if o.descendantsQuiesced {
-		o.mu.Unlock()
-
-		return
-	}
-
-	o.descendantsQuiesced = true
-	startPublishing := o.enqueueLocked(func() {
-		o.observeSnapshot(ctx, runtimeProcessProviderDescendant, 0)
-	})
-	o.mu.Unlock()
-
-	if startPublishing {
-		o.publish()
-	}
-}
-
-func (o *runtimeProcessObservation) markExited() {
-	if o == nil {
-		return
-	}
-
-	o.mu.Lock()
-	o.exited = true
-	observed := o.supervisorsObserved
-	o.supervisorsObserved = false
-
-	startPublishing := false
-	if observed && o.observe != nil {
-		startPublishing = o.enqueueLocked(func() {
-			o.observe(context.Background(), runtimeProcessHomeLockSupervisor, -2)
-		})
-	}
-	o.mu.Unlock()
-
-	if startPublishing {
-		o.publish()
-	}
-}
-
-func (o *runtimeProcessObservation) enqueueLocked(event func()) bool {
-	o.pending = append(o.pending, event)
-	if o.publishing {
-		return false
-	}
-
-	o.publishing = true
-
-	return true
-}
-
-func (o *runtimeProcessObservation) publish() {
-	for {
-		o.mu.Lock()
-		if len(o.pending) == 0 {
-			o.publishing = false
-			o.mu.Unlock()
-
-			return
-		}
-
-		event := o.pending[0]
-		o.pending[0] = nil
-		o.pending = o.pending[1:]
-		o.mu.Unlock()
-
-		event()
-	}
-}
-
-func observeOpenCodeStartupStage(ctx context.Context, options StartOptions, lifecycle, stage string, started time.Time, err error) {
-	if options.ObserveStartupStage != nil {
-		options.ObserveStartupStage(ctx, lifecycle, stage, time.Since(started), err)
-	}
+	BrowserShim       *BrowserShim
+	Env               map[string]string
+	NativeEnvironment func() map[string]string
+	PrepareTree       func(context.Context, string) error
+	ReclaimTree       func(context.Context, string) error
+	StartProcess      ProcessStarter
+	Pure              bool
+	QuestionTool      bool
+	LogLevel          string
+	MinVersion        string
+	HealthTimeout     time.Duration
+	Logger            *slog.Logger
+	ExistingXDG       XDGDirs
+	RemoveRoot        bool
+	SkipVersionGate   bool
+	SeedFiles         map[string]string
 }
 
 // MCPServerConfig describes one MCP server exposed to the native OpenCode
@@ -415,9 +247,6 @@ type openCodeServer struct {
 	baseURL                      string
 	username                     string
 	password                     string
-	cmd                          *exec.Cmd
-	process                      *os.Process
-	originalProcessGroup         int
 	cancel                       context.CancelFunc
 	xdg                          XDGDirs
 	log                          *slog.Logger
@@ -425,27 +254,30 @@ type openCodeServer struct {
 	sessionQuestionListSupport   bool
 	nativeVersion                string
 
-	eventStream                  chan EventStreamItem
-	eventReader                  func(context.Context) error
-	closed                       chan struct{}
-	directory                    string
-	scopeCancel                  context.CancelFunc
-	runtimeShutdown              *runtimeShutdownState
-	runtimeClosed                chan struct{}
-	runtimeExited                chan struct{}
-	mcpNames                     []string
-	scopeCloseMu                 sync.Mutex
-	scopeClosed                  bool
-	supervisorControl            io.WriteCloser
-	supervisor                   *supervisorProof
-	ordinaryHomeLock             *homelock.Lock
-	processObservation           *runtimeProcessObservation
-	waitDone                     chan error
-	containmentGenerationCleanup func() error
-	sessionCarrierCleanup        func() error
-	sessionCarrierBroker         *sessionCarrierBroker
-	sessionCarrierReference      string
-	pure                         bool
+	eventStream             chan EventStreamItem
+	eventReader             func(context.Context) error
+	closed                  chan struct{}
+	directory               string
+	scopeCancel             context.CancelFunc
+	runtimeShutdown         *runtimeShutdownState
+	runtimeClosed           chan struct{}
+	runtimeExited           chan struct{}
+	mcpNames                []string
+	scopeCloseMu            sync.Mutex
+	scopeClosed             bool
+	ordinaryHomeLock        *homelock.Lock
+	process                 ProcessHandle
+	settlement              *processSettlement
+	preparedTrees           []preparedNativeTree
+	reclaimTree             func(context.Context, string) error
+	sessionCarrierBroker    *sessionCarrierBroker
+	sessionCarrierReference string
+	pure                    bool
+}
+
+type preparedNativeTree struct {
+	path    string
+	cleanup func() error
 }
 
 type runtimeShutdownState struct {
@@ -878,48 +710,29 @@ type ProviderModelInputCapabilities struct {
 }
 
 var (
-	openCodeCommandContext                     = exec.CommandContext
-	openCodeStartProcess                       = startOpenCodeProcess
-	openCodeApplyCredential                    = applyProcessCredential
-	openCodeSupervisorCommand                  = supervisorCommand
-	openCodeAcquireHomeLock                    = homelock.Acquire
-	openCodeHTTPClient                         = func() *http.Client { return &http.Client{Timeout: 30 * time.Second} }
-	openCodeListen                             = net.Listen
-	openCodeRandReader               io.Reader = rand.Reader
-	openCodeMarshalIndent                      = json.MarshalIndent
-	openCodeSeedMkdirAll                       = os.MkdirAll
-	openCodeSeedWriteFile                      = os.WriteFile
-	openCodeTerminateProcess                   = terminateOpenCodeProcess
-	openCodeKillProcess                        = killOpenCodeProcess
-	openCodeWaitCommand                        = func(cmd *exec.Cmd) error { return cmd.Wait() }
-	openCodeRemoveAll                          = os.RemoveAll
-	openCodeReadFile                           = os.ReadFile
-	openCodePrepareRuntimeGeneration           = prepareDarwinRuntimeGeneration
-	openCodeAfter                              = time.After
-	openCodeReadyPollInterval                  = 100 * time.Millisecond
-	openCodeShutdownTimeout                    = 5 * time.Second
-	openCodeContainmentTimeout                 = 15 * time.Second
+	openCodeAcquireHomeLock             = homelock.Acquire
+	openCodeHTTPClient                  = func() *http.Client { return &http.Client{Timeout: 30 * time.Second} }
+	openCodeListen                      = net.Listen
+	openCodeRandReader        io.Reader = rand.Reader
+	openCodeMarshalIndent               = json.MarshalIndent
+	openCodeSeedMkdirAll                = os.MkdirAll
+	openCodeSeedWriteFile               = os.WriteFile
+	openCodeRemoveAll                   = os.RemoveAll
+	openCodeAfter                       = time.After
+	openCodeReadyPollInterval           = 100 * time.Millisecond
+	openCodeShutdownTimeout             = 5 * time.Second
 )
 
 // HealthCheckTimeout is the default bound on OpenCode server readiness checks.
 const HealthCheckTimeout = 60 * time.Second
 
-// startVerifiedOpenCodeProcess commits the launch. The native file was resolved
-// and validated far earlier in this call, so its identity is confirmed once more
-// here; the supervised arm repeats the confirmation inside the liveness
-// supervisor, which execs the file from another process and another directory.
-func startVerifiedOpenCodeProcess(cmd *exec.Cmd, executable processExecutable) (*supervisorWaiter, error) {
-	if err := executable.verify(); err != nil {
-		return nil, err
+func normalizedStartOptions(options StartOptions) StartOptions {
+	if options.NativeEnvironment == nil {
+		options.NativeEnvironment = captureProcessEnvironment
 	}
 
-	return openCodeStartProcess(cmd)
-}
-
-func normalizedStartOptions(options StartOptions) StartOptions {
-	options.ImplicitEnvironment = maps.Clone(options.ImplicitEnvironment)
-	if options.ProcessIsolation == nil && options.ImplicitEnvironment == nil {
-		options.ImplicitEnvironment = captureProcessEnvironment()
+	if options.StartProcess == nil {
+		options.StartProcess = startOrdinaryProcess
 	}
 
 	if options.Logger == nil {
@@ -947,10 +760,6 @@ func resolveRuntimeXDG(options StartOptions) (XDGDirs, error) {
 			root = filepath.Join(options.ScratchParent, "acp-go-opencode")
 		}
 
-		if options.NativeOwnedXDG {
-			return RuntimeXDGDirs(root), nil
-		}
-
 		created, err := CreateRuntimeXDGDirs(root)
 		if err != nil {
 			return XDGDirs{}, err
@@ -959,21 +768,11 @@ func resolveRuntimeXDG(options StartOptions) (XDGDirs, error) {
 		xdg = created
 	}
 
-	if !options.NativeOwnedXDG {
-		if err := ensureXDGDirs(xdg); err != nil {
-			return XDGDirs{}, err
-		}
-	}
-
-	if options.NativeOwnedXDG && !validRuntimeXDGDirs(xdg) {
-		return XDGDirs{}, errors.New("native-owned XDG directories must match their runtime root")
+	if err := ensureXDGDirs(xdg); err != nil {
+		return XDGDirs{}, err
 	}
 
 	return xdg, nil
-}
-
-func validRuntimeXDGDirs(dirs XDGDirs) bool {
-	return dirs == RuntimeXDGDirs(dirs.Root)
 }
 
 func runtimeConfigContent(seedFiles map[string]string, sessionCarrierPlugin string) (string, map[string][]byte, error) {
@@ -1020,45 +819,69 @@ func runtimeConfigContent(seedFiles map[string]string, sessionCarrierPlugin stri
 	return string(data), writes, nil
 }
 
-func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) { //nolint:gocyclo // Startup owns the ordered resource-transfer rollback sequence.
+func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) { //nolint:gocyclo // Startup is one ordered transaction across materialization, authority transfer, launch, and readiness.
 	options = normalizedStartOptions(options)
+	managedCallbacks := 0
 
-	// An explicit policy is checked before the launch touches anything. A
-	// policy this platform or this shape cannot honor refuses here, with no
-	// runtime root created, no ownership handed off, and no second attempt
-	// under ordinary execution.
-	if err := validateProcessIsolation(options.ProcessIsolation); err != nil {
-		return nil, err
+	for _, configured := range []bool{options.PrepareTree != nil, options.ReclaimTree != nil} {
+		if configured {
+			managedCallbacks++
+		}
 	}
 
-	// A hardened identity policy cannot be downgraded to a process-group
-	// boundary, so the combination is invalid rather than one of the two
-	// silently winning.
-	if options.ProcessIsolation != nil && options.DarwinBestEffort {
-		return nil, errors.New("explicit process isolation cannot be combined with darwin best-effort containment")
+	if managedCallbacks == 1 {
+		return nil, errors.New("native tree authority is incomplete")
 	}
 
-	xdg, err := resolveRuntimeXDG(options)
-	if err != nil {
-		return nil, err
+	xdg, resolveErr := resolveRuntimeXDG(options)
+	if resolveErr != nil {
+		return nil, resolveErr
 	}
 
-	var (
-		sessionCarrier        sessionCarrierPlugin
-		sessionCarrierCleanup func() error
-	)
+	var sessionCarrier sessionCarrierPlugin
 
 	if !options.Pure {
-		sessionCarrier, sessionCarrierCleanup, err = materializeSessionCarrierPlugin(xdg.Root, options.ProcessIsolation)
-		if err != nil {
-			return nil, err
+		var carrierErr error
+
+		sessionCarrier, carrierErr = materializeSessionCarrierPlugin(xdg.Root)
+		if carrierErr != nil {
+			return nil, carrierErr
 		}
-		defer func() {
-			if sessionCarrierCleanup != nil {
-				resultErr = errors.Join(resultErr, sessionCarrierCleanup())
-			}
-		}()
 	}
+
+	preparedTrees := make([]preparedNativeTree, 0, 3)
+	runtimeTree := preparedNativeTree{path: xdg.Root}
+
+	if options.RemoveRoot {
+		runtimeTree.cleanup = func() error {
+			cleanupErr := errors.Join(
+				openCodeRemoveAll(xdg.Root),
+				openCodeRemoveAll(ControlRootForXDG(xdg.Root)),
+			)
+			if cleanupErr != nil {
+				return errors.Join(ErrRuntimeScratchCleanup, cleanupErr)
+			}
+
+			return nil
+		}
+	}
+
+	transferred := false
+	defer func() {
+		if transferred {
+			return
+		}
+
+		if options.ReclaimTree != nil {
+			resultErr = errors.Join(resultErr, reclaimPreparedTrees(context.Background(), preparedTrees, options.ReclaimTree))
+		} else {
+			for _, tree := range preparedTrees {
+				if tree.cleanup != nil {
+					resultErr = errors.Join(resultErr, tree.cleanup())
+				}
+			}
+		}
+	}()
 
 	controlRoot := options.ControlRoot
 	if controlRoot == "" {
@@ -1069,356 +892,148 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		return nil, controlErr
 	}
 
-	configurationStarted := time.Now()
+	runtimeConfig, configErr := materializeOpenCodeRuntimeConfig(xdg, options.SeedFiles, sessionCarrier.URL)
+	if configErr != nil {
+		return nil, configErr
+	}
 
-	var runtimeConfig string
+	if options.PrepareTree != nil {
+		trees := []preparedNativeTree{runtimeTree}
+		if sessionCarrier.Root != "" {
+			trees = append(trees, preparedNativeTree{path: sessionCarrier.Root, cleanup: sessionCarrier.Cleanup})
+		}
 
-	if options.NativeOwnedXDG {
-		var writes map[string][]byte
+		if options.BrowserShim != nil {
+			trees = append(trees, preparedNativeTree{path: options.BrowserShim.Dir()})
+		}
 
-		runtimeConfig, writes, err = runtimeConfigContent(options.SeedFiles, sessionCarrier.URL)
-		if err == nil {
-			delete(writes, openCodeConfigFileName)
-
-			for path := range writes {
-				err = fmt.Errorf("seed file %q is unsupported with native-owned XDG", path)
-
-				break
+		for _, tree := range trees {
+			if prepareErr := options.PrepareTree(ctx, tree.path); prepareErr != nil {
+				return nil, prepareErr
 			}
+
+			preparedTrees = append(preparedTrees, tree)
 		}
 	} else {
-		runtimeConfig, err = materializeOpenCodeRuntimeConfig(xdg, options.SeedFiles, sessionCarrier.URL)
-	}
-
-	observeOpenCodeStartupStage(ctx, options, "runtime", "configuration", configurationStarted, err)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if options.HandoffXDG {
-		if handoffErr := handoffGeneratedNativeTree(xdg.Root, options.ProcessIsolation); handoffErr != nil {
-			return nil, handoffErr
+		preparedTrees = append(preparedTrees, runtimeTree)
+		if sessionCarrier.Root != "" {
+			preparedTrees = append(preparedTrees, preparedNativeTree{path: sessionCarrier.Root, cleanup: sessionCarrier.Cleanup})
 		}
 	}
 
-	if options.BrowserShim != nil {
-		if handoffErr := options.BrowserShim.Handoff(options.ProcessIsolation); handoffErr != nil {
-			return nil, handoffErr
-		}
+	port, portErr := allocatePort()
+	if portErr != nil {
+		return nil, portErr
 	}
 
-	port, err := allocatePort()
-	if err != nil {
-		return nil, err
-	}
-
-	password, err := randomPassword()
-	if err != nil {
-		return nil, err
+	password, passwordErr := randomPassword()
+	if passwordErr != nil {
+		return nil, passwordErr
 	}
 
 	username := opencodeDefaultUsername
 
-	args := []string{opencodeServeCommand, "--hostname", "127.0.0.1", "--port", strconv.Itoa(port)}
+	arguments := []string{opencodeServeCommand, "--hostname", "127.0.0.1", "--port", strconv.Itoa(port)}
 	if options.Pure {
-		args = append(args, "--pure")
+		arguments = append(arguments, "--pure")
 	}
 
 	if options.LogLevel != "" {
-		args = append(args, "--log-level", options.LogLevel)
+		arguments = append(arguments, "--log-level", options.LogLevel)
 	}
 
-	env, err := buildProcessEnvironmentFrom(
-		options.ProcessIsolation,
-		options.ImplicitEnvironment,
-		withoutManagedRootOverrides(options.Env),
-	)
-	if err != nil {
-		return nil, err
+	baseEnvironment := options.NativeEnvironment()
+	if baseEnvironment == nil {
+		return nil, errors.New("native environment is unavailable")
 	}
 
-	env["XDG_DATA_HOME"] = xdg.Data
-	env["XDG_CONFIG_HOME"] = xdg.Config
-	env["XDG_CACHE_HOME"] = xdg.Cache
-	env["XDG_STATE_HOME"] = xdg.State
-	env["OPENCODE_SERVER_USERNAME"] = username
-	env["OPENCODE_SERVER_PASSWORD"] = password
+	environment, environmentErr := buildProcessEnvironmentFrom(baseEnvironment, withoutManagedRootOverrides(options.Env))
+	if environmentErr != nil {
+		return nil, environmentErr
+	}
 
-	env["OPENCODE_CONFIG_CONTENT"] = runtimeConfig
+	environment["XDG_DATA_HOME"] = xdg.Data
+	environment["XDG_CONFIG_HOME"] = xdg.Config
+	environment["XDG_CACHE_HOME"] = xdg.Cache
+	environment["XDG_STATE_HOME"] = xdg.State
+	environment["OPENCODE_SERVER_USERNAME"] = username
+	environment["OPENCODE_SERVER_PASSWORD"] = password
+	environment["OPENCODE_CONFIG_CONTENT"] = runtimeConfig
+
 	if options.QuestionTool {
-		env["OPENCODE_ENABLE_QUESTION_TOOL"] = "1"
+		environment["OPENCODE_ENABLE_QUESTION_TOOL"] = "1"
 	}
 
-	nativeEnv := envMapToSlice(env)
+	nativeEnvironment := envMapToSlice(environment)
 	if options.BrowserShim != nil {
-		nativeEnv = options.BrowserShim.environ(nativeEnv)
+		nativeEnvironment = options.BrowserShim.environ(nativeEnvironment)
 	}
 
-	configuredExecutable := options.ExecutablePath
-	if configuredExecutable == "" {
-		configuredExecutable = opencodeExecutableName
+	executable := options.ExecutablePath
+	if executable == "" {
+		executable = opencodeExecutableName
 	}
 
-	executable, err := resolveProcessExecutable(configuredExecutable, nativeEnv, options.ProcessIsolation != nil)
-	if err != nil {
-		return nil, fmt.Errorf("find OpenCode executable: %w", err)
+	homeLock, lockErr := openCodeAcquireHomeLock(controlRoot)
+	if lockErr != nil {
+		return nil, lockErr
 	}
-
-	processCtx, cancel := context.WithCancel(context.Background())
-
-	containmentGenerationRoot, releaseContainmentGeneration, err := openCodePrepareRuntimeGeneration(ctx, options)
-	if err != nil {
-		cancel()
-
-		return nil, err
-	}
-
-	containmentGenerationTransferred := false
-
 	defer func() {
-		// Once native start makes containment incomplete, neither this frame nor
-		// its caller can prove the generation is quiescent. Keep both the root and
-		// its reservation; the root agent latches the returned sentinel.
-		if !containmentGenerationTransferred && !errors.Is(resultErr, ErrProcessContainmentIncomplete) {
-			resultErr = errors.Join(resultErr, releaseContainmentGeneration())
+		if !transferred {
+			resultErr = errors.Join(resultErr, homeLock.Release())
 		}
 	}()
 
-	var cmd *exec.Cmd
-
-	var supervisor *supervisorProof
-
-	// An ordinary launch that cannot reach the guardian/liveness pair keeps the
-	// portable writable-home exclusion here instead. The shared XDG root is
-	// still single-writer across processes; what this arm does not carry is any
-	// descendant inventory or whole-tree claim.
-	var ordinaryHomeLock *homelock.Lock
-
-	if !options.skipSupervisor && ordinaryDirectExecution(options.ProcessIsolation, options.DarwinBestEffort) {
-		ordinaryHomeLock, err = openCodeAcquireHomeLock(controlRoot)
-		if err != nil {
-			cancel()
-
-			return nil, err
-		}
-
-		defer func() {
-			if resultErr != nil {
-				resultErr = errors.Join(resultErr, ordinaryHomeLock.Release())
-			}
-		}()
-	}
-
-	if options.skipSupervisor {
-		cmd = openCodeCommandContext(processCtx, executable.Path, args...)
-		cmd.Env = nativeEnv
-
-		if credentialErr := openCodeApplyCredential(cmd, options.ProcessIsolation); credentialErr != nil {
-			cancel()
-
-			return nil, credentialErr
-		}
-	} else {
-		supervisorScratch := controlRoot
-		if containmentGenerationRoot != "" {
-			supervisorScratch = containmentGenerationRoot
-		}
-
-		cmd, supervisor, err = openCodeSupervisorCommand(processCtx, supervisorConfig{
-			NativeExecutable: executable,
-			NativeArgs:       args,
-			NativeEnv:        nativeEnv,
-			NativeDir:        "",
-			Home:             controlRoot,
-			Scratch:          supervisorScratch,
-			ScratchParent:    options.ContainmentScratchParent,
-			LifecycleKind:    darwinLifecycleRuntime,
-			DarwinBestEffort: options.DarwinBestEffort,
-			Isolation:        options.ProcessIsolation,
-		})
-		if err != nil {
-			cancel()
-
-			return nil, err
-		}
-	}
-
-	var supervisorControl io.WriteCloser
-	if supervisor != nil {
-		supervisorControl, err = cmd.StdinPipe()
-		if err != nil {
-			cancel()
-
-			return nil, err
-		}
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-
-		return nil, err
-	}
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		cancel()
-
-		return nil, err
-	}
-
-	lease, leaseErr := leasePendingServer(options, port, username, password, cancel)
-	if leaseErr != nil {
-		return nil, leaseErr
-	}
-
-	spawnStarted := time.Now()
-
-	runtimeWaiter, startErr := startVerifiedOpenCodeProcess(cmd, executable)
+	process, startErr := options.StartProcess(ctx, executable, arguments, nativeEnvironment, xdg.Root)
 	if startErr != nil {
-		_ = supervisor.closeInherited()
-
-		observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, startErr)
-
-		if supervisorControl != nil {
-			_ = supervisorControl.Close()
-		}
-
-		cancel()
-
 		return nil, startErr
 	}
 
-	if closeErr := supervisor.closeInherited(); closeErr != nil {
-		_ = cmd.Process.Kill()
-
-		runtimeWaiter.start()
-		<-runtimeWaiter.result()
-
-		cancel()
-
-		return nil, fmt.Errorf("close inherited supervisor config: %w", closeErr)
+	if !process.valid() {
+		return nil, errors.New("native process handle is incomplete")
 	}
 
-	process := cmd.Process
+	settlement := newProcessSettlement(process)
+	settlement.start()
 
-	if leaseErr := leaseStartedServer(options, lease, process, supervisorControl, cancel); leaseErr != nil {
-		runtimeWaiter.start()
-		<-runtimeWaiter.result()
-
-		return nil, leaseErr
-	}
-
-	originalProcessGroup, err := supervisorReleaseIndependentWaiter(cmd, runtimeWaiter)
-	if err != nil {
-		observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, err)
-
-		if supervisorControl != nil {
-			_ = supervisorControl.Close()
-		}
-
-		_ = cmd.Process.Kill()
-
-		runtimeWaiter.start()
-		<-runtimeWaiter.result()
-
-		cancel()
-
-		return nil, err
-	}
-
-	observeOpenCodeStartupStage(ctx, options, "runtime", "spawn", spawnStarted, nil)
-
-	if options.Logger != nil {
-		options.Logger.DebugContext(ctx, "opencode startup stage complete", slog.String("stage", "spawn"), slog.Duration("elapsed", time.Since(spawnStarted)))
-	}
-
-	waitDone := runtimeWaiter.result()
 	runtimeExited := make(chan struct{})
-	processObservation := &runtimeProcessObservation{
-		observe:         options.ObserveProcess,
-		observeSnapshot: options.ObserveProcessSnapshot,
-	}
 
 	go func() {
-		defer processObservation.markExited()
-
-		<-runtimeWaiter.done
-
+		<-settlement.done
 		close(runtimeExited)
 	}()
 
-	go drainProcessPipe(options.Logger, "opencode stdout", stdout)
-	go drainProcessPipe(options.Logger, "opencode stderr", stderr)
+	go drainProcessPipe(options.Logger, "opencode stdout", process.Output)
+	go drainProcessPipe(options.Logger, "opencode stderr", process.Errors)
 
+	processCtx, cancel := context.WithCancel(context.Background())
 	server := &openCodeServer{
-		httpClient:                   openCodeHTTPClient(),
-		baseURL:                      "http://127.0.0.1:" + strconv.Itoa(port),
-		username:                     username,
-		password:                     password,
-		cmd:                          cmd,
-		process:                      process,
-		originalProcessGroup:         originalProcessGroup,
-		cancel:                       cancel,
-		xdg:                          xdg,
-		log:                          options.Logger,
-		eventStream:                  make(chan EventStreamItem, 256),
-		closed:                       make(chan struct{}),
-		runtimeShutdown:              newRuntimeShutdownState(),
-		runtimeClosed:                make(chan struct{}),
-		runtimeExited:                runtimeExited,
-		supervisorControl:            supervisorControl,
-		supervisor:                   supervisor,
-		ordinaryHomeLock:             ordinaryHomeLock,
-		processObservation:           processObservation,
-		waitDone:                     waitDone,
-		containmentGenerationCleanup: releaseContainmentGeneration,
-		sessionCarrierCleanup:        sessionCarrierCleanup,
-		sessionCarrierBroker:         sessionCarrier.Broker,
-		pure:                         options.Pure,
+		httpClient: openCodeHTTPClient(), baseURL: "http://127.0.0.1:" + strconv.Itoa(port),
+		username: username, password: password, cancel: cancel, xdg: xdg, log: options.Logger,
+		eventStream: make(chan EventStreamItem, 256), closed: make(chan struct{}),
+		runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}), runtimeExited: runtimeExited,
+		ordinaryHomeLock: homeLock, process: process, settlement: settlement,
+		preparedTrees: preparedTrees, reclaimTree: options.ReclaimTree,
+		sessionCarrierBroker: sessionCarrier.Broker, pure: options.Pure,
 	}
-	sessionCarrierCleanup = nil
-	containmentGenerationTransferred = true
+	transferred = true
 
 	readyCtx, readyCancel := context.WithTimeout(ctx, options.HealthTimeout)
 	defer readyCancel()
 
-	readinessStarted := time.Now()
-	if err := server.waitReady(readyCtx, processCtx, options); err != nil {
-		observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, err)
-
-		shutdownErr := server.Shutdown(readyCtx)
-
-		return nil, errors.Join(err, shutdownErr)
+	if readyErr := server.waitReady(readyCtx, processCtx, options); readyErr != nil {
+		return nil, errors.Join(readyErr, server.Shutdown(context.Background()))
 	}
 
-	// A runtime that cannot prove its carrier plugin is live is a runtime whose
-	// every shell operation would run with no bearer, no operation directories
-	// and no error. It never reaches a session, so it is not ready either: the
-	// carrier proof closes the readiness stage rather than opening its own.
 	if sessionCarrier.URL != "" {
 		carrierCtx, carrierCancel := context.WithTimeout(ctx, options.HealthTimeout)
 		carrierErr := server.proveSessionCarrierLoaded(carrierCtx, sessionCarrier.Proof)
 
 		carrierCancel()
 
-		if carrierErr == nil {
-			carrierErr = eraseSessionCarrierBootstrap(sessionCarrier)
-		}
-
 		if carrierErr != nil {
-			observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, carrierErr)
-
-			return nil, errors.Join(carrierErr, server.Shutdown(ctx))
+			return nil, errors.Join(carrierErr, server.Shutdown(context.Background()))
 		}
-	}
-
-	observeOpenCodeStartupStage(ctx, options, "runtime", "readiness", readinessStarted, nil)
-
-	if supervisor != nil {
-		processObservation.markSupervisorsReady(ctx)
-		processObservation.markDescendantsReady(ctx, supervisor.processSnapshot)
 	}
 
 	return server, nil
@@ -1434,9 +1049,8 @@ func ControlRootForXDG(root string) string {
 // OpenCode instantiates a plugin lazily, with the first directory-scoped
 // request rather than at listen time, and it treats a plugin it cannot load as
 // non-fatal: the server reaches readiness, shell operations succeed, and the
-// carrier is simply absent. The scoped request below is what forces the load,
-// and the marker the plugin writes as it is instantiated is what distinguishes
-// "the hooks are installed" from "the hooks were never registered".
+// carrier is simply absent. The scoped request below forces the load, and the
+// plugin acknowledges readiness through the in-memory carrier broker.
 func (s *openCodeServer) proveSessionCarrierLoaded(ctx context.Context, proof sessionCarrierProof) error {
 	var ignored map[string]any
 
@@ -1444,16 +1058,11 @@ func (s *openCodeServer) proveSessionCarrierLoaded(ctx context.Context, proof se
 		return fmt.Errorf("drive the OpenCode session carrier plugin: %w", err)
 	}
 
-	for {
-		if content, err := openCodeReadFile(proof.Path); err == nil && string(content) == proof.Token {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return errors.New("opencode session carrier plugin did not load; refusing a runtime whose shell operations would carry no session")
-		case <-openCodeAfter(openCodeReadyPollInterval):
-		}
+	select {
+	case <-proof.Ready:
+		return nil
+	case <-ctx.Done():
+		return errors.New("opencode session carrier plugin did not load; refusing a runtime whose shell operations would carry no session")
 	}
 }
 
@@ -1576,7 +1185,7 @@ func (s *openCodeServer) releaseSessionCarrier() {
 	s.sessionCarrierBroker.remove(s.sessionCarrierReference)
 }
 
-func (s *openCodeServer) Shutdown(context.Context) error {
+func (s *openCodeServer) Shutdown(ctx context.Context) error {
 	if s.scopeCancel != nil {
 		return ErrScopeRuntimeShutdown
 	}
@@ -1598,22 +1207,20 @@ func (s *openCodeServer) Shutdown(context.Context) error {
 		}()
 	})
 
-	<-state.done
-	state.mu.Lock()
-	defer state.mu.Unlock()
+	select {
+	case <-state.done:
+		state.mu.Lock()
+		defer state.mu.Unlock()
 
-	return state.err
+		return state.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *openCodeServer) shutdownRuntime() error {
-	terminateProcess := openCodeTerminateProcess
-	killProcess := openCodeKillProcess
-	waitCommand := openCodeWaitCommand
-	after := openCodeAfter
-	shutdownTimeout := openCodeShutdownTimeout
-
-	proofCtx, proofCancel := context.WithTimeout(context.Background(), openCodeContainmentTimeout)
-	defer proofCancel()
+	cleanupCtx := context.Background()
+	waitSucceeded := false
 
 	if s.runtimeClosed != nil {
 		close(s.runtimeClosed)
@@ -1624,126 +1231,72 @@ func (s *openCodeServer) shutdownRuntime() error {
 		err = errors.Join(err, s.sessionCarrierBroker.Close())
 	}
 
-	if s.cmd != nil && s.cmd.Process != nil {
-		process := s.process
-		if process == nil {
-			process = s.cmd.Process
-		}
-
-		if s.supervisorControl != nil {
-			_ = s.supervisorControl.Close()
-		} else {
-			_ = terminateProcess(process, s.originalProcessGroup)
-		}
-
-		done := s.waitDone
-		if done == nil {
-			done = make(chan error, 1)
-			go func() { done <- waitCommand(s.cmd) }()
-		}
-
-		waited, _, waitErr := waitForOpenCodeRuntimeShutdown(
-			s,
-			process,
-			done,
-			proofCtx,
-			shutdownTimeout,
-			killProcess,
-			after,
-		)
-		err = errors.Join(err, waitErr)
-
-		if s.supervisor != nil {
-			proofErr := s.supervisor.awaitCompletion(proofCtx)
-			if proofErr == nil && waited {
-				s.processObservation.markDescendantsQuiesced(context.Background())
+	if s.settlement != nil {
+		select {
+		case <-s.settlement.done:
+		default:
+			if s.process.Input != nil {
+				err = errors.Join(err, s.process.Input.Close())
 			}
 
-			err = errors.Join(err, proofErr)
-		} else if !waited {
-			err = errors.Join(err, ErrProcessContainmentIncomplete)
+			err = errors.Join(err, s.process.Stop(cleanupCtx))
 		}
+
+		_, waitErr := s.settlement.wait(cleanupCtx)
+		err = errors.Join(err, waitErr)
+		waitSucceeded = waitErr == nil
 	}
 
 	if s.cancel != nil {
 		s.cancel()
 	}
 
-	err = errors.Join(err, s.ordinaryHomeLock.Release())
-	if s.sessionCarrierCleanup != nil && !errors.Is(err, ErrProcessContainmentIncomplete) {
-		err = errors.Join(err, s.sessionCarrierCleanup())
-		s.sessionCarrierCleanup = nil
+	if s.ordinaryHomeLock != nil {
+		err = errors.Join(err, s.ordinaryHomeLock.Release())
 	}
 
-	if s.containmentGenerationCleanup != nil && !errors.Is(err, ErrProcessContainmentIncomplete) {
-		err = errors.Join(err, s.containmentGenerationCleanup())
+	if s.settlement != nil && waitSucceeded {
+		select {
+		case <-s.settlement.done:
+			if s.reclaimTree != nil {
+				err = errors.Join(err, reclaimPreparedTrees(cleanupCtx, s.preparedTrees, s.reclaimTree))
+			} else {
+				for _, tree := range s.preparedTrees {
+					if tree.cleanup != nil {
+						err = errors.Join(err, tree.cleanup())
+					}
+				}
+			}
+
+			s.preparedTrees = nil
+		default:
+		}
 	}
 
 	return err
 }
 
-func waitForOpenCodeRuntimeShutdown(
-	server *openCodeServer,
-	process *os.Process,
-	done <-chan error,
-	proofCtx context.Context,
-	shutdownTimeout time.Duration,
-	killProcess func(*os.Process, int) error,
-	after func(time.Duration) <-chan time.Time,
-) (waited bool, quarantined bool, result error) {
-	var quarantinePoll <-chan time.Time
+func reclaimPreparedTrees(
+	ctx context.Context,
+	trees []preparedNativeTree,
+	reclaim func(context.Context, string) error,
+) error {
+	var result error
 
-	if server.supervisor != nil {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
+	for index := len(trees) - 1; index >= 0; index-- {
+		tree := trees[index]
+		if err := reclaim(ctx, tree.path); err != nil {
+			result = errors.Join(result, err)
 
-		quarantinePoll = ticker.C
-	}
-
-	shutdownDone := after(shutdownTimeout)
-
-	for {
-		select {
-		case waitErr := <-done:
-			if waitErr != nil && server.log != nil {
-				server.log.DebugContext(proofCtx, "opencode exited during shutdown")
-			}
-
-			return true, false, nil
-		case <-shutdownDone:
-			if server.supervisor == nil {
-				_ = killProcess(process, server.originalProcessGroup)
-			}
-
-			result = errors.New("opencode process did not exit after shutdown")
-		case <-proofCtx.Done():
-			if server.supervisor == nil {
-				_ = killProcess(process, server.originalProcessGroup)
-			}
-
-			return false, false, errors.Join(ErrProcessContainmentIncomplete, proofCtx.Err())
-		case <-quarantinePoll:
-			present, quarantineErr := server.supervisor.quarantineDetected()
-			if quarantineErr != nil {
-				return false, true, errors.Join(ErrProcessContainmentIncomplete, quarantineErr)
-			}
-
-			if present {
-				return false, true, errors.Join(ErrProcessContainmentIncomplete, errors.New("OpenCode supervisor entered containment quarantine"))
-			}
+			continue
 		}
 
-		if server.supervisor != nil {
-			return false, false, result
-		}
-
-		select {
-		case <-done:
-			return true, false, result
-		case <-proofCtx.Done():
-			return false, false, errors.Join(result, ErrProcessContainmentIncomplete, proofCtx.Err())
+		if tree.cleanup != nil {
+			result = errors.Join(result, tree.cleanup())
 		}
 	}
+
+	return result
 }
 
 func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Client, error) {
@@ -1779,7 +1332,7 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 	scopeCtx, cancel := context.WithCancel(context.Background())
 	scope := &openCodeServer{
 		httpClient: s.httpClient, baseURL: s.baseURL, username: s.username,
-		password: s.password, cmd: s.cmd, cancel: s.cancel, xdg: s.xdg,
+		password: s.password, cancel: s.cancel, xdg: s.xdg,
 		log: s.log, sessionPermissionListSupport: s.sessionPermissionListSupport,
 		sessionQuestionListSupport: s.sessionQuestionListSupport,
 		nativeVersion:              s.nativeVersion,
@@ -3409,7 +2962,7 @@ func validateOpenCodeSeedPath(rel string) (string, error) {
 	}
 
 	for _, segment := range strings.Split(filepath.ToSlash(rel), "/") {
-		if segment == parentPathSegment {
+		if segment == ".." {
 			return "", unsupportedField(seedFileField(rel))
 		}
 	}

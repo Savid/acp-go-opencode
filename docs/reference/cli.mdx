@@ -10,80 +10,20 @@ acp-go-opencode [flags]
 The binary speaks ACP over stdin/stdout; stdout carries JSON-RPC only and
 diagnostics go to stderr. It uses Go `flag` single-dash syntax.
 
-## Optional standalone isolation policy
+## Execution mode
 
-`-process-isolation-config` is optional. Omitting it selects ordinary
-current-identity mode on every supported platform, with no privileged setup and
-no policy load. The
-command runs OpenCode as its own root or non-root identity, applies no UID/GID
-or supplementary-group change, keeps the portable writable-home claim and
-liveness, and reports the non-authoritative `shared_identity`.
-
-Supplying `-process-isolation-config=/absolute/path/process-isolation.json`
-explicitly selects the hardened Linux policy and binds `-home` to
-`standaloneStateRoot`. It is Linux-only; every loader, decode, validation,
-authority, and unsupported-platform failure exits before ACP serving or native
-spawn, with no ordinary-mode retry. Explicit process isolation is fail closed
-without fallback: it never degrades to ordinary execution.
-The policy must be a root-owned, single-link regular file with mode `0600`.
-Every component is opened from `/` without following symlinks, and every
-ancestor must be root-owned and not writable by group or other. Unknown JSON
-fields and trailing JSON values are rejected.
-
-```json
-{
-  "uid": 20001,
-  "gid": 20001,
-  "standaloneOwnerId": "opencode-deployment-1",
-  "standaloneStateRoot": "/var/lib/acp-go-opencode",
-  "baseEnvironment": {
-    "PATH": "/usr/local/bin:/usr/bin:/bin",
-    "HOME": "/var/lib/acp-go-opencode",
-    "USER": "acp-go-opencode",
-    "LOGNAME": "acp-go-opencode",
-    "LANG": "C.UTF-8"
-  },
-  "inheritEnvironment": []
-}
-```
-
-`standaloneOwnerId` is the nonsecret, case-sensitive deployment identity:
-1--256 ASCII bytes, beginning alphanumeric, with remaining bytes limited to
-alphanumerics and `._:@/-`. `standaloneStateRoot` is the existing dedicated
-durable provider state root, is neither `/` nor equal to or beneath
-`/var/lib/acp-go/agent-identities`, and must equal the configured native home. Its clean
-absolute UTF-8 path is limited to 4096 bytes with no control character, and
-Linux resolves the complete path componentwise from `/` without following
-symlinks or magic links. Every ancestor is root-owned and not group/world
-writable; the final directory is owned by the configured UID:GID with mode
-`0700`. It binds the exact path, device, and inode.
-
-The supervisor must run as root. The UID/GID must name a nonroot account with
-that same-name private primary group, no supplementary groups, and a target-owned mode
-`0700` home matching `HOME`, reached without symlinks beneath protected
-root-owned ancestry; `/root` and `/nonexistent` are forbidden. `USER` and
-`LOGNAME` must match the account.
-`PATH` must contain existing canonical absolute directories. The child gets
-only `baseEnvironment` plus variables explicitly named in
-`inheritEnvironment`; identity, search-path, loader, interpreter, XDG/native
-home, and adapter-private variables cannot be inherited. Unset or duplicate
-inheritance entries fail startup. Darwin, Windows, and other platforms refuse
-this explicit Linux policy rather than weakening its contract.
-
-Provision the target as a locked system account with a non-login shell, its
-same-name private group, and no sudo policy. Its UID and primary GID cannot be
-shared by another account. Password locking is not a substitute for disabling
-login paths, and a locked account still needs the validated private writable
-home for native tools.
+The command uses ordinary same-identity execution on every supported platform.
+It exposes no flag for managed host authority. Applications that require a
+host-owned native process boundary embed the Go package and pass
+`WithHostAuthority`.
 
 ## Flags
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `-path` | Path to the `opencode` CLI. | resolved from `PATH` |
-| `-process-isolation-config` | Optional absolute path to the explicit standalone Linux isolation policy described above. | — |
 | `-scratch-dir` | Parent for the shared runtime root and transient adapter scratch. | system temp directory |
-| `-home` | Exact exclusive shared OpenCode XDG root; only an explicit isolation policy binds it to `standaloneStateRoot`. | generated root, or policy value |
+| `-home` | Exact exclusive shared OpenCode XDG root. | generated root |
 | `-provider-auth-root` | Durable host-owned root holding the provider-auth ledger. Empty leaves the provider-auth surface unadvertised. | — |
 | `-provider-auth-direct-home` | Canonical native home an account-level provider-auth leg may read or clear. Rejected by this adapter at session start. | — |
 | `-model` | Default model as `provider/model`. | — |
@@ -94,32 +34,6 @@ home for native tools.
 | `-opencode-log-level` | Native OpenCode server log level. | native default |
 | `-opencode-health-timeout` | OpenCode server readiness timeout. | `60s` |
 | `-seed-file <relpath>=<hostpath>` | Seed a file into the shared runtime config root (repeatable). | — |
-
-Ordinary launches claim no containment boundary on any platform. The operational
-subcommands below inspect generations left by an embedded host using
-`WithDarwinBestEffortContainment`.
-
-Operators can inspect retained records without signalling processes:
-
-```sh
-acp-go-opencode containment diagnose -scratch-dir /path/to/scratch
-```
-
-Cleanup is deliberately explicit and revalidates every marker-correlated PID:
-
-```sh
-acp-go-opencode containment cleanup \
-  -scratch-dir /path/to/scratch \
-  -runtime-id 0123456789abcdef0123456789abcdef \
-  -force
-```
-
-PID-by-PID cleanup has an unavoidable PID-reuse time-of-check/time-of-use race:
-the PID can be reassigned after revalidation and an unrelated process can be
-signalled. Marker correlation is not ownership. Markers can be scrubbed, so
-cleanup can leave escaped processes behind; ambiguous identities are reported
-and are not signalled. The fixed five-second cleanup deadline starts before the
-first process enumeration.
 
 ## Seeding files
 

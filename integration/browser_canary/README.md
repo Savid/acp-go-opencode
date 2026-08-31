@@ -1,10 +1,10 @@
-# Real-native browser containment canary
+# Real-native browser canary
 
 This fixture drives OpenCode's current Snowflake external-browser login through
 the adapter's production provider-auth broker, then uses passive `execve`
 tracing to require a real browser attempt and prove every launcher resolved
 inside the production-generated shim. The runtime container has no GUI,
-credentials, host mounts, or network.
+credentials, host mounts, network, or supplied host authority.
 
 In this pinned release the Snowflake method launches its authorization URL and
 then returns a loopback completion variant. The production broker rejects that

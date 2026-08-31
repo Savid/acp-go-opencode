@@ -51,6 +51,18 @@ func handoffEnvelope(decoded []byte) map[string]any {
 	}
 }
 
+func TestHandoffCapabilityScalar(t *testing.T) {
+	response, err := NewAgent(WithInputHandoffRoot(t.TempDir())).Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+	})
+	require.NoError(t, err)
+
+	handoff, ok := response.AgentCapabilities.Meta["acp-go.dev/handoff"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, 1, handoff["version"])
+	require.Len(t, handoff, 1)
+}
+
 // handoffBlock builds the handoff input form: an image block with empty data,
 // a file URI, and a handoff envelope.
 func handoffBlock(mime, path string, envelope any) acp.ContentBlock {

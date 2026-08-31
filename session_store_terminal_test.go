@@ -70,7 +70,7 @@ func TestInspectSessionStoreTerminalStateRejectsMalformedOrUnsupportedEntry(t *t
 		},
 		"unsupported format": {
 			entries: []SessionStoreEntry{mutateTerminalTestSnapshot(t, valid, func(snapshot *stateSnapshot) {
-				snapshot.Format = "removed-format"
+				snapshot.Format = "unknown-format"
 			})},
 			sessionID: "session", wantErr: "unsupported opencode store format",
 		},

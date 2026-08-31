@@ -324,7 +324,7 @@ func TestMaterializeLocalImage(t *testing.T) {
 
 		// A configured scratch dir moves the scratch parent off the temp
 		// directory, so the temp directory is a root here on its own account.
-		session.agent.options.ScratchDir = t.TempDir()
+		WithScratchDir(t.TempDir())(&session.agent.options)
 
 		// The real os.TempDir, not a narrowed one, and reached through
 		// os.MkdirTemp so the fixture sits wherever this platform actually puts
@@ -350,8 +350,9 @@ func TestMaterializeLocalImage(t *testing.T) {
 		session, _ := newImageSession(t)
 
 		base := t.TempDir()
-		session.agent.options.ScratchDir = filepath.Join(base, "scratch")
-		require.NoError(t, os.Mkdir(session.agent.options.ScratchDir, 0o700))
+		scratch := filepath.Join(base, "scratch")
+		WithScratchDir(scratch)(&session.agent.options)
+		require.NoError(t, os.Mkdir(scratch, 0o700))
 
 		// The temp directory is a symlink on macOS, so the root has to be
 		// resolved to the same degree as the candidate or it never matches.
@@ -473,7 +474,7 @@ func TestMaterializeLocalImageSeamFaults(t *testing.T) {
 		// cwd holds no match; the first additional root cannot resolve and is
 		// skipped, and the second additional root is the one that allows it.
 		sess.cwd = t.TempDir()
-		sess.agent.options.ScratchDir = t.TempDir()
+		WithScratchDir(t.TempDir())(&sess.agent.options)
 		sess.additionalDirectories = []string{filepath.Join(t.TempDir(), "does-not-exist"), realDir}
 		decoded, err := sess.materializeLocalImage(path)
 		require.NoError(t, err)

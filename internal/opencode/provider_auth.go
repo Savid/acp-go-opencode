@@ -11,10 +11,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
-
-	"github.com/savid/acp-go-opencode/internal/homelock"
 )
 
 const (
@@ -345,100 +341,4 @@ func urlPathSegment(value string) string {
 // IsRateLimited reports a native refusal that asks the caller to slow down.
 func IsRateLimited(err error) bool {
 	return isHTTPStatus(err, http.StatusTooManyRequests)
-}
-
-// ReapAbandonedHomes reclaims every prefixed home under parent that no live
-// adapter owns, terminating the orphan server each one still holds. The locks
-// are held by the supervisor pair rather than by the adapter, so a crashed
-// adapter leaves them held: reading them as "a live owner" is what would let an
-// orphan server keep a pending flow — and, after native completion, a live
-// refresh token in a directory no ledger entry names.
-var (
-	reapReadDir   = os.ReadDir
-	reapAcquire   = homelock.Acquire
-	reapRemoveAll = os.RemoveAll
-	reapLease     = reapBrokerLease
-)
-
-func ReapAbandonedHomes(parent string, prefix string) error {
-	entries, err := reapReadDir(parent)
-	if err != nil {
-		return fmt.Errorf("scan scratch parent: %w", err)
-	}
-
-	var errs []error
-
-	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
-			continue
-		}
-
-		home := filepath.Join(parent, entry.Name())
-
-		removable, err := reapHome(home)
-		if err != nil {
-			errs = append(errs, err)
-		}
-
-		if removable {
-			errs = append(errs, removeReapedHome(home))
-		}
-	}
-
-	return errors.Join(errs...)
-}
-
-// reapRemoveAttempts bounds how long the sweep waits out descendants still
-// writing into a home it decided nothing owns. The lease names the adapter and
-// the server it started, and neither is what repopulates the tree: a plugin
-// install under that server outlives the process group signal that ended its
-// leader, so a single pass walks a directory that is still growing and fails
-// with a not-empty error the caller only logs.
-const reapRemoveAttempts = 5
-
-// reapRemoveBackoff is the pause between removal attempts.
-var reapRemoveBackoff = 100 * time.Millisecond
-
-func removeReapedHome(home string) error {
-	var err error
-
-	for attempt := range reapRemoveAttempts {
-		if err = reapRemoveAll(home); err == nil {
-			return nil
-		}
-
-		if attempt < reapRemoveAttempts-1 {
-			time.Sleep(reapRemoveBackoff)
-		}
-	}
-
-	return err
-}
-
-// reapHome answers for one candidate home. A home carrying a lease is decided
-// by the lease alone, because that is the only record that distinguishes the
-// adapter that owns it from the server it started. A home carrying none never
-// got as far as starting a server, and free locks are enough to reclaim it.
-func reapHome(home string) (bool, error) {
-	if lease, leased := readBrokerLease(home); leased {
-		return reapLease(lease)
-	}
-
-	lock, free := acquireForReap(home)
-	if !free {
-		return false, nil
-	}
-
-	return true, lock.Release()
-}
-
-// acquireForReap reports whether nothing holds the home's locks. A busy lock is
-// an answer about the home rather than a failure to report.
-func acquireForReap(home string) (*homelock.Lock, bool) {
-	lock, err := reapAcquire(home)
-	if err != nil {
-		return nil, false
-	}
-
-	return lock, true
 }

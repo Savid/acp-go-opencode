@@ -181,10 +181,12 @@ func startNativeCarrierRuntime(t *testing.T) nativeCarrierProbe {
 	runtime, err := StartServer(ctx, StartOptions{
 		Root:           filepath.Join(root, "runtime"),
 		ExecutablePath: executable,
-		ImplicitEnvironment: map[string]string{
-			"PATH":  "/usr/bin:/bin:/usr/sbin:/sbin",
-			"HOME":  home,
-			"SHELL": shell,
+		NativeEnvironment: func() map[string]string {
+			return map[string]string{
+				"PATH":  "/usr/bin:/bin:/usr/sbin:/sbin",
+				"HOME":  home,
+				"SHELL": shell,
+			}
 		},
 		HealthTimeout: 120 * time.Second,
 	})
@@ -606,11 +608,13 @@ func startNativeScopeShellRuntime(t *testing.T) nativeScopeShellProbe {
 	runtime, err := StartServer(ctx, StartOptions{
 		Root:           filepath.Join(root, "runtime"),
 		ExecutablePath: executable,
-		ImplicitEnvironment: map[string]string{
-			"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-			"HOME": home,
-			// No scope's shell, and not a login shell at all.
-			"SHELL": "/bin/sh",
+		NativeEnvironment: func() map[string]string {
+			return map[string]string{
+				"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+				"HOME": home,
+				// No scope's shell, and not a login shell at all.
+				"SHELL": "/bin/sh",
+			}
 		},
 		HealthTimeout: 120 * time.Second,
 	})
@@ -1013,7 +1017,7 @@ func requireNoRuntimeWideCarrierShellState(t *testing.T, runtime Client) {
 
 	server, ok := runtime.(*openCodeServer)
 	require.True(t, ok)
-	require.NotNil(t, server.sessionCarrierCleanup, "the runtime owns a generated carrier tree")
+	require.Len(t, server.preparedTrees, 2, "the runtime owns its XDG and generated carrier trees")
 
 	roots, err := filepath.Glob(filepath.Join(filepath.Dir(server.xdg.Root), ".acp-go-opencode-session-carrier-*"))
 	require.NoError(t, err)
@@ -1076,9 +1080,11 @@ func TestNativeRuntimeRefusesACarrierPluginItCannotLoad(t *testing.T) {
 	runtime, err := StartServer(ctx, StartOptions{
 		Root:           filepath.Join(root, "runtime"),
 		ExecutablePath: executable,
-		ImplicitEnvironment: map[string]string{
-			"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-			"HOME": home,
+		NativeEnvironment: func() map[string]string {
+			return map[string]string{
+				"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+				"HOME": home,
+			}
 		},
 		HealthTimeout: 30 * time.Second,
 	})

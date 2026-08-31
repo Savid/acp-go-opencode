@@ -110,7 +110,8 @@ The initialize response advertises adapter surfaces under
 path, result path, and schema mode). It additionally advertises
 `providerAuth` — a single `methods` array naming the seven enabled
 `_opencode/auth/*` extension names — but only while both `-provider-auth-root`
-and `-home` are configured. The array carries no `injectionKey`, because the
+and `-home` are configured during ordinary execution. It is absent whenever
+`WithHostAuthority` is supplied. The array carries no `injectionKey`, because the
 adapter accepts no injected credential (see
 [Authentication](/docs/features/authentication)). `AgentCapabilities.Meta` also advertises
 `"acp-go.dev/route": {"version": 1}`.

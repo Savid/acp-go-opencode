@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -62,10 +61,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
-	sessionStarted := time.Now()
 	native, err := client.CreateSessionWithPolicy(ctx, "", nativePermissionPolicy(meta.Permission))
-	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err)
-
 	if err != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
@@ -652,10 +648,7 @@ func (a *Agent) newOpenCodeClient(
 			return nil, nil, 0, startupFailure(err)
 		}
 
-		configurationStarted := time.Now()
 		client, err := runtime.Scope(ctx, carrier.scopeOptions(cwd, mcpServers))
-		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, err)
-
 		if err == nil {
 			return client, releaseDirectory, generation, nil
 		}
@@ -717,15 +710,6 @@ func mcpSecretNeedles(configs []opencode.MCPServerConfig) []string {
 	}
 
 	return needles
-}
-
-// homeRoot returns the single shared runtime XDG root.
-func (a *Agent) homeRoot() string {
-	if a.options.Home != "" {
-		return a.options.Home
-	}
-
-	return filepath.Join(scratchParent(a.options.ScratchDir), defaultAgentName)
 }
 
 func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
