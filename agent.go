@@ -357,14 +357,14 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 
 	capabilityMeta := map[string]any{
 		opencodeMetaKey:  opencodeMeta,
-		routeEnvelopeKey: map[string]any{metaFieldVersions: []int{routeEnvelopeVersion}},
+		routeEnvelopeKey: map[string]any{metaFieldVersion: routeEnvelopeVersion},
 		mediaEnvelopeKey: a.options.mediaEnvelope(),
 	}
 
 	// The handoff advertisement answers whether the host's read root reached
 	// this adapter, so it is present only when one is configured.
 	if a.options.InputHandoffRoot != "" {
-		capabilityMeta[handoffEnvelopeKey] = map[string]any{metaFieldVersions: []int{handoffEnvelopeVersion}}
+		capabilityMeta[handoffEnvelopeKey] = map[string]any{metaFieldVersion: handoffEnvelopeVersion}
 	}
 
 	return acp.InitializeResponse{

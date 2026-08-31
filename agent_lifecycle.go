@@ -54,14 +54,16 @@ func provenFacts() lifecycle.Negotiated {
 // every envelope, correlation read, and lifecycle fact stays illegal for the whole
 // connection.
 func (a *Agent) negotiateLifecycle(meta map[string]any) (lifecycle.Negotiated, error) {
-	offer, present, refusal := lifecycle.DecodeOffer(meta)
+	present, refusal := lifecycle.DecodeCapability(meta)
 	if refusal != nil {
 		return lifecycle.Negotiated{}, unsupportedField(refusal.Field)
 	}
 
 	var answer lifecycle.Negotiated
 	if present {
-		answer, _ = offer.Answer(provenFacts())
+		answer = provenFacts()
+
+		answer.Version = lifecycle.Version
 	}
 
 	a.mu.Lock()

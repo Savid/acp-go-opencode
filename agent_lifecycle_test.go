@@ -13,7 +13,7 @@ import (
 
 // lifecycleOffer is the host's initialize offer.
 func lifecycleOffer() map[string]any {
-	return map[string]any{lifecycle.MetaKey: map[string]any{"versions": []any{1.0}}}
+	return map[string]any{lifecycle.MetaKey: map[string]any{"version": 1.0}}
 }
 
 // lifecycleKey is the reserved literal on a surface that carries no lifecycle
@@ -44,7 +44,7 @@ func TestInitializeAnswersOnTheResponsesOwnMeta(t *testing.T) {
 
 	answer, ok := response.Meta[lifecycle.MetaKey].(map[string]any)
 	require.True(t, ok, "the answer is absent from the response _meta")
-	require.Equal(t, []int{1}, answer["versions"])
+	require.Equal(t, 1, answer["version"])
 	require.Equal(t, true, answer["updatesOutsidePrompt"])
 	require.Equal(t, false, answer["authoritativeQuiescence"])
 	require.Equal(t, []string{}, answer["activityKinds"])
@@ -69,8 +69,7 @@ func TestInitializeOmitsTheKeyWithoutACommonVersion(t *testing.T) {
 		meta map[string]any
 	}{
 		{"no offer", nil},
-		{"no _meta member", map[string]any{"acp-go.dev/route": map[string]any{"versions": []any{1.0}}}},
-		{"no common version", map[string]any{lifecycle.MetaKey: map[string]any{"versions": []any{2.0}}}},
+		{"no _meta member", map[string]any{"acp-go.dev/route": map[string]any{"version": 1.0}}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
@@ -95,10 +94,12 @@ func TestInitializeRefusesAMalformedOfferByPath(t *testing.T) {
 		field string
 	}{
 		{"not an object", []any{1.0}, lifecycle.MetaPath},
-		{"unknown member", map[string]any{"versions": []any{1.0}, "activityKinds": []any{}}, lifecycle.MetaPath + ".activityKinds"},
-		{"versions absent", map[string]any{}, lifecycle.MetaPath + ".versions"},
-		{"versions empty", map[string]any{"versions": []any{}}, lifecycle.MetaPath + ".versions"},
-		{"versions not integers", map[string]any{"versions": []any{"1"}}, lifecycle.MetaPath + ".versions"},
+		{"unknown member", map[string]any{"version": 1.0, "activityKinds": []any{}}, lifecycle.MetaPath + ".activityKinds"},
+		{"version absent", map[string]any{}, lifecycle.MetaPath + ".version"},
+		{"other integer", map[string]any{"version": 2.0}, lifecycle.MetaPath + ".version"},
+		{"fractional", map[string]any{"version": 1.5}, lifecycle.MetaPath + ".version"},
+		{"string", map[string]any{"version": "1"}, lifecycle.MetaPath + ".version"},
+		{"boolean", map[string]any{"version": true}, lifecycle.MetaPath + ".version"},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()

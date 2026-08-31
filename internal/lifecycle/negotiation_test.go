@@ -9,27 +9,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDecodeOfferReadsTheHostsVersions(t *testing.T) {
+func TestDecodeCapabilityReadsExactVersion(t *testing.T) {
 	t.Parallel()
-
-	offer, present, refusal := DecodeOffer(map[string]any{MetaKey: map[string]any{"versions": []any{1.0}}})
-	require.Nil(t, refusal)
-	require.True(t, present)
-	require.Equal(t, []int{1}, offer.Versions)
+	for _, version := range []any{1, 1.0, json.Number("1")} {
+		present, refusal := DecodeCapability(map[string]any{MetaKey: map[string]any{"version": version}})
+		require.Nil(t, refusal)
+		require.True(t, present)
+	}
 }
 
-// TestDecodeOfferTreatsAbsenceAsNoRequest proves an absent key is the host asking
+// TestDecodeCapabilityTreatsAbsenceAsNoRequest proves an absent key is the host asking
 // for nothing rather than a refusal.
-func TestDecodeOfferTreatsAbsenceAsNoRequest(t *testing.T) {
+func TestDecodeCapabilityTreatsAbsenceAsNoRequest(t *testing.T) {
 	t.Parallel()
 
-	offer, present, refusal := DecodeOffer(map[string]any{})
+	present, refusal := DecodeCapability(map[string]any{})
 	require.Nil(t, refusal)
 	require.False(t, present)
-	require.Empty(t, offer.Versions)
 }
 
-func TestDecodeOfferStrictness(t *testing.T) {
+func TestDecodeCapabilityStrictness(t *testing.T) {
 	t.Parallel()
 
 	for _, row := range []struct {
@@ -38,18 +37,18 @@ func TestDecodeOfferStrictness(t *testing.T) {
 		field string
 	}{
 		{"not an object", []any{1}, MetaPath},
-		{"unknown member", map[string]any{"versions": []any{1}, "extra": true}, MetaPath + ".extra"},
-		{"versions missing", map[string]any{}, MetaPath + ".versions"},
-		{"versions not an array", map[string]any{"versions": 1}, MetaPath + ".versions"},
-		{"versions empty", map[string]any{"versions": []any{}}, MetaPath + ".versions"},
-		{"version not an integer", map[string]any{"versions": []any{"1"}}, MetaPath + ".versions"},
-		{"version fractional", map[string]any{"versions": []any{1.5}}, MetaPath + ".versions"},
-		{"version beyond every int", map[string]any{"versions": []any{1e300}}, MetaPath + ".versions"},
+		{"unknown member", map[string]any{"version": 1, "extra": true}, MetaPath + ".extra"},
+		{"version missing", map[string]any{}, MetaPath + ".version"},
+		{"other integer", map[string]any{"version": 2}, MetaPath + ".version"},
+		{"version not an integer", map[string]any{"version": "1"}, MetaPath + ".version"},
+		{"version fractional", map[string]any{"version": 1.5}, MetaPath + ".version"},
+		{"version boolean", map[string]any{"version": true}, MetaPath + ".version"},
+		{"version array", map[string]any{"version": []any{1}}, MetaPath + ".version"},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, present, refusal := DecodeOffer(map[string]any{MetaKey: row.value})
+			present, refusal := DecodeCapability(map[string]any{MetaKey: row.value})
 			require.False(t, present)
 			require.NotNil(t, refusal)
 			require.Equal(t, row.field, refusal.Field)
@@ -58,39 +57,19 @@ func TestDecodeOfferStrictness(t *testing.T) {
 	}
 }
 
-// TestAnswerIntersectsAnUnorderedOffer proves the offer's order is never a
-// refusal reason: only the answer is ordered, and refusing an unordered offer
-// would break the forward compatibility the array exists for.
-func TestAnswerIntersectsAnUnorderedOffer(t *testing.T) {
-	t.Parallel()
-
-	proven := Negotiated{ActivityKinds: []ActivityKind{}}
-
-	answer, ok := Offer{Versions: []int{2, 1}}.Answer(proven)
-	require.True(t, ok)
-	require.Equal(t, []int{1}, answer.Versions)
-
-	answer, ok = Offer{Versions: []int{1, 1}}.Answer(proven)
-	require.True(t, ok)
-	require.Equal(t, []int{1}, answer.Versions)
-
-	_, ok = Offer{Versions: []int{2}}.Answer(proven)
-	require.False(t, ok)
-}
-
 func TestNegotiatedAdvertisementShape(t *testing.T) {
 	t.Parallel()
 
-	degenerate := Negotiated{Versions: []int{1}}
+	degenerate := Negotiated{Version: 1}
 	require.Equal(t, map[string]any{
-		"versions":                []int{1},
+		"version":                 1,
 		"updatesOutsidePrompt":    false,
 		"authoritativeQuiescence": false,
 		"activityKinds":           []string{},
 	}, degenerate.Advertisement())
 
 	proven := Negotiated{
-		Versions:                []int{1},
+		Version:                 1,
 		AuthoritativeQuiescence: true,
 		QuiescenceSource:        ProofClassProcessContainment,
 		ActivityKinds:           []ActivityKind{ActivityTask},
@@ -99,7 +78,6 @@ func TestNegotiatedAdvertisementShape(t *testing.T) {
 	require.Equal(t, []string{"task"}, proven.Advertisement()["activityKinds"])
 	require.True(t, proven.DeclaresActivityKind(ActivityTask))
 	require.False(t, proven.DeclaresActivityKind(ActivitySubagent))
-	require.True(t, proven.SupportsVersion(1))
 
 	var absent Negotiated
 	require.False(t, absent.Present())
@@ -121,7 +99,7 @@ func TestRefuseKeyNamesTheExactPath(t *testing.T) {
 func TestDecodePromptCorrelation(t *testing.T) {
 	t.Parallel()
 
-	negotiated := Negotiated{Versions: []int{1}}
+	negotiated := Negotiated{Version: 1}
 
 	submission, refusal := DecodePromptCorrelation(map[string]any{MetaKey: map[string]any{
 		"version":    1,
@@ -174,7 +152,7 @@ func TestDecodePromptCorrelationStrictness(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, refusal := DecodePromptCorrelation(row.meta, Negotiated{Versions: []int{1}})
+			_, refusal := DecodePromptCorrelation(row.meta, Negotiated{Version: 1})
 			require.NotNil(t, refusal)
 			require.Equal(t, row.field, refusal.Field)
 		})
@@ -190,7 +168,7 @@ func TestDecodePromptCorrelationReadsAWireInteger(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`{"acp-go.dev/lifecycle":{"version":1,`+
 		`"submission":{"submissionId":"sub-1","clientNonce":"nonce-1"}}}`), &meta))
 
-	submission, refusal := DecodePromptCorrelation(meta, Negotiated{Versions: []int{1}})
+	submission, refusal := DecodePromptCorrelation(meta, Negotiated{Version: 1})
 	require.Nil(t, refusal)
 	require.Equal(t, "sub-1", submission.SubmissionID)
 

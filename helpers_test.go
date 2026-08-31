@@ -1620,7 +1620,7 @@ func requireLifecycleOutcome(t *testing.T, connection *recordingAgentClient, wan
 // the proven facts plus the version marker the answer carries on the wire.
 func negotiatedTestFacts() lifecycle.Negotiated {
 	facts := provenFacts()
-	facts.Versions = []int{lifecycle.Version}
+	facts.Version = lifecycle.Version
 
 	return facts
 }

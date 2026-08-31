@@ -10,7 +10,7 @@ import (
 )
 
 func promptContained() Negotiated {
-	return Negotiated{Versions: []int{1}, ActivityKinds: []ActivityKind{}}
+	return Negotiated{Version: 1, ActivityKinds: []ActivityKind{}}
 }
 
 // TestStreamClaimsASequenceBeforeDelivery proves a refused event consumes its
@@ -256,7 +256,7 @@ func TestEncodedEventsRoundTripThroughTheDecoder(t *testing.T) {
 	t.Parallel()
 
 	negotiated := Negotiated{
-		Versions:                []int{1},
+		Version:                 1,
 		AuthoritativeQuiescence: true,
 		QuiescenceSource:        ProofClassProcessContainment,
 		ActivityKinds:           []ActivityKind{ActivityTask},
@@ -326,7 +326,7 @@ func notification(t *testing.T, envelope map[string]any, update map[string]any) 
 }
 
 func TestStreamCloseRejectsLaterEmission(t *testing.T) {
-	stream := NewStream("stream", Negotiated{Versions: []int{Version}})
+	stream := NewStream("stream", Negotiated{Version: Version})
 	stream.Close()
 	_, err := stream.Emit(SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "idle"}, nil, QuiescenceFact{}))
 	require.ErrorContains(t, err, string(ViolationStaleStream))

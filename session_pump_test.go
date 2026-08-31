@@ -761,7 +761,7 @@ func TestCorrectionObservedOwnershipAndNativeFailureBranches(t *testing.T) {
 	current.cycle = nil
 	current.lifecycleMu.Unlock()
 
-	closedStream := lifecycle.NewStream("closed", lifecycle.Negotiated{Versions: []int{1}})
+	closedStream := lifecycle.NewStream("closed", lifecycle.Negotiated{Version: 1})
 	closedStream.Close()
 	current.lifecycleMu.Lock()
 	current.incarnation = &nativeIncarnationBinding{client: binding.client, stream: closedStream, registry: newActionRegistry()}

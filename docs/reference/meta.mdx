@@ -12,8 +12,8 @@ values carry the uniform `{"error": "unsupported", "field": "<path>"}` data.
 
 ## `acp-go.dev/lifecycle`
 
-The lifecycle key is negotiated bilaterally in initialize `_meta`: the host
-offers on `InitializeRequest._meta`, and the negotiated `acp-go.dev/lifecycle`
+The lifecycle key is enabled with exact integer `version: 1` in initialize `_meta`: the host
+sends the capability on `InitializeRequest._meta`, and the `acp-go.dev/lifecycle`
 answer is placed on `InitializeResponse._meta`. Version 1 correlates prompt
 submissions, ordered session updates, permission requests, and elicitation
 requests. It is rejected on every other method. OpenCode advertises
@@ -113,7 +113,7 @@ path, result path, and schema mode). It additionally advertises
 and `-home` are configured. The array carries no `injectionKey`, because the
 adapter accepts no injected credential (see
 [Authentication](/docs/features/authentication)). `AgentCapabilities.Meta` also advertises
-`"acp-go.dev/route": {"versions": [1]}`.
+`"acp-go.dev/route": {"version": 1}`.
 
 `promptCapabilities.image` is advertised `true`: the adapter accepts a standard
 ACP image content block and maps it to OpenCode. Per-model `_meta.opencode`
@@ -148,7 +148,7 @@ host pre-check that passes cannot be rejected on bytes by the adapter.
 
 ```json
 {
-  "acp-go.dev/handoff": {"versions": [1]}
+  "acp-go.dev/handoff": {"version": 1}
 }
 ```
 

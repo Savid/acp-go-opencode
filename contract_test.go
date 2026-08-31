@@ -208,8 +208,8 @@ func TestInitializeAdvertisesHandoffOnlyWhenConfigured(t *testing.T) {
 
 	with, err := NewAgent(WithInputHandoffRoot(root)).Initialize(context.Background(), request)
 	require.NoError(t, err)
-	require.Equal(t, map[string]any{metaFieldVersions: []int{handoffEnvelopeVersion}}, with.AgentCapabilities.Meta[handoffEnvelopeKey])
-	require.Equal(t, map[string]any{metaFieldVersions: []int{routeEnvelopeVersion}}, with.AgentCapabilities.Meta[routeEnvelopeKey])
+	require.Equal(t, map[string]any{metaFieldVersion: handoffEnvelopeVersion}, with.AgentCapabilities.Meta[handoffEnvelopeKey])
+	require.Equal(t, map[string]any{metaFieldVersion: routeEnvelopeVersion}, with.AgentCapabilities.Meta[routeEnvelopeKey])
 }
 
 // TestStableForkRouteMethodNotFound pins that the stable fork route does not

@@ -1787,7 +1787,7 @@ func TestCorrectionLifecycleDirectFailureBranches(t *testing.T) {
 	require.Error(t, current.acceptPromptCycle(context.Background(), invalidCycle, lifecycle.Submission{}))
 	current.abandonPromptCycle(nil)
 
-	stream := lifecycle.NewStream("stream", lifecycle.Negotiated{Versions: []int{1}})
+	stream := lifecycle.NewStream("stream", lifecycle.Negotiated{Version: 1})
 	stream.Close()
 	cycle := &foregroundCycle{
 		id: "cycle", turnID: "turn", reserved: true, blockers: map[string]struct{}{}, signal: make(chan struct{}),
@@ -1801,7 +1801,7 @@ func TestCorrectionLifecycleDirectFailureBranches(t *testing.T) {
 	require.Error(t, direct.acceptPromptCycle(context.Background(), cycle,
 		lifecycle.Submission{SubmissionID: "submission", ClientNonce: "nonce"}))
 
-	validStream := lifecycle.NewStream("open", lifecycle.Negotiated{Versions: []int{1}})
+	validStream := lifecycle.NewStream("open", lifecycle.Negotiated{Version: 1})
 	_, err := validStream.Emit(lifecycle.SnapshotEvent(
 		lifecycle.Foreground{State: lifecycle.ForegroundIdle, CycleID: "cycle-0"}, nil, lifecycle.QuiescenceFact{},
 	))
