@@ -537,6 +537,33 @@ func TestHostAuthorityWaitCancellationDetachesWithoutContainmentFailure(t *testi
 	require.Equal(t, 23, result.ExitCode)
 }
 
+func TestHostAuthoritySnapshotNeverAccessesPreparedRuntimeTree(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "runtime")
+	hidden := root + ".authority"
+	require.NoError(t, os.MkdirAll(root, 0o700))
+	require.NoError(t, os.Rename(root, hidden))
+	require.NoError(t, os.MkdirAll(opencode.ControlRootForXDG(root), 0o700))
+
+	client := newFakeOpenCodeClient()
+	originalRoot := client.xdg.Root
+	t.Cleanup(func() { _ = os.RemoveAll(originalRoot) })
+	client.xdg = opencode.XDGDirs{Root: root}
+	store := NewInMemorySessionStore()
+	agent := NewAgent(
+		WithHostAuthority(&fixedProcessAuthority{}),
+		WithSessionStore(store),
+	)
+	current := testSession(t, agent, client)
+
+	require.NoError(t, current.snapshotToStore(t.Context()))
+	require.NoDirExists(t, root)
+	require.DirExists(t, hidden)
+	entries, err := store.Load(t.Context(), SessionKey{SessionID: string(current.id)})
+	require.NoError(t, err)
+	require.NotEmpty(t, entries)
+}
+
 func runManagedTrace(t *testing.T, agent *Agent, authority *authorityTrace, remove bool) ([]string, string, error) {
 	t.Helper()
 
