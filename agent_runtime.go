@@ -36,8 +36,7 @@ var (
 
 func fatalRuntimeCleanup(err error) bool {
 	return errors.Is(err, ErrHostAuthorityUnavailable) ||
-		errors.Is(err, ErrContainmentIncomplete) ||
-		errors.Is(err, opencode.ErrRuntimeScratchCleanup)
+		errors.Is(err, ErrContainmentIncomplete)
 }
 
 func (a *Agent) sharedRuntimeBinding(
@@ -275,7 +274,7 @@ func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, star
 	a.mu.Lock()
 	retirement.err = cleanupErr
 
-	if errors.Is(cleanupErr, ErrNativeTreeBusy) {
+	if errors.Is(cleanupErr, ErrNativeTreeBusy) || errors.Is(cleanupErr, opencode.ErrRuntimeScratchCleanup) {
 		a.runtimeSequencing = retirement
 	}
 
@@ -448,15 +447,22 @@ func (a *Agent) closeFailedSession(session *session) error {
 }
 
 func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error) {
+	a.nativeAdmissionMu.Lock()
+	defer a.nativeAdmissionMu.Unlock()
+
 	var managedEnvironment map[string]string
 
 	if a.options.hostAuthorityConfigured {
-		var err error
+		if err := a.retryRetiredNativeTrees(ctx); err != nil {
+			return nil, err
+		}
 
-		managedEnvironment, err = hostAuthorityEnvironment(a.options.HostAuthority)
+		environment, err := hostAuthorityEnvironment(a.options.HostAuthority)
 		if err != nil {
 			return nil, err
 		}
+
+		managedEnvironment = environment
 	}
 
 	root, generated, err := a.newRuntimeRoot()
@@ -485,33 +491,20 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 		startOptions.PrepareTree = func(prepareCtx context.Context, path string) (err error) {
 			defer func() {
 				if recover() != nil {
-					err = opencode.MarkAuthorityUnavailable(ErrHostAuthorityUnavailable)
+					err = opencode.MarkPrepareOpaque(errors.Join(ErrHostAuthorityUnavailable, ErrContainmentIncomplete))
 				}
 			}()
 
 			if err := authority.PrepareNativeTree(prepareCtx, path); err != nil {
-				return err
+				return opencode.MarkPrepareOpaque(errors.Join(ErrContainmentIncomplete, err))
 			}
 
 			return nil
 		}
-		startOptions.ReclaimTree = func(reclaimCtx context.Context, path string) (err error) {
-			defer func() {
-				if recover() != nil {
-					err = errors.Join(ErrHostAuthorityUnavailable, ErrContainmentIncomplete)
-				}
-			}()
-
-			if err := authority.ReclaimNativeTree(reclaimCtx, path); err != nil {
-				if errors.Is(err, ErrNativeTreeBusy) {
-					return opencode.MarkTreeReclaimPending(err)
-				}
-
-				return errors.Join(ErrContainmentIncomplete, err)
-			}
-
-			return nil
+		startOptions.ReclaimTree = func(reclaimCtx context.Context, path string) error {
+			return reclaimManagedNativeTree(reclaimCtx, authority, path)
 		}
+		startOptions.RetainTree = a.retainNativeTree
 		startOptions.StartProcess = authorityProcessStarter(authority)
 	}
 
@@ -532,6 +525,91 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 	}
 
 	return runtime, nil
+}
+
+func reclaimManagedNativeTree(ctx context.Context, authority HostAuthority, path string) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.Join(ErrHostAuthorityUnavailable, ErrContainmentIncomplete)
+		}
+	}()
+
+	if err := authority.ReclaimNativeTree(ctx, path); err != nil {
+		if errors.Is(err, ErrNativeTreeBusy) {
+			return opencode.MarkTreeReclaimPending(err)
+		}
+
+		return errors.Join(ErrContainmentIncomplete, err)
+	}
+
+	return nil
+}
+
+func (a *Agent) retainNativeTree(path string, reclaimed bool, cleanup func() error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	existing, ok := a.retiredNativeTrees[path]
+	if ok {
+		reclaimed = existing.reclaimed || reclaimed
+		if cleanup == nil {
+			cleanup = existing.cleanup
+		}
+	}
+
+	if a.retiredNativeTrees == nil {
+		a.retiredNativeTrees = make(map[string]retiredNativeTree)
+	}
+
+	a.retiredNativeTrees[path] = retiredNativeTree{reclaimed: reclaimed, cleanup: cleanup}
+}
+
+func (a *Agent) retryRetiredNativeTrees(ctx context.Context) error {
+	a.mu.Lock()
+
+	trees := make(map[string]retiredNativeTree, len(a.retiredNativeTrees))
+	for path, tree := range a.retiredNativeTrees {
+		trees[path] = tree
+	}
+	a.mu.Unlock()
+
+	var result error
+
+	for path, tree := range trees {
+		if !tree.reclaimed {
+			err := reclaimManagedNativeTree(ctx, a.options.HostAuthority, path)
+			if err != nil {
+				result = errors.Join(result, err)
+
+				continue
+			}
+
+			tree.reclaimed = true
+
+			a.mu.Lock()
+
+			current, ok := a.retiredNativeTrees[path]
+			if ok {
+				current.reclaimed = true
+				a.retiredNativeTrees[path] = current
+			}
+			a.mu.Unlock()
+		}
+
+		if tree.cleanup != nil {
+			if err := tree.cleanup(); err != nil {
+				result = errors.Join(result, opencode.ErrRuntimeScratchCleanup, err)
+
+				continue
+			}
+		}
+
+		a.mu.Lock()
+		delete(a.retiredNativeTrees, path)
+		a.mu.Unlock()
+	}
+
+	return result
 }
 
 func (a *Agent) bindDirectory(id acp.SessionId, cwd string, servers []opencode.MCPServerConfig) (func(), error) {

@@ -32,8 +32,11 @@ An embedded managed host supplies `WithHostAuthority`. The adapter then:
 
 There is no managed-mode fallback. A nil, panicking, or malformed authority
 refuses native work with `ErrHostAuthorityUnavailable`; operation-specific
-prepare and start validation errors retain their own identity. Failures to
-establish terminality or reclaim a tree preserve
+start validation errors retain their own identity after `StartNative` has
+proved that no child remains. A failed `PrepareNativeTree` is opaque: the
+adapter preserves its error with `ErrContainmentIncomplete`, keeps host cleanup
+registered, and stops managed admission without reclaiming or removing the
+tree. Failures to establish terminality or reclaim a tree preserve
 `ErrContainmentIncomplete` or `ErrNativeTreeBusy` in the error chain and leave
 the affected resources unreused. `ErrNativeTreeBusy` blocks replacement
 admission until a later cleanup retry succeeds, without quarantining the
@@ -108,9 +111,12 @@ written to stdout corrupts the session.
 ## Credentials and snapshots
 
 Session snapshots contain only allowlisted native sync events, never XDG files
-or the SQLite database. Unknown event kinds or fields fail closed. Before an
-atomic store replacement, the adapter scans the complete graph bundle for MCP
-headers, MCP environment values, and sensitive process-environment values.
+or the SQLite database. Capture uses the authenticated loopback sync protocol
+and writes restore-ownership bookkeeping only in the adjacent control root; it
+does not read, copy, stat, or open the prepared XDG tree or its SQLite/WAL
+files. Unknown event kinds or fields fail closed. Before an atomic store
+replacement, the adapter scans the complete graph bundle for MCP headers, MCP
+environment values, and sensitive process-environment values.
 
 <Warning>
 The permission flow is load-bearing for user trust. The adapter never silently

@@ -84,7 +84,7 @@ func startOrdinaryProcess(
 				revoked.Store(true)
 			}
 
-			return err
+			return errors.Join(err, ctx.Err())
 		},
 	}, nil
 }

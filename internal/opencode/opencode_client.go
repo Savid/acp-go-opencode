@@ -112,7 +112,7 @@ var (
 	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
 	ErrScopeRuntimeShutdown  = errors.New("directory-scoped OpenCode client cannot shut down the shared runtime")
 	ErrRuntimeScratchCleanup = errors.New("OpenCode runtime scratch cleanup incomplete")
-	errAuthorityUnavailable  = errors.New("native authority unavailable")
+	errPrepareOpaque         = errors.New("native tree prepare result is opaque")
 	errTreeReclaimPending    = errors.New("native tree reclaim pending")
 	errProcessStartSettled   = errors.New("native process start failure settled")
 	errNativeCleanupRetained = errors.New("native cleanup retained")
@@ -129,8 +129,8 @@ func (e *nativeBoundaryError) Is(target error) bool {
 	return target == e.marker || errors.Is(e.err, target)
 }
 
-func MarkAuthorityUnavailable(err error) error {
-	return &nativeBoundaryError{err: err, marker: errAuthorityUnavailable}
+func MarkPrepareOpaque(err error) error {
+	return &nativeBoundaryError{err: err, marker: errPrepareOpaque}
 }
 
 func MarkTreeReclaimPending(err error) error {
@@ -245,6 +245,7 @@ type StartOptions struct {
 	NativeEnvironment func() map[string]string
 	PrepareTree       func(context.Context, string) error
 	ReclaimTree       func(context.Context, string) error
+	RetainTree        func(string, bool, func() error)
 	StartProcess      ProcessStarter
 	Pure              bool
 	QuestionTool      bool
@@ -910,13 +911,31 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	transferred := false
 
 	retainPrepared := false
+
 	defer func() {
-		if transferred || retainPrepared {
+		if transferred {
+			return
+		}
+
+		if retainPrepared {
+			retainPreparedTrees(preparedTrees, options.RetainTree)
+
+			resultErr = retainNativeCleanup(resultErr)
+
 			return
 		}
 
 		if options.ReclaimTree != nil {
-			resultErr = errors.Join(resultErr, reclaimPreparedTrees(context.Background(), preparedTrees, options.ReclaimTree))
+			var reclaimErr error
+
+			preparedTrees, reclaimErr = reclaimPreparedTreesRetaining(context.Background(), preparedTrees, options.ReclaimTree)
+			resultErr = errors.Join(resultErr, reclaimErr)
+
+			if len(preparedTrees) > 0 {
+				retainPreparedTrees(preparedTrees, options.RetainTree)
+
+				resultErr = retainNativeCleanup(resultErr)
+			}
 		} else {
 			for _, tree := range preparedTrees {
 				if tree.cleanup != nil {
@@ -948,7 +967,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 		for _, tree := range trees {
 			if prepareErr := options.PrepareTree(ctx, tree.path); prepareErr != nil {
-				if errors.Is(prepareErr, errAuthorityUnavailable) {
+				if errors.Is(prepareErr, errPrepareOpaque) {
 					retainPrepared = true
 				} else if tree.cleanup != nil {
 					prepareErr = errors.Join(prepareErr, tree.cleanup())
@@ -1103,6 +1122,16 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	}
 
 	return server, nil
+}
+
+func retainPreparedTrees(trees []preparedNativeTree, retain func(string, bool, func() error)) {
+	if retain == nil {
+		return
+	}
+
+	for _, tree := range trees {
+		retain(tree.path, tree.reclaimed, tree.cleanup)
+	}
 }
 
 func ControlRootForXDG(root string) string {
@@ -1281,7 +1310,7 @@ func (s *openCodeServer) Shutdown(ctx context.Context) error {
 			state.mu.Lock()
 			state.current = nil
 
-			if !errors.Is(attempt.err, errTreeReclaimPending) {
+			if !errors.Is(attempt.err, errTreeReclaimPending) && !errors.Is(attempt.err, ErrRuntimeScratchCleanup) {
 				state.terminal = attempt
 			}
 			state.mu.Unlock()
@@ -1364,21 +1393,39 @@ func (s *openCodeServer) shutdownRuntime() error {
 				s.preparedTrees, reclaimErr = reclaimPreparedTreesRetaining(cleanupCtx, s.preparedTrees, s.reclaimTree)
 				err = errors.Join(err, reclaimErr)
 			} else {
-				for _, tree := range s.preparedTrees {
-					if tree.cleanup != nil {
-						err = errors.Join(err, tree.cleanup())
-					}
-				}
-			}
+				var cleanupErr error
 
-			if s.reclaimTree == nil {
-				s.preparedTrees = nil
+				s.preparedTrees, cleanupErr = cleanupPreparedTreesRetaining(s.preparedTrees)
+				err = errors.Join(err, cleanupErr)
 			}
 		default:
 		}
 	}
 
 	return err
+}
+
+func cleanupPreparedTreesRetaining(trees []preparedNativeTree) ([]preparedNativeTree, error) {
+	var result error
+
+	remaining := make([]preparedNativeTree, 0, len(trees))
+
+	for index := len(trees) - 1; index >= 0; index-- {
+		tree := trees[index]
+		if tree.cleanup == nil {
+			continue
+		}
+
+		if err := tree.cleanup(); err != nil {
+			result = errors.Join(result, err)
+
+			remaining = append(remaining, tree)
+		}
+	}
+
+	slices.Reverse(remaining)
+
+	return remaining, result
 }
 
 func reclaimPreparedTrees(

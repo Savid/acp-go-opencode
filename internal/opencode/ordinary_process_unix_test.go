@@ -46,3 +46,22 @@ func TestOrdinaryProcessReportsNaturalAndRevokedResults(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.Revoked)
 }
+
+func TestOrdinaryProcessCancelledRevokeStillStartsTeardown(t *testing.T) {
+	process, err := startOrdinaryProcess(t.Context(), "/bin/sh", []string{"-c", "while :; do sleep 1; done"}, []string{"PATH=/usr/bin:/bin"}, t.TempDir())
+	require.NoError(t, err)
+	go func() {
+		_, _ = io.Copy(io.Discard, process.Output)
+		_, _ = io.Copy(io.Discard, process.Errors)
+	}()
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, process.Stop(cancelled), context.Canceled)
+
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer waitCancel()
+	result, err := process.Await(waitCtx)
+	require.NoError(t, err)
+	require.True(t, result.Revoked)
+}

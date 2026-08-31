@@ -60,8 +60,11 @@ successful prepare until a successful reclaim, the adapter performs no
 filesystem access beneath that tree. The runtime lock remains at
 `<xdg-root>.control`, outside the prepared root. Teardown closes protocol input,
 calls `Revoke`, reaches terminal `Wait`, releases the lock, reclaims prepared
-trees in reverse order, and then removes generated roots. An authority error is
-never retried through ordinary execution.
+trees in reverse order, and then removes generated roots. A failed prepare is
+opaque and leaves host cleanup in force; a busy reclaim retains retry ownership
+and blocks replacement admission. Cancelling a `Wait` caller only detaches that
+caller, and a later wait still receives the single terminal result. An
+authority error is never retried through ordinary execution.
 
 ## Agent options
 

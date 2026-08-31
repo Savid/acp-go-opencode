@@ -479,6 +479,64 @@ type emptyReader struct{}
 
 func (*emptyReader) Read([]byte) (int, error) { return 0, io.EOF }
 
+type fixedProcessAuthority struct {
+	process NativeProcess
+}
+
+func (*fixedProcessAuthority) NativeEnvironment() map[string]string {
+	return map[string]string{"PATH": "/bin"}
+}
+func (*fixedProcessAuthority) PrepareNativeTree(context.Context, string) error {
+	return nil
+}
+func (*fixedProcessAuthority) ReclaimNativeTree(context.Context, string) error {
+	return nil
+}
+func (a *fixedProcessAuthority) StartNative(context.Context, NativeRequest) (NativeProcess, error) {
+	return a.process, nil
+}
+
+type detachingWaitProcess struct {
+	terminal chan struct{}
+}
+
+func (*detachingWaitProcess) Stdin() io.WriteCloser { return nopWriteCloser{Writer: io.Discard} }
+func (*detachingWaitProcess) Stdout() io.ReadCloser { return io.NopCloser(&emptyReader{}) }
+func (*detachingWaitProcess) Stderr() io.ReadCloser { return io.NopCloser(&emptyReader{}) }
+func (p *detachingWaitProcess) Wait(ctx context.Context) (NativeResult, error) {
+	select {
+	case <-p.terminal:
+		return NativeResult{ExitCode: 23}, nil
+	case <-ctx.Done():
+		return NativeResult{}, ctx.Err()
+	}
+}
+func (*detachingWaitProcess) Revoke(context.Context) error { return nil }
+
+type nopWriteCloser struct {
+	io.Writer
+}
+
+func (nopWriteCloser) Close() error { return nil }
+
+func TestHostAuthorityWaitCancellationDetachesWithoutContainmentFailure(t *testing.T) {
+	process := &detachingWaitProcess{terminal: make(chan struct{})}
+	starter := authorityProcessStarter(&fixedProcessAuthority{process: process})
+	handle, err := starter(t.Context(), "opencode", nil, []string{"PATH=/bin"}, t.TempDir())
+	require.NoError(t, err)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = handle.Await(cancelled)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrContainmentIncomplete)
+
+	close(process.terminal)
+	result, err := handle.Await(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 23, result.ExitCode)
+}
+
 func runManagedTrace(t *testing.T, agent *Agent, authority *authorityTrace, remove bool) ([]string, string, error) {
 	t.Helper()
 
@@ -587,9 +645,7 @@ func TestHostAuthorityNoOrdinaryFallback(t *testing.T) {
 	require.NotErrorIs(t, err, ErrHostAuthorityUnavailable)
 	require.NotErrorIs(t, err, ErrContainmentIncomplete)
 	require.Contains(t, events, "start-refused")
-	for _, event := range events {
-		require.NotContains(t, event, "reclaim:")
-	}
+	require.Equal(t, 1, countAuthorityEvents(events, "start-refused"))
 
 	called := false
 	agent = NewAgent(WithHostAuthority(nil))
@@ -617,14 +673,14 @@ func TestHostAuthorityManagedFailureMatrix(t *testing.T) {
 			configure: func(authority *authorityTrace) {
 				authority.prepareErr = errors.New("carrier prepare rejected")
 			},
-			wantText: "carrier prepare rejected", wantReclaim: true,
+			want: ErrContainmentIncomplete, wantText: "carrier prepare rejected", wantRetainedTrees: true,
 		},
 		{
 			name: "start validation",
 			configure: func(authority *authorityTrace) {
 				authority.startErr = errors.New("start request rejected")
 			},
-			wantText: "start request rejected", wantRetainedTrees: true,
+			wantText: "start request rejected", wantReclaim: true,
 		},
 		{
 			name: "unusable stdio settled",
@@ -681,7 +737,7 @@ func TestHostAuthorityManagedFailureMatrix(t *testing.T) {
 			if test.wantText != "" {
 				require.ErrorContains(t, err, test.wantText)
 			}
-			if test.name == "prepare midway validation" || test.name == "start validation" {
+			if test.name == "start validation" {
 				require.NotErrorIs(t, err, ErrHostAuthorityUnavailable)
 				require.NotErrorIs(t, err, ErrContainmentIncomplete)
 			}
@@ -734,22 +790,53 @@ func TestHostAuthorityBusyReclaimBlocksAdmissionUntilRetry(t *testing.T) {
 	require.NoError(t, agent.Close())
 }
 
-func TestHostAuthorityPlainPrepareErrorDoesNotQuarantineNextRuntime(t *testing.T) {
+func TestHostAuthorityFailedStartBusyCleanupBlocksReplacementUntilRetry(t *testing.T) {
+	authority := newAuthorityTrace()
+	authority.hideTree = true
+	authority.startErr = errors.New("start request rejected")
+	authority.reclaimErr = ErrNativeTreeBusy
+	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
+
+	_, err := agent.startSharedRuntime(t.Context())
+	require.ErrorIs(t, err, authority.startErr)
+	require.ErrorIs(t, err, ErrNativeTreeBusy)
+	require.NotErrorIs(t, err, ErrContainmentIncomplete)
+	require.Len(t, agent.retiredNativeTrees, 2)
+	starts := countAuthorityEvents(authority.snapshot(), "start-refused")
+
+	_, err = agent.startSharedRuntime(t.Context())
+	require.ErrorIs(t, err, ErrNativeTreeBusy)
+	require.Equal(t, starts, countAuthorityEvents(authority.snapshot(), "start-refused"))
+	require.Len(t, agent.retiredNativeTrees, 2)
+
+	authority.mu.Lock()
+	authority.startErr = nil
+	authority.reclaimErr = nil
+	authority.mu.Unlock()
+
+	runtime, err := agent.startSharedRuntime(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, agent.retiredNativeTrees)
+	require.NoError(t, runtime.Shutdown(t.Context()))
+}
+
+func TestHostAuthorityPrepareErrorQuarantinesManagedAdmission(t *testing.T) {
 	authority := newAuthorityTrace()
 	authority.hideTree = true
 	authority.prepareErr = errors.New("one carrier path rejected")
 	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
 
-	_, err := agent.startSharedRuntime(t.Context())
+	_, _, err := agent.sharedRuntimeBinding(t.Context())
 	require.ErrorIs(t, err, authority.prepareErr)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.NotErrorIs(t, err, ErrHostAuthorityUnavailable)
-	require.NotErrorIs(t, err, ErrContainmentIncomplete)
-	require.Nil(t, agent.runtimeFatalErr)
+	require.ErrorIs(t, agent.runtimeFatalErr, ErrContainmentIncomplete)
+	prepareCalls := authority.prepareAt
 
-	runtime, err := agent.startSharedRuntime(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, 1, countAuthorityEvents(authority.snapshot(), "start:opencode"))
-	require.NoError(t, runtime.Shutdown(t.Context()))
+	_, _, err = agent.sharedRuntimeBinding(t.Context())
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+	require.Equal(t, prepareCalls, authority.prepareAt)
+	require.Zero(t, countAuthorityEvents(authority.snapshot(), "start:opencode"))
 }
 
 func countAuthorityEvents(events []string, target string) int {

@@ -63,6 +63,13 @@ type Agent struct {
 	directoryIncarnation directoryBindingIncarnation
 	fingerprintKey       [32]byte
 	restoreMu            sync.Mutex
+	nativeAdmissionMu    sync.Mutex
+	retiredNativeTrees   map[string]retiredNativeTree
+}
+
+type retiredNativeTree struct {
+	reclaimed bool
+	cleanup   func() error
 }
 
 type directoryBinding struct {
@@ -125,6 +132,7 @@ func NewAgent(opts ...Option) *Agent {
 		deleted:            make(map[acp.SessionId]struct{}),
 		directories:        make(map[string]directoryBinding),
 		runtimeRetirements: make(map[uint64]*runtimeRetirement),
+		retiredNativeTrees: make(map[string]retiredNativeTree),
 		clientCalls:        make(chan struct{}, limits.MaxConcurrentClientCalls),
 	}
 	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
@@ -251,6 +259,15 @@ func (a *Agent) Close() error {
 		if fatalRuntimeCleanup(startErr) {
 			err = errors.Join(err, startErr)
 		}
+	}
+
+	if a.options.hostAuthorityConfigured {
+		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+
+		a.nativeAdmissionMu.Lock()
+		err = errors.Join(err, a.retryRetiredNativeTrees(ctx))
+		a.nativeAdmissionMu.Unlock()
+		cancel()
 	}
 
 	a.interruptConnection()

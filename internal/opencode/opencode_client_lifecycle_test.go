@@ -693,11 +693,15 @@ func TestRuntimeShutdownReportsGeneratedScratchCleanupFailure(t *testing.T) {
 	settlement.start()
 	<-settlement.done
 	cleanupCalls := 0
+	cleanupFails := true
 	server := &openCodeServer{
 		process: process, settlement: settlement, runtimeShutdown: newRuntimeShutdownState(),
 		runtimeClosed: make(chan struct{}),
 		preparedTrees: []preparedNativeTree{{path: "runtime", cleanup: func() error {
 			cleanupCalls++
+			if !cleanupFails {
+				return nil
+			}
 
 			return errors.Join(ErrRuntimeScratchCleanup, want)
 		}}},
@@ -707,7 +711,64 @@ func TestRuntimeShutdownReportsGeneratedScratchCleanupFailure(t *testing.T) {
 	require.ErrorIs(t, err, ErrRuntimeScratchCleanup)
 	require.ErrorIs(t, err, want)
 	require.Equal(t, 1, cleanupCalls)
-	require.Same(t, err, server.Shutdown(t.Context()))
+	cleanupFails = false
+	require.NoError(t, server.Shutdown(t.Context()))
+	require.Equal(t, 2, cleanupCalls)
+	require.NoError(t, server.Shutdown(t.Context()))
+	require.Equal(t, 2, cleanupCalls)
+}
+
+func TestStartFailureTransfersCleanupOnlyRetryAfterSuccessfulReclaim(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "runtime")
+	want := errors.New("start refused")
+
+	removeAll := openCodeRemoveAll
+	failedRemoval := false
+	openCodeRemoveAll = func(path string) error {
+		if path == root && !failedRemoval {
+			failedRemoval = true
+
+			return errors.New("remove failed")
+		}
+
+		return removeAll(path)
+	}
+	t.Cleanup(func() { openCodeRemoveAll = removeAll })
+
+	var (
+		reclaims int
+		retained reclaimedTreeCleanup
+	)
+	_, err := StartServer(t.Context(), StartOptions{
+		Root: root, ControlRoot: ControlRootForXDG(root), RemoveRoot: true, Pure: true,
+		NativeEnvironment: func() map[string]string { return map[string]string{"PATH": "/bin"} },
+		PrepareTree:       func(context.Context, string) error { return nil },
+		ReclaimTree: func(context.Context, string) error {
+			reclaims++
+
+			return nil
+		},
+		RetainTree: func(path string, reclaimed bool, cleanup func() error) {
+			retained = reclaimedTreeCleanup{path: path, reclaimed: reclaimed, cleanup: cleanup}
+		},
+		StartProcess: func(context.Context, string, []string, []string, string) (ProcessHandle, error) {
+			return ProcessHandle{}, MarkProcessStartSettled(want)
+		},
+	})
+	require.ErrorIs(t, err, want)
+	require.ErrorIs(t, err, ErrRuntimeScratchCleanup)
+	require.Equal(t, 1, reclaims)
+	require.Equal(t, root, retained.path)
+	require.True(t, retained.reclaimed)
+	require.NotNil(t, retained.cleanup)
+	require.NoError(t, retained.cleanup())
+	require.Equal(t, 1, reclaims, "cleanup-only retry reclaimed the same tree twice")
+}
+
+type reclaimedTreeCleanup struct {
+	path      string
+	reclaimed bool
+	cleanup   func() error
 }
 
 func TestScopesCreateNoNativeTreesOrRetireSharedRuntime(t *testing.T) {

@@ -170,6 +170,36 @@ func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {
 	require.Equal(t, "runtime exited", current.runtimeLostCause)
 }
 
+func TestHostAuthorityLossFencesEverySharedRuntimeSession(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.closeErr = errors.Join(errors.New("authority connection closed"), ErrHostAuthorityUnavailable)
+	agent := NewAgent(WithHome(t.TempDir()))
+	agent.runtime = client
+	agent.runtimeGeneration = 1
+
+	var cancelled atomic.Int32
+	for _, id := range []acp.SessionId{"first", "second"} {
+		current := &session{
+			agent: agent, id: id, client: client, runtimeGeneration: 1,
+			cancel: func() { cancelled.Add(1) },
+			incarnation: &nativeIncarnationBinding{
+				client: client, generation: 1, registry: newActionRegistry(),
+			},
+		}
+		agent.sessions[id] = current
+	}
+
+	err := agent.retireSharedRuntime(1, "host authority unavailable")
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+	require.ErrorIs(t, agent.runtimeFatalErr, ErrHostAuthorityUnavailable)
+	require.EqualValues(t, 2, cancelled.Load())
+	for _, current := range agent.sessions {
+		require.Zero(t, current.runtimeGeneration)
+		require.Equal(t, "host authority unavailable", current.runtimeLostCause)
+		require.Nil(t, current.incarnation)
+	}
+}
+
 func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
 	shutdownBase := newFakeOpenCodeClient()
 	tests := []struct {

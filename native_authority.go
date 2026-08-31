@@ -57,7 +57,7 @@ func authorityProcessStarter(authority HostAuthority) opencode.ProcessStarter {
 			WorkingDirectory: workingDirectory,
 		})
 		if err != nil {
-			return opencode.ProcessHandle{}, err
+			return opencode.ProcessHandle{}, opencode.MarkProcessStartSettled(err)
 		}
 
 		if nativeProcessNil(process) {
@@ -81,7 +81,7 @@ func authorityProcessStarter(authority HostAuthority) opencode.ProcessStarter {
 				defer func() {
 					if recover() != nil {
 						outcome = opencode.ProcessOutcome{}
-						waitErr = ErrContainmentIncomplete
+						waitErr = errors.Join(ErrHostAuthorityUnavailable, ErrContainmentIncomplete)
 					}
 				}()
 
@@ -94,7 +94,10 @@ func authorityProcessStarter(authority HostAuthority) opencode.ProcessStarter {
 				}
 
 				if waitErr != nil {
-					waitErr = errors.Join(ErrContainmentIncomplete, waitErr)
+					ctxErr := waitCtx.Err()
+					if ctxErr == nil || !errors.Is(waitErr, ctxErr) {
+						waitErr = errors.Join(ErrContainmentIncomplete, waitErr)
+					}
 				}
 
 				return outcome, waitErr
@@ -102,7 +105,7 @@ func authorityProcessStarter(authority HostAuthority) opencode.ProcessStarter {
 			Stop: func(revokeCtx context.Context) (revokeErr error) {
 				defer func() {
 					if recover() != nil {
-						revokeErr = ErrHostAuthorityUnavailable
+						revokeErr = errors.Join(ErrHostAuthorityUnavailable, ErrContainmentIncomplete)
 					}
 				}()
 
