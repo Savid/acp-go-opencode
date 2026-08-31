@@ -94,3 +94,12 @@ func TestWindowsEnvironmentCollapsesRepeatedSpellingsDeterministically(t *testin
 	require.Equal(t, []string{"PATH=sorts-last"}, envMapToSlice(composeEnvironment(within)),
 		"and the same spelling wins on every composition of the same phase")
 }
+
+func TestOrdinaryWindowsNilProcessResultAndRevoke(t *testing.T) {
+	result := ordinaryProcessOutcome(nil, nil)
+	require.Equal(t, -1, result.ExitCode)
+	require.False(t, result.Revoked)
+	won, err := stopOrdinaryProcess(t.Context(), nil)
+	require.NoError(t, err)
+	require.False(t, won)
+}

@@ -49,10 +49,6 @@ func requireSignalClosed(t *testing.T, signal <-chan struct{}, message string) {
 	}
 }
 
-func ordinaryStartOptions(options StartOptions) StartOptions {
-	return options
-}
-
 type openCodeMethodsRecorder struct {
 	seen        []string
 	messageBody MessageRequest
@@ -525,7 +521,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	helper := fakeOpenCodeExecutable(t)
 	root := t.TempDir()
 	logger := slog.New(slog.DiscardHandler)
-	client, err := StartServer(context.Background(), ordinaryStartOptions(StartOptions{
+	client, err := StartServer(context.Background(), StartOptions{
 		Root:            root,
 		ExecutablePath:  helper,
 		Env:             map[string]string{"BASE_ENV": "base"},
@@ -536,7 +532,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		HealthTimeout:   5 * time.Second,
 		Logger:          logger,
 		SkipVersionGate: false,
-	}))
+	})
 	if err != nil {
 		t.Fatalf("StartServer: %v", err)
 	}
@@ -631,6 +627,87 @@ func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneResult(t *testing.T) {
 	require.False(t, reclaimed, "a failed terminal wait cannot authorize reclaim")
 	require.False(t, cleaned, "a failed terminal wait cannot authorize removal")
 	require.Len(t, base.preparedTrees, 1)
+}
+
+func TestRuntimeShutdownRetriesBusyReclaimWithoutRemoval(t *testing.T) {
+	process := ProcessHandle{
+		Input: testWriteCloser{}, Output: io.NopCloser(strings.NewReader("")), Errors: io.NopCloser(strings.NewReader("")),
+		Stop: func(context.Context) error { return nil },
+		Await: func(context.Context) (ProcessOutcome, error) {
+			return ProcessOutcome{}, nil
+		},
+	}
+	settlement := newProcessSettlement(process)
+	settlement.start()
+	<-settlement.done
+	events := make([]string, 0, 4)
+	busy := errors.New("tree busy")
+	carrierBusy := true
+	server := &openCodeServer{
+		process: process, settlement: settlement, runtimeShutdown: newRuntimeShutdownState(),
+		runtimeClosed: make(chan struct{}),
+		preparedTrees: []preparedNativeTree{
+			{path: "runtime", cleanup: func() error {
+				events = append(events, "remove:runtime")
+
+				return nil
+			}},
+			{path: "carrier", cleanup: func() error {
+				events = append(events, "remove:carrier")
+
+				return nil
+			}},
+		},
+		reclaimTree: func(_ context.Context, path string) error {
+			events = append(events, "reclaim:"+path)
+			if path == "carrier" && carrierBusy {
+				return MarkTreeReclaimPending(busy)
+			}
+
+			return nil
+		},
+	}
+
+	first := server.Shutdown(t.Context())
+	require.ErrorIs(t, first, busy)
+	require.Equal(t, []string{"reclaim:carrier", "reclaim:runtime", "remove:runtime"}, events)
+	require.Len(t, server.preparedTrees, 1)
+	carrierBusy = false
+	require.NoError(t, server.Shutdown(t.Context()))
+	require.Equal(t, []string{
+		"reclaim:carrier", "reclaim:runtime", "remove:runtime", "reclaim:carrier", "remove:carrier",
+	}, events)
+	require.Empty(t, server.preparedTrees)
+}
+
+func TestRuntimeShutdownReportsGeneratedScratchCleanupFailure(t *testing.T) {
+	want := errors.New("remove generated runtime failed")
+	process := ProcessHandle{
+		Input: testWriteCloser{}, Output: io.NopCloser(strings.NewReader("")), Errors: io.NopCloser(strings.NewReader("")),
+		Stop: func(context.Context) error { return nil },
+		Await: func(context.Context) (ProcessOutcome, error) {
+			return ProcessOutcome{}, nil
+		},
+	}
+	settlement := newProcessSettlement(process)
+	settlement.start()
+	<-settlement.done
+	cleanupCalls := 0
+	server := &openCodeServer{
+		process: process, settlement: settlement, runtimeShutdown: newRuntimeShutdownState(),
+		runtimeClosed: make(chan struct{}),
+		preparedTrees: []preparedNativeTree{{path: "runtime", cleanup: func() error {
+			cleanupCalls++
+
+			return errors.Join(ErrRuntimeScratchCleanup, want)
+		}}},
+	}
+
+	err := server.Shutdown(t.Context())
+	require.ErrorIs(t, err, ErrRuntimeScratchCleanup)
+	require.ErrorIs(t, err, want)
+	require.Equal(t, 1, cleanupCalls)
+	require.Same(t, err, server.Shutdown(t.Context()))
 }
 
 func TestScopesCreateNoNativeTreesOrRetireSharedRuntime(t *testing.T) {
@@ -1347,6 +1424,14 @@ func TestOpenCodeServerCloseDetachesOnContextAndCompletesAtTerminal(t *testing.T
 	settlement := newProcessSettlement(process)
 	settlement.start()
 	server := &openCodeServer{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusMethodNotAllowed,
+				Status:     "405 Method Not Allowed",
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		})},
+		baseURL: "http://opencode.test",
 		process: process, settlement: settlement,
 		runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
 	}
@@ -1365,6 +1450,7 @@ func TestOpenCodeServerCloseDetachesOnContextAndCompletesAtTerminal(t *testing.T
 
 	close(terminal)
 	require.NoError(t, <-done)
+	require.True(t, server.RuntimeRevoked())
 }
 
 func TestXDGEnvAndPipeHelpers(t *testing.T) {
@@ -2255,13 +2341,14 @@ func TestColdStartupReleaseGate(t *testing.T) {
 
 	for range releaseGateRepetitions {
 		started := time.Now()
-		client, err := StartServer(context.Background(), ordinaryStartOptions(StartOptions{
+		client, err := StartServer(context.Background(), StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  executable,
 			MinVersion:      "1.18.3",
 			HealthTimeout:   5 * time.Second,
 			SkipVersionGate: false,
-		}))
+			Pure:            true,
+		})
 		durations = append(durations, time.Since(started))
 		require.NoError(t, err)
 		require.NoError(t, client.Shutdown(context.Background()))

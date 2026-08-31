@@ -13,17 +13,17 @@ func configureOrdinaryProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func stopOrdinaryProcess(_ context.Context, command *exec.Cmd) error {
+func stopOrdinaryProcess(_ context.Context, command *exec.Cmd) (bool, error) {
 	if command == nil || command.Process == nil {
-		return nil
+		return false, nil
 	}
 
 	err := syscall.Kill(-command.Process.Pid, syscall.SIGTERM)
 	if errors.Is(err, syscall.ESRCH) {
-		return nil
+		return false, nil
 	}
 
-	return err
+	return err == nil, err
 }
 
 func containOrdinaryProcess(command *exec.Cmd) error {

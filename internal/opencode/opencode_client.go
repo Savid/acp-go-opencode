@@ -112,7 +112,42 @@ var (
 	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
 	ErrScopeRuntimeShutdown  = errors.New("directory-scoped OpenCode client cannot shut down the shared runtime")
 	ErrRuntimeScratchCleanup = errors.New("OpenCode runtime scratch cleanup incomplete")
+	errAuthorityUnavailable  = errors.New("native authority unavailable")
+	errTreeReclaimPending    = errors.New("native tree reclaim pending")
+	errProcessStartSettled   = errors.New("native process start failure settled")
+	errNativeCleanupRetained = errors.New("native cleanup retained")
 )
+
+type nativeBoundaryError struct {
+	err    error
+	marker error
+}
+
+func (e *nativeBoundaryError) Error() string { return e.err.Error() }
+func (e *nativeBoundaryError) Unwrap() error { return e.err }
+func (e *nativeBoundaryError) Is(target error) bool {
+	return target == e.marker || errors.Is(e.err, target)
+}
+
+func MarkAuthorityUnavailable(err error) error {
+	return &nativeBoundaryError{err: err, marker: errAuthorityUnavailable}
+}
+
+func MarkTreeReclaimPending(err error) error {
+	return &nativeBoundaryError{err: err, marker: errTreeReclaimPending}
+}
+
+func MarkProcessStartSettled(err error) error {
+	return &nativeBoundaryError{err: err, marker: errProcessStartSettled}
+}
+
+func NativeCleanupRetained(err error) bool {
+	return errors.Is(err, errNativeCleanupRetained)
+}
+
+func retainNativeCleanup(err error) error {
+	return &nativeBoundaryError{err: err, marker: errNativeCleanupRetained}
+}
 
 type Client interface {
 	Close(context.Context) error
@@ -260,6 +295,7 @@ type openCodeServer struct {
 	directory               string
 	scopeCancel             context.CancelFunc
 	runtimeShutdown         *runtimeShutdownState
+	runtimeCloseOnce        sync.Once
 	runtimeClosed           chan struct{}
 	runtimeExited           chan struct{}
 	mcpNames                []string
@@ -276,19 +312,24 @@ type openCodeServer struct {
 }
 
 type preparedNativeTree struct {
-	path    string
-	cleanup func() error
+	path      string
+	cleanup   func() error
+	reclaimed bool
 }
 
-type runtimeShutdownState struct {
-	once sync.Once
+type runtimeShutdownAttempt struct {
 	done chan struct{}
-	mu   sync.Mutex
 	err  error
 }
 
+type runtimeShutdownState struct {
+	mu       sync.Mutex
+	current  *runtimeShutdownAttempt
+	terminal *runtimeShutdownAttempt
+}
+
 func newRuntimeShutdownState() *runtimeShutdownState {
-	return &runtimeShutdownState{done: make(chan struct{})}
+	return &runtimeShutdownState{}
 }
 
 type NativeSession struct {
@@ -849,7 +890,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		}
 	}
 
-	preparedTrees := make([]preparedNativeTree, 0, 3)
+	preparedTrees := make([]preparedNativeTree, 0, 2)
 	runtimeTree := preparedNativeTree{path: xdg.Root}
 
 	if options.RemoveRoot {
@@ -867,8 +908,10 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	}
 
 	transferred := false
+
+	retainPrepared := false
 	defer func() {
-		if transferred {
+		if transferred || retainPrepared {
 			return
 		}
 
@@ -903,12 +946,18 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 			trees = append(trees, preparedNativeTree{path: sessionCarrier.Root, cleanup: sessionCarrier.Cleanup})
 		}
 
-		if options.BrowserShim != nil {
-			trees = append(trees, preparedNativeTree{path: options.BrowserShim.Dir()})
-		}
-
 		for _, tree := range trees {
 			if prepareErr := options.PrepareTree(ctx, tree.path); prepareErr != nil {
+				if errors.Is(prepareErr, errAuthorityUnavailable) {
+					retainPrepared = true
+				} else if tree.cleanup != nil {
+					prepareErr = errors.Join(prepareErr, tree.cleanup())
+				}
+
+				if retainPrepared {
+					prepareErr = retainNativeCleanup(prepareErr)
+				}
+
 				return nil, prepareErr
 			}
 
@@ -986,11 +1035,28 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 
 	process, startErr := options.StartProcess(ctx, executable, arguments, nativeEnvironment, xdg.Root)
 	if startErr != nil {
+		if options.ReclaimTree != nil && !errors.Is(startErr, errProcessStartSettled) {
+			retainPrepared = true
+		}
+
+		if retainPrepared {
+			startErr = retainNativeCleanup(startErr)
+		}
+
 		return nil, startErr
 	}
 
 	if !process.valid() {
-		return nil, errors.New("native process handle is incomplete")
+		if options.ReclaimTree != nil {
+			retainPrepared = true
+		}
+
+		err := errors.New("native process handle is incomplete")
+		if retainPrepared {
+			err = retainNativeCleanup(err)
+		}
+
+		return nil, err
 	}
 
 	settlement := newProcessSettlement(process)
@@ -1196,23 +1262,37 @@ func (s *openCodeServer) Shutdown(ctx context.Context) error {
 		s.runtimeShutdown = state
 	}
 
-	state.once.Do(func() {
+	state.mu.Lock()
+	if state.terminal != nil {
+		attempt := state.terminal
+		state.mu.Unlock()
+
+		return attempt.err
+	}
+
+	attempt := state.current
+	if attempt == nil {
+		attempt = &runtimeShutdownAttempt{done: make(chan struct{})}
+		state.current = attempt
+
 		go func() {
-			err := s.shutdownRuntime()
+			attempt.err = s.shutdownRuntime()
 
 			state.mu.Lock()
-			state.err = err
+			state.current = nil
+
+			if !errors.Is(attempt.err, errTreeReclaimPending) {
+				state.terminal = attempt
+			}
 			state.mu.Unlock()
-			close(state.done)
+			close(attempt.done)
 		}()
-	})
+	}
+	state.mu.Unlock()
 
 	select {
-	case <-state.done:
-		state.mu.Lock()
-		defer state.mu.Unlock()
-
-		return state.err
+	case <-attempt.done:
+		return attempt.err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -1223,10 +1303,14 @@ func (s *openCodeServer) shutdownRuntime() error {
 	waitSucceeded := false
 
 	if s.runtimeClosed != nil {
-		close(s.runtimeClosed)
+		s.runtimeCloseOnce.Do(func() { close(s.runtimeClosed) })
 	}
 
-	var err error
+	var (
+		err       error
+		revokeErr error
+	)
+
 	if s.sessionCarrierBroker != nil {
 		err = errors.Join(err, s.sessionCarrierBroker.Close())
 	}
@@ -1235,15 +1319,30 @@ func (s *openCodeServer) shutdownRuntime() error {
 		select {
 		case <-s.settlement.done:
 		default:
+			disposeErr := s.DisposeInstance(cleanupCtx)
+
+			var httpErr *HTTPError
+
+			if errors.As(disposeErr, &httpErr) && (httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed) {
+				disposeErr = nil
+			}
+
+			err = errors.Join(err, disposeErr)
+
 			if s.process.Input != nil {
 				err = errors.Join(err, s.process.Input.Close())
 			}
 
-			err = errors.Join(err, s.process.Stop(cleanupCtx))
+			revokeErr = s.process.Stop(cleanupCtx)
 		}
 
-		_, waitErr := s.settlement.wait(cleanupCtx)
-		err = errors.Join(err, waitErr)
+		outcome, waitErr := s.settlement.wait(cleanupCtx)
+
+		if waitErr == nil && outcome.Revoked {
+			revokeErr = nil
+		}
+
+		err = errors.Join(err, revokeErr, waitErr)
 		waitSucceeded = waitErr == nil
 	}
 
@@ -1253,13 +1352,17 @@ func (s *openCodeServer) shutdownRuntime() error {
 
 	if s.ordinaryHomeLock != nil {
 		err = errors.Join(err, s.ordinaryHomeLock.Release())
+		s.ordinaryHomeLock = nil
 	}
 
 	if s.settlement != nil && waitSucceeded {
 		select {
 		case <-s.settlement.done:
 			if s.reclaimTree != nil {
-				err = errors.Join(err, reclaimPreparedTrees(cleanupCtx, s.preparedTrees, s.reclaimTree))
+				var reclaimErr error
+
+				s.preparedTrees, reclaimErr = reclaimPreparedTreesRetaining(cleanupCtx, s.preparedTrees, s.reclaimTree)
+				err = errors.Join(err, reclaimErr)
 			} else {
 				for _, tree := range s.preparedTrees {
 					if tree.cleanup != nil {
@@ -1268,7 +1371,9 @@ func (s *openCodeServer) shutdownRuntime() error {
 				}
 			}
 
-			s.preparedTrees = nil
+			if s.reclaimTree == nil {
+				s.preparedTrees = nil
+			}
 		default:
 		}
 	}
@@ -1281,22 +1386,46 @@ func reclaimPreparedTrees(
 	trees []preparedNativeTree,
 	reclaim func(context.Context, string) error,
 ) error {
+	_, err := reclaimPreparedTreesRetaining(ctx, trees, reclaim)
+
+	return err
+}
+
+func reclaimPreparedTreesRetaining(
+	ctx context.Context,
+	trees []preparedNativeTree,
+	reclaim func(context.Context, string) error,
+) ([]preparedNativeTree, error) {
 	var result error
+
+	remaining := make([]preparedNativeTree, 0, len(trees))
 
 	for index := len(trees) - 1; index >= 0; index-- {
 		tree := trees[index]
-		if err := reclaim(ctx, tree.path); err != nil {
-			result = errors.Join(result, err)
+		if !tree.reclaimed {
+			if err := reclaim(ctx, tree.path); err != nil {
+				result = errors.Join(result, err)
 
-			continue
+				remaining = append(remaining, tree)
+
+				continue
+			}
+
+			tree.reclaimed = true
 		}
 
 		if tree.cleanup != nil {
-			result = errors.Join(result, tree.cleanup())
+			if err := tree.cleanup(); err != nil {
+				result = errors.Join(result, err)
+
+				remaining = append(remaining, tree)
+			}
 		}
 	}
 
-	return result
+	slices.Reverse(remaining)
+
+	return remaining, result
 }
 
 func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Client, error) {
@@ -1466,6 +1595,21 @@ func (s *openCodeServer) EventStream() <-chan EventStreamItem {
 
 func (s *openCodeServer) RuntimeExited() <-chan struct{} {
 	return s.runtimeExited
+}
+
+// RuntimeRevoked distinguishes an authority- or adapter-initiated teardown
+// from a native runtime that exited on its own.
+func (s *openCodeServer) RuntimeRevoked() bool {
+	if s.settlement == nil {
+		return false
+	}
+
+	select {
+	case <-s.settlement.done:
+		return s.settlement.result.Revoked
+	default:
+		return false
+	}
 }
 
 func (s *openCodeServer) XDGDirs() XDGDirs {

@@ -296,7 +296,7 @@ func optionStringValues(raw any) []string {
 
 		return compactNonEmptyStrings(out)
 	case map[string]any:
-		for _, key := range []string{metaOptionsKey, "values", "enum"} {
+		for _, key := range []string{metaOptionsKey, "values", jsonFieldEnum} {
 			if values := optionStringValues(value[key]); len(values) > 0 {
 				return values
 			}

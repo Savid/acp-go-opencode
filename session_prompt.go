@@ -1875,7 +1875,7 @@ func eventQuestion(data json.RawMessage) (opencode.QuestionRequest, bool) {
 		return req, true
 	}
 
-	for _, key := range []string{questionWrapperKey, jsonFieldRequest, "data"} {
+	for _, key := range []string{questionWrapperKey, jsonFieldRequest, jsonFieldData} {
 		var wrapper map[string]json.RawMessage
 		if err := json.Unmarshal(data, &wrapper); err != nil {
 			continue
@@ -1963,17 +1963,17 @@ func questionPropertySchema(index int, question opencode.QuestionInfo) map[strin
 		}
 
 		return map[string]any{
-			jsonFieldType:  "array",
-			jsonFieldTitle: title,
-			"description":  description,
-			"items":        items,
+			jsonFieldType:        jsonTypeArray,
+			jsonFieldTitle:       title,
+			jsonFieldDescription: description,
+			jsonFieldItems:       items,
 		}
 	}
 
 	property := map[string]any{
-		jsonFieldType:  schemaTypeString,
-		jsonFieldTitle: title,
-		"description":  description,
+		jsonFieldType:        schemaTypeString,
+		jsonFieldTitle:       title,
+		jsonFieldDescription: description,
 	}
 
 	if !question.Custom {
@@ -1998,7 +1998,7 @@ func questionOptionSchemas(options []opencode.QuestionOption) []map[string]any {
 			jsonFieldTitle: label,
 		}
 		if option.Description != "" {
-			item["description"] = option.Description
+			item[jsonFieldDescription] = option.Description
 		}
 
 		out = append(out, item)

@@ -13,7 +13,9 @@ The standalone command and an embedded agent without `WithHostAuthority` use
 ordinary same-identity execution. OpenCode receives the adapter's filtered
 environment plus configured overlays. On Unix it runs in a separate process
 group so ordinary shutdown can terminate the group; this is lifecycle cleanup,
-not a managed-host containment claim.
+not a managed-host containment claim. On Windows, ordinary mode uses the native
+root-process APIs and cannot independently prove descendant vacancy; hosts that
+require that guarantee supply `WithHostAuthority`.
 
 An embedded managed host supplies `WithHostAuthority`. The adapter then:
 
@@ -21,18 +23,21 @@ An embedded managed host supplies `WithHostAuthority`. The adapter then:
 - rejects malformed entries and strips adapter-private and managed-root keys
   before adding its generated XDG, config, database, authentication, and carrier
   values;
-- materializes each runtime, carrier, and browser-shim tree before calling
+- materializes each runtime and carrier tree before calling
   `PrepareNativeTree`;
 - makes no filesystem access beneath a prepared tree until
   `ReclaimNativeTree` succeeds; and
 - sends every native executable, including probes and server starts, through
   `StartNative` with the exact environment slice it built.
 
-There is no managed-mode fallback. A nil, panicking, malformed, or failing
-authority refuses native work with `ErrHostAuthorityUnavailable`. Failures to
+There is no managed-mode fallback. A nil, panicking, or malformed authority
+refuses native work with `ErrHostAuthorityUnavailable`; operation-specific
+prepare and start validation errors retain their own identity. Failures to
 establish terminality or reclaim a tree preserve
 `ErrContainmentIncomplete` or `ErrNativeTreeBusy` in the error chain and leave
-the affected resources unreused.
+the affected resources unreused. `ErrNativeTreeBusy` blocks replacement
+admission until a later cleanup retry succeeds, without quarantining the
+authority as unavailable.
 
 `HostAuthority` owns the physical process boundary. `NativeProcess.Wait`
 reports only a terminal result, while `Revoke` initiates whole-tree teardown.

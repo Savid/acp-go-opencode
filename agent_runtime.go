@@ -21,23 +21,23 @@ import (
 type runtimeRetirement struct {
 	generation uint64
 	done       chan struct{}
+	runtime    opencode.Client
+	retryMu    sync.Mutex
 	err        error
 }
 
 var (
-	runtimeEvalSymlinks      = filepath.EvalSymlinks
-	runtimeAbs               = filepath.Abs
-	runtimeJSONMarshal       = json.Marshal
-	runtimeStartServer       = opencode.StartServer
-	runtimeRemoveAll         = os.RemoveAll
-	errRuntimeScratchCleanup = errors.New("adapter-created OpenCode runtime scratch cleanup failed")
+	runtimeEvalSymlinks = filepath.EvalSymlinks
+	runtimeAbs          = filepath.Abs
+	runtimeJSONMarshal  = json.Marshal
+	runtimeStartServer  = opencode.StartServer
+	runtimeRemoveAll    = os.RemoveAll
 )
 
 func fatalRuntimeCleanup(err error) bool {
 	return errors.Is(err, ErrHostAuthorityUnavailable) ||
 		errors.Is(err, ErrContainmentIncomplete) ||
-		errors.Is(err, opencode.ErrRuntimeScratchCleanup) ||
-		errors.Is(err, errRuntimeScratchCleanup)
+		errors.Is(err, opencode.ErrRuntimeScratchCleanup)
 }
 
 func (a *Agent) sharedRuntimeBinding(
@@ -56,6 +56,16 @@ func (a *Agent) sharedRuntimeBinding(
 			a.mu.Unlock()
 
 			return nil, 0, err
+		}
+
+		if sequencing := a.runtimeSequencing; sequencing != nil {
+			a.mu.Unlock()
+
+			if err := a.retryRuntimeCleanup(ctx, sequencing); err != nil {
+				return nil, 0, err
+			}
+
+			continue
 		}
 
 		if a.runtime != nil {
@@ -129,9 +139,7 @@ func (a *Agent) sharedRuntimeBinding(
 			shutdownCancel()
 		}
 
-		cleanupErr := a.finishRuntimeShutdown(shutdownErr)
-
-		startErr := errors.Join(err, cleanupErr)
+		startErr := errors.Join(err, shutdownErr)
 
 		a.mu.Lock()
 
@@ -172,7 +180,12 @@ func (a *Agent) handleSharedRuntimeExit(runtime opencode.Client, generation uint
 		return
 	}
 
-	if err := a.retireSharedRuntime(generation, "shared OpenCode runtime exited"); err != nil && a.log != nil {
+	cause := errValueSharedRuntimeExited
+	if reporter, ok := runtime.(interface{ RuntimeRevoked() bool }); ok && reporter.RuntimeRevoked() {
+		cause = "shared OpenCode runtime revoked"
+	}
+
+	if err := a.retireSharedRuntime(generation, cause); err != nil && a.log != nil {
 		a.log.ErrorContext(context.Background(), "clean up exited shared OpenCode runtime")
 	}
 }
@@ -244,7 +257,7 @@ func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, star
 		sessions = append(sessions, current)
 	}
 
-	retirement := &runtimeRetirement{generation: generation, done: make(chan struct{})}
+	retirement := &runtimeRetirement{generation: generation, done: make(chan struct{}), runtime: runtime}
 	a.runtimeRetirements[generation] = retirement
 	a.directories = make(map[string]directoryBinding)
 	a.runtime = nil
@@ -262,6 +275,10 @@ func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, star
 	a.mu.Lock()
 	retirement.err = cleanupErr
 
+	if errors.Is(cleanupErr, ErrNativeTreeBusy) {
+		a.runtimeSequencing = retirement
+	}
+
 	if fatalRuntimeCleanup(cleanupErr) {
 		a.runtimeFatalErr = cleanupErr
 	}
@@ -274,6 +291,42 @@ func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, star
 	a.mu.Unlock()
 
 	return cleanupErr
+}
+
+func (a *Agent) retryRuntimeCleanup(ctx context.Context, retirement *runtimeRetirement) error {
+	retirement.retryMu.Lock()
+	defer retirement.retryMu.Unlock()
+
+	a.mu.Lock()
+	current := a.runtimeSequencing == retirement
+	a.mu.Unlock()
+
+	if !current {
+		return nil
+	}
+
+	err := retirement.runtime.Shutdown(ctx)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.runtimeSequencing != retirement {
+		return err
+	}
+
+	retirement.err = err
+	if err == nil {
+		a.runtimeSequencing = nil
+
+		return nil
+	}
+
+	if fatalRuntimeCleanup(err) {
+		a.runtimeFatalErr = err
+		a.runtimeSequencing = nil
+	}
+
+	return err
 }
 
 func (a *Agent) settleSharedRuntimeRetirement(
@@ -330,7 +383,7 @@ func (a *Agent) settleSharedRuntimeRetirement(
 
 	shutdownErr := errors.Join(runtime.Shutdown(ctx), detachErr)
 
-	return a.finishRuntimeShutdown(shutdownErr)
+	return shutdownErr
 }
 
 func (a *Agent) runtimeGenerationIsCurrent(generation uint64) bool {
@@ -432,12 +485,12 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 		startOptions.PrepareTree = func(prepareCtx context.Context, path string) (err error) {
 			defer func() {
 				if recover() != nil {
-					err = ErrHostAuthorityUnavailable
+					err = opencode.MarkAuthorityUnavailable(ErrHostAuthorityUnavailable)
 				}
 			}()
 
 			if err := authority.PrepareNativeTree(prepareCtx, path); err != nil {
-				return errors.Join(ErrHostAuthorityUnavailable, err)
+				return err
 			}
 
 			return nil
@@ -445,11 +498,15 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 		startOptions.ReclaimTree = func(reclaimCtx context.Context, path string) (err error) {
 			defer func() {
 				if recover() != nil {
-					err = ErrContainmentIncomplete
+					err = errors.Join(ErrHostAuthorityUnavailable, ErrContainmentIncomplete)
 				}
 			}()
 
 			if err := authority.ReclaimNativeTree(reclaimCtx, path); err != nil {
+				if errors.Is(err, ErrNativeTreeBusy) {
+					return opencode.MarkTreeReclaimPending(err)
+				}
+
 				return errors.Join(ErrContainmentIncomplete, err)
 			}
 
@@ -467,7 +524,7 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 
 	runtime, err := factory(ctx, startOptions)
 	if err != nil {
-		if generated && !fatalRuntimeCleanup(err) {
+		if generated && !fatalRuntimeCleanup(err) && !opencode.NativeCleanupRetained(err) {
 			err = errors.Join(err, runtimeRemoveAll(root), runtimeRemoveAll(opencode.ControlRootForXDG(root)))
 		}
 
@@ -475,10 +532,6 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 	}
 
 	return runtime, nil
-}
-
-func (a *Agent) finishRuntimeShutdown(shutdownErr error) error {
-	return shutdownErr
 }
 
 func (a *Agent) bindDirectory(id acp.SessionId, cwd string, servers []opencode.MCPServerConfig) (func(), error) {

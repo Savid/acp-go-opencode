@@ -21,8 +21,8 @@ var (
 )
 
 // authBrokerPrefix names every per-flow broker home under the scratch parent.
-// The prefix buys diagnosability; residence under the scratch parent is what
-// makes the directory reclaimable by a host sweep.
+// The prefix keeps each ordinary provider-auth flow diagnosable and confined
+// to the adapter's resolved scratch parent.
 const authBrokerPrefix = "acp-go-opencode-auth-broker-"
 
 // authBroker is one pending flow's short-lived native home: a dedicated

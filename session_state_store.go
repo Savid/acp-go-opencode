@@ -540,7 +540,7 @@ var syncDataFields = map[string]map[string]struct{}{
 	syncTypeSessionCreated:   {syncFieldSessionID: {}, syncFieldInfo: {}},
 	"session.updated.1":      {syncFieldSessionID: {}, syncFieldInfo: {}},
 	"message.updated.1":      {syncFieldSessionID: {}, syncFieldInfo: {}},
-	"message.part.updated.1": {syncFieldSessionID: {}, syncFieldPart: {}, "time": {}},
+	"message.part.updated.1": {syncFieldSessionID: {}, syncFieldPart: {}, jsonFieldTime: {}},
 }
 
 const (

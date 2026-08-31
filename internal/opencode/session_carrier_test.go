@@ -415,13 +415,13 @@ func TestStartServerRefusesARuntimeWhoseCarrierNeverLoaded(t *testing.T) {
 		return write(path, data, mode)
 	}
 
-	_, err := StartServer(t.Context(), ordinaryStartOptions(StartOptions{
+	_, err := StartServer(t.Context(), StartOptions{
 		Root:            t.TempDir(),
 		ExecutablePath:  fakeOpenCodeExecutable(t),
 		MinVersion:      "1.18.3",
 		HealthTimeout:   2 * time.Second,
 		SkipVersionGate: false,
-	}))
+	})
 	require.ErrorContains(t, err, "did not load")
 }
 

@@ -503,7 +503,7 @@ func TestDirectoryScopeCloseFailureQuarantinesWithoutRelease(t *testing.T) {
 	require.ErrorIs(t, agent.runtimeFatalErr, opencode.ErrMCPDisconnectUnproven)
 
 	client.closeErr = nil
-	require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
+	require.NoError(t, agent.Close(), "logical scope cleanup failure must not become native containment failure")
 }
 
 func TestDirectoryBindingIncarnationSkipsZeroAfterWrap(t *testing.T) {

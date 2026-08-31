@@ -50,10 +50,6 @@ func resolveOrdinaryProcessExecutable(path string, environment []string) (string
 		if err == nil {
 			return resolved, nil
 		}
-
-		if !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("find %s in PATH: %w", path, err)
-		}
 	}
 
 	return "", fmt.Errorf("find %s in PATH: %w", path, exec.ErrNotFound)

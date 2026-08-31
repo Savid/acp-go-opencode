@@ -1389,18 +1389,17 @@ func (s *session) settleBeforeContainment(
 	return cycle, captured, nil
 }
 
-// containmentFailure marks a close-boundary error whose subject is the
-// containment proof itself: the native interrupt was refused, the stop was never
-// proved, or the native scope would not close. The boundary answers those with
-// the sentinel a host tests for, and never with a bare transport error that
-// reads like an ordinary failure. An error already carrying the sentinel is
-// returned as it is, so the classification never nests.
+var errRuntimeConfigurationIncomplete = errors.New("OpenCode runtime configuration incomplete")
+
+// containmentFailure preserves a genuine process-containment classification,
+// while assigning loopback session and directory-scope failures to the private
+// runtime-configuration boundary they actually belong to.
 func containmentFailure(err error) error {
-	if err == nil || errors.Is(err, ErrContainmentIncomplete) {
+	if err == nil || errors.Is(err, ErrContainmentIncomplete) || errors.Is(err, errRuntimeConfigurationIncomplete) {
 		return err
 	}
 
-	return errors.Join(ErrContainmentIncomplete, err)
+	return errors.Join(errRuntimeConfigurationIncomplete, err)
 }
 
 // containNativeScope proves this session's native scope gone: the pump stops
@@ -1524,7 +1523,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 		// detaches each session. A prompt entering in that narrow interval
 		// performs the same idempotent detach itself rather than touching the
 		// already-fenced client.
-		s.detachRuntime(generation, "shared OpenCode runtime exited")
+		s.detachRuntime(generation, errValueSharedRuntimeExited)
 		s.mu.Lock()
 	}
 

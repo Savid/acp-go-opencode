@@ -975,7 +975,8 @@ func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
 	cycle := acceptTestTurn(t, current)
 
 	_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
-	require.ErrorIs(t, err, ErrContainmentIncomplete)
+	require.ErrorIs(t, err, errRuntimeConfigurationIncomplete)
+	require.NotErrorIs(t, err, ErrContainmentIncomplete)
 	require.ErrorContains(t, err, "harness refused the interrupt")
 	require.True(t, lifecycleFenced(current), "the failed close left the incarnation speaking after it had stopped")
 	require.NoError(t, current.lifecycleFailure(), "the failed close latched a stream it said nothing on")
@@ -987,10 +988,10 @@ func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
 		"the failed close turned a refused interrupt into accepted terminal evidence")
 
 	_, err = agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: current.id})
-	require.ErrorIs(t, err, ErrContainmentIncomplete)
+	require.ErrorIs(t, err, errRuntimeConfigurationIncomplete)
 
 	_, err = agent.UnstableDeleteSession(context.Background(), DeleteSessionRequest(current.id))
-	require.ErrorIs(t, err, ErrContainmentIncomplete)
+	require.ErrorIs(t, err, errRuntimeConfigurationIncomplete)
 	require.Empty(t, client.deleted, "delete removed native state over a stop nobody proved")
 }
 

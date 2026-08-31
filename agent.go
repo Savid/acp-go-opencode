@@ -58,6 +58,7 @@ type Agent struct {
 	runtimeStartErr      error
 	runtimeFatalErr      error
 	runtimeRetirements   map[uint64]*runtimeRetirement
+	runtimeSequencing    *runtimeRetirement
 	directories          map[string]directoryBinding
 	directoryIncarnation directoryBindingIncarnation
 	fingerprintKey       [32]byte
@@ -198,6 +199,7 @@ func (a *Agent) Close() error {
 	runtime := a.runtime
 	generation := a.runtimeGeneration
 	waiting := a.runtimeStarting
+	sequencing := a.runtimeSequencing
 
 	stickyRuntimeErr := a.runtimeFatalErr
 	if !fatalRuntimeCleanup(stickyRuntimeErr) {
@@ -226,9 +228,15 @@ func (a *Agent) Close() error {
 
 	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
 
-	if runtime != nil {
+	switch {
+	case runtime != nil:
 		err = errors.Join(err, a.retireSharedRuntime(generation, "shared OpenCode runtime retired while closing agent"))
-	} else if waiting != nil {
+	case sequencing != nil:
+		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+		err = errors.Join(err, a.retryRuntimeCleanup(ctx, sequencing))
+
+		cancel()
+	case waiting != nil:
 		<-waiting
 		a.mu.Lock()
 		retirement := a.runtimeRetirements[generation]
@@ -313,9 +321,9 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 			jsonFieldKey: []string{jsonFieldSessionID, "subpath"},
 		},
 		structuredOutputMetaKey: map[string]any{
-			"config": outputSchemaOptionPath,
-			"result": structuredOutputPath,
-			"schema": opencode.OutputFormatJSONSchema,
+			"config":        outputSchemaOptionPath,
+			"result":        structuredOutputPath,
+			jsonFieldSchema: opencode.OutputFormatJSONSchema,
 		},
 	}
 
@@ -531,7 +539,7 @@ func (a *Agent) storeStartedSession(session *session) error {
 	}
 
 	if a.runtime == nil {
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "shared OpenCode runtime exited"})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueSharedRuntimeExited})
 	}
 
 	if session.runtimeGeneration != a.runtimeGeneration {

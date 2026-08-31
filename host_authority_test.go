@@ -2,36 +2,44 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
 type authorityTrace struct {
-	mu       sync.Mutex
-	events   []string
-	prepared map[string]bool
-	hidden   map[string]string
-	process  *authorityTraceProcess
-	startErr error
-	hideTree bool
+	mu            sync.Mutex
+	events        []string
+	prepared      map[string]bool
+	hidden        map[string]string
+	process       *authorityTraceProcess
+	startErr      error
+	prepareErr    error
+	prepareAt     int
+	reclaimErr    error
+	waitErr       error
+	unusableStdio bool
+	readinessErr  bool
+	writeWAL      bool
+	hideTree      bool
 }
 
 func newAuthorityTrace() *authorityTrace {
-	authority := &authorityTrace{prepared: map[string]bool{}, hidden: map[string]string{}}
-	authority.process = &authorityTraceProcess{
-		authority: authority,
-		terminal:  make(chan struct{}),
-		stdin:     &authorityTraceInput{authority: authority},
-	}
-
-	return authority
+	return &authorityTrace{prepared: map[string]bool{}, hidden: map[string]string{}}
 }
 
 func (a *authorityTrace) record(event string) {
@@ -57,6 +65,13 @@ func (a *authorityTrace) PrepareNativeTree(_ context.Context, path string) error
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	a.prepareAt++
+	if a.prepareErr != nil && a.prepareAt == 2 {
+		a.events = append(a.events, "prepare-refused:"+filepath.Base(path))
+
+		return a.prepareErr
+	}
+
 	if a.hideTree {
 		hidden := path + ".authority"
 		if err := os.Rename(path, hidden); err != nil {
@@ -75,11 +90,14 @@ func (a *authorityTrace) PrepareNativeTree(_ context.Context, path string) error
 func (a *authorityTrace) ReclaimNativeTree(_ context.Context, path string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.process.settled {
+	if a.process != nil && !a.process.settled {
 		return errors.New("reclaim before terminal wait")
 	}
 	if !a.prepared[path] {
 		return errors.New("reclaim of unprepared tree")
+	}
+	if a.reclaimErr != nil {
+		return a.reclaimErr
 	}
 
 	if hidden := a.hidden[path]; hidden != "" {
@@ -88,6 +106,26 @@ func (a *authorityTrace) ReclaimNativeTree(_ context.Context, path string) error
 		}
 
 		delete(a.hidden, path)
+	}
+	if a.writeWAL {
+		database := filepath.Join(path, "data", "opencode.db")
+		if _, err := os.Stat(database); err == nil {
+			for _, candidate := range []string{database, database + "-wal"} {
+				file, openErr := os.OpenFile(candidate, os.O_RDWR|os.O_APPEND, 0)
+				if openErr != nil {
+					return openErr
+				}
+				if _, writeErr := file.Write([]byte("reopened")); writeErr != nil {
+					_ = file.Close()
+
+					return writeErr
+				}
+				if closeErr := file.Close(); closeErr != nil {
+					return closeErr
+				}
+			}
+			a.events = append(a.events, "wal-reopen")
+		}
 	}
 
 	a.events = append(a.events, "reclaim:"+filepath.Base(path))
@@ -104,13 +142,275 @@ func (a *authorityTrace) StartNative(_ context.Context, request NativeRequest) (
 	}
 	a.mu.Lock()
 	prepared := a.prepared[request.WorkingDirectory]
+	hiddenRoot := a.hidden[request.WorkingDirectory]
 	a.events = append(a.events, "start:"+request.Executable)
 	a.mu.Unlock()
 	if !prepared {
 		return nil, errors.New("native start outside prepared tree")
 	}
+	if hiddenRoot != "" {
+		if _, err := os.Stat(request.WorkingDirectory); !errors.Is(err, os.ErrNotExist) {
+			return nil, errors.New("adapter accessed prepared runtime tree before reclaim")
+		}
+	}
 
-	return a.process, nil
+	port := 0
+	for index, argument := range request.Arguments {
+		if argument == "--port" && index+1 < len(request.Arguments) {
+			port, _ = strconv.Atoi(request.Arguments[index+1])
+		}
+	}
+	if port == 0 {
+		return nil, errors.New("native start omitted port")
+	}
+
+	process := &authorityTraceProcess{
+		authority: a, terminal: make(chan struct{}), stdin: &authorityTraceInput{authority: a},
+		waitErr: a.waitErr,
+	}
+	server := httptest.NewUnstartedServer(a.nativeHandler())
+	if err := server.Listener.Close(); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		return nil, err
+	}
+	server.Listener = listener
+	server.Start()
+	process.server = server
+	a.process = process
+	a.proveCarrierReady()
+	if a.writeWAL {
+		nativeRoot := request.WorkingDirectory
+		if hidden := a.hidden[nativeRoot]; hidden != "" {
+			nativeRoot = hidden
+		}
+		database := filepath.Join(nativeRoot, "data", "opencode.db")
+		if err := os.MkdirAll(filepath.Dir(database), 0o700); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(database, []byte("SQLite format 3\x00"), 0o600); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(database+"-wal", []byte("wal-before-revoke"), 0o600); err != nil {
+			return nil, err
+		}
+	}
+	if a.unusableStdio {
+		process.stderrUnavailable = true
+	}
+
+	return process, nil
+}
+
+func (a *authorityTrace) nativeHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/global/health":
+			if a.readinessErr {
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+
+				return
+			}
+			writeAuthorityJSON(w, map[string]any{"healthy": true, "version": "9.9.9"})
+		case "/doc":
+			writeAuthorityJSON(w, authorityOpenCodeDoc())
+		case "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"type\":\"server.connected\",\"properties\":{}}\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		case "/instance/dispose", "/config":
+			if r.URL.Path == "/instance/dispose" {
+				a.record("dispose")
+			}
+			writeAuthorityJSON(w, map[string]any{})
+		default:
+			writeAuthorityJSON(w, map[string]any{})
+		}
+	})
+}
+
+func writeAuthorityJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func (a *authorityTrace) proveCarrierReady() {
+	a.mu.Lock()
+	hidden := make([]string, 0, len(a.hidden))
+	for _, path := range a.hidden {
+		hidden = append(hidden, path)
+	}
+	a.mu.Unlock()
+
+	for _, root := range hidden {
+		source, err := os.ReadFile(filepath.Join(root, "session-carrier.mjs"))
+		if err != nil {
+			continue
+		}
+		endpoint := authorityJSConstant(source, "BROKER_ENDPOINT")
+		token := authorityJSConstant(source, "BROKER_TOKEN")
+		if endpoint == "" || token == "" {
+			continue
+		}
+		request, err := http.NewRequest(http.MethodPost, endpoint+"/ready", http.NoBody)
+		if err != nil {
+			return
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		response, err := http.DefaultClient.Do(request)
+		if err == nil {
+			_ = response.Body.Close()
+		}
+
+		return
+	}
+}
+
+func authorityJSConstant(source []byte, name string) string {
+	match := regexp.MustCompile(`const ` + name + ` = ("(?:[^"\\]|\\.)*")`).FindSubmatch(source)
+	if len(match) != 2 {
+		return ""
+	}
+	value, _ := strconv.Unquote(string(match[1]))
+
+	return value
+}
+
+func authorityOpenCodeDoc() map[string]any {
+	paths := map[string]any{}
+	for _, path := range []string{
+		"/config", "/config/providers", "/command", "/event", "/session/status", "/session", "/session/{sessionID}",
+		"/session/{sessionID}/command", "/session/{sessionID}/message", "/session/{sessionID}/prompt_async",
+		"/session/{sessionID}/abort", "/session/{sessionID}/fork", "/session/{sessionID}/todo",
+		"/session/{sessionID}/revert", "/session/{sessionID}/unrevert", "/permission",
+		"/permission/{requestID}/reply", "/question", "/question/{requestID}/reply", "/question/{requestID}/reject",
+		"/api/session/{sessionID}/permission/{requestID}/reply", "/api/permission/request",
+		"/api/session/{sessionID}/question/{requestID}/reply", "/api/session/{sessionID}/question/{requestID}/reject",
+		"/api/question/request",
+	} {
+		paths[path] = map[string]any{}
+	}
+	paths["/api/permission/request"] = authorityPendingRequestPath("PermissionV2Request")
+	paths["/permission"] = authorityPendingArrayPath("PermissionRequest")
+	paths["/api/question/request"] = authorityPendingRequestPath("QuestionV2Request")
+	paths["/question"] = authorityPendingArrayPath("QuestionRequest")
+	paths["/api/session/{sessionID}/permission/{requestID}/reply"] = authorityReplyPath(
+		map[string]any{"type": "object", "properties": map[string]any{
+			"reply": map[string]any{"$ref": "#/components/schemas/PermissionV2Reply"}, "message": map[string]any{"type": "string"},
+		}, "required": []any{"reply"}}, http.StatusNoContent,
+	)
+	paths["/permission/{requestID}/reply"] = authorityReplyPath(map[string]any{
+		"type": "object", "properties": map[string]any{
+			"reply": map[string]any{"type": "string"}, "message": map[string]any{"type": "string"},
+		}, "required": []any{"reply"},
+	}, http.StatusOK)
+	paths["/api/session/{sessionID}/question/{requestID}/reply"] = authorityReplyPath(
+		map[string]any{"$ref": "#/components/schemas/QuestionV2Reply"}, http.StatusNoContent,
+	)
+	paths["/api/session/{sessionID}/question/{requestID}/reject"] = authorityNoContentPath()
+	paths["/question/{requestID}/reply"] = authorityReplyPath(nil, http.StatusOK)
+	paths["/question/{requestID}/reject"] = authorityReplyPath(nil, http.StatusOK)
+
+	return map[string]any{"paths": paths, "components": map[string]any{"schemas": authoritySchemas()}}
+}
+
+func authorityPendingRequestPath(item string) map[string]any {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{"data": map[string]any{
+			"type": "array", "items": map[string]any{"$ref": "#/components/schemas/" + item},
+		}},
+	}
+
+	return map[string]any{"get": map[string]any{"responses": map[string]any{
+		"200": map[string]any{"content": map[string]any{"application/json": map[string]any{"schema": schema}}},
+	}}}
+}
+
+func authorityPendingArrayPath(item string) map[string]any {
+	schema := map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/" + item}}
+
+	return map[string]any{"get": map[string]any{"responses": map[string]any{
+		"200": map[string]any{"content": map[string]any{"application/json": map[string]any{"schema": schema}}},
+	}}}
+}
+
+func authorityReplyPath(schema map[string]any, status int) map[string]any {
+	post := map[string]any{"responses": map[string]any{strconv.Itoa(status): map[string]any{"description": "ok"}}}
+	if schema != nil {
+		post["requestBody"] = map[string]any{"required": true, "content": map[string]any{
+			"application/json": map[string]any{"schema": schema},
+		}}
+	}
+
+	return map[string]any{"post": post}
+}
+
+func authorityNoContentPath() map[string]any {
+	return map[string]any{"post": map[string]any{"responses": map[string]any{
+		"204": map[string]any{"description": "<No Content>"},
+	}}}
+}
+
+func authoritySchemas() map[string]any {
+	events := []struct {
+		name     string
+		event    string
+		required []string
+	}{
+		{"EventPermissionV2Asked", "permission.v2.asked", []string{"id", "sessionID", "action", "resources"}},
+		{"EventPermissionV2Replied", "permission.v2.replied", []string{"sessionID", "requestID", "reply"}},
+		{"EventPermissionAsked", "permission.asked", []string{"id", "sessionID", "permission", "patterns"}},
+		{"EventPermissionReplied", "permission.replied", []string{"sessionID", "requestID", "reply"}},
+		{"EventQuestionV2Asked", "question.v2.asked", []string{"id", "sessionID", "questions"}},
+		{"EventQuestionV2Replied", "question.v2.replied", []string{"sessionID", "requestID", "answers"}},
+		{"EventQuestionAsked", "question.asked", []string{"id", "sessionID", "questions"}},
+		{"EventQuestionReplied", "question.replied", []string{"sessionID", "requestID", "answers"}},
+		{"EventMessagePartUpdated", "message.part.updated", []string{"sessionID", "part", "time"}},
+		{"EventServerConnected", "server.connected", nil},
+		{"EventSessionIdle", "session.idle", []string{"sessionID"}},
+		{"EventSessionStatus", "session.status", []string{"sessionID", "status"}},
+		{"EventSessionError", "session.error", nil},
+	}
+	refs := make([]any, 0, len(events))
+	schemas := map[string]any{}
+	for _, event := range events {
+		refs = append(refs, map[string]any{"$ref": "#/components/schemas/" + event.name})
+		schemas[event.name] = authorityEventSchema(event.event, event.required)
+	}
+	schemas["Event"] = map[string]any{"anyOf": refs}
+	schemas["QuestionV2Reply"] = map[string]any{
+		"type": "object", "properties": map[string]any{"answers": map[string]any{"type": "array"}}, "required": []any{"answers"},
+	}
+	schemas["OutputFormatJsonSchema"] = map[string]any{
+		"type": "object", "properties": map[string]any{
+			"type":       map[string]any{"type": "string", "enum": []any{"json_schema"}},
+			"schema":     map[string]any{"$ref": "#/components/schemas/JSONSchema"},
+			"retryCount": map[string]any{"type": "integer"},
+		}, "required": []any{"type", "schema"},
+	}
+
+	return schemas
+}
+
+func authorityEventSchema(eventType string, required []string) map[string]any {
+	properties := map[string]any{}
+	for _, property := range required {
+		properties[property] = map[string]any{"type": "string"}
+	}
+
+	return map[string]any{
+		"type": "object", "properties": map[string]any{
+			"id": map[string]any{"type": "string"}, "type": map[string]any{"type": "string", "enum": []string{eventType}},
+			"properties": map[string]any{
+				"type": "object", "properties": properties, "required": required, "additionalProperties": false,
+			},
+		}, "required": []string{"id", "type", "properties"}, "additionalProperties": false,
+	}
 }
 
 type authorityTraceInput struct {
@@ -129,16 +429,25 @@ func (w *authorityTraceInput) Close() error {
 }
 
 type authorityTraceProcess struct {
-	authority *authorityTrace
-	stdin     *authorityTraceInput
-	terminal  chan struct{}
-	revoke    sync.Once
-	settled   bool
+	authority         *authorityTrace
+	stdin             *authorityTraceInput
+	terminal          chan struct{}
+	server            *httptest.Server
+	revoke            sync.Once
+	settled           bool
+	waitErr           error
+	stderrUnavailable bool
 }
 
 func (p *authorityTraceProcess) Stdin() io.WriteCloser { return p.stdin }
 func (*authorityTraceProcess) Stdout() io.ReadCloser   { return io.NopCloser(&emptyReader{}) }
-func (*authorityTraceProcess) Stderr() io.ReadCloser   { return io.NopCloser(&emptyReader{}) }
+func (p *authorityTraceProcess) Stderr() io.ReadCloser {
+	if p.stderrUnavailable {
+		return nil
+	}
+
+	return io.NopCloser(&emptyReader{})
+}
 
 func (p *authorityTraceProcess) Wait(ctx context.Context) (NativeResult, error) {
 	select {
@@ -148,7 +457,7 @@ func (p *authorityTraceProcess) Wait(ctx context.Context) (NativeResult, error) 
 		p.authority.events = append(p.authority.events, "wait:terminal")
 		p.authority.mu.Unlock()
 
-		return NativeResult{Revoked: true}, nil
+		return NativeResult{Revoked: true}, p.waitErr
 	case <-ctx.Done():
 		return NativeResult{}, ctx.Err()
 	}
@@ -157,6 +466,9 @@ func (p *authorityTraceProcess) Wait(ctx context.Context) (NativeResult, error) 
 func (p *authorityTraceProcess) Revoke(context.Context) error {
 	p.revoke.Do(func() {
 		p.authority.record("revoke")
+		if p.server != nil {
+			p.server.Close()
+		}
 		close(p.terminal)
 	})
 
@@ -174,100 +486,57 @@ func runManagedTrace(t *testing.T, agent *Agent, authority *authorityTrace, remo
 	authority.events = nil
 	authority.mu.Unlock()
 
-	var root string
-	agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		root = options.Root
-		require.NotNil(t, options.PrepareTree)
-		require.NotNil(t, options.ReclaimTree)
-		require.NotNil(t, options.StartProcess)
-		require.Equal(t, "present", options.NativeEnvironment()["AUTHORITY_CANARY"])
-		require.NoError(t, options.PrepareTree(ctx, root))
-
-		process, err := options.StartProcess(ctx, "opencode", []string{"serve"}, []string{"AUTHORITY_CANARY=present"}, root)
-		if err != nil {
-			return nil, err
-		}
-		require.NoError(t, process.Input.Close())
-		require.NoError(t, process.Stop(ctx))
-		_, err = process.Await(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := options.ReclaimTree(ctx, root); err != nil {
-			return nil, err
-		}
-		if remove {
-			authority.record("remove:" + filepath.Base(root))
-			if err := os.RemoveAll(root); err != nil {
-				return nil, err
-			}
-		}
-
-		return newFakeOpenCodeClient(), nil
+	runtime, err := agent.startSharedRuntime(context.Background())
+	root := ""
+	if runtime != nil {
+		root = runtime.XDGDirs().Root
+		shutdownErr := runtime.Shutdown(context.Background())
+		err = errors.Join(err, shutdownErr)
 	}
-
-	_, err := agent.startSharedRuntime(context.Background())
+	_ = remove
 
 	return authority.snapshot(), root, err
 }
 
 func TestHostAuthorityManagedLaunchTrace(t *testing.T) {
 	authority := newAuthorityTrace()
+	authority.hideTree = true
 	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
 	events, _, err := runManagedTrace(t, agent, authority, false)
 	require.NoError(t, err)
-	require.Equal(t, []string{
-		"environment", "prepare:acp-go-opencode-runtime-", "start:opencode",
-		"protocol-close", "revoke", "wait:terminal", "reclaim:acp-go-opencode-runtime-",
-	}, normalizeAuthorityTrace(events))
-	require.Contains(t, events[1], "prepare:")
-	require.Contains(t, events[2], "start:")
-	require.Contains(t, events[5], "wait:")
-	require.Contains(t, events[6], "reclaim:")
+	normalized := normalizeAuthorityTrace(events)
+	require.Less(t, indexOfAuthorityEvent(normalized, "prepare:acp-go-opencode-runtime-"), indexOfAuthorityEvent(normalized, "start:opencode"))
+	require.Less(t, indexOfAuthorityEvent(normalized, "start:opencode"), indexOfAuthorityEvent(normalized, "protocol-close"))
+	require.Less(t, indexOfAuthorityEvent(normalized, "dispose"), indexOfAuthorityEvent(normalized, "protocol-close"))
+	require.Less(t, indexOfAuthorityEvent(normalized, "protocol-close"), indexOfAuthorityEvent(normalized, "revoke"))
+	require.Less(t, indexOfAuthorityEvent(normalized, "revoke"), indexOfAuthorityEvent(normalized, "wait:terminal"))
+	require.Less(t, indexOfAuthorityEvent(normalized, "wait:terminal"), indexOfAuthorityEvent(normalized, "reclaim:acp-go-opencode-runtime-"))
 }
 
 func TestHostAuthorityPreparedTreeExclusivity(t *testing.T) {
 	authority := newAuthorityTrace()
 	authority.hideTree = true
 	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
-	var root string
-	agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		root = options.Root
-		require.NoError(t, options.PrepareTree(ctx, root))
-		_, statErr := os.Stat(root)
-		require.ErrorIs(t, statErr, os.ErrNotExist)
-
-		process, err := options.StartProcess(ctx, "opencode", []string{"serve"}, []string{"PATH=/authority/bin"}, root)
-		require.NoError(t, err)
-		_, statErr = os.Stat(root)
-		require.ErrorIs(t, statErr, os.ErrNotExist)
-		require.NoError(t, process.Input.Close())
-		require.NoError(t, process.Stop(ctx))
-		_, err = process.Await(ctx)
-		require.NoError(t, err)
-		require.NoError(t, options.ReclaimTree(ctx, root))
-
-		return newFakeOpenCodeClient(), nil
-	}
-	_, err := agent.startSharedRuntime(context.Background())
+	events, root, err := runManagedTrace(t, agent, authority, false)
 	require.NoError(t, err)
 	_, statErr := os.Stat(root)
-	require.NoError(t, statErr)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
 	require.Empty(t, authority.prepared, "the adapter retained a prepared tree after reclaim")
 	require.NotContains(t, authority.prepared, opencode.ControlRootForXDG(root),
 		"the runtime-owned control lock entered the prepared tree set")
+	require.NotEmpty(t, events)
 }
 
 func TestHostAuthorityReclaimPrecedesRemoval(t *testing.T) {
 	authority := newAuthorityTrace()
+	authority.hideTree = true
 	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
 	events, root, err := runManagedTrace(t, agent, authority, true)
 	require.NoError(t, err)
 	normalized := normalizeAuthorityTrace(events)
 	require.Less(t, indexOfAuthorityEvent(normalized, "wait:terminal"), indexOfAuthorityEvent(normalized, "reclaim:acp-go-opencode-runtime-"))
-	require.Less(t, indexOfAuthorityEvent(normalized, "reclaim:acp-go-opencode-runtime-"), indexOfAuthorityEvent(normalized, "remove:acp-go-opencode-runtime-"))
 	_, statErr := os.Stat(root)
 	require.ErrorIs(t, statErr, os.ErrNotExist)
 }
@@ -277,36 +546,36 @@ func TestHostAuthorityForcedRevokeLeavesSQLiteWALReopenable(t *testing.T) {
 	authority.hideTree = true
 	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
 
-	agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		database := filepath.Join(options.Root, "data", "opencode.db")
-		wal := database + "-wal"
-		require.NoError(t, os.MkdirAll(filepath.Dir(database), 0o700))
-		require.NoError(t, os.WriteFile(database, []byte("SQLite format 3\x00"), 0o600))
-		require.NoError(t, os.WriteFile(wal, []byte("wal-before-revoke"), 0o600))
-		require.NoError(t, options.PrepareTree(ctx, options.Root))
-
-		process, err := options.StartProcess(ctx, "opencode", []string{"serve"}, nil, options.Root)
-		require.NoError(t, err)
-		require.NoError(t, process.Input.Close())
-		require.NoError(t, process.Stop(ctx))
-		_, err = process.Await(ctx)
-		require.NoError(t, err)
-		require.NoError(t, options.ReclaimTree(ctx, options.Root))
-
-		for _, path := range []string{database, wal} {
-			file, openErr := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0)
-			require.NoError(t, openErr)
-			_, writeErr := file.Write([]byte("reopened"))
-			require.NoError(t, writeErr)
-			require.NoError(t, file.Sync())
-			require.NoError(t, file.Close())
-		}
-
-		return newFakeOpenCodeClient(), nil
-	}
-
-	_, err := agent.startSharedRuntime(context.Background())
+	authority.writeWAL = true
+	runtime, err := agent.startSharedRuntime(context.Background())
 	require.NoError(t, err)
+	root := runtime.XDGDirs().Root
+	require.NoError(t, runtime.Shutdown(context.Background()))
+	walReopen := indexOfAuthorityEvent(authority.events, "wal-reopen")
+	require.GreaterOrEqual(t, walReopen, 0)
+	replacement, err := agent.startSharedRuntime(context.Background())
+	require.NoError(t, err)
+	secondStart := -1
+	seenStarts := 0
+	for index, event := range authority.events {
+		if event == "start:opencode" {
+			seenStarts++
+			if seenStarts == 2 {
+				secondStart = index
+			}
+		}
+	}
+	require.Less(t, walReopen, secondStart, "SQLite/WAL must reopen before replacement admission")
+	require.NoError(t, replacement.Shutdown(context.Background()))
+	for _, path := range []string{filepath.Join(root, "data", "opencode.db"), filepath.Join(root, "data", "opencode.db-wal")} {
+		_, statErr := os.Stat(path)
+		require.ErrorIs(t, statErr, os.ErrNotExist, "runtime root is removed only after WAL was reclaimed")
+	}
+	for index, event := range authority.events {
+		if strings.HasPrefix(event, "reclaim:") {
+			require.Less(t, indexOfAuthorityEvent(authority.events, "wait:terminal"), index)
+		}
+	}
 }
 
 func TestHostAuthorityNoOrdinaryFallback(t *testing.T) {
@@ -314,8 +583,13 @@ func TestHostAuthorityNoOrdinaryFallback(t *testing.T) {
 	authority.startErr = errors.New("authority refused")
 	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
 	events, _, err := runManagedTrace(t, agent, authority, false)
-	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+	require.ErrorIs(t, err, authority.startErr)
+	require.NotErrorIs(t, err, ErrHostAuthorityUnavailable)
+	require.NotErrorIs(t, err, ErrContainmentIncomplete)
 	require.Contains(t, events, "start-refused")
+	for _, event := range events {
+		require.NotContains(t, event, "reclaim:")
+	}
 
 	called := false
 	agent = NewAgent(WithHostAuthority(nil))
@@ -327,6 +601,166 @@ func TestHostAuthorityNoOrdinaryFallback(t *testing.T) {
 	_, err = agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
 	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
 	require.False(t, called)
+}
+
+func TestHostAuthorityManagedFailureMatrix(t *testing.T) {
+	tests := []struct {
+		name              string
+		configure         func(*authorityTrace)
+		want              error
+		wantText          string
+		wantReclaim       bool
+		wantRetainedTrees bool
+	}{
+		{
+			name: "prepare midway validation",
+			configure: func(authority *authorityTrace) {
+				authority.prepareErr = errors.New("carrier prepare rejected")
+			},
+			wantText: "carrier prepare rejected", wantReclaim: true,
+		},
+		{
+			name: "start validation",
+			configure: func(authority *authorityTrace) {
+				authority.startErr = errors.New("start request rejected")
+			},
+			wantText: "start request rejected", wantRetainedTrees: true,
+		},
+		{
+			name: "unusable stdio settled",
+			configure: func(authority *authorityTrace) {
+				authority.unusableStdio = true
+			},
+			wantText: "unusable host stdio", wantReclaim: true,
+		},
+		{
+			name: "unusable stdio wait failure",
+			configure: func(authority *authorityTrace) {
+				authority.unusableStdio = true
+				authority.waitErr = errors.New("wait uncertain")
+			},
+			want: ErrContainmentIncomplete, wantRetainedTrees: true,
+		},
+		{
+			name: "readiness failure",
+			configure: func(authority *authorityTrace) {
+				authority.readinessErr = true
+			},
+			wantText: "/global/health", wantReclaim: true,
+		},
+		{
+			name: "wait failure",
+			configure: func(authority *authorityTrace) {
+				authority.waitErr = errors.New("wait uncertain")
+			},
+			want: ErrContainmentIncomplete, wantRetainedTrees: true,
+		},
+		{
+			name: "reclaim failure",
+			configure: func(authority *authorityTrace) {
+				authority.reclaimErr = errors.New("reclaim uncertain")
+			},
+			want: ErrContainmentIncomplete, wantRetainedTrees: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authority := newAuthorityTrace()
+			authority.hideTree = true
+			test.configure(authority)
+			agent := NewAgent(
+				WithHostAuthority(authority), WithScratchDir(t.TempDir()),
+				WithOpenCodeHealthCheckTimeout(100*time.Millisecond),
+			)
+			_, _, err := runManagedTrace(t, agent, authority, false)
+			require.Error(t, err)
+			if test.want != nil {
+				require.ErrorIs(t, err, test.want)
+			}
+			if test.wantText != "" {
+				require.ErrorContains(t, err, test.wantText)
+			}
+			if test.name == "prepare midway validation" || test.name == "start validation" {
+				require.NotErrorIs(t, err, ErrHostAuthorityUnavailable)
+				require.NotErrorIs(t, err, ErrContainmentIncomplete)
+			}
+
+			events := authority.snapshot()
+			reclaimed := false
+			for _, event := range events {
+				if strings.HasPrefix(event, "reclaim:") {
+					reclaimed = true
+				}
+			}
+			require.Equal(t, test.wantReclaim, reclaimed, events)
+			if test.wantRetainedTrees {
+				authority.mu.Lock()
+				require.NotEmpty(t, authority.prepared)
+				for _, hidden := range authority.hidden {
+					_, statErr := os.Stat(hidden)
+					require.NoError(t, statErr)
+				}
+				authority.mu.Unlock()
+			}
+		})
+	}
+}
+
+func TestHostAuthorityBusyReclaimBlocksAdmissionUntilRetry(t *testing.T) {
+	authority := newAuthorityTrace()
+	authority.hideTree = true
+	authority.reclaimErr = ErrNativeTreeBusy
+	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
+
+	_, generation, err := agent.sharedRuntimeBinding(t.Context())
+	require.NoError(t, err)
+	err = agent.retireSharedRuntime(generation, "busy reclaim proof")
+	require.ErrorIs(t, err, ErrNativeTreeBusy)
+	require.NotErrorIs(t, err, ErrContainmentIncomplete)
+	require.Nil(t, agent.runtimeFatalErr)
+	starts := countAuthorityEvents(authority.snapshot(), "start:opencode")
+
+	_, _, err = agent.sharedRuntimeBinding(t.Context())
+	require.ErrorIs(t, err, ErrNativeTreeBusy)
+	require.Equal(t, starts, countAuthorityEvents(authority.snapshot(), "start:opencode"), "busy cleanup admitted a new runtime")
+
+	authority.mu.Lock()
+	authority.reclaimErr = nil
+	authority.mu.Unlock()
+	_, _, err = agent.sharedRuntimeBinding(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, starts+1, countAuthorityEvents(authority.snapshot(), "start:opencode"))
+	require.NoError(t, agent.Close())
+}
+
+func TestHostAuthorityPlainPrepareErrorDoesNotQuarantineNextRuntime(t *testing.T) {
+	authority := newAuthorityTrace()
+	authority.hideTree = true
+	authority.prepareErr = errors.New("one carrier path rejected")
+	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
+
+	_, err := agent.startSharedRuntime(t.Context())
+	require.ErrorIs(t, err, authority.prepareErr)
+	require.NotErrorIs(t, err, ErrHostAuthorityUnavailable)
+	require.NotErrorIs(t, err, ErrContainmentIncomplete)
+	require.Nil(t, agent.runtimeFatalErr)
+
+	runtime, err := agent.startSharedRuntime(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 1, countAuthorityEvents(authority.snapshot(), "start:opencode"))
+	require.NoError(t, runtime.Shutdown(t.Context()))
+}
+
+func countAuthorityEvents(events []string, target string) int {
+	count := 0
+	for _, event := range events {
+		if event == target {
+			count++
+		}
+	}
+
+	return count
 }
 
 func normalizeAuthorityTrace(events []string) []string {

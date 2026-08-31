@@ -133,6 +133,12 @@ func TestSessionCarrierBrokerRejectsUnsupportedRequests(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, sessionCarrierRoute+"reference", http.NoBody)
 	response := httptest.NewRecorder()
 	broker.serveHTTP(response, request)
+	require.Equal(t, http.StatusUnauthorized, response.Code)
+
+	request = httptest.NewRequest(http.MethodPost, sessionCarrierRoute+"reference", http.NoBody)
+	request.Header.Set("Authorization", "Bearer "+broker.token)
+	response = httptest.NewRecorder()
+	broker.serveHTTP(response, request)
 	require.Equal(t, http.StatusMethodNotAllowed, response.Code)
 
 	request = httptest.NewRequest(http.MethodGet, "/not-a-carrier/reference", http.NoBody)

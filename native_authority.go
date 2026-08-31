@@ -3,6 +3,10 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
@@ -53,16 +57,22 @@ func authorityProcessStarter(authority HostAuthority) opencode.ProcessStarter {
 			WorkingDirectory: workingDirectory,
 		})
 		if err != nil {
-			return opencode.ProcessHandle{}, errors.Join(ErrHostAuthorityUnavailable, err)
+			return opencode.ProcessHandle{}, err
 		}
 
-		if process == nil {
-			return opencode.ProcessHandle{}, ErrHostAuthorityUnavailable
+		if nativeProcessNil(process) {
+			return opencode.ProcessHandle{}, errors.Join(ErrHostAuthorityUnavailable, ErrContainmentIncomplete)
 		}
 
-		stdin, stdout, stderr := process.Stdin(), process.Stdout(), process.Stderr()
+		stdin, stdout, stderr, stdioErr := nativeProcessStdio(process)
+		if stdioErr != nil {
+			return opencode.ProcessHandle{}, errors.Join(stdioErr, settleUnusableNativeProcess(process))
+		}
+
 		if stdin == nil || stdout == nil || stderr == nil {
-			return opencode.ProcessHandle{}, ErrHostAuthorityUnavailable
+			return opencode.ProcessHandle{}, errors.Join(
+				errors.New("native process returned unusable host stdio"), settleUnusableNativeProcess(process),
+			)
 		}
 
 		return opencode.ProcessHandle{
@@ -92,16 +102,67 @@ func authorityProcessStarter(authority HostAuthority) opencode.ProcessStarter {
 			Stop: func(revokeCtx context.Context) (revokeErr error) {
 				defer func() {
 					if recover() != nil {
-						revokeErr = ErrContainmentIncomplete
+						revokeErr = ErrHostAuthorityUnavailable
 					}
 				}()
 
-				if revokeErr := process.Revoke(revokeCtx); revokeErr != nil {
-					return errors.Join(ErrContainmentIncomplete, revokeErr)
-				}
-
-				return nil
+				return process.Revoke(revokeCtx)
 			},
 		}, nil
 	}
+}
+
+func nativeProcessNil(process NativeProcess) bool {
+	if process == nil {
+		return true
+	}
+
+	value := reflect.ValueOf(process)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func nativeProcessStdio(process NativeProcess) (stdin io.WriteCloser, stdout, stderr io.ReadCloser, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			stdin, stdout, stderr = nil, nil, nil
+			err = errors.Join(ErrHostAuthorityUnavailable, fmt.Errorf("native process stdio panicked: %v", recovered))
+		}
+	}()
+
+	return process.Stdin(), process.Stdout(), process.Stderr(), nil
+}
+
+func settleUnusableNativeProcess(process NativeProcess) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	revokeErr := func() (err error) {
+		defer func() {
+			if recover() != nil {
+				err = ErrHostAuthorityUnavailable
+			}
+		}()
+
+		return process.Revoke(ctx)
+	}()
+
+	_, waitErr := func() (result NativeResult, err error) {
+		defer func() {
+			if recover() != nil {
+				err = ErrHostAuthorityUnavailable
+			}
+		}()
+
+		return process.Wait(ctx)
+	}()
+	if waitErr != nil {
+		return errors.Join(revokeErr, ErrContainmentIncomplete, waitErr)
+	}
+
+	return opencode.MarkProcessStartSettled(errors.Join(errors.New("native process settled after unusable stdio"), revokeErr))
 }

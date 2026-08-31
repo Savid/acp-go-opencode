@@ -4,17 +4,24 @@ package opencode
 
 import (
 	"context"
+	"errors"
+	"os"
 	"os/exec"
 )
 
 func configureOrdinaryProcess(*exec.Cmd) {}
 
-func stopOrdinaryProcess(_ context.Context, command *exec.Cmd) error {
+func stopOrdinaryProcess(_ context.Context, command *exec.Cmd) (bool, error) {
 	if command == nil || command.Process == nil {
-		return nil
+		return false, nil
 	}
 
-	return command.Process.Kill()
+	err := command.Process.Kill()
+	if errors.Is(err, os.ErrProcessDone) {
+		return false, nil
+	}
+
+	return err == nil, err
 }
 
 func containOrdinaryProcess(*exec.Cmd) error { return nil }

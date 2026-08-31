@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 )
 
 func startOrdinaryProcess(
@@ -50,6 +51,7 @@ func startOrdinaryProcess(
 		waitDone = make(chan struct{})
 		outcome  ProcessOutcome
 		waitErr  error
+		revoked  atomic.Bool
 	)
 
 	await := func(ctx context.Context) (ProcessOutcome, error) {
@@ -57,6 +59,7 @@ func startOrdinaryProcess(
 			go func() {
 				waitErr = command.Wait()
 				outcome = ordinaryProcessOutcome(command, waitErr)
+				outcome.Revoked = revoked.Load()
 				waitErr = normalizeOrdinaryWaitError(waitErr)
 				waitErr = errors.Join(waitErr, containOrdinaryProcess(command))
 
@@ -76,7 +79,12 @@ func startOrdinaryProcess(
 		Input: stdin, Output: stdout, Errors: stderr,
 		Await: await,
 		Stop: func(ctx context.Context) error {
-			return stopOrdinaryProcess(ctx, command)
+			won, err := stopOrdinaryProcess(ctx, command)
+			if won {
+				revoked.Store(true)
+			}
+
+			return err
 		},
 	}, nil
 }
