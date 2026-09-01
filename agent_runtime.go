@@ -438,7 +438,11 @@ func (a *Agent) closeDirectoryScope(client opencode.Client, releaseDirectory fun
 }
 
 func (a *Agent) closeFailedSession(session *session) error {
-	closeErr := session.Close(context.Background())
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+	closeErr := session.Close(closeCtx)
+
+	closeCancel()
+
 	if closeErr != nil {
 		a.quarantineRuntimeConfiguration(session.runtimeGeneration, closeErr)
 	}

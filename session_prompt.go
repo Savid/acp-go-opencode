@@ -1001,8 +1001,11 @@ func (s *session) classifyTurnFailure(ctx context.Context, err error, dispatch n
 }
 
 func (s *session) refreshLifecycleMCP(ctx context.Context) error {
-	s.recoveryMu.Lock()
-	defer s.recoveryMu.Unlock()
+	if err := s.recoveryMu.lock(ctx); err != nil {
+		return err
+	}
+
+	defer s.recoveryMu.unlock()
 
 	s.mu.Lock()
 	if !s.mcpRefreshPending {

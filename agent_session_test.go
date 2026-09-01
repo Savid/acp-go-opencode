@@ -968,6 +968,82 @@ func TestActiveResumePublishesNoSuccessorWhenHardCutContainmentFails(t *testing.
 	require.Empty(t, successorClient.scopes(), "failed containment admitted a successor")
 }
 
+func TestActiveResumeBoundsContendedPredecessorCloseAdmission(t *testing.T) {
+	cwd := t.TempDir()
+	store := NewInMemorySessionStore()
+	predecessorClient := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithSessionStore(store),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+	)
+	agent.sessionReplacementTimeout = 25 * time.Millisecond
+
+	predecessor := testSession(t, agent, predecessorClient)
+	predecessor.cwd = cwd
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{"/old/bin"})
+	require.NoError(t, predecessor.snapshotToStore(t.Context()))
+	require.NoError(t, predecessor.recoveryMu.lock(context.Background()))
+
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			predecessor.recoveryMu.unlock()
+		}
+	}()
+
+	successorClient := newFakeOpenCodeClient()
+	successorClient.getSession = testNativeSession(predecessor.idmap.NativeSessionID)
+	agent.mu.Lock()
+	agent.runtime = successorClient
+	agent.mu.Unlock()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
+			WithSessionOpenCodeOptions(NewOpenCodeOptions(
+				WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
+			)),
+		))
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(2 * time.Second):
+		t.Fatal("active replacement held the lifecycle gate past its close-admission deadline")
+	}
+
+	require.True(t, agent.sessionLifecycleMu.TryLock(), "timed-out close admission retained the lifecycle gate")
+	agent.sessionLifecycleMu.Unlock()
+
+	agent.mu.Lock()
+	mapped := agent.sessions[predecessor.id]
+	activeCount := len(agent.sessions)
+	agent.mu.Unlock()
+
+	predecessor.mu.Lock()
+	predecessorClosed := predecessor.closed
+	predecessor.mu.Unlock()
+
+	require.Same(t, predecessor, mapped)
+	require.Equal(t, 1, activeCount)
+	require.False(t, predecessorClosed, "timed-out admission partially closed the predecessor")
+	require.Empty(t, successorClient.scopes(), "timed-out admission published a successor")
+
+	predecessor.recoveryMu.unlock()
+	gateHeld = false
+	agent.sessionReplacementTimeout = settlementTimeout
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
+		)),
+	))
+	require.NoError(t, err, "released close admission was not retryable")
+	require.Len(t, successorClient.scopes(), 1)
+}
+
 func TestAgentLifecycleValidationAndStorageFailures(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()

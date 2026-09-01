@@ -68,7 +68,11 @@ type Agent struct {
 	// or replace an existing logical session binding. In particular, two active
 	// load/resume calls must never both prepare successors for the same map slot.
 	sessionLifecycleMu sync.Mutex
-	retiredNativeTrees map[string]retiredNativeTree
+	// sessionReplacementTimeout bounds how long an active replacement may wait
+	// to enter its predecessor's recovery/close gate. Once admitted, the close
+	// ladder owns its existing detached per-rung bounds.
+	sessionReplacementTimeout time.Duration
+	retiredNativeTrees        map[string]retiredNativeTree
 }
 
 type retiredNativeTree struct {
@@ -128,16 +132,17 @@ func NewAgent(opts ...Option) *Agent {
 	})
 
 	agent := &Agent{
-		options:            options,
-		log:                log,
-		optionsErr:         optionsErr,
-		observe:            observe,
-		sessions:           make(map[acp.SessionId]*session),
-		deleted:            make(map[acp.SessionId]struct{}),
-		directories:        make(map[string]directoryBinding),
-		runtimeRetirements: make(map[uint64]*runtimeRetirement),
-		retiredNativeTrees: make(map[string]retiredNativeTree),
-		clientCalls:        make(chan struct{}, limits.MaxConcurrentClientCalls),
+		options:                   options,
+		log:                       log,
+		optionsErr:                optionsErr,
+		observe:                   observe,
+		sessions:                  make(map[acp.SessionId]*session),
+		deleted:                   make(map[acp.SessionId]struct{}),
+		directories:               make(map[string]directoryBinding),
+		runtimeRetirements:        make(map[uint64]*runtimeRetirement),
+		retiredNativeTrees:        make(map[string]retiredNativeTree),
+		clientCalls:               make(chan struct{}, limits.MaxConcurrentClientCalls),
+		sessionReplacementTimeout: settlementTimeout,
 	}
 	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
 		agent.optionsErr = errors.Join(agent.optionsErr, fmt.Errorf("create runtime fingerprint key: %w", err))

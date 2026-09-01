@@ -209,10 +209,15 @@ func (a *Agent) loadOrResumeSession(
 		// carrier bindings can never overlap and the active-session slot is
 		// released before capacity admission runs again.
 		// Replacement is detached from request cancellation because it must not
-		// abandon a predecessor halfway through containment. It is still bounded
-		// by the same whole-ladder budget Agent.Close gives CloseAndCommit; the
-		// shorter closeTimeout only bounds individual containment rungs.
-		replacementCtx, replacementCancel := context.WithTimeout(context.Background(), settlementTimeout)
+		// abandon a predecessor halfway through containment. The deadline bounds
+		// waiting to enter the predecessor's recovery/close gate; after admission,
+		// CloseAndCommit runs its detached, internally bounded ladder to completion.
+		replacementTimeout := a.sessionReplacementTimeout
+		if replacementTimeout <= 0 {
+			replacementTimeout = settlementTimeout
+		}
+
+		replacementCtx, replacementCancel := context.WithTimeout(context.Background(), replacementTimeout)
 		closeErr := active.CloseAndCommit(replacementCtx)
 
 		replacementCancel()

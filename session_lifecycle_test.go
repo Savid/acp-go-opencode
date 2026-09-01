@@ -671,7 +671,7 @@ func TestActionRegistrationCancellationAndCloseDoNotLeak(t *testing.T) {
 
 			requireSignal(t, registrationStarted)
 			if closeSession {
-				require.NoError(t, current.closeSession(false))
+				require.NoError(t, current.closeSession(context.Background(), false))
 			} else {
 				require.NoError(t, current.cancelTurn(context.Background()))
 			}

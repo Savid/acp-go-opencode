@@ -18,6 +18,57 @@ import (
 
 const sessionUpdateAvailableCommands = "available_commands_update"
 
+// sessionRecoveryGate is the context-aware admission boundary shared by
+// runtime recovery, MCP refresh, and close. Its zero value is ready to use so
+// narrowly constructed test sessions remain valid. A timed-out waiter owns no
+// goroutine and no future admission: it simply leaves the permit with the
+// current owner, which is essential for predecessor-first replacement.
+type sessionRecoveryGate struct {
+	initMu sync.Mutex
+	permit chan struct{}
+}
+
+func (g *sessionRecoveryGate) lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	permit := g.permitChannel()
+
+	select {
+	case <-permit:
+		if err := ctx.Err(); err != nil {
+			permit <- struct{}{}
+
+			return err
+		}
+
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g *sessionRecoveryGate) unlock() {
+	select {
+	case g.permitChannel() <- struct{}{}:
+	default:
+		panic("unlock unlocked session recovery gate")
+	}
+}
+
+func (g *sessionRecoveryGate) permitChannel() chan struct{} {
+	g.initMu.Lock()
+	defer g.initMu.Unlock()
+
+	if g.permit == nil {
+		g.permit = make(chan struct{}, 1)
+		g.permit <- struct{}{}
+	}
+
+	return g.permit
+}
+
 type session struct {
 	agent                 *Agent
 	id                    acp.SessionId
@@ -43,7 +94,7 @@ type session struct {
 	directoryRelease  func()
 	mcpServers        []opencode.MCPServerConfig
 	mcpRefreshPending bool
-	recoveryMu        sync.Mutex
+	recoveryMu        sessionRecoveryGate
 	// establishMu serializes the short state transitions around establishment.
 	// The opening host notification runs without it held; establishing keeps a
 	// second caller waiting on the one immutable result.
@@ -322,7 +373,10 @@ func (s *session) failEstablishment(_ error) {
 	go func() {
 		defer handleAgentGoroutinePanicRecover(context.Background(), agentLogger(s.agent), "failed session establishment close", nil)
 
-		_ = s.Close(context.Background())
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
+		_ = s.Close(closeCtx)
+
+		closeCancel()
 	}()
 }
 
@@ -1205,8 +1259,10 @@ func validSlashCommandName(name string) bool {
 // nothing, commits nothing new, and emits no quiescence fact — has said the last
 // of it too. What the fence never becomes is evidence: settlement is judged from
 // the cycle's own loss, and a completed close from the boundary latch.
-func (s *session) Close(_ context.Context) error {
-	return s.closeSession(false)
+// ctx bounds waiting to enter the recovery/close gate. Once admitted, the
+// boundary runs its detached, internally bounded ladder to completion.
+func (s *session) Close(ctx context.Context) error {
+	return s.closeSession(ctx, false)
 }
 
 // CloseAndCommit is the close boundary that owes a resumable generation. It runs
@@ -1216,9 +1272,10 @@ func (s *session) Close(_ context.Context) error {
 // dropping state a wire close would have committed is the same lost generation
 // however the process ended. Close without the commit belongs to the two callers
 // that owe a host no generation at all: a rollback of a session that never
-// finished starting, and a delete that has already tombstoned the id.
-func (s *session) CloseAndCommit(_ context.Context) error {
-	return s.closeSession(true)
+// finished starting, and a delete that has already tombstoned the id. Its
+// context has the same admission-only role described by Close.
+func (s *session) CloseAndCommit(ctx context.Context) error {
+	return s.closeSession(ctx, true)
 }
 
 // closeSession runs the boundary once and answers for it. The retry contract is
@@ -1237,9 +1294,12 @@ func (s *session) CloseAndCommit(_ context.Context) error {
 // incarnation, while capture, containment, and the durable commit all still run.
 // It answers silently on success because the failure was already reported to the
 // caller who ran the boundary that failed.
-func (s *session) closeSession(commitResumable bool) error {
-	s.recoveryMu.Lock()
-	defer s.recoveryMu.Unlock()
+func (s *session) closeSession(ctx context.Context, commitResumable bool) error {
+	if err := s.recoveryMu.lock(ctx); err != nil {
+		return err
+	}
+
+	defer s.recoveryMu.unlock()
 
 	s.mu.Lock()
 
@@ -1501,8 +1561,11 @@ func (s *session) detachRuntime(generation uint64, cause string) {
 }
 
 func (s *session) ensureRuntime(ctx context.Context) error {
-	s.recoveryMu.Lock()
-	defer s.recoveryMu.Unlock()
+	if err := s.recoveryMu.lock(ctx); err != nil {
+		return err
+	}
+
+	defer s.recoveryMu.unlock()
 
 	s.mu.Lock()
 	if s.closed {
