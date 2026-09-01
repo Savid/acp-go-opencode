@@ -39,6 +39,30 @@ func fatalRuntimeCleanup(err error) bool {
 		errors.Is(err, ErrContainmentIncomplete)
 }
 
+func retryableRuntimeCleanup(err error) bool {
+	return !errors.Is(err, ErrHostAuthorityUnavailable) &&
+		(errors.Is(err, opencode.ErrProcessContainmentIncomplete) ||
+			errors.Is(err, ErrNativeTreeBusy) ||
+			errors.Is(err, opencode.ErrRuntimeScratchCleanup))
+}
+
+func classifyRuntimeContainment(err error) error {
+	if errors.Is(err, opencode.ErrProcessContainmentIncomplete) && !errors.Is(err, ErrContainmentIncomplete) {
+		return errors.Join(ErrContainmentIncomplete, err)
+	}
+
+	return err
+}
+
+func classifyRuntimeShutdown(ctx context.Context, err error) error {
+	err = classifyRuntimeContainment(err)
+	if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return errors.Join(ErrContainmentIncomplete, opencode.ErrProcessContainmentIncomplete, err)
+	}
+
+	return err
+}
+
 func (a *Agent) sharedRuntimeBinding(
 	ctx context.Context,
 ) (opencode.Client, uint64, error) {
@@ -274,11 +298,11 @@ func (a *Agent) retireSharedRuntimeStarted(generation uint64, cause string, star
 	a.mu.Lock()
 	retirement.err = cleanupErr
 
-	if errors.Is(cleanupErr, ErrNativeTreeBusy) || errors.Is(cleanupErr, opencode.ErrRuntimeScratchCleanup) {
+	if retryableRuntimeCleanup(cleanupErr) {
 		a.runtimeSequencing = retirement
 	}
 
-	if fatalRuntimeCleanup(cleanupErr) {
+	if fatalRuntimeCleanup(cleanupErr) && !retryableRuntimeCleanup(cleanupErr) {
 		a.runtimeFatalErr = cleanupErr
 	}
 
@@ -304,7 +328,7 @@ func (a *Agent) retryRuntimeCleanup(ctx context.Context, retirement *runtimeReti
 		return nil
 	}
 
-	err := retirement.runtime.Shutdown(ctx)
+	err := classifyRuntimeShutdown(ctx, retirement.runtime.Shutdown(ctx))
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -320,7 +344,7 @@ func (a *Agent) retryRuntimeCleanup(ctx context.Context, retirement *runtimeReti
 		return nil
 	}
 
-	if fatalRuntimeCleanup(err) {
+	if fatalRuntimeCleanup(err) && !retryableRuntimeCleanup(err) {
 		a.runtimeFatalErr = err
 		a.runtimeSequencing = nil
 	}
@@ -380,7 +404,7 @@ func (a *Agent) settleSharedRuntimeRetirement(
 	ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
 	defer cancel()
 
-	shutdownErr := errors.Join(runtime.Shutdown(ctx), detachErr)
+	shutdownErr := errors.Join(classifyRuntimeShutdown(ctx, runtime.Shutdown(ctx)), detachErr)
 
 	return shutdownErr
 }
@@ -536,6 +560,7 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 
 	runtime, err := factory(ctx, startOptions)
 	if err != nil {
+		err = classifyRuntimeContainment(err)
 		if generated && !fatalRuntimeCleanup(err) && !opencode.NativeCleanupRetained(err) {
 			err = errors.Join(err, runtimeRemoveAll(root), runtimeRemoveAll(opencode.ControlRootForXDG(root)))
 		}

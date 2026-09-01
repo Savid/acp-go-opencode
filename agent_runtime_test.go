@@ -170,6 +170,40 @@ func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {
 	require.Equal(t, "runtime exited", current.runtimeLostCause)
 }
 
+func TestRuntimeRetirementIncompleteProofFencesConfiguredHomeUntilRetry(t *testing.T) {
+	home := t.TempDir()
+	client := newFakeOpenCodeClient()
+	client.closeErr = errors.Join(ErrContainmentIncomplete, opencode.ErrProcessContainmentIncomplete)
+	agent := NewAgent(WithHome(home))
+	agent.runtime = client
+	agent.runtimeGeneration = 1
+
+	err := agent.retireSharedRuntime(1, "runtime containment incomplete")
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+	require.NotNil(t, agent.runtimeSequencing)
+	require.Nil(t, agent.runtimeFatalErr)
+
+	var starts atomic.Int32
+	replacement := newFakeOpenCodeClient()
+	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		starts.Add(1)
+		require.Equal(t, home, options.Root)
+
+		return replacement, nil
+	}
+
+	_, _, err = agent.sharedRuntimeBinding(t.Context())
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+	require.Zero(t, starts.Load(), "replacement rematerialized configured Home before containment proof")
+
+	client.closeErr = nil
+	got, generation, err := agent.sharedRuntimeBinding(t.Context())
+	require.NoError(t, err)
+	require.Same(t, replacement, got)
+	require.EqualValues(t, 2, generation)
+	require.EqualValues(t, 1, starts.Load())
+}
+
 func TestHostAuthorityLossFencesEverySharedRuntimeSession(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.closeErr = errors.Join(errors.New("authority connection closed"), ErrHostAuthorityUnavailable)

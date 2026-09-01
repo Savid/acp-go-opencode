@@ -107,15 +107,16 @@ const sseEventLineLimitBytes = 64 * 1024 * 1024
 const sseEventLimitBytes = sseEventLineLimitBytes
 
 var (
-	ErrSSEDisconnect         = errors.New("opencode SSE disconnected")
-	ErrSSEEventTooLarge      = errors.New("opencode SSE event exceeds size limit")
-	ErrMCPDisconnectUnproven = errors.New("opencode MCP disconnect unproven")
-	ErrScopeRuntimeShutdown  = errors.New("directory-scoped OpenCode client cannot shut down the shared runtime")
-	ErrRuntimeScratchCleanup = errors.New("OpenCode runtime scratch cleanup incomplete")
-	errPrepareOpaque         = errors.New("native tree prepare result is opaque")
-	errTreeReclaimPending    = errors.New("native tree reclaim pending")
-	errProcessStartSettled   = errors.New("native process start failure settled")
-	errNativeCleanupRetained = errors.New("native cleanup retained")
+	ErrSSEDisconnect                = errors.New("opencode SSE disconnected")
+	ErrSSEEventTooLarge             = errors.New("opencode SSE event exceeds size limit")
+	ErrMCPDisconnectUnproven        = errors.New("opencode MCP disconnect unproven")
+	ErrScopeRuntimeShutdown         = errors.New("directory-scoped OpenCode client cannot shut down the shared runtime")
+	ErrProcessContainmentIncomplete = errors.New("OpenCode process containment incomplete")
+	ErrRuntimeScratchCleanup        = errors.New("OpenCode runtime scratch cleanup incomplete")
+	errPrepareOpaque                = errors.New("native tree prepare result is opaque")
+	errTreeReclaimPending           = errors.New("native tree reclaim pending")
+	errProcessStartSettled          = errors.New("native process start failure settled")
+	errNativeCleanupRetained        = errors.New("native cleanup retained")
 )
 
 type nativeBoundaryError struct {
@@ -299,12 +300,19 @@ type openCodeServer struct {
 	runtimeCloseOnce        sync.Once
 	runtimeClosed           chan struct{}
 	runtimeExited           chan struct{}
+	runtimeWatchDone        chan struct{}
 	mcpNames                []string
 	scopeCloseMu            sync.Mutex
 	scopeClosed             bool
 	ordinaryHomeLock        *homelock.Lock
 	process                 ProcessHandle
 	settlement              *processSettlement
+	inputCloseOnce          sync.Once
+	inputCloseErr           error
+	streamCloseOnce         sync.Once
+	streamCloseErr          error
+	stdoutDone              chan struct{}
+	stderrDone              chan struct{}
 	preparedTrees           []preparedNativeTree
 	reclaimTree             func(context.Context, string) error
 	sessionCarrierBroker    *sessionCarrierBroker
@@ -939,7 +947,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		if options.ReclaimTree != nil {
 			var reclaimErr error
 
-			preparedTrees, reclaimErr = reclaimPreparedTreesRetaining(context.Background(), preparedTrees, options.ReclaimTree)
+			preparedTrees, reclaimErr = reclaimPreparedTreesDetached(preparedTrees, options.ReclaimTree)
 			resultErr = errors.Join(resultErr, reclaimErr)
 
 			if len(preparedTrees) > 0 {
@@ -1086,14 +1094,23 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	settlement.start()
 
 	runtimeExited := make(chan struct{})
+	runtimeWatchDone := make(chan struct{})
+
+	go observeProcessSettlement(settlement, runtimeExited, runtimeWatchDone)
+
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan struct{})
 
 	go func() {
-		<-settlement.done
-		close(runtimeExited)
-	}()
+		defer close(stdoutDone)
 
-	go drainProcessPipe(options.Logger, "opencode stdout", process.Output)
-	go drainProcessPipe(options.Logger, "opencode stderr", process.Errors)
+		drainProcessPipe(options.Logger, "opencode stdout", process.Output)
+	}()
+	go func() {
+		defer close(stderrDone)
+
+		drainProcessPipe(options.Logger, "opencode stderr", process.Errors)
+	}()
 
 	processCtx, cancel := context.WithCancel(context.Background())
 	server := &openCodeServer{
@@ -1101,6 +1118,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		username: username, password: password, cancel: cancel, xdg: xdg, log: options.Logger,
 		eventStream: make(chan EventStreamItem, 256), closed: make(chan struct{}),
 		runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}), runtimeExited: runtimeExited,
+		runtimeWatchDone: runtimeWatchDone, stdoutDone: stdoutDone, stderrDone: stderrDone,
 		ordinaryHomeLock: homeLock, process: process, settlement: settlement,
 		preparedTrees: preparedTrees, reclaimTree: options.ReclaimTree,
 		sessionCarrierBroker: sessionCarrier.Broker, pure: options.Pure,
@@ -1111,7 +1129,7 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	defer readyCancel()
 
 	if readyErr := server.waitReady(readyCtx, processCtx, options); readyErr != nil {
-		return nil, errors.Join(readyErr, server.Shutdown(context.Background()))
+		return nil, settleFailedServerStart(server, options.RetainTree, readyErr)
 	}
 
 	if sessionCarrier.URL != "" {
@@ -1121,11 +1139,33 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		carrierCancel()
 
 		if carrierErr != nil {
-			return nil, errors.Join(carrierErr, server.Shutdown(context.Background()))
+			return nil, settleFailedServerStart(server, options.RetainTree, carrierErr)
 		}
 	}
 
 	return server, nil
+}
+
+func observeProcessSettlement(settlement *processSettlement, runtimeExited, done chan struct{}) {
+	defer close(done)
+
+	<-settlement.done
+
+	if _, observed, _, _ := settlement.observation(); observed {
+		close(runtimeExited)
+	}
+}
+
+func settleFailedServerStart(server *openCodeServer, retain func(string, bool, func() error), startErr error) error {
+	err := errors.Join(startErr, server.Shutdown(context.Background()))
+	if len(server.preparedTrees) == 0 {
+		return err
+	}
+
+	retainPreparedTrees(server.preparedTrees, retain)
+	server.preparedTrees = nil
+
+	return retainNativeCleanup(err)
 }
 
 func retainPreparedTrees(trees []preparedNativeTree, retain func(string, bool, func() error)) {
@@ -1314,7 +1354,7 @@ func (s *openCodeServer) Shutdown(ctx context.Context) error {
 			state.mu.Lock()
 			state.current = nil
 
-			if !errors.Is(attempt.err, errTreeReclaimPending) && !errors.Is(attempt.err, ErrRuntimeScratchCleanup) {
+			if !runtimeShutdownRetryable(attempt.err) {
 				state.terminal = attempt
 			}
 			state.mu.Unlock()
@@ -1331,8 +1371,13 @@ func (s *openCodeServer) Shutdown(ctx context.Context) error {
 	}
 }
 
+func runtimeShutdownRetryable(err error) bool {
+	return errors.Is(err, ErrProcessContainmentIncomplete) ||
+		errors.Is(err, errTreeReclaimPending) ||
+		errors.Is(err, ErrRuntimeScratchCleanup)
+}
+
 func (s *openCodeServer) shutdownRuntime() error {
-	cleanupCtx := context.Background()
 	waitSucceeded := false
 
 	if s.runtimeClosed != nil {
@@ -1349,27 +1394,33 @@ func (s *openCodeServer) shutdownRuntime() error {
 	}
 
 	if s.settlement != nil {
-		select {
-		case <-s.settlement.done:
-		default:
-			disposeErr := s.DisposeInstance(cleanupCtx)
+		_, _, alreadyTerminal, _ := s.settlement.observation()
+		if !alreadyTerminal {
+			disposeCtx, disposeCancel := context.WithTimeout(context.Background(), processContainmentTimeout)
+			disposeErr := s.DisposeInstance(disposeCtx)
 
 			var httpErr *HTTPError
+
+			disposeCancel()
 
 			if errors.As(disposeErr, &httpErr) && (httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed) {
 				disposeErr = nil
 			}
 
 			err = errors.Join(err, disposeErr)
+			err = errors.Join(err, s.closeProcessInput())
 
-			if s.process.Input != nil {
-				err = errors.Join(err, s.process.Input.Close())
+			revokeCtx, revokeCancel := context.WithTimeout(context.Background(), processContainmentTimeout)
+			revokeErr = s.process.Stop(revokeCtx)
+
+			if revokeCtx.Err() != nil && revokeErr != nil {
+				revokeErr = errors.Join(ErrProcessContainmentIncomplete, revokeErr)
 			}
 
-			revokeErr = s.process.Stop(cleanupCtx)
+			revokeCancel()
 		}
 
-		outcome, waitErr := s.settlement.wait(cleanupCtx)
+		outcome, waitErr := s.settlement.waitTerminal()
 
 		if waitErr == nil && outcome.Revoked {
 			revokeErr = nil
@@ -1379,11 +1430,13 @@ func (s *openCodeServer) shutdownRuntime() error {
 		waitSucceeded = waitErr == nil
 	}
 
+	err = errors.Join(err, s.closeOwnedProcessWorkers())
+
 	if s.cancel != nil {
 		s.cancel()
 	}
 
-	if s.ordinaryHomeLock != nil {
+	if s.ordinaryHomeLock != nil && waitSucceeded {
 		err = errors.Join(err, s.ordinaryHomeLock.Release())
 		s.ordinaryHomeLock = nil
 	}
@@ -1394,7 +1447,7 @@ func (s *openCodeServer) shutdownRuntime() error {
 			if s.reclaimTree != nil {
 				var reclaimErr error
 
-				s.preparedTrees, reclaimErr = reclaimPreparedTreesRetaining(cleanupCtx, s.preparedTrees, s.reclaimTree)
+				s.preparedTrees, reclaimErr = reclaimPreparedTreesDetached(s.preparedTrees, s.reclaimTree)
 				err = errors.Join(err, reclaimErr)
 			} else {
 				var cleanupErr error
@@ -1404,6 +1457,56 @@ func (s *openCodeServer) shutdownRuntime() error {
 			}
 		default:
 		}
+	}
+
+	return err
+}
+
+func (s *openCodeServer) closeProcessInput() error {
+	s.inputCloseOnce.Do(func() {
+		if s.process.Input != nil {
+			s.inputCloseErr = processPipeCloseError(s.process.Input.Close())
+		}
+	})
+
+	return s.inputCloseErr
+}
+
+func (s *openCodeServer) closeOwnedProcessWorkers() error {
+	if s.settlement != nil {
+		s.settlement.cancel()
+	}
+
+	s.streamCloseOnce.Do(func() {
+		s.streamCloseErr = s.closeProcessInput()
+		if s.process.Output != nil {
+			s.streamCloseErr = errors.Join(s.streamCloseErr, processPipeCloseError(s.process.Output.Close()))
+		}
+
+		if s.process.Errors != nil {
+			s.streamCloseErr = errors.Join(s.streamCloseErr, processPipeCloseError(s.process.Errors.Close()))
+		}
+	})
+
+	doneChannels := []<-chan struct{}{s.stdoutDone, s.stderrDone, s.runtimeWatchDone}
+	if s.settlement != nil {
+		doneChannels = append(doneChannels, s.settlement.done)
+	}
+
+	for _, done := range doneChannels {
+		if done == nil {
+			continue
+		}
+
+		<-done
+	}
+
+	return s.streamCloseErr
+}
+
+func processPipeCloseError(err error) error {
+	if errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		return nil
 	}
 
 	return err
@@ -1477,6 +1580,29 @@ func reclaimPreparedTreesRetaining(
 	slices.Reverse(remaining)
 
 	return remaining, result
+}
+
+func reclaimPreparedTreesDetached(
+	trees []preparedNativeTree,
+	reclaim func(context.Context, string) error,
+) ([]preparedNativeTree, error) {
+	return reclaimPreparedTreesRetaining(context.Background(), trees, func(_ context.Context, path string) error {
+		reclaimCtx, cancel := context.WithTimeout(context.Background(), processContainmentTimeout)
+		err := reclaim(reclaimCtx, path)
+		ctxErr := reclaimCtx.Err()
+
+		cancel()
+
+		if err == nil || errors.Is(err, errTreeReclaimPending) {
+			return err
+		}
+
+		if ctxErr != nil {
+			return errors.Join(ErrProcessContainmentIncomplete, err, ctxErr)
+		}
+
+		return errors.Join(ErrProcessContainmentIncomplete, err)
+	})
 }
 
 func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Client, error) {
@@ -1655,12 +1781,9 @@ func (s *openCodeServer) RuntimeRevoked() bool {
 		return false
 	}
 
-	select {
-	case <-s.settlement.done:
-		return s.settlement.result.Revoked
-	default:
-		return false
-	}
+	result, _, terminal, _ := s.settlement.observation()
+
+	return terminal && result.Revoked
 }
 
 func (s *openCodeServer) XDGDirs() XDGDirs {

@@ -3,12 +3,15 @@ package opencode
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/savid/acp-go-opencode/internal/homelock"
 	"github.com/stretchr/testify/require"
@@ -43,7 +46,7 @@ func TestNativeBoundaryMarkersAndRuntimeStateEdges(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	require.True(t, (&openCodeServer{settlement: &processSettlement{
-		done: done, result: ProcessOutcome{Revoked: true},
+		done: done, result: ProcessOutcome{Revoked: true}, terminal: true,
 	}}).RuntimeRevoked())
 }
 
@@ -101,6 +104,53 @@ func TestProcessEnvironmentAndSettlementEdges(t *testing.T) {
 	result, err := settlement.wait(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, 7, result.ExitCode)
+
+	absent.cancel()
+	_, observed, terminal, err := absent.observation()
+	require.Error(t, err)
+	require.False(t, observed)
+	require.False(t, terminal)
+	_, err = absent.waitTerminal()
+	require.Error(t, err)
+
+	originalTimeout := processContainmentTimeout
+	processContainmentTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { processContainmentTimeout = originalTimeout })
+
+	blocked := make(chan struct{})
+	stuck := newProcessSettlement(ProcessHandle{Await: func(context.Context) (ProcessOutcome, error) {
+		<-blocked
+
+		return ProcessOutcome{}, errors.New("ordinary wait failure")
+	}})
+	stuck.start()
+	_, err = stuck.waitTerminal()
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	close(blocked)
+	<-stuck.done
+
+	ordinary := newProcessSettlement(ProcessHandle{Await: func(context.Context) (ProcessOutcome, error) {
+		return ProcessOutcome{}, errors.New("ordinary wait failure")
+	}})
+	ordinary.start()
+	<-ordinary.done
+	_, err = ordinary.waitTerminal()
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+
+	terminalSettlement := newProcessSettlement(ProcessHandle{Await: func(context.Context) (ProcessOutcome, error) {
+		return ProcessOutcome{ExitCode: 9}, nil
+	}})
+	terminalSettlement.start()
+	runtimeExited := make(chan struct{})
+	watchDone := make(chan struct{})
+	go observeProcessSettlement(terminalSettlement, runtimeExited, watchDone)
+	requireSignalClosed(t, runtimeExited, "terminal observation was not published")
+	requireSignalClosed(t, watchDone, "terminal observer did not finish")
+
+	require.NoError(t, processPipeCloseError(os.ErrClosed))
+	require.NoError(t, processPipeCloseError(io.ErrClosedPipe))
+	wantClose := errors.New("close failed")
+	require.ErrorIs(t, processPipeCloseError(wantClose), wantClose)
 }
 
 func TestOpenCodeServerAccessorsAndNilAssistantError(t *testing.T) {

@@ -709,37 +709,88 @@ func validateSyncSnapshot(sessionID string, snapshot stateSnapshot) error {
 		return fmt.Errorf("opencode sync manifest extraPathDirs: %w", err)
 	}
 
-	seen := make(map[string]stateSnapshotNode, len(snapshot.Graph))
-	for _, node := range snapshot.Graph {
+	seenNative, err := validateSyncSnapshotGraph(snapshot)
+	if err != nil {
+		return err
+	}
+
+	return validateSyncSnapshotEvents(snapshot.Events, seenNative)
+}
+
+func validateSyncSnapshotGraph(snapshot stateSnapshot) (map[string]stateSnapshotNode, error) {
+	if len(snapshot.Graph) == 0 {
+		return nil, fmt.Errorf("opencode sync graph is empty")
+	}
+
+	seenNative := make(map[string]stateSnapshotNode, len(snapshot.Graph))
+	seenLogical := make(map[string]stateSnapshotNode, len(snapshot.Graph))
+
+	for index, node := range snapshot.Graph {
 		if node.SessionID == "" || node.NativeSessionID == "" || node.SourceCwd == "" {
-			return fmt.Errorf("invalid opencode sync graph node")
+			return nil, fmt.Errorf("invalid opencode sync graph node")
 		}
 
-		if _, exists := seen[node.NativeSessionID]; exists {
-			return fmt.Errorf("duplicate opencode sync aggregate")
+		if _, exists := seenNative[node.NativeSessionID]; exists {
+			return nil, fmt.Errorf("duplicate opencode sync aggregate")
 		}
 
-		seen[node.NativeSessionID] = node
+		if _, exists := seenLogical[node.SessionID]; exists {
+			return nil, fmt.Errorf("duplicate opencode sync logical session")
+		}
+
+		parentless := node.ParentSessionID == "" && node.NativeParentID == ""
+		if (node.ParentSessionID == "") != (node.NativeParentID == "") {
+			return nil, fmt.Errorf("opencode sync graph parent identity mismatch")
+		}
+
+		if index == 0 && !parentless {
+			return nil, fmt.Errorf("opencode sync graph root has a parent")
+		}
+
+		if index > 0 {
+			parent, ok := seenLogical[node.ParentSessionID]
+			if parentless || !ok || parent.NativeSessionID != node.NativeParentID {
+				return nil, fmt.Errorf("opencode sync graph is not parent-first")
+			}
+		}
+
+		seenNative[node.NativeSessionID] = node
+		seenLogical[node.SessionID] = node
 	}
 
-	if _, ok := seen[snapshot.Session.NativeSessionID]; !ok {
-		return fmt.Errorf("selected aggregate is absent from opencode sync graph")
+	selected, ok := seenNative[snapshot.Session.NativeSessionID]
+	if !ok || selected.SessionID != snapshot.Session.SessionID ||
+		selected.ParentSessionID != snapshot.Session.ParentSessionID ||
+		selected.NativeParentID != snapshot.Session.NativeParentSessionID ||
+		selected.SourceCwd != snapshot.Session.Cwd {
+		return nil, fmt.Errorf("selected carrier does not match opencode sync graph")
 	}
 
-	for aggregateID, events := range snapshot.Events {
-		node, ok := seen[aggregateID]
+	return seenNative, nil
+}
+
+func validateSyncSnapshotEvents(
+	eventsByAggregate map[string][]opencode.SyncEvent,
+	seenNative map[string]stateSnapshotNode,
+) error {
+	for aggregateID, events := range eventsByAggregate {
+		node, ok := seenNative[aggregateID]
 		if !ok || len(events) == 0 {
 			return fmt.Errorf("opencode sync event aggregate is not allowlisted")
 		}
 
-		for _, event := range events {
+		for index, event := range events {
+			if event.Sequence != int64(index) {
+				return fmt.Errorf("aggregate %q has non-contiguous sequence", aggregateID)
+			}
+
 			if err := validateSyncEvent(event, node); err != nil {
 				return err
 			}
 		}
 	}
 
-	if len(snapshot.Events) != len(seen) {
+	if len(eventsByAggregate) != len(seenNative) {
 		return fmt.Errorf("opencode sync graph is incomplete")
 	}
 
@@ -916,32 +967,6 @@ func syncEventsEqual(left, right []opencode.SyncEvent) bool {
 	if len(left) != len(right) {
 		return false
 	}
-
-	left = append([]opencode.SyncEvent(nil), left...)
-	right = append([]opencode.SyncEvent(nil), right...)
-
-	slices.SortFunc(left, func(a, b opencode.SyncEvent) int {
-		if a.Sequence < b.Sequence {
-			return -1
-		}
-
-		if a.Sequence > b.Sequence {
-			return 1
-		}
-
-		return 0
-	})
-	slices.SortFunc(right, func(a, b opencode.SyncEvent) int {
-		if a.Sequence < b.Sequence {
-			return -1
-		}
-
-		if a.Sequence > b.Sequence {
-			return 1
-		}
-
-		return 0
-	})
 
 	for index := range left {
 		a, _ := json.Marshal(left[index])

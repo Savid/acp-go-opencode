@@ -463,6 +463,70 @@ func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
 	}
 }
 
+func TestSyncSnapshotRejectsNonCanonicalGraphAndEventOrder(t *testing.T) {
+	base := validSyncSnapshot("session", "native", "/source")
+	childEvent := syncTestEvent("child-native", 0, "session.created.1", nil)
+	base.Graph = append(base.Graph, stateSnapshotNode{
+		SessionID: "child", NativeSessionID: "child-native",
+		ParentSessionID: "session", NativeParentID: "native",
+		SourceCwd: "/source", Permission: "ask",
+	})
+	base.Events["child-native"] = []opencode.SyncEvent{childEvent}
+	require.NoError(t, validateSyncSnapshot("session", base))
+
+	tests := map[string]func(*stateSnapshot){
+		"empty graph": func(value *stateSnapshot) {
+			value.Graph = nil
+		},
+		"duplicate logical identity": func(value *stateSnapshot) {
+			value.Graph[1].SessionID = value.Graph[0].SessionID
+		},
+		"half parent identity": func(value *stateSnapshot) {
+			value.Graph[1].NativeParentID = ""
+		},
+		"root has parent": func(value *stateSnapshot) {
+			value.Graph[0].ParentSessionID = "parent"
+			value.Graph[0].NativeParentID = "parent-native"
+		},
+		"child before parent": func(value *stateSnapshot) {
+			value.Graph[0], value.Graph[1] = value.Graph[1], value.Graph[0]
+		},
+		"dangling logical parent": func(value *stateSnapshot) {
+			value.Graph[1].ParentSessionID = "missing"
+		},
+		"mismatched native parent": func(value *stateSnapshot) {
+			value.Graph[1].NativeParentID = "missing-native"
+		},
+		"selected logical mismatch": func(value *stateSnapshot) {
+			value.Graph[0].SessionID = "other"
+		},
+		"selected parent mismatch": func(value *stateSnapshot) {
+			value.Session.ParentSessionID = "parent"
+			value.Session.NativeParentSessionID = "parent-native"
+		},
+		"selected cwd mismatch": func(value *stateSnapshot) {
+			value.Session.Cwd = "/other"
+		},
+		"event sequence gap": func(value *stateSnapshot) {
+			value.Events["native"][0].Sequence = 1
+		},
+		"event sequence reordered": func(value *stateSnapshot) {
+			one := cloneSyncEvent(value.Events["native"][0])
+			one.ID = "event-one"
+			one.Sequence = 1
+			value.Events["native"] = []opencode.SyncEvent{one, value.Events["native"][0]}
+		},
+	}
+
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			value := cloneStateSnapshot(t, base)
+			mutate(&value)
+			require.Error(t, validateSyncSnapshot("session", value))
+		})
+	}
+}
+
 func TestSyncEventAllowlistAndIdentityBranches(t *testing.T) {
 	node := stateSnapshotNode{SessionID: "session", NativeSessionID: "native", SourceCwd: "/source"}
 	event := opencode.SyncEvent{
@@ -581,7 +645,7 @@ func TestHydrateRebaseAndSyncComparisonBranches(t *testing.T) {
 	require.False(t, syncEventsEqual([]opencode.SyncEvent{event}, []opencode.SyncEvent{changed}))
 	sequenceOne := cloneSyncEvent(event)
 	sequenceOne.Sequence = 1
-	require.True(t, syncEventsEqual([]opencode.SyncEvent{sequenceOne, event}, []opencode.SyncEvent{event, sequenceOne}))
+	require.False(t, syncEventsEqual([]opencode.SyncEvent{sequenceOne, event}, []opencode.SyncEvent{event, sequenceOne}))
 }
 
 func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
@@ -741,13 +805,13 @@ func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranch
 	require.ErrorContains(t, err, "lost durable restore ownership")
 }
 
-func TestRebaseArrayErrorAndSyncSortComparatorBranches(t *testing.T) {
+func TestRebaseArrayErrorAndSyncOrderComparison(t *testing.T) {
 	_, err := rebasePathValues([]any{"/outside"}, "path", "/source", "/target")
 	require.ErrorContains(t, err, "escapes source cwd")
 
 	zero := syncTestEvent("native", 0, "session.created.1", nil)
 	one := syncTestEvent("native", 1, "session.updated.1", nil)
-	require.True(t, syncEventsEqual([]opencode.SyncEvent{zero, one}, []opencode.SyncEvent{one, zero}))
+	require.False(t, syncEventsEqual([]opencode.SyncEvent{zero, one}, []opencode.SyncEvent{one, zero}))
 	require.True(t, syncEventsEqual([]opencode.SyncEvent{zero, zero}, []opencode.SyncEvent{zero, zero}))
 }
 

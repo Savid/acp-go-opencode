@@ -53,14 +53,7 @@ func InspectSessionStoreTerminalState(
 
 	var terminal SessionStoreTerminalState
 
-	for index, event := range events {
-		if event.Sequence != int64(index) {
-			return SessionStoreTerminalState{}, fmt.Errorf(
-				"native session %q has non-contiguous OpenCode sync event ordering",
-				nativeSessionID,
-			)
-		}
-
+	for _, event := range events {
 		if event.Type != syncTypeMessageUpdated {
 			continue
 		}

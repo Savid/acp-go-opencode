@@ -260,6 +260,15 @@ type revokedRuntimeClient struct{ *fakeOpenCodeClient }
 func (*revokedRuntimeClient) RuntimeRevoked() bool { return true }
 
 func TestSharedRuntimeCoordinationEdges(t *testing.T) {
+	internalContainment := errors.Join(errors.New("wait incomplete"), opencode.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, classifyRuntimeContainment(internalContainment), ErrContainmentIncomplete)
+	alreadyClassified := errors.Join(internalContainment, ErrContainmentIncomplete)
+	require.True(t, classifyRuntimeContainment(alreadyClassified) == alreadyClassified)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, classifyRuntimeShutdown(cancelled, context.Canceled), opencode.ErrProcessContainmentIncomplete)
+	require.False(t, retryableRuntimeCleanup(errors.Join(internalContainment, ErrHostAuthorityUnavailable)))
+
 	revoked := &revokedRuntimeClient{fakeOpenCodeClient: newFakeOpenCodeClient()}
 	agent := NewAgent()
 	agent.runtime = revoked

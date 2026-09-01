@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +29,27 @@ const releaseGateRepetitions = 5
 
 type testWriteCloser struct {
 	close func() error
+}
+
+type blockingReadCloser struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBlockingReadCloser() *blockingReadCloser {
+	return &blockingReadCloser{closed: make(chan struct{})}
+}
+
+func (r *blockingReadCloser) Read([]byte) (int, error) {
+	<-r.closed
+
+	return 0, io.EOF
+}
+
+func (r *blockingReadCloser) Close() error {
+	r.once.Do(func() { close(r.closed) })
+
+	return nil
 }
 
 func (w testWriteCloser) Write(value []byte) (int, error) { return len(value), nil }
@@ -578,7 +600,9 @@ func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneResult(t *testing.T) {
 	terminal := make(chan struct{})
 	var revokeCalls atomic.Int32
 	process := ProcessHandle{
-		Input:  testWriteCloser{},
+		Input: testWriteCloser{close: func() error {
+			return want
+		}},
 		Output: io.NopCloser(strings.NewReader("")),
 		Errors: io.NopCloser(strings.NewReader("")),
 		Stop: func(context.Context) error {
@@ -594,7 +618,7 @@ func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneResult(t *testing.T) {
 		Await: func(context.Context) (ProcessOutcome, error) {
 			<-terminal
 
-			return ProcessOutcome{Revoked: true}, want
+			return ProcessOutcome{Revoked: true}, nil
 		},
 	}
 	settlement := newProcessSettlement(process)
@@ -624,9 +648,9 @@ func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneResult(t *testing.T) {
 	require.ErrorIs(t, first, want)
 	require.True(t, first == second, "shutdown must publish one memoized result")
 	require.Equal(t, int32(1), revokeCalls.Load())
-	require.False(t, reclaimed, "a failed terminal wait cannot authorize reclaim")
-	require.False(t, cleaned, "a failed terminal wait cannot authorize removal")
-	require.Len(t, base.preparedTrees, 1)
+	require.True(t, reclaimed)
+	require.True(t, cleaned)
+	require.Empty(t, base.preparedTrees)
 }
 
 func TestRuntimeShutdownRetriesBusyReclaimWithoutRemoval(t *testing.T) {
@@ -678,6 +702,43 @@ func TestRuntimeShutdownRetriesBusyReclaimWithoutRemoval(t *testing.T) {
 		"reclaim:carrier", "reclaim:runtime", "remove:runtime", "reclaim:carrier", "remove:carrier",
 	}, events)
 	require.Empty(t, server.preparedTrees)
+}
+
+func TestRuntimeShutdownBoundsStopAndClearsItAfterTerminalRetry(t *testing.T) {
+	originalTimeout := processContainmentTimeout
+	processContainmentTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { processContainmentTimeout = originalTimeout })
+
+	var waits atomic.Int32
+	process := ProcessHandle{
+		Input: testWriteCloser{}, Output: io.NopCloser(strings.NewReader("")), Errors: io.NopCloser(strings.NewReader("")),
+		Stop: func(ctx context.Context) error {
+			_, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			<-ctx.Done()
+
+			return ctx.Err()
+		},
+		Await: func(ctx context.Context) (ProcessOutcome, error) {
+			if waits.Add(1) == 1 {
+				<-ctx.Done()
+
+				return ProcessOutcome{}, ctx.Err()
+			}
+
+			return ProcessOutcome{}, nil
+		},
+	}
+	settlement := newProcessSettlement(process)
+	settlement.start()
+	server := &openCodeServer{
+		process: process, settlement: settlement, runtimeShutdown: newRuntimeShutdownState(),
+		runtimeClosed: make(chan struct{}),
+	}
+
+	err := server.Shutdown(context.Background())
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.NoError(t, server.Shutdown(context.Background()))
 }
 
 func TestRuntimeShutdownReportsGeneratedScratchCleanupFailure(t *testing.T) {
@@ -763,6 +824,59 @@ func TestStartFailureTransfersCleanupOnlyRetryAfterSuccessfulReclaim(t *testing.
 	require.NotNil(t, retained.cleanup)
 	require.NoError(t, retained.cleanup())
 	require.Equal(t, 1, reclaims, "cleanup-only retry reclaimed the same tree twice")
+}
+
+func TestDetachedReclaimIsFiniteAndRetainsTreeForRetry(t *testing.T) {
+	originalTimeout := processContainmentTimeout
+	processContainmentTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { processContainmentTimeout = originalTimeout })
+
+	cleaned := false
+	trees := []preparedNativeTree{{path: "runtime", cleanup: func() error {
+		cleaned = true
+
+		return nil
+	}}}
+	remaining, err := reclaimPreparedTreesDetached(trees, func(ctx context.Context, _ string) error {
+		_, hasDeadline := ctx.Deadline()
+		require.True(t, hasDeadline)
+		<-ctx.Done()
+
+		return ctx.Err()
+	})
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.False(t, cleaned)
+	require.Len(t, remaining, 1)
+
+	want := errors.New("ordinary reclaim refusal")
+	remaining, err = reclaimPreparedTreesDetached(remaining, func(context.Context, string) error { return want })
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, want)
+	require.False(t, cleaned)
+	require.Len(t, remaining, 1)
+
+	remaining, err = reclaimPreparedTreesDetached(remaining, func(context.Context, string) error { return nil })
+	require.NoError(t, err)
+	require.True(t, cleaned)
+	require.Empty(t, remaining)
+}
+
+func TestFailedPublishedServerStartTransfersRemainingPreparedTrees(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	want := errors.Join(ErrProcessContainmentIncomplete, errors.New("terminal proof unavailable"))
+	server := &openCodeServer{
+		runtimeShutdown: &runtimeShutdownState{terminal: &runtimeShutdownAttempt{done: done, err: want}},
+		preparedTrees:   []preparedNativeTree{{path: "runtime"}},
+	}
+	var retained []preparedNativeTree
+	err := settleFailedServerStart(server, func(path string, reclaimed bool, cleanup func() error) {
+		retained = append(retained, preparedNativeTree{path: path, reclaimed: reclaimed, cleanup: cleanup})
+	}, errors.New("readiness failed"))
+	require.ErrorIs(t, err, want)
+	require.True(t, NativeCleanupRetained(err))
+	require.Equal(t, []preparedNativeTree{{path: "runtime"}}, retained)
+	require.Empty(t, server.preparedTrees)
 }
 
 type reclaimedTreeCleanup struct {
@@ -1463,24 +1577,71 @@ func TestOpenCodeReadEventsPublishesNoTerminalForAnIntentionalClose(t *testing.T
 	}
 }
 
-func TestOpenCodeServerCloseDetachesOnContextAndCompletesAtTerminal(t *testing.T) {
-	terminal := make(chan struct{})
-	stopped := make(chan struct{})
+func TestOpenCodeServerCloseDetachesAndRetryProvesTerminalAfterJoiningWorkers(t *testing.T) {
+	originalTimeout := processContainmentTimeout
+	processContainmentTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { processContainmentTimeout = originalTimeout })
+
+	observerStarted := make(chan struct{})
+	observerDone := make(chan struct{})
+	terminalWaitDone := make(chan struct{})
+	var waitCalls atomic.Int32
+	var terminal atomic.Bool
+	stdout := newBlockingReadCloser()
+	stderr := newBlockingReadCloser()
+	stopped := make(chan struct{}, 2)
+	stopRelease := make(chan struct{})
 	process := ProcessHandle{
-		Input: testWriteCloser{}, Output: io.NopCloser(strings.NewReader("")), Errors: io.NopCloser(strings.NewReader("")),
-		Stop: func(context.Context) error {
-			close(stopped)
+		Input: testWriteCloser{}, Output: stdout, Errors: stderr,
+		Stop: func(ctx context.Context) error {
+			_, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			stopped <- struct{}{}
+			<-stopRelease
 
 			return nil
 		},
-		Await: func(context.Context) (ProcessOutcome, error) {
-			<-terminal
+		Await: func(ctx context.Context) (ProcessOutcome, error) {
+			call := waitCalls.Add(1)
+			_, hasDeadline := ctx.Deadline()
 
-			return ProcessOutcome{Revoked: true}, nil
+			switch call {
+			case 1:
+				close(observerStarted)
+			default:
+				require.True(t, hasDeadline)
+			}
+
+			if terminal.Load() {
+				return ProcessOutcome{Revoked: true}, nil
+			}
+
+			<-ctx.Done()
+
+			switch call {
+			case 1:
+				close(observerDone)
+			case 2:
+				close(terminalWaitDone)
+			default:
+			}
+
+			return ProcessOutcome{}, ctx.Err()
 		},
 	}
 	settlement := newProcessSettlement(process)
 	settlement.start()
+	<-observerStarted
+
+	runtimeExited := make(chan struct{})
+	runtimeWatchDone := make(chan struct{})
+	go observeProcessSettlement(settlement, runtimeExited, runtimeWatchDone)
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan struct{})
+	go func() { defer close(stdoutDone); drainProcessPipe(nil, "stdout", stdout) }()
+	go func() { defer close(stderrDone); drainProcessPipe(nil, "stderr", stderr) }()
+
+	reclaimCalls := atomic.Int32{}
 	server := &openCodeServer{
 		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -1491,24 +1652,43 @@ func TestOpenCodeServerCloseDetachesOnContextAndCompletesAtTerminal(t *testing.T
 		})},
 		baseURL: "http://opencode.test",
 		process: process, settlement: settlement,
-		runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}),
+		runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}), runtimeExited: runtimeExited,
+		runtimeWatchDone: runtimeWatchDone, stdoutDone: stdoutDone, stderrDone: stderrDone,
+		preparedTrees: []preparedNativeTree{{path: "runtime"}},
+		reclaimTree: func(ctx context.Context, _ string) error {
+			_, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			reclaimCalls.Add(1)
+
+			return nil
+		},
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	require.ErrorIs(t, server.Shutdown(cancelled), context.Canceled)
 	requireSignalClosed(t, stopped, "shutdown never initiated revoke")
+	server.runtimeShutdown.mu.Lock()
+	firstAttempt := server.runtimeShutdown.current
+	server.runtimeShutdown.mu.Unlock()
+	require.NotNil(t, firstAttempt)
+	close(stopRelease)
 
-	done := make(chan error, 1)
-	go func() { done <- server.Shutdown(context.Background()) }()
-	select {
-	case err := <-done:
-		t.Fatalf("shutdown completed before terminal wait: %v", err)
-	default:
-	}
+	requireSignalClosed(t, observerDone, "shutdown did not join the owned observer")
+	requireSignalClosed(t, terminalWaitDone, "shutdown did not bound terminal wait")
+	requireSignalClosed(t, stdoutDone, "shutdown did not join stdout drain")
+	requireSignalClosed(t, stderrDone, "shutdown did not join stderr drain")
+	requireSignalClosed(t, runtimeWatchDone, "shutdown did not join runtime watcher")
 
-	close(terminal)
-	require.NoError(t, <-done)
+	<-firstAttempt.done
+	require.ErrorIs(t, firstAttempt.err, ErrProcessContainmentIncomplete)
+	require.Len(t, server.preparedTrees, 1)
+	require.Zero(t, reclaimCalls.Load())
+
+	terminal.Store(true)
+	require.NoError(t, server.Shutdown(context.Background()))
 	require.True(t, server.RuntimeRevoked())
+	require.Empty(t, server.preparedTrees)
+	require.EqualValues(t, 1, reclaimCalls.Load())
 }
 
 func TestXDGEnvAndPipeHelpers(t *testing.T) {
