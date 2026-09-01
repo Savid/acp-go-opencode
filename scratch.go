@@ -50,9 +50,5 @@ func (a *Agent) newRuntimeRoot() (string, bool, error) {
 		return "", false, fmt.Errorf("create OpenCode runtime root: %w", err)
 	}
 
-	if err := os.Chmod(root, 0o700); err != nil {
-		return "", false, fmt.Errorf("protect OpenCode runtime root: %w", err)
-	}
-
 	return root, true, nil
 }

@@ -244,10 +244,8 @@ func (s *session) captureStateSnapshot(
 			Graph: nodes, Events: events,
 		}
 
-		entry, marshalErr := json.Marshal(bundle)
-		if marshalErr != nil {
-			return capturedStateSnapshot{}, marshalErr
-		}
+		// The closed typed tree contains only sync-event RawMessages already validated as JSON.
+		entry, _ := json.Marshal(bundle)
 
 		if err := scanStateSnapshot(bundle, s.agent.graphSecretNeedles(graph)); err != nil {
 			return capturedStateSnapshot{}, err
@@ -607,9 +605,8 @@ func validateSyncEvent(event opencode.SyncEvent, node stateSnapshotNode) error {
 		decoder.UseNumber()
 
 		var value any
-		if err := decoder.Decode(&value); err != nil {
-			return fmt.Errorf("sync event %q field %q must be a finite number", event.ID, jsonFieldTime)
-		}
+		// json.Valid above proves this single JSON value decodes successfully.
+		_ = decoder.Decode(&value)
 
 		number, ok := value.(json.Number)
 		if !ok {

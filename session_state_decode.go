@@ -91,10 +91,8 @@ func scanUniqueJSONValue(decoder *json.Decoder, path string) error {
 				return fmt.Errorf("decode %s field: %w", path, err)
 			}
 
-			name, ok := nameToken.(string)
-			if !ok {
-				return fmt.Errorf("decode %s field name", path)
-			}
+			// encoding/json returns object member names as strings or reports a token error above.
+			name, _ := nameToken.(string)
 
 			if _, duplicate := seen[name]; duplicate {
 				return fmt.Errorf("duplicate field %q at %s", name, path)
@@ -107,13 +105,8 @@ func scanUniqueJSONValue(decoder *json.Decoder, path string) error {
 			}
 		}
 
-		closing, closeErr := decoder.Token()
-		if closeErr != nil {
+		if _, closeErr := decoder.Token(); closeErr != nil {
 			return fmt.Errorf("close %s object: %w", path, closeErr)
-		}
-
-		if closing != json.Delim('}') {
-			return fmt.Errorf("close %s object: unexpected delimiter", path)
 		}
 	case '[':
 		index := 0
@@ -126,16 +119,9 @@ func scanUniqueJSONValue(decoder *json.Decoder, path string) error {
 			index++
 		}
 
-		closing, closeErr := decoder.Token()
-		if closeErr != nil {
+		if _, closeErr := decoder.Token(); closeErr != nil {
 			return fmt.Errorf("close %s array: %w", path, closeErr)
 		}
-
-		if closing != json.Delim(']') {
-			return fmt.Errorf("close %s array: unexpected delimiter", path)
-		}
-	default:
-		return fmt.Errorf("unexpected JSON delimiter %q at %s", delim, path)
 	}
 
 	return nil

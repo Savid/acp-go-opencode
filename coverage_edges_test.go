@@ -345,6 +345,13 @@ func TestSharedRuntimeConstructionEdges(t *testing.T) {
 	_, _, err = (&Agent{options: Options{ScratchDir: readOnlyScratch}}).newRuntimeRoot()
 	require.ErrorContains(t, err, "create OpenCode runtime root")
 
+	generatedRoot, generated, err := (&Agent{options: Options{ScratchDir: t.TempDir()}}).newRuntimeRoot()
+	require.NoError(t, err)
+	require.True(t, generated)
+	info, err := os.Stat(generatedRoot)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+
 	authority := edgeAuthority{
 		environment: func() map[string]string { return map[string]string{} },
 		prepare:     func(context.Context, string) error { panic("prepare") },
@@ -462,6 +469,10 @@ func TestStateSnapshotDecoderReachableEdges(t *testing.T) {
 	}
 
 	require.Error(t, rejectDuplicateJSONFields([]byte(`[] {`)))
+	require.Error(t, rejectDuplicateJSONFields([]byte(`{"x":1,"x":2}`)))
+	require.Error(t, rejectDuplicateJSONFields([]byte(`{"x":1]`)))
+	require.Error(t, rejectDuplicateJSONFields([]byte(`[1}`)))
+	require.NoError(t, rejectDuplicateJSONFields([]byte(`{"x":[{"y":1}]}`)))
 	require.Error(t, scanUniqueJSONValue(json.NewDecoder(bytes.NewReader(nil)), "empty"))
 	require.Error(t, scanUniqueJSONValue(json.NewDecoder(bytes.NewReader([]byte(`[1`))), "array"))
 	_, err = exactJSONObject([]byte(`{`), "invalid", nil, nil)
@@ -480,6 +491,8 @@ func TestStateStoreValidationReachableEdges(t *testing.T) {
 			jsonFieldTime:      json.RawMessage(`{`),
 		},
 	}
+	require.Error(t, validateSyncEvent(partEvent, node))
+	partEvent.Data[jsonFieldTime] = json.RawMessage(`"one"`)
 	require.Error(t, validateSyncEvent(partEvent, node))
 	partEvent.Data[jsonFieldTime] = json.RawMessage(`1e10000`)
 	require.Error(t, validateSyncEvent(partEvent, node))
