@@ -208,7 +208,16 @@ func (a *Agent) loadOrResumeSession(
 		// scope contained before the successor is even hydrated, so the two
 		// carrier bindings can never overlap and the active-session slot is
 		// released before capacity admission runs again.
-		if closeErr := active.CloseAndCommit(context.Background()); closeErr != nil {
+		// Replacement is detached from request cancellation because it must not
+		// abandon a predecessor halfway through containment. It is still bounded
+		// by the same whole-ladder budget Agent.Close gives CloseAndCommit; the
+		// shorter closeTimeout only bounds individual containment rungs.
+		replacementCtx, replacementCancel := context.WithTimeout(context.Background(), settlementTimeout)
+		closeErr := active.CloseAndCommit(replacementCtx)
+
+		replacementCancel()
+
+		if closeErr != nil {
 			return nil, closeErr
 		}
 
