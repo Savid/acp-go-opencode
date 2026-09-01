@@ -450,6 +450,21 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 	a.nativeAdmissionMu.Lock()
 	defer a.nativeAdmissionMu.Unlock()
 
+	if a.options.hostAuthorityConfigured && a.options.Home != "" {
+		seedPaths := make([]string, 0, len(a.options.SeedFiles))
+		for path := range a.options.SeedFiles {
+			seedPaths = append(seedPaths, path)
+		}
+
+		slices.Sort(seedPaths)
+
+		for _, path := range seedPaths {
+			if path != "opencode.json" {
+				return nil, unsupportedField("seedFiles[" + path + "]")
+			}
+		}
+	}
+
 	var managedEnvironment map[string]string
 
 	if a.options.hostAuthorityConfigured {

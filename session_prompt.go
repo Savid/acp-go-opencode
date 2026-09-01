@@ -2149,9 +2149,7 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 		return err
 	}
 
-	s.delivery.enqueueRaw(ctx, payload)
-
-	return nil
+	return s.delivery.enqueueRaw(ctx, payload)
 }
 
 // sanitizeRawEventValue keeps raw diagnostic events free of image payloads

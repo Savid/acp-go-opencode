@@ -39,6 +39,7 @@ func preserveSessionCarrierSeams(t *testing.T) {
 func materializedCarrier(t *testing.T) (string, string, sessionCarrierPlugin) {
 	t.Helper()
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	require.NoError(t, os.Mkdir(runtimeRoot, 0o700))
 	plugin, err := materializeSessionCarrierPlugin(runtimeRoot)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = plugin.Cleanup() })
@@ -178,6 +179,7 @@ func TestMaterializeSessionCarrierPlugin(t *testing.T) {
 func TestMaterializeSessionCarrierPluginReportsEveryFailure(t *testing.T) {
 	preserveSessionCarrierSeams(t)
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	require.NoError(t, os.Mkdir(runtimeRoot, 0o700))
 
 	plugin, err := materializeSessionCarrierPlugin(runtimeRoot)
 	require.NoError(t, err)
@@ -232,7 +234,9 @@ func TestMaterializeSessionCarrierPluginReportsEveryFailure(t *testing.T) {
 
 func TestSessionCarrierReadinessRequiresBrokerAuthorization(t *testing.T) {
 	preserveSessionCarrierSeams(t)
-	plugin, err := materializeSessionCarrierPlugin(filepath.Join(t.TempDir(), "runtime"))
+	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	require.NoError(t, os.Mkdir(runtimeRoot, 0o700))
+	plugin, err := materializeSessionCarrierPlugin(runtimeRoot)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, plugin.Cleanup()) })
 
@@ -1068,6 +1072,7 @@ func TestSessionCarrierKeepsNoShellStateOfItsOwn(t *testing.T) {
 	loginShell := availableLoginShell(t)
 
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	require.NoError(t, os.Mkdir(runtimeRoot, 0o700))
 	plugin, err := materializeSessionCarrierPlugin(runtimeRoot)
 	require.NoError(t, err)
 

@@ -774,7 +774,7 @@ type reclaimedTreeCleanup struct {
 func TestScopesCreateNoNativeTreesOrRetireSharedRuntime(t *testing.T) {
 	nativeRoot := t.TempDir()
 	runtimeRoot := filepath.Join(nativeRoot, "runtime")
-	carrierRoot := filepath.Join(nativeRoot, "carrier")
+	carrierRoot := filepath.Join(runtimeRoot, "carrier")
 	require.NoError(t, os.Mkdir(runtimeRoot, 0o700))
 	require.NoError(t, os.Mkdir(carrierRoot, 0o700))
 
@@ -793,10 +793,7 @@ func TestScopesCreateNoNativeTreesOrRetireSharedRuntime(t *testing.T) {
 		runtimeShutdown:      newRuntimeShutdownState(),
 		runtimeClosed:        runtimeClosed,
 		sessionCarrierBroker: carrierBroker,
-		preparedTrees: []preparedNativeTree{
-			{path: runtimeRoot},
-			{path: carrierRoot},
-		},
+		preparedTrees:        []preparedNativeTree{{path: runtimeRoot}},
 	}
 
 	scopeClient, err := base.Scope(context.Background(), ScopeOptions{Directory: t.TempDir()})
@@ -804,10 +801,10 @@ func TestScopesCreateNoNativeTreesOrRetireSharedRuntime(t *testing.T) {
 	scope, ok := scopeClient.(*openCodeServer)
 	require.True(t, ok)
 	require.Empty(t, scope.preparedTrees)
-	require.Equal(t, []preparedNativeTree{{path: runtimeRoot}, {path: carrierRoot}}, base.preparedTrees)
+	require.Equal(t, []preparedNativeTree{{path: runtimeRoot}}, base.preparedTrees)
 	entries, err := os.ReadDir(nativeRoot)
 	require.NoError(t, err)
-	require.Equal(t, []string{"carrier", "runtime"}, []string{entries[0].Name(), entries[1].Name()})
+	require.Equal(t, []string{"runtime"}, []string{entries[0].Name()})
 
 	require.NoError(t, scope.Close(context.Background()))
 	require.Empty(t, carrierBroker.carriers)
@@ -816,7 +813,7 @@ func TestScopesCreateNoNativeTreesOrRetireSharedRuntime(t *testing.T) {
 		t.Fatal("closing one scope retired the shared runtime")
 	default:
 	}
-	require.Equal(t, []preparedNativeTree{{path: runtimeRoot}, {path: carrierRoot}}, base.preparedTrees)
+	require.Equal(t, []preparedNativeTree{{path: runtimeRoot}}, base.preparedTrees)
 }
 
 func TestStartOpenCodeServerFaultInjection(t *testing.T) {

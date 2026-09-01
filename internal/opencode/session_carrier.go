@@ -302,9 +302,7 @@ var (
 )
 
 func materializeSessionCarrierPlugin(runtimeRoot string) (sessionCarrierPlugin, error) {
-	parent := filepath.Dir(runtimeRoot)
-
-	root, err := sessionCarrierMkdirTemp(parent, ".acp-go-opencode-session-carrier-")
+	root, err := sessionCarrierMkdirTemp(runtimeRoot, ".session-carrier-")
 	if err != nil {
 		return sessionCarrierPlugin{}, fmt.Errorf("create OpenCode session carrier root: %w", err)
 	}

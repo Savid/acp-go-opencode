@@ -891,12 +891,23 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		}
 	}
 
-	preparedTrees := make([]preparedNativeTree, 0, 2)
+	preparedTrees := make([]preparedNativeTree, 0, 1)
 	runtimeTree := preparedNativeTree{path: xdg.Root}
 
+	if sessionCarrier.Cleanup != nil {
+		runtimeTree.cleanup = sessionCarrier.Cleanup
+	}
+
 	if options.RemoveRoot {
+		carrierCleanup := runtimeTree.cleanup
 		runtimeTree.cleanup = func() error {
+			var carrierErr error
+			if carrierCleanup != nil {
+				carrierErr = carrierCleanup()
+			}
+
 			cleanupErr := errors.Join(
+				carrierErr,
 				openCodeRemoveAll(xdg.Root),
 				openCodeRemoveAll(ControlRootForXDG(xdg.Root)),
 			)
@@ -960,15 +971,11 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	}
 
 	if options.PrepareTree != nil {
-		trees := []preparedNativeTree{runtimeTree}
-		if sessionCarrier.Root != "" {
-			trees = append(trees, preparedNativeTree{path: sessionCarrier.Root, cleanup: sessionCarrier.Cleanup})
-		}
-
-		for _, tree := range trees {
+		for _, tree := range []preparedNativeTree{runtimeTree} {
 			if prepareErr := options.PrepareTree(ctx, tree.path); prepareErr != nil {
 				if errors.Is(prepareErr, errPrepareOpaque) {
 					retainPrepared = true
+					prepareErr = errors.Join(prepareErr, sessionCarrier.Broker.Close())
 				} else if tree.cleanup != nil {
 					prepareErr = errors.Join(prepareErr, tree.cleanup())
 				}
@@ -984,9 +991,6 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		}
 	} else {
 		preparedTrees = append(preparedTrees, runtimeTree)
-		if sessionCarrier.Root != "" {
-			preparedTrees = append(preparedTrees, preparedNativeTree{path: sessionCarrier.Root, cleanup: sessionCarrier.Cleanup})
-		}
 	}
 
 	port, portErr := allocatePort()

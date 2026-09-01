@@ -1017,9 +1017,9 @@ func requireNoRuntimeWideCarrierShellState(t *testing.T, runtime Client) {
 
 	server, ok := runtime.(*openCodeServer)
 	require.True(t, ok)
-	require.Len(t, server.preparedTrees, 2, "the runtime owns its XDG and generated carrier trees")
+	require.Len(t, server.preparedTrees, 1, "the runtime owns one XDG residence")
 
-	roots, err := filepath.Glob(filepath.Join(filepath.Dir(server.xdg.Root), ".acp-go-opencode-session-carrier-*"))
+	roots, err := filepath.Glob(filepath.Join(server.xdg.Root, ".session-carrier-*"))
 	require.NoError(t, err)
 	require.Len(t, roots, 1)
 

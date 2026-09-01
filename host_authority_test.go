@@ -66,7 +66,16 @@ func (a *authorityTrace) PrepareNativeTree(_ context.Context, path string) error
 	defer a.mu.Unlock()
 
 	a.prepareAt++
-	if a.prepareErr != nil && a.prepareAt == 2 {
+	if a.prepareErr != nil {
+		if a.hideTree {
+			hidden := path + ".authority"
+			if err := os.Rename(path, hidden); err != nil {
+				return err
+			}
+
+			a.hidden[path] = hidden
+		}
+
 		a.events = append(a.events, "prepare-refused:"+filepath.Base(path))
 
 		return a.prepareErr
@@ -247,7 +256,12 @@ func (a *authorityTrace) proveCarrierReady() {
 	a.mu.Unlock()
 
 	for _, root := range hidden {
-		source, err := os.ReadFile(filepath.Join(root, "session-carrier.mjs"))
+		paths, err := filepath.Glob(filepath.Join(root, ".session-carrier-*", "session-carrier.mjs"))
+		if err != nil || len(paths) != 1 {
+			continue
+		}
+
+		source, err := os.ReadFile(paths[0])
 		if err != nil {
 			continue
 		}
@@ -590,6 +604,7 @@ func TestHostAuthorityManagedLaunchTrace(t *testing.T) {
 	events, _, err := runManagedTrace(t, agent, authority, false)
 	require.NoError(t, err)
 	normalized := normalizeAuthorityTrace(events)
+	require.Equal(t, 1, countAuthorityEvents(normalized, "prepare:acp-go-opencode-runtime-"))
 	require.Less(t, indexOfAuthorityEvent(normalized, "prepare:acp-go-opencode-runtime-"), indexOfAuthorityEvent(normalized, "start:opencode"))
 	require.Less(t, indexOfAuthorityEvent(normalized, "start:opencode"), indexOfAuthorityEvent(normalized, "protocol-close"))
 	require.Less(t, indexOfAuthorityEvent(normalized, "dispose"), indexOfAuthorityEvent(normalized, "protocol-close"))
@@ -686,6 +701,20 @@ func TestHostAuthorityNoOrdinaryFallback(t *testing.T) {
 	require.False(t, called)
 }
 
+func TestManagedDurableHomeRestrictsSeedFiles(t *testing.T) {
+	authority := newAuthorityTrace()
+	agent := NewAgent(
+		WithHostAuthority(authority),
+		WithHome(t.TempDir()),
+		WithSeedFiles(map[string]string{"notes.txt": "unsupported"}),
+	)
+
+	_, err := agent.startSharedRuntime(t.Context())
+	requireUnsupportedField(t, err, "seedFiles[notes.txt]")
+	require.Zero(t, authority.prepareAt)
+	require.Zero(t, countAuthorityEvents(authority.snapshot(), "start:opencode"))
+}
+
 func TestHostAuthorityManagedFailureMatrix(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -693,14 +722,15 @@ func TestHostAuthorityManagedFailureMatrix(t *testing.T) {
 		want              error
 		wantText          string
 		wantReclaim       bool
+		wantOpaqueTree    bool
 		wantRetainedTrees bool
 	}{
 		{
-			name: "prepare midway validation",
+			name: "prepare validation",
 			configure: func(authority *authorityTrace) {
 				authority.prepareErr = errors.New("carrier prepare rejected")
 			},
-			want: ErrContainmentIncomplete, wantText: "carrier prepare rejected", wantRetainedTrees: true,
+			want: ErrContainmentIncomplete, wantText: "carrier prepare rejected", wantOpaqueTree: true,
 		},
 		{
 			name: "start validation",
@@ -786,6 +816,16 @@ func TestHostAuthorityManagedFailureMatrix(t *testing.T) {
 				}
 				authority.mu.Unlock()
 			}
+			if test.wantOpaqueTree {
+				authority.mu.Lock()
+				require.Empty(t, authority.prepared)
+				require.NotEmpty(t, authority.hidden)
+				for _, hidden := range authority.hidden {
+					_, statErr := os.Stat(hidden)
+					require.NoError(t, statErr)
+				}
+				authority.mu.Unlock()
+			}
 		})
 	}
 }
@@ -828,13 +868,13 @@ func TestHostAuthorityFailedStartBusyCleanupBlocksReplacementUntilRetry(t *testi
 	require.ErrorIs(t, err, authority.startErr)
 	require.ErrorIs(t, err, ErrNativeTreeBusy)
 	require.NotErrorIs(t, err, ErrContainmentIncomplete)
-	require.Len(t, agent.retiredNativeTrees, 2)
+	require.Len(t, agent.retiredNativeTrees, 1)
 	starts := countAuthorityEvents(authority.snapshot(), "start-refused")
 
 	_, err = agent.startSharedRuntime(t.Context())
 	require.ErrorIs(t, err, ErrNativeTreeBusy)
 	require.Equal(t, starts, countAuthorityEvents(authority.snapshot(), "start-refused"))
-	require.Len(t, agent.retiredNativeTrees, 2)
+	require.Len(t, agent.retiredNativeTrees, 1)
 
 	authority.mu.Lock()
 	authority.startErr = nil
@@ -850,7 +890,7 @@ func TestHostAuthorityFailedStartBusyCleanupBlocksReplacementUntilRetry(t *testi
 func TestHostAuthorityPrepareErrorQuarantinesManagedAdmission(t *testing.T) {
 	authority := newAuthorityTrace()
 	authority.hideTree = true
-	authority.prepareErr = errors.New("one carrier path rejected")
+	authority.prepareErr = errors.New("runtime prepare rejected")
 	agent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
 
 	_, _, err := agent.sharedRuntimeBinding(t.Context())
