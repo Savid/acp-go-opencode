@@ -1,7 +1,9 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -54,7 +56,6 @@ func TestRuntimeOptionAndScratchEdges(t *testing.T) {
 
 func TestRecoveryAndLifecycleAdmissionEdges(t *testing.T) {
 	done := make(chan struct{})
-	close(done)
 	ctx := &cancelAfterFirstErrContext{Context: t.Context(), done: done}
 	var gate sessionRecoveryGate
 	require.ErrorIs(t, gate.lock(ctx), context.Canceled)
@@ -405,4 +406,174 @@ func TestLifecycleAndDeliveryCancellationEdges(t *testing.T) {
 	}()
 	require.ErrorContains(t, stoppedAfterSend.enqueueRaw(t.Context(), map[string]any{}), "stopped")
 	<-received
+}
+
+func TestStateSnapshotDecoderReachableEdges(t *testing.T) {
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	var original map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &original))
+	encode := func(t *testing.T, mutate func(map[string]any)) []byte {
+		t.Helper()
+		candidate := cloneJSONMap(t, original)
+		mutate(candidate)
+		raw, marshalErr := json.Marshal(candidate)
+		require.NoError(t, marshalErr)
+
+		return raw
+	}
+
+	for name, raw := range map[string][]byte{
+		"typed unmarshal": encode(t, func(value map[string]any) {
+			value[snapshotFieldCapturedAtUnixMilli] = "not-an-integer"
+		}),
+		"environment object": encode(t, func(value map[string]any) {
+			session, ok := value[snapshotFieldSession].(map[string]any)
+			require.True(t, ok)
+			session[snapshotFieldEnv] = []any{}
+		}),
+		"graph array": encode(t, func(value map[string]any) {
+			value[snapshotFieldGraph] = map[string]any{}
+		}),
+		"events object": encode(t, func(value map[string]any) {
+			value[jsonFieldEvents] = []any{}
+		}),
+		"aggregate array": encode(t, func(value map[string]any) {
+			events, ok := value[jsonFieldEvents].(map[string]any)
+			require.True(t, ok)
+			events["native"] = map[string]any{}
+		}),
+		"event data object": encode(t, func(value map[string]any) {
+			events, ok := value[jsonFieldEvents].(map[string]any)
+			require.True(t, ok)
+			aggregate, ok := events["native"].([]any)
+			require.True(t, ok)
+			event, ok := aggregate[0].(map[string]any)
+			require.True(t, ok)
+			event[jsonFieldData] = []any{}
+		}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, decodeErr := decodeStateSnapshot(raw)
+			require.Error(t, decodeErr)
+		})
+	}
+
+	require.Error(t, rejectDuplicateJSONFields([]byte(`[] {`)))
+	require.Error(t, scanUniqueJSONValue(json.NewDecoder(bytes.NewReader(nil)), "empty"))
+	require.Error(t, scanUniqueJSONValue(json.NewDecoder(bytes.NewReader([]byte(`[1`))), "array"))
+	_, err = exactJSONObject([]byte(`{`), "invalid", nil, nil)
+	require.Error(t, err)
+	_, err = exactJSONObject([]byte(`null`), "null", nil, nil)
+	require.Error(t, err)
+}
+
+func TestStateStoreValidationReachableEdges(t *testing.T) {
+	node := stateSnapshotNode{SessionID: "session", NativeSessionID: "native", SourceCwd: "/source"}
+	partEvent := opencode.SyncEvent{
+		ID: "part", AggregateID: "native", Type: syncTypeMessagePartUpdated,
+		Data: map[string]json.RawMessage{
+			syncFieldSessionID: json.RawMessage(`"native"`),
+			syncFieldPart:      json.RawMessage(`{}`),
+			jsonFieldTime:      json.RawMessage(`{`),
+		},
+	}
+	require.Error(t, validateSyncEvent(partEvent, node))
+	partEvent.Data[jsonFieldTime] = json.RawMessage(`1e10000`)
+	require.Error(t, validateSyncEvent(partEvent, node))
+
+	invalid := validSyncSnapshot("session", "native", "/source")
+	invalid.Format = "unsupported"
+	entry, err := json.Marshal(invalid)
+	require.NoError(t, err)
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{entry},
+	}}))
+	_, _, found, err := hydrateStateFromStore(t.Context(), store, "session")
+	require.Error(t, err)
+	require.False(t, found)
+
+	badMarshal := validSyncSnapshot("session", "native", "/source")
+	badMarshal.Events["native"][0].Data[syncFieldInfo] = json.RawMessage(`{`)
+	require.Error(t, scanStateSnapshot(badMarshal, nil))
+
+	terminal := terminalTestSnapshot(t,
+		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", int64Pointer(100)),
+	)
+	terminal = mutateTerminalTestSnapshot(t, terminal, func(value *stateSnapshot) {
+		value.Events["native"][1].Data[syncFieldInfo] = json.RawMessage(
+			`{"id":[],"sessionID":"native","role":"assistant","finish":"stop"}`,
+		)
+	})
+	_, err = InspectSessionStoreTerminalState("session", []SessionStoreEntry{terminal})
+	require.ErrorContains(t, err, "decode OpenCode message event")
+}
+
+func TestActiveReplacementAndArtifactLoadEdges(t *testing.T) {
+	t.Run("zero replacement timeout takes the default", func(t *testing.T) {
+		cwd := t.TempDir()
+		store := NewInMemorySessionStore()
+		client := newFakeOpenCodeClient()
+		agent := NewAgent(WithSessionStore(store))
+		agent.sessionReplacementTimeout = 0
+		current := testSession(t, agent, client)
+		current.cwd = cwd
+		current.carrier = newSessionCarrier(map[string]string{"COLOR": "old"}, nil)
+		require.NoError(t, current.snapshotToStore(t.Context()))
+		client.closeErr = errors.Join(errors.New("still live"), ErrContainmentIncomplete)
+
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(current.id, cwd,
+			WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{"COLOR": "new"}))),
+		))
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
+	})
+
+	t.Run("replacement detects a changed active mapping", func(t *testing.T) {
+		cwd := t.TempDir()
+		store := NewInMemorySessionStore()
+		client := newFakeOpenCodeClient()
+		agent := NewAgent(WithSessionStore(store))
+		current := testSession(t, agent, client)
+		current.cwd = cwd
+		current.carrier = newSessionCarrier(map[string]string{"COLOR": "old"}, nil)
+		require.NoError(t, current.snapshotToStore(t.Context()))
+		replacement := &session{id: current.id}
+		client.closeHook = func() {
+			agent.mu.Lock()
+			agent.sessions[current.id] = replacement
+			agent.mu.Unlock()
+		}
+
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(current.id, cwd,
+			WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{"COLOR": "new"}))),
+		))
+		require.ErrorContains(t, err, "changed during replacement")
+	})
+
+	t.Run("missing image artifact blocks hydration", func(t *testing.T) {
+		cwd := t.TempDir()
+		snapshot := validSyncSnapshot("session", "native", cwd)
+		snapshot.Events["native"] = append(snapshot.Events["native"], opencode.SyncEvent{
+			ID: "part", AggregateID: "native", Sequence: 1, Type: syncTypeMessagePartUpdated,
+			Data: map[string]json.RawMessage{
+				syncFieldSessionID: json.RawMessage(`"native"`),
+				syncFieldPart: json.RawMessage(
+					`{"url":"` + imageArtifactReferenceScheme + `missing"}`,
+				),
+				jsonFieldTime: json.RawMessage(`1`),
+			},
+		})
+		entry, err := json.Marshal(snapshot)
+		require.NoError(t, err)
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+			Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{entry},
+		}}))
+		agent := NewAgent(WithSessionStore(store))
+		_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("session", cwd))
+		require.ErrorContains(t, err, outputReasonStorageFailed)
+	})
 }
