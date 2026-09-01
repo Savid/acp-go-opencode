@@ -119,6 +119,7 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
+// WithHostAuthority routes native processes and tree ownership through authority.
 func WithHostAuthority(authority HostAuthority) Option {
 	return func(options *Options) {
 		options.HostAuthority = authority

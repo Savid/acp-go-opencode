@@ -97,7 +97,6 @@ the terminal assistant. Malformed, unsupported, or non-contiguous snapshots
 fail closed; a valid snapshot without a terminal assistant returns an empty
 `MessageID`.
 
-<Note>
 A snapshot is blocked while any input, permission, elicitation, or generation is
 pending, so a snapshot never captures a half-finished turn. `session/delete`
 removes a stored session and leaves a tombstone so the id is not silently
@@ -107,4 +106,3 @@ success. A custom `SessionStore` owes the same rule — the deleted state is
 already the caller's answer, and a store that leaves the rule to its caller
 resurrects a session whenever a settlement races the delete that answered for
 it.
-</Note>

@@ -50,7 +50,7 @@ func TestAllowlistedSyncEventsRejectsCrossAggregateAndUnknownSchema(t *testing.T
 	require.ErrorContains(t, err, "unsupported sync event type")
 }
 
-func TestSyncSnapshotHardRejectsOldAndIncompleteFormats(t *testing.T) {
+func TestSyncSnapshotHardRejectsForeignAndIncompleteFormats(t *testing.T) {
 	store := NewInMemorySessionStore()
 	require.NoError(t, store.Append(context.Background(), SessionKey{SessionID: "s"}, []SessionStoreEntry{
 		json.RawMessage(`{"format":"unknown-format"}`),
