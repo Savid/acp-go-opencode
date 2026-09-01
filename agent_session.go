@@ -102,10 +102,13 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 }
 
 func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	a.sessionLifecycleMu.Lock()
-	defer a.sessionLifecycleMu.Unlock()
-
 	ctx = a.observe.Extract(ctx, params.Meta)
+
+	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	if err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+	defer release()
 
 	session, err := a.loadOrResumeSession(ctx, params.SessionId, params.Cwd, params.AdditionalDirectories, params.McpServers, params.Meta)
 	if err != nil {
@@ -123,13 +126,16 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 }
 
 func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
-	a.sessionLifecycleMu.Lock()
-	defer a.sessionLifecycleMu.Unlock()
-
 	ctx = a.observe.Extract(ctx, params.Meta)
 	if err := validateMCPServers(params.McpServers); err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
+
+	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	if err != nil {
+		return acp.ResumeSessionResponse{}, err
+	}
+	defer release()
 
 	session, err := a.loadOrResumeSession(ctx, params.SessionId, params.Cwd, params.AdditionalDirectories, params.McpServers, params.Meta)
 	if err != nil {
@@ -442,12 +448,15 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 }
 
 func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	a.sessionLifecycleMu.Lock()
-	defer a.sessionLifecycleMu.Unlock()
-
 	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
 		return acp.CloseSessionResponse{}, refusal
 	}
+
+	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	if err != nil {
+		return acp.CloseSessionResponse{}, err
+	}
+	defer release()
 
 	session, err := a.session(params.SessionId)
 	if err != nil {
@@ -489,9 +498,6 @@ func (a *Agent) rollbackStartedSession(session *session, refusal error) error {
 }
 
 func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
-	a.sessionLifecycleMu.Lock()
-	defer a.sessionLifecycleMu.Unlock()
-
 	ctx = a.observe.Extract(ctx, params.Meta)
 	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
 		return acp.UnstableDeleteSessionResponse{}, refusal
@@ -500,6 +506,12 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	if params.SessionId == "" {
 		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
+
+	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	if err != nil {
+		return acp.UnstableDeleteSessionResponse{}, err
+	}
+	defer release()
 
 	a.mu.Lock()
 	session := a.sessions[params.SessionId]
@@ -513,7 +525,7 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	// record the tombstone is the one failure that leaves the handle exactly as
 	// it was, because nothing was promised.
 	storeCtx, cancel := a.sessionStoreContext(ctx)
-	err := a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
+	err = a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
 
 	cancel()
 

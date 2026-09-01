@@ -8,6 +8,27 @@ import (
 	"io"
 )
 
+const (
+	snapshotFieldAdapterVersion        = "adapterVersion"
+	snapshotFieldNativeVersion         = "nativeVersion"
+	snapshotFieldEventSchemaVersion    = "eventSchemaVersion"
+	snapshotFieldCapturedAtUnixMilli   = "capturedAtUnixMilli"
+	snapshotFieldRestoreGeneration     = "restoreGeneration"
+	snapshotFieldSession               = "session"
+	snapshotFieldGraph                 = "graph"
+	snapshotFieldTitle                 = "title"
+	snapshotFieldModel                 = "model"
+	snapshotFieldEnv                   = "env"
+	snapshotFieldExtraPathDirs         = "extraPathDirs"
+	snapshotFieldParentSessionID       = "parentSessionId"
+	snapshotFieldNativeParentID        = "nativeParentId"
+	snapshotFieldNativeParentSessionID = "nativeParentSessionId"
+	snapshotFieldSourceCwd             = "sourceCwd"
+	snapshotEventFieldID               = "id"
+	snapshotEventFieldAggregateID      = "aggregate_id"
+	snapshotEventFieldSequence         = "seq"
+)
+
 // decodeStateSnapshot is the single reader for a complete persisted snapshot.
 // encoding/json accepts duplicate keys and case-insensitive struct names, both
 // of which make a durable restore ambiguous. The wire shape is therefore
@@ -121,44 +142,56 @@ func scanUniqueJSONValue(decoder *json.Decoder, path string) error {
 }
 
 func validateStateSnapshotJSONShape(raw []byte) error {
-	top, err := exactJSONObject(raw, "snapshot",
-		"format", "adapterVersion", "nativeVersion", "eventSchemaVersion",
-		"capturedAtUnixMilli", "restoreGeneration", "session", "graph", "events",
-	)
+	topMembers := []string{
+		jsonFieldFormat, snapshotFieldAdapterVersion, snapshotFieldNativeVersion, snapshotFieldEventSchemaVersion,
+		snapshotFieldCapturedAtUnixMilli, snapshotFieldRestoreGeneration, snapshotFieldSession, snapshotFieldGraph, jsonFieldEvents,
+	}
+
+	top, err := exactJSONObject(raw, "snapshot", topMembers, topMembers)
 	if err != nil {
 		return err
 	}
 
-	session, err := exactJSONObject(top["session"], "snapshot.session",
-		"sessionId", "nativeSessionId", "parentSessionId", "nativeParentSessionId",
-		"cwd", "title", "model", "env", "extraPathDirs",
-	)
+	sessionMembers := []string{
+		jsonFieldSessionID, opencodeNativeIDMetaKey, snapshotFieldParentSessionID, snapshotFieldNativeParentSessionID,
+		jsonFieldCwd, snapshotFieldTitle, snapshotFieldModel, snapshotFieldEnv, snapshotFieldExtraPathDirs,
+	}
+
+	session, err := exactJSONObject(top[snapshotFieldSession], "snapshot.session", sessionMembers, []string{
+		jsonFieldSessionID, opencodeNativeIDMetaKey, jsonFieldCwd, snapshotFieldTitle,
+		snapshotFieldModel, snapshotFieldEnv, snapshotFieldExtraPathDirs,
+	})
 	if err != nil {
 		return err
 	}
 
-	if _, modelErr := exactJSONObject(session["model"], "snapshot.session.model", "providerID", "modelID", "agent"); modelErr != nil {
+	if _, modelErr := exactJSONObject(session[snapshotFieldModel], "snapshot.session.model",
+		[]string{"providerID", "modelID", provenanceAgent}, nil); modelErr != nil {
 		return modelErr
 	}
 
-	if _, envErr := exactJSONObject(session["env"], "snapshot.session.env"); envErr != nil {
+	if _, envErr := exactJSONObject(session[snapshotFieldEnv], "snapshot.session.env", nil, nil); envErr != nil {
 		return envErr
 	}
 
 	var graph []json.RawMessage
-	if graphErr := json.Unmarshal(top["graph"], &graph); graphErr != nil {
+	if graphErr := json.Unmarshal(top[snapshotFieldGraph], &graph); graphErr != nil {
 		return fmt.Errorf("decode snapshot.graph: %w", graphErr)
 	}
 
 	for index, node := range graph {
-		if _, nodeErr := exactJSONObject(node, fmt.Sprintf("snapshot.graph[%d]", index),
-			"sessionId", "nativeSessionId", "parentSessionId", "nativeParentId", "sourceCwd", "permission",
-		); nodeErr != nil {
+		nodeMembers := []string{
+			jsonFieldSessionID, opencodeNativeIDMetaKey, snapshotFieldParentSessionID,
+			snapshotFieldNativeParentID, snapshotFieldSourceCwd, metaPermissionKey,
+		}
+		if _, nodeErr := exactJSONObject(node, fmt.Sprintf("snapshot.graph[%d]", index), nodeMembers, []string{
+			jsonFieldSessionID, opencodeNativeIDMetaKey, snapshotFieldSourceCwd, metaPermissionKey,
+		}); nodeErr != nil {
 			return nodeErr
 		}
 	}
 
-	events, err := exactJSONObject(top["events"], "snapshot.events")
+	events, err := exactJSONObject(top[jsonFieldEvents], "snapshot.events", nil, nil)
 	if err != nil {
 		return err
 	}
@@ -172,12 +205,16 @@ func validateStateSnapshotJSONShape(raw []byte) error {
 		for index, entry := range entries {
 			path := fmt.Sprintf("snapshot.events[%q][%d]", aggregateID, index)
 
-			event, eventErr := exactJSONObject(entry, path, "id", "aggregate_id", "seq", "type", "data")
+			eventMembers := []string{
+				snapshotEventFieldID, snapshotEventFieldAggregateID, snapshotEventFieldSequence, jsonFieldType, jsonFieldData,
+			}
+
+			event, eventErr := exactJSONObject(entry, path, eventMembers, eventMembers)
 			if eventErr != nil {
 				return eventErr
 			}
 
-			if _, dataErr := exactJSONObject(event["data"], path+".data"); dataErr != nil {
+			if _, dataErr := exactJSONObject(event[jsonFieldData], path+".data", nil, nil); dataErr != nil {
 				return dataErr
 			}
 		}
@@ -187,9 +224,9 @@ func validateStateSnapshotJSONShape(raw []byte) error {
 }
 
 // exactJSONObject decodes one object with exact case-sensitive member names.
-// With no allowed names it accepts dynamic keys while still requiring an
-// object; duplicate keys have already been rejected by rejectDuplicateJSONFields.
-func exactJSONObject(raw []byte, path string, allowed ...string) (map[string]json.RawMessage, error) {
+// A nil allowed set accepts dynamic keys; duplicate keys have already been
+// rejected by rejectDuplicateJSONFields.
+func exactJSONObject(raw []byte, path string, allowed, required []string) (map[string]json.RawMessage, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
 		if err == nil {
@@ -199,18 +236,22 @@ func exactJSONObject(raw []byte, path string, allowed ...string) (map[string]jso
 		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
 
-	if len(allowed) == 0 {
-		return fields, nil
+	if allowed != nil {
+		permitted := make(map[string]struct{}, len(allowed))
+		for _, name := range allowed {
+			permitted[name] = struct{}{}
+		}
+
+		for name := range fields {
+			if _, ok := permitted[name]; !ok {
+				return nil, fmt.Errorf("unknown field %q at %s", name, path)
+			}
+		}
 	}
 
-	permitted := make(map[string]struct{}, len(allowed))
-	for _, name := range allowed {
-		permitted[name] = struct{}{}
-	}
-
-	for name := range fields {
-		if _, ok := permitted[name]; !ok {
-			return nil, fmt.Errorf("unknown field %q at %s", name, path)
+	for _, name := range required {
+		if _, ok := fields[name]; !ok {
+			return nil, fmt.Errorf("missing required field %q at %s", name, path)
 		}
 	}
 

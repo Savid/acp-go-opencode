@@ -64,10 +64,10 @@ type Agent struct {
 	fingerprintKey       [32]byte
 	restoreMu            sync.Mutex
 	nativeAdmissionMu    sync.Mutex
-	// sessionLifecycleMu serializes lifecycle operations that can reuse, retire,
-	// or replace an existing logical session binding. In particular, two active
-	// load/resume calls must never both prepare successors for the same map slot.
-	sessionLifecycleMu sync.Mutex
+	lifecycleAdmissionMu sync.Mutex
+	lifecycleFence       chan struct{}
+	lifecycleFenced      bool
+	lifecycleFlights     map[acp.SessionId]*sessionLifecycleFlight
 	// sessionReplacementTimeout bounds how long an active replacement may wait
 	// to enter its predecessor's recovery/close gate. Once admitted, the close
 	// ladder owns its existing detached per-rung bounds.
@@ -193,8 +193,7 @@ func (a *Agent) connection() agentClient {
 }
 
 func (a *Agent) Close() error {
-	a.sessionLifecycleMu.Lock()
-	defer a.sessionLifecycleMu.Unlock()
+	a.fenceSessionLifecycle()
 
 	a.mu.Lock()
 	if a.closeDone != nil {
@@ -346,8 +345,8 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 			"defaultEnabled": false,
 		},
 		"sessionStore": map[string]any{
-			"format":     SessionStoreFormat,
-			jsonFieldKey: []string{jsonFieldSessionID, "subpath"},
+			jsonFieldFormat: SessionStoreFormat,
+			jsonFieldKey:    []string{jsonFieldSessionID, "subpath"},
 		},
 		structuredOutputMetaKey: map[string]any{
 			"config":        outputSchemaOptionPath,

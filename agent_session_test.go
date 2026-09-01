@@ -1014,8 +1014,9 @@ func TestActiveResumeBoundsContendedPredecessorCloseAdmission(t *testing.T) {
 		t.Fatal("active replacement held the lifecycle gate past its close-admission deadline")
 	}
 
-	require.True(t, agent.sessionLifecycleMu.TryLock(), "timed-out close admission retained the lifecycle gate")
-	agent.sessionLifecycleMu.Unlock()
+	agent.lifecycleAdmissionMu.Lock()
+	require.Empty(t, agent.lifecycleFlights, "timed-out close admission retained the lifecycle flight")
+	agent.lifecycleAdmissionMu.Unlock()
 
 	agent.mu.Lock()
 	mapped := agent.sessions[predecessor.id]
@@ -1042,6 +1043,212 @@ func TestActiveResumeBoundsContendedPredecessorCloseAdmission(t *testing.T) {
 	))
 	require.NoError(t, err, "released close admission was not retryable")
 	require.Len(t, successorClient.scopes(), 1)
+}
+
+func TestSessionLifecycleFlightsIsolateIDsFenceCloseAndCleanUp(t *testing.T) {
+	cwd := t.TempDir()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	for logicalID, nativeID := range map[string]string{"s1": "native-1", "s2": "native-2"} {
+		snapshot := validSyncSnapshot(logicalID, nativeID, cwd)
+		encoded, err := json.Marshal(snapshot)
+		require.NoError(t, err)
+		require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: logicalID}, []SessionStoreReplacement{{
+			Key: SessionKey{SessionID: logicalID}, Entries: []SessionStoreEntry{encoded},
+		}}))
+	}
+
+	client := newFakeOpenCodeClient()
+	client.getSessionFunc = func(_ context.Context, id string) (opencode.NativeSession, error) {
+		return testNativeSession(id), nil
+	}
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+
+	reached := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	callbackDone := make(chan error, 1)
+	var once sync.Once
+	store.onLoad = func(key SessionKey) ([]SessionStoreEntry, error) {
+		if key.SessionID != "s1" {
+			return store.InMemorySessionStore.Load(t.Context(), key)
+		}
+
+		var callbackErr error
+		once.Do(func() {
+			_, callbackErr = agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest("callback-session"))
+			callbackDone <- callbackErr
+			close(reached)
+			<-releaseLoad
+		})
+		if callbackErr != nil {
+			return nil, callbackErr
+		}
+
+		return store.InMemorySessionStore.Load(t.Context(), key)
+	}
+
+	s1Result := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest("s1", cwd))
+		s1Result <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("s1 did not reach the blocked store load")
+	}
+	require.NoError(t, <-callbackDone, "store callback could not run an independent lifecycle operation")
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	canceledResult := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(canceled, ResumeSessionRequest("s2", cwd))
+		canceledResult <- err
+	}()
+	select {
+	case err := <-canceledResult:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("canceled s2 lifecycle call waited behind s1")
+	}
+
+	s2Result := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest("s2", cwd))
+		s2Result <- err
+	}()
+	select {
+	case err := <-s2Result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("s2 lifecycle call waited behind s1")
+	}
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- agent.Close() }()
+	select {
+	case err := <-closeResult:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Agent.Close waited behind the blocked s1 lifecycle flight")
+	}
+
+	close(releaseLoad)
+	require.Error(t, <-s1Result)
+
+	agent.lifecycleAdmissionMu.Lock()
+	require.Empty(t, agent.lifecycleFlights)
+	require.True(t, agent.lifecycleFenced)
+	agent.lifecycleAdmissionMu.Unlock()
+}
+
+func TestSessionLifecycleFlightSerializesSameIDPublication(t *testing.T) {
+	cwd := t.TempDir()
+	snapshot := validSyncSnapshot("session", "native", cwd)
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "session"}, Entries: []SessionStoreEntry{encoded},
+	}}))
+
+	reached := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	var once sync.Once
+	store.onLoad = func(key SessionKey) ([]SessionStoreEntry, error) {
+		once.Do(func() {
+			close(reached)
+			<-releaseLoad
+		})
+
+		return store.InMemorySessionStore.Load(t.Context(), key)
+	}
+
+	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+
+	results := make(chan error, 2)
+	go func() {
+		_, loadErr := agent.LoadSession(t.Context(), LoadSessionRequest("session", cwd))
+		results <- loadErr
+	}()
+	go func() {
+		_, resumeErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("session", cwd))
+		results <- resumeErr
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("first same-id resume did not reach the store")
+	}
+	close(releaseLoad)
+	require.NoError(t, <-results)
+	require.NoError(t, <-results)
+	require.Len(t, client.scopes(), 1, "same-id resumes published more than one native binding")
+
+	agent.mu.Lock()
+	require.Len(t, agent.sessions, 1)
+	agent.mu.Unlock()
+	agent.lifecycleAdmissionMu.Lock()
+	require.Empty(t, agent.lifecycleFlights)
+	agent.lifecycleAdmissionMu.Unlock()
+
+	callbackResult := make(chan error, 1)
+	store.onReplace = func(SessionKey) error {
+		_, callbackErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("independent", cwd))
+		callbackResult <- callbackErr
+
+		return nil
+	}
+	require.NoError(t, agent.Close())
+	select {
+	case callbackErr := <-callbackResult:
+		require.ErrorContains(t, callbackErr, errValueAgentClosed)
+	case <-time.After(time.Second):
+		t.Fatal("Agent.Close store callback could not reenter an independent lifecycle operation")
+	}
+}
+
+func TestAgentCloseFromLifecycleStoreCallbackDoesNotDeadlock(t *testing.T) {
+	cwd := t.TempDir()
+	snapshot := validSyncSnapshot("session", "native", cwd)
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "session"}, Entries: []SessionStoreEntry{encoded},
+	}}))
+	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+
+	store.onLoad = func(key SessionKey) ([]SessionStoreEntry, error) {
+		if closeErr := agent.Close(); closeErr != nil {
+			return nil, closeErr
+		}
+
+		return store.InMemorySessionStore.Load(t.Context(), key)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, resumeErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("session", cwd))
+		result <- resumeErr
+	}()
+	select {
+	case resumeErr := <-result:
+		require.Error(t, resumeErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Agent.Close deadlocked inside the lifecycle store callback")
+	}
 }
 
 func TestAgentLifecycleValidationAndStorageFailures(t *testing.T) {
@@ -2011,14 +2218,7 @@ func TestDeleteLeavesNoWriteThatRecreatesTheRow(t *testing.T) {
 	require.Empty(t, entries, "the deleted session's row was recreated")
 }
 
-// TestLoadRacingDeleteInstallsNothingAndResurrectsNothing proves the tombstone
-// check is not once-at-entry. A load that passed its entry check and prepared a
-// complete replacement re-reads the deletion marker under the very lock that
-// installs, so a delete that completed inside that window wins however far the
-// preparation got: the replacement is torn down, the marker is left set rather
-// than cleared as an install side effect, and neither the active map nor the
-// store carries the deleted id afterwards.
-func TestLoadRacingDeleteInstallsNothingAndResurrectsNothing(t *testing.T) {
+func TestLoadRacingDeleteSerializesTheSameLogicalSession(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -2073,19 +2273,26 @@ func TestLoadRacingDeleteInstallsNothingAndResurrectsNothing(t *testing.T) {
 		t.Fatal("the load never reached the store read")
 	}
 
-	// The delete completes entirely inside the load's preparation window.
-	_, delErr := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
-	require.NoError(t, delErr)
-	require.True(t, agent.isDeleted(created.SessionId), "the tombstone did not hide the id")
+	deleteResult := make(chan error, 1)
+	go func() {
+		_, delErr := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
+		deleteResult <- delErr
+	}()
+	select {
+	case err := <-deleteResult:
+		t.Fatalf("same-id delete overtook the active load: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
 
 	close(release)
 	wg.Wait()
+	require.NoError(t, <-deleteResult)
 
 	store.onLoad = nil
 
-	requireInvalidParamsData(t, loadErr, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	require.NoError(t, loadErr)
 	require.True(t, agent.isDeleted(created.SessionId),
-		"installing the replacement cleared the deletion marker")
+		"the serialized delete did not retain its marker")
 
 	agent.mu.Lock()
 	_, mapped := agent.sessions[created.SessionId]

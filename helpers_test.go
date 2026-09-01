@@ -247,6 +247,7 @@ type fakeOpenCodeClient struct {
 	questionRejected   chan struct{}
 
 	createSessionFunc  func(context.Context, string) (opencode.NativeSession, error)
+	getSessionFunc     func(context.Context, string) (opencode.NativeSession, error)
 	scopeFunc          func(opencode.ScopeOptions) error
 	dispatchMessage    func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
 	dispatchCommand    func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
@@ -476,7 +477,11 @@ func (c *fakeOpenCodeClient) CreateSessionWithPolicy(ctx context.Context, title 
 	return created, err
 }
 
-func (c *fakeOpenCodeClient) GetSession(context.Context, string) (opencode.NativeSession, error) {
+func (c *fakeOpenCodeClient) GetSession(ctx context.Context, id string) (opencode.NativeSession, error) {
+	if c.getSessionFunc != nil {
+		return c.getSessionFunc(ctx, id)
+	}
+
 	return c.getSession, c.getErr
 }
 

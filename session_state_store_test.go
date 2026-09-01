@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,7 +59,7 @@ func TestSyncSnapshotHardRejectsOldAndIncompleteFormats(t *testing.T) {
 	require.Empty(t, idmap)
 	require.Empty(t, hydrated)
 	require.False(t, found)
-	require.ErrorContains(t, err, "unsupported opencode store format")
+	require.ErrorContains(t, err, "missing required field")
 
 	snapshot := validSyncSnapshot("s", "native", "/source")
 	delete(snapshot.Events, "native")
@@ -104,6 +105,161 @@ func TestHydrateStateSnapshotRejectsAmbiguousJSONAtEveryTypedDepth(t *testing.T)
 			require.False(t, found)
 		})
 	}
+}
+
+func TestHydrateStateSnapshotRequiresEveryNonOmittedMemberBeforeNativeLaunch(t *testing.T) {
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot.Session.Model = stateSnapshotModel{ProviderID: "openai", ModelID: "gpt-test", Agent: "build"}
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	var original map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &original))
+
+	requiredPaths := [][]any{
+		{"format"}, {"adapterVersion"}, {"nativeVersion"}, {"eventSchemaVersion"},
+		{"capturedAtUnixMilli"}, {"restoreGeneration"}, {"session"}, {"graph"}, {"events"},
+		{"session", "sessionId"}, {"session", "nativeSessionId"}, {"session", "cwd"},
+		{"session", "title"}, {"session", "model"}, {"session", "env"}, {"session", "extraPathDirs"},
+		{"graph", 0, "sessionId"}, {"graph", 0, "nativeSessionId"},
+		{"graph", 0, "sourceCwd"}, {"graph", 0, "permission"},
+		{"events", "native", 0, "id"}, {"events", "native", 0, "aggregate_id"},
+		{"events", "native", 0, "seq"}, {"events", "native", 0, "type"},
+		{"events", "native", 0, "data"},
+	}
+
+	for _, path := range requiredPaths {
+		name := fmt.Sprint(path)
+		t.Run(name, func(t *testing.T) {
+			candidate := cloneJSONMap(t, original)
+			deleteJSONPath(t, candidate, path)
+			raw, marshalErr := json.Marshal(candidate)
+			require.NoError(t, marshalErr)
+
+			store := NewInMemorySessionStore()
+			require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+				Key: SessionKey{SessionID: "session"}, Entries: []SessionStoreEntry{raw},
+			}}))
+			client := newFakeOpenCodeClient()
+			client.getSession = testNativeSession("native")
+			agent := NewAgent(WithSessionStore(store))
+			agent.runtime = client
+
+			_, resumeErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("session", "/target"))
+			require.Error(t, resumeErr)
+			require.Empty(t, client.scopes(), "invalid snapshot reached native launch")
+		})
+	}
+
+	optional := cloneJSONMap(t, original)
+	deleteJSONPath(t, optional, []any{"session", "parentSessionId"})
+	deleteJSONPath(t, optional, []any{"session", "nativeParentSessionId"})
+	deleteJSONPath(t, optional, []any{"session", "model", "providerID"})
+	deleteJSONPath(t, optional, []any{"session", "model", "modelID"})
+	deleteJSONPath(t, optional, []any{"session", "model", "agent"})
+	deleteJSONPath(t, optional, []any{"graph", 0, "parentSessionId"})
+	deleteJSONPath(t, optional, []any{"graph", 0, "nativeParentId"})
+	optionalRaw, err := json.Marshal(optional)
+	require.NoError(t, err)
+	require.NoError(t, decodeSnapshotOnly(optionalRaw))
+}
+
+func TestSyncEventSchemasRequireMandatoryKeysAndTypes(t *testing.T) {
+	node := stateSnapshotNode{NativeSessionID: "native"}
+	valid := map[string]opencode.SyncEvent{
+		"session.created.1": syncSchemaTestEvent("session.created.1", map[string]json.RawMessage{
+			syncFieldSessionID: json.RawMessage(`"native"`), syncFieldInfo: json.RawMessage(`{"id":"native"}`),
+		}),
+		"session.updated.1": syncSchemaTestEvent("session.updated.1", map[string]json.RawMessage{
+			syncFieldSessionID: json.RawMessage(`"native"`), syncFieldInfo: json.RawMessage(`{"id":"native"}`),
+		}),
+		"message.updated.1": syncSchemaTestEvent("message.updated.1", map[string]json.RawMessage{
+			syncFieldSessionID: json.RawMessage(`"native"`), syncFieldInfo: json.RawMessage(`{"id":"message"}`),
+		}),
+		"message.part.updated.1": syncSchemaTestEvent("message.part.updated.1", map[string]json.RawMessage{
+			syncFieldSessionID: json.RawMessage(`"native"`), syncFieldPart: json.RawMessage(`{"id":"part"}`),
+			jsonFieldTime: json.RawMessage(`123.5`),
+		}),
+	}
+
+	for eventType, event := range valid {
+		t.Run(eventType+" valid", func(t *testing.T) {
+			require.NoError(t, validateSyncEvent(event, node))
+		})
+		for _, field := range syncEventDataSchemas[eventType].required {
+			t.Run(eventType+" missing "+field, func(t *testing.T) {
+				candidate := cloneSyncEvent(event)
+				delete(candidate.Data, field)
+				require.ErrorContains(t, validateSyncEvent(candidate, node), "missing required field")
+			})
+		}
+	}
+
+	wrongTypes := map[string]struct {
+		eventType string
+		field     string
+		value     json.RawMessage
+	}{
+		"session id number":  {"session.created.1", syncFieldSessionID, json.RawMessage(`1`)},
+		"session info array": {"session.updated.1", syncFieldInfo, json.RawMessage(`[]`)},
+		"message info null":  {"message.updated.1", syncFieldInfo, json.RawMessage(`null`)},
+		"part array":         {"message.part.updated.1", syncFieldPart, json.RawMessage(`[]`)},
+		"time string":        {"message.part.updated.1", jsonFieldTime, json.RawMessage(`"now"`)},
+		"time null":          {"message.part.updated.1", jsonFieldTime, json.RawMessage(`null`)},
+	}
+	for name, test := range wrongTypes {
+		t.Run(name, func(t *testing.T) {
+			candidate := cloneSyncEvent(valid[test.eventType])
+			candidate.Data[test.field] = test.value
+			require.Error(t, validateSyncEvent(candidate, node))
+		})
+	}
+}
+
+func syncSchemaTestEvent(eventType string, data map[string]json.RawMessage) opencode.SyncEvent {
+	return opencode.SyncEvent{ID: "event", AggregateID: "native", Type: eventType, Data: data}
+}
+
+func cloneJSONMap(t *testing.T, value map[string]any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	require.NoError(t, err)
+
+	var cloned map[string]any
+	require.NoError(t, json.Unmarshal(raw, &cloned))
+
+	return cloned
+}
+
+func deleteJSONPath(t *testing.T, root map[string]any, path []any) {
+	t.Helper()
+	var current any = root
+	for _, component := range path[:len(path)-1] {
+		switch typed := component.(type) {
+		case string:
+			object, ok := current.(map[string]any)
+			require.True(t, ok)
+			current, ok = object[typed]
+			require.True(t, ok)
+		case int:
+			array, ok := current.([]any)
+			require.True(t, ok)
+			require.Less(t, typed, len(array))
+			current = array[typed]
+		}
+	}
+
+	object, ok := current.(map[string]any)
+	require.True(t, ok)
+	name, ok := path[len(path)-1].(string)
+	require.True(t, ok)
+	delete(object, name)
+}
+
+func decodeSnapshotOnly(raw []byte) error {
+	_, err := decodeStateSnapshot(raw)
+
+	return err
 }
 
 func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {

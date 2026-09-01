@@ -24,13 +24,16 @@ const (
 	// surface has been validated for SessionStoreFormat. Startup fails
 	// closed below it; newer releases are accepted and covered by the
 	// event allowlist plus online replay verification on restore.
-	minNativeVersion        = "1.18.3"
-	snapshotBlockGeneration = "generation"
-	syncTypeSessionCreated  = "session.created.1"
-	syncFieldPart           = "part"
-	syncFieldDirectory      = "directory"
-	syncFieldRoot           = "root"
-	parentPathSegment       = ".."
+	minNativeVersion           = "1.18.3"
+	snapshotBlockGeneration    = "generation"
+	syncTypeSessionCreated     = "session.created.1"
+	syncTypeSessionUpdated     = "session.updated.1"
+	syncTypeMessageUpdated     = "message.updated.1"
+	syncTypeMessagePartUpdated = "message.part.updated.1"
+	syncFieldPart              = "part"
+	syncFieldDirectory         = "directory"
+	syncFieldRoot              = "root"
+	parentPathSegment          = ".."
 )
 
 // A native write that lands between the two /sync/history reads invalidates the
@@ -533,11 +536,25 @@ func allowlistedSyncEvents(history []opencode.SyncEvent, allow map[string]stateS
 	return grouped, cursors, nil
 }
 
-var syncDataFields = map[string]map[string]struct{}{
-	syncTypeSessionCreated:   {syncFieldSessionID: {}, syncFieldInfo: {}},
-	"session.updated.1":      {syncFieldSessionID: {}, syncFieldInfo: {}},
-	"message.updated.1":      {syncFieldSessionID: {}, syncFieldInfo: {}},
-	"message.part.updated.1": {syncFieldSessionID: {}, syncFieldPart: {}, jsonFieldTime: {}},
+type syncEventDataSchema struct {
+	allowed  []string
+	required []string
+}
+
+var syncEventDataSchemas = map[string]syncEventDataSchema{
+	syncTypeSessionCreated: {
+		allowed: []string{syncFieldSessionID, syncFieldInfo}, required: []string{syncFieldSessionID, syncFieldInfo},
+	},
+	syncTypeSessionUpdated: {
+		allowed: []string{syncFieldSessionID, syncFieldInfo}, required: []string{syncFieldSessionID, syncFieldInfo},
+	},
+	syncTypeMessageUpdated: {
+		allowed: []string{syncFieldSessionID, syncFieldInfo}, required: []string{syncFieldSessionID, syncFieldInfo},
+	},
+	syncTypeMessagePartUpdated: {
+		allowed:  []string{syncFieldSessionID, syncFieldPart, jsonFieldTime},
+		required: []string{syncFieldSessionID, syncFieldPart, jsonFieldTime},
+	},
 }
 
 const (
@@ -550,9 +567,14 @@ func validateSyncEvent(event opencode.SyncEvent, node stateSnapshotNode) error {
 		return fmt.Errorf("invalid sync event identity")
 	}
 
-	allowed, ok := syncDataFields[event.Type]
+	schema, ok := syncEventDataSchemas[event.Type]
 	if !ok {
 		return fmt.Errorf("unsupported sync event type %q", event.Type)
+	}
+
+	allowed := make(map[string]struct{}, len(schema.allowed))
+	for _, field := range schema.allowed {
+		allowed[field] = struct{}{}
 	}
 
 	for field := range event.Data {
@@ -561,9 +583,57 @@ func validateSyncEvent(event opencode.SyncEvent, node stateSnapshotNode) error {
 		}
 	}
 
+	for _, field := range schema.required {
+		if _, ok := event.Data[field]; !ok {
+			return fmt.Errorf("sync event %q is missing required field %q", event.ID, field)
+		}
+	}
+
 	var sessionID string
 	if err := json.Unmarshal(event.Data[syncFieldSessionID], &sessionID); err != nil || sessionID != node.NativeSessionID {
 		return fmt.Errorf("sync event %q session identity mismatch", event.ID)
+	}
+
+	if event.Type == syncTypeMessagePartUpdated {
+		if err := requireSyncEventObject(event, syncFieldPart); err != nil {
+			return err
+		}
+
+		if !json.Valid(event.Data[jsonFieldTime]) {
+			return fmt.Errorf("sync event %q field %q must be a finite number", event.ID, jsonFieldTime)
+		}
+
+		decoder := json.NewDecoder(bytes.NewReader(event.Data[jsonFieldTime]))
+		decoder.UseNumber()
+
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return fmt.Errorf("sync event %q field %q must be a finite number", event.ID, jsonFieldTime)
+		}
+
+		number, ok := value.(json.Number)
+		if !ok {
+			return fmt.Errorf("sync event %q field %q must be a finite number", event.ID, jsonFieldTime)
+		}
+
+		if _, err := number.Float64(); err != nil {
+			return fmt.Errorf("sync event %q field %q must be a finite number", event.ID, jsonFieldTime)
+		}
+
+		return nil
+	}
+
+	if err := requireSyncEventObject(event, syncFieldInfo); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func requireSyncEventObject(event opencode.SyncEvent, field string) error {
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal(event.Data[field], &value); err != nil || value == nil {
+		return fmt.Errorf("sync event %q field %q must be an object", event.ID, field)
 	}
 
 	return nil
@@ -814,7 +884,7 @@ func rebasePathValues(value any, field, sourceCwd, targetCwd string) (any, error
 
 		return typed, nil
 	case string:
-		if field != syncFieldDirectory && field != "cwd" && field != syncFieldRoot && field != jsonFieldPath {
+		if field != syncFieldDirectory && field != jsonFieldCwd && field != syncFieldRoot && field != jsonFieldPath {
 			return typed, nil
 		}
 

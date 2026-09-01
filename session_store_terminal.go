@@ -61,7 +61,7 @@ func InspectSessionStoreTerminalState(
 			)
 		}
 
-		if event.Type != "message.updated.1" {
+		if event.Type != syncTypeMessageUpdated {
 			continue
 		}
 

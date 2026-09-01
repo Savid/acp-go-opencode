@@ -88,7 +88,7 @@ func TestInspectSessionStoreTerminalStateRejectsMalformedOrUnsupportedEntry(t *t
 			entries: []SessionStoreEntry{mutateTerminalTestSnapshot(t, valid, func(snapshot *stateSnapshot) {
 				snapshot.Events["native"][1].Data[syncFieldInfo] = json.RawMessage(`[]`)
 			})},
-			sessionID: "session", wantErr: "decode OpenCode message event",
+			sessionID: "session", wantErr: `field "info" must be an object`,
 		},
 		"wrong message session": {
 			entries: []SessionStoreEntry{mutateTerminalTestSnapshot(t, valid, func(snapshot *stateSnapshot) {

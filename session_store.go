@@ -160,9 +160,9 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		return fmt.Errorf("main subpath must be %q", SessionStoreMainSubpath)
 	}
 
-	mainCount := 0
-	mainIncluded := false
 	seenReplacement := make(map[SessionKey]struct{}, len(replacements))
+	members := make(map[string]struct{}, len(replacements))
+	mainCounts := make(map[string]int, len(replacements))
 
 	for _, replacement := range replacements {
 		// The refusal names the key it refused. A replacement set lists many keys
@@ -174,17 +174,24 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		}
 
 		seenReplacement[replacement.Key] = struct{}{}
-		if replacement.Key.Subpath == SessionStoreMainSubpath {
-			mainCount++
+		if replacement.Key.SessionID == "" {
+			return fmt.Errorf("replacement session id is required")
+		}
 
-			if replacement.Key.SessionID == main.SessionID {
-				mainIncluded = true
-			}
+		members[replacement.Key.SessionID] = struct{}{}
+		if replacement.Key.Subpath == SessionStoreMainSubpath {
+			mainCounts[replacement.Key.SessionID]++
 		}
 	}
 
-	if mainCount == 0 || !mainIncluded {
-		return fmt.Errorf("replacements must include at least one main key")
+	if mainCounts[main.SessionID] != 1 {
+		return fmt.Errorf("replacements must include addressed main key exactly once")
+	}
+
+	for member := range members {
+		if mainCounts[member] != 1 {
+			return fmt.Errorf("replacements must include exactly one main key for session %q", member)
+		}
 	}
 
 	// A tombstone is final and the store is where that finality lives, not the

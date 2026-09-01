@@ -58,6 +58,8 @@ const (
 	jsonFieldSchema                    = "schema"
 	jsonFieldEnum                      = "enum"
 	jsonFieldData                      = "data"
+	jsonFieldEvents                    = "events"
+	jsonFieldFormat                    = "format"
 	jsonFieldDescription               = "description"
 	jsonFieldItems                     = "items"
 	jsonFieldTime                      = "time"
