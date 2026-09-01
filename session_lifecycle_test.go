@@ -1782,6 +1782,12 @@ func TestCorrectionLifecycleDirectFailureBranches(t *testing.T) {
 	current := &session{}
 	current.stampIncarnationGeneration(client, 7)
 	require.NotNil(t, current.incarnation)
+	stale := current.incarnation
+	replacement := &nativeIncarnationBinding{client: client, registry: newActionRegistry()}
+	current.incarnation = replacement
+	current.failLifecycleDelivery(stale, errors.New("stale delivery failure"))
+	require.Same(t, replacement, current.incarnation)
+	require.NoError(t, current.lifecycleFailure())
 
 	invalidCycle := &foregroundCycle{reserved: true}
 	require.Error(t, current.acceptPromptCycle(context.Background(), invalidCycle, lifecycle.Submission{}))
