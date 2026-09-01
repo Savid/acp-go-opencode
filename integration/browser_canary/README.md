@@ -19,4 +19,5 @@ addition to the independent launch trace.
 `prepare.sh` downloads and verifies only the native release. Image construction
 installs the exact `strace` package, and its context allowlist includes only the
 two binaries, entrypoint, and decoy. The final container executes with Docker
-`--network none`.
+`--network none`; its writable runtime and scratch roots are local tmpfs mounts,
+because production correctly refuses Docker overlayfs for cross-process locks.

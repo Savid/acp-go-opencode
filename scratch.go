@@ -5,6 +5,8 @@ import (
 	"os"
 )
 
+var runtimeMkdirTemp = os.MkdirTemp
+
 // scratchParent resolves the parent directory for all ephemeral on-disk
 // materialization: dir when set, else the system temp directory. This is the
 // only place in the module that consults the system temp directory.
@@ -45,7 +47,7 @@ func (a *Agent) newRuntimeRoot() (string, bool, error) {
 		return "", false, err
 	}
 
-	root, err := os.MkdirTemp(parent, "acp-go-opencode-runtime-")
+	root, err := runtimeMkdirTemp(parent, "acp-go-opencode-runtime-")
 	if err != nil {
 		return "", false, fmt.Errorf("create OpenCode runtime root: %w", err)
 	}

@@ -722,11 +722,14 @@ func TestSharedRuntimeConstructionEdges(t *testing.T) {
 	_, err = badRoot.startSharedRuntime(t.Context())
 	require.ErrorContains(t, err, "create scratch parent")
 
-	readOnlyScratch := t.TempDir()
-	require.NoError(t, os.Chmod(readOnlyScratch, 0o500))
-	t.Cleanup(func() { require.NoError(t, os.Chmod(readOnlyScratch, 0o700)) })
-	_, _, err = (&Agent{options: Options{ScratchDir: readOnlyScratch}}).newRuntimeRoot()
+	mkdirTempFailure := errors.New("mkdir temp refused")
+	originalMkdirTemp := runtimeMkdirTemp
+	t.Cleanup(func() { runtimeMkdirTemp = originalMkdirTemp })
+	runtimeMkdirTemp = func(string, string) (string, error) { return "", mkdirTempFailure }
+	_, _, err = (&Agent{options: Options{ScratchDir: t.TempDir()}}).newRuntimeRoot()
 	require.ErrorContains(t, err, "create OpenCode runtime root")
+	require.ErrorIs(t, err, mkdirTempFailure)
+	runtimeMkdirTemp = originalMkdirTemp
 
 	generatedRoot, generated, err := (&Agent{options: Options{ScratchDir: t.TempDir()}}).newRuntimeRoot()
 	require.NoError(t, err)

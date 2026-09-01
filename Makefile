@@ -22,7 +22,7 @@ test-integration-native-browser:
 	integration/browser_canary/prepare.sh; \
 	CGO_ENABLED=0 GOOS=linux GOARCH="$$goarch" go test -c -tags=integration,browsercanary -o .tmp/browser-canary/browser-canary.test .; \
 	docker build --platform "$$platform" --tag acp-go-opencode-browser-canary --file integration/browser_canary/Dockerfile .; \
-	docker run --rm --platform "$$platform" --network none --env ACP_GO_OPENCODE_RUN_INTEGRATION=1 --cap-add SYS_PTRACE --security-opt seccomp=unconfined acp-go-opencode-browser-canary); echo $$? >"$$rc"; } 2>&1 | tee "$$log"; \
+	docker run --rm --platform "$$platform" --network none --env ACP_GO_OPENCODE_RUN_INTEGRATION=1 --tmpfs /canary/scratch:rw,exec,mode=0700 --tmpfs /var/lib:rw,exec,mode=0755 --cap-add SYS_PTRACE --security-opt seccomp=unconfined acp-go-opencode-browser-canary); echo $$? >"$$rc"; } 2>&1 | tee "$$log"; \
 	status=$$(cat "$$rc"); passed=$$(grep -Ec '^--- PASS: TestRealNativeBrowserLaunchIsNeutralized ' "$$log" || true); skipped=$$(grep -Ec '^[[:space:]]*--- SKIP: TestRealNativeBrowserLaunchIsNeutralized(/| )' "$$log" || true); empty=$$(grep -Ec 'no tests to run' "$$log" || true); \
 	rm -f "$$log" "$$rc"; \
 	[ "$$status" -eq 0 ] || exit "$$status"; \
