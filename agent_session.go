@@ -197,7 +197,7 @@ func (a *Agent) loadOrResumeSession(
 		meta.Mode = snapshot.Session.Model.Agent
 	}
 
-	carrier := carrierFromMeta(meta, newSessionCarrier(nil, snapshot.Session.ExtraPathDirs))
+	carrier := carrierFromMeta(meta, newSessionCarrier(snapshot.Session.Env, snapshot.Session.ExtraPathDirs))
 	meta.Env, meta.ExtraPathDirs = carrier.Env, carrier.ExtraPathDirs
 
 	artifacts, artifactsErr := a.loadAndRehydrateArtifacts(ctx, string(id), snapshot.Events)

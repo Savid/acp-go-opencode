@@ -347,7 +347,7 @@ func TestSecondTurnKeepsTheCarrier(t *testing.T) {
 	require.NoError(t, agent.Close())
 }
 
-func TestCarrierBearerIsRedactedFromTheDurableSnapshot(t *testing.T) {
+func TestCarrierSecretNeedlesProtectThePortableEventGraph(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
 	agent.runtime = client

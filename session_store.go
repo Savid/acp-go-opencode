@@ -16,12 +16,9 @@ const (
 
 	// SessionStoreFormat is the one bundle shape this adapter reads and writes.
 	//
-	// `session.extraPathDirs` is a required member of that shape. A bundle that
-	// does not carry it is refused rather than defaulted: a cold load rebinds the
-	// native session to the directories it was captured with, and a bundle that
-	// cannot say what they were is a bundle whose shell operations would silently
-	// resolve against the reloading host's search path. There is no decoder that
-	// accepts the member's absence and no default that invents it.
+	// `session.env` and `session.extraPathDirs` are required members of that
+	// shape. A bundle that does not carry both is refused rather than defaulted:
+	// a cold load rebinds the native session to the carrier it was captured with.
 	SessionStoreFormat = "opencode-sync-events-v1"
 )
 

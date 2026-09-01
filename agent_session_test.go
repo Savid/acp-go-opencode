@@ -750,11 +750,8 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	loaded, err := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
 	require.NoError(t, err)
 	require.NotNil(t, loaded.Meta)
-	// A cold load keeps the durable directories and starts from no environment:
-	// an operation bearer is never frozen into the store, so the loading request
-	// owns it.
 	require.Equal(t, []string{"/original/bin"}, client.scopes()[1].ExtraPathDirs)
-	require.Empty(t, client.scopes()[1].Env)
+	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""}, client.scopes()[1].Env)
 	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
 	require.NoError(t, err)
 
@@ -768,6 +765,19 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	require.NotNil(t, resumed.Meta)
 	require.Equal(t, []string{"/replacement/bin"}, client.scopes()[2].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "rotated"}, client.scopes()[2].Env)
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+
+	loaded, err = agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeExtraPathDirs(),
+			WithOpenCodeEnv(map[string]string{}),
+		)),
+	))
+	require.NoError(t, err)
+	require.NotNil(t, loaded.Meta)
+	require.Empty(t, client.scopes()[3].ExtraPathDirs)
+	require.Empty(t, client.scopes()[3].Env)
 
 	_, err = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
 	require.NoError(t, err)

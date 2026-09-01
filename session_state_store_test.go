@@ -174,6 +174,15 @@ func TestBundleCredentialScan(t *testing.T) {
 	require.ErrorContains(t, scanSyncBundle([]byte(`{"text":"Bearer exact"}`), []string{"Bearer exact"}), "MCP credential")
 }
 
+func TestSnapshotCredentialScanAllowsOnlyTheDurableCarrier(t *testing.T) {
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot.Session.Env = map[string]string{"SERVICE_API_TOKEN": "bearer-secret", "EMPTY": ""}
+	require.NoError(t, scanStateSnapshot(snapshot, []string{"bearer-secret"}))
+
+	snapshot.Events["native"][0].Data[syncFieldInfo] = json.RawMessage(`{"id":"native","leak":"bearer-secret"}`)
+	require.ErrorContains(t, scanStateSnapshot(snapshot, []string{"bearer-secret"}), "MCP credential")
+}
+
 func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierReference(t *testing.T) {
 	agent := NewAgent()
 	client := newFakeOpenCodeClient()
@@ -212,9 +221,12 @@ func validSyncSnapshot(sessionID, nativeID, cwd string) stateSnapshot {
 	return stateSnapshot{
 		Format: SessionStoreFormat, AdapterVersion: "test", NativeVersion: minNativeVersion,
 		EventSchemaVersion: syncEventSchemaVersion, RestoreGeneration: "generation",
-		Session: stateSnapshotSession{SessionID: sessionID, NativeSessionID: nativeID, Cwd: cwd, ExtraPathDirs: []string{}},
-		Graph:   []stateSnapshotNode{{SessionID: sessionID, NativeSessionID: nativeID, SourceCwd: cwd, Permission: "ask"}},
-		Events:  map[string][]opencode.SyncEvent{nativeID: {event}},
+		Session: stateSnapshotSession{
+			SessionID: sessionID, NativeSessionID: nativeID, Cwd: cwd,
+			Env: map[string]string{}, ExtraPathDirs: []string{},
+		},
+		Graph:  []stateSnapshotNode{{SessionID: sessionID, NativeSessionID: nativeID, SourceCwd: cwd, Permission: "ask"}},
+		Events: map[string][]opencode.SyncEvent{nativeID: {event}},
 	}
 }
 func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
@@ -227,6 +239,8 @@ func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
 		"session identity":     func(value *stateSnapshot) { value.Session.SessionID = "other" },
 		"native identity":      func(value *stateSnapshot) { value.Session.NativeSessionID = "" },
 		"generation":           func(value *stateSnapshot) { value.RestoreGeneration = "" },
+		"missing environment":  func(value *stateSnapshot) { value.Session.Env = nil },
+		"invalid environment":  func(value *stateSnapshot) { value.Session.Env = map[string]string{"PATH": "/unsafe"} },
 		"missing path carrier": func(value *stateSnapshot) { value.Session.ExtraPathDirs = nil },
 		"invalid path carrier": func(value *stateSnapshot) { value.Session.ExtraPathDirs = []string{"relative"} },
 		"invalid node":         func(value *stateSnapshot) { value.Graph[0].SourceCwd = "" },

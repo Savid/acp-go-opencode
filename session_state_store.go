@@ -114,15 +114,8 @@ type stateSnapshotSession struct {
 	Cwd                   string             `json:"cwd"`
 	Title                 string             `json:"title"`
 	Model                 stateSnapshotModel `json:"model"`
-	// ExtraPathDirs is the durable half of the addressed-session carrier: a
-	// cold load rebinds the native session to these directories rather than to
-	// whatever the reloading host happens to hold.
-	//
-	// The carrier environment is deliberately absent. It is where an operation
-	// bearer lives, this bundle is scanned for exactly that material before it
-	// is written, and a rotated bearer must come from the request that reloads
-	// the session rather than from a value frozen at capture time.
-	ExtraPathDirs []string `json:"extraPathDirs"`
+	Env                   map[string]string  `json:"env"`
+	ExtraPathDirs         []string           `json:"extraPathDirs"`
 }
 
 type stateSnapshotModel struct {
@@ -226,6 +219,12 @@ func (s *session) captureStateSnapshot(
 
 	for _, member := range graph {
 		memberSnapshot := member.snapshot()
+
+		durableEnv := cloneStringMap(memberSnapshot.carrier.Env)
+		if durableEnv == nil {
+			durableEnv = map[string]string{}
+		}
+
 		bundle := stateSnapshot{
 			Format: SessionStoreFormat, AdapterVersion: s.agent.options.AgentVersion,
 			NativeVersion: s.client.NativeVersion(), EventSchemaVersion: syncEventSchemaVersion,
@@ -236,6 +235,7 @@ func (s *session) captureStateSnapshot(
 				NativeParentSessionID: memberSnapshot.idmap.NativeParentSessionID,
 				Cwd:                   memberSnapshot.cwd, Title: memberSnapshot.title,
 				Model:         stateSnapshotModel{ProviderID: memberSnapshot.providerID, ModelID: memberSnapshot.modelID, Agent: memberSnapshot.mode},
+				Env:           durableEnv,
 				ExtraPathDirs: append([]string{}, memberSnapshot.carrier.ExtraPathDirs...),
 			},
 			Graph: nodes, Events: events,
@@ -246,7 +246,7 @@ func (s *session) captureStateSnapshot(
 			return capturedStateSnapshot{}, marshalErr
 		}
 
-		if err := scanSyncBundle(entry, s.agent.graphSecretNeedles(graph)); err != nil {
+		if err := scanStateSnapshot(bundle, s.agent.graphSecretNeedles(graph)); err != nil {
 			return capturedStateSnapshot{}, err
 		}
 
@@ -456,9 +456,6 @@ func (a *Agent) graphSecretNeedles(graph []*session) []string {
 	for _, member := range graph {
 		member.mu.Lock()
 		needles = append(needles, member.secretNeedles...)
-		// The carrier is the one environment a stored snapshot writes out, so
-		// its bearer values are redacted from the same pass that redacts the
-		// agent-wide ones.
 		needles = append(needles, sensitiveEnvNeedles(member.carrier.Env)...)
 		member.mu.Unlock()
 	}
@@ -627,6 +624,14 @@ func validateSyncSnapshot(sessionID string, snapshot stateSnapshot) error {
 
 	if snapshot.Session.SessionID != sessionID || snapshot.Session.NativeSessionID == "" || snapshot.RestoreGeneration == "" {
 		return fmt.Errorf("opencode sync manifest identity mismatch")
+	}
+
+	if snapshot.Session.Env == nil {
+		return fmt.Errorf("opencode sync manifest is missing env")
+	}
+
+	if _, err := sessionEnvFromMeta(snapshot.Session.Env); err != nil {
+		return fmt.Errorf("opencode sync manifest env: %w", err)
 	}
 
 	if snapshot.Session.ExtraPathDirs == nil {
@@ -898,6 +903,17 @@ func scanSyncBundle(bundle []byte, needles []string) error {
 	}
 
 	return nil
+}
+
+func scanStateSnapshot(snapshot stateSnapshot, needles []string) error {
+	snapshot.Session.Env = nil
+
+	bundle, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+
+	return scanSyncBundle(bundle, needles)
 }
 
 func newRestoreGeneration() (string, error) {

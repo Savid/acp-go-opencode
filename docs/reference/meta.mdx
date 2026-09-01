@@ -72,9 +72,8 @@ session rather than on the shared `opencode serve` process. Concurrent sessions
 may therefore hold distinct environments and ordered directory lists without
 sharing them or restarting the server. Both are stored with the logical session
 and follow load, resume, recovery, and fork; supplying a half while restoring a
-session replaces the stored half outright. The durable snapshot records
-`extraPathDirs` only, so a reloaded session receives its environment from the
-reloading request rather than from stored bearer material.
+session replaces the stored half outright, including with an empty value. A
+request that omits a half restores it from the durable session record.
 
 A relative, empty, or path-list `extraPathDirs` entry is rejected before a
 native session is created. Inside `options.env`, a non-string value, an empty
