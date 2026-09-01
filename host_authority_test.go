@@ -96,6 +96,10 @@ func (a *authorityTrace) PrepareNativeTree(_ context.Context, path string) error
 	return nil
 }
 
+func (*authorityTrace) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
+	return nil, nil
+}
+
 func (a *authorityTrace) ReclaimNativeTree(_ context.Context, path string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -502,6 +506,9 @@ func (*fixedProcessAuthority) NativeEnvironment() map[string]string {
 }
 func (*fixedProcessAuthority) PrepareNativeTree(context.Context, string) error {
 	return nil
+}
+func (*fixedProcessAuthority) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
+	return nil, nil
 }
 func (*fixedProcessAuthority) ReclaimNativeTree(context.Context, string) error {
 	return nil
@@ -954,6 +961,7 @@ func indexOfAuthorityEvent(events []string, target string) int {
 type edgeAuthority struct {
 	environment func() map[string]string
 	prepare     func(context.Context, string) error
+	read        func(context.Context, string, uint64) ([][]byte, error)
 	reclaim     func(context.Context, string) error
 	start       func(context.Context, NativeRequest) (NativeProcess, error)
 }
@@ -965,6 +973,13 @@ func (a edgeAuthority) PrepareNativeTree(ctx context.Context, path string) error
 	}
 
 	return a.prepare(ctx, path)
+}
+func (a edgeAuthority) ReadNativeAppendLog(ctx context.Context, path string, offset uint64) ([][]byte, error) {
+	if a.read == nil {
+		return nil, nil
+	}
+
+	return a.read(ctx, path, offset)
 }
 func (a edgeAuthority) ReclaimNativeTree(ctx context.Context, path string) error {
 	if a.reclaim == nil {
