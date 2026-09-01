@@ -1,11 +1,13 @@
 package opencodeacp
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
@@ -148,5 +150,70 @@ func TestWriteRestoreOwnershipEveryInjectedFilesystemFailure(t *testing.T) {
 		client := newFakeOpenCodeClient()
 		restoreOpen = func(string) (*os.File, error) { return nil, errors.New("open failed") }
 		require.ErrorContains(t, writeRestoreOwnership(client, registry), "open failed")
+	})
+}
+func TestActiveReplacementAndArtifactLoadEdges(t *testing.T) {
+	t.Run("zero replacement timeout takes the default", func(t *testing.T) {
+		cwd := t.TempDir()
+		store := NewInMemorySessionStore()
+		client := newFakeOpenCodeClient()
+		agent := NewAgent(WithSessionStore(store))
+		agent.sessionReplacementTimeout = 0
+		current := testSession(t, agent, client)
+		current.cwd = cwd
+		current.carrier = newSessionCarrier(map[string]string{"COLOR": "old"}, nil)
+		require.NoError(t, current.snapshotToStore(t.Context()))
+		client.closeErr = errors.Join(errors.New("still live"), ErrContainmentIncomplete)
+
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(current.id, cwd,
+			WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{"COLOR": "new"}))),
+		))
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
+	})
+
+	t.Run("replacement detects a changed active mapping", func(t *testing.T) {
+		cwd := t.TempDir()
+		store := NewInMemorySessionStore()
+		client := newFakeOpenCodeClient()
+		agent := NewAgent(WithSessionStore(store))
+		current := testSession(t, agent, client)
+		current.cwd = cwd
+		current.carrier = newSessionCarrier(map[string]string{"COLOR": "old"}, nil)
+		require.NoError(t, current.snapshotToStore(t.Context()))
+		replacement := &session{id: current.id}
+		client.closeHook = func() {
+			agent.mu.Lock()
+			agent.sessions[current.id] = replacement
+			agent.mu.Unlock()
+		}
+
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(current.id, cwd,
+			WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{"COLOR": "new"}))),
+		))
+		require.ErrorContains(t, err, "changed during replacement")
+	})
+
+	t.Run("missing image artifact blocks hydration", func(t *testing.T) {
+		cwd := t.TempDir()
+		snapshot := validSyncSnapshot("session", "native", cwd)
+		snapshot.Events["native"] = append(snapshot.Events["native"], opencode.SyncEvent{
+			ID: "part", AggregateID: "native", Sequence: 1, Type: syncTypeMessagePartUpdated,
+			Data: map[string]json.RawMessage{
+				syncFieldSessionID: json.RawMessage(`"native"`),
+				syncFieldPart: json.RawMessage(
+					`{"url":"` + imageArtifactReferenceScheme + `missing"}`,
+				),
+				jsonFieldTime: json.RawMessage(`1`),
+			},
+		})
+		entry, err := json.Marshal(snapshot)
+		require.NoError(t, err)
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+			Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{entry},
+		}}))
+		agent := NewAgent(WithSessionStore(store))
+		_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("session", cwd))
+		require.ErrorContains(t, err, outputReasonStorageFailed)
 	})
 }

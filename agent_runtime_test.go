@@ -621,3 +621,136 @@ func TestReadySharedRuntimeSessionReleaseGate(t *testing.T) {
 	t.Logf("ready-session deterministic adapter gate: repetitions=%d p95=%s", repetitions, p95)
 	require.Less(t, p95, 500*time.Millisecond)
 }
+
+type shutdownHookClient struct {
+	*fakeOpenCodeClient
+	shutdown func(context.Context) error
+}
+
+func (c *shutdownHookClient) Shutdown(ctx context.Context) error { return c.shutdown(ctx) }
+
+type revokedRuntimeClient struct{ *fakeOpenCodeClient }
+
+func (*revokedRuntimeClient) RuntimeRevoked() bool { return true }
+
+func TestSharedRuntimeCoordinationEdges(t *testing.T) {
+	internalContainment := errors.Join(errors.New("wait incomplete"), opencode.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, classifyRuntimeContainment(internalContainment), ErrContainmentIncomplete)
+	alreadyClassified := errors.Join(internalContainment, ErrContainmentIncomplete)
+	require.True(t, classifyRuntimeContainment(alreadyClassified) == alreadyClassified)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, classifyRuntimeShutdown(cancelled, context.Canceled), opencode.ErrProcessContainmentIncomplete)
+	require.False(t, retryableRuntimeCleanup(errors.Join(internalContainment, ErrHostAuthorityUnavailable)))
+
+	revoked := &revokedRuntimeClient{fakeOpenCodeClient: newFakeOpenCodeClient()}
+	agent := NewAgent()
+	agent.runtime = revoked
+	agent.runtimeGeneration = 1
+	agent.handleSharedRuntimeExit(revoked, 1)
+
+	retirement := &runtimeRetirement{runtime: newFakeOpenCodeClient()}
+	require.NoError(t, agent.retryRuntimeCleanup(t.Context(), retirement))
+
+	changedAgent := NewAgent()
+	changedRetirement := &runtimeRetirement{}
+	changedRetirement.runtime = &shutdownHookClient{
+		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		shutdown: func(context.Context) error {
+			changedAgent.mu.Lock()
+			changedAgent.runtimeSequencing = nil
+			changedAgent.mu.Unlock()
+
+			return errors.New("shutdown refused")
+		},
+	}
+	changedAgent.runtimeSequencing = changedRetirement
+	require.ErrorContains(t, changedAgent.retryRuntimeCleanup(t.Context(), changedRetirement), "shutdown refused")
+
+	fatalAgent := NewAgent()
+	fatalClient := newFakeOpenCodeClient()
+	fatalClient.closeErr = ErrContainmentIncomplete
+	fatalRetirement := &runtimeRetirement{runtime: fatalClient}
+	fatalAgent.runtimeSequencing = fatalRetirement
+	require.ErrorIs(t, fatalAgent.retryRuntimeCleanup(t.Context(), fatalRetirement), ErrContainmentIncomplete)
+	require.ErrorIs(t, fatalAgent.runtimeFatalErr, ErrContainmentIncomplete)
+	require.Nil(t, fatalAgent.runtimeSequencing)
+
+	closeAgent := NewAgent()
+	closeAgent.runtimeSequencing = &runtimeRetirement{runtime: newFakeOpenCodeClient()}
+	require.NoError(t, closeAgent.Close())
+
+	retained := NewAgent()
+	cleanup := func() error { return nil }
+	retained.retainNativeTree("tree", false, cleanup)
+	retained.retainNativeTree("tree", true, nil)
+	require.True(t, retained.retiredNativeTrees["tree"].reclaimed)
+	require.NotNil(t, retained.retiredNativeTrees["tree"].cleanup)
+	zeroRetained := &Agent{}
+	zeroRetained.retainNativeTree("tree", false, nil)
+	require.Contains(t, zeroRetained.retiredNativeTrees, "tree")
+
+	panicAuthority := edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		reclaim:     func(context.Context, string) error { panic("reclaim") },
+	}
+	require.ErrorIs(t, reclaimManagedNativeTree(t.Context(), panicAuthority, "tree"), ErrHostAuthorityUnavailable)
+
+	cleanupAgent := NewAgent()
+	cleanupAgent.retiredNativeTrees["tree"] = retiredNativeTree{
+		reclaimed: true,
+		cleanup:   func() error { return errors.New("cleanup refused") },
+	}
+	require.ErrorIs(t, cleanupAgent.retryRetiredNativeTrees(t.Context()), opencode.ErrRuntimeScratchCleanup)
+}
+
+func TestSharedRuntimeConstructionEdges(t *testing.T) {
+	badEnvironment := NewAgent()
+	badEnvironment.options.hostAuthorityConfigured = true
+	badEnvironment.options.HostAuthority = edgeAuthority{
+		environment: func() map[string]string { return nil },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return nil, errors.New("unexpected start")
+		},
+	}
+	_, err := badEnvironment.startSharedRuntime(t.Context())
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+
+	file := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+	badRoot := NewAgent(WithScratchDir(filepath.Join(file, "child")))
+	_, err = badRoot.startSharedRuntime(t.Context())
+	require.ErrorContains(t, err, "create scratch parent")
+
+	readOnlyScratch := t.TempDir()
+	require.NoError(t, os.Chmod(readOnlyScratch, 0o500))
+	t.Cleanup(func() { require.NoError(t, os.Chmod(readOnlyScratch, 0o700)) })
+	_, _, err = (&Agent{options: Options{ScratchDir: readOnlyScratch}}).newRuntimeRoot()
+	require.ErrorContains(t, err, "create OpenCode runtime root")
+
+	generatedRoot, generated, err := (&Agent{options: Options{ScratchDir: t.TempDir()}}).newRuntimeRoot()
+	require.NoError(t, err)
+	require.True(t, generated)
+	info, err := os.Stat(generatedRoot)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+
+	authority := edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		prepare:     func(context.Context, string) error { panic("prepare") },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return nil, errors.New("unexpected start")
+		},
+	}
+	prepareAgent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
+	var startOptions opencode.StartOptions
+	prepareAgent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		startOptions = options
+
+		return newFakeOpenCodeClient(), nil
+	}
+	runtime, err := prepareAgent.startSharedRuntime(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, runtime)
+	require.ErrorIs(t, startOptions.PrepareTree(t.Context(), t.TempDir()), ErrHostAuthorityUnavailable)
+}

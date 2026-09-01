@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
+	"github.com/stretchr/testify/require"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
@@ -73,4 +76,24 @@ func TestWithHostAuthorityMarksTheManagedBoundary(t *testing.T) {
 	if !options.hostAuthorityConfigured || options.HostAuthority != authority {
 		t.Fatal("WithHostAuthority did not retain the authority boundary")
 	}
+}
+func TestRuntimeOptionAndScratchEdges(t *testing.T) {
+	require.Error(t, validateRuntimeOptions(Options{Env: map[string]string{"home": "/reserved"}}))
+	require.Error(t, validateRuntimeOptions(Options{Home: "relative"}))
+	require.Error(t, validateRuntimeOptions(Options{hostAuthorityConfigured: true}))
+	require.Error(t, validateDurableHomePath("/tmp/control\npath"))
+	require.True(t, reservedOpenCodeEnvKey(privateAdapterEnvPrefix+"TOKEN"))
+	require.True(t, adapterPrivateEnvKey(privateAdapterEnvPrefix+"TOKEN"))
+
+	homeAgent := &Agent{options: Options{Home: "/durable/home"}}
+	root, generated, err := homeAgent.newRuntimeRoot()
+	require.NoError(t, err)
+	require.Equal(t, "/durable/home", root)
+	require.False(t, generated)
+
+	file := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+	broken := &Agent{options: Options{ScratchDir: filepath.Join(file, "child")}}
+	_, _, err = broken.newRuntimeRoot()
+	require.ErrorContains(t, err, "create scratch parent")
 }

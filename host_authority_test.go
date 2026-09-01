@@ -950,3 +950,150 @@ func indexOfAuthorityEvent(events []string, target string) int {
 
 	return -1
 }
+
+type edgeAuthority struct {
+	environment func() map[string]string
+	prepare     func(context.Context, string) error
+	reclaim     func(context.Context, string) error
+	start       func(context.Context, NativeRequest) (NativeProcess, error)
+}
+
+func (a edgeAuthority) NativeEnvironment() map[string]string { return a.environment() }
+func (a edgeAuthority) PrepareNativeTree(ctx context.Context, path string) error {
+	if a.prepare == nil {
+		return nil
+	}
+
+	return a.prepare(ctx, path)
+}
+func (a edgeAuthority) ReclaimNativeTree(ctx context.Context, path string) error {
+	if a.reclaim == nil {
+		return nil
+	}
+
+	return a.reclaim(ctx, path)
+}
+func (a edgeAuthority) StartNative(ctx context.Context, request NativeRequest) (NativeProcess, error) {
+	return a.start(ctx, request)
+}
+
+type edgeNativeProcess struct {
+	stdin  func() io.WriteCloser
+	stdout func() io.ReadCloser
+	stderr func() io.ReadCloser
+	wait   func(context.Context) (NativeResult, error)
+	revoke func(context.Context) error
+}
+
+func (p edgeNativeProcess) Stdin() io.WriteCloser { return p.stdin() }
+func (p edgeNativeProcess) Stdout() io.ReadCloser { return p.stdout() }
+func (p edgeNativeProcess) Stderr() io.ReadCloser { return p.stderr() }
+func (p edgeNativeProcess) Wait(ctx context.Context) (NativeResult, error) {
+	return p.wait(ctx)
+}
+func (p edgeNativeProcess) Revoke(ctx context.Context) error { return p.revoke(ctx) }
+
+func usableEdgeNativeProcess() edgeNativeProcess {
+	return edgeNativeProcess{
+		stdin:  func() io.WriteCloser { return nopWriteCloser{Writer: io.Discard} },
+		stdout: func() io.ReadCloser { return io.NopCloser(&emptyReader{}) },
+		stderr: func() io.ReadCloser { return io.NopCloser(&emptyReader{}) },
+		wait:   func(context.Context) (NativeResult, error) { return NativeResult{}, nil },
+		revoke: func(context.Context) error { return nil },
+	}
+}
+
+func TestNativeAuthorityDefensiveEdges(t *testing.T) {
+	_, err := hostAuthorityEnvironment(edgeAuthority{environment: func() map[string]string { panic("environment") }})
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+	_, err = hostAuthorityEnvironment(edgeAuthority{environment: func() map[string]string { return nil }})
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+	_, err = hostAuthorityEnvironment(edgeAuthority{environment: func() map[string]string {
+		return map[string]string{"BAD=KEY": "value"}
+	}})
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+
+	startPanic := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start:       func(context.Context, NativeRequest) (NativeProcess, error) { panic("start") },
+	})
+	_, err = startPanic(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+
+	startErr := errors.New("start refused")
+	refusing := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return nil, startErr
+		},
+	})
+	_, err = refusing(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorIs(t, err, startErr)
+
+	var typedNil *edgeNativeProcess
+	typedNilStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return typedNil, nil
+		},
+	})
+	_, err = typedNilStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+
+	stdioPanicProcess := usableEdgeNativeProcess()
+	stdioPanicProcess.stdin = func() io.WriteCloser { panic("stdin") }
+	stdioPanicStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return stdioPanicProcess, nil
+		},
+	})
+	_, err = stdioPanicStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+
+	missingStdioProcess := usableEdgeNativeProcess()
+	missingStdioProcess.stderr = func() io.ReadCloser { return nil }
+	missingStdioStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return missingStdioProcess, nil
+		},
+	})
+	_, err = missingStdioStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorContains(t, err, "unusable host stdio")
+
+	waitPanicProcess := usableEdgeNativeProcess()
+	waitPanicProcess.wait = func(context.Context) (NativeResult, error) { panic("wait") }
+	waitPanicStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return waitPanicProcess, nil
+		},
+	})
+	handle, err := waitPanicStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.NoError(t, err)
+	_, err = handle.Await(t.Context())
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+
+	stopPanicProcess := usableEdgeNativeProcess()
+	stopPanicProcess.revoke = func(context.Context) error { panic("revoke") }
+	stopPanicStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return stopPanicProcess, nil
+		},
+	})
+	handle, err = stopPanicStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.NoError(t, err)
+	require.ErrorIs(t, handle.Stop(t.Context()), ErrHostAuthorityUnavailable)
+
+	settleRevokePanic := usableEdgeNativeProcess()
+	settleRevokePanic.revoke = func(context.Context) error { panic("revoke") }
+	require.ErrorIs(t, settleUnusableNativeProcess(settleRevokePanic), ErrHostAuthorityUnavailable)
+	settleWaitPanic := usableEdgeNativeProcess()
+	settleWaitPanic.wait = func(context.Context) (NativeResult, error) { panic("wait") }
+	require.ErrorIs(t, settleUnusableNativeProcess(settleWaitPanic), ErrHostAuthorityUnavailable)
+	require.True(t, nativeProcessNil(nil))
+	require.False(t, nativeProcessNil(usableEdgeNativeProcess()))
+}

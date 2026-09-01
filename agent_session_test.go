@@ -2346,3 +2346,23 @@ func TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes(t *testing.T) {
 		require.ErrorContains(t, err, "disconnect failed")
 	})
 }
+func TestAgentStoreAndActiveLoadMatchEdges(t *testing.T) {
+	agent := NewAgent()
+	id := acp.SessionId("deleted")
+	agent.deleted[id] = struct{}{}
+	require.Error(t, agent.storeStartedSession(&session{id: id}))
+
+	active := &session{
+		cwd: "/cwd", providerID: "provider", modelID: "model", mode: "build", permission: "ask",
+		outputSchema: map[string]any{"type": "object"}, carrier: sessionCarrier{},
+	}
+	snapshot := active.snapshot()
+	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
+		sessionMeta{Model: "other/model"}, sessionCarrier{}))
+	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
+		sessionMeta{Mode: "plan"}, sessionCarrier{}))
+	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
+		sessionMeta{PermissionSet: true, Permission: "allow"}, sessionCarrier{}))
+	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
+		sessionMeta{OutputSchema: map[string]any{"type": "array"}}, sessionCarrier{}))
+}

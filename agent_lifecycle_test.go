@@ -3,7 +3,9 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/lifecycle"
@@ -507,4 +509,70 @@ func requireUnsupportedField(t *testing.T, err error, field string) {
 		jsonFieldError: errValueUnsupported,
 		jsonFieldField: field,
 	}).Error(), reqErr.Error())
+}
+
+type cancelAfterFirstErrContext struct {
+	context.Context //nolint:containedctx // Test context stages the gate's post-admission cancellation recheck.
+	calls           atomic.Int32
+	done            <-chan struct{}
+}
+
+func (c *cancelAfterFirstErrContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterFirstErrContext) Done() <-chan struct{}       { return c.done }
+func (c *cancelAfterFirstErrContext) Err() error {
+	if c.calls.Add(1) > 1 {
+		return context.Canceled
+	}
+
+	return nil
+}
+func TestRecoveryAndLifecycleAdmissionEdges(t *testing.T) {
+	done := make(chan struct{})
+	ctx := &cancelAfterFirstErrContext{Context: t.Context(), done: done}
+	var gate sessionRecoveryGate
+	require.ErrorIs(t, gate.lock(ctx), context.Canceled)
+	require.NoError(t, gate.lock(t.Context()), "cancelled post-admission check must return the permit")
+	gate.unlock()
+
+	agent := NewAgent()
+	id := acp.SessionId("session")
+	flight := &sessionLifecycleFlight{done: make(chan struct{})}
+	fence := make(chan struct{})
+	close(fence)
+	agent.lifecycleFence = fence
+	agent.lifecycleFlights = make(map[acp.SessionId]*sessionLifecycleFlight)
+	agent.lifecycleFlights[id] = flight
+	_, err := agent.acquireSessionLifecycle(t.Context(), id)
+	require.Error(t, err)
+	agent.releaseSessionLifecycle(id, &sessionLifecycleFlight{})
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = agent.LoadSession(cancelled, acp.LoadSessionRequest{SessionId: id})
+	require.ErrorIs(t, err, context.Canceled)
+}
+func TestLifecycleCancellationEdges(t *testing.T) {
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	current := &session{}
+	require.ErrorIs(t, current.ensureRuntime(cancelled), context.Canceled)
+	require.ErrorIs(t, current.refreshLifecycleMCP(cancelled), context.Canceled)
+	require.Panics(t, func() { new(sessionRecoveryGate).unlock() })
+
+	done := make(chan struct{})
+	close(done)
+	ctx := &cancelAfterFirstErrContext{Context: t.Context(), done: done}
+	agent := NewAgent()
+	id := acp.SessionId("busy")
+	agent.lifecycleFlights = make(map[acp.SessionId]*sessionLifecycleFlight)
+	agent.lifecycleFlights[id] = &sessionLifecycleFlight{done: make(chan struct{})}
+	_, err := agent.acquireSessionLifecycle(ctx, id)
+	require.ErrorIs(t, err, context.Canceled)
+
+	fenced := NewAgent()
+	fenced.lifecycleFenced = true
+	_, err = fenced.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: id})
+	require.Error(t, err)
+	_, err = fenced.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: id})
+	require.Error(t, err)
 }

@@ -1,6 +1,7 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -1011,4 +1012,113 @@ func TestStateCaptureWaitHonoursDelayAndCancellation(t *testing.T) {
 	cancel()
 
 	require.ErrorIs(t, stateCaptureWait(ctx, time.Hour), context.Canceled)
+}
+func TestStateSnapshotDecoderReachableEdges(t *testing.T) {
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	var original map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &original))
+	encode := func(t *testing.T, mutate func(map[string]any)) []byte {
+		t.Helper()
+		candidate := cloneJSONMap(t, original)
+		mutate(candidate)
+		raw, marshalErr := json.Marshal(candidate)
+		require.NoError(t, marshalErr)
+
+		return raw
+	}
+
+	for name, raw := range map[string][]byte{
+		"typed unmarshal": encode(t, func(value map[string]any) {
+			value[snapshotFieldCapturedAtUnixMilli] = "not-an-integer"
+		}),
+		"environment object": encode(t, func(value map[string]any) {
+			session, ok := value[snapshotFieldSession].(map[string]any)
+			require.True(t, ok)
+			session[snapshotFieldEnv] = []any{}
+		}),
+		"graph array": encode(t, func(value map[string]any) {
+			value[snapshotFieldGraph] = map[string]any{}
+		}),
+		"events object": encode(t, func(value map[string]any) {
+			value[jsonFieldEvents] = []any{}
+		}),
+		"aggregate array": encode(t, func(value map[string]any) {
+			events, ok := value[jsonFieldEvents].(map[string]any)
+			require.True(t, ok)
+			events["native"] = map[string]any{}
+		}),
+		"event data object": encode(t, func(value map[string]any) {
+			events, ok := value[jsonFieldEvents].(map[string]any)
+			require.True(t, ok)
+			aggregate, ok := events["native"].([]any)
+			require.True(t, ok)
+			event, ok := aggregate[0].(map[string]any)
+			require.True(t, ok)
+			event[jsonFieldData] = []any{}
+		}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, decodeErr := decodeStateSnapshot(raw)
+			require.Error(t, decodeErr)
+		})
+	}
+
+	require.Error(t, rejectDuplicateJSONFields([]byte(`[] {`)))
+	require.Error(t, rejectDuplicateJSONFields([]byte(`{"x":1,"x":2}`)))
+	require.Error(t, rejectDuplicateJSONFields([]byte(`{"x":1]`)))
+	require.Error(t, rejectDuplicateJSONFields([]byte(`[1}`)))
+	require.NoError(t, rejectDuplicateJSONFields([]byte(`{"x":[{"y":1}]}`)))
+	require.Error(t, scanUniqueJSONValue(json.NewDecoder(bytes.NewReader(nil)), "empty"))
+	require.Error(t, scanUniqueJSONValue(json.NewDecoder(bytes.NewReader([]byte(`[1`))), "array"))
+	_, err = exactJSONObject([]byte(`{`), "invalid", nil, nil)
+	require.Error(t, err)
+	_, err = exactJSONObject([]byte(`null`), "null", nil, nil)
+	require.Error(t, err)
+}
+
+func TestStateStoreValidationReachableEdges(t *testing.T) {
+	node := stateSnapshotNode{SessionID: "session", NativeSessionID: "native", SourceCwd: "/source"}
+	partEvent := opencode.SyncEvent{
+		ID: "part", AggregateID: "native", Type: syncTypeMessagePartUpdated,
+		Data: map[string]json.RawMessage{
+			syncFieldSessionID: json.RawMessage(`"native"`),
+			syncFieldPart:      json.RawMessage(`{}`),
+			jsonFieldTime:      json.RawMessage(`{`),
+		},
+	}
+	require.Error(t, validateSyncEvent(partEvent, node))
+	partEvent.Data[jsonFieldTime] = json.RawMessage(`"one"`)
+	require.Error(t, validateSyncEvent(partEvent, node))
+	partEvent.Data[jsonFieldTime] = json.RawMessage(`1e10000`)
+	require.Error(t, validateSyncEvent(partEvent, node))
+
+	invalid := validSyncSnapshot("session", "native", "/source")
+	invalid.Format = "unsupported"
+	entry, err := json.Marshal(invalid)
+	require.NoError(t, err)
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{entry},
+	}}))
+	_, _, found, err := hydrateStateFromStore(t.Context(), store, "session")
+	require.Error(t, err)
+	require.False(t, found)
+
+	badMarshal := validSyncSnapshot("session", "native", "/source")
+	badMarshal.Events["native"][0].Data[syncFieldInfo] = json.RawMessage(`{`)
+	require.Error(t, scanStateSnapshot(badMarshal, nil))
+
+	terminal := terminalTestSnapshot(t,
+		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", int64Pointer(100)),
+	)
+	terminal = mutateTerminalTestSnapshot(t, terminal, func(value *stateSnapshot) {
+		value.Events["native"][1].Data[syncFieldInfo] = json.RawMessage(
+			`{"id":[],"sessionID":"native","role":"assistant","finish":"stop"}`,
+		)
+	})
+	_, err = InspectSessionStoreTerminalState("session", []SessionStoreEntry{terminal})
+	require.ErrorContains(t, err, "decode OpenCode message event")
 }

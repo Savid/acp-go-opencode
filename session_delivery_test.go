@@ -406,3 +406,21 @@ func TestCorrectionAuxiliaryDeliveryAndAuthBranches(t *testing.T) {
 	cancelQueue()
 	require.ErrorIs(t, droppedRaw.enqueueRaw(cancelled, map[string]any{"overflow": true}), context.Canceled)
 }
+func TestDeliveryCancellationEdges(t *testing.T) {
+	stoppedBeforeSend := newSessionDelivery(nil, "raw-before")
+	stoppedBeforeSend.started = true
+	stoppedBeforeSend.raw = make(chan rawDelivery)
+	close(stoppedBeforeSend.rawDone)
+	require.ErrorContains(t, stoppedBeforeSend.enqueueRaw(t.Context(), map[string]any{}), "stopped")
+
+	stoppedAfterSend := newSessionDelivery(nil, "raw-after")
+	stoppedAfterSend.started = true
+	received := make(chan struct{})
+	go func() {
+		<-stoppedAfterSend.raw
+		close(stoppedAfterSend.rawDone)
+		close(received)
+	}()
+	require.ErrorContains(t, stoppedAfterSend.enqueueRaw(t.Context(), map[string]any{}), "stopped")
+	<-received
+}
