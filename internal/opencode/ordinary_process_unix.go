@@ -31,7 +31,10 @@ func containOrdinaryProcess(command *exec.Cmd) error {
 		return nil
 	}
 
-	err := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	return normalizeContainOrdinaryProcessError(syscall.Kill(-command.Process.Pid, syscall.SIGKILL))
+}
+
+func normalizeContainOrdinaryProcessError(err error) error {
 	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}

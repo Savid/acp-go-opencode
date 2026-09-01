@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -27,23 +28,15 @@ func startOrdinaryProcess(
 	command.Dir = workingDirectory
 	configureOrdinaryProcess(command)
 
-	stdin, err := command.StdinPipe()
-	if err != nil {
-		return ProcessHandle{}, fmt.Errorf("open native stdin: %w", err)
+	stdin, stdout, stderr, err := ordinaryProcessPipes(command)
+	if err == nil {
+		if startErr := command.Start(); startErr != nil {
+			err = fmt.Errorf("start native process: %w", startErr)
+		}
 	}
 
-	stdout, err := command.StdoutPipe()
 	if err != nil {
-		return ProcessHandle{}, fmt.Errorf("open native stdout: %w", err)
-	}
-
-	stderr, err := command.StderrPipe()
-	if err != nil {
-		return ProcessHandle{}, fmt.Errorf("open native stderr: %w", err)
-	}
-
-	if err := command.Start(); err != nil {
-		return ProcessHandle{}, fmt.Errorf("start native process: %w", err)
+		return ProcessHandle{}, err
 	}
 
 	var (
@@ -87,6 +80,30 @@ func startOrdinaryProcess(
 			return errors.Join(err, ctx.Err())
 		},
 	}, nil
+}
+
+func ordinaryProcessPipes(command *exec.Cmd) (io.WriteCloser, io.ReadCloser, io.ReadCloser, error) {
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open native stdin: %w", err)
+	}
+
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+
+		return nil, nil, nil, fmt.Errorf("open native stdout: %w", err)
+	}
+
+	stderr, err := command.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+
+		return nil, nil, nil, fmt.Errorf("open native stderr: %w", err)
+	}
+
+	return stdin, stdout, stderr, nil
 }
 
 func normalizeOrdinaryWaitError(err error) error {

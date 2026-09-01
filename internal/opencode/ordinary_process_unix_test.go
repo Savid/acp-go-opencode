@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -82,6 +84,62 @@ func TestOrdinaryProcessPlatformHelperEdges(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, stopped)
 	require.NoError(t, containOrdinaryProcess(finished))
+
+	want := errors.New("contain failed")
+	require.NoError(t, normalizeContainOrdinaryProcessError(nil))
+	require.NoError(t, normalizeContainOrdinaryProcessError(syscall.ESRCH))
+	require.ErrorIs(t, normalizeContainOrdinaryProcessError(want), want)
+}
+
+func TestOrdinaryProcessPipeAllocationEdges(t *testing.T) {
+	t.Run("stdin refusal", func(t *testing.T) {
+		command := exec.Command("/bin/sh")
+		command.Stdin = strings.NewReader("configured")
+		stdin, stdout, stderr, err := ordinaryProcessPipes(command)
+		require.ErrorContains(t, err, "open native stdin")
+		require.Nil(t, stdin)
+		require.Nil(t, stdout)
+		require.Nil(t, stderr)
+	})
+
+	t.Run("stdout refusal closes stdin", func(t *testing.T) {
+		command := exec.Command("/bin/sh")
+		command.Stdout = io.Discard
+		stdin, stdout, stderr, err := ordinaryProcessPipes(command)
+		require.ErrorContains(t, err, "open native stdout")
+		require.Nil(t, stdin)
+		require.Nil(t, stdout)
+		require.Nil(t, stderr)
+		buffer := make([]byte, 1)
+		count, readErr := command.Stdin.Read(buffer)
+		require.Zero(t, count)
+		require.ErrorIs(t, readErr, io.EOF)
+	})
+
+	t.Run("stderr refusal closes stdin and stdout", func(t *testing.T) {
+		command := exec.Command("/bin/sh")
+		command.Stderr = io.Discard
+		stdin, stdout, stderr, err := ordinaryProcessPipes(command)
+		require.ErrorContains(t, err, "open native stderr")
+		require.Nil(t, stdin)
+		require.Nil(t, stdout)
+		require.Nil(t, stderr)
+		buffer := make([]byte, 1)
+		count, readErr := command.Stdin.Read(buffer)
+		require.Zero(t, count)
+		require.ErrorIs(t, readErr, io.EOF)
+		count, writeErr := command.Stdout.Write([]byte("closed"))
+		require.Zero(t, count)
+		require.Error(t, writeErr)
+	})
+
+	t.Run("success returns owned pipes", func(t *testing.T) {
+		stdin, stdout, stderr, err := ordinaryProcessPipes(exec.Command("/bin/sh"))
+		require.NoError(t, err)
+		require.NoError(t, stdin.Close())
+		require.NoError(t, stdout.Close())
+		require.NoError(t, stderr.Close())
+	})
 }
 
 func TestOrdinaryProcessReportsNaturalAndRevokedResults(t *testing.T) {
