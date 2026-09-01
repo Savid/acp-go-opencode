@@ -146,6 +146,12 @@ func TestSessionCarrierBrokerRejectsUnsupportedRequests(t *testing.T) {
 	response = httptest.NewRecorder()
 	broker.serveHTTP(response, request)
 	require.Equal(t, http.StatusNotFound, response.Code)
+
+	request = httptest.NewRequest(http.MethodGet, "/ready", http.NoBody)
+	request.Header.Set("Authorization", "Bearer "+broker.token)
+	response = httptest.NewRecorder()
+	broker.serveHTTP(response, request)
+	require.Equal(t, http.StatusMethodNotAllowed, response.Code)
 }
 
 func TestSessionCarrierBrokerStopsOnResponseWriteFailure(t *testing.T) {
