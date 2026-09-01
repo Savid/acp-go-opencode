@@ -2,6 +2,8 @@ package opencodeacp
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,4 +98,311 @@ func TestAgentStoreAndActiveLoadMatchEdges(t *testing.T) {
 		sessionMeta{PermissionSet: true, Permission: "allow"}, sessionCarrier{}))
 	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
 		sessionMeta{OutputSchema: map[string]any{"type": "array"}}, sessionCarrier{}))
+}
+
+type edgeAuthority struct {
+	environment func() map[string]string
+	prepare     func(context.Context, string) error
+	reclaim     func(context.Context, string) error
+	start       func(context.Context, NativeRequest) (NativeProcess, error)
+}
+
+func (a edgeAuthority) NativeEnvironment() map[string]string { return a.environment() }
+func (a edgeAuthority) PrepareNativeTree(ctx context.Context, path string) error {
+	if a.prepare == nil {
+		return nil
+	}
+
+	return a.prepare(ctx, path)
+}
+func (a edgeAuthority) ReclaimNativeTree(ctx context.Context, path string) error {
+	if a.reclaim == nil {
+		return nil
+	}
+
+	return a.reclaim(ctx, path)
+}
+func (a edgeAuthority) StartNative(ctx context.Context, request NativeRequest) (NativeProcess, error) {
+	return a.start(ctx, request)
+}
+
+type edgeNativeProcess struct {
+	stdin  func() io.WriteCloser
+	stdout func() io.ReadCloser
+	stderr func() io.ReadCloser
+	wait   func(context.Context) (NativeResult, error)
+	revoke func(context.Context) error
+}
+
+func (p edgeNativeProcess) Stdin() io.WriteCloser { return p.stdin() }
+func (p edgeNativeProcess) Stdout() io.ReadCloser { return p.stdout() }
+func (p edgeNativeProcess) Stderr() io.ReadCloser { return p.stderr() }
+func (p edgeNativeProcess) Wait(ctx context.Context) (NativeResult, error) {
+	return p.wait(ctx)
+}
+func (p edgeNativeProcess) Revoke(ctx context.Context) error { return p.revoke(ctx) }
+
+func usableEdgeNativeProcess() edgeNativeProcess {
+	return edgeNativeProcess{
+		stdin:  func() io.WriteCloser { return nopWriteCloser{Writer: io.Discard} },
+		stdout: func() io.ReadCloser { return io.NopCloser(&emptyReader{}) },
+		stderr: func() io.ReadCloser { return io.NopCloser(&emptyReader{}) },
+		wait:   func(context.Context) (NativeResult, error) { return NativeResult{}, nil },
+		revoke: func(context.Context) error { return nil },
+	}
+}
+
+func TestNativeAuthorityDefensiveEdges(t *testing.T) {
+	_, err := hostAuthorityEnvironment(edgeAuthority{environment: func() map[string]string { panic("environment") }})
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+	_, err = hostAuthorityEnvironment(edgeAuthority{environment: func() map[string]string { return nil }})
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+	_, err = hostAuthorityEnvironment(edgeAuthority{environment: func() map[string]string {
+		return map[string]string{"BAD=KEY": "value"}
+	}})
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+
+	startPanic := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start:       func(context.Context, NativeRequest) (NativeProcess, error) { panic("start") },
+	})
+	_, err = startPanic(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+
+	startErr := errors.New("start refused")
+	refusing := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return nil, startErr
+		},
+	})
+	_, err = refusing(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorIs(t, err, startErr)
+
+	var typedNil *edgeNativeProcess
+	typedNilStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return typedNil, nil
+		},
+	})
+	_, err = typedNilStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+
+	stdioPanicProcess := usableEdgeNativeProcess()
+	stdioPanicProcess.stdin = func() io.WriteCloser { panic("stdin") }
+	stdioPanicStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return stdioPanicProcess, nil
+		},
+	})
+	_, err = stdioPanicStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+
+	missingStdioProcess := usableEdgeNativeProcess()
+	missingStdioProcess.stderr = func() io.ReadCloser { return nil }
+	missingStdioStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return missingStdioProcess, nil
+		},
+	})
+	_, err = missingStdioStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.ErrorContains(t, err, "unusable host stdio")
+
+	waitPanicProcess := usableEdgeNativeProcess()
+	waitPanicProcess.wait = func(context.Context) (NativeResult, error) { panic("wait") }
+	waitPanicStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return waitPanicProcess, nil
+		},
+	})
+	handle, err := waitPanicStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.NoError(t, err)
+	_, err = handle.Await(t.Context())
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+
+	stopPanicProcess := usableEdgeNativeProcess()
+	stopPanicProcess.revoke = func(context.Context) error { panic("revoke") }
+	stopPanicStarter := authorityProcessStarter(edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return stopPanicProcess, nil
+		},
+	})
+	handle, err = stopPanicStarter(t.Context(), "opencode", nil, nil, t.TempDir())
+	require.NoError(t, err)
+	require.ErrorIs(t, handle.Stop(t.Context()), ErrHostAuthorityUnavailable)
+
+	settleRevokePanic := usableEdgeNativeProcess()
+	settleRevokePanic.revoke = func(context.Context) error { panic("revoke") }
+	require.ErrorIs(t, settleUnusableNativeProcess(settleRevokePanic), ErrHostAuthorityUnavailable)
+	settleWaitPanic := usableEdgeNativeProcess()
+	settleWaitPanic.wait = func(context.Context) (NativeResult, error) { panic("wait") }
+	require.ErrorIs(t, settleUnusableNativeProcess(settleWaitPanic), ErrHostAuthorityUnavailable)
+	require.True(t, nativeProcessNil(nil))
+	require.False(t, nativeProcessNil(usableEdgeNativeProcess()))
+}
+
+type shutdownHookClient struct {
+	*fakeOpenCodeClient
+	shutdown func(context.Context) error
+}
+
+func (c *shutdownHookClient) Shutdown(ctx context.Context) error { return c.shutdown(ctx) }
+
+type revokedRuntimeClient struct{ *fakeOpenCodeClient }
+
+func (*revokedRuntimeClient) RuntimeRevoked() bool { return true }
+
+func TestSharedRuntimeCoordinationEdges(t *testing.T) {
+	revoked := &revokedRuntimeClient{fakeOpenCodeClient: newFakeOpenCodeClient()}
+	agent := NewAgent()
+	agent.runtime = revoked
+	agent.runtimeGeneration = 1
+	agent.handleSharedRuntimeExit(revoked, 1)
+
+	retirement := &runtimeRetirement{runtime: newFakeOpenCodeClient()}
+	require.NoError(t, agent.retryRuntimeCleanup(t.Context(), retirement))
+
+	changedAgent := NewAgent()
+	changedRetirement := &runtimeRetirement{}
+	changedRetirement.runtime = &shutdownHookClient{
+		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		shutdown: func(context.Context) error {
+			changedAgent.mu.Lock()
+			changedAgent.runtimeSequencing = nil
+			changedAgent.mu.Unlock()
+
+			return errors.New("shutdown refused")
+		},
+	}
+	changedAgent.runtimeSequencing = changedRetirement
+	require.ErrorContains(t, changedAgent.retryRuntimeCleanup(t.Context(), changedRetirement), "shutdown refused")
+
+	fatalAgent := NewAgent()
+	fatalClient := newFakeOpenCodeClient()
+	fatalClient.closeErr = ErrContainmentIncomplete
+	fatalRetirement := &runtimeRetirement{runtime: fatalClient}
+	fatalAgent.runtimeSequencing = fatalRetirement
+	require.ErrorIs(t, fatalAgent.retryRuntimeCleanup(t.Context(), fatalRetirement), ErrContainmentIncomplete)
+	require.ErrorIs(t, fatalAgent.runtimeFatalErr, ErrContainmentIncomplete)
+	require.Nil(t, fatalAgent.runtimeSequencing)
+
+	closeAgent := NewAgent()
+	closeAgent.runtimeSequencing = &runtimeRetirement{runtime: newFakeOpenCodeClient()}
+	require.NoError(t, closeAgent.Close())
+
+	retained := NewAgent()
+	cleanup := func() error { return nil }
+	retained.retainNativeTree("tree", false, cleanup)
+	retained.retainNativeTree("tree", true, nil)
+	require.True(t, retained.retiredNativeTrees["tree"].reclaimed)
+	require.NotNil(t, retained.retiredNativeTrees["tree"].cleanup)
+	zeroRetained := &Agent{}
+	zeroRetained.retainNativeTree("tree", false, nil)
+	require.Contains(t, zeroRetained.retiredNativeTrees, "tree")
+
+	panicAuthority := edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		reclaim:     func(context.Context, string) error { panic("reclaim") },
+	}
+	require.ErrorIs(t, reclaimManagedNativeTree(t.Context(), panicAuthority, "tree"), ErrHostAuthorityUnavailable)
+
+	cleanupAgent := NewAgent()
+	cleanupAgent.retiredNativeTrees["tree"] = retiredNativeTree{
+		reclaimed: true,
+		cleanup:   func() error { return errors.New("cleanup refused") },
+	}
+	require.ErrorIs(t, cleanupAgent.retryRetiredNativeTrees(t.Context()), opencode.ErrRuntimeScratchCleanup)
+}
+
+func TestSharedRuntimeConstructionEdges(t *testing.T) {
+	badEnvironment := NewAgent()
+	badEnvironment.options.hostAuthorityConfigured = true
+	badEnvironment.options.HostAuthority = edgeAuthority{
+		environment: func() map[string]string { return nil },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return nil, errors.New("unexpected start")
+		},
+	}
+	_, err := badEnvironment.startSharedRuntime(t.Context())
+	require.ErrorIs(t, err, ErrHostAuthorityUnavailable)
+
+	file := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+	badRoot := NewAgent(WithScratchDir(filepath.Join(file, "child")))
+	_, err = badRoot.startSharedRuntime(t.Context())
+	require.ErrorContains(t, err, "create scratch parent")
+
+	readOnlyScratch := t.TempDir()
+	require.NoError(t, os.Chmod(readOnlyScratch, 0o500))
+	t.Cleanup(func() { require.NoError(t, os.Chmod(readOnlyScratch, 0o700)) })
+	_, _, err = (&Agent{options: Options{ScratchDir: readOnlyScratch}}).newRuntimeRoot()
+	require.ErrorContains(t, err, "create OpenCode runtime root")
+
+	authority := edgeAuthority{
+		environment: func() map[string]string { return map[string]string{} },
+		prepare:     func(context.Context, string) error { panic("prepare") },
+		start: func(context.Context, NativeRequest) (NativeProcess, error) {
+			return nil, errors.New("unexpected start")
+		},
+	}
+	prepareAgent := NewAgent(WithHostAuthority(authority), WithScratchDir(t.TempDir()))
+	var startOptions opencode.StartOptions
+	prepareAgent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
+		startOptions = options
+
+		return newFakeOpenCodeClient(), nil
+	}
+	runtime, err := prepareAgent.startSharedRuntime(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, runtime)
+	require.ErrorIs(t, startOptions.PrepareTree(t.Context(), t.TempDir()), ErrHostAuthorityUnavailable)
+}
+
+func TestLifecycleAndDeliveryCancellationEdges(t *testing.T) {
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	current := &session{}
+	require.ErrorIs(t, current.ensureRuntime(cancelled), context.Canceled)
+	require.ErrorIs(t, current.refreshLifecycleMCP(cancelled), context.Canceled)
+	require.Panics(t, func() { new(sessionRecoveryGate).unlock() })
+
+	done := make(chan struct{})
+	close(done)
+	ctx := &cancelAfterFirstErrContext{Context: t.Context(), done: done}
+	agent := NewAgent()
+	id := acp.SessionId("busy")
+	agent.lifecycleFlights = make(map[acp.SessionId]*sessionLifecycleFlight)
+	agent.lifecycleFlights[id] = &sessionLifecycleFlight{done: make(chan struct{})}
+	_, err := agent.acquireSessionLifecycle(ctx, id)
+	require.ErrorIs(t, err, context.Canceled)
+
+	fenced := NewAgent()
+	fenced.lifecycleFenced = true
+	_, err = fenced.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: id})
+	require.Error(t, err)
+	_, err = fenced.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: id})
+	require.Error(t, err)
+
+	stoppedBeforeSend := newSessionDelivery(nil, "raw-before")
+	stoppedBeforeSend.started = true
+	stoppedBeforeSend.raw = make(chan rawDelivery)
+	close(stoppedBeforeSend.rawDone)
+	require.ErrorContains(t, stoppedBeforeSend.enqueueRaw(t.Context(), map[string]any{}), "stopped")
+
+	stoppedAfterSend := newSessionDelivery(nil, "raw-after")
+	stoppedAfterSend.started = true
+	received := make(chan struct{})
+	go func() {
+		<-stoppedAfterSend.raw
+		close(stoppedAfterSend.rawDone)
+		close(received)
+	}()
+	require.ErrorContains(t, stoppedAfterSend.enqueueRaw(t.Context(), map[string]any{}), "stopped")
+	<-received
 }
