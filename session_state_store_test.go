@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,6 +63,47 @@ func TestSyncSnapshotHardRejectsOldAndIncompleteFormats(t *testing.T) {
 	snapshot := validSyncSnapshot("s", "native", "/source")
 	delete(snapshot.Events, "native")
 	require.ErrorContains(t, validateSyncSnapshot("s", snapshot), "incomplete")
+}
+
+func TestHydrateStateSnapshotRejectsAmbiguousJSONAtEveryTypedDepth(t *testing.T) {
+	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot.Session.Model = stateSnapshotModel{ProviderID: "openai", ModelID: "gpt-test", Agent: "build"}
+	snapshot.Session.Env = map[string]string{"SERVICE_TOKEN": "credential"}
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	valid := string(encoded)
+	tests := map[string]string{
+		"unknown top-level field": strings.Replace(valid, `"format":`, `"future":true,"format":`, 1),
+		"unknown session field":   strings.Replace(valid, `"sessionId":`, `"future":true,"sessionId":`, 1),
+		"unknown model field":     strings.Replace(valid, `"providerID":`, `"future":true,"providerID":`, 1),
+		"unknown graph field":     strings.Replace(valid, `"sourceCwd":`, `"future":true,"sourceCwd":`, 1),
+		"unknown event field":     strings.Replace(valid, `"aggregate_id":`, `"future":true,"aggregate_id":`, 1),
+		"case-folded field":       strings.Replace(valid, `"format":`, `"Format":`, 1),
+		"duplicate top-level":     strings.Replace(valid, `"format":`, `"format":"shadow","format":`, 1),
+		"duplicate session":       strings.Replace(valid, `"sessionId":`, `"sessionId":"shadow","sessionId":`, 1),
+		"duplicate model":         strings.Replace(valid, `"providerID":`, `"providerID":"shadow","providerID":`, 1),
+		"duplicate graph":         strings.Replace(valid, `"sourceCwd":`, `"sourceCwd":"/shadow","sourceCwd":`, 1),
+		"duplicate event":         strings.Replace(valid, `"aggregate_id":`, `"aggregate_id":"shadow","aggregate_id":`, 1),
+		"duplicate event data":    strings.Replace(valid, `"sessionID":`, `"sessionID":"shadow","sessionID":`, 1),
+		"duplicate nested data": strings.Replace(valid, `"directory":"/source"`,
+			`"directory":"/shadow","directory":"/source"`, 1),
+		"trailing input": valid + ` {}`,
+	}
+
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := NewInMemorySessionStore()
+			require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+				Key:     SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath},
+				Entries: []SessionStoreEntry{json.RawMessage(raw)},
+			}}))
+
+			_, _, found, err := hydrateStateFromStore(t.Context(), store, "session")
+			require.Error(t, err)
+			require.False(t, found)
+		})
+	}
 }
 
 func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {

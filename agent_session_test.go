@@ -790,6 +790,184 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	require.NoError(t, agent.Close())
 }
 
+func TestActiveLoadResumeReuseAnUnchangedCarrierWithoutConsumingCapacity(t *testing.T) {
+	for _, method := range []struct {
+		name string
+		call func(*Agent, acp.SessionId, string, ...SessionRequestOption) error
+	}{
+		{
+			name: "load with omitted carrier",
+			call: func(agent *Agent, id acp.SessionId, cwd string, options ...SessionRequestOption) error {
+				_, err := agent.LoadSession(t.Context(), LoadSessionRequest(id, cwd, options...))
+
+				return err
+			},
+		},
+		{
+			name: "resume with identical carrier",
+			call: func(agent *Agent, id acp.SessionId, cwd string, options ...SessionRequestOption) error {
+				_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(id, cwd, options...))
+
+				return err
+			},
+		},
+	} {
+		t.Run(method.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			client := newFakeOpenCodeClient()
+			agent := NewAgent(
+				WithSessionStore(NewInMemorySessionStore()),
+				WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+			)
+			current := testSession(t, agent, client)
+			current.cwd = cwd
+			current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{"/same/bin"})
+			require.NoError(t, current.snapshotToStore(t.Context()))
+
+			var options []SessionRequestOption
+			if method.name == "resume with identical carrier" {
+				options = append(options, WithSessionOpenCodeOptions(NewOpenCodeOptions(
+					WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "same"}),
+					WithOpenCodeExtraPathDirs("/same/bin"),
+				)))
+			}
+
+			require.NoError(t, method.call(agent, current.id, cwd, options...))
+
+			agent.mu.Lock()
+			mapped := agent.sessions[current.id]
+			activeCount := len(agent.sessions)
+			agent.mu.Unlock()
+
+			require.Same(t, current, mapped)
+			require.Equal(t, 1, activeCount)
+			require.False(t, client.isClosed(), "reuse contained the binding it was meant to retain")
+			require.Empty(t, client.scopes(), "reuse allocated a second native directory scope")
+		})
+	}
+}
+
+func TestActiveResumeHardCutsChangedCarrierBeforeSuccessorAdmission(t *testing.T) {
+	cwd := t.TempDir()
+	store := NewInMemorySessionStore()
+	predecessorClient := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithSessionStore(store),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+	)
+	predecessor := testSession(t, agent, predecessorClient)
+	predecessor.cwd = cwd
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{"/old/bin"})
+	require.NoError(t, predecessor.snapshotToStore(t.Context()))
+
+	successorClient := newFakeOpenCodeClient()
+	successorClient.getSession = testNativeSession(predecessor.idmap.NativeSessionID)
+	successorClient.scopeFunc = func(opencode.ScopeOptions) error {
+		require.True(t, predecessorClient.isClosed(), "successor overlapped its predecessor")
+
+		return nil
+	}
+	agent.mu.Lock()
+	agent.runtime = successorClient
+	agent.mu.Unlock()
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
+			WithOpenCodeExtraPathDirs("/new/bin"),
+		)),
+	))
+	require.NoError(t, err)
+	require.True(t, predecessorClient.isClosed())
+
+	agent.mu.Lock()
+	successor := agent.sessions[predecessor.id]
+	activeCount := len(agent.sessions)
+	agent.mu.Unlock()
+
+	require.NotNil(t, successor)
+	require.NotSame(t, predecessor, successor)
+	require.Equal(t, 1, activeCount, "replacement leaked an active-session slot")
+	require.True(t, successor.snapshot().carrier.equal(newSessionCarrier(
+		map[string]string{"SESSION_COLOR": "new"}, []string{"/new/bin"},
+	)))
+	require.Len(t, successorClient.scopes(), 1)
+}
+
+func TestActiveResumeRebindsAnUnchangedCarrierAfterRuntimeLoss(t *testing.T) {
+	cwd := t.TempDir()
+	store := NewInMemorySessionStore()
+	predecessorClient := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithSessionStore(store),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+	)
+	current := testSession(t, agent, predecessorClient)
+	current.cwd = cwd
+	current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{"/same/bin"})
+	require.NoError(t, current.snapshotToStore(t.Context()))
+
+	current.detachRuntime(current.runtimeGeneration, errValueSharedRuntimeExited)
+
+	successorClient := newFakeOpenCodeClient()
+	successorClient.getSession = testNativeSession(current.idmap.NativeSessionID)
+	agent.mu.Lock()
+	agent.runtime = successorClient
+	agent.runtimeGeneration++
+	agent.mu.Unlock()
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(current.id, cwd))
+	require.NoError(t, err)
+
+	agent.mu.Lock()
+	mapped := agent.sessions[current.id]
+	activeCount := len(agent.sessions)
+	agent.mu.Unlock()
+
+	require.Same(t, current, mapped)
+	require.Equal(t, 1, activeCount)
+	require.Len(t, successorClient.scopes(), 1)
+	require.True(t, current.snapshot().carrier.equal(newSessionCarrier(
+		map[string]string{"SESSION_COLOR": "same"}, []string{"/same/bin"},
+	)))
+}
+
+func TestActiveResumePublishesNoSuccessorWhenHardCutContainmentFails(t *testing.T) {
+	cwd := t.TempDir()
+	store := NewInMemorySessionStore()
+	predecessorClient := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithSessionStore(store),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+	)
+	predecessor := testSession(t, agent, predecessorClient)
+	predecessor.cwd = cwd
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{"/old/bin"})
+	require.NoError(t, predecessor.snapshotToStore(t.Context()))
+	predecessorClient.closeErr = errors.Join(errors.New("scope still live"), ErrContainmentIncomplete)
+
+	successorClient := newFakeOpenCodeClient()
+	agent.mu.Lock()
+	agent.runtime = successorClient
+	agent.mu.Unlock()
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
+		)),
+	))
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+
+	agent.mu.Lock()
+	mapped := agent.sessions[predecessor.id]
+	activeCount := len(agent.sessions)
+	agent.mu.Unlock()
+
+	require.Same(t, predecessor, mapped)
+	require.Equal(t, 1, activeCount)
+	require.Empty(t, successorClient.scopes(), "failed containment admitted a successor")
+}
+
 func TestAgentLifecycleValidationAndStorageFailures(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()

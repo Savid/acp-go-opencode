@@ -48,6 +48,13 @@ outright, and an empty value is a replacement rather than an omission. A
 snapshot missing either half is refused because it cannot reconstruct the
 session's shell environment exactly.
 
+Loading or resuming an already-active session with the same effective carrier
+and binding options reuses that active incarnation, recovering its runtime in
+place if necessary. A changed carrier is a hard cut: the predecessor commits
+its latest generation and proves its native scope contained before its active
+slot is released and the successor is hydrated. Failed containment publishes
+no successor, so old and new credential carriers never overlap.
+
 `PATH` is refused inside `env`, without regard to case, because the map replaces
 whole values. `extraPathDirs` is the additive mechanism that owns the search
 path. Static environment values configured with `WithEnv` remain shared by the

@@ -64,7 +64,11 @@ type Agent struct {
 	fingerprintKey       [32]byte
 	restoreMu            sync.Mutex
 	nativeAdmissionMu    sync.Mutex
-	retiredNativeTrees   map[string]retiredNativeTree
+	// sessionLifecycleMu serializes lifecycle operations that can reuse, retire,
+	// or replace an existing logical session binding. In particular, two active
+	// load/resume calls must never both prepare successors for the same map slot.
+	sessionLifecycleMu sync.Mutex
+	retiredNativeTrees map[string]retiredNativeTree
 }
 
 type retiredNativeTree struct {
@@ -184,6 +188,9 @@ func (a *Agent) connection() agentClient {
 }
 
 func (a *Agent) Close() error {
+	a.sessionLifecycleMu.Lock()
+	defer a.sessionLifecycleMu.Unlock()
+
 	a.mu.Lock()
 	if a.closeDone != nil {
 		done := a.closeDone

@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -103,6 +104,23 @@ func TestInspectSessionStoreTerminalStateRejectsMalformedOrUnsupportedEntry(t *t
 		t.Run(name, func(t *testing.T) {
 			_, err := InspectSessionStoreTerminalState(test.sessionID, test.entries)
 			require.ErrorContains(t, err, test.wantErr)
+		})
+	}
+}
+
+func TestInspectSessionStoreTerminalStateUsesTheStrictSnapshotReader(t *testing.T) {
+	valid := string(terminalTestSnapshot(t,
+		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", int64Pointer(100)),
+	))
+
+	for name, raw := range map[string]string{
+		"duplicate": strings.Replace(valid, `"format":`, `"format":"shadow","format":`, 1),
+		"unknown":   strings.Replace(valid, `"aggregate_id":`, `"aggregateId":"native","aggregate_id":`, 1),
+		"trailing":  valid + ` null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := InspectSessionStoreTerminalState("session", []SessionStoreEntry{SessionStoreEntry(raw)})
+			require.ErrorContains(t, err, "decode OpenCode session-store snapshot")
 		})
 	}
 }

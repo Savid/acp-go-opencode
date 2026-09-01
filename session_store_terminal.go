@@ -38,8 +38,8 @@ func InspectSessionStoreTerminalState(
 		)
 	}
 
-	var snapshot stateSnapshot
-	if err := json.Unmarshal(entries[0], &snapshot); err != nil {
+	snapshot, err := decodeStateSnapshot(entries[0])
+	if err != nil {
 		return SessionStoreTerminalState{}, fmt.Errorf("decode OpenCode session-store snapshot: %w", err)
 	}
 

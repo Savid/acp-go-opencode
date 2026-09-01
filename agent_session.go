@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -101,6 +102,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 }
 
 func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	a.sessionLifecycleMu.Lock()
+	defer a.sessionLifecycleMu.Unlock()
+
 	ctx = a.observe.Extract(ctx, params.Meta)
 
 	session, err := a.loadOrResumeSession(ctx, params.SessionId, params.Cwd, params.AdditionalDirectories, params.McpServers, params.Meta)
@@ -119,6 +123,9 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 }
 
 func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
+	a.sessionLifecycleMu.Lock()
+	defer a.sessionLifecycleMu.Unlock()
+
 	ctx = a.observe.Extract(ctx, params.Meta)
 	if err := validateMCPServers(params.McpServers); err != nil {
 		return acp.ResumeSessionResponse{}, err
@@ -174,6 +181,42 @@ func (a *Agent) loadOrResumeSession(
 	meta, err := sessionMetaFromVendorOptions(metaMap)
 	if err != nil {
 		return nil, vendorOptionsMetaError(err)
+	}
+
+	a.mu.Lock()
+	active := a.sessions[id]
+	a.mu.Unlock()
+
+	if active != nil {
+		activeSnapshot := active.snapshot()
+		carrier := carrierFromMeta(meta, activeSnapshot.carrier)
+
+		if activeLoadRequestMatches(activeSnapshot, active, cwd, additionalDirectories, mcpServers, metaMap, meta, carrier) {
+			// An active logical session is already the newest incarnation. Reuse
+			// it instead of hydrating an older committed generation over it; if
+			// its shared runtime was lost, ensureRuntime performs the in-place
+			// rebind before the handler exposes the session again.
+			if ensureErr := active.ensureRuntime(ctx); ensureErr != nil {
+				return nil, ensureErr
+			}
+
+			return active, nil
+		}
+
+		// A changed carrier or another binding-affecting option is a hard cut.
+		// The predecessor commits its latest generation and proves its native
+		// scope contained before the successor is even hydrated, so the two
+		// carrier bindings can never overlap and the active-session slot is
+		// released before capacity admission runs again.
+		if closeErr := active.CloseAndCommit(context.Background()); closeErr != nil {
+			return nil, closeErr
+		}
+
+		if !a.removeSessionIf(id, active) {
+			return nil, acp.NewInternalError(map[string]any{jsonFieldError: "active OpenCode session changed during replacement"})
+		}
+
+		a.observe.AddActiveSession(ctx, -1)
 	}
 
 	storeCtx, cancel := a.sessionStoreContext(ctx)
@@ -241,6 +284,55 @@ func (a *Agent) loadOrResumeSession(
 	}
 
 	return session, nil
+}
+
+// activeLoadRequestMatches reports whether load/resume can keep the active
+// incarnation. Omitted options retain the active values; explicitly repeated
+// values are equally reusable. Anything that changes the native directory
+// binding or the session behavior requires the hard-cut path above.
+func activeLoadRequestMatches(
+	snapshot sessionSnapshot,
+	active *session,
+	cwd string,
+	additionalDirectories []string,
+	mcpServers []acp.McpServer,
+	metaMap map[string]any,
+	meta sessionMeta,
+	carrier sessionCarrier,
+) bool {
+	active.mu.Lock()
+	closed := active.closed
+	mcpConfigs := cloneNativeMCPServerConfigs(active.mcpServers)
+	outputSchema := cloneAnyMap(active.outputSchema)
+	active.mu.Unlock()
+
+	if closed || snapshot.cwd != cwd ||
+		!slices.Equal(snapshot.additionalDirectories, additionalDirectories) ||
+		!reflect.DeepEqual(mcpConfigs, nativeMCPServerConfigs(mcpServers)) ||
+		!snapshot.carrier.equal(carrier) {
+		return false
+	}
+
+	if meta.Model != "" && meta.Model != joinModelValue(snapshot.providerID, snapshot.modelID) {
+		return false
+	}
+
+	if meta.Mode != "" && meta.Mode != snapshot.mode {
+		return false
+	}
+
+	if meta.PermissionSet && normalizeOpenCodePermission(meta.Permission) != snapshot.permission {
+		return false
+	}
+
+	if meta.OutputSchema != nil && !reflect.DeepEqual(meta.OutputSchema, outputSchema) {
+		return false
+	}
+
+	opencodeMeta, _ := metaMap[opencodeMetaKey].(map[string]any)
+	_, rawMessagesSet := opencodeMeta[rawEventKey]
+
+	return !rawMessagesSet || meta.RawMessages == snapshot.rawMessages
 }
 
 func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
@@ -336,6 +428,9 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 }
 
 func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
+	a.sessionLifecycleMu.Lock()
+	defer a.sessionLifecycleMu.Unlock()
+
 	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
 		return acp.CloseSessionResponse{}, refusal
 	}
@@ -380,6 +475,9 @@ func (a *Agent) rollbackStartedSession(session *session, refusal error) error {
 }
 
 func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
+	a.sessionLifecycleMu.Lock()
+	defer a.sessionLifecycleMu.Unlock()
+
 	ctx = a.observe.Extract(ctx, params.Meta)
 	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
 		return acp.UnstableDeleteSessionResponse{}, refusal

@@ -247,6 +247,7 @@ type fakeOpenCodeClient struct {
 	questionRejected   chan struct{}
 
 	createSessionFunc  func(context.Context, string) (opencode.NativeSession, error)
+	scopeFunc          func(opencode.ScopeOptions) error
 	dispatchMessage    func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
 	dispatchCommand    func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
 	omitPromptEvidence bool
@@ -434,6 +435,11 @@ func (c *fakeOpenCodeClient) Scope(_ context.Context, options opencode.ScopeOpti
 		ExtraPathDirs: append([]string(nil), options.ExtraPathDirs...),
 	})
 	c.mu.Unlock()
+	if c.scopeFunc != nil {
+		if err := c.scopeFunc(options); err != nil {
+			return nil, err
+		}
+	}
 
 	return c, c.scopeErr
 }

@@ -45,6 +45,11 @@ type SessionStoreReplacement struct {
 // SessionStore is the durable authority for every list, load, resume, and delete
 // this adapter answers.
 //
+// Main snapshot entries persist the addressed session environment and may
+// therefore contain credentials. Implementations must protect entries with
+// access control, transport and at-rest safeguards, and an appropriate
+// retention policy.
+//
 // Tombstone finality is the store's own obligation rather than the adapter's: an
 // `Append` or a `Replace` addressed to a key `Delete` tombstoned writes nothing,
 // clears nothing, and returns success. An implementation that leaves the rule to
@@ -392,8 +397,8 @@ func mainSessionKey(sessionID string) SessionKey {
 }
 
 func summaryFromStoreEntry(summary SessionSummary, entry SessionStoreEntry) SessionSummary {
-	var snapshot stateSnapshot
-	if err := json.Unmarshal(entry, &snapshot); err != nil {
+	snapshot, err := decodeStateSnapshot(entry)
+	if err != nil {
 		return summary
 	}
 

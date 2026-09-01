@@ -60,10 +60,20 @@ than defaulted. A cold load rebinds the native session to the complete carrier
 it was captured with. Explicit load or resume values replace the stored half,
 including with an empty map or list.
 
+<Warning>
+The persisted `env` map can contain bearer tokens, API keys, and other
+credential-bearing values. Treat the session store as a credential store:
+restrict access to the intended principal, protect data in transit and at rest,
+avoid logging entries, and apply an appropriate deletion and retention policy.
+</Warning>
+
 The adapter exports through `POST /sync/history`; it never opens or copies the
-live SQLite database. Only known event kinds and known fields are accepted.
-Unknown event data fails closed, and the event graph is scanned for MCP and
-process-environment secret leakage before the store replacement is published.
+live SQLite database. The complete snapshot reader requires exact,
+case-sensitive field names and one JSON value, and rejects unknown or duplicate
+fields at every typed envelope depth. Only known event kinds and known fields
+are accepted. Unknown event data fails closed, and the event graph is scanned
+for MCP and process-environment secret leakage before the store replacement is
+published.
 
 Restore durably claims each source-to-destination aggregate mapping before the
 first `POST /sync/replay`, replays one complete aggregate per call in

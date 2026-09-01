@@ -598,8 +598,8 @@ func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID st
 		return idmapRecord{}, stateSnapshot{}, false, err
 	}
 
-	var snapshot stateSnapshot
-	if err := json.Unmarshal(entries[len(entries)-1], &snapshot); err != nil {
+	snapshot, err := decodeStateSnapshot(entries[len(entries)-1])
+	if err != nil {
 		return idmapRecord{}, stateSnapshot{}, false, err
 	}
 
