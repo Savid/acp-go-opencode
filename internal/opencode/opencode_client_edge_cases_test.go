@@ -71,7 +71,11 @@ func TestRuntimeXDGAndRetentionEdges(t *testing.T) {
 func TestProcessEnvironmentAndSettlementEdges(t *testing.T) {
 	originalEnviron := processEnviron
 	processEnviron = func() []string {
-		return []string{"PATH=/captured", privateEnvironmentPrefix + "TOKEN=secret"}
+		return []string{
+			"PATH=/captured",
+			privateEnvironmentPrefix + "TOKEN=secret",
+			"OPENCODE_CONFIG_CONTENT=managed",
+		}
 	}
 	t.Cleanup(func() { processEnviron = originalEnviron })
 
@@ -79,6 +83,7 @@ func TestProcessEnvironmentAndSettlementEdges(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "/captured", environment[pathEnv])
 	require.NotContains(t, environment, privateEnvironmentPrefix+"TOKEN")
+	require.NotContains(t, environment, "OPENCODE_CONFIG_CONTENT")
 	_, err = buildProcessEnvironmentFrom(map[string]string{"BAD=KEY": "value"})
 	require.Error(t, err)
 	_, err = buildProcessEnvironmentFrom(map[string]string{}, map[string]string{"BAD=KEY": "value"})
