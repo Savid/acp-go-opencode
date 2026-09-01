@@ -51,11 +51,6 @@ type NativeProcess interface {
 `WorkingDirectory`. `NativeResult` contains `ExitCode`, `Signal`, and
 `Revoked`.
 
-`ReadNativeAppendLog` is the family authority capability for adapters whose
-native state is an append-only log. OpenCode does not invoke it: OpenCode
-persistence uses its online sync-event protocol instead of reading native
-runtime files.
-
 The environment map must be complete and valid. The adapter filters reserved
 keys, applies `WithEnv`, adds its managed runtime values, sorts the resulting
 environment, and passes that exact slice to `StartNative`. It does not mix in
