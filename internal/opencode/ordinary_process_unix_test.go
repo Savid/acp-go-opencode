@@ -53,9 +53,23 @@ func TestOrdinaryResolverAndProcessFailureEdges(t *testing.T) {
 	require.NoError(t, normalizeOrdinaryWaitError(failed.Run()))
 }
 
+// releaseOrdinaryProcessPipes drops the three parent ends the ordinary backend
+// hands out. They are the caller's property for the process's whole life —
+// nothing in exec closes them any more — so every started process is released
+// here rather than leaking descriptors through the rest of the package run.
+func releaseOrdinaryProcessPipes(t *testing.T, process ProcessHandle) {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = process.Input.Close()
+		_ = process.Output.Close()
+		_ = process.Errors.Close()
+	})
+}
+
 func TestOrdinaryProcessAwaitCancellation(t *testing.T) {
 	process, err := startOrdinaryProcess(t.Context(), "/bin/sh", []string{"-c", "while :; do sleep 1; done"}, []string{"PATH=/usr/bin:/bin"}, t.TempDir())
 	require.NoError(t, err)
+	releaseOrdinaryProcessPipes(t, process)
 	go func() {
 		_, _ = io.Copy(io.Discard, process.Output)
 		_, _ = io.Copy(io.Discard, process.Errors)
@@ -91,60 +105,148 @@ func TestOrdinaryProcessPlatformHelperEdges(t *testing.T) {
 	require.ErrorIs(t, normalizeContainOrdinaryProcessError(want), want)
 }
 
+// recordProcessPipes replaces the pipe seam with one that remembers both ends
+// of every pipe it hands out, so a refusal can be checked for descriptors left
+// behind rather than only for its message.
+func recordProcessPipes(t *testing.T, allow int, refusal error) *[]*os.File {
+	t.Helper()
+
+	original := newProcessPipe
+	t.Cleanup(func() { newProcessPipe = original })
+
+	claimed := &[]*os.File{}
+	remaining := allow
+	newProcessPipe = func() (*os.File, *os.File, error) {
+		if remaining == 0 {
+			return nil, nil, refusal
+		}
+
+		remaining--
+
+		read, write, err := original()
+		if err == nil {
+			*claimed = append(*claimed, read, write)
+		}
+
+		return read, write, err
+	}
+
+	return claimed
+}
+
+func requireProcessPipesReleased(t *testing.T, claimed *[]*os.File, want int) {
+	t.Helper()
+	require.Len(t, *claimed, 2*want, "each claimed pipe has two ends")
+
+	for _, file := range *claimed {
+		require.ErrorIs(t, file.Close(), os.ErrClosed, "descriptor leaked into the refusal")
+	}
+}
+
 func TestOrdinaryProcessPipeAllocationEdges(t *testing.T) {
+	unlimited := errors.New("unreachable refusal")
+
 	t.Run("stdin refusal", func(t *testing.T) {
+		claimed := recordProcessPipes(t, 3, unlimited)
 		command := exec.Command("/bin/sh")
 		command.Stdin = strings.NewReader("configured")
-		stdin, stdout, stderr, err := ordinaryProcessPipes(command)
+		pipes, err := ordinaryProcessPipes(command)
 		require.ErrorContains(t, err, "open native stdin")
-		require.Nil(t, stdin)
-		require.Nil(t, stdout)
-		require.Nil(t, stderr)
+		require.Nil(t, pipes)
+		requireProcessPipesReleased(t, claimed, 0)
 	})
 
-	t.Run("stdout refusal closes stdin", func(t *testing.T) {
+	t.Run("stdout refusal releases the stdin pipe", func(t *testing.T) {
+		claimed := recordProcessPipes(t, 3, unlimited)
 		command := exec.Command("/bin/sh")
 		command.Stdout = io.Discard
-		stdin, stdout, stderr, err := ordinaryProcessPipes(command)
+		pipes, err := ordinaryProcessPipes(command)
 		require.ErrorContains(t, err, "open native stdout")
-		require.Nil(t, stdin)
-		require.Nil(t, stdout)
-		require.Nil(t, stderr)
-		buffer := make([]byte, 1)
-		count, readErr := command.Stdin.Read(buffer)
-		require.Zero(t, count)
-		require.ErrorIs(t, readErr, io.EOF)
+		require.Nil(t, pipes)
+		requireProcessPipesReleased(t, claimed, 1)
 	})
 
-	t.Run("stderr refusal closes stdin and stdout", func(t *testing.T) {
+	t.Run("stderr refusal releases the stdin and stdout pipes", func(t *testing.T) {
+		claimed := recordProcessPipes(t, 3, unlimited)
 		command := exec.Command("/bin/sh")
 		command.Stderr = io.Discard
-		stdin, stdout, stderr, err := ordinaryProcessPipes(command)
+		pipes, err := ordinaryProcessPipes(command)
 		require.ErrorContains(t, err, "open native stderr")
-		require.Nil(t, stdin)
-		require.Nil(t, stdout)
-		require.Nil(t, stderr)
-		buffer := make([]byte, 1)
-		count, readErr := command.Stdin.Read(buffer)
-		require.Zero(t, count)
-		require.ErrorIs(t, readErr, io.EOF)
-		count, writeErr := command.Stdout.Write([]byte("closed"))
-		require.Zero(t, count)
-		require.Error(t, writeErr)
+		require.Nil(t, pipes)
+		requireProcessPipesReleased(t, claimed, 2)
 	})
 
-	t.Run("success returns owned pipes", func(t *testing.T) {
-		stdin, stdout, stderr, err := ordinaryProcessPipes(exec.Command("/bin/sh"))
+	t.Run("success hands the child ends to the command", func(t *testing.T) {
+		command := exec.Command("/bin/sh")
+		pipes, err := ordinaryProcessPipes(command)
 		require.NoError(t, err)
-		require.NoError(t, stdin.Close())
-		require.NoError(t, stdout.Close())
-		require.NoError(t, stderr.Close())
+		require.Same(t, pipes.childInput, command.Stdin)
+		require.Same(t, pipes.childOutput, command.Stdout)
+		require.Same(t, pipes.childErrors, command.Stderr)
+
+		pipes.closeChildEnds()
+		pipes.closeParentEnds()
 	})
+}
+
+// TestOrdinaryProcessPipeExhaustionReleasesClaimedDescriptors covers each pipe
+// this backend claims: a host that cannot hand out the next one refuses the
+// start naming that stream, and every descriptor already claimed is released
+// rather than leaked into the refusal.
+func TestOrdinaryProcessPipeExhaustionReleasesClaimedDescriptors(t *testing.T) {
+	want := errors.New("no descriptors left")
+
+	for _, testCase := range []struct {
+		stream string
+		allow  int
+	}{
+		{stream: "stdin", allow: 0},
+		{stream: "stdout", allow: 1},
+		{stream: "stderr", allow: 2},
+	} {
+		t.Run(testCase.stream, func(t *testing.T) {
+			claimed := recordProcessPipes(t, testCase.allow, want)
+
+			handle, err := startOrdinaryProcess(t.Context(), "/bin/sh", nil,
+				[]string{"PATH=/usr/bin:/bin"}, t.TempDir())
+			require.ErrorIs(t, err, want)
+			require.ErrorContains(t, err, "open native "+testCase.stream)
+			require.False(t, handle.valid())
+			requireProcessPipesReleased(t, claimed, testCase.allow)
+		})
+	}
+}
+
+// TestOrdinaryProcessDeliversTheTailWrittenBeforeExit pins pipe ownership: the
+// wait is taken before either stream is drained, exactly as the settlement
+// takes it while the drains are still reading, and the child's whole output
+// must still arrive afterwards. A backend that hands its parent ends to
+// exec.Cmd.Wait loses both payloads here every time.
+func TestOrdinaryProcessDeliversTheTailWrittenBeforeExit(t *testing.T) {
+	process, err := startOrdinaryProcess(t.Context(), "/bin/sh",
+		[]string{"-c", "printf 'ordinary stdout'; printf 'ordinary stderr' >&2"},
+		[]string{"PATH=/usr/bin:/bin"}, t.TempDir())
+	require.NoError(t, err)
+	releaseOrdinaryProcessPipes(t, process)
+	require.NoError(t, process.Input.Close())
+
+	result, err := process.Await(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, ProcessOutcome{}, result)
+
+	stdout, err := io.ReadAll(process.Output)
+	require.NoError(t, err)
+	require.Equal(t, "ordinary stdout", string(stdout))
+
+	stderr, err := io.ReadAll(process.Errors)
+	require.NoError(t, err)
+	require.Equal(t, "ordinary stderr", string(stderr))
 }
 
 func TestOrdinaryProcessReportsNaturalAndRevokedResults(t *testing.T) {
 	natural, err := startOrdinaryProcess(t.Context(), "/bin/sh", []string{"-c", "exit 7"}, []string{"PATH=/usr/bin:/bin"}, t.TempDir())
 	require.NoError(t, err)
+	releaseOrdinaryProcessPipes(t, natural)
 	result, err := natural.Await(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, 7, result.ExitCode)
@@ -152,6 +254,7 @@ func TestOrdinaryProcessReportsNaturalAndRevokedResults(t *testing.T) {
 
 	revoked, err := startOrdinaryProcess(t.Context(), "/bin/sh", []string{"-c", "while :; do sleep 1; done"}, []string{"PATH=/usr/bin:/bin"}, t.TempDir())
 	require.NoError(t, err)
+	releaseOrdinaryProcessPipes(t, revoked)
 	go func() {
 		_, _ = io.Copy(io.Discard, revoked.Output)
 		_, _ = io.Copy(io.Discard, revoked.Errors)
@@ -167,6 +270,7 @@ func TestOrdinaryProcessReportsNaturalAndRevokedResults(t *testing.T) {
 func TestOrdinaryProcessCancelledRevokeStillStartsTeardown(t *testing.T) {
 	process, err := startOrdinaryProcess(t.Context(), "/bin/sh", []string{"-c", "while :; do sleep 1; done"}, []string{"PATH=/usr/bin:/bin"}, t.TempDir())
 	require.NoError(t, err)
+	releaseOrdinaryProcessPipes(t, process)
 	go func() {
 		_, _ = io.Copy(io.Discard, process.Output)
 		_, _ = io.Copy(io.Discard, process.Errors)
