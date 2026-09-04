@@ -113,10 +113,12 @@ Absolute paths, parent escapes, and empty keys are rejected.
 
 `WithPluginSeedDir` names the cache of the npm tree OpenCode installs for its
 plugin loader. The adapter copies a cached tree into each new runtime root
-before launch so OpenCode skips the install, and harvests the tree OpenCode
-produces when the cache has no entry for the running binary. A managed runtime
-under `WithHostAuthority` restores from the cache but never harvests, because
-its prepared tree is not the adapter's to read. See the
+before launch so OpenCode skips the install. When the cache has no entry for
+the running binary, a priming launch fills it first: a throwaway runtime under
+the scratch parent that performs the install, serves no session, and is torn
+down and harvested before the runtime itself starts. Under `WithHostAuthority`
+the priming launch is prepared, started, and reclaimed through the same
+authority, and its tree is read only after reclaim. See the
 [CLI reference](/docs/reference/cli#plugin-seed-cache) for the layout and
 [Security](/docs/operations/security) for the trust boundary.
 

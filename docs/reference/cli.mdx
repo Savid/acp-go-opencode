@@ -47,9 +47,22 @@ every launch gets a fresh root, so a cold boot waits minutes for that install.
 The adapter therefore keeps one copy of the tree OpenCode produced, keyed by the
 identity of the `opencode` binary, in the plugin seed cache and copies it into
 each new runtime root before launch. OpenCode finds the install complete and
-skips it, so a warm boot answers `session/new` in seconds. A binary upgrade
-changes the key and the next boot harvests a fresh copy; stale entries are
+skips it, so a warm boot answers `session/new` in seconds. Stale entries are
 removed after thirty days and the cache keeps a handful of binaries at most.
+
+When the cache holds no entry for the running binary, the adapter fills it
+before the runtime starts through a priming launch: a throwaway runtime root
+under `-scratch-dir`, named `acp-go-opencode-plugin-prime-*`, that boots the
+same binary with the same environment and seed files, performs the install,
+and is shut down as soon as the session carrier handshake proves it complete.
+The tree it leaves is harvested into the cache and the root is removed, and the
+runtime then restores from the fresh entry. No session ever reaches the priming
+runtime, which is what makes its tree safe to copy into every later root. The
+priming launch has its own readiness budget of ten minutes, so the first boot
+of a new binary no longer needs a raised `-opencode-health-timeout`; a binary
+upgrade changes the key and primes again on the next boot. Under a host
+authority the priming root is prepared, started, and reclaimed through the same
+authority, and is read only after reclaim.
 
 The default location is `acp-go-opencode/plugin-seed` beneath the user cache
 directory: `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on

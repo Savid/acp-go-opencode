@@ -276,10 +276,13 @@ func WithOpenCodeHealthCheckTimeout(timeout time.Duration) Option {
 // WithPluginSeedDir relocates the plugin seed cache. OpenCode installs its
 // plugin loader with npm into every fresh runtime root, which costs minutes on
 // a cold boot; the adapter keeps one copy of that install per native binary in
-// this directory and copies it into each new root before launch. The default
-// is plugin-seed beneath the adapter's directory in the user cache directory.
-// The cache holds code OpenCode executes, so it must stay private to the user
-// running the adapter.
+// this directory and copies it into each new root before launch. A cache with
+// no entry for the running binary is filled by a priming launch — a throwaway
+// runtime that performs the install, serves no session, and is torn down —
+// before the runtime itself starts, in ordinary and managed execution alike.
+// The default is plugin-seed beneath the adapter's directory in the user cache
+// directory. The cache holds code OpenCode executes, so it must stay private to
+// the user running the adapter.
 func WithPluginSeedDir(dir string) Option {
 	return func(options *Options) {
 		options.PluginSeedDir = dir

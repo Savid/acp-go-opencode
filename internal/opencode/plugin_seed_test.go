@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -491,7 +492,7 @@ func TestPluginSeedHarvest(t *testing.T) {
 		cacheDir := filepath.Join(t.TempDir(), "cache", "plugin-seed")
 		cache := newPluginSeedCache(cacheDir, logger)
 
-		cache.harvest(t.Context(), "key", newSource(t), "1.18.27-native")
+		require.NoError(t, cache.harvest(t.Context(), "key", newSource(t), "1.18.27-native"))
 		require.Contains(t, logs.String(), "plugin seed harvested")
 		require.Equal(t, []string{"key"}, cacheEntryNames(t, cacheDir), "no staging tree survives a successful publish")
 
@@ -516,7 +517,7 @@ func TestPluginSeedHarvest(t *testing.T) {
 		source := newSource(t)
 		require.NoError(t, os.RemoveAll(filepath.Join(source, pluginSeedModulesDirName, pluginSeedPluginPackage)))
 
-		cache.harvest(t.Context(), "key", source, "1")
+		require.ErrorContains(t, cache.harvest(t.Context(), "key", source, "1"), "not a complete plugin install")
 		require.Contains(t, logs.String(), "not a complete plugin install")
 		require.NoDirExists(t, cacheDir)
 	})
@@ -527,7 +528,7 @@ func TestPluginSeedHarvest(t *testing.T) {
 		entry := writePluginSeedEntry(t, cacheDir, "key", "0.0.1", time.Now())
 		cache := newPluginSeedCache(cacheDir, logger)
 
-		cache.harvest(t.Context(), "key", newSource(t), "1")
+		require.Error(t, cache.harvest(t.Context(), "key", newSource(t), "1"))
 		require.Contains(t, logs.String(), errPluginSeedEntryExists.Error())
 		require.Equal(t, []string{"key"}, cacheEntryNames(t, cacheDir))
 
@@ -542,7 +543,7 @@ func TestPluginSeedHarvest(t *testing.T) {
 		require.NoError(t, os.WriteFile(file, nil, 0o600))
 		cache := newPluginSeedCache(filepath.Join(file, "seed"), logger)
 
-		cache.harvest(t.Context(), "key", newSource(t), "1")
+		require.Error(t, cache.harvest(t.Context(), "key", newSource(t), "1"))
 		require.Contains(t, logs.String(), "create plugin seed cache")
 	})
 
@@ -605,7 +606,7 @@ func TestPluginSeedHarvest(t *testing.T) {
 				cacheDir := t.TempDir()
 				cache := newPluginSeedCache(cacheDir, logger)
 
-				cache.harvest(t.Context(), "key", newSource(t), "1")
+				require.Error(t, cache.harvest(t.Context(), "key", newSource(t), "1"))
 				require.Contains(t, logs.String(), tc.wantErr)
 				require.Empty(t, cacheEntryNames(t, cacheDir), "no entry and no staging tree remain")
 			})
@@ -620,7 +621,7 @@ func TestPluginSeedHarvest(t *testing.T) {
 		var wg sync.WaitGroup
 		for range 6 {
 			wg.Go(func() {
-				newPluginSeedCache(cacheDir, logger).harvest(t.Context(), "key", source, "1")
+				_ = newPluginSeedCache(cacheDir, logger).harvest(t.Context(), "key", source, "1")
 			})
 		}
 
@@ -845,28 +846,92 @@ func TestStartServerPluginSeedLifecycle(t *testing.T) {
 		return client
 	}
 
+	// installOnLaunch stands in for the npm install OpenCode performs inside a
+	// runtime root: the tree appears in the config root of every launch whose
+	// root satisfies want, and the native process starts as usual.
+	installOnLaunch := func(t *testing.T, want func(dir string) bool, observe func(dir string)) ProcessStarter {
+		t.Helper()
+
+		return func(ctx context.Context, executable string, arguments []string, environment []string, dir string) (ProcessHandle, error) {
+			if observe != nil {
+				observe(dir)
+			}
+
+			if want(dir) {
+				writePluginSeedTree(t, openCodeConfigDir(RuntimeXDGDirs(dir)), testPluginVersion)
+			}
+
+			return startOrdinaryProcess(ctx, executable, arguments, environment, dir)
+		}
+	}
+
+	isPrimeRoot := func(dir string) bool { return strings.HasPrefix(filepath.Base(dir), pluginSeedPrimeRootPrefix) }
+
 	t.Run("pure runtime writes nothing", func(t *testing.T) {
 		logger, _ := debugLogger(t)
 		start(t, t.TempDir(), logger, func(options *StartOptions) { options.Pure = true })
 		require.NoDirExists(t, seedDir)
 	})
 
-	t.Run("cold boot harvests the install OpenCode produced", func(t *testing.T) {
+	t.Run("an install already in the root is left alone and never harvested", func(t *testing.T) {
 		logger, logs := debugLogger(t)
 		root := t.TempDir()
 		configDir := openCodeConfigDir(RuntimeXDGDirs(root))
 		writePluginSeedTree(t, configDir, testPluginVersion)
 
-		start(t, root, logger, nil)
+		start(t, root, logger, func(options *StartOptions) { options.ScratchParent = t.TempDir() })
 
-		require.Contains(t, logs.String(), errPluginSeedTargetOccupied.Error(), "an install already in the root is left alone")
-		require.Contains(t, logs.String(), "plugin seed harvested")
+		require.Contains(t, logs.String(), errPluginSeedTargetOccupied.Error())
+		require.NotContains(t, logs.String(), "plugin seed priming", "a root with npm state of its own gains nothing from the cache")
+		require.NotContains(t, logs.String(), "plugin seed harvested", "a tree sessions may have touched is never the cache's source")
+		require.NoDirExists(t, seedDir)
+	})
+
+	t.Run("cold boot without a scratch parent boots cold", func(t *testing.T) {
+		logger, logs := debugLogger(t)
+
+		start(t, t.TempDir(), logger, nil)
+
+		require.Contains(t, logs.String(), errPluginSeedMiss.Error())
+		require.Contains(t, logs.String(), "plugin seed not primed")
+		require.Contains(t, logs.String(), "requires a scratch parent")
+		require.NoDirExists(t, seedDir)
+	})
+
+	t.Run("cold boot primes through a throwaway launch and restores from it", func(t *testing.T) {
+		logger, logs := debugLogger(t)
+		root := t.TempDir()
+		scratch := t.TempDir()
+
+		var launched []string
+
+		var restoredBeforeLaunch []string
+
+		start(t, root, logger, func(options *StartOptions) {
+			options.ScratchParent = scratch
+			options.StartProcess = installOnLaunch(t, isPrimeRoot, func(dir string) {
+				launched = append(launched, dir)
+
+				if dir == root {
+					restoredBeforeLaunch = cacheEntryNames(t, openCodeConfigDir(RuntimeXDGDirs(root)))
+				}
+			})
+		})
+
+		require.Len(t, launched, 2, "one priming launch, then the runtime")
+		require.True(t, isPrimeRoot(launched[0]), "the priming launch goes first: %s", launched[0])
+		require.Equal(t, scratch, filepath.Dir(launched[0]), "the priming root is a scratch generation")
+		require.Equal(t, root, launched[1])
+
+		for _, message := range []string{"plugin seed priming", "plugin seed harvested", "plugin seed primed", "plugin seed restored"} {
+			require.Contains(t, logs.String(), message)
+		}
+
+		require.Subset(t, restoredBeforeLaunch, pluginSeedItems, "the runtime launches from the restored tree")
+		requirePluginSeedTree(t, openCodeConfigDir(RuntimeXDGDirs(root)))
 		require.Len(t, cacheEntryNames(t, seedDir), 1)
-
-		meta, err := readPluginSeedMeta(filepath.Join(seedDir, cacheEntryNames(t, seedDir)[0]))
-		require.NoError(t, err)
-		require.Equal(t, "1.18.3", meta.OpenCodeVersion, "the health version is recorded for diagnostics")
-		require.Equal(t, testPluginVersion, meta.PluginVersion)
+		require.NoDirExists(t, launched[0], "the priming root is removed after the harvest")
+		require.NoDirExists(t, ControlRootForXDG(launched[0]))
 	})
 
 	t.Run("warm boot restores before launch and harvests nothing", func(t *testing.T) {
@@ -876,6 +941,7 @@ func TestStartServerPluginSeedLifecycle(t *testing.T) {
 		var launchedWith []string
 
 		start(t, root, logger, func(options *StartOptions) {
+			options.ScratchParent = t.TempDir()
 			options.StartProcess = func(ctx context.Context, executable string, arguments []string, environment []string, dir string) (ProcessHandle, error) {
 				launchedWith = cacheEntryNames(t, openCodeConfigDir(RuntimeXDGDirs(root)))
 
@@ -884,19 +950,21 @@ func TestStartServerPluginSeedLifecycle(t *testing.T) {
 		})
 
 		require.Contains(t, logs.String(), "plugin seed restored")
+		require.NotContains(t, logs.String(), "plugin seed priming")
 		require.NotContains(t, logs.String(), "plugin seed harvested")
 		require.Subset(t, launchedWith, pluginSeedItems, "the tree is in place before the native process starts")
 		requirePluginSeedTree(t, openCodeConfigDir(RuntimeXDGDirs(root)))
 		require.Len(t, cacheEntryNames(t, seedDir), 1)
 	})
 
-	t.Run("managed runtime restores before preparation and never harvests", func(t *testing.T) {
+	t.Run("managed warm boot restores before preparation and harvests nothing", func(t *testing.T) {
 		logger, logs := debugLogger(t)
 		root := t.TempDir()
 
 		var preparedWith []string
 
 		start(t, root, logger, func(options *StartOptions) {
+			options.ScratchParent = t.TempDir()
 			options.PrepareTree = func(_ context.Context, path string) error {
 				preparedWith = cacheEntryNames(t, openCodeConfigDir(RuntimeXDGDirs(path)))
 
@@ -907,8 +975,199 @@ func TestStartServerPluginSeedLifecycle(t *testing.T) {
 
 		require.Contains(t, logs.String(), "plugin seed restored")
 		require.Subset(t, preparedWith, pluginSeedItems, "the copy is the adapter's last write before the tree is handed over")
+		require.NotContains(t, logs.String(), "plugin seed priming")
 		require.NotContains(t, logs.String(), "plugin seed harvested")
 		require.NotContains(t, logs.String(), "plugin seed not harvested")
+	})
+
+	t.Run("managed cold boot primes through the authority and harvests only after reclaim", func(t *testing.T) {
+		logger, logs := debugLogger(t)
+		managedSeed := filepath.Join(t.TempDir(), "managed-seed")
+		root := t.TempDir()
+		scratch := t.TempDir()
+
+		var timeline []string
+
+		var cacheAtReclaim, cacheAtRuntimePrepare, restoredBeforePrepare []string
+
+		start(t, root, logger, func(options *StartOptions) {
+			options.PluginSeedDir = managedSeed
+			options.ScratchParent = scratch
+			options.StartProcess = installOnLaunch(t, isPrimeRoot, nil)
+			options.PrepareTree = func(_ context.Context, path string) error {
+				timeline = append(timeline, "prepare:"+path)
+
+				if path == root {
+					cacheAtRuntimePrepare = cacheEntryNames(t, managedSeed)
+					restoredBeforePrepare = cacheEntryNames(t, openCodeConfigDir(RuntimeXDGDirs(path)))
+				}
+
+				return nil
+			}
+			options.ReclaimTree = func(_ context.Context, path string) error {
+				timeline = append(timeline, "reclaim:"+path)
+
+				if isPrimeRoot(path) {
+					cacheAtReclaim = cacheEntryNames(t, managedSeed)
+				}
+
+				return nil
+			}
+		})
+
+		require.Len(t, timeline, 3, "the priming tree is prepared and reclaimed before the runtime tree is prepared: %v", timeline)
+		require.True(t, strings.HasPrefix(timeline[0], "prepare:") && isPrimeRoot(strings.TrimPrefix(timeline[0], "prepare:")), timeline[0])
+		require.True(t, strings.HasPrefix(timeline[1], "reclaim:") && isPrimeRoot(strings.TrimPrefix(timeline[1], "reclaim:")), timeline[1])
+		require.Equal(t, "prepare:"+root, timeline[2])
+		require.Empty(t, cacheAtReclaim, "nothing is read from the priming tree until reclaim has returned it")
+		require.Len(t, cacheAtRuntimePrepare, 1, "the harvest lands between the reclaim and the runtime's preparation")
+		require.Subset(t, restoredBeforePrepare, pluginSeedItems, "the runtime tree is handed over already restored")
+		require.Contains(t, logs.String(), "plugin seed primed")
+		require.NoDirExists(t, strings.TrimPrefix(timeline[0], "prepare:"))
+	})
+
+	t.Run("priming launch that cannot start leaves the runtime to boot cold", func(t *testing.T) {
+		logger, logs := debugLogger(t)
+		root := t.TempDir()
+		scratch := t.TempDir()
+		refused := errors.New("launch refused")
+
+		var primeRoot string
+
+		start(t, root, logger, func(options *StartOptions) {
+			options.PluginSeedDir = filepath.Join(t.TempDir(), "empty-seed")
+			options.ScratchParent = scratch
+			options.StartProcess = func(ctx context.Context, executable string, arguments []string, environment []string, dir string) (ProcessHandle, error) {
+				if isPrimeRoot(dir) {
+					primeRoot = dir
+
+					return ProcessHandle{}, refused
+				}
+
+				return startOrdinaryProcess(ctx, executable, arguments, environment, dir)
+			}
+		})
+
+		require.Contains(t, logs.String(), "plugin seed not primed")
+		require.Contains(t, logs.String(), refused.Error())
+		require.NotEmpty(t, primeRoot)
+		require.NoDirExists(t, primeRoot, "a priming root this adapter still owns is removed")
+		require.NoDirExists(t, ControlRootForXDG(primeRoot))
+	})
+
+	t.Run("priming launch whose tree the host keeps is left to host cleanup", func(t *testing.T) {
+		logger, logs := debugLogger(t)
+		root := t.TempDir()
+		scratch := t.TempDir()
+
+		var primeRoot string
+
+		start(t, root, logger, func(options *StartOptions) {
+			options.PluginSeedDir = filepath.Join(t.TempDir(), "empty-seed")
+			options.ScratchParent = scratch
+			options.PrepareTree = func(_ context.Context, path string) error {
+				if isPrimeRoot(path) {
+					primeRoot = path
+
+					return MarkPrepareOpaque(errors.New("prepare refused"))
+				}
+
+				return nil
+			}
+			options.ReclaimTree = func(context.Context, string) error { return nil }
+		})
+
+		require.Contains(t, logs.String(), "plugin seed not primed")
+		require.Contains(t, logs.String(), "prepare refused")
+		require.NotEmpty(t, primeRoot)
+		require.DirExists(t, primeRoot, "an opaque prepare leaves the tree to host cleanup; nothing here may touch it")
+	})
+
+	t.Run("priming launch whose reclaim stays pending retains the tree", func(t *testing.T) {
+		logger, logs := debugLogger(t)
+		root := t.TempDir()
+		scratch := t.TempDir()
+
+		var retained []string
+
+		start(t, root, logger, func(options *StartOptions) {
+			options.PluginSeedDir = filepath.Join(t.TempDir(), "empty-seed")
+			options.ScratchParent = scratch
+			options.StartProcess = installOnLaunch(t, isPrimeRoot, nil)
+			options.PrepareTree = func(context.Context, string) error { return nil }
+			options.ReclaimTree = func(_ context.Context, path string) error {
+				if isPrimeRoot(path) {
+					return MarkTreeReclaimPending(errors.New("still busy"))
+				}
+
+				return nil
+			}
+			options.RetainTree = func(path string, _ bool, _ func() error) { retained = append(retained, path) }
+		})
+
+		require.Contains(t, logs.String(), "priming runtime tree was not returned")
+		require.Len(t, retained, 1)
+		require.True(t, isPrimeRoot(retained[0]))
+		require.DirExists(t, retained[0], "a tree the host still holds is never read or removed here")
+		require.NotContains(t, logs.String(), "plugin seed harvested")
+	})
+
+	t.Run("priming launch that installs nothing publishes nothing", func(t *testing.T) {
+		logger, logs := debugLogger(t)
+		root := t.TempDir()
+		scratch := t.TempDir()
+		emptySeed := filepath.Join(t.TempDir(), "empty-seed")
+
+		start(t, root, logger, func(options *StartOptions) {
+			options.PluginSeedDir = emptySeed
+			options.ScratchParent = scratch
+		})
+
+		require.Contains(t, logs.String(), "not a complete plugin install")
+		require.Contains(t, logs.String(), "plugin seed not primed")
+		require.NoDirExists(t, emptySeed)
+
+		entries, err := os.ReadDir(scratch)
+		require.NoError(t, err)
+		require.Empty(t, entries, "the priming root and its control root are removed even when the harvest fails")
+	})
+
+	t.Run("priming root creation failure is reported", func(t *testing.T) {
+		restorePluginSeedSeams(t)
+
+		pluginSeedMkdirTemp = func(string, string) (string, error) { return "", errors.New("mkdirtemp refused") }
+
+		logger, logs := debugLogger(t)
+
+		start(t, t.TempDir(), logger, func(options *StartOptions) {
+			options.PluginSeedDir = filepath.Join(t.TempDir(), "empty-seed")
+			options.ScratchParent = t.TempDir()
+		})
+
+		require.Contains(t, logs.String(), "create priming runtime root")
+		require.Contains(t, logs.String(), "mkdirtemp refused")
+	})
+
+	t.Run("priming root removal failure is reported after the harvest", func(t *testing.T) {
+		restorePluginSeedSeams(t)
+
+		pluginSeedRemoveAll = func(string) error { return errors.New("remove refused") }
+
+		logger, logs := debugLogger(t)
+		root := t.TempDir()
+		seed := filepath.Join(t.TempDir(), "seed")
+
+		start(t, root, logger, func(options *StartOptions) {
+			options.PluginSeedDir = seed
+			options.ScratchParent = t.TempDir()
+			options.StartProcess = installOnLaunch(t, isPrimeRoot, nil)
+		})
+
+		require.Contains(t, logs.String(), "plugin seed harvested")
+		require.Contains(t, logs.String(), "plugin seed not primed")
+		require.Contains(t, logs.String(), "remove refused")
+		require.Contains(t, logs.String(), "plugin seed restored", "the entry the launch published still serves the runtime")
+		require.Len(t, cacheEntryNames(t, seed), 1)
 	})
 
 	t.Run("unresolvable executable skips seeding", func(t *testing.T) {
@@ -935,6 +1194,40 @@ func TestStartServerPluginSeedLifecycle(t *testing.T) {
 		})
 		require.ErrorContains(t, err, "invalid environment entry")
 	})
+}
+
+func TestPluginSeedPrimable(t *testing.T) {
+	require.True(t, pluginSeedPrimable(errPluginSeedMiss))
+	require.True(t, pluginSeedPrimable(fmt.Errorf("%w: bad", errPluginSeedEntryRejected)))
+	require.False(t, pluginSeedPrimable(errPluginSeedTargetOccupied))
+	require.False(t, pluginSeedPrimable(errors.New("copy failed")))
+	require.False(t, pluginSeedPrimable(nil))
+}
+
+func TestPrimingStartOptions(t *testing.T) {
+	shim := &BrowserShim{}
+	base := StartOptions{
+		Root: "/durable/home", ControlRoot: "/durable/home.control", ExistingXDG: RuntimeXDGDirs("/durable/home"),
+		RemoveRoot: true, BrowserShim: shim, PluginSeedDir: "/cache", HealthTimeout: time.Second,
+		ScratchParent: "/scratch", ExecutablePath: "opencode", SeedFiles: map[string]string{"opencode.json": "{}"},
+		MinVersion: "1.0.0", Pure: false, LogLevel: "debug",
+	}
+
+	derived := primingStartOptions(base, "/scratch/acp-go-opencode-plugin-prime-1")
+
+	require.Equal(t, "/scratch/acp-go-opencode-plugin-prime-1", derived.Root)
+	require.Empty(t, derived.ControlRoot)
+	require.Equal(t, XDGDirs{}, derived.ExistingXDG)
+	require.False(t, derived.RemoveRoot)
+	require.Nil(t, derived.BrowserShim)
+	require.Empty(t, derived.PluginSeedDir, "a priming launch never primes again")
+	require.Equal(t, pluginSeedPrimeTimeout, derived.HealthTimeout)
+	require.Equal(t, base.SeedFiles, derived.SeedFiles)
+	require.Equal(t, base.MinVersion, derived.MinVersion)
+	require.Equal(t, base.ExecutablePath, derived.ExecutablePath)
+
+	longer := primingStartOptions(StartOptions{HealthTimeout: time.Hour}, "/scratch/x")
+	require.Equal(t, time.Hour, longer.HealthTimeout, "an operator budget above the floor is kept")
 }
 
 func TestPluginSeedTempPrefixSortsBeforeKeys(t *testing.T) {

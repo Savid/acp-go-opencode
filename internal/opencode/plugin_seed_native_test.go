@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,11 +29,40 @@ const envTestPluginSeedDir = "ACP_GO_OPENCODE_TEST_PLUGIN_SEED_DIR"
 // rather than once per runtime. TestMain removes the cache when the run ends
 // unless the developer asked for a durable one.
 var (
-	sharedPluginSeedOnce sync.Once
-	sharedPluginSeedRoot string
-	sharedPluginSeedPath string
-	sharedPluginSeedErr  error
+	sharedPluginSeedOnce     sync.Once
+	sharedPluginSeedRoot     string
+	sharedPluginSeedPath     string
+	sharedPluginSeedErr      error
+	sharedPluginSeedObserved *pluginSeedPrimeObservation
 )
+
+// pluginSeedPrimeObservation is what the priming pass saw of the managed
+// launch shape, kept so a test can assert on it without paying a second cold
+// install.
+type pluginSeedPrimeObservation struct {
+	mu                       sync.Mutex
+	prepared                 []string
+	reclaimed                []string
+	cacheAtPrimeReclaim      int
+	cacheAtRuntimePrepare    int
+	restoredAtRuntimePrepare []string
+	runtimePreparedAt        time.Time
+	total                    time.Duration
+	warm                     time.Duration
+}
+
+func isPluginSeedPrimeRoot(path string) bool {
+	return strings.HasPrefix(filepath.Base(path), pluginSeedPrimeRootPrefix)
+}
+
+func countDirEntries(path string) int {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return 0
+	}
+
+	return len(entries)
+}
 
 func TestMain(m *testing.M) {
 	code := m.Run()
@@ -90,23 +121,70 @@ func primeSharedPluginSeed(t *testing.T, executable string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
+	// The prime runs in the managed launch shape — a tree authority that
+	// prepares and reclaims every root — with the same identity standing in as
+	// the authority, so what it proves is the adapter's ordering against the
+	// real binary: the priming root is prepared and reclaimed, the harvest waits
+	// for the reclaim, and the runtime root is handed over already restored.
+	observed := &pluginSeedPrimeObservation{}
+	runtimeRoot := filepath.Join(root, "prime-runtime")
 	started := time.Now()
 
 	runtime, err := StartServer(ctx, StartOptions{
-		Root:           filepath.Join(root, "prime-runtime"),
+		Root:           runtimeRoot,
 		RemoveRoot:     true,
+		ScratchParent:  root,
 		ExecutablePath: executable,
 		NativeEnvironment: func() map[string]string {
 			return map[string]string{"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": home}
 		},
-		HealthTimeout: 8 * time.Minute,
+		HealthTimeout: 60 * time.Second,
 		PluginSeedDir: sharedPluginSeedPath,
+		PrepareTree: func(_ context.Context, path string) error {
+			observed.mu.Lock()
+			defer observed.mu.Unlock()
+
+			observed.prepared = append(observed.prepared, path)
+
+			if path == runtimeRoot {
+				observed.cacheAtRuntimePrepare = countDirEntries(sharedPluginSeedPath)
+				observed.runtimePreparedAt = time.Now()
+
+				entries, listErr := os.ReadDir(openCodeConfigDir(RuntimeXDGDirs(path)))
+				if listErr != nil {
+					return listErr
+				}
+
+				for _, entry := range entries {
+					observed.restoredAtRuntimePrepare = append(observed.restoredAtRuntimePrepare, entry.Name())
+				}
+			}
+
+			return nil
+		},
+		ReclaimTree: func(_ context.Context, path string) error {
+			observed.mu.Lock()
+			defer observed.mu.Unlock()
+
+			observed.reclaimed = append(observed.reclaimed, path)
+
+			if isPluginSeedPrimeRoot(path) {
+				observed.cacheAtPrimeReclaim = countDirEntries(sharedPluginSeedPath)
+			}
+
+			return nil
+		},
 	})
 	if err != nil {
-		return fmt.Errorf("cold launch to prime the plugin seed cache: %w", err)
+		return fmt.Errorf("cold managed launch to prime the plugin seed cache: %w", err)
 	}
 
-	t.Logf("cold native boot primed the plugin seed cache in %s", time.Since(started).Round(time.Millisecond))
+	observed.total = time.Since(started)
+	observed.warm = time.Since(observed.runtimePreparedAt)
+	sharedPluginSeedObserved = observed
+
+	t.Logf("cold managed boot primed the plugin seed cache in %s; the runtime itself booted warm in %s",
+		observed.total.Round(time.Millisecond), observed.warm.Round(time.Millisecond))
 
 	if shutdownErr := runtime.Shutdown(context.Background()); shutdownErr != nil {
 		return shutdownErr
@@ -122,6 +200,35 @@ func primeSharedPluginSeed(t *testing.T, executable string) error {
 	}
 
 	return validatePluginSeedEntry(filepath.Join(sharedPluginSeedPath, entries[0].Name()))
+}
+
+// TestPluginSeedPrimesManagedColdBoot is the acceptance proof for the priming
+// launch against the real OpenCode CLI in the managed launch shape: a cold
+// cache is filled by a throwaway root the authority prepared and reclaimed,
+// nothing is read from that root before reclaim returns it, and the runtime
+// root is handed to the authority already carrying the restored install.
+func TestPluginSeedPrimesManagedColdBoot(t *testing.T) {
+	requireNativeCarrierIntegration(t)
+	sharedPluginSeedDir(t)
+
+	observed := sharedPluginSeedObserved
+	if observed == nil {
+		t.Skipf("the durable cache named by %s was reused, so no cold prime ran in this process", envTestPluginSeedDir)
+	}
+
+	require.Len(t, observed.prepared, 2, "one priming root, then the runtime root: %v", observed.prepared)
+	require.True(t, isPluginSeedPrimeRoot(observed.prepared[0]), "the priming root is prepared first: %s", observed.prepared[0])
+	require.Equal(t, sharedPluginSeedRoot, filepath.Dir(observed.prepared[0]), "the priming root is a scratch generation")
+	require.False(t, isPluginSeedPrimeRoot(observed.prepared[1]))
+	require.True(t, slices.Contains(observed.reclaimed, observed.prepared[0]), "the priming root is reclaimed: %v", observed.reclaimed)
+	require.Zero(t, observed.cacheAtPrimeReclaim, "nothing is harvested before reclaim returns the priming tree")
+	require.Equal(t, 1, observed.cacheAtRuntimePrepare, "the harvest lands before the runtime root is prepared")
+	require.Subset(t, observed.restoredAtRuntimePrepare, pluginSeedItems, "the runtime root is handed over restored")
+	require.NoDirExists(t, observed.prepared[0], "the priming root is removed after the harvest")
+	require.NoDirExists(t, ControlRootForXDG(observed.prepared[0]))
+	require.Less(t, observed.warm, 20*time.Second, "the runtime root skips the install the priming launch paid for")
+
+	t.Logf("managed cold prime: total %s, runtime warm boot %s", observed.total.Round(time.Millisecond), observed.warm.Round(time.Millisecond))
 }
 
 // sharedPluginSeedEntries lists the cache entries a test may reason about: a

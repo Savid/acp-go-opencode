@@ -32,6 +32,13 @@ import (
 // Entries are immutable: a harvest builds a temporary tree and renames it into
 // place, and a restore copies out of an entry rather than linking to it, so a
 // later npm run inside a runtime root can never write into the cache.
+//
+// A tree is harvested only from a priming launch: a runtime started for no
+// purpose but the install, torn down as soon as the carrier handshake proves
+// the install complete, and never handed to a session. That is what makes the
+// harvested tree OpenCode's own work rather than anything a session's shell
+// left behind, and it holds in managed execution too, where the launch goes
+// through the same host authority and is read only after reclaim returns it.
 
 const (
 	pluginSeedPackageFileName = "package.json"
@@ -46,6 +53,14 @@ const (
 	pluginSeedTempMaxAge      = 24 * time.Hour
 	pluginSeedLooseModeBits   = 0o022
 	pluginSeedParentDir       = ".."
+	// pluginSeedPrimeRootPrefix names a priming launch's runtime root beneath
+	// the scratch parent, in the family's sweepable directory-name shape.
+	pluginSeedPrimeRootPrefix = "acp-go-opencode-plugin-prime-"
+	// pluginSeedPrimeTimeout is the least readiness budget a priming launch
+	// gets. Its whole purpose is the cold path, OpenCode's own npm install,
+	// measured at two to four minutes on a warm npm cache, so the runtime's own
+	// health budget is far too short for it.
+	pluginSeedPrimeTimeout = 10 * time.Minute
 )
 
 var (
@@ -57,6 +72,9 @@ var (
 	// errPluginSeedEntryExists reports that another harvest published the entry
 	// first, which is the expected outcome of a lost race.
 	errPluginSeedEntryExists = errors.New("plugin seed entry already exists")
+	// errPluginSeedEntryRejected reports that the entry for the key failed
+	// validation and was removed, leaving the key free for a fresh harvest.
+	errPluginSeedEntryRejected = errors.New("plugin seed entry rejected")
 )
 
 // pluginSeedItems lists the npm state OpenCode produces, in copy order: the
@@ -128,17 +146,137 @@ func pluginSeedKey(executable string, environment []string) (string, error) {
 // was restored; any other outcome is logged at debug and leaves configDir
 // exactly as the cold path expects.
 func (c *pluginSeedCache) restore(ctx context.Context, key string, configDir string) bool {
+	return c.restoreOutcome(ctx, key, configDir) == nil
+}
+
+// restoreOutcome is restore reporting why a tree was not restored, so a caller
+// can tell a miss a priming launch can fill from a root that already holds an
+// install of its own.
+func (c *pluginSeedCache) restoreOutcome(ctx context.Context, key string, configDir string) error {
 	started := pluginSeedNow()
 
 	if err := c.restoreEntry(ctx, key, configDir); err != nil {
 		c.log.DebugContext(ctx, "plugin seed not restored", slog.String("key", key), slog.String("reason", err.Error()))
 
-		return false
+		return err
 	}
 
 	c.log.DebugContext(ctx, "plugin seed restored", slog.String("key", key), slog.Duration("elapsed", pluginSeedNow().Sub(started)))
 
-	return true
+	return nil
+}
+
+// pluginSeedPrimable reports whether a restore failure is one a priming launch
+// can fill: the entry is absent, or it was rejected and removed. A root that
+// already holds npm state of its own gains nothing from the cache, and a copy
+// that failed part-way would fail the same way again.
+func pluginSeedPrimable(err error) bool {
+	return errors.Is(err, errPluginSeedMiss) || errors.Is(err, errPluginSeedEntryRejected)
+}
+
+// seedRuntimePlugins gives the runtime rooted at xdg a restored plugin install
+// where the cache can supply one. A primable miss is filled first by a priming
+// launch, and the restore is then attempted again, so the runtime itself only
+// ever pays the install when priming was impossible.
+func seedRuntimePlugins(ctx context.Context, options StartOptions, executable string, environment map[string]string, xdg XDGDirs) {
+	cache := newPluginSeedCache(options.PluginSeedDir, options.Logger)
+
+	key, err := pluginSeedKey(executable, envMapToSlice(environment))
+	if err != nil {
+		options.Logger.DebugContext(ctx, "plugin seed not restored", slog.String("reason", err.Error()))
+
+		return
+	}
+
+	configDir := openCodeConfigDir(xdg)
+
+	if restoreErr := cache.restoreOutcome(ctx, key, configDir); !pluginSeedPrimable(restoreErr) {
+		return
+	}
+
+	if primeErr := cache.prime(ctx, options, key); primeErr != nil {
+		options.Logger.DebugContext(ctx, "plugin seed not primed", slog.String("key", key), slog.String("reason", primeErr.Error()))
+	}
+
+	// A lost harvest race still leaves the entry another launch published, so
+	// the second attempt is made whatever priming reported.
+	cache.restore(ctx, key, configDir)
+}
+
+// primingStartOptions derives a priming launch from the options of the runtime
+// that needs the cache filled. It keeps the binary, environment, seed files,
+// version gate, and authority — so the tree it produces is the tree that
+// runtime would have produced — under a scratch root of its own, with no
+// browser shim, no cache to recurse into, and a readiness budget sized for the
+// install rather than for a warm boot.
+func primingStartOptions(options StartOptions, root string) StartOptions {
+	options.Root = root
+	options.ControlRoot = ""
+	options.ExistingXDG = XDGDirs{}
+	options.RemoveRoot = false
+	options.BrowserShim = nil
+	options.PluginSeedDir = ""
+	options.HealthTimeout = max(options.HealthTimeout, pluginSeedPrimeTimeout)
+
+	return options
+}
+
+// prime fills the entry for key with a priming launch. The launch registers
+// the session carrier like any runtime, so OpenCode performs the install its
+// first directory-scoped request triggers, and it is shut down as soon as that
+// handshake completes. The tree is harvested only once shutdown has returned
+// it — under host authority, only once reclaim has — and the root is removed
+// afterwards. A launch whose tree stays with the host is left to host cleanup:
+// its root sits under the scratch parent with the family prefix, which is what
+// makes it a host sweep's to reclaim.
+func (c *pluginSeedCache) prime(ctx context.Context, options StartOptions, key string) error {
+	if options.ScratchParent == "" {
+		return errors.New("priming launch requires a scratch parent")
+	}
+
+	root, err := pluginSeedMkdirTemp(options.ScratchParent, pluginSeedPrimeRootPrefix)
+	if err != nil {
+		return fmt.Errorf("create priming runtime root: %w", err)
+	}
+
+	started := pluginSeedNow()
+
+	c.log.DebugContext(ctx, "plugin seed priming", slog.String("key", key), slog.String("root", root))
+
+	server, startErr := startServer(ctx, primingStartOptions(options, root))
+	if startErr != nil {
+		if NativeCleanupRetained(startErr) {
+			return fmt.Errorf("priming launch: %w", startErr)
+		}
+
+		return errors.Join(fmt.Errorf("priming launch: %w", startErr), removePrimingRoot(root))
+	}
+
+	// The shutdown is waited out on its own context, as a failed start's is:
+	// a wait the caller could withdraw from would leave the shutdown running
+	// while the tree bookkeeping below is read. Every step of it is bounded by
+	// the containment timeout, so the wait is finite either way.
+	shutdownErr := server.Shutdown(context.Background())
+	if len(server.preparedTrees) > 0 {
+		retainPreparedTrees(server.preparedTrees, options.RetainTree)
+		server.preparedTrees = nil
+
+		return retainNativeCleanup(errors.Join(errors.New("priming runtime tree was not returned"), shutdownErr))
+	}
+
+	harvestErr := c.harvest(ctx, key, openCodeConfigDir(RuntimeXDGDirs(root)), server.nativeVersion)
+
+	if err := errors.Join(shutdownErr, harvestErr, removePrimingRoot(root)); err != nil {
+		return err
+	}
+
+	c.log.DebugContext(ctx, "plugin seed primed", slog.String("key", key), slog.Duration("elapsed", pluginSeedNow().Sub(started)))
+
+	return nil
+}
+
+func removePrimingRoot(root string) error {
+	return errors.Join(pluginSeedRemoveAll(root), pluginSeedRemoveAll(ControlRootForXDG(root)))
 }
 
 func (c *pluginSeedCache) restoreEntry(ctx context.Context, key string, configDir string) error {
@@ -160,7 +298,7 @@ func (c *pluginSeedCache) restoreEntry(ctx context.Context, key string, configDi
 	if err := validatePluginSeedEntry(entry); err != nil {
 		// A rejected entry never becomes valid on its own, and leaving it in
 		// place would also block the harvest that could replace it.
-		return fmt.Errorf("plugin seed entry rejected: %w", errors.Join(err, pluginSeedRemoveAll(entry)))
+		return fmt.Errorf("%w: %w", errPluginSeedEntryRejected, errors.Join(err, pluginSeedRemoveAll(entry)))
 	}
 
 	if err := copyPluginSeedItems(ctx, entry, configDir); err != nil {
@@ -178,17 +316,19 @@ func (c *pluginSeedCache) restoreEntry(ctx context.Context, key string, configDi
 // harvest publishes the tree OpenCode produced under configDir as the entry
 // for key. A tree is only harvested complete, and the entry appears in one
 // rename so a concurrent reader never sees a partial one.
-func (c *pluginSeedCache) harvest(ctx context.Context, key string, configDir string, nativeVersion string) {
+func (c *pluginSeedCache) harvest(ctx context.Context, key string, configDir string, nativeVersion string) error {
 	started := pluginSeedNow()
 
 	if err := c.harvestEntry(ctx, key, configDir, nativeVersion); err != nil {
 		c.log.DebugContext(ctx, "plugin seed not harvested", slog.String("key", key), slog.String("reason", err.Error()))
 
-		return
+		return err
 	}
 
 	c.log.DebugContext(ctx, "plugin seed harvested", slog.String("key", key), slog.Duration("elapsed", pluginSeedNow().Sub(started)))
 	c.collect(ctx, key)
+
+	return nil
 }
 
 func (c *pluginSeedCache) harvestEntry(ctx context.Context, key string, configDir string, nativeVersion string) error {

@@ -260,9 +260,11 @@ type StartOptions struct {
 	SeedFiles         map[string]string
 	// PluginSeedDir is the adapter-owned cache of the npm tree OpenCode installs
 	// for its plugin loader. A hit is copied into the runtime config root before
-	// launch so OpenCode skips the install; a miss is harvested after readiness.
-	// Empty disables seeding, as does Pure, and a managed runtime never harvests
-	// because its prepared tree is not the adapter's to read.
+	// launch so OpenCode skips the install. A miss is filled first by a priming
+	// launch — a throwaway runtime under ScratchParent that boots to the carrier
+	// handshake, serves no session, and is harvested once its tree is the
+	// adapter's to read — so the runtime itself always starts from a restored
+	// tree. Empty disables seeding, as does Pure.
 	PluginSeedDir string
 }
 
@@ -875,7 +877,18 @@ func runtimeConfigContent(seedFiles map[string]string, sessionCarrierPlugin stri
 	return string(data), writes, nil
 }
 
-func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr error) { //nolint:gocyclo // Startup is one ordered transaction across materialization, authority transfer, launch, and readiness.
+// StartServer launches one OpenCode runtime and returns it once it is ready to
+// serve sessions.
+func StartServer(ctx context.Context, options StartOptions) (Client, error) {
+	server, err := startServer(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+
+	return server, nil
+}
+
+func startServer(ctx context.Context, options StartOptions) (_ *openCodeServer, resultErr error) { //nolint:gocyclo // Startup is one ordered transaction across materialization, authority transfer, launch, and readiness.
 	options = normalizedStartOptions(options)
 	managedCallbacks := 0
 
@@ -1004,24 +1017,11 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		environment, environmentErr = buildProcessEnvironmentFrom(baseEnvironment, withoutManagedRootOverrides(options.Env))
 	}
 
-	var (
-		pluginSeed         *pluginSeedCache
-		pluginSeedEntryKey string
-		pluginSeedRestored bool
-	)
-
+	// The seed lands before the tree is prepared, because a prepared tree is the
+	// host's until it is reclaimed. A miss primes the cache through a launch of
+	// its own before this runtime goes on, so the runtime never pays the install.
 	if options.PluginSeedDir != "" && !options.Pure && environmentErr == nil && environment != nil {
-		pluginSeed = newPluginSeedCache(options.PluginSeedDir, options.Logger)
-
-		key, keyErr := pluginSeedKey(executable, envMapToSlice(environment))
-		if keyErr != nil {
-			options.Logger.DebugContext(ctx, "plugin seed not restored", slog.String("reason", keyErr.Error()))
-
-			pluginSeed = nil
-		} else {
-			pluginSeedEntryKey = key
-			pluginSeedRestored = pluginSeed.restore(ctx, key, openCodeConfigDir(xdg))
-		}
+		seedRuntimePlugins(ctx, options, executable, environment, xdg)
 	}
 
 	if options.PrepareTree != nil {
@@ -1189,13 +1189,6 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 				return nil, settleFailedServerStart(server, options.RetainTree, eraseErr)
 			}
 		}
-	}
-
-	// The install OpenCode just completed is worth keeping only when the adapter
-	// still owns the tree it lives in. A prepared tree belongs to host authority
-	// until it is reclaimed, and a restored tree is already cached.
-	if pluginSeed != nil && !pluginSeedRestored && options.PrepareTree == nil {
-		pluginSeed.harvest(ctx, pluginSeedEntryKey, openCodeConfigDir(xdg), server.nativeVersion)
 	}
 
 	return server, nil

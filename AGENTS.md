@@ -50,7 +50,8 @@ Organized by domain. The public surface lives in the root package
   directory-scoped SSE, dynamic MCP scopes, portable home locking, ordinary
   process execution, host-authority launch adapters, and the plugin seed cache
   (`plugin_seed.go`) that copies OpenCode's npm plugin install into new runtime
-  roots so a cold boot skips the install.
+  roots so a cold boot skips the install, filling an empty cache through a
+  session-free priming launch first.
 - **Observability** (`internal/observer`): OpenTelemetry instrumentation
   helpers (trace/metric definitions, trace-context propagation) and the
   instrumentation name.
