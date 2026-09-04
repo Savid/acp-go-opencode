@@ -3,7 +3,7 @@ set -euo pipefail
 
 provider=opencode
 packages=(./internal/opencode)
-selector='^(TestOrdinaryWindowsExecutableAndEnvironmentBehavior|TestWindowsEnvironmentCollapsesRepeatedSpellingsDeterministically)$'
+selector='^(TestOrdinaryWindowsExecutableAndEnvironmentBehavior|TestOrdinaryWindowsTeardownKillsTheShimGrandchild|TestWindowsEnvironmentCollapsesRepeatedSpellingsDeterministically)$'
 
 result_log="$(mktemp)"
 cleanup() { rm -f "$result_log"; }

@@ -72,18 +72,18 @@ func TestOrdinaryProcessAwaitCancellation(t *testing.T) {
 }
 
 func TestOrdinaryProcessPlatformHelperEdges(t *testing.T) {
-	stopped, err := stopOrdinaryProcess(t.Context(), nil)
+	stopped, err := stopOrdinaryProcess(t.Context(), nil, &ordinaryProcessGuard{})
 	require.NoError(t, err)
 	require.False(t, stopped)
-	require.NoError(t, containOrdinaryProcess(nil))
+	require.NoError(t, containOrdinaryProcess(nil, &ordinaryProcessGuard{}))
 	require.Equal(t, ProcessOutcome{ExitCode: -1}, ordinaryProcessOutcome(nil, nil))
 
 	finished := exec.Command("/bin/sh", "-c", "exit 0")
 	require.NoError(t, finished.Run())
-	stopped, err = stopOrdinaryProcess(t.Context(), finished)
+	stopped, err = stopOrdinaryProcess(t.Context(), finished, &ordinaryProcessGuard{})
 	require.NoError(t, err)
 	require.False(t, stopped)
-	require.NoError(t, containOrdinaryProcess(finished))
+	require.NoError(t, containOrdinaryProcess(finished, &ordinaryProcessGuard{}))
 
 	want := errors.New("contain failed")
 	require.NoError(t, normalizeContainOrdinaryProcessError(nil))
@@ -181,4 +181,29 @@ func TestOrdinaryProcessCancelledRevokeStillStartsTeardown(t *testing.T) {
 	result, err := process.Await(waitCtx)
 	require.NoError(t, err)
 	require.True(t, result.Revoked)
+}
+
+// TestStartOrdinaryProcessStopsAnUncontainableChild pins the refusal path: a
+// child the platform cannot place under containment is killed rather than
+// returned, so no uncontained native process ever reaches a caller.
+func TestStartOrdinaryProcessStopsAnUncontainableChild(t *testing.T) {
+	original := superviseOrdinary
+	t.Cleanup(func() { superviseOrdinary = original })
+
+	failure := errors.New("containment refused")
+	var contained *exec.Cmd
+
+	superviseOrdinary = func(command *exec.Cmd) (*ordinaryProcessGuard, error) {
+		contained = command
+
+		return nil, failure
+	}
+
+	handle, err := startOrdinaryProcess(t.Context(), "/bin/sh", []string{"-c", "sleep 30"},
+		[]string{"PATH=/usr/bin:/bin"}, t.TempDir())
+	require.ErrorIs(t, err, failure)
+	require.False(t, handle.valid())
+	require.NotNil(t, contained)
+	require.NotNil(t, contained.ProcessState, "the uncontainable child must be reaped, not merely killed")
+	require.False(t, contained.ProcessState.Success(), "the uncontainable child must not survive the refusal")
 }

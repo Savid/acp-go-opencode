@@ -12,10 +12,15 @@ anything it persists or streams.
 The standalone command and an embedded agent without `WithHostAuthority` use
 ordinary same-identity execution. OpenCode receives the adapter's filtered
 environment plus configured overlays. On Unix it runs in a separate process
-group so ordinary shutdown can terminate the group; this is lifecycle cleanup,
-not a managed-host containment claim. On Windows, ordinary mode uses the native
-root-process APIs and cannot independently prove descendant vacancy; hosts that
-require that guarantee supply `WithHostAuthority`.
+group so ordinary shutdown can terminate the group. On Windows it runs inside a
+job object, which shutdown terminates and whose closing destroys whatever is
+still inside it, because Windows has no process group that outlives its leader
+and the harness is commonly reached through an interpreter shim that would
+otherwise leave it orphaned. Neither is a managed-host containment claim:
+membership is inherited at creation, so a descendant started in the window
+between process start and job assignment is outside the job, and this remains
+lifecycle cleanup. Hosts that require proven descendant vacancy supply
+`WithHostAuthority`.
 
 An embedded managed host supplies `WithHostAuthority`. The adapter then:
 

@@ -9,11 +9,21 @@ import (
 	"syscall"
 )
 
+// ordinaryProcessGuard carries no state on POSIX: the process group set before
+// the child starts already contains every descendant, and outlives its leader,
+// so there is no handle for teardown to own. Windows has no such group and its
+// guard owns a job object instead.
+type ordinaryProcessGuard struct{}
+
 func configureOrdinaryProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func stopOrdinaryProcess(_ context.Context, command *exec.Cmd) (bool, error) {
+func superviseOrdinaryProcess(*exec.Cmd) (*ordinaryProcessGuard, error) {
+	return &ordinaryProcessGuard{}, nil
+}
+
+func stopOrdinaryProcess(_ context.Context, command *exec.Cmd, _ *ordinaryProcessGuard) (bool, error) {
 	if command == nil || command.Process == nil {
 		return false, nil
 	}
@@ -26,7 +36,7 @@ func stopOrdinaryProcess(_ context.Context, command *exec.Cmd) (bool, error) {
 	return err == nil, err
 }
 
-func containOrdinaryProcess(command *exec.Cmd) error {
+func containOrdinaryProcess(command *exec.Cmd, _ *ordinaryProcessGuard) error {
 	if command == nil || command.Process == nil {
 		return nil
 	}

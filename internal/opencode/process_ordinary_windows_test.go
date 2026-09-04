@@ -99,7 +99,7 @@ func TestOrdinaryWindowsNilProcessResultAndRevoke(t *testing.T) {
 	result := ordinaryProcessOutcome(nil, nil)
 	require.Equal(t, -1, result.ExitCode)
 	require.False(t, result.Revoked)
-	won, err := stopOrdinaryProcess(t.Context(), nil)
+	won, err := stopOrdinaryProcess(t.Context(), nil, &ordinaryProcessGuard{})
 	require.NoError(t, err)
 	require.False(t, won)
 }

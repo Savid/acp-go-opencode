@@ -10,6 +10,10 @@ import (
 	"sync/atomic"
 )
 
+// superviseOrdinary is the seam the containment tests replace: the platform
+// implementation only fails on Windows, where the coverage gate does not run.
+var superviseOrdinary = superviseOrdinaryProcess
+
 func startOrdinaryProcess(
 	_ context.Context,
 	executable string,
@@ -39,6 +43,17 @@ func startOrdinaryProcess(
 		return ProcessHandle{}, err
 	}
 
+	guard, err := superviseOrdinary(command)
+	if err != nil {
+		// A child the platform will not contain is never handed back, and it
+		// is waited on rather than only killed: the wait is what reaps it and
+		// closes the three pipes opened above, which nothing else now holds.
+		_ = command.Process.Kill()
+		_ = command.Wait()
+
+		return ProcessHandle{}, err
+	}
+
 	var (
 		waitOnce sync.Once
 		waitDone = make(chan struct{})
@@ -54,7 +69,7 @@ func startOrdinaryProcess(
 				outcome = ordinaryProcessOutcome(command, waitErr)
 				outcome.Revoked = revoked.Load()
 				waitErr = normalizeOrdinaryWaitError(waitErr)
-				waitErr = errors.Join(waitErr, containOrdinaryProcess(command))
+				waitErr = errors.Join(waitErr, containOrdinaryProcess(command, guard))
 
 				close(waitDone)
 			}()
@@ -72,7 +87,7 @@ func startOrdinaryProcess(
 		Input: stdin, Output: stdout, Errors: stderr,
 		Await: await,
 		Stop: func(ctx context.Context) error {
-			won, err := stopOrdinaryProcess(ctx, command)
+			won, err := stopOrdinaryProcess(ctx, command, guard)
 			if won {
 				revoked.Store(true)
 			}
