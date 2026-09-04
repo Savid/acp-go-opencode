@@ -709,7 +709,11 @@ func (s *session) awaitPromptTerminal(
 	case err := <-completion:
 		if err != nil {
 			s.recordCycleFailure(cycle, err)
+
+			return s.observedCycleEnd(cycle)
 		}
+
+		s.awaitAssistantEvidence(turnCtx, cycle)
 
 		return s.observedCycleEnd(cycle)
 	case <-turnCtx.Done():
@@ -734,6 +738,42 @@ func (s *session) awaitPromptTerminal(
 		end.timedOut = true
 
 		return end
+	}
+}
+
+// promptCompletionEvidenceWait bounds the settling wait below. It is a variable
+// so a test can drive the expiry without spending the real bound.
+var promptCompletionEvidenceWait = settlementTimeout
+
+// awaitAssistantEvidence lets the ordered stream catch up to a completion the
+// native route already reported.
+//
+// A completion-reporting route answers on its own connection, so its response
+// races the stream that carries the assistant identities the turn settles on.
+// The response is still terminal — a command that completed with a blocker
+// pending must end the turn rather than wait for an idle that never comes — so
+// this waits only for the identity the settling read needs, and only while the
+// cycle holds none. The wait is bounded: a run that produced no assistant
+// message at all still fails on the missing identity instead of holding the
+// turn open.
+func (s *session) awaitAssistantEvidence(turnCtx context.Context, cycle *foregroundCycle) {
+	s.lifecycleMu.Lock()
+	evidence := cycle.assistantEvidence
+	adopted := len(cycle.assistantIDs) > 0
+	s.lifecycleMu.Unlock()
+
+	if adopted || evidence == nil {
+		return
+	}
+
+	timer := time.NewTimer(promptCompletionEvidenceWait)
+	defer timer.Stop()
+
+	select {
+	case <-evidence:
+	case <-cycle.signal:
+	case <-turnCtx.Done():
+	case <-timer.C:
 	}
 }
 
