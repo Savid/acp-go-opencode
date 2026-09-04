@@ -206,13 +206,27 @@ func TestValidatePluginSeedTree(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, testPluginVersion, version)
 
+	writeAt := func(dir string, rel string, content string) error {
+		return os.WriteFile(filepath.Join(dir, filepath.FromSlash(rel)), []byte(content), 0o644)
+	}
+
 	lockWith := func(root string, plugin string) string {
 		return `{"packages":{` + root + plugin + `}}`
 	}
 
-	writeAt := func(dir string, rel string, content string) error {
-		return os.WriteFile(filepath.Join(dir, filepath.FromSlash(rel)), []byte(content), 0o644)
-	}
+	// npm keys every package entry by its path relative to the directory it
+	// resolved the install from, which is a prefix reaching back out through a
+	// symbolic link rather than the empty path whenever the config root holds
+	// one, as every root beneath the tree macOS reaches through /var does.
+	prefixed := t.TempDir()
+	writePluginSeedTree(t, prefixed, testPluginVersion)
+	require.NoError(t, writeAt(prefixed, pluginSeedLockFileName, lockWith(
+		`"":{"dependencies":{"@opencode-ai/plugin":"`+testPluginVersion+`"}},`,
+		`"../../private/var/opencode/node_modules/@opencode-ai/plugin":{"version":"`+testPluginVersion+`"}`)))
+
+	version, err = validatePluginSeedTree(prefixed)
+	require.NoError(t, err)
+	require.Equal(t, testPluginVersion, version)
 
 	cases := []struct {
 		name    string
@@ -259,6 +273,14 @@ func TestValidatePluginSeedTree(t *testing.T) {
 			name: "lock without the installed plugin",
 			mutate: func(dir string) error {
 				return writeAt(dir, pluginSeedLockFileName, lockWith(`"":{"dependencies":{"@opencode-ai/plugin":"1"}}`, ``))
+			},
+			wantErr: "does not record an installed",
+		},
+		{
+			name: "lock recording the plugin only under another package's install",
+			mutate: func(dir string) error {
+				return writeAt(dir, pluginSeedLockFileName, lockWith(`"":{"dependencies":{"@opencode-ai/plugin":"1"}},`,
+					`"node_modules/some-dep/node_modules/@opencode-ai/plugin":{"version":"1"}`))
 			},
 			wantErr: "does not record an installed",
 		},

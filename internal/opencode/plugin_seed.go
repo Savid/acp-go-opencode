@@ -109,6 +109,17 @@ type pluginSeedMeta struct {
 	CreatedAt       time.Time `json:"createdAt"`
 }
 
+// pluginSeedLock is the part of npm's lockfile the seed reasons about.
+type pluginSeedLock struct {
+	Packages map[string]pluginSeedLockPackage `json:"packages"`
+}
+
+// pluginSeedLockPackage is one package entry in npm's lockfile.
+type pluginSeedLockPackage struct {
+	Version      string            `json:"version"`
+	Dependencies map[string]string `json:"dependencies"`
+}
+
 // pluginSeedCache addresses one adapter-owned seed directory.
 type pluginSeedCache struct {
 	dir string
@@ -533,12 +544,7 @@ func validatePluginSeedTree(dir string) (string, error) {
 		return "", fmt.Errorf("%s does not depend on %s", pluginSeedPackageFileName, pluginSeedPluginPackage)
 	}
 
-	var lock struct {
-		Packages map[string]struct {
-			Version      string            `json:"version"`
-			Dependencies map[string]string `json:"dependencies"`
-		} `json:"packages"`
-	}
+	var lock pluginSeedLock
 
 	if err := readPluginSeedJSON(filepath.Join(dir, pluginSeedLockFileName), &lock); err != nil {
 		return "", err
@@ -555,8 +561,8 @@ func validatePluginSeedTree(dir string) (string, error) {
 		}
 	}
 
-	locked, ok := lock.Packages[pluginSeedModulesDirName+"/"+pluginSeedPluginPackage]
-	if !ok || locked.Version == "" {
+	lockedVersion := lockedPluginVersion(lock)
+	if lockedVersion == "" {
 		return "", fmt.Errorf("%s does not record an installed %s", pluginSeedLockFileName, pluginSeedPluginPackage)
 	}
 
@@ -569,11 +575,33 @@ func validatePluginSeedTree(dir string) (string, error) {
 		return "", err
 	}
 
-	if installed.Name != pluginSeedPluginPackage || installed.Version != locked.Version {
-		return "", fmt.Errorf("installed %s@%s does not match locked %s@%s", installed.Name, installed.Version, pluginSeedPluginPackage, locked.Version)
+	if installed.Name != pluginSeedPluginPackage || installed.Version != lockedVersion {
+		return "", fmt.Errorf("installed %s@%s does not match locked %s@%s", installed.Name, installed.Version, pluginSeedPluginPackage, lockedVersion)
 	}
 
 	return installed.Version, nil
+}
+
+// lockedPluginVersion reports the version the lock records for the plugin
+// installed in the install root's own node_modules, and the empty string when
+// it records none.
+//
+// npm keys every package entry by its path relative to the directory it
+// resolved the install from. That path is empty when the config root holds no
+// symbolic link, and a prefix reaching back out through the link when it does
+// — which is every root beneath the temporary tree macOS reaches through
+// /var — so the entry is found by its position inside the root's own
+// node_modules rather than by an exact key. A prefix of its own node_modules
+// would name a nested install of another package's dependency instead.
+func lockedPluginVersion(lock pluginSeedLock) string {
+	for path, entry := range lock.Packages {
+		prefix, ok := strings.CutSuffix(path, pluginSeedModulesDirName+"/"+pluginSeedPluginPackage)
+		if ok && !strings.Contains(prefix, pluginSeedModulesDirName+"/") {
+			return entry.Version
+		}
+	}
+
+	return ""
 }
 
 func readPluginSeedJSON(path string, value any) error {
