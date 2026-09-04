@@ -457,6 +457,8 @@ func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	require.Nil(t, handed.StartProcess)
 	require.Nil(t, handed.PrepareTree)
 	require.Nil(t, handed.ReclaimTree)
+	require.Equal(t, agent.pluginSeedDir(context.Background()), handed.PluginSeedDir)
+	require.NotEmpty(t, handed.PluginSeedDir, "the runtime is handed the resolved plugin seed cache")
 
 	originalStart := runtimeStartServer
 	runtimeStartServer = func(context.Context, opencode.StartOptions) (opencode.Client, error) {

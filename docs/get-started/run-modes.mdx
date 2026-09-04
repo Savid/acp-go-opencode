@@ -27,6 +27,13 @@ Use `-home` when the host assigns an exact exclusive runtime XDG root. Use
 assigned. Either location must resolve to an approved local filesystem; remote,
 overlay, and unrecognized filesystems are rejected before native startup.
 
+The first boot of a fresh runtime root waits for OpenCode to npm-install its
+plugin loader, which can take minutes. The adapter caches that install per
+`opencode` binary in the [plugin seed cache](/docs/reference/cli#plugin-seed-cache)
+and copies it into every new root, so later boots without `-home` start in
+seconds. A persistent `-home` reaches the same steady state on its own after
+one cold boot.
+
 ## Embedded
 
 `Serve` runs the agent against reader/writer streams you supply, so your host

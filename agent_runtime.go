@@ -523,7 +523,7 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 		Pure: a.options.Pure, QuestionTool: a.options.QuestionTool,
 		LogLevel: a.options.LogLevel, MinVersion: minNativeVersion,
 		HealthTimeout: a.options.HealthCheckTimeout, Logger: a.log,
-		SeedFiles: a.options.SeedFiles,
+		SeedFiles: a.options.SeedFiles, PluginSeedDir: a.pluginSeedDir(ctx),
 	}
 
 	if a.options.hostAuthorityConfigured {

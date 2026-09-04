@@ -97,6 +97,31 @@ filesystem access beneath it and the module remains for the runtime's life
 inside that tree. A managed host that wants the same guarantee should treat the
 prepared tree as holding a live credential.
 
+### Plugin seed cache
+
+The [plugin seed cache](/docs/reference/cli#plugin-seed-cache) holds a copy of
+the `@opencode-ai/plugin` npm tree that OpenCode loads and executes inside every
+runtime root. It is executable code, and the adapter treats it accordingly:
+
+- The cache is populated only from a tree OpenCode produced inside a runtime
+  root this adapter launched. Nothing is ever read from `~/.config/opencode` or
+  any other native home.
+- Entries are created with mode `0700` under the invoking user, keyed by the
+  resolved path, size, and modification time of the `opencode` binary, and
+  published in a single rename. No entry is modified in place.
+- Before a restore, an entry must be owned by the invoking user, closed to group
+  and world writes, and hold a complete install with the plugin package at the
+  locked version. Anything else is discarded and the boot takes the cold path.
+- A restore is a real copy. Symbolic links are recreated only when relative and
+  confined to the tree, so nothing inside a runtime root refers back into the
+  cache, and a later npm run inside that root cannot write into it.
+- A managed runtime under `WithHostAuthority` restores before its tree is
+  prepared and never harvests, because a prepared tree is not the adapter's to
+  read.
+
+Point `-plugin-seed-dir` only at a directory private to the user running the
+adapter, or disable the cache with `-no-plugin-seed`.
+
 ## Session and handoff boundaries
 
 Native session IDs, canonical directory scopes, and turn nonces bind every

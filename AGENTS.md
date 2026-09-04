@@ -32,11 +32,12 @@ Organized by domain. The public surface lives in the root package
   cancel handling, native REST/SSE event mapping, permission and question
   reconciliation, plan and message emission, config-option (model/mode)
   resolution, and session metadata parsing.
-- **Options and builders** (`options.go`, `request_builders.go`): agent
-  `Option` constructors (executable path, scratch directory, default model, env,
-  session store, telemetry providers, and OpenCode runtime toggles) and the
-  exported request builders, `OpenCodeOptions`, MCP server builders, and fork
-  call helper.
+- **Options and builders** (`options.go`, `request_builders.go`,
+  `plugin_seed.go`): agent `Option` constructors (executable path, scratch
+  directory, default model, env, session store, telemetry providers, plugin
+  seed cache location, and OpenCode runtime toggles), the default plugin seed
+  cache resolution, and the exported request builders, `OpenCodeOptions`, MCP
+  server builders, and fork call helper.
 - **Session storage** (`session_store.go`, `session_state_store.go`,
   `session_restore_ownership.go`): the
   `SessionStore` interface, `InMemorySessionStore`, the
@@ -47,7 +48,9 @@ Organized by domain. The public surface lives in the root package
 - **Native OpenCode client** (`internal/opencode`, package `opencode`): launch
   and readiness of the loopback `opencode serve` process, native REST and
   directory-scoped SSE, dynamic MCP scopes, portable home locking, ordinary
-  process execution, and host-authority launch adapters.
+  process execution, host-authority launch adapters, and the plugin seed cache
+  (`plugin_seed.go`) that copies OpenCode's npm plugin install into new runtime
+  roots so a cold boot skips the install.
 - **Observability** (`internal/observer`): OpenTelemetry instrumentation
   helpers (trace/metric definitions, trace-context propagation) and the
   instrumentation name.
@@ -93,6 +96,11 @@ coverage. The live suite runs the zero-cost
 `ACP_GO_OPENCODE_QUESTION_PROMPT` to override the model and the prompts used to
 exercise permission and question flows.
 Live tests always launch OpenCode under an exclusive test runtime XDG root.
+The native proofs in `internal/opencode` share one plugin seed cache that a
+single cold launch primes, so a package run pays for OpenCode's npm install
+once; set `ACP_GO_OPENCODE_TEST_PLUGIN_SEED_DIR` to a scratch directory such as
+`.tmp/plugin-seed` to keep that cache across local reruns. Never point it at the
+real user cache.
 
 `make test-integration-attended` sets `ACP_GO_OPENCODE_RUN_ATTENDED=1` and runs
 the provider-auth flows a human must approve at the provider.

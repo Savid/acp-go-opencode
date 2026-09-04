@@ -258,6 +258,12 @@ type StartOptions struct {
 	RemoveRoot        bool
 	SkipVersionGate   bool
 	SeedFiles         map[string]string
+	// PluginSeedDir is the adapter-owned cache of the npm tree OpenCode installs
+	// for its plugin loader. A hit is copied into the runtime config root before
+	// launch so OpenCode skips the install; a miss is harvested after readiness.
+	// Empty disables seeding, as does Pure, and a managed runtime never harvests
+	// because its prepared tree is not the adapter's to read.
+	PluginSeedDir string
 }
 
 // MCPServerConfig describes one MCP server exposed to the native OpenCode
@@ -978,6 +984,46 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		return nil, configErr
 	}
 
+	executable := options.ExecutablePath
+	if executable == "" {
+		executable = opencodeExecutableName
+	}
+
+	// The environment is built here, ahead of tree preparation, because the seed
+	// key must resolve the executable against the PATH the child will get. Its
+	// failures are reported below, after the tree joins the prepared set, so a
+	// refused environment still cleans the carrier up.
+	baseEnvironment := options.NativeEnvironment()
+
+	var (
+		environment    map[string]string
+		environmentErr error
+	)
+
+	if baseEnvironment != nil {
+		environment, environmentErr = buildProcessEnvironmentFrom(baseEnvironment, withoutManagedRootOverrides(options.Env))
+	}
+
+	var (
+		pluginSeed         *pluginSeedCache
+		pluginSeedEntryKey string
+		pluginSeedRestored bool
+	)
+
+	if options.PluginSeedDir != "" && !options.Pure && environmentErr == nil && environment != nil {
+		pluginSeed = newPluginSeedCache(options.PluginSeedDir, options.Logger)
+
+		key, keyErr := pluginSeedKey(executable, envMapToSlice(environment))
+		if keyErr != nil {
+			options.Logger.DebugContext(ctx, "plugin seed not restored", slog.String("reason", keyErr.Error()))
+
+			pluginSeed = nil
+		} else {
+			pluginSeedEntryKey = key
+			pluginSeedRestored = pluginSeed.restore(ctx, key, openCodeConfigDir(xdg))
+		}
+	}
+
 	if options.PrepareTree != nil {
 		for _, tree := range []preparedNativeTree{runtimeTree} {
 			if prepareErr := options.PrepareTree(ctx, tree.path); prepareErr != nil {
@@ -1022,12 +1068,10 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		arguments = append(arguments, "--log-level", options.LogLevel)
 	}
 
-	baseEnvironment := options.NativeEnvironment()
 	if baseEnvironment == nil {
 		return nil, errors.New("native environment is unavailable")
 	}
 
-	environment, environmentErr := buildProcessEnvironmentFrom(baseEnvironment, withoutManagedRootOverrides(options.Env))
 	if environmentErr != nil {
 		return nil, environmentErr
 	}
@@ -1047,11 +1091,6 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 	nativeEnvironment := envMapToSlice(environment)
 	if options.BrowserShim != nil {
 		nativeEnvironment = options.BrowserShim.environ(nativeEnvironment)
-	}
-
-	executable := options.ExecutablePath
-	if executable == "" {
-		executable = opencodeExecutableName
 	}
 
 	homeLock, lockErr := openCodeAcquireHomeLock(controlRoot)
@@ -1150,6 +1189,13 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 				return nil, settleFailedServerStart(server, options.RetainTree, eraseErr)
 			}
 		}
+	}
+
+	// The install OpenCode just completed is worth keeping only when the adapter
+	// still owns the tree it lives in. A prepared tree belongs to host authority
+	// until it is reclaimed, and a restored tree is already cached.
+	if pluginSeed != nil && !pluginSeedRestored && options.PrepareTree == nil {
+		pluginSeed.harvest(ctx, pluginSeedEntryKey, openCodeConfigDir(xdg), server.nativeVersion)
 	}
 
 	return server, nil
@@ -3067,6 +3113,12 @@ func ensureXDGDirs(dirs XDGDirs) error {
 	return nil
 }
 
+// openCodeConfigDir is the directory OpenCode reads its configuration from and
+// installs its plugin loader into, beneath the runtime's XDG config root.
+func openCodeConfigDir(dirs XDGDirs) string {
+	return filepath.Join(dirs.Config, opencodeExecutableName)
+}
+
 const (
 	openCodeConfigFileName    = "opencode.json"
 	openCodeSeedManifestName  = ".seed-manifest.json"
@@ -3078,7 +3130,7 @@ const (
 // configuration. Permission and MCP state are session/directory scoped and
 // must never enter OPENCODE_CONFIG_CONTENT on a multiplexed runtime.
 func materializeOpenCodeRuntimeConfig(dirs XDGDirs, seedFiles map[string]string, sessionCarrierPlugin string) (string, error) {
-	configDir := filepath.Join(dirs.Config, opencodeExecutableName)
+	configDir := openCodeConfigDir(dirs)
 	if err := openCodeSeedMkdirAll(configDir, 0o700); err != nil {
 		return "", err
 	}

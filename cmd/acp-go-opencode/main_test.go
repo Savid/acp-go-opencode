@@ -62,6 +62,8 @@ func TestRunServeSuccessAndError(t *testing.T) {
 		"-opencode-log-level", "INFO",
 		"-opencode-health-timeout", "1s",
 		"-seed-file", "opencode.json=" + seedHost,
+		"-plugin-seed-dir", "/tmp/plugin-seed",
+		"-no-plugin-seed",
 	}, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
 		t.Fatalf("serve success code = %d", code)
 	}
@@ -74,6 +76,9 @@ func TestRunServeSuccessAndError(t *testing.T) {
 	}
 	if configured.ExecutablePath != "opencode" || configured.Home != "/tmp/home" {
 		t.Fatalf("configured options = %#v", configured)
+	}
+	if configured.PluginSeedDir != "/tmp/plugin-seed" || !configured.PluginSeedDisabled {
+		t.Fatalf("plugin seed options = %q / disabled=%t", configured.PluginSeedDir, configured.PluginSeedDisabled)
 	}
 
 	serve = func(context.Context, io.Reader, io.Writer, ...opencodeacp.Option) error {

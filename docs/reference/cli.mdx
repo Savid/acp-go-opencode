@@ -34,6 +34,29 @@ host-owned native process boundary embed the Go package and pass
 | `-opencode-log-level` | Native OpenCode server log level. | native default |
 | `-opencode-health-timeout` | OpenCode server readiness timeout. | `60s` |
 | `-seed-file <relpath>=<hostpath>` | Seed a file into the shared runtime config root (repeatable). | — |
+| `-plugin-seed-dir` | Cache of the OpenCode plugin install copied into new runtime roots. | `plugin-seed` under the user cache directory |
+| `-no-plugin-seed` | Disable the plugin install cache. | off |
+
+## Plugin seed cache
+
+OpenCode installs its plugin loader, the `@opencode-ai/plugin` npm package,
+into `<XDG_CONFIG_HOME>/opencode/` the first time a runtime root names any
+plugin. This adapter always names one, its session carrier, and without `-home`
+every launch gets a fresh root, so a cold boot waits minutes for that install.
+
+The adapter therefore keeps one copy of the tree OpenCode produced, keyed by the
+identity of the `opencode` binary, in the plugin seed cache and copies it into
+each new runtime root before launch. OpenCode finds the install complete and
+skips it, so a warm boot answers `session/new` in seconds. A binary upgrade
+changes the key and the next boot harvests a fresh copy; stale entries are
+removed after thirty days and the cache keeps a handful of binaries at most.
+
+The default location is `acp-go-opencode/plugin-seed` beneath the user cache
+directory: `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on
+macOS, and `%LocalAppData%` on Windows. `-plugin-seed-dir` relocates it and
+`-no-plugin-seed` turns it off. `-opencode-pure` runs install no plugin loader
+and never touch the cache. The cache holds code OpenCode executes; see
+[Security](/docs/operations/security) for who may write it.
 
 ## Seeding files
 

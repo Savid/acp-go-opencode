@@ -78,6 +78,8 @@ authority error is never retried through ordinary execution.
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
 | `WithEnv` | Agent-wide ordinary-variable overlays. Managed OpenCode/XDG roots remain adapter-owned. |
 | `WithSeedFiles` | Immutable files materialized in the shared config root before launch. |
+| `WithPluginSeedDir` | Cache of the OpenCode plugin install copied into new runtime roots; empty uses `plugin-seed` under the user cache directory. |
+| `WithPluginSeed` | Enable or disable the plugin install cache; enabled by default. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration; default `10s`. |
 | `WithConcurrencyLimits` | Cap concurrent client calls and active sessions. |
@@ -108,6 +110,15 @@ Leaving it unset rejects the handoff form.
 start. A seeded `opencode.json` is merged with the adapter's `$schema` and must
 not contain `permission` or `mcp`, which remain session and directory scoped.
 Absolute paths, parent escapes, and empty keys are rejected.
+
+`WithPluginSeedDir` names the cache of the npm tree OpenCode installs for its
+plugin loader. The adapter copies a cached tree into each new runtime root
+before launch so OpenCode skips the install, and harvests the tree OpenCode
+produces when the cache has no entry for the running binary. A managed runtime
+under `WithHostAuthority` restores from the cache but never harvests, because
+its prepared tree is not the adapter's to read. See the
+[CLI reference](/docs/reference/cli#plugin-seed-cache) for the layout and
+[Security](/docs/operations/security) for the trust boundary.
 
 ### OpenCode process options
 

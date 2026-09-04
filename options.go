@@ -61,11 +61,18 @@ type Options struct {
 	SeedFiles               map[string]string
 	ImageLimits             ImageLimits
 
-	Pure                    bool
-	QuestionTool            bool
-	LogLevel                string
-	HealthCheckTimeout      time.Duration
-	TurnTimeout             time.Duration
+	Pure               bool
+	QuestionTool       bool
+	LogLevel           string
+	HealthCheckTimeout time.Duration
+	TurnTimeout        time.Duration
+	// PluginSeedDir is the adapter-owned cache of the npm tree OpenCode installs
+	// for its plugin loader, copied into each new runtime root before launch.
+	// Empty resolves to plugin-seed beneath the adapter's user cache directory.
+	PluginSeedDir string
+	// PluginSeedDisabled turns the plugin seed cache off entirely: every cold
+	// runtime root then waits for OpenCode's own install.
+	PluginSeedDisabled      bool
 	clientFactory           func(context.Context, opencode.StartOptions) (opencode.Client, error)
 	implicitEnvironment     map[string]string
 	hostAuthorityConfigured bool
@@ -263,6 +270,28 @@ func WithOpenCodeLogLevel(level string) Option {
 func WithOpenCodeHealthCheckTimeout(timeout time.Duration) Option {
 	return func(options *Options) {
 		options.HealthCheckTimeout = timeout
+	}
+}
+
+// WithPluginSeedDir relocates the plugin seed cache. OpenCode installs its
+// plugin loader with npm into every fresh runtime root, which costs minutes on
+// a cold boot; the adapter keeps one copy of that install per native binary in
+// this directory and copies it into each new root before launch. The default
+// is plugin-seed beneath the adapter's directory in the user cache directory.
+// The cache holds code OpenCode executes, so it must stay private to the user
+// running the adapter.
+func WithPluginSeedDir(dir string) Option {
+	return func(options *Options) {
+		options.PluginSeedDir = dir
+	}
+}
+
+// WithPluginSeed enables or disables the plugin seed cache. It is enabled by
+// default; disabling it leaves every cold runtime root to OpenCode's own
+// install and writes nothing beneath the seed directory.
+func WithPluginSeed(enabled bool) Option {
+	return func(options *Options) {
+		options.PluginSeedDisabled = !enabled
 	}
 }
 

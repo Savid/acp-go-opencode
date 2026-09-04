@@ -189,6 +189,7 @@ func startNativeCarrierRuntime(t *testing.T) nativeCarrierProbe {
 			}
 		},
 		HealthTimeout: 120 * time.Second,
+		PluginSeedDir: sharedPluginSeedDir(t),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = runtime.Shutdown(context.Background()) })
@@ -617,6 +618,7 @@ func startNativeScopeShellRuntime(t *testing.T) nativeScopeShellProbe {
 			}
 		},
 		HealthTimeout: 120 * time.Second,
+		PluginSeedDir: sharedPluginSeedDir(t),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = runtime.Shutdown(context.Background()) })
@@ -1087,6 +1089,7 @@ func TestNativeRuntimeRefusesACarrierPluginItCannotLoad(t *testing.T) {
 			}
 		},
 		HealthTimeout: 30 * time.Second,
+		PluginSeedDir: sharedPluginSeedDir(t),
 	})
 	require.Error(t, err, "a runtime whose carrier plugin never loaded must never reach a session")
 	require.ErrorContains(t, err, "session carrier plugin did not load")

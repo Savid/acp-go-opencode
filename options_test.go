@@ -44,10 +44,18 @@ func TestApplyOptions(t *testing.T) {
 		WithOpenCodeQuestionTool(true),
 		WithOpenCodeLogLevel("INFO"),
 		WithOpenCodeHealthCheckTimeout(time.Second),
+		WithPluginSeedDir("/tmp/plugin-seed"),
+		WithPluginSeed(false),
 	})
 	if opts.AgentName != "name" || opts.AgentTitle != "title" || opts.ExecutablePath != "opencode" ||
 		opts.Env["A"] != "1" || !opts.Pure || !opts.QuestionTool || opts.SessionStore != store {
 		t.Fatalf("options = %#v", opts)
+	}
+	if opts.PluginSeedDir != "/tmp/plugin-seed" || !opts.PluginSeedDisabled {
+		t.Fatalf("plugin seed options = %q / disabled=%t", opts.PluginSeedDir, opts.PluginSeedDisabled)
+	}
+	if defaults := applyOptions(nil); defaults.PluginSeedDisabled || defaults.PluginSeedDir != "" {
+		t.Fatalf("plugin seed defaults = %#v", defaults)
 	}
 	if scratch := (&Agent{options: opts}).scratchParent(); opts.Home != "/tmp/home" || scratch != "/tmp/scratch" {
 		t.Fatalf("home/scratch options = %q / %q", opts.Home, scratch)

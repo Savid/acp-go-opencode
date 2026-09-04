@@ -20,6 +20,18 @@ The overall readiness budget defaults to 60 seconds and is configurable with
 session creation stays slow, raise `-debug` logging and watch the per-stage
 startup timings on stderr.
 
+Health and OpenAPI usually answer within seconds; the long wait, when there is
+one, is OpenCode npm-installing its plugin loader into a fresh runtime root
+before it will load the adapter's session carrier. The adapter avoids that on
+every boot after the first through the
+[plugin seed cache](/docs/reference/cli#plugin-seed-cache). A boot that still
+waits minutes with `-debug` on will log why the cache was not used: a
+`plugin seed not restored` line names the reason, such as an unresolvable
+executable, a cache directory owned by another user, or `-no-plugin-seed`. A
+readiness timeout on the very first boot of a new `opencode` binary is the cold
+install itself; raise `-opencode-health-timeout` for that boot or reuse a
+persistent `-home`.
+
 Reproduced by `TestHealthAttemptDeadlineReleaseGate` in
 `internal/opencode/opencode_client_lifecycle_test.go`.
 

@@ -41,6 +41,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	questionTool := flags.Bool("opencode-question-tool", false, "enable OpenCode native question tool mapping")
 	logLevel := flags.String("opencode-log-level", "", "OpenCode native server log level")
 	healthTimeout := flags.Duration("opencode-health-timeout", opencode.HealthCheckTimeout, "OpenCode server readiness timeout")
+	pluginSeedDir := flags.String("plugin-seed-dir", "", "cache of the OpenCode plugin install copied into new runtime roots; empty uses plugin-seed under the user cache directory")
+	noPluginSeed := flags.Bool("no-plugin-seed", false, "disable the OpenCode plugin install cache")
 
 	var seedFiles seedFileFlag
 
@@ -96,6 +98,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		opencodeacp.WithOpenCodeQuestionTool(*questionTool),
 		opencodeacp.WithOpenCodeLogLevel(*logLevel),
 		opencodeacp.WithOpenCodeHealthCheckTimeout(*healthTimeout),
+		opencodeacp.WithPluginSeedDir(*pluginSeedDir),
+		opencodeacp.WithPluginSeed(!*noPluginSeed),
 	)
 
 	if len(seedFiles.files) > 0 {
