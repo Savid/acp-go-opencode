@@ -63,3 +63,14 @@ func TestPluginSeedRestoreRefusesAnotherUsersEntry(t *testing.T) {
 	require.NoDirExists(t, entry)
 	require.NoFileExists(t, filepath.Join(configDir, pluginSeedPackageFileName))
 }
+
+// TestValidatePluginSeedEntryRefusesAGroupWritableEntry states the half of the
+// cache's guard that only a platform with POSIX modes can express. It lives
+// beside pluginSeedModeLoose rather than in the entry table, because that table
+// runs everywhere and Windows reports the group and world write bits set on
+// every path it has.
+func TestValidatePluginSeedEntryRefusesAGroupWritableEntry(t *testing.T) {
+	entry := writePluginSeedEntry(t, t.TempDir(), "key", testPluginVersion, time.Now())
+	require.NoError(t, os.Chmod(entry, 0o770))
+	require.ErrorContains(t, validatePluginSeedEntry(entry), "writable by group or world")
+}

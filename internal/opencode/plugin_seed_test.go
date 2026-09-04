@@ -312,11 +312,6 @@ func TestValidatePluginSeedEntry(t *testing.T) {
 			wantErr: "is not a directory",
 		},
 		{
-			name:    "entry writable by group",
-			mutate:  func(entry string) error { return os.Chmod(entry, 0o770) },
-			wantErr: "writable by group or world",
-		},
-		{
 			name: "manifest is a directory",
 			mutate: func(entry string) error {
 				path := filepath.Join(entry, pluginSeedPackageFileName)
