@@ -503,7 +503,7 @@ func requireGuardedPluginSeedPath(path string, wantDir bool) error {
 		return fmt.Errorf("%s is not a directory", path)
 	case !wantDir && !info.Mode().IsRegular():
 		return fmt.Errorf("%s is not a regular file", path)
-	case info.Mode().Perm()&pluginSeedLooseModeBits != 0:
+	case pluginSeedModeLoose(info):
 		return fmt.Errorf("%s is writable by group or world", path)
 	}
 

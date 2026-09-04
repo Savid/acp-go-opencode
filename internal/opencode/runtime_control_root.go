@@ -23,8 +23,8 @@ func ensureRuntimeControlRoot(root string) error {
 		return fmt.Errorf("inspect OpenCode runtime control root: %w", err)
 	}
 
-	if !info.IsDir() || info.Mode().Perm() != 0o700 {
-		return errors.New("OpenCode runtime control root must be a trusted directory with mode 0700")
+	if !info.IsDir() || !runtimeControlRootTrusted(info) {
+		return errors.New("OpenCode runtime control root must be a directory this user alone may write")
 	}
 
 	return nil

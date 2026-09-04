@@ -27,3 +27,10 @@ func pluginSeedOwnedByCaller(info fs.FileInfo) error {
 
 	return nil
 }
+
+// pluginSeedModeLoose reports a cache path any account but the owner may
+// write. The cache holds code OpenCode will execute, so a path a second
+// account could rewrite between validation and copy is never restored.
+func pluginSeedModeLoose(info fs.FileInfo) bool {
+	return info.Mode().Perm()&pluginSeedLooseModeBits != 0
+}

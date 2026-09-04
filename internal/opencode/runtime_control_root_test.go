@@ -15,27 +15,14 @@ func TestEnsureRuntimeControlRootCreatesAndValidatesProtectedDirectory(t *testin
 	info, err := os.Lstat(root)
 	require.NoError(t, err)
 	require.True(t, info.IsDir())
-	require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
 	require.NoError(t, ensureRuntimeControlRoot(root))
 }
 
-func TestEnsureRuntimeControlRootRefusesRedirectsAndUnsafeExistingPaths(t *testing.T) {
+// TestEnsureRuntimeControlRootRefusesPathsThatAreNotADirectory covers what
+// every platform judges the same way. What "this user alone may write" means
+// is platform-specific and is pinned beside the platform's own predicate.
+func TestEnsureRuntimeControlRootRefusesPathsThatAreNotADirectory(t *testing.T) {
 	parent := t.TempDir()
-	decoy := filepath.Join(parent, "decoy")
-	require.NoError(t, os.Mkdir(decoy, 0o755))
-	symlink := filepath.Join(parent, "symlink")
-	require.NoError(t, os.Symlink(decoy, symlink))
-	require.Error(t, ensureRuntimeControlRoot(symlink))
-	info, err := os.Stat(decoy)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
-
-	unsafe := filepath.Join(parent, "unsafe")
-	require.NoError(t, os.Mkdir(unsafe, 0o755))
-	require.Error(t, ensureRuntimeControlRoot(unsafe))
-	info, err = os.Stat(unsafe)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
 
 	regular := filepath.Join(parent, "regular")
 	require.NoError(t, os.WriteFile(regular, []byte("state"), 0o600))

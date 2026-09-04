@@ -45,10 +45,19 @@ func materializedCarrier(t *testing.T) (string, string, sessionCarrierPlugin) {
 	t.Cleanup(func() { _ = plugin.Cleanup() })
 	parsed, err := url.Parse(plugin.URL)
 	require.NoError(t, err)
-	content, err := os.ReadFile(parsed.Path)
+	require.Equal(t, sessionCarrierURLScheme, parsed.Scheme)
+
+	// A file URL's path is slash-separated and, where the platform has drive
+	// letters, carries a leading slash the filesystem does not. The module the
+	// URL names is the one the plugin already holds, so the URL is checked
+	// against that path rather than being turned back into one.
+	require.True(t, strings.HasSuffix(parsed.Path, filepath.ToSlash(plugin.Path)),
+		"the registered URL must name the module that was written")
+
+	content, err := os.ReadFile(plugin.Path)
 	require.NoError(t, err)
 
-	return parsed.Path, string(content), plugin
+	return plugin.Path, string(content), plugin
 }
 
 // carrierMarkFor names the generated search-path component the plugin and the
