@@ -87,9 +87,11 @@ covers behavior that does not spend model tokens. `make test-integration-live`
 additionally sets `ACP_GO_OPENCODE_RUN_LIVE_TOKENS=1` and may spend model
 tokens. `make test-integration-cover` runs the smoke suite against a compiled
 binary named through `ACP_GO_OPENCODE_AGENT_BINARY` with `GOCOVERDIR`
-coverage. The live suite reads `ACP_GO_OPENCODE_MODEL`,
-`ACP_GO_OPENCODE_PERMISSION_PROMPT`, and `ACP_GO_OPENCODE_QUESTION_PROMPT` to
-tune the model and the prompts used to exercise permission and question flows.
+coverage. The live suite runs the zero-cost
+`opencode/muse-spark-1.3-contributor-free` model by default and reads
+`ACP_GO_OPENCODE_MODEL`, `ACP_GO_OPENCODE_PERMISSION_PROMPT`, and
+`ACP_GO_OPENCODE_QUESTION_PROMPT` to override the model and the prompts used to
+exercise permission and question flows.
 Live tests always launch OpenCode under an exclusive test runtime XDG root.
 
 `make test-integration-attended` sets `ACP_GO_OPENCODE_RUN_ATTENDED=1` and runs

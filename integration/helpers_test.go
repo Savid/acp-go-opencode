@@ -13,8 +13,11 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
+	opencodeacp "github.com/savid/acp-go-opencode"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 )
 
 const (
@@ -22,6 +25,16 @@ const (
 	envRunLiveTokens  = "ACP_GO_OPENCODE_RUN_LIVE_TOKENS"
 	envHarnessPath    = "ACP_GO_OPENCODE_HARNESS_PATH"
 	envAgentBinary    = "ACP_GO_OPENCODE_AGENT_BINARY"
+	envModel          = "ACP_GO_OPENCODE_MODEL"
+
+	// defaultLiveModel is the model every token-spending test runs under unless
+	// ACP_GO_OPENCODE_MODEL names another. OpenCode publishes it at zero cost
+	// with tool calling, so the permission and question flows run for free.
+	defaultLiveModel = "opencode/muse-spark-1.3-contributor-free"
+
+	// agentExitGrace bounds how long a closed stdin may take to shut the wrapper
+	// and the native runtime it owns down before the process is killed outright.
+	agentExitGrace = 5 * time.Second
 )
 
 var integrationLogger = slog.New(slog.DiscardHandler)
@@ -201,12 +214,47 @@ func repoRoot() string {
 }
 
 type liveAgent struct {
-	cmd    interface{ ProcessState() *os.ProcessState }
-	stdin  io.WriteCloser
-	stdout io.Reader
-	stderr safeBuffer
-	close  func()
-	wait   func() error
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	stdout    io.Reader
+	stderr    safeBuffer
+	done      chan error
+	closeOnce sync.Once
+}
+
+// startAgent launches the wrapper with the given flags and registers its
+// teardown with t.Cleanup, so a failed test still shuts the wrapper and the
+// native runtime it owns down instead of leaving an orphaned opencode serve.
+func startAgent(t *testing.T, ctx context.Context, args ...string) *liveAgent {
+	t.Helper()
+
+	cmd := agentCommand(ctx, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A cancelled test context ends the ACP connection the way a host does
+	// rather than killing the wrapper before it can tear its runtime down; the
+	// kill only follows a wrapper that ignores the closed input.
+	cmd.Cancel = stdin.Close
+	cmd.WaitDelay = agentExitGrace
+
+	agent := &liveAgent{cmd: cmd, stdin: stdin, stdout: stdout, done: make(chan error, 1)}
+	cmd.Stderr = &agent.stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() { agent.done <- cmd.Wait() }()
+
+	t.Cleanup(agent.close)
+
+	return agent
 }
 
 func startLiveAgent(t *testing.T, ctx context.Context, home string, extraArgs ...string) *liveAgent {
@@ -218,30 +266,56 @@ func startLiveAgent(t *testing.T, ctx context.Context, home string, extraArgs ..
 		"-opencode-health-timeout", "60s",
 	}
 	args = append(args, extraArgs...)
-	cmd := agentCommand(ctx, args...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	agent := &liveAgent{stdin: stdin, stdout: stdout, wait: cmd.Wait}
-	cmd.Stderr = &agent.stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	agent.close = func() {
-		_ = stdin.Close()
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	}
-	return agent
+
+	return startAgent(t, ctx, args...)
+}
+
+// close shuts the wrapper down the way a host does: closing stdin ends the ACP
+// connection and the wrapper tears its native runtime down before it exits.
+// Killing the process is the fallback for a wrapper that does not exit in time,
+// and a killed wrapper cannot stop its runtime, so the grace period comes first.
+func (a *liveAgent) close() {
+	a.closeOnce.Do(func() {
+		_ = a.stdin.Close()
+
+		select {
+		case <-a.done:
+		case <-time.After(agentExitGrace):
+			_ = a.cmd.Process.Kill()
+			<-a.done
+		}
+	})
 }
 
 func (a *liveAgent) stderrString() string {
 	return a.stderr.String()
+}
+
+// liveModelArgs names the model a token-spending test runs under.
+func liveModelArgs() []string {
+	return []string{"-model", envOrDefault(envModel, defaultLiveModel)}
+}
+
+// lifecycleOffer is the initialize offer that enables the lifecycle extension.
+// This adapter admits native actions such as permission requests only on a
+// connection that negotiated it, so every token-spending test offers it.
+func lifecycleOffer() map[string]any {
+	return map[string]any{lifecycle.MetaKey: map[string]any{"version": 1}}
+}
+
+// correlatedPrompt stamps both envelopes a negotiated prompt carries: the turn
+// route and the lifecycle submission correlation.
+func correlatedPrompt(sessionID acp.SessionId, turnNonce, text string) acp.PromptRequest {
+	request := opencodeacp.TextPromptRequest(sessionID, turnNonce, text)
+	request.Meta[lifecycle.MetaKey] = map[string]any{
+		"version": 1,
+		"submission": map[string]any{
+			"submissionId": "submission-" + turnNonce,
+			"clientNonce":  "client-" + turnNonce,
+		},
+	}
+
+	return request
 }
 
 func envOrDefault(name string, fallback string) string {

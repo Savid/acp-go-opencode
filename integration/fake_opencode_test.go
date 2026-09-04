@@ -5,10 +5,13 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,7 +36,6 @@ func TestOpenCodeACPAgentFakeExecutableStdoutNoise(t *testing.T) {
 	defer cancel()
 
 	agent := startAgentWithOpenCodePath(t, ctx, fakeOpenCodeExecutable(t, fakeModeOK), t.TempDir())
-	defer agent.close()
 
 	conn := acp.NewClientSideConnection(&recordingClient{}, agent.stdin, agent.stdout)
 	if _, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}); err != nil {
@@ -56,7 +58,6 @@ func TestOpenCodeACPAgentFakeExecutableSharedRuntimeLayout(t *testing.T) {
 
 	home := t.TempDir()
 	agent := startAgentWithOpenCodePath(t, ctx, fakeOpenCodeExecutable(t, fakeModeOK), home)
-	defer agent.close()
 
 	conn := acp.NewClientSideConnection(&recordingClient{}, agent.stdin, agent.stdout)
 	if _, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}); err != nil {
@@ -74,9 +75,27 @@ func TestOpenCodeACPAgentFakeExecutableSharedRuntimeLayout(t *testing.T) {
 		t.Fatalf("logical session ids were reused: %q", first.SessionId)
 	}
 
-	runtimeRoot := filepath.Join(home, "acp-go-opencode")
+	// A scratch-dir launch generates one shared runtime root beneath home, named
+	// with the documented acp-go-opencode-runtime- prefix, and lays the XDG
+	// directories out inside it. Both sessions share that one root. The runtime
+	// also owns a sibling "<root>.control" directory, which is not a second
+	// runtime.
+	matches, err := filepath.Glob(filepath.Join(home, "acp-go-opencode-runtime-*"))
+	if err != nil {
+		t.Fatalf("glob shared runtime roots: %v", err)
+	}
+	runtimeRoots := make([]string, 0, 1)
+	for _, match := range matches {
+		if strings.HasSuffix(match, ".control") {
+			continue
+		}
+		runtimeRoots = append(runtimeRoots, match)
+	}
+	if len(runtimeRoots) != 1 {
+		t.Fatalf("shared runtime roots = %v, want exactly one", runtimeRoots)
+	}
 	for _, name := range []string{"data", "config", "cache", "state"} {
-		info, statErr := os.Stat(filepath.Join(runtimeRoot, name))
+		info, statErr := os.Stat(filepath.Join(runtimeRoots[0], name))
 		if statErr != nil || !info.IsDir() {
 			t.Fatalf("shared runtime %s dir: info=%v err=%v", name, info, statErr)
 		}
@@ -95,15 +114,22 @@ func TestOpenCodeACPAgentFakeExecutablePermissionDocFailClosed(t *testing.T) {
 	defer cancel()
 
 	agent := startAgentWithOpenCodePath(t, ctx, fakeOpenCodeExecutable(t, fakeModeMissingDoc), t.TempDir())
-	defer agent.close()
 
 	conn := acp.NewClientSideConnection(&recordingClient{}, agent.stdin, agent.stdout)
 	if _, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}); err != nil {
 		t.Fatalf("initialize: %v\nstderr:\n%s", err, agent.stderrString())
 	}
+	// The fake drops only the native permission-reply path, so version
+	// validation must reject the runtime and fail session creation closed. The
+	// wire error is a generic internal error by design: the adapter reduces every
+	// handler failure to "handler failed" and never leaks the failing detail,
+	// which the -debug stream carries instead. The ok-mode tests share this
+	// fixture minus that one path and create sessions, so the dropped path is
+	// what fails this one.
 	_, err := conn.NewSession(ctx, opencodeacp.NewSessionRequest(t.TempDir()))
-	if err == nil || !strings.Contains(err.Error(), "/api/session/{sessionID}/permission/{requestID}/reply") {
-		t.Fatalf("new session with missing permission /doc path err = %v\nstderr:\n%s", err, agent.stderrString())
+	var reqErr *acp.RequestError
+	if !errors.As(err, &reqErr) || reqErr.Code != -32603 {
+		t.Fatalf("new session with missing permission /doc path err = %v, want internal error\nstderr:\n%s", err, agent.stderrString())
 	}
 }
 
@@ -120,31 +146,13 @@ func TestFakeOpenCodeExecutable(t *testing.T) {
 
 func startAgentWithOpenCodePath(t *testing.T, ctx context.Context, opencodePath string, home string) *liveAgent {
 	t.Helper()
-	cmd := agentCommand(ctx,
+
+	return startAgent(t, ctx,
 		"-path", opencodePath,
 		"-scratch-dir", home,
 		"-opencode-pure",
 		"-opencode-health-timeout", "5s",
 	)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	agent := &liveAgent{stdin: stdin, stdout: stdout, wait: cmd.Wait}
-	cmd.Stderr = &agent.stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	agent.close = func() {
-		_ = stdin.Close()
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	}
-	return agent
 }
 
 func fakeOpenCodeExecutable(t *testing.T, mode string) string {
@@ -177,6 +185,8 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 	if mode == "" {
 		mode = fakeModeOK
 	}
+
+	carrier := &fakeCarrierLoader{}
 
 	_, _ = fmt.Fprintln(os.Stdout, "native stdout noise before HTTP readiness")
 	var stateMu sync.Mutex
@@ -246,6 +256,15 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 			writeFakeJSON(w, []any{})
 		case strings.HasPrefix(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/abort") && r.Method == http.MethodPost:
 			writeFakeJSON(w, map[string]any{"ok": true})
+		case r.URL.Path == "/config" && r.Method == http.MethodGet:
+			// The first directory-scoped request is where OpenCode instantiates
+			// the seeded plugins, so this is where the carrier proof happens.
+			if err := carrier.load(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+
+				return
+			}
+			writeFakeJSON(w, map[string]any{})
 		case r.URL.Path == "/config/providers":
 			writeFakeJSON(w, map[string]any{"providers": []map[string]any{{
 				"id":   "openai",
@@ -277,6 +296,7 @@ func runFakeOpenCodeServer(args []string, mode string) error {
 func fakeOpenCodeDoc(mode string) map[string]any {
 	required := []string{
 		"/command",
+		"/config",
 		"/config/providers",
 		"/event",
 		"/session/status",
@@ -373,6 +393,9 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 		"paths": paths,
 		"components": map[string]any{"schemas": map[string]any{
 			"Event": fakeEventUnion(
+				"EventSessionIdle",
+				"EventSessionStatus",
+				"EventSessionError",
 				"EventPermissionV2Asked",
 				"EventPermissionV2Replied",
 				"EventPermissionAsked",
@@ -384,6 +407,9 @@ func fakeOpenCodeDoc(mode string) map[string]any {
 				"EventMessagePartUpdated",
 				"EventServerConnected",
 			),
+			"EventSessionIdle":       fakeEventSchema("session.idle", []string{"sessionID"}),
+			"EventSessionStatus":     fakeEventSchema("session.status", []string{"sessionID", "status"}),
+			"EventSessionError":      fakeEventSchema("session.error", nil),
 			"EventPermissionV2Asked": fakeEventSchema("permission.v2.asked", []string{"id", "sessionID", "action", "resources"}),
 			"EventPermissionV2Replied": fakeEventSchema("permission.v2.replied", []string{
 				"sessionID",
@@ -492,4 +518,97 @@ func fakeNativeSession(id string, directory string) map[string]any {
 func writeFakeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+// fakeCarrierLoader stands in for OpenCode's plugin loader. OpenCode
+// instantiates the generated session-carrier plugin on the first
+// directory-scoped request, and the plugin then proves itself to the wrapper's
+// broker before the wrapper hands out a session. The fake performs that proof
+// from the plugin source the wrapper seeded through OPENCODE_CONFIG_CONTENT.
+type fakeCarrierLoader struct {
+	once sync.Once
+	err  error
+}
+
+func (l *fakeCarrierLoader) load() error {
+	l.once.Do(func() {
+		l.err = announceFakeCarrierReady(os.Getenv("OPENCODE_CONFIG_CONTENT"))
+	})
+
+	return l.err
+}
+
+// announceFakeCarrierReady posts the startup proof the seeded carrier plugin
+// would post. A runtime that seeded no carrier plugin has nothing to prove.
+func announceFakeCarrierReady(configContent string) error {
+	var config struct {
+		Plugin []any `json:"plugin"`
+	}
+	if err := json.Unmarshal([]byte(configContent), &config); err != nil {
+		return fmt.Errorf("fake opencode: decode OPENCODE_CONFIG_CONTENT: %w", err)
+	}
+
+	for _, entry := range config.Plugin {
+		plugin, ok := entry.(string)
+		if !ok || !strings.HasPrefix(plugin, "file://") {
+			continue
+		}
+
+		pluginURL, err := url.Parse(plugin)
+		if err != nil {
+			return fmt.Errorf("fake opencode: parse plugin URL %q: %w", plugin, err)
+		}
+
+		source, err := os.ReadFile(pluginURL.Path)
+		if err != nil {
+			return fmt.Errorf("fake opencode: read carrier plugin: %w", err)
+		}
+
+		endpoint, err := fakePluginConstant(source, "BROKER_ENDPOINT")
+		if err != nil {
+			return err
+		}
+
+		token, err := fakePluginConstant(source, "BROKER_TOKEN")
+		if err != nil {
+			return err
+		}
+
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint+"/ready", http.NoBody)
+		if err != nil {
+			return fmt.Errorf("fake opencode: build carrier proof: %w", err)
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return fmt.Errorf("fake opencode: post carrier proof: %w", err)
+		}
+		_ = response.Body.Close()
+
+		if response.StatusCode != http.StatusNoContent {
+			return fmt.Errorf("fake opencode: carrier proof status %d", response.StatusCode)
+		}
+
+		return nil
+	}
+
+	return nil
+}
+
+// fakePluginConstant reads one of the JS string constants the wrapper renders
+// into the carrier plugin. The literal is JSON-encoded, so JSON decodes it.
+func fakePluginConstant(source []byte, name string) (string, error) {
+	pattern := regexp.MustCompile(`(?m)^const ` + regexp.QuoteMeta(name) + ` = ("(?:[^"\\]|\\.)*")$`)
+	match := pattern.FindSubmatch(source)
+	if match == nil {
+		return "", fmt.Errorf("fake opencode: carrier plugin has no %s constant", name)
+	}
+
+	var value string
+	if err := json.Unmarshal(match[1], &value); err != nil {
+		return "", fmt.Errorf("fake opencode: decode %s: %w", name, err)
+	}
+
+	return value, nil
 }

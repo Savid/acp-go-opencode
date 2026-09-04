@@ -4,12 +4,12 @@ package integration
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 	opencodeacp "github.com/savid/acp-go-opencode"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
 )
 
 func TestOpenCodeACPAgentBinarySessionLifecycle(t *testing.T) {
@@ -20,7 +20,6 @@ func TestOpenCodeACPAgentBinarySessionLifecycle(t *testing.T) {
 
 	home := t.TempDir()
 	agent := startLiveAgent(t, ctx, home)
-	defer agent.close()
 
 	conn := acp.NewClientSideConnection(&recordingClient{}, agent.stdin, agent.stdout)
 	initResp, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
@@ -78,22 +77,23 @@ func TestOpenCodeACPAgentLivePromptPermissionElicitation(t *testing.T) {
 	defer cancel()
 
 	home := t.TempDir()
-	args := []string{"-opencode-question-tool"}
-	if model := os.Getenv("ACP_GO_OPENCODE_MODEL"); model != "" {
-		args = append(args, "-model", model)
-	}
+	args := append([]string{"-opencode-question-tool"}, liveModelArgs()...)
 	agent := startLiveAgent(t, ctx, home, args...)
-	defer agent.close()
 
 	client := newRecordingClient()
 	conn := acp.NewClientSideConnection(client, agent.stdin, agent.stdout)
-	if _, err := conn.Initialize(ctx, acp.InitializeRequest{
+	initResp, err := conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		ClientCapabilities: acp.ClientCapabilities{
 			Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
 		},
-	}); err != nil {
+		Meta: lifecycleOffer(),
+	})
+	if err != nil {
 		t.Fatalf("initialize: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	if initResp.Meta[lifecycle.MetaKey] == nil {
+		t.Fatalf("initialize answered no lifecycle capability: %#v", initResp.Meta)
 	}
 	cwd := t.TempDir()
 	session, err := conn.NewSession(ctx, opencodeacp.NewSessionRequest(cwd))
@@ -106,8 +106,12 @@ func TestOpenCodeACPAgentLivePromptPermissionElicitation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create permission turn nonce: %v", err)
 	}
-	if _, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(session.SessionId, permissionTurnNonce, permissionPrompt)); err != nil {
+	permissionResp, err := conn.Prompt(ctx, correlatedPrompt(session.SessionId, permissionTurnNonce, permissionPrompt))
+	if err != nil {
 		t.Fatalf("permission prompt: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	if permissionResp.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("permission prompt stop reason = %q, want %q\nstderr:\n%s", permissionResp.StopReason, acp.StopReasonEndTurn, agent.stderrString())
 	}
 	if client.permissionCount() == 0 {
 		t.Fatalf("permission prompt did not reach session/request_permission; stderr:\n%s", agent.stderrString())
@@ -118,8 +122,12 @@ func TestOpenCodeACPAgentLivePromptPermissionElicitation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create question turn nonce: %v", err)
 	}
-	if _, err := conn.Prompt(ctx, opencodeacp.TextPromptRequest(session.SessionId, questionTurnNonce, questionPrompt)); err != nil {
+	questionResp, err := conn.Prompt(ctx, correlatedPrompt(session.SessionId, questionTurnNonce, questionPrompt))
+	if err != nil {
 		t.Fatalf("question prompt: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	if questionResp.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("question prompt stop reason = %q, want %q\nstderr:\n%s", questionResp.StopReason, acp.StopReasonEndTurn, agent.stderrString())
 	}
 	if client.elicitationCount() == 0 {
 		t.Fatalf("question prompt did not reach elicitation/create; stderr:\n%s", agent.stderrString())
