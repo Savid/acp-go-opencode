@@ -24,13 +24,16 @@ const (
 	// surface has been validated for SessionStoreFormat. Startup fails
 	// closed below it; newer releases are accepted and covered by the
 	// event allowlist plus online replay verification on restore.
-	minNativeVersion        = "1.18.3"
-	snapshotBlockGeneration = "generation"
-	syncTypeSessionCreated  = "session.created.1"
-	syncFieldPart           = "part"
-	syncFieldDirectory      = "directory"
-	syncFieldRoot           = "root"
-	parentPathSegment       = ".."
+	minNativeVersion           = "1.18.3"
+	snapshotBlockGeneration    = "generation"
+	syncTypeSessionCreated     = "session.created.1"
+	syncTypeSessionUpdated     = "session.updated.1"
+	syncTypeMessageUpdated     = "message.updated.1"
+	syncTypeMessagePartUpdated = "message.part.updated.1"
+	syncFieldPart              = "part"
+	syncFieldDirectory         = "directory"
+	syncFieldRoot              = "root"
+	parentPathSegment          = ".."
 )
 
 // A native write that lands between the two /sync/history reads invalidates the
@@ -114,15 +117,8 @@ type stateSnapshotSession struct {
 	Cwd                   string             `json:"cwd"`
 	Title                 string             `json:"title"`
 	Model                 stateSnapshotModel `json:"model"`
-	// ExtraPathDirs is the durable half of the addressed-session carrier: a
-	// cold load rebinds the native session to these directories rather than to
-	// whatever the reloading host happens to hold.
-	//
-	// The carrier environment is deliberately absent. It is where an operation
-	// bearer lives, this bundle is scanned for exactly that material before it
-	// is written, and a rotated bearer must come from the request that reloads
-	// the session rather than from a value frozen at capture time.
-	ExtraPathDirs []string `json:"extraPathDirs"`
+	Env                   map[string]string  `json:"env"`
+	ExtraPathDirs         []string           `json:"extraPathDirs"`
 }
 
 type stateSnapshotModel struct {
@@ -226,6 +222,12 @@ func (s *session) captureStateSnapshot(
 
 	for _, member := range graph {
 		memberSnapshot := member.snapshot()
+
+		durableEnv := cloneStringMap(memberSnapshot.carrier.Env)
+		if durableEnv == nil {
+			durableEnv = map[string]string{}
+		}
+
 		bundle := stateSnapshot{
 			Format: SessionStoreFormat, AdapterVersion: s.agent.options.AgentVersion,
 			NativeVersion: s.client.NativeVersion(), EventSchemaVersion: syncEventSchemaVersion,
@@ -236,17 +238,16 @@ func (s *session) captureStateSnapshot(
 				NativeParentSessionID: memberSnapshot.idmap.NativeParentSessionID,
 				Cwd:                   memberSnapshot.cwd, Title: memberSnapshot.title,
 				Model:         stateSnapshotModel{ProviderID: memberSnapshot.providerID, ModelID: memberSnapshot.modelID, Agent: memberSnapshot.mode},
+				Env:           durableEnv,
 				ExtraPathDirs: append([]string{}, memberSnapshot.carrier.ExtraPathDirs...),
 			},
 			Graph: nodes, Events: events,
 		}
 
-		entry, marshalErr := json.Marshal(bundle)
-		if marshalErr != nil {
-			return capturedStateSnapshot{}, marshalErr
-		}
+		// The closed typed tree contains only sync-event RawMessages already validated as JSON.
+		entry, _ := json.Marshal(bundle)
 
-		if err := scanSyncBundle(entry, s.agent.graphSecretNeedles(graph)); err != nil {
+		if err := scanStateSnapshot(bundle, s.agent.graphSecretNeedles(graph)); err != nil {
 			return capturedStateSnapshot{}, err
 		}
 
@@ -456,9 +457,6 @@ func (a *Agent) graphSecretNeedles(graph []*session) []string {
 	for _, member := range graph {
 		member.mu.Lock()
 		needles = append(needles, member.secretNeedles...)
-		// The carrier is the one environment a stored snapshot writes out, so
-		// its bearer values are redacted from the same pass that redacts the
-		// agent-wide ones.
 		needles = append(needles, sensitiveEnvNeedles(member.carrier.Env)...)
 		member.mu.Unlock()
 	}
@@ -536,11 +534,25 @@ func allowlistedSyncEvents(history []opencode.SyncEvent, allow map[string]stateS
 	return grouped, cursors, nil
 }
 
-var syncDataFields = map[string]map[string]struct{}{
-	syncTypeSessionCreated:   {syncFieldSessionID: {}, syncFieldInfo: {}},
-	"session.updated.1":      {syncFieldSessionID: {}, syncFieldInfo: {}},
-	"message.updated.1":      {syncFieldSessionID: {}, syncFieldInfo: {}},
-	"message.part.updated.1": {syncFieldSessionID: {}, syncFieldPart: {}, "time": {}},
+type syncEventDataSchema struct {
+	allowed  []string
+	required []string
+}
+
+var syncEventDataSchemas = map[string]syncEventDataSchema{
+	syncTypeSessionCreated: {
+		allowed: []string{syncFieldSessionID, syncFieldInfo}, required: []string{syncFieldSessionID, syncFieldInfo},
+	},
+	syncTypeSessionUpdated: {
+		allowed: []string{syncFieldSessionID, syncFieldInfo}, required: []string{syncFieldSessionID, syncFieldInfo},
+	},
+	syncTypeMessageUpdated: {
+		allowed: []string{syncFieldSessionID, syncFieldInfo}, required: []string{syncFieldSessionID, syncFieldInfo},
+	},
+	syncTypeMessagePartUpdated: {
+		allowed:  []string{syncFieldSessionID, syncFieldPart, jsonFieldTime},
+		required: []string{syncFieldSessionID, syncFieldPart, jsonFieldTime},
+	},
 }
 
 const (
@@ -553,9 +565,14 @@ func validateSyncEvent(event opencode.SyncEvent, node stateSnapshotNode) error {
 		return fmt.Errorf("invalid sync event identity")
 	}
 
-	allowed, ok := syncDataFields[event.Type]
+	schema, ok := syncEventDataSchemas[event.Type]
 	if !ok {
 		return fmt.Errorf("unsupported sync event type %q", event.Type)
+	}
+
+	allowed := make(map[string]struct{}, len(schema.allowed))
+	for _, field := range schema.allowed {
+		allowed[field] = struct{}{}
 	}
 
 	for field := range event.Data {
@@ -564,9 +581,56 @@ func validateSyncEvent(event opencode.SyncEvent, node stateSnapshotNode) error {
 		}
 	}
 
+	for _, field := range schema.required {
+		if _, ok := event.Data[field]; !ok {
+			return fmt.Errorf("sync event %q is missing required field %q", event.ID, field)
+		}
+	}
+
 	var sessionID string
 	if err := json.Unmarshal(event.Data[syncFieldSessionID], &sessionID); err != nil || sessionID != node.NativeSessionID {
 		return fmt.Errorf("sync event %q session identity mismatch", event.ID)
+	}
+
+	if event.Type == syncTypeMessagePartUpdated {
+		if err := requireSyncEventObject(event, syncFieldPart); err != nil {
+			return err
+		}
+
+		if !json.Valid(event.Data[jsonFieldTime]) {
+			return fmt.Errorf("sync event %q field %q must be a finite number", event.ID, jsonFieldTime)
+		}
+
+		decoder := json.NewDecoder(bytes.NewReader(event.Data[jsonFieldTime]))
+		decoder.UseNumber()
+
+		var value any
+		// json.Valid above proves this single JSON value decodes successfully.
+		_ = decoder.Decode(&value)
+
+		number, ok := value.(json.Number)
+		if !ok {
+			return fmt.Errorf("sync event %q field %q must be a finite number", event.ID, jsonFieldTime)
+		}
+
+		if _, err := number.Float64(); err != nil {
+			return fmt.Errorf("sync event %q field %q must be a finite number", event.ID, jsonFieldTime)
+		}
+
+		return nil
+	}
+
+	if err := requireSyncEventObject(event, syncFieldInfo); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func requireSyncEventObject(event opencode.SyncEvent, field string) error {
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal(event.Data[field], &value); err != nil || value == nil {
+		return fmt.Errorf("sync event %q field %q must be an object", event.ID, field)
 	}
 
 	return nil
@@ -601,8 +665,8 @@ func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID st
 		return idmapRecord{}, stateSnapshot{}, false, err
 	}
 
-	var snapshot stateSnapshot
-	if err := json.Unmarshal(entries[len(entries)-1], &snapshot); err != nil {
+	snapshot, err := decodeStateSnapshot(entries[len(entries)-1])
+	if err != nil {
 		return idmapRecord{}, stateSnapshot{}, false, err
 	}
 
@@ -629,6 +693,14 @@ func validateSyncSnapshot(sessionID string, snapshot stateSnapshot) error {
 		return fmt.Errorf("opencode sync manifest identity mismatch")
 	}
 
+	if snapshot.Session.Env == nil {
+		return fmt.Errorf("opencode sync manifest is missing env")
+	}
+
+	if _, err := sessionEnvFromMeta(snapshot.Session.Env); err != nil {
+		return fmt.Errorf("opencode sync manifest env: %w", err)
+	}
+
 	if snapshot.Session.ExtraPathDirs == nil {
 		return fmt.Errorf("opencode sync manifest is missing extraPathDirs")
 	}
@@ -637,37 +709,88 @@ func validateSyncSnapshot(sessionID string, snapshot stateSnapshot) error {
 		return fmt.Errorf("opencode sync manifest extraPathDirs: %w", err)
 	}
 
-	seen := make(map[string]stateSnapshotNode, len(snapshot.Graph))
-	for _, node := range snapshot.Graph {
+	seenNative, err := validateSyncSnapshotGraph(snapshot)
+	if err != nil {
+		return err
+	}
+
+	return validateSyncSnapshotEvents(snapshot.Events, seenNative)
+}
+
+func validateSyncSnapshotGraph(snapshot stateSnapshot) (map[string]stateSnapshotNode, error) {
+	if len(snapshot.Graph) == 0 {
+		return nil, fmt.Errorf("opencode sync graph is empty")
+	}
+
+	seenNative := make(map[string]stateSnapshotNode, len(snapshot.Graph))
+	seenLogical := make(map[string]stateSnapshotNode, len(snapshot.Graph))
+
+	for index, node := range snapshot.Graph {
 		if node.SessionID == "" || node.NativeSessionID == "" || node.SourceCwd == "" {
-			return fmt.Errorf("invalid opencode sync graph node")
+			return nil, fmt.Errorf("invalid opencode sync graph node")
 		}
 
-		if _, exists := seen[node.NativeSessionID]; exists {
-			return fmt.Errorf("duplicate opencode sync aggregate")
+		if _, exists := seenNative[node.NativeSessionID]; exists {
+			return nil, fmt.Errorf("duplicate opencode sync aggregate")
 		}
 
-		seen[node.NativeSessionID] = node
+		if _, exists := seenLogical[node.SessionID]; exists {
+			return nil, fmt.Errorf("duplicate opencode sync logical session")
+		}
+
+		parentless := node.ParentSessionID == "" && node.NativeParentID == ""
+		if (node.ParentSessionID == "") != (node.NativeParentID == "") {
+			return nil, fmt.Errorf("opencode sync graph parent identity mismatch")
+		}
+
+		if index == 0 && !parentless {
+			return nil, fmt.Errorf("opencode sync graph root has a parent")
+		}
+
+		if index > 0 {
+			parent, ok := seenLogical[node.ParentSessionID]
+			if parentless || !ok || parent.NativeSessionID != node.NativeParentID {
+				return nil, fmt.Errorf("opencode sync graph is not parent-first")
+			}
+		}
+
+		seenNative[node.NativeSessionID] = node
+		seenLogical[node.SessionID] = node
 	}
 
-	if _, ok := seen[snapshot.Session.NativeSessionID]; !ok {
-		return fmt.Errorf("selected aggregate is absent from opencode sync graph")
+	selected, ok := seenNative[snapshot.Session.NativeSessionID]
+	if !ok || selected.SessionID != snapshot.Session.SessionID ||
+		selected.ParentSessionID != snapshot.Session.ParentSessionID ||
+		selected.NativeParentID != snapshot.Session.NativeParentSessionID ||
+		selected.SourceCwd != snapshot.Session.Cwd {
+		return nil, fmt.Errorf("selected carrier does not match opencode sync graph")
 	}
 
-	for aggregateID, events := range snapshot.Events {
-		node, ok := seen[aggregateID]
+	return seenNative, nil
+}
+
+func validateSyncSnapshotEvents(
+	eventsByAggregate map[string][]opencode.SyncEvent,
+	seenNative map[string]stateSnapshotNode,
+) error {
+	for aggregateID, events := range eventsByAggregate {
+		node, ok := seenNative[aggregateID]
 		if !ok || len(events) == 0 {
 			return fmt.Errorf("opencode sync event aggregate is not allowlisted")
 		}
 
-		for _, event := range events {
+		for index, event := range events {
+			if event.Sequence != int64(index) {
+				return fmt.Errorf("aggregate %q has non-contiguous sequence", aggregateID)
+			}
+
 			if err := validateSyncEvent(event, node); err != nil {
 				return err
 			}
 		}
 	}
 
-	if len(snapshot.Events) != len(seen) {
+	if len(eventsByAggregate) != len(seenNative) {
 		return fmt.Errorf("opencode sync graph is incomplete")
 	}
 
@@ -809,7 +932,7 @@ func rebasePathValues(value any, field, sourceCwd, targetCwd string) (any, error
 
 		return typed, nil
 	case string:
-		if field != syncFieldDirectory && field != "cwd" && field != syncFieldRoot && field != jsonFieldPath {
+		if field != syncFieldDirectory && field != jsonFieldCwd && field != syncFieldRoot && field != jsonFieldPath {
 			return typed, nil
 		}
 
@@ -845,32 +968,6 @@ func syncEventsEqual(left, right []opencode.SyncEvent) bool {
 		return false
 	}
 
-	left = append([]opencode.SyncEvent(nil), left...)
-	right = append([]opencode.SyncEvent(nil), right...)
-
-	slices.SortFunc(left, func(a, b opencode.SyncEvent) int {
-		if a.Sequence < b.Sequence {
-			return -1
-		}
-
-		if a.Sequence > b.Sequence {
-			return 1
-		}
-
-		return 0
-	})
-	slices.SortFunc(right, func(a, b opencode.SyncEvent) int {
-		if a.Sequence < b.Sequence {
-			return -1
-		}
-
-		if a.Sequence > b.Sequence {
-			return 1
-		}
-
-		return 0
-	})
-
 	for index := range left {
 		a, _ := json.Marshal(left[index])
 
@@ -898,6 +995,17 @@ func scanSyncBundle(bundle []byte, needles []string) error {
 	}
 
 	return nil
+}
+
+func scanStateSnapshot(snapshot stateSnapshot, needles []string) error {
+	snapshot.Session.Env = nil
+
+	bundle, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+
+	return scanSyncBundle(bundle, needles)
 }
 
 func newRestoreGeneration() (string, error) {

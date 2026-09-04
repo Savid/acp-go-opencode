@@ -52,11 +52,11 @@ func TestOrdinaryWindowsExecutableAndEnvironmentBehavior(t *testing.T) {
 	)
 	require.NoError(t, err)
 	entries := envMapToSlice(environment)
-	resolved, err := resolveProcessExecutable("opencode", entries, false)
+	resolved, err := resolveOrdinaryProcessExecutable("opencode", entries)
 	require.NoError(t, err)
-	require.Equal(t, targetPath, resolved.Path)
+	require.Equal(t, targetPath, resolved)
 
-	command := exec.Command(resolved.Path,
+	command := exec.Command(resolved,
 		"-test.run=^TestOrdinaryWindowsExecutableAndEnvironmentBehavior$",
 		"--", windowsEnvironmentChildMarker,
 	)
@@ -85,14 +85,37 @@ func TestOrdinaryWindowsExecutableAndEnvironmentBehavior(t *testing.T) {
 // same value on every run is not.
 func TestWindowsEnvironmentCollapsesRepeatedSpellingsDeterministically(t *testing.T) {
 	require.Equal(t, "selected", environmentValue([]string{"Path=discarded", "PATH=selected"}, pathEnv))
-	require.Equal(t, "selected", environmentMapValue(
-		composeEnvironment(map[string]string{"Path": "discarded"}, map[string]string{"PATH": "selected"}),
-		pathEnv,
-	))
+	require.Equal(t, "selected",
+		composeEnvironment(map[string]string{"Path": "discarded"}, map[string]string{"PATH": "selected"})[pathEnv])
 
 	within := map[string]string{"PATH": "sorts-first", "Path": "sorts-last"}
 	require.Equal(t, []string{"PATH=sorts-last"}, envMapToSlice(composeEnvironment(within)),
 		"one semantic key reaches the child, carrying the value of the spelling that sorts last")
 	require.Equal(t, []string{"PATH=sorts-last"}, envMapToSlice(composeEnvironment(within)),
 		"and the same spelling wins on every composition of the same phase")
+}
+
+func TestOrdinaryWindowsNilProcessResultAndRevoke(t *testing.T) {
+	result := ordinaryProcessOutcome(nil, nil)
+	require.Equal(t, -1, result.ExitCode)
+	require.False(t, result.Revoked)
+	won, err := stopOrdinaryProcess(t.Context(), nil, &ordinaryProcessGuard{})
+	require.NoError(t, err)
+	require.False(t, won)
+}
+
+// TestOrdinaryWindowsStopAfterTheWaitIsNotAContainmentFailure pins the platform
+// difference the fallback kill has to absorb. Windows releases the process
+// handle when Wait returns, so a Kill afterwards is refused with EINVAL rather
+// than with the os.ErrProcessDone the platform reports before the wait. Both
+// mean there is nothing left to revoke, and reading the refusal as a failure
+// would answer every close over an already-settled turn with a bogus
+// containment refusal.
+func TestOrdinaryWindowsStopAfterTheWaitIsNotAContainmentFailure(t *testing.T) {
+	command := exec.Command("cmd.exe", "/c", "exit", "0")
+	require.NoError(t, command.Run())
+
+	won, err := stopOrdinaryProcess(t.Context(), command, &ordinaryProcessGuard{})
+	require.NoError(t, err, "a process that has already been waited on is not a containment failure")
+	require.False(t, won, "nothing was revoked, because nothing was still running")
 }

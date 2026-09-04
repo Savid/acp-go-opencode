@@ -22,11 +22,9 @@ func NewTurnNonce() (string, error) {
 }
 
 const (
-	routeEnvelopeKey     = "acp-go.dev/route"
-	routeEnvelopeVersion = 1
-	// metaFieldVersions carries the supported versions of a family-reserved
-	// metadata envelope in the capability advertisement.
-	metaFieldVersions      = "versions"
+	routeEnvelopeKey       = "acp-go.dev/route"
+	routeEnvelopeVersion   = 1
+	metaFieldVersion       = "version"
 	routeTurnNonceMaxBytes = 4 * 1024
 	routeFieldVersion      = "version"
 	routeFieldTurnNonce    = "turnNonce"

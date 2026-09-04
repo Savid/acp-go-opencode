@@ -46,10 +46,9 @@ type rawDelivery struct {
 	done    chan error
 }
 
-// sessionDelivery owns transport writes for one session. Typed updates use one
-// bounded ordered lane; optional raw events use a separate abandonable lane, so
-// a raw writer can neither stand ahead of authoritative state nor consume its
-// capacity.
+// sessionDelivery owns transport writes for one session. Typed updates and raw
+// events use separate bounded ordered lanes, so a raw writer can neither stand
+// ahead of authoritative state nor consume its capacity.
 type sessionDelivery struct {
 	agent *Agent
 	id    acp.SessionId
@@ -296,22 +295,32 @@ func (d *sessionDelivery) failQueued(err error) {
 	}
 }
 
-// enqueueRaw is deliberately best-effort. Queue saturation or a stalled raw
-// writer drops diagnostics without consuming a sequence and never affects the
-// authoritative lane.
-func (d *sessionDelivery) enqueueRaw(_ context.Context, payload map[string]any) {
+func (d *sessionDelivery) enqueueRaw(ctx context.Context, payload map[string]any) error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	if d.closed {
-		return
+		d.mu.Unlock()
+
+		return errors.New("session delivery is closed")
 	}
 
 	d.startLocked()
+	rawDone := d.rawDone
+	d.mu.Unlock()
+
+	done := make(chan error, 1)
+	select {
+	case d.raw <- rawDelivery{payload: payload, done: done}:
+	case <-rawDone:
+		return errors.New("raw session delivery stopped")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	select {
-	case d.raw <- rawDelivery{payload: payload}:
-	default:
+	case err := <-done:
+		return err
+	case <-rawDone:
+		return errors.New("raw session delivery stopped")
 	}
 }
 
@@ -357,7 +366,9 @@ func (d *sessionDelivery) runRaw(ctx context.Context) {
 			return
 		case job := <-d.raw:
 			if job.payload == nil {
-				job.done <- nil
+				if job.done != nil {
+					job.done <- nil
+				}
 
 				continue
 			}
@@ -378,8 +389,6 @@ func (d *sessionDelivery) deliverRaw(ctx context.Context, payload map[string]any
 	defer func() {
 		if recover() != nil {
 			err = errors.New("raw session delivery panicked")
-
-			d.terminalizePanic("raw session delivery panicked")
 		}
 	}()
 

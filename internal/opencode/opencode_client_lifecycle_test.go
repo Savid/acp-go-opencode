@@ -13,11 +13,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +27,40 @@ import (
 
 const releaseGateRepetitions = 5
 
+type testWriteCloser struct {
+	close func() error
+}
+
+type blockingReadCloser struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBlockingReadCloser() *blockingReadCloser {
+	return &blockingReadCloser{closed: make(chan struct{})}
+}
+
+func (r *blockingReadCloser) Read([]byte) (int, error) {
+	<-r.closed
+
+	return 0, io.EOF
+}
+
+func (r *blockingReadCloser) Close() error {
+	r.once.Do(func() { close(r.closed) })
+
+	return nil
+}
+
+func (w testWriteCloser) Write(value []byte) (int, error) { return len(value), nil }
+func (w testWriteCloser) Close() error {
+	if w.close != nil {
+		return w.close()
+	}
+
+	return nil
+}
+
 func requireSignalClosed(t *testing.T, signal <-chan struct{}, message string) {
 	t.Helper()
 
@@ -36,29 +69,6 @@ func requireSignalClosed(t *testing.T, signal <-chan struct{}, message string) {
 	case <-time.After(time.Second):
 		t.Fatal(message)
 	}
-}
-
-func testContainmentScratchReservation(context.Context) (func(), error) {
-	return func() {}, nil
-}
-
-// platformStartOptions gives a launch the boundary its platform can actually
-// select. Darwin gets ordinary execution plus the explicit best-effort opt-in,
-// because a hardened identity policy cannot be downgraded to a process-group
-// boundary and the two together are refused. Elsewhere the fixture keeps the
-// hardened policy.
-func platformStartOptions(t *testing.T, options StartOptions) StartOptions {
-	t.Helper()
-
-	if runtime.GOOS == "darwin" {
-		options.DarwinBestEffort = true
-		options.ContainmentScratchParent = t.TempDir()
-		options.ReserveContainmentScratch = testContainmentScratchReservation
-
-		return options
-	}
-
-	return withTestProcessIsolation(options)
 }
 
 type openCodeMethodsRecorder struct {
@@ -530,11 +540,10 @@ func TestOpenCodeDispatchErrors(t *testing.T) {
 }
 
 func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
-	skipUnprivilegedDarwinIsolation(t)
 	helper := fakeOpenCodeExecutable(t)
-	root := testGeneratedTempDir(t)
+	root := t.TempDir()
 	logger := slog.New(slog.DiscardHandler)
-	client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
+	client, err := StartServer(context.Background(), StartOptions{
 		Root:            root,
 		ExecutablePath:  helper,
 		Env:             map[string]string{"BASE_ENV": "base"},
@@ -545,7 +554,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		HealthTimeout:   5 * time.Second,
 		Logger:          logger,
 		SkipVersionGate: false,
-	}))
+	})
 	if err != nil {
 		t.Fatalf("StartServer: %v", err)
 	}
@@ -556,8 +565,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	if server.xdg.Root != root {
 		t.Fatalf("xdg dirs = %#v", server.xdg)
 	}
-	// The supervisor holds both locks in the control root beside the XDG root,
-	// which is the home it was handed.
+	// The runtime holds both locks in the control root beside the XDG root.
 	controlRoot := ControlRootForXDG(server.xdg.Root)
 	for _, name := range []string{homelock.ClaimFileName, homelock.LivenessFileName} {
 		if _, statErr := os.Stat(filepath.Join(controlRoot, name)); statErr != nil {
@@ -587,180 +595,405 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	}
 }
 
-func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneContainmentResult(t *testing.T) {
-	restoreOpenCodeClientSeams(t)
-	openCodeTerminateProcess = func(*os.Process, int) error { return nil }
-	shutdownTimeout := make(chan time.Time)
-	openCodeAfter = func(time.Duration) <-chan time.Time {
-		return shutdownTimeout
+func TestRuntimeShutdownIsBaseOwnedAndMemoizesOneResult(t *testing.T) {
+	want := errors.New("native wait failed")
+	terminal := make(chan struct{})
+	var revokeCalls atomic.Int32
+	process := ProcessHandle{
+		Input: testWriteCloser{close: func() error {
+			return want
+		}},
+		Output: io.NopCloser(strings.NewReader("")),
+		Errors: io.NopCloser(strings.NewReader("")),
+		Stop: func(context.Context) error {
+			revokeCalls.Add(1)
+			select {
+			case <-terminal:
+			default:
+				close(terminal)
+			}
+
+			return nil
+		},
+		Await: func(context.Context) (ProcessOutcome, error) {
+			<-terminal
+
+			return ProcessOutcome{Revoked: true}, nil
+		},
 	}
-
-	var kills atomic.Int32
-	openCodeKillProcess = func(*os.Process, int) error {
-		kills.Add(1)
-
-		return nil
-	}
-
-	root := t.TempDir()
-	completion := filepath.Join(root, "complete")
-	require.NoError(t, writeSupervisorMarker(completion))
+	settlement := newProcessSettlement(process)
+	settlement.start()
 	state := newRuntimeShutdownState()
+	reclaimed := false
+	cleaned := false
 	base := &openCodeServer{
-		cmd: &exec.Cmd{Process: &os.Process{Pid: 123}}, supervisorControl: nopWriteCloser{},
-		supervisor: &supervisorProof{completion: completion}, waitDone: make(chan error, 1),
-		runtimeShutdown: state, runtimeClosed: make(chan struct{}),
+		process: process, settlement: settlement, runtimeShutdown: state,
+		runtimeClosed: make(chan struct{}),
+		preparedTrees: []preparedNativeTree{{path: "/prepared", cleanup: func() error {
+			cleaned = true
+
+			return nil
+		}}},
+		reclaimTree: func(context.Context, string) error {
+			reclaimed = true
+
+			return nil
+		},
 	}
 	scope := &openCodeServer{scopeCancel: func() {}, runtimeShutdown: state}
 	require.ErrorIs(t, scope.Shutdown(context.Background()), ErrScopeRuntimeShutdown)
-	require.Zero(t, kills.Load())
 
-	results := make(chan error, 2)
-	go func() { results <- base.Shutdown(context.Background()) }()
-	go func() {
-		cancelled, cancel := context.WithCancel(context.Background())
-		cancel()
-		results <- base.Shutdown(cancelled)
-	}()
-	shutdownTimeout <- time.Now()
-	base.waitDone <- nil
-	first := <-results
-	second := <-results
-	require.ErrorContains(t, first, "did not exit after shutdown")
-	require.True(t, first == second, "all shutdown callers must receive the exact memoized error")
-	require.Zero(t, kills.Load(), "caller timeout must not kill a trusted supervisor that can own quarantine")
-	require.True(t, first == base.Shutdown(context.Background()))
+	first := base.Shutdown(context.Background())
+	second := base.Shutdown(context.Background())
+	require.ErrorIs(t, first, want)
+	require.True(t, first == second, "shutdown must publish one memoized result")
+	require.Equal(t, int32(1), revokeCalls.Load())
+	require.True(t, reclaimed)
+	require.True(t, cleaned)
+	require.Empty(t, base.preparedTrees)
+}
+
+func TestRuntimeShutdownRetriesBusyReclaimWithoutRemoval(t *testing.T) {
+	process := ProcessHandle{
+		Input: testWriteCloser{}, Output: io.NopCloser(strings.NewReader("")), Errors: io.NopCloser(strings.NewReader("")),
+		Stop: func(context.Context) error { return nil },
+		Await: func(context.Context) (ProcessOutcome, error) {
+			return ProcessOutcome{}, nil
+		},
+	}
+	settlement := newProcessSettlement(process)
+	settlement.start()
+	<-settlement.done
+	events := make([]string, 0, 4)
+	busy := errors.New("tree busy")
+	carrierBusy := true
+	server := &openCodeServer{
+		process: process, settlement: settlement, runtimeShutdown: newRuntimeShutdownState(),
+		runtimeClosed: make(chan struct{}),
+		preparedTrees: []preparedNativeTree{
+			{path: "runtime", cleanup: func() error {
+				events = append(events, "remove:runtime")
+
+				return nil
+			}},
+			{path: "carrier", cleanup: func() error {
+				events = append(events, "remove:carrier")
+
+				return nil
+			}},
+		},
+		reclaimTree: func(_ context.Context, path string) error {
+			events = append(events, "reclaim:"+path)
+			if path == "carrier" && carrierBusy {
+				return MarkTreeReclaimPending(busy)
+			}
+
+			return nil
+		},
+	}
+
+	first := server.Shutdown(t.Context())
+	require.ErrorIs(t, first, busy)
+	require.Equal(t, []string{"reclaim:carrier", "reclaim:runtime", "remove:runtime"}, events)
+	require.Len(t, server.preparedTrees, 1)
+	carrierBusy = false
+	require.NoError(t, server.Shutdown(t.Context()))
+	require.Equal(t, []string{
+		"reclaim:carrier", "reclaim:runtime", "remove:runtime", "reclaim:carrier", "remove:carrier",
+	}, events)
+	require.Empty(t, server.preparedTrees)
+}
+
+func TestRuntimeShutdownBoundsStopAndClearsItAfterTerminalRetry(t *testing.T) {
+	originalTimeout := processContainmentTimeout
+	processContainmentTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { processContainmentTimeout = originalTimeout })
+
+	var waits atomic.Int32
+	process := ProcessHandle{
+		Input: testWriteCloser{}, Output: io.NopCloser(strings.NewReader("")), Errors: io.NopCloser(strings.NewReader("")),
+		Stop: func(ctx context.Context) error {
+			_, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			<-ctx.Done()
+
+			return ctx.Err()
+		},
+		Await: func(ctx context.Context) (ProcessOutcome, error) {
+			if waits.Add(1) == 1 {
+				<-ctx.Done()
+
+				return ProcessOutcome{}, ctx.Err()
+			}
+
+			return ProcessOutcome{}, nil
+		},
+	}
+	settlement := newProcessSettlement(process)
+	settlement.start()
+	server := &openCodeServer{
+		process: process, settlement: settlement, runtimeShutdown: newRuntimeShutdownState(),
+		runtimeClosed: make(chan struct{}),
+	}
+
+	err := server.Shutdown(context.Background())
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.NoError(t, server.Shutdown(context.Background()))
+}
+
+func TestRuntimeShutdownReportsGeneratedScratchCleanupFailure(t *testing.T) {
+	want := errors.New("remove generated runtime failed")
+	process := ProcessHandle{
+		Input: testWriteCloser{}, Output: io.NopCloser(strings.NewReader("")), Errors: io.NopCloser(strings.NewReader("")),
+		Stop: func(context.Context) error { return nil },
+		Await: func(context.Context) (ProcessOutcome, error) {
+			return ProcessOutcome{}, nil
+		},
+	}
+	settlement := newProcessSettlement(process)
+	settlement.start()
+	<-settlement.done
+	cleanupCalls := 0
+	cleanupFails := true
+	server := &openCodeServer{
+		process: process, settlement: settlement, runtimeShutdown: newRuntimeShutdownState(),
+		runtimeClosed: make(chan struct{}),
+		preparedTrees: []preparedNativeTree{{path: "runtime", cleanup: func() error {
+			cleanupCalls++
+			if !cleanupFails {
+				return nil
+			}
+
+			return errors.Join(ErrRuntimeScratchCleanup, want)
+		}}},
+	}
+
+	err := server.Shutdown(t.Context())
+	require.ErrorIs(t, err, ErrRuntimeScratchCleanup)
+	require.ErrorIs(t, err, want)
+	require.Equal(t, 1, cleanupCalls)
+	cleanupFails = false
+	require.NoError(t, server.Shutdown(t.Context()))
+	require.Equal(t, 2, cleanupCalls)
+	require.NoError(t, server.Shutdown(t.Context()))
+	require.Equal(t, 2, cleanupCalls)
+}
+
+func TestStartFailureTransfersCleanupOnlyRetryAfterSuccessfulReclaim(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "runtime")
+	want := errors.New("start refused")
+
+	removeAll := openCodeRemoveAll
+	failedRemoval := false
+	openCodeRemoveAll = func(path string) error {
+		if path == root && !failedRemoval {
+			failedRemoval = true
+
+			return errors.New("remove failed")
+		}
+
+		return removeAll(path)
+	}
+	t.Cleanup(func() { openCodeRemoveAll = removeAll })
+
+	var (
+		reclaims int
+		retained reclaimedTreeCleanup
+	)
+	_, err := StartServer(t.Context(), StartOptions{
+		Root: root, ControlRoot: ControlRootForXDG(root), RemoveRoot: true, Pure: true,
+		NativeEnvironment: func() map[string]string { return map[string]string{"PATH": "/bin"} },
+		PrepareTree:       func(context.Context, string) error { return nil },
+		ReclaimTree: func(context.Context, string) error {
+			reclaims++
+
+			return nil
+		},
+		RetainTree: func(path string, reclaimed bool, cleanup func() error) {
+			retained = reclaimedTreeCleanup{path: path, reclaimed: reclaimed, cleanup: cleanup}
+		},
+		StartProcess: func(context.Context, string, []string, []string, string) (ProcessHandle, error) {
+			return ProcessHandle{}, MarkProcessStartSettled(want)
+		},
+	})
+	require.ErrorIs(t, err, want)
+	require.ErrorIs(t, err, ErrRuntimeScratchCleanup)
+	require.Equal(t, 1, reclaims)
+	require.Equal(t, root, retained.path)
+	require.True(t, retained.reclaimed)
+	require.NotNil(t, retained.cleanup)
+	require.NoError(t, retained.cleanup())
+	require.Equal(t, 1, reclaims, "cleanup-only retry reclaimed the same tree twice")
+}
+
+func TestDetachedReclaimIsFiniteAndRetainsTreeForRetry(t *testing.T) {
+	originalTimeout := processContainmentTimeout
+	processContainmentTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { processContainmentTimeout = originalTimeout })
+
+	cleaned := false
+	trees := []preparedNativeTree{{path: "runtime", cleanup: func() error {
+		cleaned = true
+
+		return nil
+	}}}
+	remaining, err := reclaimPreparedTreesDetached(trees, func(ctx context.Context, _ string) error {
+		_, hasDeadline := ctx.Deadline()
+		require.True(t, hasDeadline)
+		<-ctx.Done()
+
+		return ctx.Err()
+	})
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.False(t, cleaned)
+	require.Len(t, remaining, 1)
+
+	want := errors.New("ordinary reclaim refusal")
+	remaining, err = reclaimPreparedTreesDetached(remaining, func(context.Context, string) error { return want })
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, want)
+	require.False(t, cleaned)
+	require.Len(t, remaining, 1)
+
+	remaining, err = reclaimPreparedTreesDetached(remaining, func(context.Context, string) error { return nil })
+	require.NoError(t, err)
+	require.True(t, cleaned)
+	require.Empty(t, remaining)
+}
+
+func TestFailedPublishedServerStartTransfersRemainingPreparedTrees(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	want := errors.Join(ErrProcessContainmentIncomplete, errors.New("terminal proof unavailable"))
+	server := &openCodeServer{
+		runtimeShutdown: &runtimeShutdownState{terminal: &runtimeShutdownAttempt{done: done, err: want}},
+		preparedTrees:   []preparedNativeTree{{path: "runtime"}},
+	}
+	var retained []preparedNativeTree
+	err := settleFailedServerStart(server, func(path string, reclaimed bool, cleanup func() error) {
+		retained = append(retained, preparedNativeTree{path: path, reclaimed: reclaimed, cleanup: cleanup})
+	}, errors.New("readiness failed"))
+	require.ErrorIs(t, err, want)
+	require.True(t, NativeCleanupRetained(err))
+	require.Equal(t, []preparedNativeTree{{path: "runtime"}}, retained)
+	require.Empty(t, server.preparedTrees)
+}
+
+type reclaimedTreeCleanup struct {
+	path      string
+	reclaimed bool
+	cleanup   func() error
+}
+
+func TestScopesCreateNoNativeTreesOrRetireSharedRuntime(t *testing.T) {
+	nativeRoot := t.TempDir()
+	runtimeRoot := filepath.Join(nativeRoot, "runtime")
+	carrierRoot := filepath.Join(runtimeRoot, "carrier")
+	require.NoError(t, os.Mkdir(runtimeRoot, 0o700))
+	require.NoError(t, os.Mkdir(carrierRoot, 0o700))
+
+	runtimeClosed := make(chan struct{})
+	carrierBroker := &sessionCarrierBroker{carriers: map[string]sessionCarrierPayload{}}
+	base := &openCodeServer{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"server.connected\",\"properties\":{}}\n\n")),
+			}, nil
+		})},
+		baseURL:              "http://opencode.test",
+		runtimeShutdown:      newRuntimeShutdownState(),
+		runtimeClosed:        runtimeClosed,
+		sessionCarrierBroker: carrierBroker,
+		preparedTrees:        []preparedNativeTree{{path: runtimeRoot}},
+	}
+
+	scopeClient, err := base.Scope(context.Background(), ScopeOptions{Directory: t.TempDir()})
+	require.NoError(t, err)
+	scope, ok := scopeClient.(*openCodeServer)
+	require.True(t, ok)
+	require.Empty(t, scope.preparedTrees)
+	require.Equal(t, []preparedNativeTree{{path: runtimeRoot}}, base.preparedTrees)
+	entries, err := os.ReadDir(nativeRoot)
+	require.NoError(t, err)
+	require.Equal(t, []string{"runtime"}, []string{entries[0].Name()})
+
+	require.NoError(t, scope.Close(context.Background()))
+	require.Empty(t, carrierBroker.carriers)
+	select {
+	case <-runtimeClosed:
+		t.Fatal("closing one scope retired the shared runtime")
+	default:
+	}
+	require.Equal(t, []preparedNativeTree{{path: runtimeRoot}}, base.preparedTrees)
 }
 
 func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("defaults and start error", func(t *testing.T) {
-		restoreOpenCodeClientSeams(t)
-		xdg := testXDGDirs(t)
-		binaryDir := t.TempDir()
-		binary := filepath.Join(binaryDir, opencodeExecutableName)
-		require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0o700))
-		isolation := testProcessIsolation()
-		isolation.BaseEnvironment["PATH"] = binaryDir + string(os.PathListSeparator) + isolation.BaseEnvironment["PATH"]
-		var executable string
-		openCodeCommandContext = func(ctx context.Context, name string, _ ...string) *exec.Cmd {
-			executable = name
+	t.Run("create xdg", func(t *testing.T) {
+		_, err := StartServer(ctx, StartOptions{Root: filepath.Join(t.TempDir(), string([]byte{0}))})
+		require.Error(t, err)
+	})
 
-			return exec.CommandContext(ctx, filepath.Join(t.TempDir(), "missing-opencode"))
-		}
+	t.Run("incomplete existing xdg", func(t *testing.T) {
+		_, err := StartServer(ctx, StartOptions{ExistingXDG: XDGDirs{Root: filepath.Join(t.TempDir(), "root")}})
+		require.Error(t, err)
+	})
+
+	t.Run("runtime config", func(t *testing.T) {
 		_, err := StartServer(ctx, StartOptions{
-			ExistingXDG:      xdg,
-			skipSupervisor:   true,
-			ProcessIsolation: isolation,
+			ExistingXDG: testXDGDirs(t), SeedFiles: map[string]string{"../escape": "bad"},
 		})
-		if err == nil {
-			t.Fatal("missing executable unexpectedly started")
-		}
-		if filepath.Base(executable) != "opencode" {
-			t.Fatalf("default executable = %q", executable)
-		}
+		require.Error(t, err)
 	})
 
-	t.Run("create xdg failure", func(t *testing.T) {
-		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
-			Root: filepath.Join(t.TempDir(), string([]byte{0})),
-		}))
-		if err == nil {
-			t.Fatal("invalid session xdg path unexpectedly succeeded")
-		}
-	})
-
-	t.Run("ensure existing xdg failure", func(t *testing.T) {
-		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
-			ExistingXDG: XDGDirs{Root: filepath.Join(t.TempDir(), "root")},
-		}))
-		if err == nil {
-			t.Fatal("incomplete existing xdg unexpectedly succeeded")
-		}
-	})
-
-	t.Run("runtime config failure", func(t *testing.T) {
-		_, err := StartServer(ctx, StartOptions{
-			ExistingXDG:      testXDGDirs(t),
-			SeedFiles:        map[string]string{"../escape": "bad"},
-			ProcessIsolation: testProcessIsolation(),
-		})
-		if err == nil {
-			t.Fatal("invalid permission unexpectedly started")
-		}
-	})
-
-	t.Run("allocate port failure", func(t *testing.T) {
+	t.Run("allocate port", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeListen = func(string, string) (net.Listener, error) {
 			return nil, errors.New("listen failed")
 		}
-		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
-			t.Fatal("listen error was ignored")
-		}
+		_, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t), Pure: true})
+		require.ErrorContains(t, err, "listen failed")
 	})
 
-	t.Run("carrier proof entropy failure", func(t *testing.T) {
+	t.Run("entropy", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeRandReader = errorReader{err: errors.New("entropy failed")}
-		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
-			t.Fatal("entropy error was ignored")
-		}
+		_, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)})
+		require.ErrorContains(t, err, "entropy failed")
 	})
 
-	t.Run("password entropy failure", func(t *testing.T) {
-		restoreOpenCodeClientSeams(t)
-		openCodeRandReader = &budgetReader{budget: 64, err: errors.New("entropy failed")}
-		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
-			t.Fatal("entropy error was ignored")
-		}
-	})
-
-	t.Run("stdout pipe failure", func(t *testing.T) {
-		restoreOpenCodeClientSeams(t)
-		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestFakeOpenCodeServerProcessHelper")
-			cmd.Stdout = io.Discard
-
-			return cmd
-		}
+	t.Run("start process", func(t *testing.T) {
+		want := errors.New("native spawn refused")
 		_, err := StartServer(ctx, StartOptions{
-			ExistingXDG:    testXDGDirs(t),
-			ExecutablePath: "/usr/bin/true",
-			Pure:           true,
-			skipSupervisor: true,
+			ExistingXDG: testXDGDirs(t), Pure: true,
+			StartProcess: func(context.Context, string, []string, []string, string) (ProcessHandle, error) {
+				return ProcessHandle{}, want
+			},
 		})
-		require.ErrorContains(t, err, "Stdout already set")
+		require.ErrorIs(t, err, want)
 	})
 
-	t.Run("stderr pipe failure", func(t *testing.T) {
-		restoreOpenCodeClientSeams(t)
-		openCodeCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestFakeOpenCodeServerProcessHelper")
-			cmd.Stderr = io.Discard
-
-			return cmd
-		}
-		if _, err := StartServer(ctx, withTestProcessIsolation(StartOptions{ExistingXDG: testXDGDirs(t)})); err == nil {
-			t.Fatal("stderr pipe error was ignored")
-		}
+	t.Run("incomplete process", func(t *testing.T) {
+		_, err := StartServer(ctx, StartOptions{
+			ExistingXDG: testXDGDirs(t), Pure: true,
+			StartProcess: func(context.Context, string, []string, []string, string) (ProcessHandle, error) {
+				return ProcessHandle{}, nil
+			},
+		})
+		require.ErrorContains(t, err, "native process handle is incomplete")
 	})
 
-	t.Run("readiness failure closes process", func(t *testing.T) {
-		skipUnprivilegedDarwinIsolation(t)
+	t.Run("readiness", func(t *testing.T) {
 		helper := fakeOpenCodeExecutable(t)
-		_, err := StartServer(ctx, platformStartOptions(t, StartOptions{
-			Root:            testGeneratedTempDir(t),
-			ExecutablePath:  helper,
-			MinVersion:      "99.0.0",
-			HealthTimeout:   5 * time.Second,
-			SkipVersionGate: false,
-			Logger:          slog.New(slog.DiscardHandler),
-		}))
-		if err == nil || !strings.Contains(err.Error(), "below minimum supported") {
-			t.Fatalf("readiness error = %v", err)
-		}
+		_, err := StartServer(ctx, StartOptions{
+			Root: t.TempDir(), ExecutablePath: helper, MinVersion: "99.0.0",
+			HealthTimeout: 5 * time.Second, Logger: slog.New(slog.DiscardHandler),
+		})
+		require.ErrorContains(t, err, "below minimum supported")
 	})
 }
 
@@ -1344,43 +1577,121 @@ func TestOpenCodeReadEventsPublishesNoTerminalForAnIntentionalClose(t *testing.T
 	}
 }
 
-func TestOpenCodeServerCloseTimeoutAndContext(t *testing.T) {
-	for name, cancelled := range map[string]bool{"timeout": false, "context": true} {
-		t.Run(name, func(t *testing.T) {
-			restoreOpenCodeClientSeams(t)
-			openCodeContainmentTimeout = 10 * time.Millisecond
-			cmd := &exec.Cmd{Process: &os.Process{Pid: 1234}}
-			openCodeTerminateProcess = func(*os.Process, int) error { return nil }
-			openCodeKillProcess = func(*os.Process, int) error { return nil }
-			openCodeWaitCommand = func(*exec.Cmd) error {
-				select {}
+func TestOpenCodeServerCloseDetachesAndRetryProvesTerminalAfterJoiningWorkers(t *testing.T) {
+	originalTimeout := processContainmentTimeout
+	processContainmentTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { processContainmentTimeout = originalTimeout })
+
+	observerStarted := make(chan struct{})
+	observerDone := make(chan struct{})
+	terminalWaitDone := make(chan struct{})
+	var waitCalls atomic.Int32
+	var terminal atomic.Bool
+	stdout := newBlockingReadCloser()
+	stderr := newBlockingReadCloser()
+	stopped := make(chan struct{}, 2)
+	stopRelease := make(chan struct{})
+	process := ProcessHandle{
+		Input: testWriteCloser{}, Output: stdout, Errors: stderr,
+		Stop: func(ctx context.Context) error {
+			_, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			stopped <- struct{}{}
+			<-stopRelease
+
+			return nil
+		},
+		Await: func(ctx context.Context) (ProcessOutcome, error) {
+			call := waitCalls.Add(1)
+			_, hasDeadline := ctx.Deadline()
+
+			switch call {
+			case 1:
+				close(observerStarted)
+			default:
+				require.True(t, hasDeadline)
 			}
-			server := &openCodeServer{
-				cmd:    cmd,
-				cancel: func() {},
-				closed: make(chan struct{}),
-				log:    slog.New(slog.DiscardHandler),
+
+			if terminal.Load() {
+				return ProcessOutcome{Revoked: true}, nil
 			}
-			ctx := context.Background()
-			if cancelled {
-				cancelCtx, cancel := context.WithCancel(ctx)
-				cancel()
-				ctx = cancelCtx
-				openCodeAfter = func(time.Duration) <-chan time.Time {
-					return make(chan time.Time)
-				}
-			} else {
-				openCodeShutdownTimeout = time.Millisecond
+
+			<-ctx.Done()
+
+			switch call {
+			case 1:
+				close(observerDone)
+			case 2:
+				close(terminalWaitDone)
+			default:
 			}
-			if err := server.Shutdown(ctx); err == nil {
-				t.Fatal("Shutdown unexpectedly succeeded")
-			}
-		})
+
+			return ProcessOutcome{}, ctx.Err()
+		},
 	}
+	settlement := newProcessSettlement(process)
+	settlement.start()
+	<-observerStarted
+
+	runtimeExited := make(chan struct{})
+	runtimeWatchDone := make(chan struct{})
+	go observeProcessSettlement(settlement, runtimeExited, runtimeWatchDone)
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan struct{})
+	go func() { defer close(stdoutDone); drainProcessPipe(nil, "stdout", stdout) }()
+	go func() { defer close(stderrDone); drainProcessPipe(nil, "stderr", stderr) }()
+
+	reclaimCalls := atomic.Int32{}
+	server := &openCodeServer{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusMethodNotAllowed,
+				Status:     "405 Method Not Allowed",
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		})},
+		baseURL: "http://opencode.test",
+		process: process, settlement: settlement,
+		runtimeShutdown: newRuntimeShutdownState(), runtimeClosed: make(chan struct{}), runtimeExited: runtimeExited,
+		runtimeWatchDone: runtimeWatchDone, stdoutDone: stdoutDone, stderrDone: stderrDone,
+		preparedTrees: []preparedNativeTree{{path: "runtime"}},
+		reclaimTree: func(ctx context.Context, _ string) error {
+			_, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			reclaimCalls.Add(1)
+
+			return nil
+		},
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, server.Shutdown(cancelled), context.Canceled)
+	requireSignalClosed(t, stopped, "shutdown never initiated revoke")
+	server.runtimeShutdown.mu.Lock()
+	firstAttempt := server.runtimeShutdown.current
+	server.runtimeShutdown.mu.Unlock()
+	require.NotNil(t, firstAttempt)
+	close(stopRelease)
+
+	requireSignalClosed(t, observerDone, "shutdown did not join the owned observer")
+	requireSignalClosed(t, terminalWaitDone, "shutdown did not bound terminal wait")
+	requireSignalClosed(t, stdoutDone, "shutdown did not join stdout drain")
+	requireSignalClosed(t, stderrDone, "shutdown did not join stderr drain")
+	requireSignalClosed(t, runtimeWatchDone, "shutdown did not join runtime watcher")
+
+	<-firstAttempt.done
+	require.ErrorIs(t, firstAttempt.err, ErrProcessContainmentIncomplete)
+	require.Len(t, server.preparedTrees, 1)
+	require.Zero(t, reclaimCalls.Load())
+
+	terminal.Store(true)
+	require.NoError(t, server.Shutdown(context.Background()))
+	require.True(t, server.RuntimeRevoked())
+	require.Empty(t, server.preparedTrees)
+	require.EqualValues(t, 1, reclaimCalls.Load())
 }
 
 func TestXDGEnvAndPipeHelpers(t *testing.T) {
-	withLinuxProcessIsolation(t)
 	root := t.TempDir()
 	xdg, err := CreateRuntimeXDGDirs(root)
 	if err != nil {
@@ -1396,14 +1707,7 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	if err != nil || strings.Contains(permissionConfig, `"permission"`) {
 		t.Fatalf("runtime config = %q err=%v", permissionConfig, err)
 	}
-	permissionFile := filepath.Join(xdg.Config, "opencode", "opencode.json")
-	info, err := os.Stat(permissionFile)
-	if err != nil {
-		t.Fatalf("permission config file stat: %v", err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("permission config file mode = %v", info.Mode().Perm())
-	}
+	requireOwnerOnlyMode(t, filepath.Join(xdg.Config, "opencode", "opencode.json"), 0o600)
 	configRootFile := filepath.Join(t.TempDir(), "config-file")
 	if writeErr := os.WriteFile(configRootFile, []byte("file"), 0o600); writeErr != nil {
 		t.Fatal(writeErr)
@@ -1426,10 +1730,10 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	if err != nil || password == "" {
 		t.Fatalf("randomPassword = %q err=%v", password, err)
 	}
-	env, err := buildProcessEnvironmentFrom(&ProcessIsolation{
-		UID: 1, GID: 2, BaseEnvironment: map[string]string{"PATH": "/usr/bin:/bin"},
-		StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/var/lib/acp-go-test",
-	}, nil, map[string]string{"A": "1"}, map[string]string{"A": "2", "B": "3"})
+	env, err := buildProcessEnvironmentFrom(
+		map[string]string{"PATH": "/usr/bin:/bin"},
+		map[string]string{"A": "1"}, map[string]string{"A": "2", "B": "3"},
+	)
 	if err != nil || env["A"] != "2" || env["B"] != "3" {
 		t.Fatalf("merged env = %#v, err = %v", env, err)
 	}
@@ -1519,7 +1823,11 @@ func TestOpenCodeSeedFilesMergeAndConfinement(t *testing.T) {
 
 	// Path confinement: absolute, parent escapes, dot, empty, and
 	// whitespace-only keys fail closed.
-	for _, bad := range []string{"/etc/passwd", "../escape.json", "a/../../escape", ".", "", "   ", "\t"} {
+	// A rooted path is refused whichever way the platform spells one: the
+	// volume-qualified form and the volume-relative "/etc/passwd" alike.
+	for _, bad := range []string{
+		absTestPath("etc", "passwd"), "/etc/passwd", "../escape.json", "a/../../escape", ".", "", "   ", "\t",
+	} {
 		if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", map[string]string{bad: "x"}, nil); err == nil {
 			t.Fatalf("seed path %q was not rejected", bad)
 		}
@@ -1903,40 +2211,18 @@ func TestFakeOpenCodeServerProcessHelper(t *testing.T) {
 
 func fakeOpenCodeExecutable(t *testing.T) string {
 	t.Helper()
-	directory := testTraversableTempDir(t)
-	script := filepath.Join(directory, "fake-opencode")
-	body := fmt.Sprintf(
-		"#!/bin/sh\nACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n",
-		reachableTestBinary(t, directory),
-	)
+	directory := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test executable: %v", err)
+	}
+	script := filepath.Join(directory, fakeOpenCodeLauncherName)
+	body := fakeOpenCodeLauncher(executable)
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake executable: %v", err)
 	}
 
 	return script
-}
-
-// reachableTestBinary copies the test binary somewhere the isolated native
-// identity can reach it. The product launches the fake executable as that
-// identity, and the binary the go tool builds is a 0700 root-owned file inside
-// a 0700 build directory, so exec'ing it in place fails for anyone but the
-// runner and the launch dies before the server ever listens.
-func reachableTestBinary(t *testing.T, directory string) string {
-	t.Helper()
-	source, err := os.Executable()
-	if err != nil {
-		t.Fatalf("test executable: %v", err)
-	}
-	payload, err := os.ReadFile(source)
-	if err != nil {
-		t.Fatalf("read test executable: %v", err)
-	}
-	reachable := filepath.Join(directory, "fake-opencode-helper")
-	if err = os.WriteFile(reachable, payload, 0o755); err != nil {
-		t.Fatalf("publish test executable: %v", err)
-	}
-
-	return reachable
 }
 
 func runFakeOpenCodeServerProcess() {
@@ -1994,49 +2280,30 @@ func runFakeOpenCodeServerProcess() {
 	}
 }
 
-// recordedSessionCarrierPlugin holds the plugin module the product last wrote,
-// so an in-process native fake can instantiate the real generated source rather
-// than a hand-written stand-in.
-var recordedSessionCarrierPlugin atomic.Pointer[string]
+// publishFakeSessionCarrierProof performs the startup proof the generated
+// plugin makes on its first load: one authorized POST to the broker's ready
+// route, using the endpoint and bearer token the runtime wrote into the module.
+func publishFakeSessionCarrierProof(source string) {
+	endpoint, endpointOK := fakePluginConstant(source, "BROKER_ENDPOINT")
+	token, tokenOK := fakePluginConstant(source, "BROKER_TOKEN")
 
-// recordSessionCarrierPluginForFakeNative lets a fake that answers the native
-// routes in-process behave the way a real OpenCode does: the plugin is loaded
-// by the first directory-scoped request, and loading it publishes the marker
-// the runtime demands before it serves a session.
-func recordSessionCarrierPluginForFakeNative(t *testing.T) {
-	t.Helper()
-	write := sessionCarrierWriteFile
-	t.Cleanup(func() {
-		sessionCarrierWriteFile = write
-
-		recordedSessionCarrierPlugin.Store(nil)
-	})
-	sessionCarrierWriteFile = func(path string, data []byte, mode os.FileMode) error {
-		if filepath.Base(path) == sessionCarrierPluginFileName {
-			source := string(data)
-			recordedSessionCarrierPlugin.Store(&source)
-		}
-
-		return write(path, data, mode)
-	}
-}
-
-func instantiateRecordedSessionCarrierPlugin(request *http.Request) {
-	source := recordedSessionCarrierPlugin.Load()
-	if source == nil || request.URL.Query().Get("directory") == "" {
+	if !endpointOK || !tokenOK {
 		return
 	}
 
-	publishFakeSessionCarrierProof(*source)
-}
-
-func publishFakeSessionCarrierProof(source string) {
-	path, pathOK := fakePluginConstant(source, "PROOF_PATH")
-	token, tokenOK := fakePluginConstant(source, "PROOF_TOKEN")
-
-	if pathOK && tokenOK {
-		_ = os.WriteFile(path, []byte(token), 0o600)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint+"/ready", nil)
+	if err != nil {
+		return
 	}
+
+	request.Header.Set("Authorization", "Bearer "+token)
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return
+	}
+
+	_ = response.Body.Close()
 }
 
 // instantiateFakeSessionCarrierPlugin does for the fake native process what a
@@ -2057,7 +2324,7 @@ func instantiateFakeSessionCarrierPlugin() {
 		if err != nil || parsed.Scheme != "file" {
 			continue
 		}
-		source, err := os.ReadFile(parsed.Path)
+		source, err := os.ReadFile(testLocalPathFromURIPath(parsed.Path))
 		if err != nil {
 			continue
 		}
@@ -2084,11 +2351,6 @@ func fakePluginConstant(source string, name string) (string, bool) {
 
 func restoreOpenCodeClientSeams(t *testing.T) {
 	t.Helper()
-	withLinuxProcessIsolation(t)
-	commandContext := openCodeCommandContext
-	startProcess := openCodeStartProcess
-	applyCredential := openCodeApplyCredential
-	supervisorCommandFn := openCodeSupervisorCommand
 	acquireHomeLock := openCodeAcquireHomeLock
 	httpClient := openCodeHTTPClient
 	listen := openCodeListen
@@ -2096,20 +2358,11 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 	marshalIndent := openCodeMarshalIndent
 	seedMkdirAll := openCodeSeedMkdirAll
 	seedWriteFile := openCodeSeedWriteFile
-	terminateProcess := openCodeTerminateProcess
-	killProcess := openCodeKillProcess
-	waitCommand := openCodeWaitCommand
 	removeAll := openCodeRemoveAll
-	prepareRuntimeGeneration := openCodePrepareRuntimeGeneration
 	after := openCodeAfter
 	readyPoll := openCodeReadyPollInterval
 	shutdownTimeout := openCodeShutdownTimeout
-	containmentTimeout := openCodeContainmentTimeout
 	t.Cleanup(func() {
-		openCodeCommandContext = commandContext
-		openCodeStartProcess = startProcess
-		openCodeApplyCredential = applyCredential
-		openCodeSupervisorCommand = supervisorCommandFn
 		openCodeAcquireHomeLock = acquireHomeLock
 		openCodeHTTPClient = httpClient
 		openCodeListen = listen
@@ -2117,21 +2370,16 @@ func restoreOpenCodeClientSeams(t *testing.T) {
 		openCodeMarshalIndent = marshalIndent
 		openCodeSeedMkdirAll = seedMkdirAll
 		openCodeSeedWriteFile = seedWriteFile
-		openCodeTerminateProcess = terminateProcess
-		openCodeKillProcess = killProcess
-		openCodeWaitCommand = waitCommand
 		openCodeRemoveAll = removeAll
-		openCodePrepareRuntimeGeneration = prepareRuntimeGeneration
 		openCodeAfter = after
 		openCodeReadyPollInterval = readyPoll
 		openCodeShutdownTimeout = shutdownTimeout
-		openCodeContainmentTimeout = containmentTimeout
 	})
 }
 
 func testXDGDirs(t *testing.T) XDGDirs {
 	t.Helper()
-	root := testGeneratedTempDir(t)
+	root := t.TempDir()
 
 	return XDGDirs{
 		Root:   root,
@@ -2148,29 +2396,6 @@ type errorReader struct {
 
 func (r errorReader) Read([]byte) (int, error) {
 	return 0, r.err
-}
-
-// budgetReader serves a fixed number of bytes and then fails. The carrier
-// plugin draws its startup proof before the runtime draws its server password,
-// so exhausting the budget between the two is the only way to reach the
-// password's own entropy failure.
-type budgetReader struct {
-	budget int
-	err    error
-}
-
-func (r *budgetReader) Read(p []byte) (int, error) {
-	if r.budget <= 0 {
-		return 0, r.err
-	}
-
-	if len(p) > r.budget {
-		p = p[:r.budget]
-	}
-
-	r.budget -= len(p)
-
-	return len(p), nil
 }
 
 type errorReadCloser struct {
@@ -2360,19 +2585,19 @@ func TestHealthAttemptDeadlineReleaseGate(t *testing.T) {
 // version contract; this is not a physical OpenCode p95 claim.
 // With five samples, nearest-rank p95 is the slowest sample.
 func TestColdStartupReleaseGate(t *testing.T) {
-	skipUnprivilegedDarwinIsolation(t)
 	executable := fakeOpenCodeExecutable(t)
 	durations := make([]time.Duration, 0, releaseGateRepetitions)
 
 	for range releaseGateRepetitions {
 		started := time.Now()
-		client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
-			Root:            testGeneratedTempDir(t),
+		client, err := StartServer(context.Background(), StartOptions{
+			Root:            t.TempDir(),
 			ExecutablePath:  executable,
 			MinVersion:      "1.18.3",
 			HealthTimeout:   5 * time.Second,
 			SkipVersionGate: false,
-		}))
+			Pure:            true,
+		})
 		durations = append(durations, time.Since(started))
 		require.NoError(t, err)
 		require.NoError(t, client.Shutdown(context.Background()))

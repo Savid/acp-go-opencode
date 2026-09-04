@@ -262,10 +262,6 @@ func TestCommandCompletionCancelsAStillPendingBlocker(t *testing.T) {
 
 	current.markPublishedToolCall("call-1")
 
-	type promptResult struct {
-		response acp.PromptResponse
-		err      error
-	}
 	done := make(chan promptResult, 1)
 
 	go func() {
@@ -531,7 +527,7 @@ func TestStreamlessIncarnationRefusesToOpenAnAgentTurn(t *testing.T) {
 	old := newTurnNonceRead
 	newTurnNonceRead = failingRouteReader{}.Read
 
-	current := newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"),
+	current := newSession(agent, "session-1", absTestPath("tmp", "project"), nil, testNativeSession("native-1"),
 		newFakeOpenCodeClient(), sessionMeta{}, idmapRecord{
 			SessionID: "session-1", NativeSessionID: "native-1", Format: SessionStoreFormat,
 		})

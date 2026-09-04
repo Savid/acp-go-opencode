@@ -51,6 +51,8 @@ func newAuthAgent(t *testing.T) authHarness {
 func withBrokerFactory(t *testing.T, agent *Agent) *fakeOpenCodeClient {
 	t.Helper()
 
+	neutralizeBrowserShimWhereUnsupported(t)
+
 	broker := newFakeOpenCodeClient()
 	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 		broker.mu.Lock()
@@ -175,6 +177,28 @@ func TestInitializeAdvertisesProviderAuthOnlyWhenEnabled(t *testing.T) {
 	plainVendor, ok := plainResponse.AgentCapabilities.Meta[opencodeMetaKey].(map[string]any)
 	require.True(t, ok)
 	require.NotContains(t, plainVendor, providerAuthCapabilityKey)
+}
+
+func TestManagedAuthorityWithholdsProviderAuth(t *testing.T) {
+	agent := NewAgent(
+		WithHome(t.TempDir()),
+		WithProviderAuthRoot(t.TempDir()),
+		WithHostAuthority(optionTestAuthority{}),
+	)
+	require.Nil(t, agent.providerAuth)
+
+	response, err := agent.Initialize(context.Background(), acp.InitializeRequest{})
+	require.NoError(t, err)
+	vendor, ok := response.AgentCapabilities.Meta[opencodeMetaKey].(map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, vendor, providerAuthCapabilityKey)
+
+	for _, method := range authMethodNames() {
+		_, methodErr := agent.HandleExtensionMethod(context.Background(), method, json.RawMessage(`{}`))
+		var requestErr *acp.RequestError
+		require.ErrorAs(t, methodErr, &requestErr)
+		require.Equal(t, -32601, requestErr.Code)
+	}
 }
 
 func TestUnadvertisedAuthLegsReturnMethodNotFound(t *testing.T) {
@@ -407,7 +431,7 @@ func TestLoggableError(t *testing.T) {
 func TestValidateProviderAuthOptionsRejectsDirectHome(t *testing.T) {
 	require.NoError(t, validateProviderAuthOptions(Options{}))
 
-	err := validateProviderAuthOptions(Options{ProviderAuthDirectHome: "/home/opencode"})
+	err := validateProviderAuthOptions(Options{ProviderAuthDirectHome: absTestPath("home", "opencode")})
 
 	var reqErr *acp.RequestError
 
@@ -421,7 +445,7 @@ func TestValidateProviderAuthOptionsRejectsDirectHome(t *testing.T) {
 
 func TestSessionStartRejectsProviderAuthDirectHome(t *testing.T) {
 	agent := NewAgent(
-		WithProviderAuthDirectHome("/home/opencode"),
+		WithProviderAuthDirectHome(absTestPath("home", "opencode")),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
 

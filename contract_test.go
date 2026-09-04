@@ -10,10 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestInitializeCapabilitiesHardCutover pins the capabilities this adapter
-// advertises and the ones it never will: a removed surface stays removed, and a
-// host reads support off the advertisement alone.
-func TestInitializeCapabilitiesHardCutover(t *testing.T) {
+func TestInitializeCapabilities(t *testing.T) {
 	agent := NewAgent()
 	resp, err := agent.Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	if err != nil {
@@ -208,8 +205,20 @@ func TestInitializeAdvertisesHandoffOnlyWhenConfigured(t *testing.T) {
 
 	with, err := NewAgent(WithInputHandoffRoot(root)).Initialize(context.Background(), request)
 	require.NoError(t, err)
-	require.Equal(t, map[string]any{metaFieldVersions: []int{handoffEnvelopeVersion}}, with.AgentCapabilities.Meta[handoffEnvelopeKey])
-	require.Equal(t, map[string]any{metaFieldVersions: []int{routeEnvelopeVersion}}, with.AgentCapabilities.Meta[routeEnvelopeKey])
+	require.Equal(t, map[string]any{metaFieldVersion: handoffEnvelopeVersion}, with.AgentCapabilities.Meta[handoffEnvelopeKey])
+	require.Equal(t, map[string]any{metaFieldVersion: routeEnvelopeVersion}, with.AgentCapabilities.Meta[routeEnvelopeKey])
+}
+
+func TestRouteCapabilityScalar(t *testing.T) {
+	response, err := NewAgent().Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+	})
+	require.NoError(t, err)
+
+	route, ok := response.AgentCapabilities.Meta["acp-go.dev/route"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, 1, route["version"])
+	require.Len(t, route, 1)
 }
 
 // TestStableForkRouteMethodNotFound pins that the stable fork route does not

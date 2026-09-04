@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,24 +22,47 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func boolPtr(value bool) *bool {
-	return &value
+// absTestPath builds a host-absolute path from POSIX-looking segments, so a
+// test states "an absolute working directory" rather than a spelling only one
+// platform accepts.
+func absTestPath(segments ...string) string {
+	root := "/"
+	if runtime.GOOS == "windows" {
+		root = `C:\`
+	}
+
+	return filepath.Join(append([]string{root}, segments...)...)
 }
 
-// testNativeOwnedHome builds a durable native home the ownership predicate can
-// actually admit. t.TempDir is unusable here: its leaf is created 0777&^umask,
-// so it lands on 0755 under the fleet's umask 022 while the predicate requires
-// exactly 0700. The home is also a direct child of the temp root so its
-// ancestry stays traversable by a foreign target identity, which keeps a
-// wrong-owner refusal about the owner rather than about the walk.
-func testNativeOwnedHome(t *testing.T) string {
+// retainedScratchDir is a scratch parent for a case that deliberately leaves a
+// runtime uncontained. t.TempDir fails the test when it cannot remove what it
+// created, and a runtime whose containment could not be proven still holds its
+// claim lock open — which Windows refuses to unlink. The removal here is best
+// effort for exactly that reason.
+func retainedScratchDir(t *testing.T) string {
 	t.Helper()
-	home, err := os.MkdirTemp("", "acp-go-opencode-native-home-")
-	require.NoError(t, err)
-	require.NoError(t, os.Chmod(home, 0o700))
-	t.Cleanup(func() { _ = os.RemoveAll(home) })
 
-	return home
+	dir, err := os.MkdirTemp("", "acp-go-opencode-retained-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	return dir
+}
+
+// testURIPath spells a local path the way a file URI carries it: rooted at a
+// single slash, so a Windows volume name sits after that slash rather than in
+// the URI's authority.
+func testURIPath(path string) string {
+	return "/" + strings.TrimPrefix(filepath.ToSlash(path), "/")
+}
+
+// testFileURI is the file URI that names a local path on this host.
+func testFileURI(path string) string {
+	return "file://" + testURIPath(path)
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func stringPtr(value string) *string {
@@ -161,8 +186,9 @@ func narrowedOutsideRoot(t *testing.T, sess *session) string {
 	t.Helper()
 
 	base := t.TempDir()
-	sess.agent.options.ScratchDir = filepath.Join(base, "scratch")
-	require.NoError(t, os.Mkdir(sess.agent.options.ScratchDir, 0o700))
+	scratch := filepath.Join(base, "scratch")
+	WithScratchDir(scratch)(&sess.agent.options)
+	require.NoError(t, os.Mkdir(scratch, 0o700))
 
 	tempRoot := filepath.Join(base, "tmp")
 	require.NoError(t, os.Mkdir(tempRoot, 0o700))
@@ -262,6 +288,8 @@ type fakeOpenCodeClient struct {
 	questionRejected   chan struct{}
 
 	createSessionFunc  func(context.Context, string) (opencode.NativeSession, error)
+	getSessionFunc     func(context.Context, string) (opencode.NativeSession, error)
+	scopeFunc          func(opencode.ScopeOptions) error
 	dispatchMessage    func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error)
 	dispatchCommand    func(context.Context, string, opencode.CommandRequest) (opencode.NativeMessage, error)
 	omitPromptEvidence bool
@@ -449,6 +477,11 @@ func (c *fakeOpenCodeClient) Scope(_ context.Context, options opencode.ScopeOpti
 		ExtraPathDirs: append([]string(nil), options.ExtraPathDirs...),
 	})
 	c.mu.Unlock()
+	if c.scopeFunc != nil {
+		if err := c.scopeFunc(options); err != nil {
+			return nil, err
+		}
+	}
 
 	return c, c.scopeErr
 }
@@ -485,7 +518,11 @@ func (c *fakeOpenCodeClient) CreateSessionWithPolicy(ctx context.Context, title 
 	return created, err
 }
 
-func (c *fakeOpenCodeClient) GetSession(context.Context, string) (opencode.NativeSession, error) {
+func (c *fakeOpenCodeClient) GetSession(ctx context.Context, id string) (opencode.NativeSession, error) {
+	if c.getSessionFunc != nil {
+		return c.getSessionFunc(ctx, id)
+	}
+
 	return c.getSession, c.getErr
 }
 
@@ -1217,6 +1254,29 @@ func signalTestHook(ch chan struct{}) {
 	once.Do(func() { close(ch) })
 }
 
+// promptResult carries a Prompt call's value and its error back to the test
+// goroutine. A require.* call inside a goroutine ends that goroutine through
+// runtime.Goexit, so the send after it never runs and the receiving test blocks
+// until the package timeout; assertions belong on the receiving side.
+type promptResult struct {
+	response acp.PromptResponse
+	err      error
+}
+
+// awaitPromptResult receives a prompt outcome under a bounded deadline so a turn
+// that never settles fails this test instead of hanging the whole package.
+func awaitPromptResult(t *testing.T, done <-chan promptResult) promptResult {
+	t.Helper()
+	select {
+	case result := <-done:
+		return result
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the prompt to settle")
+
+		return promptResult{}
+	}
+}
+
 func requireSignal(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
 	select {
@@ -1346,7 +1406,7 @@ func testSession(t *testing.T, agent *Agent, client *fakeOpenCodeClient) *sessio
 	generation := agent.runtimeGeneration
 	agent.mu.Unlock()
 
-	session := newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
+	session := newSession(agent, "session-1", absTestPath("tmp", "project"), nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
 		SessionID:       "session-1",
 		NativeSessionID: "native-1",
 		Format:          SessionStoreFormat,
@@ -1620,7 +1680,7 @@ func requireLifecycleOutcome(t *testing.T, connection *recordingAgentClient, wan
 // the proven facts plus the version marker the answer carries on the wire.
 func negotiatedTestFacts() lifecycle.Negotiated {
 	facts := provenFacts()
-	facts.Versions = []int{lifecycle.Version}
+	facts.Version = lifecycle.Version
 
 	return facts
 }

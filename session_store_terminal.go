@@ -38,8 +38,8 @@ func InspectSessionStoreTerminalState(
 		)
 	}
 
-	var snapshot stateSnapshot
-	if err := json.Unmarshal(entries[0], &snapshot); err != nil {
+	snapshot, err := decodeStateSnapshot(entries[0])
+	if err != nil {
 		return SessionStoreTerminalState{}, fmt.Errorf("decode OpenCode session-store snapshot: %w", err)
 	}
 
@@ -53,15 +53,8 @@ func InspectSessionStoreTerminalState(
 
 	var terminal SessionStoreTerminalState
 
-	for index, event := range events {
-		if event.Sequence != int64(index) {
-			return SessionStoreTerminalState{}, fmt.Errorf(
-				"native session %q has non-contiguous OpenCode sync event ordering",
-				nativeSessionID,
-			)
-		}
-
-		if event.Type != "message.updated.1" {
+	for _, event := range events {
+		if event.Type != syncTypeMessageUpdated {
 			continue
 		}
 

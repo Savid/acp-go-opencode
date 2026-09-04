@@ -9,7 +9,7 @@ import (
 )
 
 func TestDecodedDuplicateComparisonPreservesIntegersAboveFloatPrecision(t *testing.T) {
-	negotiated := Negotiated{Versions: []int{Version}}
+	negotiated := Negotiated{Version: Version}
 	frame := func(marker string) json.RawMessage {
 		return json.RawMessage(`{"sessionId":"s","update":{"sessionUpdate":"session_info_update"},"_meta":{"acp-go.dev/lifecycle":{"version":1,"streamId":"stream","sequence":1,"event":{"type":"lifecycle_snapshot","foreground":{"state":"idle","cycleId":"idle"},"activities":[],"actions":[],"quiescence":{"quiescent":false}}},"marker":` + marker + `}}`)
 	}
@@ -24,7 +24,7 @@ func TestDecodedDuplicateComparisonPreservesIntegersAboveFloatPrecision(t *testi
 
 func decodeNegotiated() Negotiated {
 	return Negotiated{
-		Versions:                []int{1},
+		Version:                 1,
 		AuthoritativeQuiescence: true,
 		QuiescenceSource:        ProofClassProcessContainment,
 		ActivityKinds:           []ActivityKind{ActivityTask},
@@ -146,7 +146,7 @@ func TestDecodeStrictness(t *testing.T) {
 		{"sequence not an integer", `{"version":1,"streamId":"s","sequence":"1","event":{"type":"prompt_accepted"}}`, ViolationMalformedEnvelope},
 		{"version missing", `{"streamId":"s","sequence":1,"event":{"type":"prompt_accepted"}}`, ViolationMalformedEnvelope},
 		{"version not an integer", `{"version":"1","streamId":"s","sequence":1,"event":{"type":"prompt_accepted"}}`, ViolationMalformedEnvelope},
-		{"version outside the set", `{"version":2,"streamId":"s","sequence":1,"event":{"type":"prompt_accepted"}}`, ViolationUnsupportedVersion},
+		{"unsupported version", `{"version":2,"streamId":"s","sequence":1,"event":{"type":"prompt_accepted"}}`, ViolationUnsupportedVersion},
 		{"event missing", `{"version":1,"streamId":"s","sequence":1}`, ViolationMalformedEnvelope},
 		{"event not an object", `{"version":1,"streamId":"s","sequence":1,"event":7}`, ViolationMalformedEnvelope},
 		{"event type missing", envelopeAround(`{}`), ViolationMalformedEnvelope},

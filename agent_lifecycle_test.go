@@ -3,7 +3,9 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/lifecycle"
@@ -13,7 +15,7 @@ import (
 
 // lifecycleOffer is the host's initialize offer.
 func lifecycleOffer() map[string]any {
-	return map[string]any{lifecycle.MetaKey: map[string]any{"versions": []any{1.0}}}
+	return map[string]any{lifecycle.MetaKey: map[string]any{"version": 1.0}}
 }
 
 // lifecycleKey is the reserved literal on a surface that carries no lifecycle
@@ -44,7 +46,7 @@ func TestInitializeAnswersOnTheResponsesOwnMeta(t *testing.T) {
 
 	answer, ok := response.Meta[lifecycle.MetaKey].(map[string]any)
 	require.True(t, ok, "the answer is absent from the response _meta")
-	require.Equal(t, []int{1}, answer["versions"])
+	require.Equal(t, 1, answer["version"])
 	require.Equal(t, true, answer["updatesOutsidePrompt"])
 	require.Equal(t, false, answer["authoritativeQuiescence"])
 	require.Equal(t, []string{}, answer["activityKinds"])
@@ -58,10 +60,9 @@ func TestInitializeAnswersOnTheResponsesOwnMeta(t *testing.T) {
 	require.NotContains(t, vendor, "lifecycle")
 }
 
-// TestInitializeOmitsTheKeyWithoutACommonVersion proves the key is omitted whole
-// rather than answered with an empty array, and that an absent offer is the host
-// asking for nothing.
-func TestInitializeOmitsTheKeyWithoutACommonVersion(t *testing.T) {
+// TestInitializeOmitsLifecycleWithoutOffer proves an absent offer is the host
+// asking for no lifecycle capability.
+func TestInitializeOmitsLifecycleWithoutOffer(t *testing.T) {
 	t.Parallel()
 
 	for _, row := range []struct {
@@ -69,8 +70,7 @@ func TestInitializeOmitsTheKeyWithoutACommonVersion(t *testing.T) {
 		meta map[string]any
 	}{
 		{"no offer", nil},
-		{"no _meta member", map[string]any{"acp-go.dev/route": map[string]any{"versions": []any{1.0}}}},
-		{"no common version", map[string]any{lifecycle.MetaKey: map[string]any{"versions": []any{2.0}}}},
+		{"no _meta member", map[string]any{"acp-go.dev/route": map[string]any{"version": 1.0}}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
@@ -95,10 +95,12 @@ func TestInitializeRefusesAMalformedOfferByPath(t *testing.T) {
 		field string
 	}{
 		{"not an object", []any{1.0}, lifecycle.MetaPath},
-		{"unknown member", map[string]any{"versions": []any{1.0}, "activityKinds": []any{}}, lifecycle.MetaPath + ".activityKinds"},
-		{"versions absent", map[string]any{}, lifecycle.MetaPath + ".versions"},
-		{"versions empty", map[string]any{"versions": []any{}}, lifecycle.MetaPath + ".versions"},
-		{"versions not integers", map[string]any{"versions": []any{"1"}}, lifecycle.MetaPath + ".versions"},
+		{"unknown member", map[string]any{"version": 1.0, "activityKinds": []any{}}, lifecycle.MetaPath + ".activityKinds"},
+		{"version absent", map[string]any{}, lifecycle.MetaPath + ".version"},
+		{"other integer", map[string]any{"version": 2.0}, lifecycle.MetaPath + ".version"},
+		{"fractional", map[string]any{"version": 1.5}, lifecycle.MetaPath + ".version"},
+		{"string", map[string]any{"version": "1"}, lifecycle.MetaPath + ".version"},
+		{"boolean", map[string]any{"version": true}, lifecycle.MetaPath + ".version"},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
@@ -113,37 +115,13 @@ func TestInitializeRefusesAMalformedOfferByPath(t *testing.T) {
 	}
 }
 
-// TestLifecycleAnswerIsTheSameOnEveryContainmentMode proves the answer states
-// only what this adapter proves, and that no containment mode changes it. The
-// mode decides how the native process boundary is enforced; it decides nothing
-// about out-of-prompt delivery, quiescence, or activity kinds, so a host reading
-// the answer learns the same degenerate row however the runtime is contained —
-// including the quiescence source, which an answer proving no class never states.
-func TestLifecycleAnswerIsTheSameOnEveryContainmentMode(t *testing.T) {
-	t.Parallel()
-
-	for _, mode := range []RuntimeContainmentMode{
-		RuntimeContainmentAuthoritative,
-		RuntimeContainmentBestEffort,
-		RuntimeContainmentSharedIdentity,
-		RuntimeContainmentUnavailable,
-		RuntimeContainmentMode("unnamed"),
-	} {
-		agent := NewAgent()
-		agent.containmentMode = mode
-
-		response, err := agent.Initialize(context.Background(), acp.InitializeRequest{Meta: lifecycleOffer()})
-		require.NoError(t, err)
-
-		facts := agent.lifecycleNegotiated()
-		require.True(t, facts.UpdatesOutsidePrompt, mode)
-		require.False(t, facts.AuthoritativeQuiescence, mode)
-		require.Empty(t, facts.QuiescenceSource, mode)
-		require.Equal(t, []lifecycle.ActivityKind{}, facts.ActivityKinds, mode)
-
-		answer, ok := response.Meta[lifecycle.MetaKey].(map[string]any)
-		require.True(t, ok, mode)
-		require.NotContains(t, answer, "quiescenceSource", mode)
+func TestLifecycleCapabilityStrictScalar(t *testing.T) {
+	for _, raw := range []string{`"1"`, `1.0`, `1.5`, `null`, `true`, `{}`, `[]`, `2`} {
+		t.Run(raw, func(t *testing.T) {
+			var capability lifecycle.Negotiated
+			err := json.Unmarshal([]byte(`{"version":`+raw+`}`), &capability)
+			require.Error(t, err)
+		})
 	}
 }
 
@@ -158,20 +136,20 @@ func TestReservedLifecycleKeyIsRefusedOnEveryCarryingRoute(t *testing.T) {
 		call func(*Agent) error
 	}{
 		{"session/new", func(a *Agent) error {
-			_, err := a.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", Meta: lifecycleKey()})
+			_, err := a.NewSession(context.Background(), acp.NewSessionRequest{Cwd: absTestPath("tmp"), Meta: lifecycleKey()})
 
 			return err
 		}},
 		{"session/load", func(a *Agent) error {
 			_, err := a.LoadSession(context.Background(), acp.LoadSessionRequest{
-				SessionId: "session-1", Cwd: "/tmp", Meta: lifecycleKey(),
+				SessionId: "session-1", Cwd: absTestPath("tmp"), Meta: lifecycleKey(),
 			})
 
 			return err
 		}},
 		{"session/resume", func(a *Agent) error {
 			_, err := a.ResumeSession(context.Background(), acp.ResumeSessionRequest{
-				SessionId: "session-1", Cwd: "/tmp", Meta: lifecycleKey(),
+				SessionId: "session-1", Cwd: absTestPath("tmp"), Meta: lifecycleKey(),
 			})
 
 			return err
@@ -531,4 +509,70 @@ func requireUnsupportedField(t *testing.T, err error, field string) {
 		jsonFieldError: errValueUnsupported,
 		jsonFieldField: field,
 	}).Error(), reqErr.Error())
+}
+
+type cancelAfterFirstErrContext struct {
+	context.Context //nolint:containedctx // Test context stages the gate's post-admission cancellation recheck.
+	calls           atomic.Int32
+	done            <-chan struct{}
+}
+
+func (c *cancelAfterFirstErrContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterFirstErrContext) Done() <-chan struct{}       { return c.done }
+func (c *cancelAfterFirstErrContext) Err() error {
+	if c.calls.Add(1) > 1 {
+		return context.Canceled
+	}
+
+	return nil
+}
+func TestRecoveryAndLifecycleAdmissionEdges(t *testing.T) {
+	done := make(chan struct{})
+	ctx := &cancelAfterFirstErrContext{Context: t.Context(), done: done}
+	var gate sessionRecoveryGate
+	require.ErrorIs(t, gate.lock(ctx), context.Canceled)
+	require.NoError(t, gate.lock(t.Context()), "cancelled post-admission check must return the permit")
+	gate.unlock()
+
+	agent := NewAgent()
+	id := acp.SessionId("session")
+	flight := &sessionLifecycleFlight{done: make(chan struct{})}
+	fence := make(chan struct{})
+	close(fence)
+	agent.lifecycleFence = fence
+	agent.lifecycleFlights = make(map[acp.SessionId]*sessionLifecycleFlight)
+	agent.lifecycleFlights[id] = flight
+	_, err := agent.acquireSessionLifecycle(t.Context(), id)
+	require.Error(t, err)
+	agent.releaseSessionLifecycle(id, &sessionLifecycleFlight{})
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = agent.LoadSession(cancelled, acp.LoadSessionRequest{SessionId: id})
+	require.ErrorIs(t, err, context.Canceled)
+}
+func TestLifecycleCancellationEdges(t *testing.T) {
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	current := &session{}
+	require.ErrorIs(t, current.ensureRuntime(cancelled), context.Canceled)
+	require.ErrorIs(t, current.refreshLifecycleMCP(cancelled), context.Canceled)
+	require.Panics(t, func() { new(sessionRecoveryGate).unlock() })
+
+	done := make(chan struct{})
+	close(done)
+	ctx := &cancelAfterFirstErrContext{Context: t.Context(), done: done}
+	agent := NewAgent()
+	id := acp.SessionId("busy")
+	agent.lifecycleFlights = make(map[acp.SessionId]*sessionLifecycleFlight)
+	agent.lifecycleFlights[id] = &sessionLifecycleFlight{done: make(chan struct{})}
+	_, err := agent.acquireSessionLifecycle(ctx, id)
+	require.ErrorIs(t, err, context.Canceled)
+
+	fenced := NewAgent()
+	fenced.lifecycleFenced = true
+	_, err = fenced.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: id})
+	require.Error(t, err)
+	_, err = fenced.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: id})
+	require.Error(t, err)
 }

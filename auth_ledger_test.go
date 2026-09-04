@@ -49,17 +49,12 @@ func TestNewAuthLedgerValidatesTheConfiguredRoot(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "root")
 	require.NoError(t, os.Mkdir(root, 0o755))
 
-	ledger, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: "/home/opencode"})
+	ledger, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: absTestPath("home", "opencode")})
 	require.NoError(t, err)
-	require.Equal(t, filepath.Join(root, authLedgerVendorDir, authLedgerHomeKey("/home/opencode"), authLedgerLeafDir), ledger.dir)
+	require.Equal(t, filepath.Join(root, authLedgerVendorDir, authLedgerHomeKey(absTestPath("home", "opencode")), authLedgerLeafDir), ledger.dir)
 
-	rootInfo, err := os.Stat(root)
-	require.NoError(t, err)
-	require.Equal(t, fs.FileMode(authLedgerDirMode), rootInfo.Mode().Perm())
-
-	info, err := os.Stat(ledger.dir)
-	require.NoError(t, err)
-	require.Equal(t, fs.FileMode(authLedgerDirMode), info.Mode().Perm())
+	requireOwnerOnlyMode(t, root, authLedgerDirMode)
+	requireOwnerOnlyMode(t, ledger.dir, authLedgerDirMode)
 }
 
 func TestNewAuthLedgerRejectsUnusableRoots(t *testing.T) {
@@ -167,9 +162,7 @@ func TestAuthLedgerRoundTrip(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "c1", stored.ConnectionID)
 
-	info, err := os.Stat(ledger.path("xai"))
-	require.NoError(t, err)
-	require.Equal(t, fs.FileMode(authLedgerFileMode), info.Mode().Perm())
+	requireOwnerOnlyMode(t, ledger.path("xai"), authLedgerFileMode)
 
 	require.NoError(t, ledger.write(authLedgerRecord{ProviderID: "deepseek", State: authLedgerConfirmed}))
 
@@ -269,7 +262,7 @@ func TestAuthLedgerWriteFailures(t *testing.T) {
 
 	ledgerRename = func(string, string) error { return nil }
 	ledgerOpen = func(string) (*os.File, error) { return nil, errors.New("open") }
-	require.Error(t, ledger.write(authLedgerRecord{ProviderID: "xai"}))
+	requireDirectoryFlushOutcome(t, ledger.write(authLedgerRecord{ProviderID: "xai"}), "open")
 }
 
 func TestAuthLedgerListFailures(t *testing.T) {

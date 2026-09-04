@@ -109,12 +109,14 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 		t.Fatalf("empty session id delete left tombstones: %#v", store.tombstones)
 	}
 	store.mu.Unlock()
-	entry := SessionStoreEntry(`{
-			"capturedAtUnixMilli": 200,
-			"session": {"cwd": "/repo", "title": "Stored", "nativeSessionId": "native-1"}
-		}`)
-	if err := store.Append(ctx, key, []SessionStoreEntry{entry}); err != nil {
-		t.Fatalf("append main: %v", err)
+	snapshot := validSyncSnapshot("s1", "native-1", absTestPath("repo"))
+	snapshot.CapturedAtUnixMilli = 200
+	snapshot.Session.Title = "Stored"
+	entryBytes, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	entry := SessionStoreEntry(entryBytes)
+	if appendErr := store.Append(ctx, key, []SessionStoreEntry{entry}); appendErr != nil {
+		t.Fatalf("append main: %v", appendErr)
 	}
 	entry[0] = '['
 	loaded, err := store.Load(ctx, key)
@@ -148,7 +150,7 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 			stored = &summaries[i]
 		}
 	}
-	if len(summaries) != 2 || stored == nil || stored.Cwd != "/repo" || stored.Title != "Stored" {
+	if len(summaries) != 2 || stored == nil || stored.Cwd != absTestPath("repo") || stored.Title != "Stored" {
 		t.Fatalf("summaries = %#v", summaries)
 	}
 	subkeys, err := store.ListSubkeys(ctx, key)
@@ -245,6 +247,10 @@ func TestInMemoryStoreReplaceValidation(t *testing.T) {
 		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
 		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
 	}), `duplicate replacement key: session "s1" subpath ""`)
+	require.ErrorContains(t, store.Replace(ctx, main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+		{Key: SessionKey{Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+	}), "replacement session id is required")
 
 	if err := store.Replace(ctx, SessionKey{}, nil); err == nil {
 		t.Fatal("replace accepted missing main session id")
@@ -285,6 +291,48 @@ func TestInMemoryStoreReplaceValidation(t *testing.T) {
 
 	if len(entries) != 0 {
 		t.Fatalf("empty subkey entries = %v", entries)
+	}
+}
+
+func TestInMemoryStoreReplaceRequiresOneMainPerNamedMemberAtomically(t *testing.T) {
+	ctx := t.Context()
+	store := NewInMemorySessionStore()
+	sMain := SessionKey{SessionID: "s"}
+	xMain := SessionKey{SessionID: "x"}
+	require.NoError(t, store.Replace(ctx, sMain, []SessionStoreReplacement{{
+		Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"before"}`)},
+	}}))
+
+	err := store.Replace(ctx, sMain, []SessionStoreReplacement{
+		{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
+		{Key: SessionKey{SessionID: "x", Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{"x":true}`)}},
+	})
+	require.ErrorContains(t, err, `exactly one main key for session "x"`)
+
+	entries, loadErr := store.Load(ctx, sMain)
+	require.NoError(t, loadErr)
+	require.JSONEq(t, `{"generation":"before"}`, string(entries[0]))
+	xArtifact, loadErr := store.Load(ctx, SessionKey{SessionID: "x", Subpath: "artifact"})
+	require.NoError(t, loadErr)
+	require.Empty(t, xArtifact, "refused replacement mutated an unaddressed member")
+
+	require.NoError(t, store.Replace(ctx, sMain, []SessionStoreReplacement{
+		{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"after"}`)}},
+		{Key: SessionKey{SessionID: "s", Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{"s":true}`)}},
+		{Key: xMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"x"}`)}},
+		{Key: SessionKey{SessionID: "x", Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{"x":true}`)}},
+	}))
+
+	for key, expected := range map[SessionKey]string{
+		sMain:                                 `{"generation":"after"}`,
+		{SessionID: "s", Subpath: "artifact"}: `{"s":true}`,
+		xMain:                                 `{"generation":"x"}`,
+		{SessionID: "x", Subpath: "artifact"}: `{"x":true}`,
+	} {
+		stored, storedErr := store.Load(ctx, key)
+		require.NoError(t, storedErr)
+		require.Len(t, stored, 1)
+		require.JSONEq(t, expected, string(stored[0]))
 	}
 }
 

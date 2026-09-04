@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const (
@@ -100,13 +103,15 @@ func callAuthLeg(t *testing.T, ctx context.Context, conn *acp.ClientSideConnecti
 	return nil
 }
 
+type authMethodEntryWire struct {
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	Label string `json:"label"`
+}
+
 type authMethodsWire struct {
-	Providers map[string][]struct {
-		ID    string `json:"id"`
-		Type  string `json:"type"`
-		Label string `json:"label"`
-	} `json:"providers"`
-	Generation string `json:"generation"`
+	Providers  map[string][]authMethodEntryWire `json:"providers"`
+	Generation string                           `json:"generation"`
 }
 
 type authAuthorizeWire struct {
@@ -125,17 +130,86 @@ type authStatusWire struct {
 	Reason string `json:"reason"`
 }
 
-// TestProviderAuthCatalogOmitsXAILoopbackMethod pins the live OpenCode method
-// split that the catalog filter depends on. The browser flow is native slot 0
-// and must be absent; the headless and API-key flows keep native slots 1 and 2.
-func TestProviderAuthCatalogOmitsXAILoopbackMethod(t *testing.T) {
+// readNativeAuthMethods returns the native login methods the installed
+// OpenCode publishes, read from a runtime the test owns so the adapter's
+// catalog can be checked against the input it was built from. The list is
+// compiled into the binary, so two runtimes of the same binary agree on it;
+// the model catalog is not, being fetched per runtime, which is why the test
+// never compares that.
+func readNativeAuthMethods(t *testing.T, ctx context.Context) map[string][]opencode.ProviderAuthMethod {
+	t.Helper()
+
+	root := t.TempDir()
+
+	client, err := opencode.StartServer(ctx, opencode.StartOptions{
+		Root:           filepath.Join(root, "runtime"),
+		ControlRoot:    filepath.Join(root, "control"),
+		ScratchParent:  root,
+		ExecutablePath: integrationOpenCodePath(t),
+		Pure:           true,
+		HealthTimeout:  60 * time.Second,
+		Logger:         integrationLogger,
+	})
+	if err != nil {
+		t.Fatalf("start native catalog runtime: %v", err)
+	}
+
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), agentExitGrace)
+		defer cancel()
+
+		if err := client.Shutdown(shutdownCtx); err != nil {
+			t.Logf("shut native catalog runtime down: %v", err)
+		}
+	})
+
+	native, err := client.ProviderAuthMethods(ctx)
+	if err != nil {
+		t.Fatalf("native provider auth methods: %v", err)
+	}
+
+	return native
+}
+
+func hasPublishedMethod(entries []authMethodEntryWire, id, kind, label string) bool {
+	return slices.ContainsFunc(entries, func(entry authMethodEntryWire) bool {
+		return entry.ID == id && entry.Type == kind && entry.Label == label
+	})
+}
+
+func nativeMethodIndex(methods []opencode.ProviderAuthMethod, kind, label string) int {
+	return slices.IndexFunc(methods, func(method opencode.ProviderAuthMethod) bool {
+		return method.Type == kind && method.Label == label
+	})
+}
+
+func describeNativeMethods(methods []opencode.ProviderAuthMethod) string {
+	described := make([]string, 0, len(methods))
+
+	for _, method := range methods {
+		described = append(described, method.Type+":"+method.Label)
+	}
+
+	return fmt.Sprintf("%q", described)
+}
+
+// TestProviderAuthCatalogPublishesReviewedMethods pins the adapter's catalog
+// against the native method list the installed OpenCode publishes, naming no
+// provider. Every reviewed OAuth method must still ship upstream and be
+// published under its native slot, every published OAuth method must be a
+// reviewed one, every native API-key method must be published under its slot,
+// and a synthesized default may stand only for a provider with no native
+// methods. A reviewed label that upstream renames fails here naming the
+// provider and label to re-review, instead of silently leaving the catalog.
+func TestProviderAuthCatalogPublishesReviewedMethods(t *testing.T) {
 	requireRunIntegration(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	conn, agent, _, _, _ := providerAuthAgent(t, ctx)
-	defer agent.close()
+	native := readNativeAuthMethods(t, ctx)
+
+	conn, _, _, _, _ := providerAuthAgent(t, ctx)
 
 	sessionID := newProviderAuthSession(t, ctx, conn)
 
@@ -144,21 +218,72 @@ func TestProviderAuthCatalogOmitsXAILoopbackMethod(t *testing.T) {
 		t.Fatalf("_opencode/auth/methods: %v", err)
 	}
 
-	entries, ok := methods.Providers["xai"]
-	if !ok {
-		t.Fatalf("catalog carried no %q provider: %#v", "xai", methods.Providers)
+	reviewed := opencode.ReviewedOAuthMethods()
+
+	for providerID, labels := range reviewed {
+		nativeMethods, ok := native[providerID]
+		if !ok {
+			t.Errorf("reviewed provider %q ships no native login methods in this OpenCode; re-review it", providerID)
+
+			continue
+		}
+
+		for _, label := range labels {
+			index := nativeMethodIndex(nativeMethods, "oauth", label)
+			if index < 0 {
+				t.Errorf("reviewed method %q/%q no longer ships in this OpenCode; re-review the plugin, which now publishes %s",
+					providerID, label, describeNativeMethods(nativeMethods))
+
+				continue
+			}
+
+			if !hasPublishedMethod(methods.Providers[providerID], strconv.Itoa(index), "oauth", label) {
+				t.Errorf("reviewed method %q/%q is not published under native slot %d: %#v", providerID, label, index, methods.Providers[providerID])
+			}
+		}
 	}
 
-	if len(entries) != 2 {
-		t.Fatalf("xAI methods = %#v, want exactly the headless and API-key methods", entries)
+	for providerID, entries := range methods.Providers {
+		nativeMethods, special := native[providerID]
+
+		for _, entry := range entries {
+			if entry.ID == "default-api" {
+				if special {
+					t.Errorf("provider %q ships native methods but was published with the synthesized default: %#v", providerID, entry)
+				} else if entry.Type != "api" || entry.Label == "" || len(entries) != 1 {
+					t.Errorf("provider %q default = %#v among %#v, want one named api-key method", providerID, entry, entries)
+				}
+
+				continue
+			}
+
+			index, err := strconv.Atoi(entry.ID)
+			if err != nil || index < 0 || index >= len(nativeMethods) {
+				t.Errorf("provider %q method %#v addresses no native slot of %s", providerID, entry, describeNativeMethods(nativeMethods))
+
+				continue
+			}
+
+			if got := nativeMethods[index]; got.Type != entry.Type || got.Label != entry.Label {
+				t.Errorf("provider %q method %#v does not match native slot %d %q/%q", providerID, entry, index, got.Type, got.Label)
+			}
+
+			if entry.Type == "oauth" && !slices.Contains(reviewed[providerID], entry.Label) {
+				t.Errorf("provider %q published oauth method %q with no reviewed entry", providerID, entry.Label)
+			}
+		}
 	}
 
-	if got := entries[0]; got.ID != "1" || got.Type != "oauth" || got.Label != "xAI Grok OAuth (Headless / Remote / VPS)" {
-		t.Fatalf("xAI method 1 = %#v, want the headless OAuth method", got)
-	}
+	for providerID, nativeMethods := range native {
+		for index, method := range nativeMethods {
+			if method.Type != "api" {
+				continue
+			}
 
-	if got := entries[1]; got.ID != "2" || got.Type != "api" || got.Label != "Manually enter API Key" {
-		t.Fatalf("xAI method 2 = %#v, want the API-key method", got)
+			if !hasPublishedMethod(methods.Providers[providerID], strconv.Itoa(index), "api", method.Label) {
+				t.Errorf("native api-key method %q/%q at slot %d is not published: %#v", providerID, method.Label, index, methods.Providers[providerID])
+			}
+		}
 	}
 }
 
@@ -171,8 +296,7 @@ func TestAttendedProviderAuthDeviceFlowCompletes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	conn, agent, home, authRoot, scratch := providerAuthAgent(t, ctx)
-	defer agent.close()
+	conn, _, home, authRoot, scratch := providerAuthAgent(t, ctx)
 
 	sessionID := newProviderAuthSession(t, ctx, conn)
 
@@ -248,8 +372,7 @@ func TestKeystoreProviderAuthResidence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	conn, agent, home, authRoot, _ := providerAuthAgent(t, ctx)
-	defer agent.close()
+	conn, _, home, authRoot, _ := providerAuthAgent(t, ctx)
 
 	sessionID := newProviderAuthSession(t, ctx, conn)
 

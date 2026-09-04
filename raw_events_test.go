@@ -61,7 +61,7 @@ func rawEventSession(t *testing.T, id acp.SessionId, conn agentClient) *session 
 	agent := NewAgent()
 	agent.setAgentClient(conn)
 	client := newFakeOpenCodeClient()
-	sess := newSession(agent, id, "/tmp/project", nil, testNativeSession(string(id)), client, sessionMeta{}, idmapRecord{
+	sess := newSession(agent, id, absTestPath("tmp", "project"), nil, testNativeSession(string(id)), client, sessionMeta{}, idmapRecord{
 		SessionID:       string(id),
 		NativeSessionID: string(id),
 		Format:          SessionStoreFormat,

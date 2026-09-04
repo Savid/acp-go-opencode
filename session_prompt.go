@@ -10,7 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
-	"path/filepath"
+	"path"
 	"reflect"
 	"strings"
 	"time"
@@ -709,7 +709,11 @@ func (s *session) awaitPromptTerminal(
 	case err := <-completion:
 		if err != nil {
 			s.recordCycleFailure(cycle, err)
+
+			return s.observedCycleEnd(cycle)
 		}
+
+		s.awaitAssistantEvidence(turnCtx, cycle)
 
 		return s.observedCycleEnd(cycle)
 	case <-turnCtx.Done():
@@ -734,6 +738,42 @@ func (s *session) awaitPromptTerminal(
 		end.timedOut = true
 
 		return end
+	}
+}
+
+// promptCompletionEvidenceWait bounds the settling wait below. It is a variable
+// so a test can drive the expiry without spending the real bound.
+var promptCompletionEvidenceWait = settlementTimeout
+
+// awaitAssistantEvidence lets the ordered stream catch up to a completion the
+// native route already reported.
+//
+// A completion-reporting route answers on its own connection, so its response
+// races the stream that carries the assistant identities the turn settles on.
+// The response is still terminal — a command that completed with a blocker
+// pending must end the turn rather than wait for an idle that never comes — so
+// this waits only for the identity the settling read needs, and only while the
+// cycle holds none. The wait is bounded: a run that produced no assistant
+// message at all still fails on the missing identity instead of holding the
+// turn open.
+func (s *session) awaitAssistantEvidence(turnCtx context.Context, cycle *foregroundCycle) {
+	s.lifecycleMu.Lock()
+	evidence := cycle.assistantEvidence
+	adopted := len(cycle.assistantIDs) > 0
+	s.lifecycleMu.Unlock()
+
+	if adopted || evidence == nil {
+		return
+	}
+
+	timer := time.NewTimer(promptCompletionEvidenceWait)
+	defer timer.Stop()
+
+	select {
+	case <-evidence:
+	case <-cycle.signal:
+	case <-turnCtx.Done():
+	case <-timer.C:
 	}
 }
 
@@ -1001,8 +1041,11 @@ func (s *session) classifyTurnFailure(ctx context.Context, err error, dispatch n
 }
 
 func (s *session) refreshLifecycleMCP(ctx context.Context) error {
-	s.recoveryMu.Lock()
-	defer s.recoveryMu.Unlock()
+	if err := s.recoveryMu.lock(ctx); err != nil {
+		return err
+	}
+
+	defer s.recoveryMu.unlock()
 
 	s.mu.Lock()
 	if !s.mcpRefreshPending {
@@ -1221,7 +1264,9 @@ func filenameFromURI(uri string) string {
 		return ""
 	}
 
-	name := filepath.Base(parsed.Path)
+	// A URI path is slash-separated whatever the host platform spells, so this
+	// is path.Base and never filepath.Base.
+	name := path.Base(parsed.Path)
 	if name == "." || name == "/" {
 		return ""
 	}
@@ -1875,7 +1920,7 @@ func eventQuestion(data json.RawMessage) (opencode.QuestionRequest, bool) {
 		return req, true
 	}
 
-	for _, key := range []string{questionWrapperKey, jsonFieldRequest, "data"} {
+	for _, key := range []string{questionWrapperKey, jsonFieldRequest, jsonFieldData} {
 		var wrapper map[string]json.RawMessage
 		if err := json.Unmarshal(data, &wrapper); err != nil {
 			continue
@@ -1963,17 +2008,17 @@ func questionPropertySchema(index int, question opencode.QuestionInfo) map[strin
 		}
 
 		return map[string]any{
-			jsonFieldType:  "array",
-			jsonFieldTitle: title,
-			"description":  description,
-			"items":        items,
+			jsonFieldType:        jsonTypeArray,
+			jsonFieldTitle:       title,
+			jsonFieldDescription: description,
+			jsonFieldItems:       items,
 		}
 	}
 
 	property := map[string]any{
-		jsonFieldType:  schemaTypeString,
-		jsonFieldTitle: title,
-		"description":  description,
+		jsonFieldType:        schemaTypeString,
+		jsonFieldTitle:       title,
+		jsonFieldDescription: description,
 	}
 
 	if !question.Custom {
@@ -1998,7 +2043,7 @@ func questionOptionSchemas(options []opencode.QuestionOption) []map[string]any {
 			jsonFieldTitle: label,
 		}
 		if option.Description != "" {
-			item["description"] = option.Description
+			item[jsonFieldDescription] = option.Description
 		}
 
 		out = append(out, item)
@@ -2149,9 +2194,7 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 		return err
 	}
 
-	s.delivery.enqueueRaw(ctx, payload)
-
-	return nil
+	return s.delivery.enqueueRaw(ctx, payload)
 }
 
 // sanitizeRawEventValue keeps raw diagnostic events free of image payloads

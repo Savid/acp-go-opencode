@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 
 	opencodeacp "github.com/savid/acp-go-opencode"
@@ -20,8 +19,6 @@ var agentVersion = version
 var exit = os.Exit
 var shutdownOpenTelemetry = shutdownTelemetry
 
-const containmentCommand = "containment"
-
 func main() {
 	if code := run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr); code != 0 {
 		exit(code)
@@ -29,10 +26,6 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
-	if len(args) > 0 && args[0] == containmentCommand {
-		return runContainment(args[1:], stdout, stderr)
-	}
-
 	flags := flag.NewFlagSet("acp-go-opencode", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
@@ -48,7 +41,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	questionTool := flags.Bool("opencode-question-tool", false, "enable OpenCode native question tool mapping")
 	logLevel := flags.String("opencode-log-level", "", "OpenCode native server log level")
 	healthTimeout := flags.Duration("opencode-health-timeout", opencode.HealthCheckTimeout, "OpenCode server readiness timeout")
-	isolationConfigPath := flags.String(processIsolationConfigFlag, "", "optional absolute path to the root-owned mode-0600 Linux explicit process-isolation policy; empty runs ordinary same-identity mode and loads no policy")
+	pluginSeedDir := flags.String("plugin-seed-dir", "", "cache of the OpenCode plugin install copied into new runtime roots; empty uses plugin-seed under the user cache directory")
+	noPluginSeed := flags.Bool("no-plugin-seed", false, "disable the OpenCode plugin install cache")
 
 	var seedFiles seedFileFlag
 
@@ -62,30 +56,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		_, _ = fmt.Fprintln(stdout, agentVersion())
 
 		return 0
-	}
-
-	var isolation *processIsolationConfig
-
-	if *isolationConfigPath != "" {
-		loaded, err := processIsolationConfigLoader(*isolationConfigPath)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "acp-go-opencode: process isolation: %v\n", err)
-
-			return 1
-		}
-
-		isolation = &loaded
-
-		if *opencodeHome == "" {
-			*opencodeHome = loaded.StandaloneStateRoot
-		}
-
-		if !filepath.IsAbs(*opencodeHome) || filepath.Clean(*opencodeHome) != *opencodeHome ||
-			*opencodeHome != loaded.StandaloneStateRoot {
-			_, _ = fmt.Fprintf(stderr, "acp-go-opencode: -home must equal standaloneStateRoot %q\n", loaded.StandaloneStateRoot)
-
-			return 1
-		}
 	}
 
 	logger := slog.New(slog.DiscardHandler)
@@ -128,17 +98,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		opencodeacp.WithOpenCodeQuestionTool(*questionTool),
 		opencodeacp.WithOpenCodeLogLevel(*logLevel),
 		opencodeacp.WithOpenCodeHealthCheckTimeout(*healthTimeout),
+		opencodeacp.WithPluginSeedDir(*pluginSeedDir),
+		opencodeacp.WithPluginSeed(!*noPluginSeed),
 	)
-
-	if isolation != nil {
-		opts = append(opts, opencodeacp.WithProcessIsolation(opencodeacp.ProcessIsolation{
-			UID:                 isolation.UID,
-			GID:                 isolation.GID,
-			BaseEnvironment:     isolation.BaseEnvironment,
-			StandaloneOwnerID:   isolation.StandaloneOwnerID,
-			StandaloneStateRoot: isolation.StandaloneStateRoot,
-		}))
-	}
 
 	if len(seedFiles.files) > 0 {
 		opts = append(opts, opencodeacp.WithSeedFiles(seedFiles.files))

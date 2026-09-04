@@ -135,24 +135,24 @@ func TestSessionExtraPathDirsMeta(t *testing.T) {
 	}
 
 	meta, err := sessionMetaFromVendorOptions(options(map[string]any{
-		metaExtraPathDirsKey: []any{"/session/bin", "/tools/bin"},
+		metaExtraPathDirsKey: []any{absTestPath("session", "bin"), absTestPath("tools", "bin")},
 	}))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/session/bin", "/tools/bin"}, meta.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("session", "bin"), absTestPath("tools", "bin")}, meta.ExtraPathDirs)
 	require.True(t, meta.ExtraPathDirsSet)
 
 	meta, err = sessionMetaFromVendorOptions(options(map[string]any{
-		metaExtraPathDirsKey: []string{"/session/bin"},
+		metaExtraPathDirsKey: []string{absTestPath("session", "bin")},
 	}))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/session/bin"}, meta.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("session", "bin")}, meta.ExtraPathDirs)
 
 	rejected := []struct {
 		name   string
 		values map[string]any
 		field  string
 	}{
-		{"extra path dirs is not an array", map[string]any{metaExtraPathDirsKey: "/session/bin"}, extraPathDirsOptionPath},
+		{"extra path dirs is not an array", map[string]any{metaExtraPathDirsKey: absTestPath("session", "bin")}, extraPathDirsOptionPath},
 		{"extra path dir is not a string", map[string]any{metaExtraPathDirsKey: []any{1}}, extraPathDirsOptionPath + "[0]"},
 	}
 
@@ -164,14 +164,14 @@ func TestSessionExtraPathDirsMeta(t *testing.T) {
 	}
 
 	_, err = sessionMetaFromVendorOptions(options(map[string]any{
-		metaExtraPathDirsKey: []any{"/session/bin", "tools/bin"},
+		metaExtraPathDirsKey: []any{absTestPath("session", "bin"), "tools/bin"},
 	}))
 	require.Equal(t, acp.NewInvalidParams(map[string]any{
 		jsonFieldError: errValueAbsolutePathRequired,
 		jsonFieldField: extraPathDirsOptionPath + "[1]",
 	}), err)
 
-	for _, value := range []string{"", "/session/bin" + string(os.PathListSeparator) + "/tools/bin"} {
+	for _, value := range []string{"", absTestPath("session", "bin") + string(os.PathListSeparator) + absTestPath("tools", "bin")} {
 		_, err = sessionMetaFromVendorOptions(options(map[string]any{metaExtraPathDirsKey: []any{value}}))
 		require.Equal(t, acp.NewInvalidParams(map[string]any{
 			jsonFieldError: errValueAbsolutePathRequired,

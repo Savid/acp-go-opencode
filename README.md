@@ -101,16 +101,13 @@ OpenTelemetry providers.
   working directory. Routine cancel and timeout interrupt only the addressed
   session and await its native idle acknowledgement.
 - Native stream gaps, runtime exits, and host delivery failures fence and retire
-  the exact producing runtime generation before replacement admission. Linux
-  helper-owned subreapers catch
-  `setsid` escapees. Omitting `WithProcessIsolation` is the ordinary default on
-  every supported platform: native work runs as the adapter's current root or
-  non-root identity, keeps the portable writable-home claim and liveness, and
-  reports the non-authoritative `shared_identity` with no provider-descendant
-  inventory and no whole-tree quiescence claim. Supplying it explicitly selects
-  the hardened Linux identity boundary, which is strict, fail-closed, and never
-  falls back. Embedded Darwin hosts may instead select best-effort
-  process-group containment with `WithDarwinBestEffortContainment`.
+  the exact producing runtime generation before replacement admission. Omitting
+  `WithHostAuthority` selects ordinary same-identity execution. An embedded
+  managed host supplies `HostAuthority`; every native launch then uses its exact
+  environment and process/tree operations, and authority loss fails closed with
+  no ordinary-launch retry. Runtime teardown closes the native protocol first,
+  revokes the process tree, waits for terminality, reclaims prepared trees, and
+  only then removes generated roots.
 - A native-server crash fails the active turn, retains loaded logical
   sessions, and reconstructs a session from its last committed sync-event
   generation before a following prompt can reach the replacement runtime.
@@ -126,8 +123,9 @@ OpenTelemetry providers.
   beneath that read root instead of being carried inline. Unset, no inbound path
   is ever read.
 - Brokered provider logins through the seven `_opencode/auth/*` extension
-  methods, advertised only while both `-provider-auth-root` /
-  `WithProviderAuthRoot` and `-home` / `WithHome` are configured. The adapter
+  methods during ordinary execution, advertised only while both
+  `-provider-auth-root` / `WithProviderAuthRoot` and `-home` / `WithHome` are
+  configured. The surface is withheld when `WithHostAuthority` is supplied. The adapter
   installs a completed credential into OpenCode's own durable store and hands
   none back: there is no credential leg and no injection key. Each device or
   paste-back flow runs in a short-lived broker home destroyed on every terminal

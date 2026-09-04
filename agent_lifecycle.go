@@ -11,8 +11,7 @@ const metaMember = "_meta"
 
 // provenFacts is the lifecycle answer this adapter gives, and it is one answer
 // rather than a table: no field below turns on how the native process boundary
-// is enforced, so keying them on the containment mode would state a dependency
-// the values do not have. Negotiating version 1 obligates the complete ordered
+// is enforced. Negotiating version 1 obligates the complete ordered
 // foreground stream whatever the fields say.
 //
 // Each field states what this adapter proves, and nothing more:
@@ -54,14 +53,16 @@ func provenFacts() lifecycle.Negotiated {
 // every envelope, correlation read, and lifecycle fact stays illegal for the whole
 // connection.
 func (a *Agent) negotiateLifecycle(meta map[string]any) (lifecycle.Negotiated, error) {
-	offer, present, refusal := lifecycle.DecodeOffer(meta)
+	present, refusal := lifecycle.DecodeCapability(meta)
 	if refusal != nil {
 		return lifecycle.Negotiated{}, unsupportedField(refusal.Field)
 	}
 
 	var answer lifecycle.Negotiated
 	if present {
-		answer, _ = offer.Answer(provenFacts())
+		answer = provenFacts()
+
+		answer.Version = lifecycle.Version
 	}
 
 	a.mu.Lock()

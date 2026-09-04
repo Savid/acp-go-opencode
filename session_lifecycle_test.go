@@ -327,12 +327,11 @@ func TestNativeIdleSettlesTheTurnWithoutPolling(t *testing.T) {
 		return opencode.NativeMessage{}, nil
 	}
 
-	done := make(chan acp.PromptResponse, 1)
+	done := make(chan promptResult, 1)
 
 	go func() {
 		response, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-		require.NoError(t, err)
-		done <- response
+		done <- promptResult{response: response, err: err}
 	}()
 
 	select {
@@ -342,7 +341,9 @@ func TestNativeIdleSettlesTheTurnWithoutPolling(t *testing.T) {
 	}
 
 	close(release)
-	require.Equal(t, acp.StopReasonEndTurn, (<-done).StopReason)
+	result := awaitPromptResult(t, done)
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonEndTurn, result.response.StopReason)
 	requireLifecycleOutcome(t, connection, lifecycle.OutcomeSuccess)
 }
 
@@ -671,7 +672,7 @@ func TestActionRegistrationCancellationAndCloseDoNotLeak(t *testing.T) {
 
 			requireSignal(t, registrationStarted)
 			if closeSession {
-				require.NoError(t, current.closeSession(false))
+				require.NoError(t, current.closeSession(context.Background(), false))
 			} else {
 				require.NoError(t, current.cancelTurn(context.Background()))
 			}
@@ -830,18 +831,19 @@ func TestCancelTerminalizesBlockersBeforeTheEndingIdle(t *testing.T) {
 
 	current.markPublishedToolCall("call-1")
 
-	done := make(chan acp.PromptResponse, 1)
+	done := make(chan promptResult, 1)
 
 	go func() {
 		response, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-		require.NoError(t, err)
-		done <- response
+		done <- promptResult{response: response, err: err}
 	}()
 
 	<-dispatched
 	requireSignal(t, started)
 	require.NoError(t, current.agent.Cancel(context.Background(), CancelRequest(current.id, internalSeamTurnNonce)))
-	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
+	result := awaitPromptResult(t, done)
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonCancelled, result.response.StopReason)
 
 	require.Equal(t, []string{native}, client.abortedSessions())
 	require.Equal(t, permissionReplyReject, client.permissionReply(0).reply)
@@ -883,7 +885,7 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 	clientA := newFakeOpenCodeClient()
 	first := testSession(t, agent, clientA)
 	clientB := newFakeOpenCodeClient()
-	second := newSession(agent, "session-2", "/tmp/project", nil, testNativeSession("native-2"), clientB, sessionMeta{}, idmapRecord{
+	second := newSession(agent, "session-2", absTestPath("tmp", "project"), nil, testNativeSession("native-2"), clientB, sessionMeta{}, idmapRecord{
 		SessionID: "session-2", NativeSessionID: "native-2", Format: SessionStoreFormat,
 	})
 	second.runtimeGeneration = first.runtimeGeneration
@@ -934,10 +936,6 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 		return opencode.NativeMessage{}, nil
 	}
 
-	type promptResult struct {
-		response acp.PromptResponse
-		err      error
-	}
 	firstDone := make(chan promptResult, 1)
 	secondDone := make(chan promptResult, 1)
 
@@ -992,7 +990,7 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 	clientA := newFakeOpenCodeClient()
 	first := testSession(t, agent, clientA)
 	clientB := newFakeOpenCodeClient()
-	second := newSession(agent, "session-2", "/tmp/project", nil, testNativeSession("native-2"), clientB, sessionMeta{}, idmapRecord{
+	second := newSession(agent, "session-2", absTestPath("tmp", "project"), nil, testNativeSession("native-2"), clientB, sessionMeta{}, idmapRecord{
 		SessionID: "session-2", NativeSessionID: "native-2", Format: SessionStoreFormat,
 	})
 	second.runtimeGeneration = first.runtimeGeneration
@@ -1029,13 +1027,11 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 		return opencode.NativeMessage{}, nil
 	}
 
-	firstDone := make(chan struct{})
+	firstDone := make(chan promptResult, 1)
 
 	go func() {
-		defer close(firstDone)
-
-		_, err := first.Prompt(context.Background(), correlatedPrompt(first.id, "turn-a", "hello"))
-		require.NoError(t, err)
+		response, err := first.Prompt(context.Background(), correlatedPrompt(first.id, "turn-a", "hello"))
+		firstDone <- promptResult{response: response, err: err}
 	}()
 
 	<-firstStarted
@@ -1044,7 +1040,7 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 	require.NoError(t, err, "a live turn on one session blocked another session's prompt")
 
 	close(held)
-	<-firstDone
+	require.NoError(t, awaitPromptResult(t, firstDone).err)
 }
 
 // TestPersistenceFailureFencesInsteadOfEmittingIdle proves the durability
@@ -1136,7 +1132,7 @@ func TestStreamFailureLatchesRatherThanHidingAGap(t *testing.T) {
 	)), "a latched stream emitted again")
 }
 
-func TestUnnegotiatedConnectionRefusesActionsWithoutACompatibilityPath(t *testing.T) {
+func TestUnnegotiatedConnectionRefusesActions(t *testing.T) {
 	agent := NewAgent()
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
@@ -1221,12 +1217,11 @@ func TestCloseSettlesTheOpenTurnBeforeReleasingTheSession(t *testing.T) {
 		return nil
 	}
 
-	done := make(chan acp.PromptResponse, 1)
+	done := make(chan promptResult, 1)
 
 	go func() {
 		response, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-		require.NoError(t, err)
-		done <- response
+		done <- promptResult{response: response, err: err}
 	}()
 
 	<-started
@@ -1234,7 +1229,9 @@ func TestCloseSettlesTheOpenTurnBeforeReleasingTheSession(t *testing.T) {
 	closeErr := make(chan error, 1)
 	go func() { closeErr <- current.Close(context.Background()) }()
 
-	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
+	result := awaitPromptResult(t, done)
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonCancelled, result.response.StopReason)
 	require.NoError(t, <-closeErr)
 	require.NotNil(t, current.agent.runtime, "close retired the shared runtime")
 	require.True(t, lifecycleFenced(current), "close left the stream unfenced")
@@ -1385,7 +1382,7 @@ func TestLifecycleDeliveryWithoutAConnectionFailsTheEstablishingRequest(t *testi
 	client := newFakeOpenCodeClient()
 	client.ensureSyncAggregate("native-1")
 
-	current := newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"),
+	current := newSession(agent, "session-1", absTestPath("tmp", "project"), nil, testNativeSession("native-1"),
 		client, sessionMeta{}, idmapRecord{
 			SessionID: "session-1", NativeSessionID: "native-1", Format: SessionStoreFormat,
 		})
@@ -1782,12 +1779,18 @@ func TestCorrectionLifecycleDirectFailureBranches(t *testing.T) {
 	current := &session{}
 	current.stampIncarnationGeneration(client, 7)
 	require.NotNil(t, current.incarnation)
+	stale := current.incarnation
+	replacement := &nativeIncarnationBinding{client: client, registry: newActionRegistry()}
+	current.incarnation = replacement
+	current.failLifecycleDelivery(stale, errors.New("stale delivery failure"))
+	require.Same(t, replacement, current.incarnation)
+	require.NoError(t, current.lifecycleFailure())
 
 	invalidCycle := &foregroundCycle{reserved: true}
 	require.Error(t, current.acceptPromptCycle(context.Background(), invalidCycle, lifecycle.Submission{}))
 	current.abandonPromptCycle(nil)
 
-	stream := lifecycle.NewStream("stream", lifecycle.Negotiated{Versions: []int{1}})
+	stream := lifecycle.NewStream("stream", lifecycle.Negotiated{Version: 1})
 	stream.Close()
 	cycle := &foregroundCycle{
 		id: "cycle", turnID: "turn", reserved: true, blockers: map[string]struct{}{}, signal: make(chan struct{}),
@@ -1801,7 +1804,7 @@ func TestCorrectionLifecycleDirectFailureBranches(t *testing.T) {
 	require.Error(t, direct.acceptPromptCycle(context.Background(), cycle,
 		lifecycle.Submission{SubmissionID: "submission", ClientNonce: "nonce"}))
 
-	validStream := lifecycle.NewStream("open", lifecycle.Negotiated{Versions: []int{1}})
+	validStream := lifecycle.NewStream("open", lifecycle.Negotiated{Version: 1})
 	_, err := validStream.Emit(lifecycle.SnapshotEvent(
 		lifecycle.Foreground{State: lifecycle.ForegroundIdle, CycleID: "cycle-0"}, nil, lifecycle.QuiescenceFact{},
 	))

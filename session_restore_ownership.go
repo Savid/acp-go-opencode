@@ -196,14 +196,7 @@ func writeRestoreOwnership(client opencode.Client, registry restoreOwnershipFile
 		return fmt.Errorf("publish restore ownership: %w", renameErr)
 	}
 
-	dir, err := restoreOpen(directory)
-	if err != nil {
-		return err
-	}
-
-	err = restoreSync(dir)
-
-	return errors.Join(err, restoreClose(dir))
+	return syncRestoreOwnershipDirectory(directory)
 }
 
 func restoreOwnershipDirectory(client opencode.Client) string {

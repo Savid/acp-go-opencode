@@ -7,7 +7,7 @@ Shared instructions for automated coding agents working in this repository.
 This project is a Go implementation of an ACP agent for OpenCode. Each Agent
 owns one shared `opencode serve` runtime and builds directly on
 `github.com/coder/acp-go-sdk`. OpenCode owns model execution and native state;
-this package owns ACP dispatch, supervised runtime/XDG ownership,
+this package owns ACP dispatch, shared runtime/XDG coordination,
 directory/session/turn routing, REST/SSE event mapping, permission requests,
 config options, and `opencode-sync-events-v1` session storage.
 
@@ -32,11 +32,12 @@ Organized by domain. The public surface lives in the root package
   cancel handling, native REST/SSE event mapping, permission and question
   reconciliation, plan and message emission, config-option (model/mode)
   resolution, and session metadata parsing.
-- **Options and builders** (`options.go`, `request_builders.go`): agent
-  `Option` constructors (executable path, scratch directory, default model, env,
-  session store, telemetry providers, and OpenCode runtime toggles) and the
-  exported request builders, `OpenCodeOptions`, MCP server builders, and fork
-  call helper.
+- **Options and builders** (`options.go`, `request_builders.go`,
+  `plugin_seed.go`): agent `Option` constructors (executable path, scratch
+  directory, default model, env, session store, telemetry providers, plugin
+  seed cache location, and OpenCode runtime toggles), the default plugin seed
+  cache resolution, and the exported request builders, `OpenCodeOptions`, MCP
+  server builders, and fork call helper.
 - **Session storage** (`session_store.go`, `session_state_store.go`,
   `session_restore_ownership.go`): the
   `SessionStore` interface, `InMemorySessionStore`, the
@@ -46,8 +47,11 @@ Organized by domain. The public surface lives in the root package
   `_opencode/rawEvent` notification config.
 - **Native OpenCode client** (`internal/opencode`, package `opencode`): launch
   and readiness of the loopback `opencode serve` process, native REST and
-  directory-scoped SSE, dynamic MCP scopes, portable home locking, and the
-  per-GOOS dual-supervisor process-tree fence.
+  directory-scoped SSE, dynamic MCP scopes, portable home locking, ordinary
+  process execution, host-authority launch adapters, and the plugin seed cache
+  (`plugin_seed.go`) that copies OpenCode's npm plugin install into new runtime
+  roots so a cold boot skips the install, filling an empty cache through a
+  session-free priming launch first.
 - **Observability** (`internal/observer`): OpenTelemetry instrumentation
   helpers (trace/metric definitions, trace-context propagation) and the
   instrumentation name.
@@ -69,9 +73,8 @@ gate, vulnerability scan, modernization check, docs audit, and module tidy and
 verification. `make lint`, `make fmt`, and `make vuln` are available
 individually. Lint details live in `.golangci.yml`.
 
-`make docs-audit` checks that the required docs files exist, that every CLI
-flag is registered in both `docs/reference/cli.mdx` and the command source,
-and that public docs and examples do not reintroduce removed public terms.
+`make docs-audit` checks that the required docs files exist and that every CLI
+flag is registered in both `docs/reference/cli.mdx` and the command source.
 Keep `stdout` reserved for ACP JSON-RPC in the CLI; logs and diagnostics
 belong on `stderr`.
 
@@ -88,10 +91,17 @@ covers behavior that does not spend model tokens. `make test-integration-live`
 additionally sets `ACP_GO_OPENCODE_RUN_LIVE_TOKENS=1` and may spend model
 tokens. `make test-integration-cover` runs the smoke suite against a compiled
 binary named through `ACP_GO_OPENCODE_AGENT_BINARY` with `GOCOVERDIR`
-coverage. The live suite reads `ACP_GO_OPENCODE_MODEL`,
-`ACP_GO_OPENCODE_PERMISSION_PROMPT`, and `ACP_GO_OPENCODE_QUESTION_PROMPT` to
-tune the model and the prompts used to exercise permission and question flows.
+coverage. The live suite runs the zero-cost
+`opencode/muse-spark-1.3-contributor-free` model by default and reads
+`ACP_GO_OPENCODE_MODEL`, `ACP_GO_OPENCODE_PERMISSION_PROMPT`, and
+`ACP_GO_OPENCODE_QUESTION_PROMPT` to override the model and the prompts used to
+exercise permission and question flows.
 Live tests always launch OpenCode under an exclusive test runtime XDG root.
+The native proofs in `internal/opencode` share one plugin seed cache that a
+single cold launch primes, so a package run pays for OpenCode's npm install
+once; set `ACP_GO_OPENCODE_TEST_PLUGIN_SEED_DIR` to a scratch directory such as
+`.tmp/plugin-seed` to keep that cache across local reruns. Never point it at the
+real user cache.
 
 `make test-integration-attended` sets `ACP_GO_OPENCODE_RUN_ATTENDED=1` and runs
 the provider-auth flows a human must approve at the provider.
@@ -136,6 +146,8 @@ Unless explicitly requested, ask before:
 - Changing the permission or question/elicitation flow shape.
 - Adding new ACP extension methods or `_meta` fields.
 - Changing the `opencode-sync-events-v1` session-store contract.
+- Admitting a native OAuth login method to the reviewed registry in
+  `internal/opencode`.
 - Changing shared XDG ownership or the native process launch and teardown
   behavior.
 
@@ -150,6 +162,9 @@ Unless explicitly requested, ask before:
 - Keep the shared XDG root single-writer and never open the live native
   database directly. Portable state moves only through allowlisted online sync
   events.
+- When `WithHostAuthority` is supplied, route every native launch through it,
+  treat prepared trees as inaccessible until reclaim succeeds, and never fall
+  back to ordinary execution.
 - Route every prompt, active cancellation, session update, raw event, and
   elicitation with the versioned turn envelope. Fence permissions structurally
   by session id plus a tool-call id pending in the current turn; never infer an

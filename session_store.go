@@ -16,12 +16,9 @@ const (
 
 	// SessionStoreFormat is the one bundle shape this adapter reads and writes.
 	//
-	// `session.extraPathDirs` is a required member of that shape. A bundle that
-	// does not carry it is refused rather than defaulted: a cold load rebinds the
-	// native session to the directories it was captured with, and a bundle that
-	// cannot say what they were is a bundle whose shell operations would silently
-	// resolve against the reloading host's search path. There is no decoder that
-	// accepts the member's absence and no default that invents it.
+	// `session.env` and `session.extraPathDirs` are required members of that
+	// shape. A bundle that does not carry both is refused rather than defaulted:
+	// a cold load rebinds the native session to the carrier it was captured with.
 	SessionStoreFormat = "opencode-sync-events-v1"
 )
 
@@ -47,6 +44,11 @@ type SessionStoreReplacement struct {
 
 // SessionStore is the durable authority for every list, load, resume, and delete
 // this adapter answers.
+//
+// Main snapshot entries persist the addressed session environment and may
+// therefore contain credentials. Implementations must protect entries with
+// access control, transport and at-rest safeguards, and an appropriate
+// retention policy.
 //
 // Tombstone finality is the store's own obligation rather than the adapter's: an
 // `Append` or a `Replace` addressed to a key `Delete` tombstoned writes nothing,
@@ -158,9 +160,9 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		return fmt.Errorf("main subpath must be %q", SessionStoreMainSubpath)
 	}
 
-	mainCount := 0
-	mainIncluded := false
 	seenReplacement := make(map[SessionKey]struct{}, len(replacements))
+	members := make(map[string]struct{}, len(replacements))
+	mainCounts := make(map[string]int, len(replacements))
 
 	for _, replacement := range replacements {
 		// The refusal names the key it refused. A replacement set lists many keys
@@ -172,17 +174,24 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		}
 
 		seenReplacement[replacement.Key] = struct{}{}
-		if replacement.Key.Subpath == SessionStoreMainSubpath {
-			mainCount++
+		if replacement.Key.SessionID == "" {
+			return fmt.Errorf("replacement session id is required")
+		}
 
-			if replacement.Key.SessionID == main.SessionID {
-				mainIncluded = true
-			}
+		members[replacement.Key.SessionID] = struct{}{}
+		if replacement.Key.Subpath == SessionStoreMainSubpath {
+			mainCounts[replacement.Key.SessionID]++
 		}
 	}
 
-	if mainCount == 0 || !mainIncluded {
-		return fmt.Errorf("replacements must include at least one main key")
+	if mainCounts[main.SessionID] != 1 {
+		return fmt.Errorf("replacements must include addressed main key exactly once")
+	}
+
+	for member := range members {
+		if mainCounts[member] != 1 {
+			return fmt.Errorf("replacements must include exactly one main key for session %q", member)
+		}
 	}
 
 	// A tombstone is final and the store is where that finality lives, not the
@@ -395,8 +404,8 @@ func mainSessionKey(sessionID string) SessionKey {
 }
 
 func summaryFromStoreEntry(summary SessionSummary, entry SessionStoreEntry) SessionSummary {
-	var snapshot stateSnapshot
-	if err := json.Unmarshal(entry, &snapshot); err != nil {
+	snapshot, err := decodeStateSnapshot(entry)
+	if err != nil {
 		return summary
 	}
 

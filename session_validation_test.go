@@ -13,9 +13,9 @@ func TestValidationHelperBranches(t *testing.T) {
 		map[string]any{jsonFieldError: errValueAbsolutePathRequired, jsonFieldField: jsonFieldCwd})
 	requireInvalidParamsData(t, validateRequiredAbsolutePath(jsonFieldCwd, ""),
 		map[string]any{jsonFieldCwd: validationRequired})
-	requireInvalidParamsData(t, validateSessionStartPaths("/tmp/project", []string{"relative"}),
+	requireInvalidParamsData(t, validateSessionStartPaths(absTestPath("tmp", "project"), []string{"relative"}),
 		map[string]any{jsonFieldError: errValueAbsolutePathRequired, jsonFieldField: "additionalDirectories[0]"})
-	value := "/tmp/project"
+	value := absTestPath("tmp", "project")
 	if err := validateOptionalAbsolutePath("cwd", &value); err != nil {
 		t.Fatalf("validateOptionalAbsolutePath: %v", err)
 	}

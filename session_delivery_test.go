@@ -47,11 +47,14 @@ func TestRawWriterStallNeverOccupiesAuthoritativeDelivery(t *testing.T) {
 	agent.setAgentClient(connection)
 	delivery := newSessionDelivery(agent, "session-1")
 
-	delivery.enqueueRaw(context.Background(), map[string]any{
-		jsonFieldSessionID: acp.SessionId("session-1"),
-		jsonFieldSource:    rawEventSource,
-		jsonFieldEvent:     map[string]any{"type": "diagnostic"},
-	})
+	rawDone := make(chan error, 1)
+	go func() {
+		rawDone <- delivery.enqueueRaw(context.Background(), map[string]any{
+			jsonFieldSessionID: acp.SessionId("session-1"),
+			jsonFieldSource:    rawEventSource,
+			jsonFieldEvent:     map[string]any{"type": "diagnostic"},
+		})
+	}()
 	<-connection.notifyStarted
 
 	receipt, err := delivery.enqueueUpdate(context.Background(), acp.SessionNotification{
@@ -61,6 +64,7 @@ func TestRawWriterStallNeverOccupiesAuthoritativeDelivery(t *testing.T) {
 	require.NoError(t, waitDelivery(context.Background(), receipt))
 
 	delivery.close()
+	require.Error(t, <-rawDone)
 	connection.mu.Lock()
 	require.Len(t, connection.updates, 1)
 	connection.mu.Unlock()
@@ -258,16 +262,16 @@ func TestTypedWriterAndCommitPanicsFailReceiptsQueueAndFence(t *testing.T) {
 	})
 }
 
-func TestRawWriterPanicFencesWithoutBlockingClose(t *testing.T) {
+func TestRawWriterPanicIsObservedWithoutFencing(t *testing.T) {
 	current, _, connection := lifecycleSession(t)
 	current.agent.setAgentClient(&panickingRawClient{recordingAgentClient: connection})
-	current.delivery.enqueueRaw(context.Background(), map[string]any{
+	require.Error(t, current.delivery.enqueueRaw(context.Background(), map[string]any{
 		jsonFieldSessionID: current.id,
 		jsonFieldSource:    rawEventSource,
 		jsonFieldEvent:     map[string]any{"type": "diagnostic"},
-	})
+	}))
 	require.NoError(t, current.delivery.flushRaw(context.Background()))
-	requireEventually(t, func() bool { return current.lifecycleFailure() != nil }, "raw panic did not fence the incarnation")
+	require.NoError(t, current.lifecycleFailure())
 
 	closed := make(chan struct{})
 	go func() {
@@ -310,7 +314,7 @@ func TestCorrectionDeliveryDefensiveBranches(t *testing.T) {
 
 	closed := newSessionDelivery(agent, "session")
 	closed.closed = true
-	closed.enqueueRaw(context.Background(), map[string]any{"type": "ignored"})
+	require.ErrorContains(t, closed.enqueueRaw(context.Background(), map[string]any{"type": "ignored"}), "closed")
 	require.ErrorContains(t, closed.flushRaw(context.Background()), "closed")
 	closed.close()
 	(*sessionDelivery)(nil).close()
@@ -383,10 +387,8 @@ func TestCorrectionDeliveryDefensiveBranches(t *testing.T) {
 func TestCorrectionAuxiliaryDeliveryAndAuthBranches(t *testing.T) {
 	delivery := newSessionDelivery(nil, "raw")
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
 	go delivery.runRaw(ctx)
-	delivery.raw <- rawDelivery{payload: map[string]any{"value": true}, done: done}
-	require.Error(t, <-done)
+	require.Error(t, delivery.enqueueRaw(context.Background(), map[string]any{"value": true}))
 	cancel()
 	<-delivery.rawDone
 
@@ -400,5 +402,25 @@ func TestCorrectionAuxiliaryDeliveryAndAuthBranches(t *testing.T) {
 	for index := 0; index < cap(droppedRaw.raw); index++ {
 		droppedRaw.raw <- rawDelivery{payload: map[string]any{"index": index}}
 	}
-	droppedRaw.enqueueRaw(context.Background(), map[string]any{"overflow": true})
+	cancelled, cancelQueue := context.WithCancel(context.Background())
+	cancelQueue()
+	require.ErrorIs(t, droppedRaw.enqueueRaw(cancelled, map[string]any{"overflow": true}), context.Canceled)
+}
+func TestDeliveryCancellationEdges(t *testing.T) {
+	stoppedBeforeSend := newSessionDelivery(nil, "raw-before")
+	stoppedBeforeSend.started = true
+	stoppedBeforeSend.raw = make(chan rawDelivery)
+	close(stoppedBeforeSend.rawDone)
+	require.ErrorContains(t, stoppedBeforeSend.enqueueRaw(t.Context(), map[string]any{}), "stopped")
+
+	stoppedAfterSend := newSessionDelivery(nil, "raw-after")
+	stoppedAfterSend.started = true
+	received := make(chan struct{})
+	go func() {
+		<-stoppedAfterSend.raw
+		close(stoppedAfterSend.rawDone)
+		close(received)
+	}()
+	require.ErrorContains(t, stoppedAfterSend.enqueueRaw(t.Context(), map[string]any{}), "stopped")
+	<-received
 }

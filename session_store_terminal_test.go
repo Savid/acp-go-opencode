@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -70,7 +71,7 @@ func TestInspectSessionStoreTerminalStateRejectsMalformedOrUnsupportedEntry(t *t
 		},
 		"unsupported format": {
 			entries: []SessionStoreEntry{mutateTerminalTestSnapshot(t, valid, func(snapshot *stateSnapshot) {
-				snapshot.Format = "removed-format"
+				snapshot.Format = "unknown-format"
 			})},
 			sessionID: "session", wantErr: "unsupported opencode store format",
 		},
@@ -87,7 +88,7 @@ func TestInspectSessionStoreTerminalStateRejectsMalformedOrUnsupportedEntry(t *t
 			entries: []SessionStoreEntry{mutateTerminalTestSnapshot(t, valid, func(snapshot *stateSnapshot) {
 				snapshot.Events["native"][1].Data[syncFieldInfo] = json.RawMessage(`[]`)
 			})},
-			sessionID: "session", wantErr: "decode OpenCode message event",
+			sessionID: "session", wantErr: `field "info" must be an object`,
 		},
 		"wrong message session": {
 			entries: []SessionStoreEntry{mutateTerminalTestSnapshot(t, valid, func(snapshot *stateSnapshot) {
@@ -107,10 +108,27 @@ func TestInspectSessionStoreTerminalStateRejectsMalformedOrUnsupportedEntry(t *t
 	}
 }
 
+func TestInspectSessionStoreTerminalStateUsesTheStrictSnapshotReader(t *testing.T) {
+	valid := string(terminalTestSnapshot(t,
+		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", int64Pointer(100)),
+	))
+
+	for name, raw := range map[string]string{
+		"duplicate": strings.Replace(valid, `"format":`, `"format":"shadow","format":`, 1),
+		"unknown":   strings.Replace(valid, `"aggregate_id":`, `"aggregateId":"native","aggregate_id":`, 1),
+		"trailing":  valid + ` null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := InspectSessionStoreTerminalState("session", []SessionStoreEntry{SessionStoreEntry(raw)})
+			require.ErrorContains(t, err, "decode OpenCode session-store snapshot")
+		})
+	}
+}
+
 func terminalTestSnapshot(t *testing.T, events ...opencode.SyncEvent) SessionStoreEntry {
 	t.Helper()
 
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	snapshot.Events["native"] = append(snapshot.Events["native"], events...)
 	entry, err := json.Marshal(snapshot)
 	require.NoError(t, err)

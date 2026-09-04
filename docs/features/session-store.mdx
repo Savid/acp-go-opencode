@@ -51,23 +51,29 @@ A snapshot is taken after a completed turn and on lifecycle boundaries. The
 - a restore generation and the selected ACP/native session identity;
 - the adopted parent/child graph in parent-first order, including source cwd
   and per-session permission policy;
-- the session's `extraPathDirs`, the durable half of the addressed-session
-  carrier; and
+- the session's environment and ordered `extraPathDirs`; and
 - exact event arrays for each allowlisted aggregate.
 
-`extraPathDirs` is a required member of the bundle, and the format stays
-`opencode-sync-events-v1`: a bundle that omits it is refused rather than
-defaulted to an empty list. A cold load rebinds the native session to the
-directories the session was captured with, so a bundle that cannot name them
-would restore a session whose shell operations silently resolve against the
-reloading host's search path. The carrier environment is deliberately not
-persisted — an operation bearer is resupplied by the request that reloads the
-session.
+`env` and `extraPathDirs` are required members of the bundle, and the format
+stays `opencode-sync-events-v1`: a bundle that omits either is refused rather
+than defaulted. A cold load rebinds the native session to the complete carrier
+it was captured with. Explicit load or resume values replace the stored half,
+including with an empty map or list.
+
+<Warning>
+The persisted `env` map can contain bearer tokens, API keys, and other
+credential-bearing values. Treat the session store as a credential store:
+restrict access to the intended principal, protect data in transit and at rest,
+avoid logging entries, and apply an appropriate deletion and retention policy.
+</Warning>
 
 The adapter exports through `POST /sync/history`; it never opens or copies the
-live SQLite database. Only known event kinds and known fields are accepted.
-Unknown event data fails closed, and the finished bundle is scanned for MCP and
-process-environment secrets before the store replacement is published.
+live SQLite database. The complete snapshot reader requires exact,
+case-sensitive field names and one JSON value, and rejects unknown or duplicate
+fields at every typed envelope depth. Only known event kinds and known fields
+are accepted. Unknown event data fails closed, and the event graph is scanned
+for MCP and process-environment secret leakage before the store replacement is
+published.
 
 Restore durably claims each source-to-destination aggregate mapping before the
 first `POST /sync/replay`, replays one complete aggregate per call in
@@ -91,7 +97,6 @@ the terminal assistant. Malformed, unsupported, or non-contiguous snapshots
 fail closed; a valid snapshot without a terminal assistant returns an empty
 `MessageID`.
 
-<Note>
 A snapshot is blocked while any input, permission, elicitation, or generation is
 pending, so a snapshot never captures a half-finished turn. `session/delete`
 removes a stored session and leaves a tombstone so the id is not silently
@@ -101,4 +106,3 @@ success. A custom `SessionStore` owes the same rule — the deleted state is
 already the caller's answer, and a store that leaves the rule to its caller
 resurrects a session whenever a settlement races the delete that answered for
 it.
-</Note>

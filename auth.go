@@ -121,7 +121,7 @@ type authFlowKey struct {
 // root is removed on runtime teardown, so a login completed into one would
 // report success and leave nothing resident.
 func newProviderAuth(agent *Agent) *providerAuth {
-	if !authLedgerRootConfigured(agent.options) || agent.options.Home == "" {
+	if agent.options.hostAuthorityConfigured || !authLedgerRootConfigured(agent.options) || agent.options.Home == "" {
 		return nil
 	}
 

@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,17 +23,13 @@ func TestCaptureAmbientEnvironmentDropsAdapterPrivateCarriers(t *testing.T) {
 
 	t.Setenv(privateCanary, "leaked")
 	t.Setenv(strings.ToLower(privateCanary), "leaked")
-	t.Setenv(opencode.DarwinRuntimeIDEnv, "leaked")
-	t.Setenv(opencode.DarwinScratchRootEnv, "/leaked")
 	t.Setenv(keptCanary, "kept")
 
 	captured := captureAmbientEnvironment()
 
 	require.NotContains(t, captured, privateCanary)
 	require.NotContains(t, captured, strings.ToLower(privateCanary))
-	require.NotContains(t, captured, opencode.DarwinRuntimeIDEnv)
-	require.NotContains(t, captured, opencode.DarwinScratchRootEnv)
 	require.Equal(t, "kept", captured[keptCanary],
-		"only the private namespace and the containment markers are dropped")
+		"only the private namespace is dropped")
 	require.Equal(t, os.Getenv("PATH"), captured["PATH"])
 }

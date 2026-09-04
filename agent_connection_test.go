@@ -24,7 +24,7 @@ func TestInitializeAdvertisesRouteEnvelopeV1(t *testing.T) {
 	require.NoError(t, err)
 	capability, ok := response.AgentCapabilities.Meta[routeEnvelopeKey].(map[string]any)
 	require.True(t, ok)
-	require.Equal(t, []int{1}, capability["versions"])
+	require.Equal(t, 1, capability["version"])
 }
 
 func TestScopedElicitationStampsExactRouteAndRejectsCollision(t *testing.T) {

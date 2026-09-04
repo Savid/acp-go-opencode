@@ -175,6 +175,9 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 
 	if strings.HasPrefix(method, "_") {
 		extensionResult, err := c.agent.HandleExtensionMethod(ctx, method, params)
+		if err != nil {
+			c.agent.logHandlerFailure(ctx, method, err)
+		}
 
 		reqErr = requestError(ctx, err)
 		if reqErr == nil {
@@ -214,6 +217,8 @@ func localResponse[Req any, ReqPtr localAgentParams[Req], Resp any](
 
 		resp, err := call(agent, ctx, value)
 		if err != nil {
+			agent.logHandlerFailure(ctx, "", err)
+
 			return nil, requestError(ctx, err)
 		}
 
@@ -231,6 +236,8 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 		}
 
 		if err := call(agent, ctx, value); err != nil {
+			agent.logHandlerFailure(ctx, "", err)
+
 			return nil, requestError(ctx, err)
 		}
 
@@ -312,6 +319,20 @@ func (c *localAgentConnection) NotifyExtension(ctx context.Context, method strin
 	defer release()
 
 	return c.conn.SendNotification(ctx, method, params)
+}
+
+// logHandlerFailure records a handler error the ACP boundary is about to reduce
+// to a generic internal error. The wire deliberately carries no detail, so the
+// -debug stream is where an operator learns why a request failed. A request
+// error already tells the host what went wrong and is not repeated here.
+func (a *Agent) logHandlerFailure(ctx context.Context, method string, err error) {
+	var reqErr *acp.RequestError
+	if errors.As(err, &reqErr) {
+		return
+	}
+
+	a.log.DebugContext(ctx, "ACP handler failed",
+		slog.String("method", method), slog.String("error", err.Error()))
 }
 
 // requestError decides cancellation from the request context rather than from

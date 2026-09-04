@@ -34,7 +34,7 @@ func restoreBrowserShimSeams(t *testing.T) {
 func browserProbeDir(t *testing.T, marker string) string {
 	t.Helper()
 
-	probe := testTraversableTempDir(t)
+	probe := t.TempDir()
 	body := fmt.Sprintf("#!/bin/sh\necho \"$0 $*\" >> %q\nexit 0\n", marker)
 
 	for _, name := range browserLauncherNames {
@@ -50,7 +50,9 @@ func browserProbeDir(t *testing.T, marker string) string {
 func browserLaunchingOpenCodeExecutable(t *testing.T) string {
 	t.Helper()
 
-	directory := testTraversableTempDir(t)
+	directory := t.TempDir()
+	executable, err := os.Executable()
+	require.NoError(t, err)
 
 	var body strings.Builder
 
@@ -63,7 +65,7 @@ func browserLaunchingOpenCodeExecutable(t *testing.T) string {
 	fmt.Fprintf(
 		&body,
 		"ACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n",
-		reachableTestBinary(t, directory),
+		executable,
 	)
 
 	script := filepath.Join(directory, "fake-opencode")
@@ -73,7 +75,6 @@ func browserLaunchingOpenCodeExecutable(t *testing.T) string {
 }
 
 func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
-	skipUnprivilegedDarwinIsolation(t)
 	marker := filepath.Join(t.TempDir(), "launched")
 	probe := browserProbeDir(t, marker)
 
@@ -86,17 +87,18 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 	require.FileExists(t, marker, "the probe launchers never recorded a call, so a missing marker proves nothing")
 	require.NoError(t, os.Remove(marker))
 
-	shim, err := NewBrowserShim(testTraversableTempDir(t))
+	shim, err := NewBrowserShim(t.TempDir())
 	require.NoError(t, err)
 
-	client, err := StartServer(context.Background(), platformStartOptions(t, StartOptions{
-		Root:            testGeneratedTempDir(t),
+	client, err := StartServer(context.Background(), StartOptions{
+		Root:            t.TempDir(),
 		ExecutablePath:  browserLaunchingOpenCodeExecutable(t),
 		BrowserShim:     shim,
+		Pure:            true,
 		HealthTimeout:   30 * time.Second,
 		Logger:          slog.New(slog.DiscardHandler),
 		SkipVersionGate: true,
-	}))
+	})
 	require.NoError(t, err)
 
 	t.Cleanup(func() { require.NoError(t, client.Shutdown(context.Background())) })
@@ -147,13 +149,11 @@ func TestBrowserShimEnvironShadowsPathAndBrowser(t *testing.T) {
 
 func TestBrowserShimMethodsHandleNilAndConcreteReceivers(t *testing.T) {
 	var nilShim *BrowserShim
-	require.NoError(t, nilShim.Handoff(nil))
 	require.NoError(t, nilShim.Remove())
 
 	dir := t.TempDir()
 	shim := &BrowserShim{dir: dir}
 	require.Equal(t, browserShimEnviron([]string{"PATH=/usr/bin"}, dir), shim.environ([]string{"PATH=/usr/bin"}))
-	require.NoError(t, shim.Handoff(nil))
 	require.NoError(t, shim.Remove())
 	require.NoDirExists(t, dir)
 }

@@ -15,27 +15,14 @@ func TestEnsureRuntimeControlRootCreatesAndValidatesProtectedDirectory(t *testin
 	info, err := os.Lstat(root)
 	require.NoError(t, err)
 	require.True(t, info.IsDir())
-	require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
 	require.NoError(t, ensureRuntimeControlRoot(root))
 }
 
-func TestEnsureRuntimeControlRootRefusesRedirectsAndUnsafeExistingPaths(t *testing.T) {
+// TestEnsureRuntimeControlRootRefusesPathsThatAreNotADirectory covers what
+// every platform judges the same way. What "this user alone may write" means
+// is platform-specific and is pinned beside the platform's own predicate.
+func TestEnsureRuntimeControlRootRefusesPathsThatAreNotADirectory(t *testing.T) {
 	parent := t.TempDir()
-	decoy := filepath.Join(parent, "decoy")
-	require.NoError(t, os.Mkdir(decoy, 0o755))
-	symlink := filepath.Join(parent, "symlink")
-	require.NoError(t, os.Symlink(decoy, symlink))
-	require.Error(t, ensureRuntimeControlRoot(symlink))
-	info, err := os.Stat(decoy)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
-
-	unsafe := filepath.Join(parent, "unsafe")
-	require.NoError(t, os.Mkdir(unsafe, 0o755))
-	require.Error(t, ensureRuntimeControlRoot(unsafe))
-	info, err = os.Stat(unsafe)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
 
 	regular := filepath.Join(parent, "regular")
 	require.NoError(t, os.WriteFile(regular, []byte("state"), 0o600))
@@ -44,9 +31,9 @@ func TestEnsureRuntimeControlRootRefusesRedirectsAndUnsafeExistingPaths(t *testi
 }
 
 func TestEnsureRuntimeControlRootReportsCreationAndInspectionFailures(t *testing.T) {
-	originalLstat, originalMkdir, originalValidate := runtimeControlLstat, runtimeControlMkdir, runtimeControlValidateOwner
+	originalLstat, originalMkdir := runtimeControlLstat, runtimeControlMkdir
 	t.Cleanup(func() {
-		runtimeControlLstat, runtimeControlMkdir, runtimeControlValidateOwner = originalLstat, originalMkdir, originalValidate
+		runtimeControlLstat, runtimeControlMkdir = originalLstat, originalMkdir
 	})
 	want := errors.New("filesystem")
 	runtimeControlLstat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
@@ -64,10 +51,4 @@ func TestEnsureRuntimeControlRootReportsCreationAndInspectionFailures(t *testing
 	}
 	runtimeControlMkdir = func(string, os.FileMode) error { return nil }
 	require.ErrorIs(t, ensureRuntimeControlRoot("/control"), want)
-
-	runtimeControlLstat, runtimeControlMkdir = originalLstat, originalMkdir
-	root := t.TempDir()
-	require.NoError(t, os.Chmod(root, 0o700))
-	runtimeControlValidateOwner = func(os.FileInfo) error { return want }
-	require.ErrorIs(t, ensureRuntimeControlRoot(root), want)
 }

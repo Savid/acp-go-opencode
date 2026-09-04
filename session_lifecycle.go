@@ -44,9 +44,13 @@ type foregroundCycle struct {
 	// turn with a new assistant message per step, so assistantIDs holds every step
 	// this cycle owns and assistantID names the newest of them — the step whose
 	// stop reason and usage settle the turn.
-	failure           error
-	assistantIDs      map[string]struct{}
-	assistantID       string
+	failure      error
+	assistantIDs map[string]struct{}
+	assistantID  string
+	// assistantEvidence closes when the cycle adopts its first step, so a
+	// settlement that outran the ordered stream can wait for the identity it
+	// needs rather than read a turn the stream has not described yet.
+	assistantEvidence chan struct{}
 	assistantTerminal bool
 	// lost records that the cycle ended with no native terminal signal at all,
 	// and incarnationLost records that the reason was the death of the
@@ -109,6 +113,14 @@ func (c *foregroundCycle) adoptAssistant(info opencode.NativeMessageInfo) {
 
 		c.assistantIDs[info.ID] = struct{}{}
 		c.assistantID = info.ID
+
+		if c.assistantEvidence != nil {
+			select {
+			case <-c.assistantEvidence:
+			default:
+				close(c.assistantEvidence)
+			}
+		}
 	}
 
 	if info.Finish != "" || info.Time.Completed > 0 {
@@ -348,15 +360,16 @@ func (s *session) reservePromptCycle(
 	nextTurn := s.turnCounter + 1
 
 	cycle := &foregroundCycle{
-		id:               fmt.Sprintf("cycle-%d", nextCycle),
-		turnID:           fmt.Sprintf("turn-%d", nextTurn),
-		origin:           lifecycle.CauseSubmission,
-		turnNonce:        turnNonceFromContext(ctx),
-		reserved:         true,
-		dispatchEvidence: make(chan struct{}),
-		nativeMessageID:  nativeMessageID,
-		blockers:         map[string]struct{}{},
-		signal:           make(chan struct{}),
+		id:                fmt.Sprintf("cycle-%d", nextCycle),
+		turnID:            fmt.Sprintf("turn-%d", nextTurn),
+		origin:            lifecycle.CauseSubmission,
+		turnNonce:         turnNonceFromContext(ctx),
+		reserved:          true,
+		dispatchEvidence:  make(chan struct{}),
+		nativeMessageID:   nativeMessageID,
+		blockers:          map[string]struct{}{},
+		signal:            make(chan struct{}),
+		assistantEvidence: make(chan struct{}),
 	}
 	if stream := s.lifecycleStreamLocked(); stream != nil {
 		if err := stream.Preflight(

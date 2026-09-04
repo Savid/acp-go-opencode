@@ -1,13 +1,16 @@
-# Real-native browser containment canary
+# Real-native browser canary
 
 This fixture drives OpenCode's current Snowflake external-browser login through
 the adapter's production provider-auth broker, then uses passive `execve`
 tracing to require a real browser attempt and prove every launcher resolved
 inside the production-generated shim. The runtime container has no GUI,
-credentials, host mounts, or network.
+credentials, host mounts, network, or supplied host authority.
 
 In this pinned release the Snowflake method launches its authorization URL and
-then returns a loopback completion variant. The production broker rejects that
+then returns a loopback completion variant. The production catalog publishes no
+such method, because its reviewed registry admits only OAuth flows that open
+nothing while they mint, so the canary admits the Snowflake method through an
+in-package test seam before enumerating. The production broker rejects the
 variant; the canary requires that exact rejection and the broker's cleanup in
 addition to the independent launch trace.
 
@@ -19,4 +22,5 @@ addition to the independent launch trace.
 `prepare.sh` downloads and verifies only the native release. Image construction
 installs the exact `strace` package, and its context allowlist includes only the
 two binaries, entrypoint, and decoy. The final container executes with Docker
-`--network none`.
+`--network none`; its writable runtime and scratch roots are local tmpfs mounts,
+because production correctly refuses Docker overlayfs for cross-process locks.

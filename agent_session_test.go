@@ -300,10 +300,6 @@ func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *test
 		return nil
 	}
 
-	type promptResult struct {
-		response acp.PromptResponse
-		err      error
-	}
 	done := make(chan promptResult, 1)
 
 	go func() {
@@ -398,42 +394,6 @@ func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []SessionStoreEntry{entry}, retained)
 }
-func TestRuntimeResourceHooksAcquireRejectAndReleaseExactlyOnce(t *testing.T) {
-	ctx := context.Background()
-	client := newFakeOpenCodeClient()
-	client.createSession = testNativeSession("native-1")
-	client.agents = []opencode.NativeAgent{{Name: "build"}}
-	var nativeAcquire, scratchAcquire, nativeRelease, scratchRelease atomic.Int64
-	hooks := RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			nativeAcquire.Add(1)
-
-			return func() { nativeRelease.Add(1) }, nil
-		},
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			scratchAcquire.Add(1)
-
-			return func() { scratchRelease.Add(1) }, nil
-		},
-	}
-	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(hooks), func(options *Options) {
-		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) { return client, nil }
-	})
-	_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(),
-		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("openai/gpt-test")))))
-	require.NoError(t, err)
-	require.EqualValues(t, 1, nativeAcquire.Load())
-	require.EqualValues(t, 1, scratchAcquire.Load())
-	require.NoError(t, agent.Close())
-	require.EqualValues(t, 1, nativeRelease.Load())
-	require.EqualValues(t, 1, scratchRelease.Load())
-
-	rejected := NewAgent(WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) { return nil, errors.New("pool full") },
-	}))
-	_, _, err = rejected.sharedRuntimeBinding(ctx)
-	require.ErrorContains(t, err, "pool full")
-}
 
 func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *testing.T) {
 	ctx := context.Background()
@@ -445,15 +405,8 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 	second.getSession = testNativeSession("native-first")
 	second.agents = []opencode.NativeAgent{{Name: "build"}}
 
-	var factoryCalls, nativeReleases, scratchReleases atomic.Int64
-	agent := NewAgent(WithScratchDir(t.TempDir()), WithRuntimeResourceHooks(RuntimeResourceHooks{
-		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { nativeReleases.Add(1) }, nil
-		},
-		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
-			return func() { scratchReleases.Add(1) }, nil
-		},
-	}), func(options *Options) {
+	var factoryCalls atomic.Int64
+	agent := NewAgent(WithScratchDir(t.TempDir()), func(options *Options) {
 		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 			if factoryCalls.Add(1) == 1 {
 				return first, nil
@@ -472,10 +425,8 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 		retained := agent.runtime == nil && len(agent.sessions) == 1
 		agent.mu.Unlock()
 
-		return retained && nativeReleases.Load() == 1 && scratchReleases.Load() == 1
+		return retained
 	}, time.Second, 10*time.Millisecond)
-	require.EqualValues(t, 1, nativeReleases.Load())
-	require.EqualValues(t, 1, scratchReleases.Load())
 
 	response, err := agent.Prompt(ctx, TextPromptRequest(created.SessionId, "recovery-turn", "continue after restart"))
 	require.NoError(t, err)
@@ -484,8 +435,6 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 	require.Len(t, agent.sessions, 1)
 	require.NoError(t, agent.sessions[created.SessionId].runtimeFailure())
 	require.NoError(t, agent.Close())
-	require.EqualValues(t, 2, nativeReleases.Load())
-	require.EqualValues(t, 2, scratchReleases.Load())
 }
 
 func TestRecoverySkipsCrashedReplacementGenerationBeforePrompt(t *testing.T) {
@@ -779,12 +728,12 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 		WithSessionOpenCodeOptions(OpenCodeOptions{
 			Model: "openai/gpt-test", Mode: "build", Permission: "allow",
 			Env:           map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""},
-			ExtraPathDirs: []string{"/original/bin"},
+			ExtraPathDirs: []string{absTestPath("original", "bin")},
 		}),
 	))
 	require.NoError(t, err)
 	require.NotEmpty(t, created.SessionId)
-	require.Equal(t, []string{"/original/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("original", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""}, client.scopes()[0].Env)
 
 	listed, err := agent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
@@ -797,24 +746,34 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	loaded, err := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
 	require.NoError(t, err)
 	require.NotNil(t, loaded.Meta)
-	// A cold load keeps the durable directories and starts from no environment:
-	// an operation bearer is never frozen into the store, so the loading request
-	// owns it.
-	require.Equal(t, []string{"/original/bin"}, client.scopes()[1].ExtraPathDirs)
-	require.Empty(t, client.scopes()[1].Env)
+	require.Equal(t, []string{absTestPath("original", "bin")}, client.scopes()[1].ExtraPathDirs)
+	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""}, client.scopes()[1].Env)
 	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
 	require.NoError(t, err)
 
 	resumed, err := agent.ResumeSession(ctx, ResumeSessionRequest(created.SessionId, cwd,
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(
-			WithOpenCodeExtraPathDirs("/replacement/bin"),
+			WithOpenCodeExtraPathDirs(absTestPath("replacement", "bin")),
 			WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "rotated"}),
 		)),
 	))
 	require.NoError(t, err)
 	require.NotNil(t, resumed.Meta)
-	require.Equal(t, []string{"/replacement/bin"}, client.scopes()[2].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("replacement", "bin")}, client.scopes()[2].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "rotated"}, client.scopes()[2].Env)
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+
+	loaded, err = agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeExtraPathDirs(),
+			WithOpenCodeEnv(map[string]string{}),
+		)),
+	))
+	require.NoError(t, err)
+	require.NotNil(t, loaded.Meta)
+	require.Empty(t, client.scopes()[3].ExtraPathDirs)
+	require.Empty(t, client.scopes()[3].Env)
 
 	_, err = agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
 	require.NoError(t, err)
@@ -825,6 +784,467 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, listed.Sessions)
 	require.NoError(t, agent.Close())
+}
+
+func TestActiveLoadResumeReuseAnUnchangedCarrierWithoutConsumingCapacity(t *testing.T) {
+	for _, method := range []struct {
+		name string
+		call func(*Agent, acp.SessionId, string, ...SessionRequestOption) error
+	}{
+		{
+			name: "load with omitted carrier",
+			call: func(agent *Agent, id acp.SessionId, cwd string, options ...SessionRequestOption) error {
+				_, err := agent.LoadSession(t.Context(), LoadSessionRequest(id, cwd, options...))
+
+				return err
+			},
+		},
+		{
+			name: "resume with identical carrier",
+			call: func(agent *Agent, id acp.SessionId, cwd string, options ...SessionRequestOption) error {
+				_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(id, cwd, options...))
+
+				return err
+			},
+		},
+	} {
+		t.Run(method.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			client := newFakeOpenCodeClient()
+			agent := NewAgent(
+				WithSessionStore(NewInMemorySessionStore()),
+				WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+			)
+			current := testSession(t, agent, client)
+			current.cwd = cwd
+			current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{absTestPath("same", "bin")})
+			require.NoError(t, current.snapshotToStore(t.Context()))
+
+			var options []SessionRequestOption
+			if method.name == "resume with identical carrier" {
+				options = append(options, WithSessionOpenCodeOptions(NewOpenCodeOptions(
+					WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "same"}),
+					WithOpenCodeExtraPathDirs(absTestPath("same", "bin")),
+				)))
+			}
+
+			require.NoError(t, method.call(agent, current.id, cwd, options...))
+
+			agent.mu.Lock()
+			mapped := agent.sessions[current.id]
+			activeCount := len(agent.sessions)
+			agent.mu.Unlock()
+
+			require.Same(t, current, mapped)
+			require.Equal(t, 1, activeCount)
+			require.False(t, client.isClosed(), "reuse contained the binding it was meant to retain")
+			require.Empty(t, client.scopes(), "reuse allocated a second native directory scope")
+		})
+	}
+}
+
+func TestActiveResumeHardCutsChangedCarrierBeforeSuccessorAdmission(t *testing.T) {
+	cwd := t.TempDir()
+	store := NewInMemorySessionStore()
+	predecessorClient := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithSessionStore(store),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+	)
+	predecessor := testSession(t, agent, predecessorClient)
+	predecessor.cwd = cwd
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{absTestPath("old", "bin")})
+	require.NoError(t, predecessor.snapshotToStore(t.Context()))
+
+	successorClient := newFakeOpenCodeClient()
+	successorClient.getSession = testNativeSession(predecessor.idmap.NativeSessionID)
+	successorClient.scopeFunc = func(opencode.ScopeOptions) error {
+		require.True(t, predecessorClient.isClosed(), "successor overlapped its predecessor")
+
+		return nil
+	}
+	agent.mu.Lock()
+	agent.runtime = successorClient
+	agent.mu.Unlock()
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
+			WithOpenCodeExtraPathDirs(absTestPath("new", "bin")),
+		)),
+	))
+	require.NoError(t, err)
+	require.True(t, predecessorClient.isClosed())
+
+	agent.mu.Lock()
+	successor := agent.sessions[predecessor.id]
+	activeCount := len(agent.sessions)
+	agent.mu.Unlock()
+
+	require.NotNil(t, successor)
+	require.NotSame(t, predecessor, successor)
+	require.Equal(t, 1, activeCount, "replacement leaked an active-session slot")
+	require.True(t, successor.snapshot().carrier.equal(newSessionCarrier(
+		map[string]string{"SESSION_COLOR": "new"}, []string{absTestPath("new", "bin")},
+	)))
+	require.Len(t, successorClient.scopes(), 1)
+}
+
+func TestActiveResumeRebindsAnUnchangedCarrierAfterRuntimeLoss(t *testing.T) {
+	cwd := t.TempDir()
+	store := NewInMemorySessionStore()
+	predecessorClient := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithSessionStore(store),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+	)
+	current := testSession(t, agent, predecessorClient)
+	current.cwd = cwd
+	current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{absTestPath("same", "bin")})
+	require.NoError(t, current.snapshotToStore(t.Context()))
+
+	current.detachRuntime(current.runtimeGeneration, errValueSharedRuntimeExited)
+
+	successorClient := newFakeOpenCodeClient()
+	successorClient.getSession = testNativeSession(current.idmap.NativeSessionID)
+	agent.mu.Lock()
+	agent.runtime = successorClient
+	agent.runtimeGeneration++
+	agent.mu.Unlock()
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(current.id, cwd))
+	require.NoError(t, err)
+
+	agent.mu.Lock()
+	mapped := agent.sessions[current.id]
+	activeCount := len(agent.sessions)
+	agent.mu.Unlock()
+
+	require.Same(t, current, mapped)
+	require.Equal(t, 1, activeCount)
+	require.Len(t, successorClient.scopes(), 1)
+	require.True(t, current.snapshot().carrier.equal(newSessionCarrier(
+		map[string]string{"SESSION_COLOR": "same"}, []string{absTestPath("same", "bin")},
+	)))
+}
+
+func TestActiveResumePublishesNoSuccessorWhenHardCutContainmentFails(t *testing.T) {
+	cwd := t.TempDir()
+	store := NewInMemorySessionStore()
+	predecessorClient := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithSessionStore(store),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+	)
+	predecessor := testSession(t, agent, predecessorClient)
+	predecessor.cwd = cwd
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{absTestPath("old", "bin")})
+	require.NoError(t, predecessor.snapshotToStore(t.Context()))
+	predecessorClient.closeErr = errors.Join(errors.New("scope still live"), ErrContainmentIncomplete)
+
+	successorClient := newFakeOpenCodeClient()
+	agent.mu.Lock()
+	agent.runtime = successorClient
+	agent.mu.Unlock()
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
+		)),
+	))
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+
+	agent.mu.Lock()
+	mapped := agent.sessions[predecessor.id]
+	activeCount := len(agent.sessions)
+	agent.mu.Unlock()
+
+	require.Same(t, predecessor, mapped)
+	require.Equal(t, 1, activeCount)
+	require.Empty(t, successorClient.scopes(), "failed containment admitted a successor")
+}
+
+func TestActiveResumeBoundsContendedPredecessorCloseAdmission(t *testing.T) {
+	cwd := t.TempDir()
+	store := NewInMemorySessionStore()
+	predecessorClient := newFakeOpenCodeClient()
+	agent := NewAgent(
+		WithSessionStore(store),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
+	)
+	agent.sessionReplacementTimeout = 25 * time.Millisecond
+
+	predecessor := testSession(t, agent, predecessorClient)
+	predecessor.cwd = cwd
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{absTestPath("old", "bin")})
+	require.NoError(t, predecessor.snapshotToStore(t.Context()))
+	require.NoError(t, predecessor.recoveryMu.lock(context.Background()))
+
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			predecessor.recoveryMu.unlock()
+		}
+	}()
+
+	successorClient := newFakeOpenCodeClient()
+	successorClient.getSession = testNativeSession(predecessor.idmap.NativeSessionID)
+	agent.mu.Lock()
+	agent.runtime = successorClient
+	agent.mu.Unlock()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
+			WithSessionOpenCodeOptions(NewOpenCodeOptions(
+				WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
+			)),
+		))
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(2 * time.Second):
+		t.Fatal("active replacement held the lifecycle gate past its close-admission deadline")
+	}
+
+	agent.lifecycleAdmissionMu.Lock()
+	require.Empty(t, agent.lifecycleFlights, "timed-out close admission retained the lifecycle flight")
+	agent.lifecycleAdmissionMu.Unlock()
+
+	agent.mu.Lock()
+	mapped := agent.sessions[predecessor.id]
+	activeCount := len(agent.sessions)
+	agent.mu.Unlock()
+
+	predecessor.mu.Lock()
+	predecessorClosed := predecessor.closed
+	predecessor.mu.Unlock()
+
+	require.Same(t, predecessor, mapped)
+	require.Equal(t, 1, activeCount)
+	require.False(t, predecessorClosed, "timed-out admission partially closed the predecessor")
+	require.Empty(t, successorClient.scopes(), "timed-out admission published a successor")
+
+	predecessor.recoveryMu.unlock()
+	gateHeld = false
+	agent.sessionReplacementTimeout = settlementTimeout
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(
+			WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
+		)),
+	))
+	require.NoError(t, err, "released close admission was not retryable")
+	require.Len(t, successorClient.scopes(), 1)
+}
+
+func TestSessionLifecycleFlightsIsolateIDsFenceCloseAndCleanUp(t *testing.T) {
+	cwd := t.TempDir()
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	for logicalID, nativeID := range map[string]string{"s1": "native-1", "s2": "native-2"} {
+		snapshot := validSyncSnapshot(logicalID, nativeID, cwd)
+		encoded, err := json.Marshal(snapshot)
+		require.NoError(t, err)
+		require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: logicalID}, []SessionStoreReplacement{{
+			Key: SessionKey{SessionID: logicalID}, Entries: []SessionStoreEntry{encoded},
+		}}))
+	}
+
+	client := newFakeOpenCodeClient()
+	client.getSessionFunc = func(_ context.Context, id string) (opencode.NativeSession, error) {
+		return testNativeSession(id), nil
+	}
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+
+	reached := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	callbackDone := make(chan error, 1)
+	var once sync.Once
+	store.onLoad = func(key SessionKey) ([]SessionStoreEntry, error) {
+		if key.SessionID != "s1" {
+			return store.InMemorySessionStore.Load(t.Context(), key)
+		}
+
+		var callbackErr error
+		once.Do(func() {
+			_, callbackErr = agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest("callback-session"))
+			callbackDone <- callbackErr
+			close(reached)
+			<-releaseLoad
+		})
+		if callbackErr != nil {
+			return nil, callbackErr
+		}
+
+		return store.InMemorySessionStore.Load(t.Context(), key)
+	}
+
+	s1Result := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest("s1", cwd))
+		s1Result <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("s1 did not reach the blocked store load")
+	}
+	require.NoError(t, <-callbackDone, "store callback could not run an independent lifecycle operation")
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	canceledResult := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(canceled, ResumeSessionRequest("s2", cwd))
+		canceledResult <- err
+	}()
+	select {
+	case err := <-canceledResult:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("canceled s2 lifecycle call waited behind s1")
+	}
+
+	s2Result := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest("s2", cwd))
+		s2Result <- err
+	}()
+	select {
+	case err := <-s2Result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("s2 lifecycle call waited behind s1")
+	}
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- agent.Close() }()
+	select {
+	case err := <-closeResult:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Agent.Close waited behind the blocked s1 lifecycle flight")
+	}
+
+	close(releaseLoad)
+	require.Error(t, <-s1Result)
+
+	agent.lifecycleAdmissionMu.Lock()
+	require.Empty(t, agent.lifecycleFlights)
+	require.True(t, agent.lifecycleFenced)
+	agent.lifecycleAdmissionMu.Unlock()
+}
+
+func TestSessionLifecycleFlightSerializesSameIDPublication(t *testing.T) {
+	cwd := t.TempDir()
+	snapshot := validSyncSnapshot("session", "native", cwd)
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "session"}, Entries: []SessionStoreEntry{encoded},
+	}}))
+
+	reached := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	var once sync.Once
+	store.onLoad = func(key SessionKey) ([]SessionStoreEntry, error) {
+		once.Do(func() {
+			close(reached)
+			<-releaseLoad
+		})
+
+		return store.InMemorySessionStore.Load(t.Context(), key)
+	}
+
+	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+
+	results := make(chan error, 2)
+	go func() {
+		_, loadErr := agent.LoadSession(t.Context(), LoadSessionRequest("session", cwd))
+		results <- loadErr
+	}()
+	go func() {
+		_, resumeErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("session", cwd))
+		results <- resumeErr
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("first same-id resume did not reach the store")
+	}
+	close(releaseLoad)
+	require.NoError(t, <-results)
+	require.NoError(t, <-results)
+	require.Len(t, client.scopes(), 1, "same-id resumes published more than one native binding")
+
+	agent.mu.Lock()
+	require.Len(t, agent.sessions, 1)
+	agent.mu.Unlock()
+	agent.lifecycleAdmissionMu.Lock()
+	require.Empty(t, agent.lifecycleFlights)
+	agent.lifecycleAdmissionMu.Unlock()
+
+	callbackResult := make(chan error, 1)
+	store.onReplace = func(SessionKey) error {
+		_, callbackErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("independent", cwd))
+		callbackResult <- callbackErr
+
+		return nil
+	}
+	require.NoError(t, agent.Close())
+	select {
+	case callbackErr := <-callbackResult:
+		require.ErrorContains(t, callbackErr, errValueAgentClosed)
+	case <-time.After(time.Second):
+		t.Fatal("Agent.Close store callback could not reenter an independent lifecycle operation")
+	}
+}
+
+func TestAgentCloseFromLifecycleStoreCallbackDoesNotDeadlock(t *testing.T) {
+	cwd := t.TempDir()
+	snapshot := validSyncSnapshot("session", "native", cwd)
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "session"}, Entries: []SessionStoreEntry{encoded},
+	}}))
+	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	agent := NewAgent(WithSessionStore(store))
+	agent.runtime = client
+
+	store.onLoad = func(key SessionKey) ([]SessionStoreEntry, error) {
+		if closeErr := agent.Close(); closeErr != nil {
+			return nil, closeErr
+		}
+
+		return store.InMemorySessionStore.Load(t.Context(), key)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, resumeErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("session", cwd))
+		result <- resumeErr
+	}()
+	select {
+	case resumeErr := <-result:
+		require.Error(t, resumeErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Agent.Close deadlocked inside the lifecycle store callback")
+	}
 }
 
 func TestAgentLifecycleValidationAndStorageFailures(t *testing.T) {
@@ -1052,8 +1472,8 @@ func TestLifecycleMCPPaginationAndRequestBuilderHelpers(t *testing.T) {
 	require.Error(t, err)
 
 	require.Equal(t, acp.SessionId("delete"), DeleteSessionRequest("delete").SessionId)
-	list := ListSessionsRequest(WithListSessionsCwd("/repo"))
-	require.Equal(t, "/repo", *list.Cwd)
+	list := ListSessionsRequest(WithListSessionsCwd(absTestPath("repo")))
+	require.Equal(t, absTestPath("repo"), *list.Cwd)
 }
 
 func TestDirectoryBindingFingerprintAndResourceBranches(t *testing.T) {
@@ -1240,7 +1660,7 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 		agent := NewAgent()
 		agent.runtime = client
 		parent := testSession(t, agent, client)
-		parent.carrier = newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "parent-token"}, []string{"/parent/bin"})
+		parent.carrier = newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "parent-token"}, []string{absTestPath("parent", "bin")})
 		agent.sessions[parent.id] = parent
 
 		return agent, client, parent
@@ -1249,15 +1669,15 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 	agent, client, parent := newForkAgent()
 	_, err := agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir()))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/parent/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("parent", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "parent-token"}, client.scopes()[0].Env)
 
 	agent, client, parent = newForkAgent()
 	_, err = agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir(),
-		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeExtraPathDirs("/child/bin"))),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeExtraPathDirs(absTestPath("child", "bin")))),
 	))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/child/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("child", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "parent-token"}, client.scopes()[0].Env,
 		"replacing one half of the carrier must leave the other half alone")
 
@@ -1268,7 +1688,7 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{}))),
 	))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/parent/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("parent", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Empty(t, client.scopes()[0].Env)
 }
 
@@ -1284,7 +1704,7 @@ func (store *summaryCoverageStore) ListSessions(context.Context) ([]SessionSumma
 func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	encoded, err := json.Marshal(snapshot)
 	require.NoError(t, err)
 
@@ -1398,7 +1818,7 @@ func TestSessionCarrierReachesTheAddressedNativeScopeOnly(t *testing.T) {
 
 	agent := NewAgent(
 		WithHome(t.TempDir()),
-		WithEnv(map[string]string{"PATH": "/static/bin"}),
+		WithEnv(map[string]string{"PATH": absTestPath("static", "bin")}),
 		func(options *Options) {
 			options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
 				started = options
@@ -1410,17 +1830,17 @@ func TestSessionCarrierReachesTheAddressedNativeScopeOnly(t *testing.T) {
 	agent.setAgentClient(newRecordingAgentClient())
 
 	_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeExtraPathDirs("/session/bin"),
+		WithOpenCodeExtraPathDirs(absTestPath("session", "bin")),
 		WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "session-token"}),
 	))))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/session/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("session", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "session-token"}, client.scopes()[0].Env)
 
 	// The shared process is started under the operator's environment only. A
 	// session value there would be the same value for every session of the
 	// Agent and would outlive the session that asked for it.
-	require.Equal(t, "/static/bin", started.Env["PATH"])
+	require.Equal(t, absTestPath("static", "bin"), started.Env["PATH"])
 	require.NotContains(t, started.Env, "WAGIE_API_TOKEN")
 
 	require.NoError(t, agent.Close())
@@ -1474,14 +1894,14 @@ func TestConcurrentSessionsCarryDistinctOrderedPathDirs(t *testing.T) {
 		)))
 	}
 
-	_, err := agent.NewSession(ctx, session("/one", "/shared", "/one"))
+	_, err := agent.NewSession(ctx, session(absTestPath("one"), absTestPath("shared"), absTestPath("one")))
 	require.NoError(t, err)
 
-	_, err = agent.NewSession(ctx, session("/two", "/shared"))
+	_, err = agent.NewSession(ctx, session(absTestPath("two"), absTestPath("shared")))
 	require.NoError(t, err)
 	require.EqualValues(t, 1, factoryCalls.Load())
-	require.Equal(t, []string{"/one", "/shared", "/one"}, client.scopes()[0].ExtraPathDirs)
-	require.Equal(t, []string{"/two", "/shared"}, client.scopes()[1].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("one"), absTestPath("shared"), absTestPath("one")}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("two"), absTestPath("shared")}, client.scopes()[1].ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }
 
@@ -1517,7 +1937,7 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	agent.setAgentClient(newRecordingAgentClient())
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeExtraPathDirs("/session/bin"),
+		WithOpenCodeExtraPathDirs(absTestPath("session", "bin")),
 	))))
 	require.NoError(t, err)
 	establishCreatedSession(t, agent, created.SessionId)
@@ -1536,7 +1956,7 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	startedMu.Lock()
 	require.Len(t, started, 2)
 	startedMu.Unlock()
-	require.Equal(t, []string{"/session/bin"}, second.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("session", "bin")}, second.scopes()[0].ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }
 
@@ -1666,7 +2086,7 @@ func TestCloseSessionRefusesWithoutADurableSnapshot(t *testing.T) {
 func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.closeErr = errors.Join(errors.New("scope refused to close"), opencode.ErrProcessContainmentIncomplete)
+	client.closeErr = errors.Join(errors.New("scope refused to close"), ErrContainmentIncomplete)
 	store := NewInMemorySessionStore()
 	agent := NewAgent(WithSessionStore(store))
 	current := testSession(t, agent, client)
@@ -1674,7 +2094,7 @@ func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	require.NoError(t, current.snapshotToStore(ctx))
 
 	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.True(t, agent.isDeleted(current.id), "a failed teardown left the deleted id addressable")
 	require.Contains(t, agent.sessions, current.id, "the failed teardown abandoned the native scope it left running")
 
@@ -1716,13 +2136,13 @@ func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 func TestAgentCloseSweepsTheScopeAFailedDeleteLeftBehind(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.closeErr = errors.Join(errors.New("scope refused to close"), opencode.ErrProcessContainmentIncomplete)
+	client.closeErr = errors.Join(errors.New("scope refused to close"), ErrContainmentIncomplete)
 	agent := NewAgent(WithSessionStore(NewInMemorySessionStore()))
 	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 
 	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(current.id))
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 
 	client.closeErr = nil
 	attempts := client.containmentAttempts()
@@ -1794,14 +2214,7 @@ func TestDeleteLeavesNoWriteThatRecreatesTheRow(t *testing.T) {
 	require.Empty(t, entries, "the deleted session's row was recreated")
 }
 
-// TestLoadRacingDeleteInstallsNothingAndResurrectsNothing proves the tombstone
-// check is not once-at-entry. A load that passed its entry check and prepared a
-// complete replacement re-reads the deletion marker under the very lock that
-// installs, so a delete that completed inside that window wins however far the
-// preparation got: the replacement is torn down, the marker is left set rather
-// than cleared as an install side effect, and neither the active map nor the
-// store carries the deleted id afterwards.
-func TestLoadRacingDeleteInstallsNothingAndResurrectsNothing(t *testing.T) {
+func TestLoadRacingDeleteSerializesTheSameLogicalSession(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -1856,19 +2269,26 @@ func TestLoadRacingDeleteInstallsNothingAndResurrectsNothing(t *testing.T) {
 		t.Fatal("the load never reached the store read")
 	}
 
-	// The delete completes entirely inside the load's preparation window.
-	_, delErr := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
-	require.NoError(t, delErr)
-	require.True(t, agent.isDeleted(created.SessionId), "the tombstone did not hide the id")
+	deleteResult := make(chan error, 1)
+	go func() {
+		_, delErr := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(created.SessionId))
+		deleteResult <- delErr
+	}()
+	select {
+	case err := <-deleteResult:
+		t.Fatalf("same-id delete overtook the active load: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
 
 	close(release)
 	wg.Wait()
+	require.NoError(t, <-deleteResult)
 
 	store.onLoad = nil
 
-	requireInvalidParamsData(t, loadErr, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	require.NoError(t, loadErr)
 	require.True(t, agent.isDeleted(created.SessionId),
-		"installing the replacement cleared the deletion marker")
+		"the serialized delete did not retain its marker")
 
 	agent.mu.Lock()
 	_, mapped := agent.sessions[created.SessionId]
@@ -1921,4 +2341,24 @@ func TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes(t *testing.T) {
 		require.ErrorIs(t, err, refusal)
 		require.ErrorContains(t, err, "disconnect failed")
 	})
+}
+func TestAgentStoreAndActiveLoadMatchEdges(t *testing.T) {
+	agent := NewAgent()
+	id := acp.SessionId("deleted")
+	agent.deleted[id] = struct{}{}
+	require.Error(t, agent.storeStartedSession(&session{id: id}))
+
+	active := &session{
+		cwd: absTestPath("cwd"), providerID: "provider", modelID: "model", mode: "build", permission: "ask",
+		outputSchema: map[string]any{"type": "object"}, carrier: sessionCarrier{},
+	}
+	snapshot := active.snapshot()
+	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
+		sessionMeta{Model: "other/model"}, sessionCarrier{}))
+	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
+		sessionMeta{Mode: "plan"}, sessionCarrier{}))
+	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
+		sessionMeta{PermissionSet: true, Permission: "allow"}, sessionCarrier{}))
+	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
+		sessionMeta{OutputSchema: map[string]any{"type": "array"}}, sessionCarrier{}))
 }

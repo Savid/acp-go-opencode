@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -62,10 +62,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 		return acp.NewSessionResponse{}, err
 	}
 
-	sessionStarted := time.Now()
 	native, err := client.CreateSessionWithPolicy(ctx, "", nativePermissionPolicy(meta.Permission))
-	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err)
-
 	if err != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
@@ -107,6 +104,12 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	ctx = a.observe.Extract(ctx, params.Meta)
 
+	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	if err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+	defer release()
+
 	session, err := a.loadOrResumeSession(ctx, params.SessionId, params.Cwd, params.AdditionalDirectories, params.McpServers, params.Meta)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
@@ -127,6 +130,12 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 	if err := validateMCPServers(params.McpServers); err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
+
+	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	if err != nil {
+		return acp.ResumeSessionResponse{}, err
+	}
+	defer release()
 
 	session, err := a.loadOrResumeSession(ctx, params.SessionId, params.Cwd, params.AdditionalDirectories, params.McpServers, params.Meta)
 	if err != nil {
@@ -180,6 +189,56 @@ func (a *Agent) loadOrResumeSession(
 		return nil, vendorOptionsMetaError(err)
 	}
 
+	a.mu.Lock()
+	active := a.sessions[id]
+	a.mu.Unlock()
+
+	if active != nil {
+		activeSnapshot := active.snapshot()
+		carrier := carrierFromMeta(meta, activeSnapshot.carrier)
+
+		if activeLoadRequestMatches(activeSnapshot, active, cwd, additionalDirectories, mcpServers, metaMap, meta, carrier) {
+			// An active logical session is already the newest incarnation. Reuse
+			// it instead of hydrating an older committed generation over it; if
+			// its shared runtime was lost, ensureRuntime performs the in-place
+			// rebind before the handler exposes the session again.
+			if ensureErr := active.ensureRuntime(ctx); ensureErr != nil {
+				return nil, ensureErr
+			}
+
+			return active, nil
+		}
+
+		// A changed carrier or another binding-affecting option is a hard cut.
+		// The predecessor commits its latest generation and proves its native
+		// scope contained before the successor is even hydrated, so the two
+		// carrier bindings can never overlap and the active-session slot is
+		// released before capacity admission runs again.
+		// Replacement is detached from request cancellation because it must not
+		// abandon a predecessor halfway through containment. The deadline bounds
+		// waiting to enter the predecessor's recovery/close gate; after admission,
+		// CloseAndCommit runs its detached, internally bounded ladder to completion.
+		replacementTimeout := a.sessionReplacementTimeout
+		if replacementTimeout <= 0 {
+			replacementTimeout = settlementTimeout
+		}
+
+		replacementCtx, replacementCancel := context.WithTimeout(context.Background(), replacementTimeout)
+		closeErr := active.CloseAndCommit(replacementCtx)
+
+		replacementCancel()
+
+		if closeErr != nil {
+			return nil, closeErr
+		}
+
+		if !a.removeSessionIf(id, active) {
+			return nil, acp.NewInternalError(map[string]any{jsonFieldError: "active OpenCode session changed during replacement"})
+		}
+
+		a.observe.AddActiveSession(ctx, -1)
+	}
+
 	storeCtx, cancel := a.sessionStoreContext(ctx)
 	idmap, snapshot, ok, err := hydrateStateFromStore(storeCtx, a.sessionStore(), string(id))
 
@@ -201,7 +260,7 @@ func (a *Agent) loadOrResumeSession(
 		meta.Mode = snapshot.Session.Model.Agent
 	}
 
-	carrier := carrierFromMeta(meta, newSessionCarrier(nil, snapshot.Session.ExtraPathDirs))
+	carrier := carrierFromMeta(meta, newSessionCarrier(snapshot.Session.Env, snapshot.Session.ExtraPathDirs))
 	meta.Env, meta.ExtraPathDirs = carrier.Env, carrier.ExtraPathDirs
 
 	artifacts, artifactsErr := a.loadAndRehydrateArtifacts(ctx, string(id), snapshot.Events)
@@ -245,6 +304,55 @@ func (a *Agent) loadOrResumeSession(
 	}
 
 	return session, nil
+}
+
+// activeLoadRequestMatches reports whether load/resume can keep the active
+// incarnation. Omitted options retain the active values; explicitly repeated
+// values are equally reusable. Anything that changes the native directory
+// binding or the session behavior requires the hard-cut path above.
+func activeLoadRequestMatches(
+	snapshot sessionSnapshot,
+	active *session,
+	cwd string,
+	additionalDirectories []string,
+	mcpServers []acp.McpServer,
+	metaMap map[string]any,
+	meta sessionMeta,
+	carrier sessionCarrier,
+) bool {
+	active.mu.Lock()
+	closed := active.closed
+	mcpConfigs := cloneNativeMCPServerConfigs(active.mcpServers)
+	outputSchema := cloneAnyMap(active.outputSchema)
+	active.mu.Unlock()
+
+	if closed || snapshot.cwd != cwd ||
+		!slices.Equal(snapshot.additionalDirectories, additionalDirectories) ||
+		!reflect.DeepEqual(mcpConfigs, nativeMCPServerConfigs(mcpServers)) ||
+		!snapshot.carrier.equal(carrier) {
+		return false
+	}
+
+	if meta.Model != "" && meta.Model != joinModelValue(snapshot.providerID, snapshot.modelID) {
+		return false
+	}
+
+	if meta.Mode != "" && meta.Mode != snapshot.mode {
+		return false
+	}
+
+	if meta.PermissionSet && normalizeOpenCodePermission(meta.Permission) != snapshot.permission {
+		return false
+	}
+
+	if meta.OutputSchema != nil && !reflect.DeepEqual(meta.OutputSchema, outputSchema) {
+		return false
+	}
+
+	opencodeMeta, _ := metaMap[opencodeMetaKey].(map[string]any)
+	_, rawMessagesSet := opencodeMeta[rawEventKey]
+
+	return !rawMessagesSet || meta.RawMessages == snapshot.rawMessages
 }
 
 func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
@@ -344,6 +452,12 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		return acp.CloseSessionResponse{}, refusal
 	}
 
+	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	if err != nil {
+		return acp.CloseSessionResponse{}, err
+	}
+	defer release()
+
 	session, err := a.session(params.SessionId)
 	if err != nil {
 		return acp.CloseSessionResponse{}, err
@@ -393,6 +507,12 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
 
+	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	if err != nil {
+		return acp.UnstableDeleteSessionResponse{}, err
+	}
+	defer release()
+
 	a.mu.Lock()
 	session := a.sessions[params.SessionId]
 	a.mu.Unlock()
@@ -405,7 +525,7 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 	// record the tombstone is the one failure that leaves the handle exactly as
 	// it was, because nothing was promised.
 	storeCtx, cancel := a.sessionStoreContext(ctx)
-	err := a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
+	err = a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
 
 	cancel()
 
@@ -652,10 +772,7 @@ func (a *Agent) newOpenCodeClient(
 			return nil, nil, 0, startupFailure(err)
 		}
 
-		configurationStarted := time.Now()
 		client, err := runtime.Scope(ctx, carrier.scopeOptions(cwd, mcpServers))
-		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, err)
-
 		if err == nil {
 			return client, releaseDirectory, generation, nil
 		}
@@ -717,15 +834,6 @@ func mcpSecretNeedles(configs []opencode.MCPServerConfig) []string {
 	}
 
 	return needles
-}
-
-// homeRoot returns the single shared runtime XDG root.
-func (a *Agent) homeRoot() string {
-	if a.options.Home != "" {
-		return a.options.Home
-	}
-
-	return filepath.Join(scratchParent(a.options.ScratchDir), defaultAgentName)
 }
 
 func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {

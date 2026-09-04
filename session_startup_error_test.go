@@ -131,10 +131,10 @@ func TestStartupFailurePreservesTheChainItRetells(t *testing.T) {
 	require.Same(t, plain, startupFailure(plain))
 
 	wrapped := startupFailure(errors.Join(
-		opencode.ErrProcessContainmentIncomplete,
+		ErrContainmentIncomplete,
 		startupHTTPError(http.MethodDelete, "/mcp/gateway"),
 	))
-	require.ErrorIs(t, wrapped, opencode.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, wrapped, ErrContainmentIncomplete)
 	require.Equal(t, "opencode DELETE /mcp/gateway returned 401 Unauthorized", wrapped.Error())
 	require.NotContains(t, wrapped.Error(), startupBodySecret)
 

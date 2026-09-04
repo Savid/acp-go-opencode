@@ -324,7 +324,9 @@ func (s *session) routeNativeEventForIncarnation(
 		return nil
 	}
 
-	_ = s.emitRawOpenCodeEvent(ctx, event)
+	if err := s.emitRawOpenCodeEvent(ctx, event); err != nil {
+		s.agent.log.WarnContext(ctx, "raw OpenCode event emission failed")
+	}
 
 	if err := s.applyNativeEvent(ctx, event); err != nil {
 		return err

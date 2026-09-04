@@ -51,10 +51,22 @@ func handoffEnvelope(decoded []byte) map[string]any {
 	}
 }
 
+func TestHandoffCapabilityScalar(t *testing.T) {
+	response, err := NewAgent(WithInputHandoffRoot(t.TempDir())).Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+	})
+	require.NoError(t, err)
+
+	handoff, ok := response.AgentCapabilities.Meta["acp-go.dev/handoff"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, 1, handoff["version"])
+	require.Len(t, handoff, 1)
+}
+
 // handoffBlock builds the handoff input form: an image block with empty data,
 // a file URI, and a handoff envelope.
 func handoffBlock(mime, path string, envelope any) acp.ContentBlock {
-	uri := "file://" + filepath.ToSlash(path)
+	uri := "file://" + testURIPath(path)
 	block := acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", MimeType: mime, Uri: &uri}}
 
 	if envelope != nil {
@@ -270,7 +282,7 @@ func TestHandoffFormRejectsMalformedBlocks(t *testing.T) {
 		},
 		{
 			name:    "uri empty",
-			block:   handoffBlock(mimePNG, "", handoffEnvelope(decoded)),
+			block:   imageBlockWithURI(mimePNG, "", handoffEnvelope(decoded)),
 			message: handoffCauseURI,
 		},
 		{
@@ -357,7 +369,7 @@ func TestHandoffFormRejectsUnreachablePaths(t *testing.T) {
 		root := t.TempDir()
 
 		session := handoffSession(t, root)
-		uri := "file://" + filepath.ToSlash(root) + "/%2e%2e/%2e%2e/etc/passwd"
+		uri := "file://" + testURIPath(root) + "/%2e%2e/%2e%2e/etc/passwd"
 		requireHandoffVerdict(t, session, imageBlockWithURI(mimePNG, uri, envelope),
 			imageErrorPathNotAllowed, handoffCauseOutsideRoot)
 	})
@@ -749,14 +761,14 @@ func TestHandoffFormSelection(t *testing.T) {
 
 	t.Run("a loopback host resolves", func(t *testing.T) {
 		session := handoffSession(t, root)
-		block := imageBlockWithURI(mimePNG, "file://localhost"+filepath.ToSlash(path), handoffEnvelope(decoded))
+		block := imageBlockWithURI(mimePNG, "file://localhost"+testURIPath(path), handoffEnvelope(decoded))
 		require.NoError(t, validatePromptMediaError(session, block))
 	})
 }
 
 func TestInputHandoffRootValidation(t *testing.T) {
 	require.NoError(t, validateInputHandoffRoot(""))
-	require.NoError(t, validateInputHandoffRoot(filepath.Join(string(filepath.Separator), "srv", "handoff")))
+	require.NoError(t, validateInputHandoffRoot(absTestPath("srv", "handoff")))
 	require.Error(t, validateInputHandoffRoot(filepath.Join("relative", "handoff")))
 
 	_, err := NewAgent(WithInputHandoffRoot("relative")).Initialize(context.Background(), acp.InitializeRequest{
@@ -1240,7 +1252,7 @@ func TestHandoffEnvelopeNumericBounds(t *testing.T) {
 		require.True(t, ok)
 		require.IsType(t, json.Number(""), envelope[handoffFieldVersion])
 
-		uri := "file://" + filepath.ToSlash(path)
+		uri := "file://" + testURIPath(path)
 		block := acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", MimeType: mimePNG, Uri: &uri, Meta: meta}}
 
 		session := handoffSession(t, root)

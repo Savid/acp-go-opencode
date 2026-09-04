@@ -1,12 +1,11 @@
 ---
 title: Go API
-description: The public opencodeacp package surface — entry points, agent options, and request builders.
+description: The public opencodeacp package surface — entry points, host authority, agent options, and request builders.
 ---
 
-The full API, with signatures and doc comments, lives on
+The complete signatures and doc comments live on
 [pkg.go.dev](https://pkg.go.dev/github.com/savid/acp-go-opencode). This page
-indexes the surface so you know what exists and where to look; it does not
-reproduce godoc.
+indexes the surface and explains the contracts that matter to an embedding host.
 
 ## Entry points
 
@@ -15,122 +14,113 @@ agent := opencodeacp.NewAgent(opts...)
 err := opencodeacp.Serve(ctx, input, output, opts...)
 ```
 
-`Serve` runs the agent against the supplied streams; `NewAgent` builds the same
-agent when you need a reference first. Both take the same `Option` values.
+`Serve` runs against the supplied streams and closes the agent before it
+returns. `NewAgent` builds the same agent when the caller needs a reference.
+Both accept the same `Option` values.
 
-`Serve` closes the agent before it returns. If shutdown fails, that close error
-takes precedence over EOF or context cancellation. In particular,
-`errors.Is(err, opencodeacp.ErrProcessContainmentIncomplete)` means the selected
-native containment boundary did not complete; an embedding host must keep that
-runtime and its resources quarantined.
+Shutdown errors preserve public sentinels. `ErrHostAuthorityUnavailable` means
+the supplied authority cannot accept more managed work.
+`ErrContainmentIncomplete` means terminal process-tree proof or cleanup did not
+complete. `ErrNativeTreeBusy` means reclaim found live lease processes. A host
+must keep affected resources out of reuse.
+
+## Host authority
+
+Omitting `WithHostAuthority` selects ordinary same-identity execution. A
+managed host implements this exact boundary:
+
+```go
+type HostAuthority interface {
+	NativeEnvironment() map[string]string
+	PrepareNativeTree(context.Context, string) error
+	ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error)
+	ReclaimNativeTree(context.Context, string) error
+	StartNative(context.Context, NativeRequest) (NativeProcess, error)
+}
+
+type NativeProcess interface {
+	Stdin() io.WriteCloser
+	Stdout() io.ReadCloser
+	Stderr() io.ReadCloser
+	Wait(context.Context) (NativeResult, error)
+	Revoke(context.Context) error
+}
+```
+
+`NativeRequest` contains `Executable`, `Arguments`, `Environment`, and
+`WorkingDirectory`. `NativeResult` contains `ExitCode`, `Signal`, and
+`Revoked`.
+
+The environment map must be complete and valid. The adapter filters reserved
+keys, applies `WithEnv`, adds its managed runtime values, sorts the resulting
+environment, and passes that exact slice to `StartNative`. It does not mix in
+the adapter's ambient environment.
+
+Every prepared tree is fully materialized before `PrepareNativeTree`. From a
+successful prepare until a successful reclaim, the adapter performs no
+filesystem access beneath that tree. The runtime lock remains at
+`<xdg-root>.control`, outside the prepared root. Teardown closes protocol input,
+calls `Revoke`, reaches terminal `Wait`, releases the lock, reclaims prepared
+trees in reverse order, and then removes generated roots. A failed prepare is
+opaque and leaves host cleanup in force; a busy reclaim retains retry ownership
+and blocks replacement admission. Cancelling a `Wait` caller only detaches that
+caller, and a later wait still receives the single terminal result. An
+authority error is never retried through ordinary execution.
 
 ## Agent options
 
 | Option | Purpose |
 |---|---|
 | `WithExecutablePath` | Path to the `opencode` binary. |
-| `WithProcessIsolation` | Explicit hardened Linux boundary: nonzero target UID/GID distinct from a trusted root supervisor, empty supplementary groups, and a complete replacement environment. Strict and fail-closed on every platform, authority, and launch failure, and never combined with `WithDarwinBestEffortContainment`. Omit it for ordinary current-identity execution, which is the default and never a configuration error. |
-| `WithScratchDir` | Parent for a materialized shared runtime root and transient adapter scratch; empty uses the system temp directory. |
-| `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. Standalone isolation defaults it to `StandaloneStateRoot` and rejects any different explicit path. |
-| `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant and numeric-PGID-reuse risks. |
+| `WithHostAuthority` | Route all managed native environment, tree, start, wait, and revoke work through the supplied authority. |
+| `WithScratchDir` | Parent for a generated shared runtime root and transient adapter material; empty uses the system temp directory. |
+| `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
-| `WithEnv` | Agent-wide ordinary-variable overrides. With explicit isolation they overlay `ProcessIsolation.BaseEnvironment`; otherwise they overlay the environment captured when the agent was constructed. Managed XDG/config/database roots retain adapter precedence. |
-| `WithSeedFiles` | Immutable files written into the shared config root before launch. |
+| `WithEnv` | Agent-wide ordinary-variable overlays. Managed OpenCode/XDG roots remain adapter-owned. |
+| `WithSeedFiles` | Immutable files materialized in the shared config root before launch. |
+| `WithPluginSeedDir` | Cache of the OpenCode plugin install copied into new runtime roots; empty uses `plugin-seed` under the user cache directory. |
+| `WithPluginSeed` | Enable or disable the plugin install cache; enabled by default. |
 | `WithSessionStore` | Host-provided persistence backend. |
-| `WithSessionStoreLoadTimeout` | Bound each store read during hydration (default `10s`). |
-| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions; routine cancellation remains scoped to the addressed native session. |
-| `WithTurnTimeout` | Per-turn deadline; `0` (default) disables it. |
-| `WithImageLimits` | Decoded-byte bounds for prompt and emitted image content (`ImageLimits`); each field defaults to 6 MiB, `0` disables that policy limit, and a negative value is rejected at construction. |
-| `WithInputHandoffRoot` | Absolute directory a prompt image may be read from in the handoff input form. Read-only, unset by default, and a relative value is rejected at construction. |
-| `WithProviderAuthRoot` | Absolute durable directory holding the values-free provider-auth ledger. Unset — or set without `WithHome` — leaves every `_opencode/auth/*` method unadvertised. |
-| `WithProviderAuthDirectHome` | Declared for configuration symmetry; a set value is rejected at session start with the uniform unsupported error. |
-| `WithRuntimeResourceHooks` | Worker-global native-root and scratch-root permit hooks; a non-nil hook must return a non-nil release function. |
+| `WithSessionStoreLoadTimeout` | Bound each store read during hydration; default `10s`. |
+| `WithConcurrencyLimits` | Cap concurrent client calls and active sessions. |
+| `WithTurnTimeout` | Per-turn deadline; `0` disables it. |
+| `WithImageLimits` | Decoded-byte bounds for prompt and emitted images. |
+| `WithInputHandoffRoot` | Absolute read root for digest-verified local image handoff. |
+| `WithProviderAuthRoot` | Durable values-free provider-auth ledger root for ordinary execution. |
+| `WithProviderAuthDirectHome` | Declared for host configuration symmetry; OpenCode rejects a configured value as unsupported. |
 | `WithAgentName` / `WithAgentTitle` / `WithAgentVersion` | Identity in the initialize response. |
 | `WithLogger` | `*slog.Logger` for adapter diagnostics. |
 | `WithTracerProvider` / `WithMeterProvider` / `WithTextMapPropagator` | OpenTelemetry wiring. |
 
-`ProcessIsolation.IdentityLock` and `ProcessIsolation.AuthorityDomain`
-optionally accept opaque host capabilities with `Duplicate() (*os.File, error)`
-for the already-held canonical UID lock and shared `domain.lock` lease. Each
-capability keeps ownership of its original descriptor; caller-owned duplicates
-reach only the trusted supervisor, which validates the named inodes, held locks,
-and strict matching domain record and protects them with checked `FD_CLOEXEC`.
-Set both fields together for
-host-borrowed authority or leave both nil for standalone domain, permanent
-provider-owner binding, retained `ACTIVE`, and UID-lock acquisition. A
-mixed nil/non-nil pair fails closed. Borrowed authority rejects owned UIDs. Native
-processes receive neither capability nor descriptor.
+Provider auth is advertised only when `WithProviderAuthRoot` and `WithHome` are
+both configured in ordinary mode. Supplying `WithHostAuthority` withholds the
+entire provider-auth surface, regardless of those options.
 
-For an explicit policy, `ProcessIsolation.StandaloneOwnerID` and
-`ProcessIsolation.StandaloneStateRoot` are required when both capabilities
-are nil and forbidden when both are set. The owner ID is the nonsecret
-case-sensitive deployment identity: 1--256 canonical ASCII bytes beginning
-alphanumeric, followed only by alphanumerics or `._:@/-`. The state root is
-the existing dedicated durable provider home, neither `/` nor equal to or
-beneath `/var/lib/acp-go/agent-identities`, expressed as a clean absolute UTF-8 path of
-at most 4096 bytes with no control character. Linux resolves it from `/`
-without symlinks or magic links, requires protected root-owned ancestry and an
-exact configured UID:GID mode-`0700` final directory, and binds the exact
-path, device, and inode. The protected path and metadata are revalidated
-immediately before `ACTIVE` publication and native launch. Standalone claims
-are permanent; changing either value does not migrate authority and fails
-closed. Standalone `WithHome` defaults to this exact state root and any
-different explicit home fails construction validation.
+`ImageLimits` has four decoded-byte fields. Input fields bound each image and
+the prompt aggregate; output fields bound each emitted image and tool-call
+aggregate. Every field defaults to 6 MiB, and `0` disables that policy limit.
+Transport-frame limits still clamp output. Input supports static PNG, JPEG,
+GIF, and WebP. Effective input bounds are advertised during initialize.
 
-`ImageLimits` has four decoded-byte fields: `MaxInputBytesPerImage` and
-`MaxInputBytesPerPrompt` bound prompt images before a turn starts;
-`MaxOutputBytesPerImage` and `MaxOutputBytesPerToolCall` bound emitted image
-content. Every field defaults to 6 MiB. A `0` field disables that policy limit,
-but the output bounds are additionally clamped to the ACP transport frame limit
-(7,864,155 decoded bytes), which a larger configured value cannot exceed. The
-input allowlist is exactly `image/png`, `image/jpeg`, `image/gif`, and
-`image/webp`, static frames only; animated members are rejected before the turn.
-Both input bounds are advertised at initialize, so a host can pre-check a prompt
-against the exact numbers the gates enforce.
+`WithInputHandoffRoot` enables digest-verified `file://` image input beneath an
+absolute read root. The adapter never writes, moves, or deletes beneath it.
+Leaving it unset rejects the handoff form.
 
-`WithInputHandoffRoot` enables the handoff input form described in
-[Prompt Streaming](/docs/core/prompt-streaming). It is a read root: the adapter
-resolves a prompt image's `file://` URI beneath it, verifies the declared
-digest, and reads the bytes, and it never writes, moves, or deletes anything
-there. It materializes nothing and therefore carries no scratch semantics, and
-it is independent of `WithScratchDir`. Files beneath it belong to the host,
-which may delete one the moment the prompt call returns. Leaving it unset
-rejects every handoff-form block with `invalid_handoff`.
+`WithSeedFiles` maps relative config paths to bytes materialized before server
+start. A seeded `opencode.json` is merged with the adapter's `$schema` and must
+not contain `permission` or `mcp`, which remain session and directory scoped.
+Absolute paths, parent escapes, and empty keys are rejected.
 
-`WithProviderAuthRoot` turns on the brokered provider-login surface described
-in [Authentication](/docs/features/authentication). It is durable adapter-owned
-bookkeeping rather than ephemeral materialization, so it is independent of
-`WithScratchDir` and is never a scratch parent, and it carries no config or
-auth-resolution semantics. The adapter creates it `0700` when missing and
-writes ledger entries `0600`; a root it cannot create, that is not a directory,
-or that is not writable leaves the surface unadvertised exactly as an unset one
-does.
-
-`RuntimeResourceHooks` also carries `ObserveProcess`,
-`ObserveProcessSnapshot`, `ObserveStartupStage`, and `ObserveContainment`.
-`Agent.ContainmentMode` returns `authoritative`, `shared_identity`,
-`best_effort`, or `unavailable`. Omission reports `shared_identity` on every
-platform where the native launch works, root or not; it is a posture rather
-than an achievement, so no provider-descendant inventory and no whole-tree
-quiescence are published for it. `ObserveProcessSnapshot` is withheld for the
-whole Agent lifetime in every mode except `authoritative`, terminal zero
-included. An explicit policy reports `authoritative` on Linux and `unavailable`
-wherever it cannot be honored; it never reports `shared_identity`.
-OpenCode reports its two
-actual home-lock supervisors only after native readiness and removes them when
-the supervisor waiter observes exit; it never derives that count from root
-permits. Absolute provider-descendant snapshots are emitted only when the
-containment backend is authoritative; Darwin best-effort suppresses snapshots,
-including fabricated zeroes. Startup observations distinguish
-`spawn`, `readiness`, `configuration`, and native `session` creation and carry
-the stage error. The session-carrier proof closes the `readiness` stage rather
-than reporting one of its own: a runtime whose carrier plugin never loaded is
-not ready.
-
-Cancellation, timeout, and turn-failure settlement use a 20-second adapter
-budget around a base-runtime shutdown whose internal containment proof is
-bounded to 15 seconds. Every waiter for a runtime generation receives the same
-memoized result; a scope client cannot shut down the base runtime.
+`WithPluginSeedDir` names the cache of the npm tree OpenCode installs for its
+plugin loader. The adapter copies a cached tree into each new runtime root
+before launch so OpenCode skips the install. When the cache has no entry for
+the running binary, a priming launch fills it first: a throwaway runtime under
+the scratch parent that performs the install, serves no session, and is torn
+down and harvested before the runtime itself starts. Under `WithHostAuthority`
+the priming launch is prepared, started, and reclaimed through the same
+authority, and its tree is read only after reclaim. See the
+[CLI reference](/docs/reference/cli#plugin-seed-cache) for the layout and
+[Security](/docs/operations/security) for the trust boundary.
 
 ### OpenCode process options
 
@@ -141,84 +131,48 @@ memoized result; a scope client cannot shut down the base runtime.
 | `WithOpenCodeLogLevel` | Native server log level. | native default |
 | `WithOpenCodeHealthCheckTimeout` | Server readiness timeout. | `60s` |
 
-`WithSeedFiles` maps relative paths to file contents written into the shared
-OpenCode config root (`<XDG_CONFIG_HOME>/opencode/`) before the server starts.
-A seeded `opencode.json` must not contain `permission` or `mcp`; those values
-belong to native sessions and directory scopes. Every other seeded file is
-written verbatim. Absolute paths, `..` escapes, and empty keys are rejected.
-With a process-isolated durable home, only `opencode.json` is accepted and its
-merged content is delivered directly to the native process; the adapter never
-writes beneath the target-owned XDG root.
-See
-[Models and config](/docs/features/models-config) for a seeded `provider`
-example.
-
 ## Session request builders
 
-Client-side helpers build ACP requests with the adapter's `_meta.opencode`
-vocabulary already populated:
+Client-side helpers populate the adapter's `_meta.opencode` vocabulary:
 
 | Builder | Builds |
 |---|---|
-| `NewSessionRequest` | `session/new` request. |
+| `NewSessionRequest` | `session/new`. |
 | `LoadSessionRequest` / `ResumeSessionRequest` | `session/load` / `session/resume`. |
-| `ForkSessionRequest` / `CallForkSession` | `_opencode/session/fork` request and call helper. |
-| `ListSessionsRequest` (with `WithListSessionsCwd` / `-Cursor` / `-Meta`) | `session/list`. |
-| `NewTurnNonce` | Generate a cryptographically random turn identity. |
+| `ForkSessionRequest` / `CallForkSession` | `_opencode/session/fork`. |
+| `ListSessionsRequest` with its list options | `session/list`. |
+| `NewTurnNonce` | A cryptographically random turn identity. |
 | `PromptRequest` / `TextPromptRequest` | `session/prompt` with a required turn nonce. |
-| `CancelRequest` | `session/cancel` for the same required turn nonce. |
+| `CancelRequest` | `session/cancel` for the active turn nonce. |
 | `SetConfigOptionRequest` / `SetModelRequest` | `session/set_config_option`. |
 | `StdioMCPServer` / `HTTPMCPServer` | MCP server definitions. |
 
-Two exported sentinels classify a native-runtime failure.
-`ErrProcessContainmentIncomplete` means the selected containment boundary did
-not complete, so the runtime stays quarantined.
-`ErrRuntimeLockUnsupported` means the platform has no advisory-lock primitive
-for the runtime home's single-writer fence: construction fails with it rather
-than proceeding unlocked, and it is distinct from a lock another process is
-holding — that one is worth retrying and this one never is.
+Prompt and cancel builders stamp a route only for a non-empty turn nonce of at
+most 4096 bytes. Reserved `acp-go.dev/*` metadata keys cannot be supplied by
+`WithSessionMeta` or `WithListSessionsMeta`.
 
-`PromptRequest`, `TextPromptRequest`, and `CancelRequest` stamp route metadata
-only for a non-empty `turnNonce` of at most 4096 bytes. An invalid nonce leaves
-the request without a route envelope, so the adapter rejects it rather than
-sending an invalid or unbounded route.
+Session options include `WithSessionMCPServers`,
+`WithSessionAdditionalDirectories`, `WithSessionMeta`,
+`WithSessionOutputSchema`, `WithSessionRawEvents`, and
+`WithSessionOpenCodeOptions`.
 
-Session-scoped request options include `WithSessionMCPServers`,
-`WithSessionAdditionalDirectories`, `WithSessionMeta`, `WithSessionOutputSchema`,
-`WithSessionRawEvents`, and `WithSessionOpenCodeOptions`.
+`OpenCodeOptions` is built with `NewOpenCodeOptions` plus model, output-schema,
+mode, permission, environment, and extra-path options. Session environment and
+extra path directories are scoped to the addressed native session rather than
+the shared server. `PATH` and managed runtime roots are refused in session
+environment. Ordered extra paths persist across load, resume, recovery, and
+fork; environment is supplied again on reload instead of storing bearer values.
 
-`WithSessionMeta` and `WithListSessionsMeta` take host-supplied metadata. A
-caller key naming a reserved `acp-go.dev/*` literal — `route`, `mediaEnvelope`,
-`handoff`, or `lifecycle` — is refused rather than merged or overwritten: those
-values are minted by the adapter on the surfaces that carry them, so a collision
-is a defect in the calling code and the builder panics rather than putting an
-unvalidated reserved value on the wire.
-
-`OpenCodeOptions` (built with `NewOpenCodeOptions` and `WithOpenCodeModel`,
-`WithOpenCodeOutputSchema`, `WithOpenCodeMode`,
-`WithOpenCodePermission`, `WithOpenCodeEnv`, and `WithOpenCodeExtraPathDirs`)
-render into `_meta.opencode.options` via its `Meta` method.
-
-`WithOpenCodeEnv` sets the environment that native session's shell tools run
-under, and `WithOpenCodeExtraPathDirs` places absolute directories ahead of the
-`PATH` those tools resolve against. Both are session-local: two live sessions of
-one Agent hold different values, and a restored session rebinds to the values
-its request supplies. The directories remain ordered and durable across load,
-resume, recovery, and fork; the environment follows the same rules except that
-it is not written to the session store, so a reloaded session supplies it again.
-`WithOpenCodeEnv` refuses `PATH` in any casing along with managed OpenCode and
-XDG roots. Use `WithEnv` for static environment configuration shared by the
-Agent's native server.
+`ErrRuntimeLockUnsupported` means the platform cannot provide the runtime
+home's advisory single-writer fence. Construction fails rather than continuing
+unlocked.
 
 ## Session store
 
-`SessionStore` is the persistence interface; `NewInMemorySessionStore` is the
-default implementation. Rows use `SessionStoreFormat`
-(`opencode-sync-events-v1`)
-constant. See [Session store](/docs/features/session-store).
+`SessionStore` is the persistence interface and `NewInMemorySessionStore` is
+the default implementation. Rows use `SessionStoreFormat`
+(`opencode-sync-events-v1`). See [Session store](/docs/features/session-store).
 
-`InspectSessionStoreTerminalState` validates the committed
-`SessionStoreEntry` set for a logical ACP session and returns
-`SessionStoreTerminalState`, whose `MessageID` is the snapshot's latest
-finished assistant message. This is the durable terminal identity for
-host-side turn checkpoint reconciliation.
+`InspectSessionStoreTerminalState` validates the committed entries for a
+logical ACP session and returns the latest durable terminal assistant message
+identity for host checkpoint reconciliation.

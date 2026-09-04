@@ -3518,10 +3518,6 @@ func TestAcceptedTurnOutlivingItsCallerReadsTheEvidenceItAlreadyHas(t *testing.T
 	current.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	type promptResult struct {
-		response acp.PromptResponse
-		err      error
-	}
 	done := make(chan promptResult, 1)
 
 	go func() {
@@ -3898,4 +3894,106 @@ func TestCorrectionPromptDispatchAndEmissionFailureBranches(t *testing.T) {
 	emitFailure.emittedUsage = map[string]emittedUsageState{}
 	err = emitFailure.emitUsageUpdate(context.Background(), "assistant", opencode.NativeTokens{Input: 1}, 10)
 	require.Error(t, err)
+}
+
+// TestCommandCompletionWaitsForTheAssistantIdentity pins the settlement order of
+// a completion-reporting route. The native command response ends the run and is
+// terminal, but the assistant identity the turn settles on arrives over the
+// ordered stream on another connection. A response that lands first must let the
+// stream catch up rather than read a turn it has not described yet.
+func TestCommandCompletionWaitsForTheAssistantIdentity(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
+	current := testSession(t, NewAgent(), client)
+
+	answered := make(chan string, 1)
+	client.dispatchCommand = func(_ context.Context, id string, _ opencode.CommandRequest) (opencode.NativeMessage, error) {
+		answered <- id
+
+		// An empty message answers the frame without publishing any assistant
+		// identity: the run is over on the native side, the stream has not said so.
+		return opencode.NativeMessage{}, nil
+	}
+
+	done := make(chan promptResult, 1)
+
+	go func() {
+		response, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "/review now"))
+		done <- promptResult{response: response, err: err}
+	}()
+
+	nativeID := <-answered
+
+	select {
+	case result := <-done:
+		t.Fatalf("the turn settled before the stream named its assistant: %#v / %v", result.response, result.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	client.completeTurnWith(nativeID, opencode.NativeMessage{Info: opencode.NativeMessageInfo{
+		ID: "assistant-after-response", SessionID: nativeID, Role: roleAssistant, Finish: "stop",
+	}})
+
+	result := <-done
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonEndTurn, result.response.StopReason)
+}
+
+// TestAwaitAssistantEvidenceReleasesOnEveryBound proves the settling wait is
+// bounded on every side, so a completion whose stream never names an assistant
+// fails on the missing identity instead of holding the turn open.
+func TestAwaitAssistantEvidenceReleasesOnEveryBound(t *testing.T) {
+	original := promptCompletionEvidenceWait
+	t.Cleanup(func() { promptCompletionEvidenceWait = original })
+
+	current := &session{}
+
+	t.Run("a cycle that already holds a step waits for nothing", func(t *testing.T) {
+		promptCompletionEvidenceWait = time.Hour
+		current.awaitAssistantEvidence(context.Background(), &foregroundCycle{
+			assistantIDs:      map[string]struct{}{"assistant-1": {}},
+			assistantEvidence: make(chan struct{}),
+		})
+	})
+
+	t.Run("a cycle carrying no evidence channel waits for nothing", func(t *testing.T) {
+		promptCompletionEvidenceWait = time.Hour
+		current.awaitAssistantEvidence(context.Background(), &foregroundCycle{})
+	})
+
+	t.Run("the adopted step releases the wait", func(t *testing.T) {
+		promptCompletionEvidenceWait = time.Hour
+		cycle := &foregroundCycle{assistantEvidence: make(chan struct{}), signal: make(chan struct{})}
+
+		go func() {
+			current.lifecycleMu.Lock()
+			cycle.adoptAssistant(opencode.NativeMessageInfo{ID: "assistant-1"})
+			current.lifecycleMu.Unlock()
+		}()
+
+		current.awaitAssistantEvidence(context.Background(), cycle)
+	})
+
+	t.Run("terminal evidence releases the wait", func(t *testing.T) {
+		promptCompletionEvidenceWait = time.Hour
+		cycle := &foregroundCycle{assistantEvidence: make(chan struct{}), signal: make(chan struct{})}
+		close(cycle.signal)
+		current.awaitAssistantEvidence(context.Background(), cycle)
+	})
+
+	t.Run("a dead turn releases the wait", func(t *testing.T) {
+		promptCompletionEvidenceWait = time.Hour
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		current.awaitAssistantEvidence(ctx, &foregroundCycle{
+			assistantEvidence: make(chan struct{}), signal: make(chan struct{}),
+		})
+	})
+
+	t.Run("the bound releases the wait", func(t *testing.T) {
+		promptCompletionEvidenceWait = time.Millisecond
+		current.awaitAssistantEvidence(context.Background(), &foregroundCycle{
+			assistantEvidence: make(chan struct{}), signal: make(chan struct{}),
+		})
+	})
 }

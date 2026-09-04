@@ -35,36 +35,49 @@ var (
 
 // Agent exposes OpenCode through ACP.
 type Agent struct {
-	options         Options
-	log             *slog.Logger
-	observe         *observer.Observer
-	optionsErr      error
-	containmentMode RuntimeContainmentMode
-	providerAuth    *providerAuth
+	options      Options
+	log          *slog.Logger
+	observe      *observer.Observer
+	optionsErr   error
+	providerAuth *providerAuth
 
-	mu                       sync.Mutex
-	closed                   bool
-	conn                     agentClient
-	closeDone                chan struct{}
-	closeErr                 error
-	sessions                 map[acp.SessionId]*session
-	deleted                  map[acp.SessionId]struct{}
-	clientCalls              chan struct{}
-	clientCapabilities       acp.ClientCapabilities
-	positionEncoding         acp.PositionEncodingKind
-	lifecycle                lifecycle.Negotiated
-	runtime                  opencode.Client
-	runtimeGeneration        uint64
-	runtimeStarting          chan struct{}
-	runtimeStartErr          error
-	runtimeFatalErr          error
-	runtimeNativeRelease     func()
-	runtimeXDGScratchRelease func()
-	runtimeRetirements       map[uint64]*runtimeRetirement
-	directories              map[string]directoryBinding
-	directoryIncarnation     directoryBindingIncarnation
-	fingerprintKey           [32]byte
-	restoreMu                sync.Mutex
+	mu                   sync.Mutex
+	closed               bool
+	conn                 agentClient
+	closeDone            chan struct{}
+	closeErr             error
+	sessions             map[acp.SessionId]*session
+	deleted              map[acp.SessionId]struct{}
+	clientCalls          chan struct{}
+	clientCapabilities   acp.ClientCapabilities
+	positionEncoding     acp.PositionEncodingKind
+	lifecycle            lifecycle.Negotiated
+	runtime              opencode.Client
+	runtimeGeneration    uint64
+	runtimeStarting      chan struct{}
+	runtimeStartErr      error
+	runtimeFatalErr      error
+	runtimeRetirements   map[uint64]*runtimeRetirement
+	runtimeSequencing    *runtimeRetirement
+	directories          map[string]directoryBinding
+	directoryIncarnation directoryBindingIncarnation
+	fingerprintKey       [32]byte
+	restoreMu            sync.Mutex
+	nativeAdmissionMu    sync.Mutex
+	lifecycleAdmissionMu sync.Mutex
+	lifecycleFence       chan struct{}
+	lifecycleFenced      bool
+	lifecycleFlights     map[acp.SessionId]*sessionLifecycleFlight
+	// sessionReplacementTimeout bounds how long an active replacement may wait
+	// to enter its predecessor's recovery/close gate. Once admitted, the close
+	// ladder owns its existing detached per-rung bounds.
+	sessionReplacementTimeout time.Duration
+	retiredNativeTrees        map[string]retiredNativeTree
+}
+
+type retiredNativeTree struct {
+	reclaimed bool
+	cleanup   func() error
 }
 
 type directoryBinding struct {
@@ -81,10 +94,12 @@ var (
 
 func NewAgent(opts ...Option) *Agent {
 	options := applyOptions(opts)
-	homeErr := normalizeStandaloneHome(&options)
 	limits, optionsErr := normalizeConcurrencyLimits(options.ConcurrencyLimits)
-	optionsErr = errors.Join(optionsErr, homeErr)
-	optionsErr = errors.Join(optionsErr, validateContainmentOptions(options))
+
+	optionsErr = errors.Join(optionsErr, validateRuntimeOptions(options))
+	if options.hostAuthorityConfigured && options.HostAuthority == nil {
+		optionsErr = errors.Join(optionsErr, ErrHostAuthorityUnavailable)
+	}
 
 	options.ConcurrencyLimits = limits
 
@@ -115,39 +130,19 @@ func NewAgent(opts ...Option) *Agent {
 		TracerProvider: options.TracerProvider,
 		Version:        options.AgentVersion,
 	})
-	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe)
-
-	mode := containmentMode(options)
-	if options.RuntimeResourceHooks.ObserveContainment != nil {
-		options.RuntimeResourceHooks.ObserveContainment(context.Background(), mode)
-	}
-
-	// Only the authoritative backend can enumerate the provider descendants it
-	// contains. Ordinary same-identity execution and Darwin best effort both
-	// know the count they would report is not the count that exists, and a
-	// terminal zero from either would read as a quiescence proof neither one
-	// performed, so the snapshot hook is withheld for the Agent's whole life.
-	if mode != RuntimeContainmentAuthoritative {
-		options.RuntimeResourceHooks.ObserveProcessSnapshot = nil
-	}
-
-	if mode == RuntimeContainmentBestEffort {
-		log.Warn("Darwin best-effort process containment is enabled; escaped descendants may survive, numeric PGID reuse can cause collateral signalling, marker correlation is not ownership, markers can be scrubbed, and native-root permits do not bound escaped provider work",
-			slog.String("containment", string(mode)),
-		)
-	}
 
 	agent := &Agent{
-		options:            options,
-		log:                log,
-		optionsErr:         optionsErr,
-		containmentMode:    mode,
-		observe:            observe,
-		sessions:           make(map[acp.SessionId]*session),
-		deleted:            make(map[acp.SessionId]struct{}),
-		directories:        make(map[string]directoryBinding),
-		runtimeRetirements: make(map[uint64]*runtimeRetirement),
-		clientCalls:        make(chan struct{}, limits.MaxConcurrentClientCalls),
+		options:                   options,
+		log:                       log,
+		optionsErr:                optionsErr,
+		observe:                   observe,
+		sessions:                  make(map[acp.SessionId]*session),
+		deleted:                   make(map[acp.SessionId]struct{}),
+		directories:               make(map[string]directoryBinding),
+		runtimeRetirements:        make(map[uint64]*runtimeRetirement),
+		retiredNativeTrees:        make(map[string]retiredNativeTree),
+		clientCalls:               make(chan struct{}, limits.MaxConcurrentClientCalls),
+		sessionReplacementTimeout: settlementTimeout,
 	}
 	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
 		agent.optionsErr = errors.Join(agent.optionsErr, fmt.Errorf("create runtime fingerprint key: %w", err))
@@ -156,15 +151,6 @@ func NewAgent(opts ...Option) *Agent {
 	agent.providerAuth = newProviderAuth(agent)
 
 	return agent
-}
-
-// ContainmentMode reports the effective native process boundary.
-func (a *Agent) ContainmentMode() RuntimeContainmentMode {
-	if a == nil {
-		return RuntimeContainmentUnavailable
-	}
-
-	return a.containmentMode
 }
 
 func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) (serveErr error) {
@@ -207,6 +193,8 @@ func (a *Agent) connection() agentClient {
 }
 
 func (a *Agent) Close() error {
+	a.fenceSessionLifecycle()
+
 	a.mu.Lock()
 	if a.closeDone != nil {
 		done := a.closeDone
@@ -230,6 +218,7 @@ func (a *Agent) Close() error {
 	runtime := a.runtime
 	generation := a.runtimeGeneration
 	waiting := a.runtimeStarting
+	sequencing := a.runtimeSequencing
 
 	stickyRuntimeErr := a.runtimeFatalErr
 	if !fatalRuntimeCleanup(stickyRuntimeErr) {
@@ -258,9 +247,15 @@ func (a *Agent) Close() error {
 
 	a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
 
-	if runtime != nil {
+	switch {
+	case runtime != nil:
 		err = errors.Join(err, a.retireSharedRuntime(generation, "shared OpenCode runtime retired while closing agent"))
-	} else if waiting != nil {
+	case sequencing != nil:
+		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+		err = errors.Join(err, a.retryRuntimeCleanup(ctx, sequencing))
+
+		cancel()
+	case waiting != nil:
 		<-waiting
 		a.mu.Lock()
 		retirement := a.runtimeRetirements[generation]
@@ -275,6 +270,15 @@ func (a *Agent) Close() error {
 		if fatalRuntimeCleanup(startErr) {
 			err = errors.Join(err, startErr)
 		}
+	}
+
+	if a.options.hostAuthorityConfigured {
+		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+
+		a.nativeAdmissionMu.Lock()
+		err = errors.Join(err, a.retryRetiredNativeTrees(ctx))
+		a.nativeAdmissionMu.Unlock()
+		cancel()
 	}
 
 	a.interruptConnection()
@@ -331,7 +335,7 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 		},
 		"elicitation": map[string]any{
 			"unstable":     true,
-			jsonFieldScope: string(RuntimeResourceSession),
+			jsonFieldScope: string(lifecycle.CauseSession),
 			"tracks":       "ACP v1 elicitation",
 		},
 		rawEventCapabilityKey: map[string]any{
@@ -341,13 +345,13 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 			"defaultEnabled": false,
 		},
 		"sessionStore": map[string]any{
-			"format":     SessionStoreFormat,
-			jsonFieldKey: []string{jsonFieldSessionID, "subpath"},
+			jsonFieldFormat: SessionStoreFormat,
+			jsonFieldKey:    []string{jsonFieldSessionID, "subpath"},
 		},
 		structuredOutputMetaKey: map[string]any{
-			"config": outputSchemaOptionPath,
-			"result": structuredOutputPath,
-			"schema": opencode.OutputFormatJSONSchema,
+			"config":        outputSchemaOptionPath,
+			"result":        structuredOutputPath,
+			jsonFieldSchema: opencode.OutputFormatJSONSchema,
 		},
 	}
 
@@ -357,14 +361,14 @@ func (a *Agent) Initialize(_ context.Context, params acp.InitializeRequest) (acp
 
 	capabilityMeta := map[string]any{
 		opencodeMetaKey:  opencodeMeta,
-		routeEnvelopeKey: map[string]any{metaFieldVersions: []int{routeEnvelopeVersion}},
+		routeEnvelopeKey: map[string]any{metaFieldVersion: routeEnvelopeVersion},
 		mediaEnvelopeKey: a.options.mediaEnvelope(),
 	}
 
 	// The handoff advertisement answers whether the host's read root reached
 	// this adapter, so it is present only when one is configured.
 	if a.options.InputHandoffRoot != "" {
-		capabilityMeta[handoffEnvelopeKey] = map[string]any{metaFieldVersions: []int{handoffEnvelopeVersion}}
+		capabilityMeta[handoffEnvelopeKey] = map[string]any{metaFieldVersion: handoffEnvelopeVersion}
 	}
 
 	return acp.InitializeResponse{
@@ -493,7 +497,10 @@ func (a *Agent) ensureOpen() error {
 // The data carries only the joined prose because no wire field is at fault to
 // name, and that text is all an operator has to find the bad option.
 func (a *Agent) optionsError() error {
-	return acp.NewInternalError(map[string]any{jsonFieldError: a.optionsErr.Error()})
+	return errors.Join(
+		a.optionsErr,
+		acp.NewInternalError(map[string]any{jsonFieldError: a.optionsErr.Error()}),
+	)
 }
 
 func (a *Agent) sessionStore() SessionStore {
@@ -560,7 +567,7 @@ func (a *Agent) storeStartedSession(session *session) error {
 	}
 
 	if a.runtime == nil {
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: "shared OpenCode runtime exited"})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueSharedRuntimeExited})
 	}
 
 	if session.runtimeGeneration != a.runtimeGeneration {

@@ -21,10 +21,12 @@ type sessionCarrierPayload struct {
 }
 
 type sessionCarrierBroker struct {
-	server   *http.Server
-	listener net.Listener
-	endpoint string
-	token    string
+	server    *http.Server
+	listener  net.Listener
+	endpoint  string
+	token     string
+	ready     chan struct{}
+	readyOnce sync.Once
 
 	mu        sync.RWMutex
 	carriers  map[string]sessionCarrierPayload
@@ -50,6 +52,7 @@ func startSessionCarrierBroker() (*sessionCarrierBroker, error) {
 		listener: listener,
 		endpoint: "http://" + listener.Addr().String(),
 		token:    token,
+		ready:    make(chan struct{}),
 		carriers: map[string]sessionCarrierPayload{},
 	}
 	broker.server = &http.Server{
@@ -112,15 +115,28 @@ func (b *sessionCarrierBroker) serveHTTP(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	authorization, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || subtle.ConstantTimeCompare([]byte(authorization), []byte(b.token)) != 1 {
+		w.WriteHeader(http.StatusUnauthorized)
 
 		return
 	}
 
-	authorization, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !ok || subtle.ConstantTimeCompare([]byte(authorization), []byte(b.token)) != 1 {
-		w.WriteHeader(http.StatusUnauthorized)
+	if r.URL.Path == "/ready" {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+
+			return
+		}
+
+		b.readyOnce.Do(func() { close(b.ready) })
+		w.WriteHeader(http.StatusNoContent)
+
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 
 		return
 	}

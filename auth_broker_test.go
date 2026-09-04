@@ -21,7 +21,6 @@ func restoreBrokerSeams(t *testing.T) {
 	authBrokerRemoveBackoff = time.Millisecond
 
 	t.Cleanup(func() {
-		brokerReapHomes = opencode.ReapAbandonedHomes
 		brokerMkdirTemp = os.MkdirTemp
 		brokerChmod = os.Chmod
 		brokerCreateXDG = opencode.CreateRuntimeXDGDirs
@@ -64,19 +63,11 @@ func TestStartBrokerCreatesAPrefixedHomeUnderTheScratchParent(t *testing.T) {
 	agent, broker := harness.agent, harness.broker
 	node := withBrokerFactory(t, agent)
 
-	reaped := ""
 	restoreBrokerSeams(t)
-
-	brokerReapHomes = func(parent string, prefix string) error {
-		reaped = parent + "|" + prefix
-
-		return nil
-	}
 
 	created, err := broker.startBroker(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, agent.options.ScratchDir+"|"+authBrokerPrefix, reaped)
-	require.Equal(t, filepath.Dir(created.home), agent.options.ScratchDir)
+	require.Equal(t, filepath.Dir(created.home), agent.scratchParent())
 	require.True(t, strings.HasPrefix(filepath.Base(created.home), authBrokerPrefix))
 	require.Equal(t, opencode.Client(node), created.client)
 	require.DirExists(t, created.home)
@@ -84,20 +75,6 @@ func TestStartBrokerCreatesAPrefixedHomeUnderTheScratchParent(t *testing.T) {
 	created.destroy(context.Background())
 	require.NoDirExists(t, created.home)
 	require.True(t, node.closed)
-}
-
-func TestStartBrokerContinuesWhenReapFails(t *testing.T) {
-	harness := newAuthAgent(t)
-	agent, broker := harness.agent, harness.broker
-	withBrokerFactory(t, agent)
-	restoreBrokerSeams(t)
-
-	brokerReapHomes = func(string, string) error { return errors.New("scan") }
-
-	created, err := broker.startBroker(context.Background())
-	require.NoError(t, err)
-
-	created.destroy(context.Background())
 }
 
 func TestStartBrokerFailures(t *testing.T) {
@@ -113,7 +90,7 @@ func TestStartBrokerFailures(t *testing.T) {
 			file := filepath.Join(t.TempDir(), "not-a-dir")
 			require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
 
-			agent.options.ScratchDir = file
+			WithScratchDir(file)(&agent.options)
 		}},
 		{name: "home creation", setup: func(_ *testing.T, _ *Agent) {
 			brokerMkdirTemp = func(string, string) (string, error) { return "", failure }
@@ -153,6 +130,7 @@ func TestStartBrokerFallsBackToTheDefaultFactory(t *testing.T) {
 	harness := newAuthAgent(t)
 	agent, broker := harness.agent, harness.broker
 	restoreBrokerSeams(t)
+	neutralizeBrowserShimWhereUnsupported(t)
 
 	agent.options.clientFactory = nil
 
@@ -232,40 +210,8 @@ func TestDestroyToleratesANilBroker(t *testing.T) {
 	broker.destroy(context.Background())
 }
 
-func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testing.T) {
-	harness := newAuthAgent(t)
-	agent, broker := harness.agent, harness.broker
-	restoreBrokerSeams(t)
-
-	node := newFakeOpenCodeClient()
-
-	var handed opencode.StartOptions
-
-	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		handed = options
-
-		return node, nil
-	}
-
-	created, err := broker.startBroker(context.Background())
-	require.NoError(t, err)
-	require.NotNil(t, handed.BrowserShim)
-	require.Same(t, created.shim, handed.BrowserShim)
-	require.Equal(t, filepath.Join(created.home, "control"), handed.ControlRoot)
-	require.Equal(t, created.home, handed.LeaseDir)
-	require.Nil(t, handed.ProcessIsolation)
-	require.NotNil(t, handed.ImplicitEnvironment)
-	require.Equal(t, agent.options.ScratchDir, filepath.Dir(handed.BrowserShim.Dir()))
-	require.True(t, strings.HasPrefix(filepath.Base(handed.BrowserShim.Dir()), "acp-go-opencode-browser-shim-"))
-	require.FileExists(t, filepath.Join(handed.BrowserShim.Dir(), "open"))
-
-	created.destroy(context.Background())
-	require.NoDirExists(t, handed.BrowserShim.Dir())
-}
-
 // TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment proves the
-// login runtime is built the same way the session runtime is: ordinary
-// execution with no policy, from the ambient snapshot the Agent captured once,
+// login runtime is built as ordinary execution from the ambient snapshot the Agent captured once,
 // with the adapter-private carriers and every adapter-managed OpenCode root
 // already scrubbed. The broker is the second consumer of that snapshot, so a
 // scrub that only happened at the session launch would leak here.
@@ -276,8 +222,6 @@ func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testi
 	)
 
 	t.Setenv(privateCanary, "leaked")
-	t.Setenv(opencode.DarwinRuntimeIDEnv, "leaked")
-	t.Setenv(opencode.DarwinScratchRootEnv, "/leaked")
 	t.Setenv("OPENCODE_DB", "/leaked/opencode.db")
 	t.Setenv("OPENCODE_CONFIG_DIR", "/leaked/config")
 	t.Setenv(ambientCanary, "kept")
@@ -285,6 +229,7 @@ func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testi
 	harness := newAuthAgent(t)
 	agent, broker := harness.agent, harness.broker
 	restoreBrokerSeams(t)
+	neutralizeBrowserShimWhereUnsupported(t)
 
 	var handed opencode.StartOptions
 
@@ -298,12 +243,11 @@ func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testi
 	require.NoError(t, err)
 	t.Cleanup(func() { created.destroy(context.Background()) })
 
-	require.Nil(t, handed.ProcessIsolation, "the broker runtime is ordinary execution, never a manufactured policy")
-	require.NotContains(t, handed.ImplicitEnvironment, privateCanary)
-	require.NotContains(t, handed.ImplicitEnvironment, strings.ToLower(privateCanary))
-	require.NotContains(t, handed.ImplicitEnvironment, opencode.DarwinRuntimeIDEnv)
-	require.NotContains(t, handed.ImplicitEnvironment, opencode.DarwinScratchRootEnv)
-	require.Equal(t, "kept", handed.ImplicitEnvironment[ambientCanary],
+	require.Nil(t, handed.StartProcess, "the broker runtime uses the ordinary launcher")
+	environment := handed.NativeEnvironment()
+	require.NotContains(t, environment, privateCanary)
+	require.NotContains(t, environment, strings.ToLower(privateCanary))
+	require.Equal(t, "kept", environment[ambientCanary],
 		"only the private namespace is dropped, not the whole prefix")
 
 	// The managed OpenCode roots are dropped where the native environment is
@@ -311,50 +255,4 @@ func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testi
 	// is the broker inheriting a caller override of one.
 	require.NotContains(t, handed.Env, "OPENCODE_DB")
 	require.NotContains(t, handed.Env, "OPENCODE_CONFIG_DIR")
-}
-
-func TestDestroyReportsBrowserShimRemovalFailure(t *testing.T) {
-	restoreBrokerSeams(t)
-
-	shim, err := opencode.NewBrowserShim(t.TempDir())
-	require.NoError(t, err)
-
-	// A 0500 parent does not deny a privileged identity, so the removal failure
-	// is injected instead of provoked, and the shim survives destruction.
-	broker := &authBroker{
-		home: t.TempDir(), shim: shim, client: newFakeOpenCodeClient(), log: slog.New(slog.DiscardHandler),
-		removeShim: func() error { return errors.New("remove shim") },
-	}
-	broker.destroy(context.Background())
-
-	require.DirExists(t, shim.Dir())
-}
-
-func TestStartBrokerReservesOneContainmentScratchRoot(t *testing.T) {
-	harness := newAuthAgent(t)
-	agent, broker := harness.agent, harness.broker
-	restoreBrokerSeams(t)
-
-	reserved := make(chan RuntimeResourceKind, 1)
-	agent.options.RuntimeResourceHooks.ReserveScratchRoot = func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
-		reserved <- kind
-
-		return func() {}, nil
-	}
-
-	node := newFakeOpenCodeClient()
-	agent.options.clientFactory = func(ctx context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		release, err := options.ReserveContainmentScratch(ctx)
-		require.NoError(t, err)
-
-		release()
-
-		return node, nil
-	}
-
-	created, err := broker.startBroker(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, RuntimeResourceDiscovery, <-reserved)
-
-	created.destroy(context.Background())
 }

@@ -3,10 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"os"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -14,7 +11,6 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 
-	"github.com/savid/acp-go-opencode/internal/homelock"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -46,7 +42,7 @@ func TestOutputSchemaInvalidRejected(t *testing.T) {
 func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient()
-	client.closeErr = errors.Join(errors.New("close failed"), opencode.ErrProcessContainmentIncomplete)
+	client.closeErr = errors.Join(errors.New("close failed"), ErrContainmentIncomplete)
 	agent := NewAgent()
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
@@ -55,8 +51,7 @@ func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	newAgentForServe = func(...Option) *Agent { return agent }
 	t.Cleanup(func() { newAgentForServe = oldNewAgent })
 	err := Serve(ctx, strings.NewReader(""), io.Discard)
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
-	require.ErrorIs(t, ErrProcessContainmentIncomplete, opencode.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 
 	oldMarshal := agentJSONMarshal
 	oldUnmarshal := agentJSONUnmarshal
@@ -222,75 +217,6 @@ func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
 	require.Equal(t, map[string]string{"key": "value"}, cloneAny(map[string]string{"key": "value"}))
 }
 
-// TestExplicitProcessIsolationPreservesPolicy proves a supplied policy reaches
-// the runtime exactly as written — no field dropped, no shared base map a later
-// caller could mutate — and that a policy this platform cannot honor refuses
-// the session instead of starting a runtime without it. The second half is the
-// no-fallback rule: the launch seam is failed if it is ever reached.
-func TestExplicitProcessIsolationPreservesPolicy(t *testing.T) {
-	base := map[string]string{"CANARY": "base", "PATH": "/usr/bin:/bin"}
-	policy := ProcessIsolation{
-		UID: 65534, GID: 65534, BaseEnvironment: base,
-		StandaloneOwnerID: "deployment-1", StandaloneStateRoot: "/var/lib/opencode",
-	}
-
-	converted := openCodeProcessIsolation(&policy)
-	base["CANARY"] = "mutated"
-
-	require.NotNil(t, converted)
-	require.Equal(t, uint32(65534), converted.UID)
-	require.Equal(t, uint32(65534), converted.GID)
-	require.Equal(t, "base", converted.BaseEnvironment["CANARY"])
-	require.Equal(t, "deployment-1", converted.StandaloneOwnerID)
-	require.Equal(t, "/var/lib/opencode", converted.StandaloneStateRoot)
-	require.Nil(t, openCodeProcessIsolation(nil), "nil isolation did not remain nil")
-
-	originalGOOS := runtimeGOOS
-	t.Cleanup(func() { runtimeGOOS = originalGOOS })
-
-	// The honored half needs the real platform, not a faked one: adapter-owned
-	// native state is handed to the configured identity through a build-tagged
-	// ownership boundary that a GOOS variable cannot move.
-	if runtime.GOOS == platformLinux {
-		requireExplicitPolicyReachesTheRuntime(t, policy)
-	}
-
-	runtimeGOOS = platformDarwin
-
-	refused := NewAgent(WithHome("/var/lib/opencode"), WithProcessIsolation(policy), WithScratchDir(t.TempDir()))
-	refused.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-		t.Fatal("an unavailable explicit policy must never start a runtime without it")
-
-		return nil, errors.New("unreachable")
-	}
-	_, err := refused.NewSession(t.Context(), acp.NewSessionRequest{Cwd: t.TempDir()})
-	require.ErrorContains(t, err, "explicit process isolation is supported only on linux")
-}
-
-func requireExplicitPolicyReachesTheRuntime(t *testing.T, policy ProcessIsolation) {
-	t.Helper()
-
-	runtimeGOOS = platformLinux
-	home := testNativeOwnedHome(t)
-	require.NoError(t, os.Chown(home, int(policy.UID), int(policy.GID)))
-	policy.StandaloneStateRoot = home
-
-	var launched *opencode.ProcessIsolation
-
-	honored := NewAgent(WithHome(home), WithProcessIsolation(policy), WithScratchDir(t.TempDir()))
-	honored.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		launched = options.ProcessIsolation
-
-		return nil, errors.New("native launch refused by the fixture")
-	}
-	_, err := honored.NewSession(t.Context(), acp.NewSessionRequest{Cwd: t.TempDir()})
-	require.ErrorContains(t, err, "native launch refused by the fixture")
-	require.NotNil(t, launched, "an honored policy must reach the runtime")
-	require.Equal(t, uint32(65534), launched.UID)
-	require.Equal(t, "deployment-1", launched.StandaloneOwnerID)
-	require.Equal(t, home, launched.StandaloneStateRoot)
-}
-
 // TestAgentCloseRunsTheDurableRungAWireCloseOwes proves the durable rung travels
 // with the ladder. An embedded shutdown closes each session through the same
 // committing boundary a wire `session/close` runs, so state the session took on
@@ -339,35 +265,4 @@ func TestAgentCloseRunsTheDurableRungAWireCloseOwes(t *testing.T) {
 
 	require.Equal(t, "plan", stored(t).Session.Model.Agent,
 		"the embedded shutdown dropped state a wire close would have committed")
-}
-
-// TestRuntimeConstructionFailsWithThePublicUnsupportedLockSentinel proves the
-// platform gate reaches a host through the exported name. A runtime home nobody
-// can claim exclusively is not a lock somebody else is holding: the second is
-// worth retrying and the first never is, so the refusal has to be classifiable
-// rather than a message to match, and it has to be classifiable from outside
-// this module.
-func TestRuntimeConstructionFailsWithThePublicUnsupportedLockSentinel(t *testing.T) {
-	require.ErrorIs(t, ErrRuntimeLockUnsupported, homelock.ErrRuntimeLockUnsupported)
-
-	originalStart := runtimeStartServer
-	runtimeStartServer = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
-		return nil, fmt.Errorf("claim OpenCode writable home: %w", homelock.ErrRuntimeLockUnsupported)
-	}
-
-	t.Cleanup(func() { runtimeStartServer = originalStart })
-
-	agent := NewAgent(WithHome(t.TempDir()))
-	agent.options.clientFactory = nil
-
-	runtime, nativeRelease, scratchRelease, err := agent.startSharedRuntime(context.Background())
-	require.ErrorIs(t, err, ErrRuntimeLockUnsupported,
-		"an unsupported platform failed construction with something a host cannot classify")
-	require.Nil(t, runtime)
-	require.Nil(t, nativeRelease)
-	require.Nil(t, scratchRelease)
-
-	_, err = agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
-	require.ErrorIs(t, err, ErrRuntimeLockUnsupported,
-		"the public session surface hid the construction refusal")
 }
