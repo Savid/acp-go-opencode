@@ -10,6 +10,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// requireDirectoryFlushOutcome states what a failing directory-flush seam does
+// to the write that published a file. Windows cannot flush a directory handle
+// opened through os.Open, so the flush is a documented no-op there and never
+// opens the directory at all: the seam is unreachable and the write succeeds.
+func requireDirectoryFlushOutcome(t *testing.T, err error, _ string) {
+	t.Helper()
+	require.NoError(t, err)
+}
+
 // requireOwnerOnlyMode states what Windows has instead of the POSIX bits. There
 // is no mode to narrow here: Go synthesises 0777 for every directory and 0666
 // for every writable file whatever the ACL says, so a chmod to 0700 records
