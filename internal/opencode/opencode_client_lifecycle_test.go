@@ -2286,13 +2286,30 @@ func runFakeOpenCodeServerProcess() {
 	}
 }
 
+// publishFakeSessionCarrierProof performs the startup proof the generated
+// plugin makes on its first load: one authorized POST to the broker's ready
+// route, using the endpoint and bearer token the runtime wrote into the module.
 func publishFakeSessionCarrierProof(source string) {
-	path, pathOK := fakePluginConstant(source, "PROOF_PATH")
-	token, tokenOK := fakePluginConstant(source, "PROOF_TOKEN")
+	endpoint, endpointOK := fakePluginConstant(source, "BROKER_ENDPOINT")
+	token, tokenOK := fakePluginConstant(source, "BROKER_TOKEN")
 
-	if pathOK && tokenOK {
-		_ = os.WriteFile(path, []byte(token), 0o600)
+	if !endpointOK || !tokenOK {
+		return
 	}
+
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint+"/ready", nil)
+	if err != nil {
+		return
+	}
+
+	request.Header.Set("Authorization", "Bearer "+token)
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return
+	}
+
+	_ = response.Body.Close()
 }
 
 // instantiateFakeSessionCarrierPlugin does for the fake native process what a
