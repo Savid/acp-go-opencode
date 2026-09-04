@@ -80,6 +80,23 @@ supplied, the entire `_opencode/auth/*` capability is absent and every method is
 unavailable. The standalone command and ordinary embedded mode retain the
 brokered surface when its durable home and ledger root are configured.
 
+### Session carrier bootstrap
+
+The generated carrier module names the in-memory broker and carries its bearer
+token as a literal. That token reads any session's carrier payload, which holds
+the session environment and its operation directories, and every native shell
+operation runs as the invoking user. The adapter therefore erases the module as
+soon as OpenCode proves it loaded, before the runtime is handed to any session.
+A runtime whose module cannot be erased is torn down rather than served.
+OpenCode resolves the module once and serves later directory scopes from its
+own module cache, so the erase costs the runtime nothing.
+
+Under `WithHostAuthority` the runtime root belongs to the host from
+`PrepareNativeTree` until `ReclaimNativeTree`, so the adapter makes no
+filesystem access beneath it and the module remains for the runtime's life
+inside that tree. A managed host that wants the same guarantee should treat the
+prepared tree as holding a live credential.
+
 ## Session and handoff boundaries
 
 Native session IDs, canonical directory scopes, and turn nonces bind every

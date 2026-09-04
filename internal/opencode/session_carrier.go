@@ -299,7 +299,30 @@ var (
 	sessionCarrierMkdirTemp = os.MkdirTemp
 	sessionCarrierMkdirAll  = os.MkdirAll
 	sessionCarrierWriteFile = os.WriteFile
+	sessionCarrierRemove    = os.Remove
 )
+
+// eraseSessionCarrierBootstrap removes the generated module once OpenCode has
+// proven it loaded.
+//
+// The module names the broker endpoint and carries its bearer token as a
+// literal, and that token reads any session's carrier payload — the session
+// environment and its operation directories. Every native shell operation runs
+// as this user and can read the runtime root, so a module left on disk hands
+// one session the authorization to read its neighbour's secrets. OpenCode
+// resolves the module once and serves every later directory scope from its own
+// module cache, so erasing it after the load proof costs the runtime nothing.
+func eraseSessionCarrierBootstrap(plugin sessionCarrierPlugin) error {
+	if plugin.Path == "" {
+		return nil
+	}
+
+	if err := sessionCarrierRemove(plugin.Path); err != nil {
+		return fmt.Errorf("erase OpenCode session carrier bootstrap: %w", err)
+	}
+
+	return nil
+}
 
 func materializeSessionCarrierPlugin(runtimeRoot string) (sessionCarrierPlugin, error) {
 	root, err := sessionCarrierMkdirTemp(runtimeRoot, ".session-carrier-")

@@ -28,11 +28,11 @@ func preserveSessionCarrierSeams(t *testing.T) {
 	t.Helper()
 	mkdirTemp, mkdirAll := sessionCarrierMkdirTemp, sessionCarrierMkdirAll
 	writeFile, randReader := sessionCarrierWriteFile, openCodeRandReader
-	listen := sessionCarrierListen
+	listen, remove := sessionCarrierListen, sessionCarrierRemove
 	t.Cleanup(func() {
 		sessionCarrierMkdirTemp, sessionCarrierMkdirAll = mkdirTemp, mkdirAll
 		sessionCarrierWriteFile, openCodeRandReader = writeFile, randReader
-		sessionCarrierListen = listen
+		sessionCarrierListen, sessionCarrierRemove = listen, remove
 	})
 }
 
@@ -1177,4 +1177,78 @@ func tryCarrierWrapper(t *testing.T, wrapper string, cwd string, env []string, a
 	output, err := cmd.CombinedOutput()
 
 	return string(output), err
+}
+
+// TestEraseSessionCarrierBootstrapRemovesTheTokenBearingModule proves the
+// generated module does not outlive its load. It names the broker endpoint and
+// carries its bearer token as a literal, and that token reads any session's
+// carrier payload, so a module left in the runtime root would hand one
+// session's shell the authorization to read its neighbour's environment.
+func TestEraseSessionCarrierBootstrapRemovesTheTokenBearingModule(t *testing.T) {
+	preserveSessionCarrierSeams(t)
+
+	path, source, plugin := materializedCarrier(t)
+	require.Contains(t, source, plugin.Broker.token, "the fixture must carry the token this erase exists to remove")
+	require.FileExists(t, path)
+
+	require.NoError(t, eraseSessionCarrierBootstrap(plugin))
+	require.NoFileExists(t, path)
+
+	// The probe directory and the shell wrapper are not authorization and stay.
+	require.DirExists(t, plugin.Proof.Directory)
+
+	// A carrier that was never materialized has no bootstrap to erase.
+	require.NoError(t, eraseSessionCarrierBootstrap(sessionCarrierPlugin{}))
+
+	want := errors.New("module is pinned")
+	sessionCarrierRemove = func(string) error { return want }
+	require.ErrorIs(t, eraseSessionCarrierBootstrap(plugin), want)
+}
+
+// TestStartServerRefusesARuntimeWhoseBootstrapSurvives proves the erase is
+// fail-closed: a runtime that reached readiness but could not have its
+// token-bearing module removed is torn down rather than handed to a session.
+func TestStartServerRefusesARuntimeWhoseBootstrapSurvives(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+	preserveSessionCarrierSeams(t)
+
+	want := errors.New("module is pinned")
+	sessionCarrierRemove = func(string) error { return want }
+
+	_, err := StartServer(t.Context(), StartOptions{
+		Root:            t.TempDir(),
+		ExecutablePath:  fakeOpenCodeExecutable(t),
+		MinVersion:      "1.18.3",
+		HealthTimeout:   5 * time.Second,
+		SkipVersionGate: false,
+	})
+	require.ErrorIs(t, err, want)
+}
+
+// TestStartServerLeavesAPreparedTreesBootstrapAlone proves the erase respects
+// tree ownership: under host authority the runtime root belongs to the host
+// from preparation until reclaim, so the adapter does not write into it.
+func TestStartServerLeavesAPreparedTreesBootstrapAlone(t *testing.T) {
+	restoreOpenCodeClientSeams(t)
+	preserveSessionCarrierSeams(t)
+
+	erased := false
+	sessionCarrierRemove = func(string) error {
+		erased = true
+
+		return nil
+	}
+
+	client, err := StartServer(t.Context(), StartOptions{
+		Root:            t.TempDir(),
+		ExecutablePath:  fakeOpenCodeExecutable(t),
+		HealthTimeout:   5 * time.Second,
+		SkipVersionGate: true,
+		PrepareTree:     func(context.Context, string) error { return nil },
+		ReclaimTree:     func(context.Context, string) error { return nil },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Shutdown(context.Background()) })
+
+	require.False(t, erased, "a prepared tree is not this adapter's to write")
 }

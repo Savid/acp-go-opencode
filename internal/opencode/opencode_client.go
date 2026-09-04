@@ -1141,6 +1141,15 @@ func StartServer(ctx context.Context, options StartOptions) (_ Client, resultErr
 		if carrierErr != nil {
 			return nil, settleFailedServerStart(server, options.RetainTree, carrierErr)
 		}
+
+		// A prepared tree is the host's until it is reclaimed, so the module can
+		// only be erased where this adapter still owns the runtime root. Under
+		// host authority the bootstrap stays for the runtime's life.
+		if options.PrepareTree == nil {
+			if eraseErr := eraseSessionCarrierBootstrap(sessionCarrier); eraseErr != nil {
+				return nil, settleFailedServerStart(server, options.RetainTree, eraseErr)
+			}
+		}
 	}
 
 	return server, nil
