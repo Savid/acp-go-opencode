@@ -35,8 +35,6 @@ const (
 	authProviderAzure       = "azure"
 	authProviderCopilot     = "github-copilot"
 	authProviderGitLab      = "gitlab"
-	authProviderOpenAI      = "openai"
-	authProviderXAI         = "xai"
 	authPromptKeyAccount    = "account"
 	authPromptKeyEnterprise = "enterpriseUrl"
 	authPromptKeyInstance   = "instanceUrl"
@@ -126,24 +124,31 @@ type authHostFormingRule struct {
 	Domains []string
 }
 
-// authLoopbackMethods names every native login method whose completion lands on
-// a loopback listener the harness opens inside the broker home, keyed by
-// provider and by the native method label that identifies it.
-//
-// Such a method is omitted from the catalog rather than refused at authorize,
-// because the harness opens that listener while it mints and the refusal can
-// only run on the answer. OpenAI's binds the wildcard address rather than
-// loopback, exposing a port on every interface of the worker host; GitLab's
-// binds a fixed port and, in the same call, execs the platform browser launcher
-// at the authorization URL, which only the broker's own shim then stops; xAI's
-// binds its registered fixed loopback address before returning. The one place
-// the adapter can hold the broker's bind-loopback-only property is before the
-// native call exists to make. Each entry is a per-provider constant recorded in
-// the family registry, on the same terms as the host-forming allowlists below.
-var authLoopbackMethods = map[string]map[string]struct{}{
-	authProviderOpenAI: {"ChatGPT Pro/Plus (browser)": {}},
-	authProviderGitLab: {"GitLab OAuth": {}},
-	authProviderXAI:    {"xAI Grok OAuth (SuperGrok Subscription)": {}},
+// authReviewedOAuthMethods is the catalog's OAuth allowlist, keyed by provider
+// id and native method label: the reviewed registry in internal/opencode
+// projected to a lookup. The registry documents what an entry certifies. A
+// native OAuth method with no entry is omitted rather than refused at
+// authorize, because a method that binds a callback listener while it mints
+// has already bound it by the time the adapter sees the answer; the one place
+// the broker's no-listener property can be held is before the native call
+// exists to make. authLoopbackHost stays as the check on the minted answer,
+// for a reviewed method whose native flow drifts under its label.
+var authReviewedOAuthMethods = reviewedOAuthMethodSet(opencode.ReviewedOAuthMethods())
+
+func reviewedOAuthMethodSet(registry map[string][]string) map[string]map[string]struct{} {
+	set := make(map[string]map[string]struct{}, len(registry))
+
+	for providerID, labels := range registry {
+		entries := make(map[string]struct{}, len(labels))
+
+		for _, label := range labels {
+			entries[label] = struct{}{}
+		}
+
+		set[providerID] = entries
+	}
+
+	return set
 }
 
 // authHostFormingRules names every native prompt whose value is interpolated
@@ -284,8 +289,10 @@ func buildProviderMethods(
 			continue
 		}
 
-		if _, loopback := authLoopbackMethods[providerID][method.Label]; loopback {
-			continue
+		if method.Type == authMethodTypeOAuth {
+			if _, reviewed := authReviewedOAuthMethods[providerID][method.Label]; !reviewed {
+				continue
+			}
 		}
 
 		prompts, ok, err := buildAuthPrompts(providerID, method.Prompts)

@@ -43,7 +43,7 @@ func newAuthFixture(t *testing.T) *authFixture {
 	}
 	runtime.providerAuthMethods = map[string][]opencode.ProviderAuthMethod{
 		"xai": {
-			{Type: authMethodTypeOAuth, Label: "xAI Grok OAuth"},
+			{Type: authMethodTypeOAuth, Label: "SuperGrok Subscription"},
 			{Type: authMethodTypeAPI, Label: "Manually enter API Key"},
 		},
 	}
@@ -649,7 +649,7 @@ func TestAuthorizeNativeFailures(t *testing.T) {
 func TestAuthorizeCarriesValidatedInputsIntoTheNativeMint(t *testing.T) {
 	fixture := newAuthFixture(t)
 	fixture.runtime.providerAuthMethods = map[string][]opencode.ProviderAuthMethod{
-		"xai": {{Type: authMethodTypeOAuth, Label: "xAI", Prompts: []opencode.ProviderAuthPrompt{
+		"xai": {{Type: authMethodTypeOAuth, Label: "SuperGrok Subscription", Prompts: []opencode.ProviderAuthPrompt{
 			{Type: "text", Key: "note", Message: "Note"},
 		}}},
 	}

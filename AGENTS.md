@@ -135,6 +135,8 @@ Unless explicitly requested, ask before:
 - Changing the permission or question/elicitation flow shape.
 - Adding new ACP extension methods or `_meta` fields.
 - Changing the `opencode-sync-events-v1` session-store contract.
+- Admitting a native OAuth login method to the reviewed registry in
+  `internal/opencode`.
 - Changing shared XDG ownership or the native process launch and teardown
   behavior.
 

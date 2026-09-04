@@ -20,6 +20,11 @@ const (
 	browserCanaryScratch = "/canary/scratch"
 	browserCanaryNative  = "/usr/local/bin/opencode"
 	browserCanaryState   = "/var/lib/acp-go-opencode-browser-canary"
+
+	// browserCanaryMethodLabel is the native Snowflake browser method in the
+	// pinned release. Its mint execs the platform browser launcher and returns
+	// a loopback completion variant, which is what the canary traces.
+	browserCanaryMethodLabel = "Login with Snowflake (External Browser)"
 )
 
 func TestRealNativeBrowserLaunchIsNeutralized(t *testing.T) {
@@ -27,6 +32,12 @@ func TestRealNativeBrowserLaunchIsNeutralized(t *testing.T) {
 		t.Fatal("real-native browser canary was selected without its required execution gate")
 	}
 	require.FileExists(t, browserCanaryNative)
+
+	// The reviewed registry publishes no browser method, so the canary admits
+	// the pinned one itself. The proof is about what lies past the catalog: a
+	// real browser launch resolves inside the production shim, and the broker
+	// still refuses the loopback completion variant and cleans up.
+	admitOAuthMethodForTest(t, authProviderSnowflake, browserCanaryMethodLabel)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
@@ -101,6 +112,35 @@ func TestRealNativeBrowserLaunchIsNeutralized(t *testing.T) {
 		matches, globErr := filepath.Glob(filepath.Join(browserCanaryScratch, "acp-go-opencode-browser-shim-*"))
 		return globErr == nil && len(matches) == 0
 	}, 15*time.Second, 25*time.Millisecond, "terminal provider-auth rejection left its browser shim behind")
+}
+
+// admitOAuthMethodForTest publishes one native OAuth method for the duration
+// of the test, so a flow past the catalog can be driven against a method the
+// reviewed registry does not carry. The canary is the only caller and runs
+// alone in its container, so the package-level lookup is safe to edit.
+func admitOAuthMethodForTest(t *testing.T, providerID, label string) {
+	t.Helper()
+
+	entries, existed := authReviewedOAuthMethods[providerID]
+	if !existed {
+		entries = map[string]struct{}{}
+		authReviewedOAuthMethods[providerID] = entries
+	}
+
+	_, admitted := entries[label]
+	entries[label] = struct{}{}
+
+	t.Cleanup(func() {
+		if admitted {
+			return
+		}
+
+		delete(entries, label)
+
+		if !existed {
+			delete(authReviewedOAuthMethods, providerID)
+		}
+	})
 }
 
 func browserCanaryParams(t *testing.T, value map[string]any) json.RawMessage {

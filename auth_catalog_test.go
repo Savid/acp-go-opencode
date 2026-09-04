@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -25,10 +26,13 @@ func TestMethodsMergesTheCatalogWithSpecialMethods(t *testing.T) {
 	}
 	client.providerAuthMethods = map[string][]opencode.ProviderAuthMethod{
 		"xai": {
-			nativeOAuthMethod("xAI Grok OAuth"),
+			nativeOAuthMethod("SuperGrok Subscription"),
 			{Type: authMethodTypeAPI, Label: "Manually enter API Key"},
 		},
-		"special-only": {nativeOAuthMethod("Special")},
+		"special-only": {
+			nativeOAuthMethod("Special"),
+			{Type: authMethodTypeAPI, Label: "Special key"},
+		},
 	}
 
 	result, err := broker.methods(context.Background(), mustJSON(t, map[string]any{authFieldSessionID: string(session.id)}))
@@ -39,7 +43,7 @@ func TestMethodsMergesTheCatalogWithSpecialMethods(t *testing.T) {
 	require.NotEmpty(t, methods.Generation)
 
 	require.Equal(t, []authMethodEntry{
-		{ID: "0", Type: authMethodTypeOAuth, Label: "xAI Grok OAuth"},
+		{ID: "0", Type: authMethodTypeOAuth, Label: "SuperGrok Subscription"},
 		{ID: "1", Type: authMethodTypeAPI, Label: "Manually enter API Key"},
 	}, methods.Providers["xai"])
 
@@ -47,8 +51,10 @@ func TestMethodsMergesTheCatalogWithSpecialMethods(t *testing.T) {
 		{ID: authDefaultAPIMethodID, Type: authMethodTypeAPI, Label: "DeepSeek"},
 	}, methods.Providers["deepseek"])
 
+	// A provider absent from the model catalog still merges in; its unreviewed
+	// OAuth method is omitted without renumbering the API-key method.
 	require.Equal(t, []authMethodEntry{
-		{ID: "0", Type: authMethodTypeOAuth, Label: "Special"},
+		{ID: "1", Type: authMethodTypeAPI, Label: "Special key"},
 	}, methods.Providers["special-only"])
 
 	require.NotContains(t, methods.Providers, "")
@@ -88,7 +94,7 @@ func TestMethodsFailures(t *testing.T) {
 	client.providerAuthMethodsErr = nil
 	client.providerCatalog = []opencode.ProviderCatalogEntry{{ID: "xai", Name: "xAI"}}
 	client.providerAuthMethods = map[string][]opencode.ProviderAuthMethod{
-		"xai": {{Type: authMethodTypeOAuth, Label: "ok", Prompts: []opencode.ProviderAuthPrompt{{Type: "text", Message: "m"}}}},
+		"xai": {{Type: authMethodTypeAPI, Label: "ok", Prompts: []opencode.ProviderAuthPrompt{{Type: "text", Message: "m"}}}},
 	}
 
 	_, err = broker.methods(context.Background(), params)
@@ -120,13 +126,14 @@ func TestMethodsFailsWhenTheRuntimeIsGone(t *testing.T) {
 func TestBuildProviderMethodsOmitsUnpublishableEntries(t *testing.T) {
 	methods, published, err := buildProviderMethods("xai", []opencode.ProviderAuthMethod{
 		{Type: "wellknown", Label: "unsupported variant"},
-		{Type: authMethodTypeOAuth, Label: strings.Repeat("a", authMaxLabelBytes+1)},
-		{Type: authMethodTypeOAuth, Label: "kept"},
+		{Type: authMethodTypeAPI, Label: strings.Repeat("a", authMaxLabelBytes+1)},
+		{Type: authMethodTypeOAuth, Label: "unreviewed"},
+		{Type: authMethodTypeAPI, Label: "kept"},
 	}, false)
 	require.NoError(t, err)
 	require.Len(t, methods, 1)
-	require.Equal(t, "2", methods[0].ID)
-	require.Equal(t, 2, methods[0].Index)
+	require.Equal(t, "3", methods[0].ID)
+	require.Equal(t, 3, methods[0].Index)
 	require.Len(t, published, 1)
 }
 
@@ -169,8 +176,9 @@ func gitlabNativeMethods() []opencode.ProviderAuthMethod {
 // methods, so nothing about `when` reaches gitlab; the fixed vendor host is
 // still an allowlist entry the prompt can have, which is what keeps the
 // token method addressable instead of dropping the provider outright. The
-// OAuth method goes for the other reason entirely: its callback lands on a
-// listener the harness binds on the worker host while it mints.
+// OAuth method goes for the other reason entirely: it has no reviewed entry,
+// and can have none, because its native mint binds a fixed loopback port and
+// execs the platform browser launcher before it returns.
 func TestBuildAuthCatalogPublishesGitLabAgainstItsVendorHost(t *testing.T) {
 	methods, entries, err := buildAuthCatalog(
 		[]opencode.ProviderCatalogEntry{{ID: authProviderGitLab, Name: "GitLab"}},
@@ -248,11 +256,13 @@ func TestBuildAuthCatalogKeepsAMethodWhoseUnallowlistedPromptIsGated(t *testing.
 	}), authFieldInputs+".enterpriseUrl")
 }
 
-// TestBuildAuthCatalogOmitsLoopbackCompletingMethods pins the one place the
-// adapter can hold the broker's bind-loopback-only property. The harness opens
-// its wildcard callback listener while it mints, so a method refused after the
-// mint has already exposed a port on every interface of the worker host.
-func TestBuildAuthCatalogOmitsLoopbackCompletingMethods(t *testing.T) {
+// TestBuildAuthCatalogPublishesOnlyReviewedOAuthMethods pins the one place the
+// adapter can hold the broker's no-listener property, on OpenAI's native
+// split. The browser method opens its wildcard callback listener while it
+// mints, so refusing it after the mint would already have exposed a port on
+// every interface of the worker host; the headless method is reviewed and
+// stays, under the native slot the omitted method left behind.
+func TestBuildAuthCatalogPublishesOnlyReviewedOAuthMethods(t *testing.T) {
 	methods, entries, err := buildAuthCatalog(
 		[]opencode.ProviderCatalogEntry{{ID: "openai", Name: "OpenAI"}},
 		map[string][]opencode.ProviderAuthMethod{"openai": {
@@ -273,27 +283,96 @@ func TestBuildAuthCatalogOmitsLoopbackCompletingMethods(t *testing.T) {
 	require.Equal(t, 2, methods["openai"][1].Index)
 }
 
-// TestBuildAuthCatalogOmitsXAILoopbackMethod pins OpenCode 1.18.5's xAI
-// method split. The browser method opens 127.0.0.1:56121 while it mints, but
-// the headless method uses an RFC 8628 device flow and opens no callback
-// listener. Omitting the first native slot must not renumber the other two.
-func TestBuildAuthCatalogOmitsXAILoopbackMethod(t *testing.T) {
-	methods, entries, err := buildAuthCatalog(
-		[]opencode.ProviderCatalogEntry{{ID: authProviderXAI, Name: "xAI"}},
-		map[string][]opencode.ProviderAuthMethod{authProviderXAI: {
-			nativeOAuthMethod("xAI Grok OAuth (SuperGrok Subscription)"),
-			nativeOAuthMethod("xAI Grok OAuth (Headless / Remote / VPS)"),
-			{Type: authMethodTypeAPI, Label: "Manually enter API Key"},
-		}},
-	)
-	require.NoError(t, err)
-	require.Equal(t, []authMethodEntry{
-		{ID: "1", Type: authMethodTypeOAuth, Label: "xAI Grok OAuth (Headless / Remote / VPS)"},
-		{ID: "2", Type: authMethodTypeAPI, Label: "Manually enter API Key"},
-	}, entries[authProviderXAI])
+// TestBuildAuthCatalogFailsClosedOnUnreviewedOAuthMethods drives the allowlist
+// with native method arrays as OpenCode 1.18.27 publishes them. A method with
+// no reviewed entry is omitted without renumbering its neighbours, a reviewed
+// label upstream renames is omitted the same way, and a provider left with no
+// publishable method loses its catalog entry.
+func TestBuildAuthCatalogFailsClosedOnUnreviewedOAuthMethods(t *testing.T) {
+	apiKey := opencode.ProviderAuthMethod{Type: authMethodTypeAPI, Label: "Manually enter API Key"}
 
-	require.Equal(t, 1, methods[authProviderXAI][0].Index)
-	require.Equal(t, 2, methods[authProviderXAI][1].Index)
+	cases := []struct {
+		name       string
+		providerID string
+		native     []opencode.ProviderAuthMethod
+		want       []authMethodEntry
+	}{
+		{
+			name:       "reviewed device flow is published",
+			providerID: "xai",
+			native:     []opencode.ProviderAuthMethod{nativeOAuthMethod("SuperGrok Subscription"), apiKey},
+			want: []authMethodEntry{
+				{ID: "0", Type: authMethodTypeOAuth, Label: "SuperGrok Subscription"},
+				{ID: "1", Type: authMethodTypeAPI, Label: "Manually enter API Key"},
+			},
+		},
+		{
+			name:       "renamed reviewed label is omitted",
+			providerID: "xai",
+			native:     []opencode.ProviderAuthMethod{nativeOAuthMethod("xAI Grok OAuth (SuperGrok Subscription)"), apiKey},
+			want:       []authMethodEntry{{ID: "1", Type: authMethodTypeAPI, Label: "Manually enter API Key"}},
+		},
+		{
+			name:       "ephemeral loopback listener is omitted",
+			providerID: "poe",
+			native:     []opencode.ProviderAuthMethod{nativeOAuthMethod("Login with Poe (browser)"), apiKey},
+			want:       []authMethodEntry{{ID: "1", Type: authMethodTypeAPI, Label: "Manually enter API Key"}},
+		},
+		{
+			name:       "wildcard listener is omitted",
+			providerID: "digitalocean",
+			native: []opencode.ProviderAuthMethod{
+				nativeOAuthMethod("Login with DigitalOcean"),
+				{Type: authMethodTypeAPI, Label: "Paste Model Access Key"},
+			},
+			want: []authMethodEntry{{ID: "1", Type: authMethodTypeAPI, Label: "Paste Model Access Key"}},
+		},
+		{
+			name:       "provider with only an unreviewed method is dropped",
+			providerID: "special-only",
+			native:     []opencode.ProviderAuthMethod{nativeOAuthMethod("Special")},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			methods, entries, err := buildAuthCatalog(
+				[]opencode.ProviderCatalogEntry{{ID: testCase.providerID, Name: "Provider"}},
+				map[string][]opencode.ProviderAuthMethod{testCase.providerID: testCase.native},
+			)
+			require.NoError(t, err)
+
+			if testCase.want == nil {
+				require.NotContains(t, entries, testCase.providerID)
+				require.NotContains(t, methods, testCase.providerID)
+
+				return
+			}
+
+			require.Equal(t, testCase.want, entries[testCase.providerID])
+
+			// Published ids stay the native array indices, so every surviving
+			// method still addresses its own native slot.
+			for index, entry := range entries[testCase.providerID] {
+				require.Equal(t, entry.ID, strconv.Itoa(methods[testCase.providerID][index].Index))
+			}
+		})
+	}
+}
+
+// TestAuthReviewedOAuthMethodsMirrorsTheRegistry pins the lookup the catalog
+// consults to the registry it is projected from.
+func TestAuthReviewedOAuthMethodsMirrorsTheRegistry(t *testing.T) {
+	registry := opencode.ReviewedOAuthMethods()
+	require.Len(t, authReviewedOAuthMethods, len(registry))
+
+	for providerID, labels := range registry {
+		require.Len(t, authReviewedOAuthMethods[providerID], len(labels))
+
+		for _, label := range labels {
+			require.Contains(t, authReviewedOAuthMethods[providerID], label)
+		}
+	}
 }
 
 func TestBuildAuthCatalogPropagatesPromptDrift(t *testing.T) {
@@ -301,7 +380,7 @@ func TestBuildAuthCatalogPropagatesPromptDrift(t *testing.T) {
 		[]opencode.ProviderCatalogEntry{{ID: "xai", Name: "xAI"}},
 		map[string][]opencode.ProviderAuthMethod{"xai": {{
 			Type:    authMethodTypeOAuth,
-			Label:   "xAI",
+			Label:   "SuperGrok Subscription",
 			Prompts: []opencode.ProviderAuthPrompt{{Type: "text", Key: "a", Message: "m"}, {Type: "text", Key: "a", Message: "m"}},
 		}}},
 	)

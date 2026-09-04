@@ -83,10 +83,14 @@ home for the gate to authorize.
    provider list with its special login methods; a provider with no special
    method receives one synthesized API-key method under the reserved id
    `default-api`. A method id is a native array index, so it is meaningful only
-   inside the generation that produced it. A method whose native login completes
-   on a loopback callback listener is omitted: OpenCode opens that listener on
-   the wildcard address while it mints, so the only place the adapter can hold
-   the broker's loopback-only bind is before the native call exists to make.
+   inside the generation that produced it. A native OAuth method is published
+   only when the adapter's reviewed registry carries its provider and label; a
+   provider OpenCode adds, or a method it renames, stays unpublished until
+   someone has read its plugin. An entry certifies that the native mint opens no
+   callback listener and execs no browser launcher before it returns: OpenCode
+   binds such a listener while it mints, so the only place the adapter can hold
+   the broker's no-listener property is before the native call exists to make.
+   API-key methods need no entry.
 2. `_opencode/auth/authorize` starts one flow per `(sessionId, providerId)`. It
    carries the `methodsGeneration` token, a caller-minted `authorizeRequestId`
    idempotency key, and the answers to the method's prompts. A repeat of the

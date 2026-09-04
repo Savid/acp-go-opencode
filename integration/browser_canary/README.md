@@ -7,7 +7,10 @@ inside the production-generated shim. The runtime container has no GUI,
 credentials, host mounts, network, or supplied host authority.
 
 In this pinned release the Snowflake method launches its authorization URL and
-then returns a loopback completion variant. The production broker rejects that
+then returns a loopback completion variant. The production catalog publishes no
+such method, because its reviewed registry admits only OAuth flows that open
+nothing while they mint, so the canary admits the Snowflake method through an
+in-package test seam before enumerating. The production broker rejects the
 variant; the canary requires that exact rejection and the broker's cleanup in
 addition to the independent launch trace.
 
