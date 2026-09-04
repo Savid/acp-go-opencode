@@ -104,7 +104,7 @@ func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	native := opencode.NativeSession{ID: "native"}
 	native.Model.ID = "fallback-model"
-	current := newSession(agent, "session", "/repo", []string{"/other"}, native, client, sessionMeta{},
+	current := newSession(agent, "session", absTestPath("repo"), []string{"/other"}, native, client, sessionMeta{},
 		idmapRecord{SessionID: "session", Format: SessionStoreFormat})
 	require.Equal(t, "OpenCode session", current.title)
 	require.Equal(t, "fallback-model", current.modelID)

@@ -14,7 +14,7 @@ import (
 func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.xdg.Root = ""
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	node := snapshot.Graph[0]
 	require.Error(t, recordSnapshotOwnership(client, snapshot))
 	require.Error(t, claimRestoreOwnership(client, snapshot, nil))
@@ -75,7 +75,7 @@ func preserveRestoreOwnershipSeams(t *testing.T) {
 
 func TestRestoreOwnershipRemainingPropagationConflictAndLossBranches(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	node := snapshot.Graph[0]
 	path := filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName)
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
@@ -149,7 +149,7 @@ func TestWriteRestoreOwnershipEveryInjectedFilesystemFailure(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
 		client := newFakeOpenCodeClient()
 		restoreOpen = func(string) (*os.File, error) { return nil, errors.New("open failed") }
-		require.ErrorContains(t, writeRestoreOwnership(client, registry), "open failed")
+		requireDirectoryFlushOutcome(t, writeRestoreOwnership(client, registry), "open failed")
 	})
 }
 func TestActiveReplacementAndArtifactLoadEdges(t *testing.T) {

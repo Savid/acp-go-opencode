@@ -32,13 +32,8 @@ func TestIndependentLocksFailClosedAndAreNeverUnlinked(t *testing.T) {
 	}
 
 	for _, name := range []string{ClaimFileName, LivenessFileName} {
-		info, err := os.Stat(filepath.Join(home, name))
-		if err != nil {
-			t.Fatalf("stat %s: %v", name, err)
-		}
-		if info.Mode().Perm() != 0o600 {
-			t.Fatalf("%s mode = %o", name, info.Mode().Perm())
-		}
+		require.FileExists(t, filepath.Join(home, name), "a released lock file is never unlinked")
+		requireOwnerOnlyMode(t, filepath.Join(home, name), 0o600)
 	}
 }
 
@@ -83,10 +78,12 @@ func TestVerifyLockedPathFailures(t *testing.T) {
 	require.NoError(t, file.Close())
 	require.ErrorContains(t, verifyLockedPath(file, path), "stat held")
 
+	// A path that names nothing is the same branch as a path unlinked under the
+	// held descriptor, and it is the spelling both platforms can stage: Windows
+	// refuses to unlink a file this process still holds open.
 	file, err = os.OpenFile(path, os.O_RDWR, 0o600)
 	require.NoError(t, err)
-	require.NoError(t, os.Remove(path))
-	require.ErrorContains(t, verifyLockedPath(file, path), "stat runtime lock path")
+	require.ErrorContains(t, verifyLockedPath(file, filepath.Join(root, "absent")), "stat runtime lock path")
 	require.NoError(t, file.Close())
 
 	first := filepath.Join(root, "first")

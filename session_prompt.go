@@ -10,7 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
-	"path/filepath"
+	"path"
 	"reflect"
 	"strings"
 	"time"
@@ -1264,7 +1264,9 @@ func filenameFromURI(uri string) string {
 		return ""
 	}
 
-	name := filepath.Base(parsed.Path)
+	// A URI path is slash-separated whatever the host platform spells, so this
+	// is path.Base and never filepath.Base.
+	name := path.Base(parsed.Path)
 	if name == "." || name == "/" {
 		return ""
 	}

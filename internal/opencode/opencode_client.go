@@ -3326,10 +3326,10 @@ func writeOpenCodeSeedManifest(configDir string, manifest []string) error {
 }
 
 // validateOpenCodeSeedPath confines a seeded relative path to the config root,
-// rejecting empty keys, absolute paths, and parent-directory escapes with the
+// rejecting empty keys, rooted paths, and parent-directory escapes with the
 // uniform unsupported error. It returns the cleaned, slash-normalized path.
 func validateOpenCodeSeedPath(rel string) (string, error) {
-	if strings.TrimSpace(rel) == "" || filepath.IsAbs(rel) {
+	if strings.TrimSpace(rel) == "" || rootedPath(rel) {
 		return "", unsupportedField(seedFileField(rel))
 	}
 
@@ -3340,7 +3340,7 @@ func validateOpenCodeSeedPath(rel string) (string, error) {
 	}
 
 	clean := filepath.Clean(rel)
-	if clean == "." || clean == ".." || filepath.IsAbs(clean) ||
+	if clean == "." || clean == ".." || rootedPath(clean) ||
 		strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", unsupportedField(seedFileField(rel))
 	}

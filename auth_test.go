@@ -51,6 +51,8 @@ func newAuthAgent(t *testing.T) authHarness {
 func withBrokerFactory(t *testing.T, agent *Agent) *fakeOpenCodeClient {
 	t.Helper()
 
+	neutralizeBrowserShimWhereUnsupported(t)
+
 	broker := newFakeOpenCodeClient()
 	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 		broker.mu.Lock()
@@ -429,7 +431,7 @@ func TestLoggableError(t *testing.T) {
 func TestValidateProviderAuthOptionsRejectsDirectHome(t *testing.T) {
 	require.NoError(t, validateProviderAuthOptions(Options{}))
 
-	err := validateProviderAuthOptions(Options{ProviderAuthDirectHome: "/home/opencode"})
+	err := validateProviderAuthOptions(Options{ProviderAuthDirectHome: absTestPath("home", "opencode")})
 
 	var reqErr *acp.RequestError
 
@@ -443,7 +445,7 @@ func TestValidateProviderAuthOptionsRejectsDirectHome(t *testing.T) {
 
 func TestSessionStartRejectsProviderAuthDirectHome(t *testing.T) {
 	agent := NewAgent(
-		WithProviderAuthDirectHome("/home/opencode"),
+		WithProviderAuthDirectHome(absTestPath("home", "opencode")),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
 

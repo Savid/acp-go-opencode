@@ -103,3 +103,19 @@ func TestOrdinaryWindowsNilProcessResultAndRevoke(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, won)
 }
+
+// TestOrdinaryWindowsStopAfterTheWaitIsNotAContainmentFailure pins the platform
+// difference the fallback kill has to absorb. Windows releases the process
+// handle when Wait returns, so a Kill afterwards is refused with EINVAL rather
+// than with the os.ErrProcessDone the platform reports before the wait. Both
+// mean there is nothing left to revoke, and reading the refusal as a failure
+// would answer every close over an already-settled turn with a bogus
+// containment refusal.
+func TestOrdinaryWindowsStopAfterTheWaitIsNotAContainmentFailure(t *testing.T) {
+	command := exec.Command("cmd.exe", "/c", "exit", "0")
+	require.NoError(t, command.Run())
+
+	won, err := stopOrdinaryProcess(t.Context(), command, &ordinaryProcessGuard{})
+	require.NoError(t, err, "a process that has already been waited on is not a containment failure")
+	require.False(t, won, "nothing was revoked, because nothing was still running")
+}

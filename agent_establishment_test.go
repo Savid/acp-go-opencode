@@ -186,7 +186,7 @@ func TestEstablishmentHookIgnoresWhatItCannotEstablish(t *testing.T) {
 	tagged, err := json.Marshal(map[string]any{
 		"sessionId":            "session-1",
 		establishmentHookParam: "7",
-		jsonFieldCwd:           "/repo",
+		jsonFieldCwd:           absTestPath("repo"),
 	})
 	require.NoError(t, err)
 
@@ -363,7 +363,7 @@ func TestIncompleteEstablishingResponsePermanentlyFencesExactSession(t *testing.
 			agent := NewAgent()
 			client := newFakeOpenCodeClient()
 			id := acp.SessionId(fmt.Sprintf("session-%d", index))
-			current := newSession(agent, id, "/repo", nil, testNativeSession("native-1"), client,
+			current := newSession(agent, id, absTestPath("repo"), nil, testNativeSession("native-1"), client,
 				sessionMeta{}, idmapRecord{SessionID: string(id), NativeSessionID: "native-1", Format: SessionStoreFormat})
 			current.runtimeGeneration = 1
 			current.stampIncarnationGeneration(client, 1)
@@ -532,7 +532,7 @@ func lifecycleSessionWithBrokenStream(t *testing.T) *session {
 	agent.setAgentClient(connection)
 
 	client := newFakeOpenCodeClient()
-	current := newSession(agent, "session-broken", "/tmp/project", nil, testNativeSession("native-broken"), client, sessionMeta{}, idmapRecord{
+	current := newSession(agent, "session-broken", absTestPath("tmp", "project"), nil, testNativeSession("native-broken"), client, sessionMeta{}, idmapRecord{
 		SessionID: "session-broken", NativeSessionID: "native-broken", Format: SessionStoreFormat,
 	})
 

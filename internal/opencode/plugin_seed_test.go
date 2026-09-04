@@ -119,15 +119,12 @@ func requirePluginSeedTree(t *testing.T, dir string) {
 
 	link, err := os.Readlink(filepath.Join(dir, pluginSeedModulesDirName, ".bin", "plugin"))
 	require.NoError(t, err)
-	require.Equal(t, testPluginRelativeBin, link, "npm's relative .bin link is recreated as a link")
+	require.Equal(t, filepath.FromSlash(testPluginRelativeBin), link,
+		"npm's relative .bin link is recreated as a link")
 
-	info, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(testPluginExecutableBin)))
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o755), info.Mode().Perm(), "the executable bit survives the copy")
-
-	loose, err := os.Lstat(filepath.Join(dir, pluginSeedModulesDirName, "some-dep", "loose.js"))
-	require.NoError(t, err)
-	require.Zero(t, loose.Mode().Perm()&pluginSeedLooseModeBits, "group and world write bits are dropped")
+	requireCopiedSeedModes(t,
+		filepath.Join(dir, filepath.FromSlash(testPluginExecutableBin)),
+		filepath.Join(dir, pluginSeedModulesDirName, "some-dep", "loose.js"))
 }
 
 func cacheEntryNames(t *testing.T, cacheDir string) []string {
@@ -151,7 +148,7 @@ func cacheEntryNames(t *testing.T, cacheDir string) []string {
 func writeExecutable(t *testing.T, dir string, name string, body string) string {
 	t.Helper()
 
-	path := filepath.Join(dir, name)
+	path := filepath.Join(dir, testExecutableName(name))
 	require.NoError(t, os.WriteFile(path, []byte(body), 0o755))
 
 	return path
@@ -270,7 +267,7 @@ func TestValidatePluginSeedTree(t *testing.T) {
 			mutate: func(dir string) error {
 				return os.RemoveAll(filepath.Join(dir, pluginSeedModulesDirName, pluginSeedPluginPackage))
 			},
-			wantErr: pluginSeedPluginPackage,
+			wantErr: filepath.FromSlash(pluginSeedPluginPackage),
 		},
 		{
 			name: "installed package is another version",
@@ -342,7 +339,7 @@ func TestValidatePluginSeedEntry(t *testing.T) {
 			mutate: func(entry string) error {
 				return os.RemoveAll(filepath.Join(entry, pluginSeedModulesDirName, pluginSeedPluginPackage))
 			},
-			wantErr: pluginSeedPluginPackage,
+			wantErr: filepath.FromSlash(pluginSeedPluginPackage),
 		},
 	}
 
@@ -389,10 +386,22 @@ func TestPluginSeedRestore(t *testing.T) {
 	})
 
 	t.Run("unreadable entry path is reported", func(t *testing.T) {
+		restorePluginSeedSeams(t)
+
 		logger, logs := debugLogger(t)
-		file := filepath.Join(t.TempDir(), "not-a-dir")
-		require.NoError(t, os.WriteFile(file, nil, 0o600))
-		cache := newPluginSeedCache(file, logger)
+		root := t.TempDir()
+		cache := newPluginSeedCache(root, logger)
+
+		// An entry that cannot be inspected is not an absent entry. The fault is
+		// injected rather than staged on disk, because the two platforms report
+		// a different errno for every staging a test could build.
+		pluginSeedLstat = func(path string) (fs.FileInfo, error) {
+			if strings.HasPrefix(path, root) {
+				return nil, fmt.Errorf("stat %s: %w", path, fs.ErrPermission)
+			}
+
+			return os.Lstat(path)
+		}
 
 		require.False(t, cache.restore(t.Context(), "key", t.TempDir()))
 		require.Contains(t, logs.String(), "inspect plugin seed entry")
@@ -495,9 +504,7 @@ func TestPluginSeedHarvest(t *testing.T) {
 		requirePluginSeedTree(t, entry)
 		require.NoError(t, validatePluginSeedEntry(entry))
 
-		info, err := os.Stat(entry)
-		require.NoError(t, err)
-		require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+		requireOwnerOnlyMode(t, entry, 0o700)
 
 		meta, err := readPluginSeedMeta(entry)
 		require.NoError(t, err)

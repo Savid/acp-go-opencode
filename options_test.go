@@ -29,8 +29,8 @@ func TestApplyOptions(t *testing.T) {
 		WithAgentTitle("title"),
 		WithAgentVersion("version"),
 		WithExecutablePath("opencode"),
-		WithHome("/tmp/home"),
-		WithScratchDir("/tmp/scratch"),
+		WithHome(absTestPath("tmp", "home")),
+		WithScratchDir(absTestPath("tmp", "scratch")),
 		WithDefaultModel("openai/gpt"),
 		WithEnv(map[string]string{"A": "1"}),
 		WithTracerProvider(tracenoop.NewTracerProvider()),
@@ -44,20 +44,20 @@ func TestApplyOptions(t *testing.T) {
 		WithOpenCodeQuestionTool(true),
 		WithOpenCodeLogLevel("INFO"),
 		WithOpenCodeHealthCheckTimeout(time.Second),
-		WithPluginSeedDir("/tmp/plugin-seed"),
+		WithPluginSeedDir(absTestPath("tmp", "plugin-seed")),
 		WithPluginSeed(false),
 	})
 	if opts.AgentName != "name" || opts.AgentTitle != "title" || opts.ExecutablePath != "opencode" ||
 		opts.Env["A"] != "1" || !opts.Pure || !opts.QuestionTool || opts.SessionStore != store {
 		t.Fatalf("options = %#v", opts)
 	}
-	if opts.PluginSeedDir != "/tmp/plugin-seed" || !opts.PluginSeedDisabled {
+	if opts.PluginSeedDir != absTestPath("tmp", "plugin-seed") || !opts.PluginSeedDisabled {
 		t.Fatalf("plugin seed options = %q / disabled=%t", opts.PluginSeedDir, opts.PluginSeedDisabled)
 	}
 	if defaults := applyOptions(nil); defaults.PluginSeedDisabled || defaults.PluginSeedDir != "" {
 		t.Fatalf("plugin seed defaults = %#v", defaults)
 	}
-	if scratch := (&Agent{options: opts}).scratchParent(); opts.Home != "/tmp/home" || scratch != "/tmp/scratch" {
+	if scratch := (&Agent{options: opts}).scratchParent(); opts.Home != absTestPath("tmp", "home") || scratch != absTestPath("tmp", "scratch") {
 		t.Fatalf("home/scratch options = %q / %q", opts.Home, scratch)
 	}
 	if opts.SeedFiles["opencode.json"] != `{"provider":{}}` {
@@ -96,10 +96,10 @@ func TestRuntimeOptionAndScratchEdges(t *testing.T) {
 	require.True(t, reservedOpenCodeEnvKey(privateAdapterEnvPrefix+"TOKEN"))
 	require.True(t, adapterPrivateEnvKey(privateAdapterEnvPrefix+"TOKEN"))
 
-	homeAgent := &Agent{options: Options{Home: "/durable/home"}}
+	homeAgent := &Agent{options: Options{Home: absTestPath("durable", "home")}}
 	root, generated, err := homeAgent.newRuntimeRoot()
 	require.NoError(t, err)
-	require.Equal(t, "/durable/home", root)
+	require.Equal(t, absTestPath("durable", "home"), root)
 	require.False(t, generated)
 
 	file := filepath.Join(t.TempDir(), "not-a-directory")

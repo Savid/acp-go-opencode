@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +21,45 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
+
+// absTestPath builds a host-absolute path from POSIX-looking segments, so a
+// test states "an absolute working directory" rather than a spelling only one
+// platform accepts.
+func absTestPath(segments ...string) string {
+	root := "/"
+	if runtime.GOOS == "windows" {
+		root = `C:\`
+	}
+
+	return filepath.Join(append([]string{root}, segments...)...)
+}
+
+// retainedScratchDir is a scratch parent for a case that deliberately leaves a
+// runtime uncontained. t.TempDir fails the test when it cannot remove what it
+// created, and a runtime whose containment could not be proven still holds its
+// claim lock open — which Windows refuses to unlink. The removal here is best
+// effort for exactly that reason.
+func retainedScratchDir(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("", "acp-go-opencode-retained-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	return dir
+}
+
+// testURIPath spells a local path the way a file URI carries it: rooted at a
+// single slash, so a Windows volume name sits after that slash rather than in
+// the URI's authority.
+func testURIPath(path string) string {
+	return "/" + strings.TrimPrefix(filepath.ToSlash(path), "/")
+}
+
+// testFileURI is the file URI that names a local path on this host.
+func testFileURI(path string) string {
+	return "file://" + testURIPath(path)
+}
 
 func boolPtr(value bool) *bool {
 	return &value
@@ -1213,6 +1254,29 @@ func signalTestHook(ch chan struct{}) {
 	once.Do(func() { close(ch) })
 }
 
+// promptResult carries a Prompt call's value and its error back to the test
+// goroutine. A require.* call inside a goroutine ends that goroutine through
+// runtime.Goexit, so the send after it never runs and the receiving test blocks
+// until the package timeout; assertions belong on the receiving side.
+type promptResult struct {
+	response acp.PromptResponse
+	err      error
+}
+
+// awaitPromptResult receives a prompt outcome under a bounded deadline so a turn
+// that never settles fails this test instead of hanging the whole package.
+func awaitPromptResult(t *testing.T, done <-chan promptResult) promptResult {
+	t.Helper()
+	select {
+	case result := <-done:
+		return result
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the prompt to settle")
+
+		return promptResult{}
+	}
+}
+
 func requireSignal(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
 	select {
@@ -1342,7 +1406,7 @@ func testSession(t *testing.T, agent *Agent, client *fakeOpenCodeClient) *sessio
 	generation := agent.runtimeGeneration
 	agent.mu.Unlock()
 
-	session := newSession(agent, "session-1", "/tmp/project", nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
+	session := newSession(agent, "session-1", absTestPath("tmp", "project"), nil, testNativeSession("native-1"), client, sessionMeta{}, idmapRecord{
 		SessionID:       "session-1",
 		NativeSessionID: "native-1",
 		Format:          SessionStoreFormat,

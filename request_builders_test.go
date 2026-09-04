@@ -19,8 +19,8 @@ func TestRequestBuilders(t *testing.T) {
 	sseServer := acp.McpServer{Sse: &acp.McpServerSseInline{Name: "sse", Url: "https://sse.example"}}
 	acpServer := acp.McpServer{Acp: &acp.McpServerAcpInline{Id: "acp-1", Name: "acp"}}
 	meta := map[string]any{"foreign": map[string]any{"a": []any{"b"}}}
-	req := NewSessionRequest("/tmp/project",
-		WithSessionAdditionalDirectories("/tmp/other"),
+	req := NewSessionRequest(absTestPath("tmp", "project"),
+		WithSessionAdditionalDirectories(absTestPath("tmp", "other")),
 		WithSessionMCPServers(httpServer, stdioServer, sseServer, acpServer),
 		WithSessionMeta(meta),
 		WithSessionRawEvents(true),
@@ -31,7 +31,7 @@ func TestRequestBuilders(t *testing.T) {
 			WithOpenCodePermission("allow"),
 		)),
 	)
-	if req.Cwd != "/tmp/project" || len(req.McpServers) != 4 || len(req.AdditionalDirectories) != 1 {
+	if req.Cwd != absTestPath("tmp", "project") || len(req.McpServers) != 4 || len(req.AdditionalDirectories) != 1 {
 		t.Fatalf("NewSessionRequest = %#v", req)
 	}
 	if !rawMessageConfigFromMeta(req.Meta).Enabled() {
@@ -48,7 +48,7 @@ func TestRequestBuilders(t *testing.T) {
 	if options[metaPermissionKey] != "allow" {
 		t.Fatalf("permission not set in meta: %#v", req.Meta)
 	}
-	if ResumeSessionRequest("s", "/tmp/project", WithSessionMCPServers(httpServer)).SessionId != "s" {
+	if ResumeSessionRequest("s", absTestPath("tmp", "project"), WithSessionMCPServers(httpServer)).SessionId != "s" {
 		t.Fatal("ResumeSessionRequest did not set session id")
 	}
 	if prompt := TextPromptRequest("s", "nonce", "hello"); prompt.SessionId != "s" || len(prompt.Prompt) != 1 {
@@ -95,7 +95,7 @@ func TestTurnRequestBuildersFailClosedOnInvalidNonce(t *testing.T) {
 }
 
 func TestRequestBuilderCloneEdgeBranches(t *testing.T) {
-	rawOnly := NewSessionRequest("/tmp/project", WithSessionRawEvents(true))
+	rawOnly := NewSessionRequest(absTestPath("tmp", "project"), WithSessionRawEvents(true))
 	if !rawMessageConfigFromMeta(rawOnly.Meta).Enabled() {
 		t.Fatalf("rawOnly meta = %#v", rawOnly.Meta)
 	}
@@ -147,7 +147,7 @@ func TestCallForkSessionHelper(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			conn, closeConn := forkClientConnection(t, handler)
 			defer closeConn()
-			resp, err := CallForkSession(ctx, conn, ForkSessionRequest("s", "/tmp/project"))
+			resp, err := CallForkSession(ctx, conn, ForkSessionRequest("s", absTestPath("tmp", "project")))
 			switch name {
 			case "success":
 				if err != nil || resp.SessionId != "forked" {
@@ -226,8 +226,8 @@ func (noopACPClient) WaitForTerminalExit(context.Context, acp.WaitForTerminalExi
 }
 
 func TestOpenCodeExtraPathDirsBuilderClones(t *testing.T) {
-	dirs := []string{"/session/bin"}
-	req := NewSessionRequest("/tmp/project", WithSessionOpenCodeOptions(NewOpenCodeOptions(
+	dirs := []string{absTestPath("session", "bin")}
+	req := NewSessionRequest(absTestPath("tmp", "project"), WithSessionOpenCodeOptions(NewOpenCodeOptions(
 		WithOpenCodeExtraPathDirs(dirs...),
 	)))
 
@@ -237,7 +237,7 @@ func TestOpenCodeExtraPathDirsBuilderClones(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session meta from builder: %v", err)
 	}
-	if len(meta.ExtraPathDirs) != 1 || meta.ExtraPathDirs[0] != "/session/bin" {
+	if len(meta.ExtraPathDirs) != 1 || meta.ExtraPathDirs[0] != absTestPath("session", "bin") {
 		t.Fatalf("session extra path dirs = %#v", meta.ExtraPathDirs)
 	}
 
@@ -265,7 +265,7 @@ func TestOpenCodeExtraPathDirsBuilderClones(t *testing.T) {
 
 func TestOpenCodeEnvBuilderClones(t *testing.T) {
 	env := map[string]string{"WAGIE_API_TOKEN": "bearer", "CLEARED": ""}
-	req := NewSessionRequest("/tmp/project", WithSessionOpenCodeOptions(NewOpenCodeOptions(
+	req := NewSessionRequest(absTestPath("tmp", "project"), WithSessionOpenCodeOptions(NewOpenCodeOptions(
 		WithOpenCodeEnv(env),
 	)))
 
@@ -330,7 +330,7 @@ func TestCallerMetaBuildersRejectEveryFamilyLiteral(t *testing.T) {
 
 	// An ordinary host key still merges, and the vendor namespace is not
 	// reserved: only the family-global literals are.
-	request := NewSessionRequest("/repo", WithSessionMeta(map[string]any{
+	request := NewSessionRequest(absTestPath("repo"), WithSessionMeta(map[string]any{
 		"host.example/trace": "trace-1",
 		opencodeMetaKey:      map[string]any{"stored": true},
 	}))

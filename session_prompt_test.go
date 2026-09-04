@@ -3518,10 +3518,6 @@ func TestAcceptedTurnOutlivingItsCallerReadsTheEvidenceItAlreadyHas(t *testing.T
 	current.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	type promptResult struct {
-		response acp.PromptResponse
-		err      error
-	}
 	done := make(chan promptResult, 1)
 
 	go func() {
@@ -3917,11 +3913,6 @@ func TestCommandCompletionWaitsForTheAssistantIdentity(t *testing.T) {
 		// An empty message answers the frame without publishing any assistant
 		// identity: the run is over on the native side, the stream has not said so.
 		return opencode.NativeMessage{}, nil
-	}
-
-	type promptResult struct {
-		response acp.PromptResponse
-		err      error
 	}
 
 	done := make(chan promptResult, 1)

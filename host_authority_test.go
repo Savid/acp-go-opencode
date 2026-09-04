@@ -58,7 +58,7 @@ func (a *authorityTrace) snapshot() []string {
 func (a *authorityTrace) NativeEnvironment() map[string]string {
 	a.record("environment")
 
-	return map[string]string{"PATH": "/authority/bin", "AUTHORITY_CANARY": "present"}
+	return map[string]string{"PATH": absTestPath("authority", "bin"), "AUTHORITY_CANARY": "present"}
 }
 
 func (a *authorityTrace) PrepareNativeTree(_ context.Context, path string) error {
@@ -502,7 +502,7 @@ type fixedProcessAuthority struct {
 }
 
 func (*fixedProcessAuthority) NativeEnvironment() map[string]string {
-	return map[string]string{"PATH": "/bin"}
+	return map[string]string{"PATH": absTestPath("bin")}
 }
 func (*fixedProcessAuthority) PrepareNativeTree(context.Context, string) error {
 	return nil
@@ -790,7 +790,7 @@ func TestHostAuthorityManagedFailureMatrix(t *testing.T) {
 			authority.hideTree = true
 			test.configure(authority)
 			agent := NewAgent(
-				WithHostAuthority(authority), WithScratchDir(t.TempDir()),
+				WithHostAuthority(authority), WithScratchDir(retainedScratchDir(t)),
 				WithOpenCodeHealthCheckTimeout(100*time.Millisecond),
 			)
 			_, _, err := runManagedTrace(t, agent, authority, false)

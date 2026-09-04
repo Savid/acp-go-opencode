@@ -646,7 +646,7 @@ func copyPluginSeedLink(path string, destination string, relative string) error 
 	}
 
 	resolved := filepath.Clean(filepath.Join(filepath.Dir(relative), link))
-	if filepath.IsAbs(link) || resolved == pluginSeedParentDir || strings.HasPrefix(resolved, pluginSeedParentDir+string(filepath.Separator)) {
+	if rootedPath(link) || resolved == pluginSeedParentDir || strings.HasPrefix(resolved, pluginSeedParentDir+string(filepath.Separator)) {
 		return fmt.Errorf("refusing to copy %s: symbolic link leaves the tree", path)
 	}
 

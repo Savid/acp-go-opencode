@@ -137,7 +137,9 @@ func TestMaterializeSessionCarrierPlugin(t *testing.T) {
 
 	root := filepath.Dir(path)
 	mark := carrierMarkFor(root)
-	require.Contains(t, content, `const PATH_MARK = "`+mark+`"`)
+	// The mark reaches the plugin as a JS string literal, so the expectation is
+	// the encoded form: a Windows path carries separators the source escapes.
+	require.Contains(t, content, `const PATH_MARK = `+jsStringLiteral(mark))
 
 	// The login shell is not a thing the carrier holds. It is resolved per
 	// workspace scope and published with each operation, so a second scope with

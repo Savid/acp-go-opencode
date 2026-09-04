@@ -367,9 +367,7 @@ func handoffPathFromURI(raw *string) (string, bool) {
 		return "", false
 	}
 
-	if !strings.HasPrefix(parsed.Path, "/") {
-		return "", false
-	}
+	local := localPathFromURIPath(parsed.Path)
 
-	return filepath.FromSlash(parsed.Path), true
+	return local, local != ""
 }

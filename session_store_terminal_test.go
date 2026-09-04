@@ -128,7 +128,7 @@ func TestInspectSessionStoreTerminalStateUsesTheStrictSnapshotReader(t *testing.
 func terminalTestSnapshot(t *testing.T, events ...opencode.SyncEvent) SessionStoreEntry {
 	t.Helper()
 
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	snapshot.Events["native"] = append(snapshot.Events["native"], events...)
 	entry, err := json.Marshal(snapshot)
 	require.NoError(t, err)

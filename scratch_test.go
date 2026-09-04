@@ -12,7 +12,7 @@ func TestScratchParent(t *testing.T) {
 	t.Parallel()
 
 	require.Equal(t, os.TempDir(), scratchParent(""), "empty scratch dir must resolve to the system temp directory")
-	require.Equal(t, "/custom/scratch", scratchParent("/custom/scratch"), "non-empty scratch dir must pass through unchanged")
+	require.Equal(t, absTestPath("custom", "scratch"), scratchParent(absTestPath("custom", "scratch")), "non-empty scratch dir must pass through unchanged")
 }
 
 func TestEnsureScratchParent(t *testing.T) {
@@ -38,7 +38,7 @@ func TestEnsureScratchParent(t *testing.T) {
 		info, statErr := os.Stat(nested)
 		require.NoError(t, statErr)
 		require.True(t, info.IsDir())
-		require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+		requireOwnerOnlyMode(t, nested, 0o700)
 	})
 
 	t.Run("regular-file parent errors", func(t *testing.T) {

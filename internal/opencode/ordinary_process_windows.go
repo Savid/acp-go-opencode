@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -148,11 +149,22 @@ func stopOrdinaryProcess(_ context.Context, command *exec.Cmd, guard *ordinaryPr
 	}
 
 	err := command.Process.Kill()
-	if errors.Is(err, os.ErrProcessDone) {
+	if ordinaryProcessAlreadyFinished(err) {
 		return false, nil
 	}
 
 	return err == nil, err
+}
+
+// ordinaryProcessAlreadyFinished reports whether a kill failed only because
+// there was no longer a process to kill. Windows releases the process handle
+// when Wait returns, and a Kill afterwards is refused with EINVAL rather than
+// the os.ErrProcessDone the platform reports before the wait. Both mean the
+// same thing teardown cares about — nothing to revoke — and reading EINVAL as a
+// failure would answer every close over an already-settled turn with a bogus
+// containment refusal.
+func ordinaryProcessAlreadyFinished(err error) bool {
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.EINVAL)
 }
 
 // containOrdinaryProcess closes the job once the direct child has been waited

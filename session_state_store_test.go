@@ -18,10 +18,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// jsonTestPath spells an absolute test path as a JSON string value, so a raw
+// JSON fixture carries the same absolute path the surrounding Go code passes.
+func jsonTestPath(segments ...string) string {
+	encoded, err := json.Marshal(absTestPath(segments...))
+	if err != nil {
+		panic(err)
+	}
+
+	return string(encoded)
+}
+
 func syncTestEvent(aggregate string, sequence int64, kind string, extra map[string]json.RawMessage) opencode.SyncEvent {
 	data := map[string]json.RawMessage{
 		"sessionID": json.RawMessage(`"` + aggregate + `"`),
-		"info":      json.RawMessage(`{"id":"` + aggregate + `","directory":"/source"}`),
+		"info":      json.RawMessage(`{"id":"` + aggregate + `","directory":` + jsonTestPath("source") + `}`),
 	}
 	for key, value := range extra {
 		data[key] = value
@@ -31,7 +42,7 @@ func syncTestEvent(aggregate string, sequence int64, kind string, extra map[stri
 }
 
 func TestAllowlistedSyncEventsRejectsCrossAggregateAndUnknownSchema(t *testing.T) {
-	allow := map[string]stateSnapshotNode{"a": {NativeSessionID: "a", SourceCwd: "/source"}}
+	allow := map[string]stateSnapshotNode{"a": {NativeSessionID: "a", SourceCwd: absTestPath("source")}}
 	history := []opencode.SyncEvent{
 		syncTestEvent("a", 0, "session.created.1", nil),
 		syncTestEvent("other", 0, "session.created.1", nil),
@@ -62,13 +73,13 @@ func TestSyncSnapshotHardRejectsForeignAndIncompleteFormats(t *testing.T) {
 	require.False(t, found)
 	require.ErrorContains(t, err, "missing required field")
 
-	snapshot := validSyncSnapshot("s", "native", "/source")
+	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 	delete(snapshot.Events, "native")
 	require.ErrorContains(t, validateSyncSnapshot("s", snapshot), "incomplete")
 }
 
 func TestHydrateStateSnapshotRejectsAmbiguousJSONAtEveryTypedDepth(t *testing.T) {
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	snapshot.Session.Model = stateSnapshotModel{ProviderID: "openai", ModelID: "gpt-test", Agent: "build"}
 	snapshot.Session.Env = map[string]string{"SERVICE_TOKEN": "credential"}
 	encoded, err := json.Marshal(snapshot)
@@ -88,8 +99,9 @@ func TestHydrateStateSnapshotRejectsAmbiguousJSONAtEveryTypedDepth(t *testing.T)
 		"duplicate graph":         strings.Replace(valid, `"sourceCwd":`, `"sourceCwd":"/shadow","sourceCwd":`, 1),
 		"duplicate event":         strings.Replace(valid, `"aggregate_id":`, `"aggregate_id":"shadow","aggregate_id":`, 1),
 		"duplicate event data":    strings.Replace(valid, `"sessionID":`, `"sessionID":"shadow","sessionID":`, 1),
-		"duplicate nested data": strings.Replace(valid, `"directory":"/source"`,
-			`"directory":"/shadow","directory":"/source"`, 1),
+		"duplicate nested data": strings.Replace(valid,
+			`"directory":`+jsonTestPath("source"),
+			`"directory":"/shadow","directory":`+jsonTestPath("source"), 1),
 		"trailing input": valid + ` {}`,
 	}
 
@@ -109,7 +121,7 @@ func TestHydrateStateSnapshotRejectsAmbiguousJSONAtEveryTypedDepth(t *testing.T)
 }
 
 func TestHydrateStateSnapshotRequiresEveryNonOmittedMemberBeforeNativeLaunch(t *testing.T) {
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	snapshot.Session.Model = stateSnapshotModel{ProviderID: "openai", ModelID: "gpt-test", Agent: "build"}
 	encoded, err := json.Marshal(snapshot)
 	require.NoError(t, err)
@@ -146,7 +158,7 @@ func TestHydrateStateSnapshotRequiresEveryNonOmittedMemberBeforeNativeLaunch(t *
 			agent := NewAgent(WithSessionStore(store))
 			agent.runtime = client
 
-			_, resumeErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("session", "/target"))
+			_, resumeErr := agent.ResumeSession(t.Context(), ResumeSessionRequest("session", absTestPath("target")))
 			require.Error(t, resumeErr)
 			require.Empty(t, client.scopes(), "invalid snapshot reached native launch")
 		})
@@ -266,36 +278,36 @@ func decodeSnapshotOnly(raw []byte) error {
 func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.getSession = testNativeSession("native")
-	snapshot := validSyncSnapshot("s", "native", "/source")
-	native, err := restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
+	native, err := restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.NoError(t, err)
 	require.Equal(t, "native", native.ID)
 	require.Len(t, client.syncEvents, 1)
 	var info map[string]any
 	require.NoError(t, json.Unmarshal(client.syncEvents[0].Data["info"], &info))
-	require.Equal(t, "/target", info["directory"])
+	require.Equal(t, absTestPath("target"), info["directory"])
 	_, err = os.Stat(filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName))
 	require.NoError(t, err)
 
 	// A complete retry is idempotent and verifies rather than duplicating.
-	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.NoError(t, err)
 	require.Len(t, client.syncEvents, 1)
 
-	client.syncEvents[0].Data["info"] = json.RawMessage(`{"id":"foreign","directory":"/target"}`)
-	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	client.syncEvents[0].Data["info"] = json.RawMessage(`{"id":"foreign","directory":` + jsonTestPath("target") + `}`)
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "owned by another restore")
 }
 
 func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.getSession = testNativeSession("native")
-	snapshot := validSyncSnapshot("s", "native", "/source")
+	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 
 	nativeEvent := cloneSyncEvent(snapshot.Events["native"][0])
 	nativeEvent.Data[syncFieldInfo] = json.RawMessage(`{
 		"id":"native",
-		"directory":"/source",
+		"directory":` + jsonTestPath("source") + `,
 		"metadata":{
 			"native":{"kept":true},
 			"acp-go-opencode":{"ref":"stale-reference"}
@@ -307,7 +319,7 @@ func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testin
 	require.NoError(t, recordSnapshotOwnership(client, snapshot))
 	client.syncEvents = []opencode.SyncEvent{nativeEvent}
 
-	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/source")
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("source"))
 	require.NoError(t, err)
 	require.Len(t, client.syncEvents, 1, "matching native history must be verified, not replayed")
 	require.Contains(t, string(client.syncEvents[0].Data[syncFieldInfo]), "stale-reference",
@@ -317,19 +329,19 @@ func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testin
 func TestRestoreRejectsMalformedCarrierInExistingAndVerifiedNativeHistory(t *testing.T) {
 	t.Run("existing", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
-		snapshot := validSyncSnapshot("s", "native", "/source")
+		snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 		require.NoError(t, recordSnapshotOwnership(client, snapshot))
 		malformed := cloneSyncEvent(snapshot.Events["native"][0])
 		malformed.Data[syncFieldInfo] = json.RawMessage(`{"metadata":"not-an-object"}`)
 		client.syncEvents = []opencode.SyncEvent{malformed}
 
-		_, err := restoreSyncState(context.Background(), client, snapshot, "native", "/source")
+		_, err := restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("source"))
 		require.ErrorContains(t, err, "sanitize sync event")
 	})
 
 	t.Run("verified after replay", func(t *testing.T) {
 		client := newFakeOpenCodeClient()
-		snapshot := validSyncSnapshot("s", "native", "/source")
+		snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 		historyCalls := 0
 		client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
 			historyCalls++
@@ -343,7 +355,7 @@ func TestRestoreRejectsMalformedCarrierInExistingAndVerifiedNativeHistory(t *tes
 			return []opencode.SyncEvent{malformed}, nil
 		}
 
-		_, err := restoreSyncState(context.Background(), client, snapshot, "native", "/source")
+		_, err := restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("source"))
 		require.ErrorContains(t, err, "sanitize sync event")
 	})
 }
@@ -351,18 +363,18 @@ func TestRestoreRejectsMalformedCarrierInExistingAndVerifiedNativeHistory(t *tes
 func TestRestoreRejectsExistingAggregateWithoutDurableOwner(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	client.syncEvents = []opencode.SyncEvent{syncTestEvent("native", 0, "session.created.1", nil)}
-	snapshot := validSyncSnapshot("s", "native", "/source")
+	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 
-	_, err := restoreSyncState(context.Background(), client, snapshot, "native", "/source")
+	_, err := restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("source"))
 	require.ErrorContains(t, err, "no durable restore owner")
 }
 
 func TestRestoreRejectsPathOutsideCapturedCWD(t *testing.T) {
 	client := newFakeOpenCodeClient()
-	snapshot := validSyncSnapshot("s", "native", "/source")
-	snapshot.Events["native"][0].Data["info"] = json.RawMessage(`{"id":"native","directory":"/other"}`)
+	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
+	snapshot.Events["native"][0].Data["info"] = json.RawMessage(`{"id":"native","directory":` + jsonTestPath("other") + `}`)
 
-	_, err := restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	_, err := restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "escapes source cwd")
 	require.Empty(t, client.syncEvents)
 }
@@ -374,7 +386,7 @@ func TestBundleCredentialScan(t *testing.T) {
 }
 
 func TestSnapshotCredentialScanAllowsOnlyTheDurableCarrier(t *testing.T) {
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	snapshot.Session.Env = map[string]string{"SERVICE_API_TOKEN": "bearer-secret", "EMPTY": ""}
 	require.NoError(t, scanStateSnapshot(snapshot, []string{"bearer-secret"}))
 
@@ -389,7 +401,7 @@ func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierReference(t *testing.T
 	agent.sessions[current.id] = current
 	client.syncEvents[0].Data[syncFieldInfo] = json.RawMessage(`{
 		"id":"native-1",
-		"directory":"/source",
+		"directory":` + jsonTestPath("source") + `,
 		"metadata":{
 			"native":{"kept":true},
 			"acp-go-opencode":{"ref":"opaque-operation-reference"}
@@ -399,7 +411,7 @@ func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierReference(t *testing.T
 	events, err := current.readSyncGeneration(
 		context.Background(),
 		map[string]stateSnapshotNode{"native-1": {
-			SessionID: string(current.id), NativeSessionID: "native-1", SourceCwd: "/source",
+			SessionID: string(current.id), NativeSessionID: "native-1", SourceCwd: absTestPath("source"),
 		}},
 		nil,
 	)
@@ -429,7 +441,7 @@ func validSyncSnapshot(sessionID, nativeID, cwd string) stateSnapshot {
 	}
 }
 func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
-	base := validSyncSnapshot("session", "native", "/source")
+	base := validSyncSnapshot("session", "native", absTestPath("source"))
 	require.NoError(t, validateSyncSnapshot("session", base))
 
 	tests := map[string]func(*stateSnapshot){
@@ -465,12 +477,12 @@ func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
 }
 
 func TestSyncSnapshotRejectsNonCanonicalGraphAndEventOrder(t *testing.T) {
-	base := validSyncSnapshot("session", "native", "/source")
+	base := validSyncSnapshot("session", "native", absTestPath("source"))
 	childEvent := syncTestEvent("child-native", 0, "session.created.1", nil)
 	base.Graph = append(base.Graph, stateSnapshotNode{
 		SessionID: "child", NativeSessionID: "child-native",
 		ParentSessionID: "session", NativeParentID: "native",
-		SourceCwd: "/source", Permission: "ask",
+		SourceCwd: absTestPath("source"), Permission: "ask",
 	})
 	base.Events["child-native"] = []opencode.SyncEvent{childEvent}
 	require.NoError(t, validateSyncSnapshot("session", base))
@@ -506,7 +518,7 @@ func TestSyncSnapshotRejectsNonCanonicalGraphAndEventOrder(t *testing.T) {
 			value.Session.NativeParentSessionID = "parent-native"
 		},
 		"selected cwd mismatch": func(value *stateSnapshot) {
-			value.Session.Cwd = "/other"
+			value.Session.Cwd = absTestPath("other")
 		},
 		"event sequence gap": func(value *stateSnapshot) {
 			value.Events["native"][0].Sequence = 1
@@ -529,7 +541,7 @@ func TestSyncSnapshotRejectsNonCanonicalGraphAndEventOrder(t *testing.T) {
 }
 
 func TestSyncEventAllowlistAndIdentityBranches(t *testing.T) {
-	node := stateSnapshotNode{SessionID: "session", NativeSessionID: "native", SourceCwd: "/source"}
+	node := stateSnapshotNode{SessionID: "session", NativeSessionID: "native", SourceCwd: absTestPath("source")}
 	event := opencode.SyncEvent{
 		ID: "event", AggregateID: "native", Sequence: 0, Type: "session.created.1",
 		Data: map[string]json.RawMessage{"sessionID": json.RawMessage(`"native"`), "info": json.RawMessage(`{"id":"native"}`)},
@@ -600,7 +612,7 @@ func TestHydrateRebaseAndSyncComparisonBranches(t *testing.T) {
 	require.Empty(t, badSnapshot)
 	require.False(t, badFound)
 
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	encoded, err := json.Marshal(snapshot)
 	require.NoError(t, err)
 	require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
@@ -613,27 +625,29 @@ func TestHydrateRebaseAndSyncComparisonBranches(t *testing.T) {
 	require.Equal(t, snapshot.RestoreGeneration, loaded.RestoreGeneration)
 
 	value := map[string]any{
-		"directory": "/source", "cwd": "/source/sub", "root": "relative", "other": "/source/ignored",
-		"nested": []any{map[string]any{"path": "/source/file"}, true},
+		"directory": absTestPath("source"), "cwd": absTestPath("source", "sub"),
+		"root": "relative", "other": absTestPath("source", "ignored"),
+		"nested": []any{map[string]any{"path": absTestPath("source", "file")}, true},
 	}
-	rebased, err := rebasePathValues(value, "", "/source", "/target")
+	rebased, err := rebasePathValues(value, "", absTestPath("source"), absTestPath("target"))
 	require.NoError(t, err)
 	result, ok := rebased.(map[string]any)
 	require.True(t, ok)
-	require.Equal(t, "/target", result["directory"])
-	require.Equal(t, filepath.Join("/target", "sub"), result["cwd"])
+	require.Equal(t, absTestPath("target"), result["directory"])
+	require.Equal(t, absTestPath("target", "sub"), result["cwd"])
 	require.Equal(t, "relative", result["root"])
-	require.Equal(t, "/source/ignored", result["other"])
-	_, err = rebasePathValues("/outside", "path", "/source", "/target")
+	require.Equal(t, absTestPath("source", "ignored"), result["other"])
+	_, err = rebasePathValues(absTestPath("outside"), "path", absTestPath("source"), absTestPath("target"))
 	require.ErrorContains(t, err, "escapes source cwd")
 
 	badEvent := cloneSyncEvent(snapshot.Events["native"][0])
 	badEvent.Data["info"] = json.RawMessage(`{`)
-	_, err = rebaseSyncEvents([]opencode.SyncEvent{badEvent}, "/source", "/target")
+	_, err = rebaseSyncEvents([]opencode.SyncEvent{badEvent}, absTestPath("source"), absTestPath("target"))
 	require.Error(t, err)
 	samePathEvent := cloneSyncEvent(snapshot.Events["native"][0])
-	samePathEvent.Data["info"] = json.RawMessage(`{ "directory": "/source", "id": "native" }`)
-	samePath, err := rebaseSyncEvents([]opencode.SyncEvent{samePathEvent}, "/source/.", "/source")
+	samePathEvent.Data["info"] = json.RawMessage(`{ "directory": ` + jsonTestPath("source") + `, "id": "native" }`)
+	samePath, err := rebaseSyncEvents([]opencode.SyncEvent{samePathEvent},
+		absTestPath("source")+string(filepath.Separator)+".", absTestPath("source"))
 	require.NoError(t, err)
 	require.Equal(t, samePathEvent.Data["info"], samePath[0].Data["info"], "same-path restore must preserve native JSON bytes")
 
@@ -757,15 +771,15 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 }
 
 func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranches(t *testing.T) {
-	invalid := validSyncSnapshot("session", "native", "/source")
+	invalid := validSyncSnapshot("session", "native", absTestPath("source"))
 	invalid.Format = "wrong"
-	_, err := restoreSyncState(context.Background(), newFakeOpenCodeClient(), invalid, "native", "/target")
+	_, err := restoreSyncState(context.Background(), newFakeOpenCodeClient(), invalid, "native", absTestPath("target"))
 	require.Error(t, err)
 
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	client := newFakeOpenCodeClient()
 	client.syncReplayErr = errors.New("replay failed")
-	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "replay failed")
 
 	client = newFakeOpenCodeClient()
@@ -778,17 +792,17 @@ func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranch
 
 		return nil, nil
 	}
-	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "verify history failed")
 
 	client = newFakeOpenCodeClient()
 	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) { return nil, nil }
-	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "failed exact replay verification")
 
 	client = newFakeOpenCodeClient()
 	historyCalls = 0
-	expected, err := rebaseSyncEvents(snapshot.Events["native"], "/source", "/target")
+	expected, err := rebaseSyncEvents(snapshot.Events["native"], absTestPath("source"), absTestPath("target"))
 	require.NoError(t, err)
 	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
 		historyCalls++
@@ -802,12 +816,12 @@ func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranch
 
 		return expected, nil
 	}
-	_, err = restoreSyncState(context.Background(), client, snapshot, "native", "/target")
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "lost durable restore ownership")
 }
 
 func TestRebaseArrayErrorAndSyncOrderComparison(t *testing.T) {
-	_, err := rebasePathValues([]any{"/outside"}, "path", "/source", "/target")
+	_, err := rebasePathValues([]any{absTestPath("outside")}, "path", absTestPath("source"), absTestPath("target"))
 	require.ErrorContains(t, err, "escapes source cwd")
 
 	zero := syncTestEvent("native", 0, "session.created.1", nil)
@@ -1014,7 +1028,7 @@ func TestStateCaptureWaitHonoursDelayAndCancellation(t *testing.T) {
 	require.ErrorIs(t, stateCaptureWait(ctx, time.Hour), context.Canceled)
 }
 func TestStateSnapshotDecoderReachableEdges(t *testing.T) {
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	encoded, err := json.Marshal(snapshot)
 	require.NoError(t, err)
 
@@ -1080,7 +1094,7 @@ func TestStateSnapshotDecoderReachableEdges(t *testing.T) {
 }
 
 func TestStateStoreValidationReachableEdges(t *testing.T) {
-	node := stateSnapshotNode{SessionID: "session", NativeSessionID: "native", SourceCwd: "/source"}
+	node := stateSnapshotNode{SessionID: "session", NativeSessionID: "native", SourceCwd: absTestPath("source")}
 	partEvent := opencode.SyncEvent{
 		ID: "part", AggregateID: "native", Type: syncTypeMessagePartUpdated,
 		Data: map[string]json.RawMessage{
@@ -1095,7 +1109,7 @@ func TestStateStoreValidationReachableEdges(t *testing.T) {
 	partEvent.Data[jsonFieldTime] = json.RawMessage(`1e10000`)
 	require.Error(t, validateSyncEvent(partEvent, node))
 
-	invalid := validSyncSnapshot("session", "native", "/source")
+	invalid := validSyncSnapshot("session", "native", absTestPath("source"))
 	invalid.Format = "unsupported"
 	entry, err := json.Marshal(invalid)
 	require.NoError(t, err)
@@ -1107,7 +1121,7 @@ func TestStateStoreValidationReachableEdges(t *testing.T) {
 	require.Error(t, err)
 	require.False(t, found)
 
-	badMarshal := validSyncSnapshot("session", "native", "/source")
+	badMarshal := validSyncSnapshot("session", "native", absTestPath("source"))
 	badMarshal.Events["native"][0].Data[syncFieldInfo] = json.RawMessage(`{`)
 	require.Error(t, scanStateSnapshot(badMarshal, nil))
 

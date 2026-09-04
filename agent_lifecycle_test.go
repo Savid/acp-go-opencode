@@ -136,20 +136,20 @@ func TestReservedLifecycleKeyIsRefusedOnEveryCarryingRoute(t *testing.T) {
 		call func(*Agent) error
 	}{
 		{"session/new", func(a *Agent) error {
-			_, err := a.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", Meta: lifecycleKey()})
+			_, err := a.NewSession(context.Background(), acp.NewSessionRequest{Cwd: absTestPath("tmp"), Meta: lifecycleKey()})
 
 			return err
 		}},
 		{"session/load", func(a *Agent) error {
 			_, err := a.LoadSession(context.Background(), acp.LoadSessionRequest{
-				SessionId: "session-1", Cwd: "/tmp", Meta: lifecycleKey(),
+				SessionId: "session-1", Cwd: absTestPath("tmp"), Meta: lifecycleKey(),
 			})
 
 			return err
 		}},
 		{"session/resume", func(a *Agent) error {
 			_, err := a.ResumeSession(context.Background(), acp.ResumeSessionRequest{
-				SessionId: "session-1", Cwd: "/tmp", Meta: lifecycleKey(),
+				SessionId: "session-1", Cwd: absTestPath("tmp"), Meta: lifecycleKey(),
 			})
 
 			return err

@@ -300,10 +300,6 @@ func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *test
 		return nil
 	}
 
-	type promptResult struct {
-		response acp.PromptResponse
-		err      error
-	}
 	done := make(chan promptResult, 1)
 
 	go func() {
@@ -732,12 +728,12 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 		WithSessionOpenCodeOptions(OpenCodeOptions{
 			Model: "openai/gpt-test", Mode: "build", Permission: "allow",
 			Env:           map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""},
-			ExtraPathDirs: []string{"/original/bin"},
+			ExtraPathDirs: []string{absTestPath("original", "bin")},
 		}),
 	))
 	require.NoError(t, err)
 	require.NotEmpty(t, created.SessionId)
-	require.Equal(t, []string{"/original/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("original", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""}, client.scopes()[0].Env)
 
 	listed, err := agent.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
@@ -750,20 +746,20 @@ func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	loaded, err := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
 	require.NoError(t, err)
 	require.NotNil(t, loaded.Meta)
-	require.Equal(t, []string{"/original/bin"}, client.scopes()[1].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("original", "bin")}, client.scopes()[1].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-one", "EMPTY": ""}, client.scopes()[1].Env)
 	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
 	require.NoError(t, err)
 
 	resumed, err := agent.ResumeSession(ctx, ResumeSessionRequest(created.SessionId, cwd,
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(
-			WithOpenCodeExtraPathDirs("/replacement/bin"),
+			WithOpenCodeExtraPathDirs(absTestPath("replacement", "bin")),
 			WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "rotated"}),
 		)),
 	))
 	require.NoError(t, err)
 	require.NotNil(t, resumed.Meta)
-	require.Equal(t, []string{"/replacement/bin"}, client.scopes()[2].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("replacement", "bin")}, client.scopes()[2].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "rotated"}, client.scopes()[2].Env)
 	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId})
 	require.NoError(t, err)
@@ -821,14 +817,14 @@ func TestActiveLoadResumeReuseAnUnchangedCarrierWithoutConsumingCapacity(t *test
 			)
 			current := testSession(t, agent, client)
 			current.cwd = cwd
-			current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{"/same/bin"})
+			current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{absTestPath("same", "bin")})
 			require.NoError(t, current.snapshotToStore(t.Context()))
 
 			var options []SessionRequestOption
 			if method.name == "resume with identical carrier" {
 				options = append(options, WithSessionOpenCodeOptions(NewOpenCodeOptions(
 					WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "same"}),
-					WithOpenCodeExtraPathDirs("/same/bin"),
+					WithOpenCodeExtraPathDirs(absTestPath("same", "bin")),
 				)))
 			}
 
@@ -857,7 +853,7 @@ func TestActiveResumeHardCutsChangedCarrierBeforeSuccessorAdmission(t *testing.T
 	)
 	predecessor := testSession(t, agent, predecessorClient)
 	predecessor.cwd = cwd
-	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{"/old/bin"})
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{absTestPath("old", "bin")})
 	require.NoError(t, predecessor.snapshotToStore(t.Context()))
 
 	successorClient := newFakeOpenCodeClient()
@@ -874,7 +870,7 @@ func TestActiveResumeHardCutsChangedCarrierBeforeSuccessorAdmission(t *testing.T
 	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(predecessor.id, cwd,
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(
 			WithOpenCodeEnv(map[string]string{"SESSION_COLOR": "new"}),
-			WithOpenCodeExtraPathDirs("/new/bin"),
+			WithOpenCodeExtraPathDirs(absTestPath("new", "bin")),
 		)),
 	))
 	require.NoError(t, err)
@@ -889,7 +885,7 @@ func TestActiveResumeHardCutsChangedCarrierBeforeSuccessorAdmission(t *testing.T
 	require.NotSame(t, predecessor, successor)
 	require.Equal(t, 1, activeCount, "replacement leaked an active-session slot")
 	require.True(t, successor.snapshot().carrier.equal(newSessionCarrier(
-		map[string]string{"SESSION_COLOR": "new"}, []string{"/new/bin"},
+		map[string]string{"SESSION_COLOR": "new"}, []string{absTestPath("new", "bin")},
 	)))
 	require.Len(t, successorClient.scopes(), 1)
 }
@@ -904,7 +900,7 @@ func TestActiveResumeRebindsAnUnchangedCarrierAfterRuntimeLoss(t *testing.T) {
 	)
 	current := testSession(t, agent, predecessorClient)
 	current.cwd = cwd
-	current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{"/same/bin"})
+	current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{absTestPath("same", "bin")})
 	require.NoError(t, current.snapshotToStore(t.Context()))
 
 	current.detachRuntime(current.runtimeGeneration, errValueSharedRuntimeExited)
@@ -928,7 +924,7 @@ func TestActiveResumeRebindsAnUnchangedCarrierAfterRuntimeLoss(t *testing.T) {
 	require.Equal(t, 1, activeCount)
 	require.Len(t, successorClient.scopes(), 1)
 	require.True(t, current.snapshot().carrier.equal(newSessionCarrier(
-		map[string]string{"SESSION_COLOR": "same"}, []string{"/same/bin"},
+		map[string]string{"SESSION_COLOR": "same"}, []string{absTestPath("same", "bin")},
 	)))
 }
 
@@ -942,7 +938,7 @@ func TestActiveResumePublishesNoSuccessorWhenHardCutContainmentFails(t *testing.
 	)
 	predecessor := testSession(t, agent, predecessorClient)
 	predecessor.cwd = cwd
-	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{"/old/bin"})
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{absTestPath("old", "bin")})
 	require.NoError(t, predecessor.snapshotToStore(t.Context()))
 	predecessorClient.closeErr = errors.Join(errors.New("scope still live"), ErrContainmentIncomplete)
 
@@ -980,7 +976,7 @@ func TestActiveResumeBoundsContendedPredecessorCloseAdmission(t *testing.T) {
 
 	predecessor := testSession(t, agent, predecessorClient)
 	predecessor.cwd = cwd
-	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{"/old/bin"})
+	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{absTestPath("old", "bin")})
 	require.NoError(t, predecessor.snapshotToStore(t.Context()))
 	require.NoError(t, predecessor.recoveryMu.lock(context.Background()))
 
@@ -1476,8 +1472,8 @@ func TestLifecycleMCPPaginationAndRequestBuilderHelpers(t *testing.T) {
 	require.Error(t, err)
 
 	require.Equal(t, acp.SessionId("delete"), DeleteSessionRequest("delete").SessionId)
-	list := ListSessionsRequest(WithListSessionsCwd("/repo"))
-	require.Equal(t, "/repo", *list.Cwd)
+	list := ListSessionsRequest(WithListSessionsCwd(absTestPath("repo")))
+	require.Equal(t, absTestPath("repo"), *list.Cwd)
 }
 
 func TestDirectoryBindingFingerprintAndResourceBranches(t *testing.T) {
@@ -1664,7 +1660,7 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 		agent := NewAgent()
 		agent.runtime = client
 		parent := testSession(t, agent, client)
-		parent.carrier = newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "parent-token"}, []string{"/parent/bin"})
+		parent.carrier = newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "parent-token"}, []string{absTestPath("parent", "bin")})
 		agent.sessions[parent.id] = parent
 
 		return agent, client, parent
@@ -1673,15 +1669,15 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 	agent, client, parent := newForkAgent()
 	_, err := agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir()))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/parent/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("parent", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "parent-token"}, client.scopes()[0].Env)
 
 	agent, client, parent = newForkAgent()
 	_, err = agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir(),
-		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeExtraPathDirs("/child/bin"))),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeExtraPathDirs(absTestPath("child", "bin")))),
 	))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/child/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("child", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "parent-token"}, client.scopes()[0].Env,
 		"replacing one half of the carrier must leave the other half alone")
 
@@ -1692,7 +1688,7 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{}))),
 	))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/parent/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("parent", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Empty(t, client.scopes()[0].Env)
 }
 
@@ -1708,7 +1704,7 @@ func (store *summaryCoverageStore) ListSessions(context.Context) ([]SessionSumma
 func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
-	snapshot := validSyncSnapshot("session", "native", "/source")
+	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	encoded, err := json.Marshal(snapshot)
 	require.NoError(t, err)
 
@@ -1822,7 +1818,7 @@ func TestSessionCarrierReachesTheAddressedNativeScopeOnly(t *testing.T) {
 
 	agent := NewAgent(
 		WithHome(t.TempDir()),
-		WithEnv(map[string]string{"PATH": "/static/bin"}),
+		WithEnv(map[string]string{"PATH": absTestPath("static", "bin")}),
 		func(options *Options) {
 			options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
 				started = options
@@ -1834,17 +1830,17 @@ func TestSessionCarrierReachesTheAddressedNativeScopeOnly(t *testing.T) {
 	agent.setAgentClient(newRecordingAgentClient())
 
 	_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeExtraPathDirs("/session/bin"),
+		WithOpenCodeExtraPathDirs(absTestPath("session", "bin")),
 		WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "session-token"}),
 	))))
 	require.NoError(t, err)
-	require.Equal(t, []string{"/session/bin"}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("session", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "session-token"}, client.scopes()[0].Env)
 
 	// The shared process is started under the operator's environment only. A
 	// session value there would be the same value for every session of the
 	// Agent and would outlive the session that asked for it.
-	require.Equal(t, "/static/bin", started.Env["PATH"])
+	require.Equal(t, absTestPath("static", "bin"), started.Env["PATH"])
 	require.NotContains(t, started.Env, "WAGIE_API_TOKEN")
 
 	require.NoError(t, agent.Close())
@@ -1898,14 +1894,14 @@ func TestConcurrentSessionsCarryDistinctOrderedPathDirs(t *testing.T) {
 		)))
 	}
 
-	_, err := agent.NewSession(ctx, session("/one", "/shared", "/one"))
+	_, err := agent.NewSession(ctx, session(absTestPath("one"), absTestPath("shared"), absTestPath("one")))
 	require.NoError(t, err)
 
-	_, err = agent.NewSession(ctx, session("/two", "/shared"))
+	_, err = agent.NewSession(ctx, session(absTestPath("two"), absTestPath("shared")))
 	require.NoError(t, err)
 	require.EqualValues(t, 1, factoryCalls.Load())
-	require.Equal(t, []string{"/one", "/shared", "/one"}, client.scopes()[0].ExtraPathDirs)
-	require.Equal(t, []string{"/two", "/shared"}, client.scopes()[1].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("one"), absTestPath("shared"), absTestPath("one")}, client.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("two"), absTestPath("shared")}, client.scopes()[1].ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }
 
@@ -1941,7 +1937,7 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	agent.setAgentClient(newRecordingAgentClient())
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
-		WithOpenCodeExtraPathDirs("/session/bin"),
+		WithOpenCodeExtraPathDirs(absTestPath("session", "bin")),
 	))))
 	require.NoError(t, err)
 	establishCreatedSession(t, agent, created.SessionId)
@@ -1960,7 +1956,7 @@ func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	startedMu.Lock()
 	require.Len(t, started, 2)
 	startedMu.Unlock()
-	require.Equal(t, []string{"/session/bin"}, second.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("session", "bin")}, second.scopes()[0].ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }
 
@@ -2353,16 +2349,16 @@ func TestAgentStoreAndActiveLoadMatchEdges(t *testing.T) {
 	require.Error(t, agent.storeStartedSession(&session{id: id}))
 
 	active := &session{
-		cwd: "/cwd", providerID: "provider", modelID: "model", mode: "build", permission: "ask",
+		cwd: absTestPath("cwd"), providerID: "provider", modelID: "model", mode: "build", permission: "ask",
 		outputSchema: map[string]any{"type": "object"}, carrier: sessionCarrier{},
 	}
 	snapshot := active.snapshot()
-	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
+	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
 		sessionMeta{Model: "other/model"}, sessionCarrier{}))
-	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
+	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
 		sessionMeta{Mode: "plan"}, sessionCarrier{}))
-	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
+	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
 		sessionMeta{PermissionSet: true, Permission: "allow"}, sessionCarrier{}))
-	require.False(t, activeLoadRequestMatches(snapshot, active, "/cwd", nil, nil, nil,
+	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
 		sessionMeta{OutputSchema: map[string]any{"type": "array"}}, sessionCarrier{}))
 }

@@ -24,12 +24,12 @@ func TestPluginSeedDirResolution(t *testing.T) {
 	})
 
 	t.Run("explicit directory wins", func(t *testing.T) {
-		agent := NewAgent(WithPluginSeedDir("/srv/seed"))
-		require.Equal(t, "/srv/seed", agent.pluginSeedDir(context.Background()))
+		agent := NewAgent(WithPluginSeedDir(absTestPath("srv", "seed")))
+		require.Equal(t, absTestPath("srv", "seed"), agent.pluginSeedDir(context.Background()))
 	})
 
 	t.Run("disabled resolves to nothing", func(t *testing.T) {
-		agent := NewAgent(WithPluginSeedDir("/srv/seed"), WithPluginSeed(false))
+		agent := NewAgent(WithPluginSeedDir(absTestPath("srv", "seed")), WithPluginSeed(false))
 		require.Empty(t, agent.pluginSeedDir(context.Background()))
 
 		reenabled := NewAgent(WithPluginSeed(false), WithPluginSeed(true))
@@ -37,7 +37,7 @@ func TestPluginSeedDirResolution(t *testing.T) {
 	})
 
 	t.Run("pure runtimes install no plugin loader", func(t *testing.T) {
-		agent := NewAgent(WithPluginSeedDir("/srv/seed"), WithOpenCodePure(true))
+		agent := NewAgent(WithPluginSeedDir(absTestPath("srv", "seed")), WithOpenCodePure(true))
 		require.Empty(t, agent.pluginSeedDir(context.Background()))
 	})
 

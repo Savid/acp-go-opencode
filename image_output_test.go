@@ -44,8 +44,8 @@ func TestOutputHelperPredicates(t *testing.T) {
 	})
 
 	t.Run("localArtifactPath", func(t *testing.T) {
-		require.Equal(t, "/abs/a.png", localArtifactPath("/abs/a.png"))
-		require.Equal(t, "/tmp/a.png", localArtifactPath("file:///tmp/a.png"))
+		require.Equal(t, absTestPath("abs", "a.png"), localArtifactPath(absTestPath("abs", "a.png")))
+		require.Equal(t, absTestPath("tmp", "a.png"), localArtifactPath(testFileURI(absTestPath("tmp", "a.png"))))
 		require.Empty(t, localArtifactPath("http://example.com/a.png"))
 		require.Empty(t, localArtifactPath("%zz"))
 	})
@@ -194,7 +194,7 @@ func TestMapOutputArtifactExtraBranches(t *testing.T) {
 		sess, _ := newImageSession(t)
 		path := filepath.Join(sess.cwd, "note.txt")
 		require.NoError(t, os.WriteFile(path, []byte("hi"), 0o600))
-		_, mapped, err := sess.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: "text/plain", URL: "file://" + path}, "id-1", provenanceTool, false)
+		_, mapped, err := sess.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: "text/plain", URL: testFileURI(path)}, "id-1", provenanceTool, false)
 		require.NoError(t, err)
 		require.False(t, mapped)
 	})
@@ -213,7 +213,7 @@ func TestMapOutputArtifactExtraBranches(t *testing.T) {
 		sess, _ := newImageSession(t)
 		path := filepath.Join(sess.cwd, "fake.png")
 		require.NoError(t, os.WriteFile(path, []byte("still not an image"), 0o600))
-		_, _, err := sess.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: "file://" + path}, "id-1", provenanceTool, false)
+		_, _, err := sess.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: testFileURI(path)}, "id-1", provenanceTool, false)
 		data := assertTurnFailed(t, err, causeTransport, "")
 		require.Equal(t, outputReasonNotARaster, data[jsonFieldReason])
 	})
@@ -237,7 +237,7 @@ func TestMapLocalImageArtifactReplay(t *testing.T) {
 		sess, _ := newImageSession(t)
 		path := filepath.Join(sess.cwd, "shot.png")
 		require.NoError(t, os.WriteFile(path, png, 0o600))
-		attachment := opencode.NativeAttachment{Mime: mimePNG, URL: "file://" + path}
+		attachment := opencode.NativeAttachment{Mime: mimePNG, URL: testFileURI(path)}
 
 		_, mapped, err := sess.mapOutputArtifact(ctx, attachment, "id-1", provenanceTool, false)
 		require.NoError(t, err)
@@ -253,7 +253,7 @@ func TestMapLocalImageArtifactReplay(t *testing.T) {
 
 	t.Run("replay of a swept artifact fails", func(t *testing.T) {
 		sess, _ := newImageSession(t)
-		_, _, err := sess.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: "file:///tmp/gone.png"}, "missing", provenanceTool, true)
+		_, _, err := sess.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: testFileURI(absTestPath("tmp", "gone.png"))}, "missing", provenanceTool, true)
 		data := assertTurnFailed(t, err, causeTransport, "")
 		require.Equal(t, outputReasonStorageFailed, data[jsonFieldReason])
 	})
@@ -263,7 +263,7 @@ func TestMapLocalImageArtifactReplay(t *testing.T) {
 		sess.setImageArtifacts(map[string]imageArtifactRecord{
 			"fp": {Version: imageArtifactRecordVersion, NativeID: "id-bad", Fingerprint: "fp", Mime: mimePNG, Data: "!!!!"},
 		})
-		_, _, err := sess.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: "file:///tmp/x.png"}, "id-bad", provenanceTool, true)
+		_, _, err := sess.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: testFileURI(absTestPath("tmp", "x.png"))}, "id-bad", provenanceTool, true)
 		data := assertTurnFailed(t, err, causeTransport, "")
 		require.Equal(t, outputReasonStorageFailed, data[jsonFieldReason])
 	})
@@ -312,7 +312,7 @@ func TestMaterializeLocalImage(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, png, 0o600))
 
 		item, mapped, err := session.mapOutputArtifact(ctx, opencode.NativeAttachment{
-			Mime: mimePNG, URL: "file://" + path,
+			Mime: mimePNG, URL: testFileURI(path),
 		}, "id-1", provenanceTool, false)
 		require.NoError(t, err)
 		require.True(t, mapped)
@@ -339,7 +339,7 @@ func TestMaterializeLocalImage(t *testing.T) {
 		require.False(t, pathWithinRoot(session.cwd, path))
 
 		item, mapped, err := session.mapOutputArtifact(ctx, opencode.NativeAttachment{
-			Mime: mimePNG, URL: "file://" + path,
+			Mime: mimePNG, URL: testFileURI(path),
 		}, "id-temp", provenanceTool, false)
 		require.NoError(t, err)
 		require.True(t, mapped)
@@ -374,7 +374,7 @@ func TestMaterializeLocalImage(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, png, 0o600))
 
 		item, mapped, err := session.mapOutputArtifact(ctx, opencode.NativeAttachment{
-			Mime: mimePNG, URL: "file://" + path,
+			Mime: mimePNG, URL: testFileURI(path),
 		}, "id-temp-link", provenanceTool, false)
 		require.NoError(t, err)
 		require.True(t, mapped)
@@ -386,7 +386,7 @@ func TestMaterializeLocalImage(t *testing.T) {
 		outside := filepath.Join(narrowedOutsideRoot(t, session), "elsewhere.png")
 		require.NoError(t, os.WriteFile(outside, png, 0o600))
 
-		_, _, err := session.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: "file://" + outside}, "id-1", provenanceTool, false)
+		_, _, err := session.mapOutputArtifact(ctx, opencode.NativeAttachment{Mime: mimePNG, URL: testFileURI(outside)}, "id-1", provenanceTool, false)
 		data := assertTurnFailed(t, err, causeTransport, "")
 		require.Equal(t, outputReasonPathNotAllowed, data[jsonFieldReason])
 	})
@@ -580,7 +580,7 @@ func TestMapLocalImageArtifactReplayFinishError(t *testing.T) {
 	sess.setImageArtifacts(map[string]imageArtifactRecord{
 		"fp": {Version: imageArtifactRecordVersion, NativeID: "id-x", Fingerprint: "fp", Mime: mimePNG, Data: notRaster},
 	})
-	_, _, err := sess.mapOutputArtifact(context.Background(), opencode.NativeAttachment{Mime: mimePNG, URL: "file:///tmp/x.png"}, "id-x", provenanceTool, true)
+	_, _, err := sess.mapOutputArtifact(context.Background(), opencode.NativeAttachment{Mime: mimePNG, URL: testFileURI(absTestPath("tmp", "x.png"))}, "id-x", provenanceTool, true)
 	data := assertTurnFailed(t, err, causeTransport, "")
 	require.Equal(t, outputReasonNotARaster, data[jsonFieldReason])
 }

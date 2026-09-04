@@ -109,7 +109,7 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 		t.Fatalf("empty session id delete left tombstones: %#v", store.tombstones)
 	}
 	store.mu.Unlock()
-	snapshot := validSyncSnapshot("s1", "native-1", "/repo")
+	snapshot := validSyncSnapshot("s1", "native-1", absTestPath("repo"))
 	snapshot.CapturedAtUnixMilli = 200
 	snapshot.Session.Title = "Stored"
 	entryBytes, err := json.Marshal(snapshot)
@@ -150,7 +150,7 @@ func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
 			stored = &summaries[i]
 		}
 	}
-	if len(summaries) != 2 || stored == nil || stored.Cwd != "/repo" || stored.Title != "Stored" {
+	if len(summaries) != 2 || stored == nil || stored.Cwd != absTestPath("repo") || stored.Title != "Stored" {
 		t.Fatalf("summaries = %#v", summaries)
 	}
 	subkeys, err := store.ListSubkeys(ctx, key)

@@ -246,7 +246,7 @@ func localArtifactPath(value string) string {
 		return ""
 	}
 
-	return parsed.Path
+	return localPathFromURIPath(parsed.Path)
 }
 
 func resourceLinkItem(artifact opencode.NativeAttachment) imageOutputItem {

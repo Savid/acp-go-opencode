@@ -1707,14 +1707,7 @@ func TestXDGEnvAndPipeHelpers(t *testing.T) {
 	if err != nil || strings.Contains(permissionConfig, `"permission"`) {
 		t.Fatalf("runtime config = %q err=%v", permissionConfig, err)
 	}
-	permissionFile := filepath.Join(xdg.Config, "opencode", "opencode.json")
-	info, err := os.Stat(permissionFile)
-	if err != nil {
-		t.Fatalf("permission config file stat: %v", err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("permission config file mode = %v", info.Mode().Perm())
-	}
+	requireOwnerOnlyMode(t, filepath.Join(xdg.Config, "opencode", "opencode.json"), 0o600)
 	configRootFile := filepath.Join(t.TempDir(), "config-file")
 	if writeErr := os.WriteFile(configRootFile, []byte("file"), 0o600); writeErr != nil {
 		t.Fatal(writeErr)
@@ -1830,7 +1823,11 @@ func TestOpenCodeSeedFilesMergeAndConfinement(t *testing.T) {
 
 	// Path confinement: absolute, parent escapes, dot, empty, and
 	// whitespace-only keys fail closed.
-	for _, bad := range []string{"/etc/passwd", "../escape.json", "a/../../escape", ".", "", "   ", "\t"} {
+	// A rooted path is refused whichever way the platform spells one: the
+	// volume-qualified form and the volume-relative "/etc/passwd" alike.
+	for _, bad := range []string{
+		absTestPath("etc", "passwd"), "/etc/passwd", "../escape.json", "a/../../escape", ".", "", "   ", "\t",
+	} {
 		if _, err := materializeOpenCodePermissionConfig(testXDGDirs(t), "ask", map[string]string{bad: "x"}, nil); err == nil {
 			t.Fatalf("seed path %q was not rejected", bad)
 		}
@@ -2219,11 +2216,8 @@ func fakeOpenCodeExecutable(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("test executable: %v", err)
 	}
-	script := filepath.Join(directory, "fake-opencode")
-	body := fmt.Sprintf(
-		"#!/bin/sh\nACP_GO_OPENCODE_FAKE_SERVER_HELPER=1 exec %q -test.run=TestFakeOpenCodeServerProcessHelper -- \"$@\"\n",
-		executable,
-	)
+	script := filepath.Join(directory, fakeOpenCodeLauncherName)
+	body := fakeOpenCodeLauncher(executable)
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake executable: %v", err)
 	}
@@ -2330,7 +2324,7 @@ func instantiateFakeSessionCarrierPlugin() {
 		if err != nil || parsed.Scheme != "file" {
 			continue
 		}
-		source, err := os.ReadFile(parsed.Path)
+		source, err := os.ReadFile(testLocalPathFromURIPath(parsed.Path))
 		if err != nil {
 			continue
 		}

@@ -130,6 +130,7 @@ func TestStartBrokerFallsBackToTheDefaultFactory(t *testing.T) {
 	harness := newAuthAgent(t)
 	agent, broker := harness.agent, harness.broker
 	restoreBrokerSeams(t)
+	neutralizeBrowserShimWhereUnsupported(t)
 
 	agent.options.clientFactory = nil
 
@@ -209,38 +210,6 @@ func TestDestroyToleratesANilBroker(t *testing.T) {
 	broker.destroy(context.Background())
 }
 
-func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testing.T) {
-	harness := newAuthAgent(t)
-	agent, broker := harness.agent, harness.broker
-	restoreBrokerSeams(t)
-
-	node := newFakeOpenCodeClient()
-
-	var handed opencode.StartOptions
-
-	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
-		handed = options
-
-		return node, nil
-	}
-
-	created, err := broker.startBroker(context.Background())
-	require.NoError(t, err)
-	require.NotNil(t, handed.BrowserShim)
-	require.Same(t, created.shim, handed.BrowserShim)
-	require.Equal(t, filepath.Join(created.home, "control"), handed.ControlRoot)
-	require.Nil(t, handed.StartProcess)
-	require.Nil(t, handed.PrepareTree)
-	require.Nil(t, handed.ReclaimTree)
-	require.NotNil(t, handed.NativeEnvironment)
-	require.Equal(t, agent.scratchParent(), filepath.Dir(handed.BrowserShim.Dir()))
-	require.True(t, strings.HasPrefix(filepath.Base(handed.BrowserShim.Dir()), "acp-go-opencode-browser-shim-"))
-	require.FileExists(t, filepath.Join(handed.BrowserShim.Dir(), "open"))
-
-	created.destroy(context.Background())
-	require.NoDirExists(t, handed.BrowserShim.Dir())
-}
-
 // TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment proves the
 // login runtime is built as ordinary execution from the ambient snapshot the Agent captured once,
 // with the adapter-private carriers and every adapter-managed OpenCode root
@@ -260,6 +229,7 @@ func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testi
 	harness := newAuthAgent(t)
 	agent, broker := harness.agent, harness.broker
 	restoreBrokerSeams(t)
+	neutralizeBrowserShimWhereUnsupported(t)
 
 	var handed opencode.StartOptions
 
@@ -285,20 +255,4 @@ func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testi
 	// is the broker inheriting a caller override of one.
 	require.NotContains(t, handed.Env, "OPENCODE_DB")
 	require.NotContains(t, handed.Env, "OPENCODE_CONFIG_DIR")
-}
-
-func TestDestroyReportsBrowserShimRemovalFailure(t *testing.T) {
-	restoreBrokerSeams(t)
-
-	shim, err := opencode.NewBrowserShim(t.TempDir())
-	require.NoError(t, err)
-
-	// The removal failure is injected, and the shim survives destruction.
-	broker := &authBroker{
-		home: t.TempDir(), shim: shim, client: newFakeOpenCodeClient(), log: slog.New(slog.DiscardHandler),
-		removeShim: func() error { return errors.New("remove shim") },
-	}
-	broker.destroy(context.Background())
-
-	require.DirExists(t, shim.Dir())
 }

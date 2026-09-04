@@ -736,9 +736,7 @@ func TestSharedRuntimeConstructionEdges(t *testing.T) {
 	generatedRoot, generated, err := (&Agent{options: Options{ScratchDir: t.TempDir()}}).newRuntimeRoot()
 	require.NoError(t, err)
 	require.True(t, generated)
-	info, err := os.Stat(generatedRoot)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+	requireOwnerOnlyMode(t, generatedRoot, 0o700)
 
 	authority := edgeAuthority{
 		environment: func() map[string]string { return map[string]string{} },

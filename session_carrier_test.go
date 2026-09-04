@@ -59,7 +59,7 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 		{"empty name", map[string]any{"": "bearer"}, envOptionPath + "."},
 		{"name carries an equals sign", map[string]any{"A=B": "bearer"}, envOptionPath + ".A=B"},
 		{"name carries a NUL", map[string]any{"A\x00B": "bearer"}, envOptionPath + ".A\x00B"},
-		{"raw PATH", map[string]any{envPathKey: "/attacker/bin"}, envOptionPath + "." + envPathKey},
+		{"raw PATH", map[string]any{envPathKey: absTestPath("attacker", "bin")}, envOptionPath + "." + envPathKey},
 		{"managed OpenCode root", map[string]any{managedOpenCodeRoot: "/elsewhere"}, envOptionPath + "." + managedOpenCodeRoot},
 		{"managed XDG root", map[string]any{managedXDGRoot: "/elsewhere"}, envOptionPath + "." + managedXDGRoot},
 	}
@@ -78,7 +78,7 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T) {
 	for _, spelling := range []string{"path", "Path", "PaTh"} {
 		meta, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
-			metaEnvKey: map[string]any{spelling: "/attacker/bin"},
+			metaEnvKey: map[string]any{spelling: absTestPath("attacker", "bin")},
 		}))
 
 		if runtime.GOOS == "windows" {
@@ -88,14 +88,14 @@ func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T)
 		}
 
 		require.NoError(t, err)
-		require.Equal(t, map[string]string{spelling: "/attacker/bin"}, meta.Env)
+		require.Equal(t, map[string]string{spelling: absTestPath("attacker", "bin")}, meta.Env)
 	}
 }
 
 func TestLifecycleMetaAllowsTheCarrierOptionsOnly(t *testing.T) {
 	_, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 		metaEnvKey:           map[string]any{"WAGIE_API_TOKEN": "bearer"},
-		metaExtraPathDirsKey: []any{"/session/bin"},
+		metaExtraPathDirsKey: []any{absTestPath("session", "bin")},
 	}))
 	require.NoError(t, err)
 
@@ -104,17 +104,17 @@ func TestLifecycleMetaAllowsTheCarrierOptionsOnly(t *testing.T) {
 }
 
 func TestCarrierFromMetaReplacesOnlyThePresentHalf(t *testing.T) {
-	recorded := newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "old"}, []string{"/old/bin"})
+	recorded := newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "old"}, []string{absTestPath("old", "bin")})
 
 	unchanged := carrierFromMeta(sessionMeta{}, recorded)
 	require.Equal(t, recorded, unchanged)
 
 	rotated := carrierFromMeta(sessionMeta{
 		EnvSet: true, Env: map[string]string{"WAGIE_API_TOKEN": "new"},
-		ExtraPathDirsSet: true, ExtraPathDirs: []string{"/new/bin"},
+		ExtraPathDirsSet: true, ExtraPathDirs: []string{absTestPath("new", "bin")},
 	}, recorded)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "new"}, rotated.Env)
-	require.Equal(t, []string{"/new/bin"}, rotated.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("new", "bin")}, rotated.ExtraPathDirs)
 	require.NotEqual(t, recorded, rotated, "the recorded carrier must not be mutated in place")
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "old"}, recorded.Env)
 
@@ -123,23 +123,23 @@ func TestCarrierFromMetaReplacesOnlyThePresentHalf(t *testing.T) {
 	require.Empty(t, cleared.ExtraPathDirs)
 
 	// The clone is deep: a caller that keeps one cannot reach into the other.
-	source := newSessionCarrier(map[string]string{"A": "1"}, []string{"/bin"})
+	source := newSessionCarrier(map[string]string{"A": "1"}, []string{absTestPath("bin")})
 	copied := source.clone()
 	copied.Env["A"] = "2"
 	copied.ExtraPathDirs[0] = "/other"
 	require.Equal(t, map[string]string{"A": "1"}, source.Env)
-	require.Equal(t, []string{"/bin"}, source.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("bin")}, source.ExtraPathDirs)
 	require.NotEqual(t, source, copied)
 }
 
 func TestCarrierScopeOptionsClone(t *testing.T) {
-	carrier := newSessionCarrier(map[string]string{"A": "1"}, []string{"/bin"})
-	options := carrier.scopeOptions("/cwd", []opencode.MCPServerConfig{{Name: "tools"}})
-	require.Equal(t, "/cwd", options.Directory)
+	carrier := newSessionCarrier(map[string]string{"A": "1"}, []string{absTestPath("bin")})
+	options := carrier.scopeOptions(absTestPath("cwd"), []opencode.MCPServerConfig{{Name: "tools"}})
+	require.Equal(t, absTestPath("cwd"), options.Directory)
 	options.Env["A"] = "2"
 	options.ExtraPathDirs[0] = "/other"
 	require.Equal(t, map[string]string{"A": "1"}, carrier.Env)
-	require.Equal(t, []string{"/bin"}, carrier.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("bin")}, carrier.ExtraPathDirs)
 }
 
 // TestConcurrentSessionsCarryDistinctBearersAndDirectories is the isolation
@@ -177,17 +177,17 @@ func TestConcurrentSessionsCarryDistinctBearersAndDirectories(t *testing.T) {
 		return response.SessionId
 	}
 
-	first := start("bearer-one", "/one", "/shared")
-	second := start("bearer-two", "/two", "/shared")
+	first := start("bearer-one", absTestPath("one"), absTestPath("shared"))
+	second := start("bearer-two", absTestPath("two"), absTestPath("shared"))
 	require.NotEqual(t, first, second)
 	require.EqualValues(t, 1, factoryCalls.Load(), "one runtime serves both sessions")
 
 	scopes := client.scopes()
 	require.Len(t, scopes, 2)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-one"}, scopes[0].Env)
-	require.Equal(t, []string{"/one", "/shared"}, scopes[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("one"), absTestPath("shared")}, scopes[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-two"}, scopes[1].Env)
-	require.Equal(t, []string{"/two", "/shared"}, scopes[1].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("two"), absTestPath("shared")}, scopes[1].ExtraPathDirs)
 
 	require.NoError(t, agent.Close())
 }
@@ -218,13 +218,13 @@ func TestRebindRotatesOneSessionAndLeavesItsPeerAlone(t *testing.T) {
 
 	rotating, err := agent.NewSession(ctx, NewSessionRequest(rotatingCwd, WithSessionOpenCodeOptions(NewOpenCodeOptions(
 		WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "bearer-one", "OPERATION": "first"}),
-		WithOpenCodeExtraPathDirs("/first/bin"),
+		WithOpenCodeExtraPathDirs(absTestPath("first", "bin")),
 	))))
 	require.NoError(t, err)
 
 	_, err = agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
 		WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "bearer-peer"}),
-		WithOpenCodeExtraPathDirs("/peer/bin"),
+		WithOpenCodeExtraPathDirs(absTestPath("peer", "bin")),
 	))))
 	require.NoError(t, err)
 
@@ -234,7 +234,7 @@ func TestRebindRotatesOneSessionAndLeavesItsPeerAlone(t *testing.T) {
 	_, err = agent.ResumeSession(ctx, ResumeSessionRequest(rotating.SessionId, rotatingCwd,
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(
 			WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "bearer-rotated"}),
-			WithOpenCodeExtraPathDirs("/rotated/bin"),
+			WithOpenCodeExtraPathDirs(absTestPath("rotated", "bin")),
 		)),
 	))
 	require.NoError(t, err)
@@ -244,12 +244,12 @@ func TestRebindRotatesOneSessionAndLeavesItsPeerAlone(t *testing.T) {
 
 	rebound := scopes[2]
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-rotated"}, rebound.Env)
-	require.Equal(t, []string{"/rotated/bin"}, rebound.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("rotated", "bin")}, rebound.ExtraPathDirs)
 	require.NotContains(t, rebound.Env, "OPERATION", "the replaced environment must not retain a stale key")
 
 	peer := scopes[1]
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-peer"}, peer.Env)
-	require.Equal(t, []string{"/peer/bin"}, peer.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("peer", "bin")}, peer.ExtraPathDirs)
 
 	require.NoError(t, agent.Close())
 }
@@ -289,7 +289,7 @@ func TestRecoveredSessionKeepsItsCarrier(t *testing.T) {
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
 		WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "bearer-recovered"}),
-		WithOpenCodeExtraPathDirs("/session/bin"),
+		WithOpenCodeExtraPathDirs(absTestPath("session", "bin")),
 	))))
 	require.NoError(t, err)
 	establishCreatedSession(t, agent, created.SessionId)
@@ -309,7 +309,7 @@ func TestRecoveredSessionKeepsItsCarrier(t *testing.T) {
 	startedMu.Unlock()
 
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-recovered"}, second.scopes()[0].Env)
-	require.Equal(t, []string{"/session/bin"}, second.scopes()[0].ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("session", "bin")}, second.scopes()[0].ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }
 
@@ -330,7 +330,7 @@ func TestSecondTurnKeepsTheCarrier(t *testing.T) {
 
 	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(
 		WithOpenCodeEnv(map[string]string{"WAGIE_API_TOKEN": "bearer-turns"}),
-		WithOpenCodeExtraPathDirs("/turns/bin"),
+		WithOpenCodeExtraPathDirs(absTestPath("turns", "bin")),
 	))))
 	require.NoError(t, err)
 	establishCreatedSession(t, agent, created.SessionId)
@@ -343,7 +343,7 @@ func TestSecondTurnKeepsTheCarrier(t *testing.T) {
 
 	snapshot := agent.sessions[created.SessionId].snapshot()
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "bearer-turns"}, snapshot.carrier.Env)
-	require.Equal(t, []string{"/turns/bin"}, snapshot.carrier.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("turns", "bin")}, snapshot.carrier.ExtraPathDirs)
 	require.NoError(t, agent.Close())
 }
 
