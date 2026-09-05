@@ -996,3 +996,82 @@ func TestUnroutableNativeActionsAreDroppedOnARetiredIncarnation(t *testing.T) {
 	require.Zero(t, client.permissionReplyCount(), "a retired incarnation answered a permission")
 	require.Zero(t, client.questionRejectCount(), "a retired incarnation answered a question")
 }
+
+// TestTerminalizeActionReportsARefusedRunningTransition pins the failure path
+// after the transition that releases a cycle. The refusal is deterministic
+// rather than a delivery race: the stream still holds a nonterminal blocker for
+// the cycle, so the reducer refuses `running` outright while the resolution that
+// preceded it was accepted. The call must report that refusal and must not wait
+// on the accepted resolution's receipt first — a parked delivery proves it,
+// because a call that waited could not return at all.
+func TestTerminalizeActionReportsARefusedRunningTransition(t *testing.T) {
+	ctx := context.Background()
+	current, _, connection := lifecycleSession(t)
+	current.stopPump()
+	binding := testIncarnation(current)
+
+	current.lifecycleMu.Lock()
+	cycle, err := current.openAgentCycleLocked(ctx)
+	current.lifecycleMu.Unlock()
+	require.NoError(t, err)
+
+	newAction := func(id string) *pendingAction {
+		return &pendingAction{
+			id: id, binding: binding, cycle: cycle,
+			owner: lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: cycle.turnID},
+		}
+	}
+
+	resolving, lingering := newAction("resolving"), newAction("lingering")
+	for _, action := range []*pendingAction{resolving, lingering} {
+		announced, announceErr := current.announceAction(ctx, action, cycle)
+		require.True(t, announced)
+		require.NoError(t, announceErr)
+	}
+
+	// The adapter's own blocker set knows only one of the two blockers the
+	// stream is holding, so resolving it reaches the running transition while
+	// the stream still has a nonterminal blocker for the same cycle.
+	current.lifecycleMu.Lock()
+	cycle.blockers[resolving.id] = struct{}{}
+	current.lifecycleMu.Unlock()
+
+	// The resolution's delivery is parked before the call runs, so the receipt
+	// it would have waited on stays unresolved for the whole test.
+	connection.mu.Lock()
+	connection.updateStarted = make(chan struct{})
+	connection.updateRelease = make(chan struct{})
+	started, release := connection.updateStarted, connection.updateRelease
+	connection.mu.Unlock()
+
+	defer close(release)
+
+	result := make(chan error, 1)
+
+	go func() { result <- current.terminalizeAction(ctx, resolving, lifecycle.ActionAccepted) }()
+
+	select {
+	case terminalErr := <-result:
+		require.ErrorContains(t, terminalErr, "is blocked and reported "+string(lifecycle.ForegroundRunning))
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminalizeAction waited on the resolution receipt it never published a transition for")
+	}
+
+	// The resolution really was in flight and unresolved: the transition that
+	// would have followed it was never handed to the transport.
+	requireSignal(t, started)
+	require.Equal(t, lifecycle.ForegroundRequiresAction, current.lifecycleStateForTest(t))
+}
+
+// lifecycleStateForTest reports the foreground state the emitted stream proves.
+func (s *session) lifecycleStateForTest(t *testing.T) lifecycle.ForegroundState {
+	t.Helper()
+
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	stream := s.lifecycleStreamLocked()
+	require.NotNil(t, stream)
+
+	return stream.State().Foreground.State
+}
