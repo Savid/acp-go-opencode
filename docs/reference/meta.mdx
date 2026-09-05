@@ -173,7 +173,7 @@ A failed turn returns an ACP internal error whose `data` carries:
 | Field | Meaning |
 |---|---|
 | `error` | Always `opencode_turn_failed`. |
-| `cause` | `provider`, `transport`, or `timeout`; a shared-runtime exit is `transport`. |
+| `cause` | `provider`, `transport`, or `timeout`; a shared-runtime exit and a native incarnation lost mid-turn are both `transport`. |
 | `message` | A fixed closed description for the selected `cause`; native/provider text is never copied here. |
 | `statusCode` | Included when a provider reports a positive numeric HTTP status. |
 | `structuredOutputRequested` | `true` when the turn sent a native output schema. |
@@ -182,6 +182,47 @@ A failed turn returns an ACP internal error whose `data` carries:
 
 No native response body, SSE payload, tool failure body, panic value, or provider
 code crosses this error surface.
+
+## Internal-error data
+
+Every `-32603` this adapter raises off the prompt-turn path carries a single
+closed token in `data.error`, `message` stays the JSON-RPC constant
+`Internal error`, and the data never carries a `message` member, a Go error
+string, or native text:
+
+| `error` | Additional members | Raised when |
+|---|---|---|
+| `opencode_invalid_options` | none | The agent was constructed with an option set it will not serve under. `NewAgent` returns no error, so the verdict is delivered on `initialize` and on every session-establishing entry point. The refused options are joined onto the wrapped Go error for the operator's log and never reach the wire. |
+| `opencode_restore_failed` | none | `session/load` or `session/resume` found a store entry it could not replay. The entry is neither deleted nor tombstoned; the store and native detail stay in the `-debug` stream. |
+| `opencode_runtime_unavailable` | none | The shared `opencode serve` runtime is gone and cannot be replaced: a previous incarnation's process tree is still alive and un-containable, or a directory scope's MCP disconnect could not be proven and quarantined the generation. A runtime that merely exited is never this token — the next explicit operation starts one replacement. |
+| `opencode_session_poisoned` | `cause` | The addressed session is poisoned and refuses every operation but `session/close` and `session/delete`. `cause` is the closed token `native_session_id_drift`: the harness attributed a message or part to a session id the logical session does not own. The drifting field and the two native ids stay in the `-debug` stream. |
+| `opencode_internal_failure` | optional `class` | Every failure the adapter cannot classify above. `class` is one of the closed tokens `native_startup` (a loopback call failed while a runtime or native session was starting; its route, status, and body stay off the wire) and `session_replacement_raced` (the addressed session's active incarnation changed under a replacement). |
+
+`-32603` is never answered with a different code: a poisoned session is not
+`-32600`, and the construction verdict is never `-32602`, because it names the
+agent's own state rather than a defect in the caller's request.
+
+## Reserved-key refusals on `session/prompt`
+
+The two reserved keys a prompt carries are read before the session id is
+resolved, so a host that got one wrong reads that answer even on a session that
+does not exist. Route validation runs first, so a prompt that fails both reports
+the route refusal alone.
+
+| Condition | `-32602` data |
+|---|---|
+| `_meta["acp-go.dev/route"]` absent | `{"error":"missing","field":"_meta[\"acp-go.dev/route\"]"}` |
+| route value is not an object | `{"error":"unsupported","field":"_meta[\"acp-go.dev/route\"]"}` |
+| route `version` missing or not `1` | `{"error":"unsupported","field":"_meta[\"acp-go.dev/route\"].version"}` |
+| route `turnNonce` missing, empty, or over 4096 bytes | `{"error":"unsupported","field":"_meta[\"acp-go.dev/route\"].turnNonce"}` |
+| route carries an unknown member | `{"error":"unsupported","field":"_meta[\"acp-go.dev/route\"].<member>"}` |
+| `_meta["acp-go.dev/lifecycle"]` absent while the capability is enabled | `{"error":"missing","field":"_meta[\"acp-go.dev/lifecycle\"]"}` |
+| lifecycle correlation malformed | `{"error":"unsupported","field":"_meta[\"acp-go.dev/lifecycle\"].<member path>"}` |
+| lifecycle key present while the capability was not negotiated | `{"error":"unsupported","field":"_meta[\"acp-go.dev/lifecycle\"]"}` |
+
+`missing` and `unsupported` are distinct verdicts and are never collapsed:
+`unsupported` names a value that is present and refused, `missing` names one the
+contract requires and the caller left out.
 
 ## Provider-auth error data
 

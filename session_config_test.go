@@ -257,9 +257,10 @@ func TestUnknownModelReachesOpenCodeAndFailsClosedWithoutExactAssistant(t *testi
 
 	select {
 	case promptErr := <-done:
-		data := requireInternalErrorData(t, promptErr)
-		require.Equal(t, "opencode_turn_assistant_identity_missing", data[jsonFieldError])
-		require.Equal(t, causeProvider, data[jsonFieldCause])
+		// A native failure that produced no assistant step is a provider
+		// refusal in the one contracted turn-failure envelope, never an
+		// adapter-symptom token of its own.
+		assertTurnFailed(t, promptErr, causeProvider, "")
 	case <-time.After(2 * time.Second):
 		t.Fatal("prompt did not return the native model error")
 	}
@@ -347,9 +348,10 @@ func TestUnadvertisedModeReachesOpenCodeAndFailsClosedWithoutExactAssistant(t *t
 
 	select {
 	case promptErr := <-done:
-		data := requireInternalErrorData(t, promptErr)
-		require.Equal(t, "opencode_turn_assistant_identity_missing", data[jsonFieldError])
-		require.Equal(t, causeProvider, data[jsonFieldCause])
+		// A native failure that produced no assistant step is a provider
+		// refusal in the one contracted turn-failure envelope, never an
+		// adapter-symptom token of its own.
+		assertTurnFailed(t, promptErr, causeProvider, "")
 	case <-time.After(5 * time.Second):
 		t.Fatal("prompt did not return the native agent error")
 	}
@@ -424,9 +426,10 @@ func TestUnknownModelSetThroughConfigOptionReachesOpenCode(t *testing.T) {
 
 	select {
 	case promptErr := <-done:
-		data := requireInternalErrorData(t, promptErr)
-		require.Equal(t, "opencode_turn_assistant_identity_missing", data[jsonFieldError])
-		require.Equal(t, causeProvider, data[jsonFieldCause])
+		// A native failure that produced no assistant step is a provider
+		// refusal in the one contracted turn-failure envelope, never an
+		// adapter-symptom token of its own.
+		assertTurnFailed(t, promptErr, causeProvider, "")
 	case <-time.After(5 * time.Second):
 		t.Fatal("prompt did not return the native model error")
 	}

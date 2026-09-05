@@ -271,3 +271,26 @@ func overBound() string {
 
 	return string(value)
 }
+
+// TestPromptCorrelationMissingIsItsOwnVerdict proves the two verdicts a host
+// reads from one field path stay distinct: a key the contract requires and the
+// caller omitted is `missing`, and a key that is present where it may not be, or
+// a member that is wrong, is `unsupported`.
+func TestPromptCorrelationMissingIsItsOwnVerdict(t *testing.T) {
+	t.Parallel()
+
+	negotiated := Negotiated{Version: Version}
+
+	_, refusal := DecodePromptCorrelation(map[string]any{}, negotiated)
+	require.NotNil(t, refusal)
+	require.True(t, refusal.Missing)
+	require.Equal(t, MetaPath, refusal.Field)
+	require.Equal(t, "missing "+MetaPath, refusal.Error())
+
+	// The key present on a connection that negotiated nothing is the other
+	// verdict on the same path.
+	_, refusal = DecodePromptCorrelation(map[string]any{MetaKey: map[string]any{}}, Negotiated{})
+	require.NotNil(t, refusal)
+	require.False(t, refusal.Missing)
+	require.Equal(t, "unsupported "+MetaPath, refusal.Error())
+}

@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -39,7 +41,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 	meta, err := sessionMetaFromVendorOptions(params.Meta)
 	if err != nil {
-		return acp.NewSessionResponse{}, vendorOptionsMetaError(err)
+		return acp.NewSessionResponse{}, err
 	}
 
 	if meta.Model == "" {
@@ -57,7 +59,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 	carrier := newSessionCarrier(meta.Env, meta.ExtraPathDirs)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, carrier)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, "", params.Cwd, mcpConfigs, carrier)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -186,7 +188,7 @@ func (a *Agent) loadOrResumeSession(
 
 	meta, err := sessionMetaFromVendorOptions(metaMap)
 	if err != nil {
-		return nil, vendorOptionsMetaError(err)
+		return nil, err
 	}
 
 	a.mu.Lock()
@@ -233,7 +235,10 @@ func (a *Agent) loadOrResumeSession(
 		}
 
 		if !a.removeSessionIf(id, active) {
-			return nil, acp.NewInternalError(map[string]any{jsonFieldError: "active OpenCode session changed during replacement"})
+			return nil, acp.NewInternalError(map[string]any{
+				jsonFieldError: errValueInternalFailure,
+				jsonFieldClass: classSessionReplacementRaced,
+			})
 		}
 
 		a.observe.AddActiveSession(ctx, -1)
@@ -245,7 +250,7 @@ func (a *Agent) loadOrResumeSession(
 	cancel()
 
 	if err != nil {
-		return nil, err
+		return nil, a.classifyRestoreFailure(ctx, id, err)
 	}
 
 	if !ok {
@@ -270,7 +275,7 @@ func (a *Agent) loadOrResumeSession(
 
 	mcpConfigs := nativeMCPServerConfigs(mcpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, cwd, mcpConfigs, carrier)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, acp.SessionId(idmap.ParentSessionID), cwd, mcpConfigs, carrier)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +287,7 @@ func (a *Agent) loadOrResumeSession(
 	if err != nil {
 		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
 
-		return nil, errors.Join(err, closeErr)
+		return nil, errors.Join(a.classifyRestoreFailure(ctx, id, err), closeErr)
 	}
 
 	session := newSession(a, id, cwd, additionalDirectories, native, client, meta, idmap)
@@ -304,6 +309,39 @@ func (a *Agent) loadOrResumeSession(
 	}
 
 	return session, nil
+}
+
+// classifyRestoreFailure names the one internal failure a host can act on. A
+// stored snapshot this adapter will not replay is a property of the stored
+// session rather than of the request that named it, so `session/load` and
+// `session/resume` answer a closed token instead of the unclassified handler
+// token every other unnamed error reduces to: a host can tell "this session is
+// not restorable" from "something else went wrong" without parsing prose. The
+// native and store detail never reaches the wire and stays in the debug stream.
+//
+// Both stages that read the stored snapshot answer the same token — validating
+// it on hydration and replaying its events into a native session — because they
+// are one operation as far as a host is concerned, and splitting them would
+// publish where this adapter keeps its state. A refusal that already carries its
+// own wire classification keeps it, and a store the host supplied that simply
+// failed its own I/O is that store's error and passes through unchanged: only a
+// snapshot this adapter will not replay is this adapter's verdict to name.
+func (a *Agent) classifyRestoreFailure(ctx context.Context, id acp.SessionId, err error) error {
+	var reqErr *acp.RequestError
+	if errors.As(err, &reqErr) {
+		return reqErr
+	}
+
+	if !errors.Is(err, errUnrestorableSnapshot) {
+		return err
+	}
+
+	if a.log != nil {
+		a.log.DebugContext(ctx, "OpenCode session restore failed",
+			slog.String("session_id", string(id)), loggableError(err))
+	}
+
+	return acp.NewInternalError(map[string]any{jsonFieldError: errValueRestoreFailed})
 }
 
 // activeLoadRequestMatches reports whether load/resume can keep the active
@@ -580,7 +618,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 	meta, err := sessionMetaFromVendorOptions(params.Meta)
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, vendorOptionsMetaError(err)
+		return acp.UnstableForkSessionResponse{}, err
 	}
 
 	parent, err := a.session(params.SessionId)
@@ -589,6 +627,22 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	}
 
 	parentSnapshot := parent.snapshot()
+
+	// OpenCode's native fork keeps the source session's directory. `POST
+	// /session/{id}/fork` accepts a `directory` query parameter and ignores it:
+	// the forked session's `directory` and `projectID` are the parent's whatever
+	// the request says, the directory header does not move it either, and
+	// `PATCH /session/{id}` cannot change a directory after the fact. A fork
+	// therefore inherits its parent's workspace, and a request naming another
+	// one is refused here rather than accepted and then stored as a lineage no
+	// restore could rebase. The parent's own spelling is what the fork carries,
+	// so the two nodes of the lineage record one identical source cwd.
+	if filepath.Clean(params.Cwd) != filepath.Clean(parentSnapshot.cwd) {
+		return acp.UnstableForkSessionResponse{}, unsupportedField(jsonFieldCwd)
+	}
+
+	cwd := parentSnapshot.cwd
+
 	if meta.PermissionSet && normalizeOpenCodePermission(meta.Permission) != parentSnapshot.permission {
 		return acp.UnstableForkSessionResponse{}, acp.NewInvalidParams(map[string]any{
 			jsonFieldError: "child_permission_must_inherit",
@@ -623,7 +677,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 	mcpConfigs := nativeMCPServerConfigsFromUnstable(params.McpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.Cwd, mcpConfigs, carrier)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.SessionId, cwd, mcpConfigs, carrier)
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -643,7 +697,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 		Format:                SessionStoreFormat,
 	}
 
-	session := newSession(a, id, params.Cwd, params.AdditionalDirectories, native, client, meta, idmap)
+	session := newSession(a, id, cwd, params.AdditionalDirectories, native, client, meta, idmap)
 	session.directoryRelease = releaseDirectory
 
 	session.secretNeedles = append(mcpSecretNeedles(mcpConfigs), sensitiveEnvNeedles(meta.Env)...)
@@ -752,15 +806,20 @@ func httpHeaderMap(headers []acp.HttpHeader) map[string]string {
 	return values
 }
 
+// newOpenCodeClient admits one logical session to its canonical directory and
+// opens its directory-scoped native client. parentID is the session's ACP fork
+// parent, or the empty id for a lineage root; it is what lets a fork share the
+// directory principal its parent holds.
 func (a *Agent) newOpenCodeClient(
 	ctx context.Context,
 	id acp.SessionId,
+	parentID acp.SessionId,
 	cwd string,
 	mcpServers []opencode.MCPServerConfig,
 	carrier sessionCarrier,
 ) (opencode.Client, func(), uint64, error) {
 	for {
-		releaseDirectory, err := a.bindDirectory(id, cwd, mcpServers)
+		releaseDirectory, err := a.bindDirectory(id, parentID, cwd, mcpServers)
 		if err != nil {
 			return nil, nil, 0, err
 		}

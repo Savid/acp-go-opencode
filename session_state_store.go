@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
@@ -178,7 +177,13 @@ func (s *session) captureStateSnapshot(
 		return capturedStateSnapshot{}, nil
 	}
 
-	graph := s.agent.adoptedGraph(s)
+	// A stored bundle is exactly one logical session's. OpenCode's native fork
+	// produces an independent aggregate — the forked session owns a complete
+	// copy of the history it branched from and its native parentID is unset — so
+	// no session's restore needs another session's events, and a bundle that
+	// carried them would go stale the moment that other session did any work.
+	// Lineage is recorded as identity on the node and the carrier instead.
+	graph := []*session{s}
 	for _, member := range graph {
 		if reason := member.snapshotBlockedReason(); reason != "" {
 			if !allowInterruptedGeneration || member != s || reason != snapshotBlockGeneration {
@@ -402,55 +407,6 @@ func (s *session) snapshotBlockedReason() string {
 	return ""
 }
 
-func (a *Agent) adoptedGraph(selected *session) []*session {
-	a.mu.Lock()
-
-	all := make(map[acp.SessionId]*session, len(a.sessions))
-	for id, member := range a.sessions {
-		all[id] = member
-	}
-	a.mu.Unlock()
-
-	root := selected
-	for root != nil {
-		parentID := acp.SessionId(root.snapshot().idmap.ParentSessionID)
-
-		parent := all[parentID]
-		if parent == nil {
-			break
-		}
-
-		root = parent
-	}
-
-	children := make(map[acp.SessionId][]*session)
-
-	for _, member := range all {
-		parent := acp.SessionId(member.snapshot().idmap.ParentSessionID)
-		children[parent] = append(children[parent], member)
-	}
-
-	for parent := range children {
-		slices.SortFunc(children[parent], func(left, right *session) int {
-			return strings.Compare(string(left.id), string(right.id))
-		})
-	}
-
-	var graph []*session
-
-	var visit func(*session)
-
-	visit = func(member *session) {
-		graph = append(graph, member)
-		for _, child := range children[member.id] {
-			visit(child)
-		}
-	}
-	visit(root)
-
-	return graph
-}
-
 func (a *Agent) graphSecretNeedles(graph []*session) []string {
 	var needles []string
 
@@ -659,6 +615,15 @@ func portableSyncEvents(events []opencode.SyncEvent) ([]opencode.SyncEvent, erro
 	return portable, nil
 }
 
+// errUnrestorableSnapshot marks a stored snapshot this adapter will not replay,
+// as opposed to a host store that failed its own I/O. Only the first is this
+// adapter's verdict to name on the wire, and the two reach the same call sites.
+var errUnrestorableSnapshot = errors.New("opencode stored session is not restorable")
+
+func unrestorableSnapshot(err error) error {
+	return fmt.Errorf("%w: %w", errUnrestorableSnapshot, err)
+}
+
 func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID string) (idmapRecord, stateSnapshot, bool, error) {
 	entries, err := store.Load(ctx, SessionKey{SessionID: sessionID, Subpath: SessionStoreMainSubpath})
 	if err != nil || len(entries) == 0 {
@@ -667,11 +632,11 @@ func hydrateStateFromStore(ctx context.Context, store SessionStore, sessionID st
 
 	snapshot, err := decodeStateSnapshot(entries[len(entries)-1])
 	if err != nil {
-		return idmapRecord{}, stateSnapshot{}, false, err
+		return idmapRecord{}, stateSnapshot{}, false, unrestorableSnapshot(err)
 	}
 
 	if err := validateSyncSnapshot(sessionID, snapshot); err != nil {
-		return idmapRecord{}, stateSnapshot{}, false, err
+		return idmapRecord{}, stateSnapshot{}, false, unrestorableSnapshot(err)
 	}
 
 	idmap := idmapRecord{
@@ -717,56 +682,35 @@ func validateSyncSnapshot(sessionID string, snapshot stateSnapshot) error {
 	return validateSyncSnapshotEvents(snapshot.Events, seenNative)
 }
 
+// validateSyncSnapshotGraph checks the one node a bundle carries. The graph is
+// the session's own node and nothing else: it records the source cwd the events
+// were captured under, the permission policy in force, and the session's fork
+// lineage. Lineage is metadata — a fork's aggregate stands alone — so a node may
+// name a parent no bundle contains, but it may never disagree with the carrier
+// it belongs to.
 func validateSyncSnapshotGraph(snapshot stateSnapshot) (map[string]stateSnapshotNode, error) {
-	if len(snapshot.Graph) == 0 {
-		return nil, fmt.Errorf("opencode sync graph is empty")
+	if len(snapshot.Graph) != 1 {
+		return nil, fmt.Errorf("opencode sync graph must carry exactly one node")
 	}
 
-	seenNative := make(map[string]stateSnapshotNode, len(snapshot.Graph))
-	seenLogical := make(map[string]stateSnapshotNode, len(snapshot.Graph))
-
-	for index, node := range snapshot.Graph {
-		if node.SessionID == "" || node.NativeSessionID == "" || node.SourceCwd == "" {
-			return nil, fmt.Errorf("invalid opencode sync graph node")
-		}
-
-		if _, exists := seenNative[node.NativeSessionID]; exists {
-			return nil, fmt.Errorf("duplicate opencode sync aggregate")
-		}
-
-		if _, exists := seenLogical[node.SessionID]; exists {
-			return nil, fmt.Errorf("duplicate opencode sync logical session")
-		}
-
-		parentless := node.ParentSessionID == "" && node.NativeParentID == ""
-		if (node.ParentSessionID == "") != (node.NativeParentID == "") {
-			return nil, fmt.Errorf("opencode sync graph parent identity mismatch")
-		}
-
-		if index == 0 && !parentless {
-			return nil, fmt.Errorf("opencode sync graph root has a parent")
-		}
-
-		if index > 0 {
-			parent, ok := seenLogical[node.ParentSessionID]
-			if parentless || !ok || parent.NativeSessionID != node.NativeParentID {
-				return nil, fmt.Errorf("opencode sync graph is not parent-first")
-			}
-		}
-
-		seenNative[node.NativeSessionID] = node
-		seenLogical[node.SessionID] = node
+	node := snapshot.Graph[0]
+	if node.SessionID == "" || node.NativeSessionID == "" || node.SourceCwd == "" {
+		return nil, fmt.Errorf("invalid opencode sync graph node")
 	}
 
-	selected, ok := seenNative[snapshot.Session.NativeSessionID]
-	if !ok || selected.SessionID != snapshot.Session.SessionID ||
-		selected.ParentSessionID != snapshot.Session.ParentSessionID ||
-		selected.NativeParentID != snapshot.Session.NativeParentSessionID ||
-		selected.SourceCwd != snapshot.Session.Cwd {
+	if (node.ParentSessionID == "") != (node.NativeParentID == "") {
+		return nil, fmt.Errorf("opencode sync graph parent identity mismatch")
+	}
+
+	if node.SessionID != snapshot.Session.SessionID ||
+		node.NativeSessionID != snapshot.Session.NativeSessionID ||
+		node.ParentSessionID != snapshot.Session.ParentSessionID ||
+		node.NativeParentID != snapshot.Session.NativeParentSessionID ||
+		node.SourceCwd != snapshot.Session.Cwd {
 		return nil, fmt.Errorf("selected carrier does not match opencode sync graph")
 	}
 
-	return seenNative, nil
+	return map[string]stateSnapshotNode{node.NativeSessionID: node}, nil
 }
 
 func validateSyncSnapshotEvents(
@@ -799,7 +743,7 @@ func validateSyncSnapshotEvents(
 
 func restoreSyncState(ctx context.Context, client opencode.Client, snapshot stateSnapshot, nativeID, targetCwd string) (opencode.NativeSession, error) {
 	if err := validateSyncSnapshot(snapshot.Session.SessionID, snapshot); err != nil {
-		return opencode.NativeSession{}, err
+		return opencode.NativeSession{}, unrestorableSnapshot(err)
 	}
 
 	history, err := client.SyncHistory(ctx, map[string]int64{})
@@ -819,7 +763,7 @@ func restoreSyncState(ctx context.Context, client opencode.Client, snapshot stat
 	for _, node := range snapshot.Graph {
 		expected, err := rebaseSyncEvents(snapshot.Events[node.NativeSessionID], node.SourceCwd, targetCwd)
 		if err != nil {
-			return opencode.NativeSession{}, err
+			return opencode.NativeSession{}, unrestorableSnapshot(err)
 		}
 
 		current, err := portableSyncEvents(existing[node.NativeSessionID])
@@ -827,8 +771,15 @@ func restoreSyncState(ctx context.Context, client opencode.Client, snapshot stat
 			return opencode.NativeSession{}, err
 		}
 
-		if len(current) > 0 && !syncEventPrefix(current, expected) {
-			return opencode.NativeSession{}, fmt.Errorf("destination aggregate %q is owned by another restore", node.NativeSessionID)
+		// The destination may already hold events. Whichever side is shorter must
+		// be the ordered prefix of the other: the aggregate is either behind the
+		// stored generation, which replay completes, or ahead of it, which is
+		// the same session's own native continuation past the capture. Anything
+		// else is content this bundle did not write.
+		if len(current) > 0 && !syncEventsAgree(current, expected) {
+			return opencode.NativeSession{}, fmt.Errorf(
+				"destination aggregate %q holds %d events that diverge from the stored generation's %d",
+				node.NativeSessionID, len(current), len(expected))
 		}
 
 		if len(existing[node.NativeSessionID]) < len(expected) {
@@ -861,8 +812,12 @@ func restoreSyncState(ctx context.Context, client opencode.Client, snapshot stat
 			return opencode.NativeSession{}, err
 		}
 
-		if !syncEventsEqual(actual, expected) {
-			return opencode.NativeSession{}, fmt.Errorf("aggregate %q failed exact replay verification", node.NativeSessionID)
+		// The complete stored generation must be present, in order, from the
+		// first event. Native events appended after the capture stay where they
+		// are: they are this session's own later state, never replayed and never
+		// removed.
+		if len(actual) < len(expected) || !syncEventsAgree(actual, expected) {
+			return opencode.NativeSession{}, fmt.Errorf("aggregate %q failed replay verification", node.NativeSessionID)
 		}
 
 		if err := verifyRestoreOwnership(client, snapshot, node); err != nil {
@@ -955,12 +910,20 @@ func rebasePathValues(value any, field, sourceCwd, targetCwd string) (any, error
 	}
 }
 
-func syncEventPrefix(current, expected []opencode.SyncEvent) bool {
-	if len(current) > len(expected) {
-		return false
+// syncEventsAgree reports whether two event sequences describe the same
+// aggregate history: the shorter is the ordered prefix of the longer. A
+// destination behind the stored generation is completed by replay; one ahead of
+// it holds native events appended after the capture, which is the ordinary state
+// of a session the harness kept writing to — a title it settled, a timestamp it
+// touched — after this adapter took its snapshot. Requiring exact equality there
+// would make every stored session unrestorable the moment the harness wrote once
+// more.
+func syncEventsAgree(left, right []opencode.SyncEvent) bool {
+	if len(left) > len(right) {
+		left, right = right, left
 	}
 
-	return syncEventsEqual(current, expected[:len(current)])
+	return syncEventsEqual(left, right[:len(left)])
 }
 
 func syncEventsEqual(left, right []opencode.SyncEvent) bool {

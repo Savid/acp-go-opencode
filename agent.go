@@ -80,10 +80,15 @@ type retiredNativeTree struct {
 	cleanup   func() error
 }
 
+// directoryBinding is one canonical directory's MCP principal. A directory has
+// exactly one principal, and the fork lineage rooted at one logical session
+// holds it jointly: OpenCode's native fork keeps the source session's directory,
+// so a fork and its parent are necessarily two live sessions in one workspace.
+// Holders maps each holding session to the incarnation that admitted it, and the
+// principal is released when the last holder leaves.
 type directoryBinding struct {
-	SessionID      acp.SessionId
+	Holders        map[acp.SessionId]directoryBindingIncarnation
 	MCPFingerprint string
-	Incarnation    directoryBindingIncarnation
 }
 
 var (
@@ -452,13 +457,16 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 
 	switch method {
 	case ForkSessionMethod:
+		// Params this adapter cannot decode, or that fail validation as a whole,
+		// name the params body itself in the uniform refusal. A member that is
+		// wrong on its own is named by the member path the handler reaches.
 		var req acp.UnstableForkSessionRequest
 		if err := json.Unmarshal(params, &req); err != nil {
-			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: "invalid request parameters"})
+			return nil, unsupportedField(jsonFieldParams)
 		}
 
 		if err := req.Validate(); err != nil {
-			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: "request validation failed"})
+			return nil, unsupportedField(jsonFieldParams)
 		}
 
 		return a.forkSession(ctx, req)
@@ -494,12 +502,14 @@ func (a *Agent) ensureOpen() error {
 // point must answer with. The code is internal error, not invalid params: the
 // caller's params are fine, and what is broken is the agent the embedding host
 // built, so blaming the request would send the caller chasing its own payload.
-// The data carries only the joined prose because no wire field is at fault to
-// name, and that text is all an operator has to find the bad option.
+// The data carries the closed construction verdict alone — this adapter refuses
+// the whole joined option set rather than one option at a time, so there is no
+// single field to name, and the joined prose stays on the wrapped error for the
+// operator's log rather than on the wire.
 func (a *Agent) optionsError() error {
 	return errors.Join(
 		a.optionsErr,
-		acp.NewInternalError(map[string]any{jsonFieldError: a.optionsErr.Error()}),
+		acp.NewInternalError(map[string]any{jsonFieldError: errValueInvalidOptions}),
 	)
 }
 

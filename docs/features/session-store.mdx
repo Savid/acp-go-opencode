@@ -42,6 +42,31 @@ with a `storage_failed` reason rather than replaying a transcript with a hole.
 Store keys require a non-empty `SessionID`: `Append` and `Replace` with an
 empty session id fail, and `Delete` of an empty-id key is a pure no-op.
 
+## Every `Replace` is one session's
+
+A replacement set addresses exactly one logical session. The `main` key names
+it, and every other key in the set is a subpath of that same session. A custom
+`SessionStore` owes this rule as a **refusal, checked before anything is
+written**:
+
+- a replacement key whose `SessionID` differs from the addressed
+  `main.SessionID` is refused with an error naming that key and the addressed
+  session;
+- a `{SessionID, Subpath}` the set lists twice is refused with an error naming
+  that key;
+- the set must carry the addressed `main` key exactly once, and a replacement
+  key with an empty `SessionID` is refused.
+
+A refused call writes nothing and clears nothing: the store is left exactly as
+it was, including every subpath of the addressed session and every row of any
+session the refused set mentioned. `NewInMemorySessionStore` enforces all of
+this, and the same battery is the conformance bar for a host store.
+
+An accepted set replaces the addressed session's **whole** subtree: a subpath
+the new set does not list does not survive as a stale sibling of the ones it
+does. Because the set can never name another session, one session's commit can
+never retire another session's rows.
+
 ## Snapshot contents
 
 A snapshot is taken after a completed turn and on lifecycle boundaries. The
@@ -49,10 +74,20 @@ A snapshot is taken after a completed turn and on lifecycle boundaries. The
 
 - adapter, probed native, and event-schema versions;
 - a restore generation and the selected ACP/native session identity;
-- the adopted parent/child graph in parent-first order, including source cwd
-  and per-session permission policy;
+- `graph`, which carries **exactly one node** — the session's own — with its
+  source cwd, its per-session permission policy, and its fork lineage
+  (`parentSessionId` and `nativeParentId`, both present or both absent);
 - the session's environment and ordered `extraPathDirs`; and
-- exact event arrays for each allowlisted aggregate.
+- `events`, the exact event array for that session's own aggregate and no
+  other.
+
+A bundle is one logical session's. OpenCode's native fork produces an
+independent aggregate — the forked session owns a complete copy of the history
+it branched from, and its native parent id is unset — so no session's restore
+needs another session's events, and a bundle that carried them would go stale
+the moment that other session did any work. Fork lineage is therefore recorded
+as identity, not as structure: a node may name a parent no bundle contains, and
+a fork is restorable whichever member of its lineage was closed first.
 
 `env` and `extraPathDirs` are required members of the bundle, and the format
 stays `opencode-sync-events-v1`: a bundle that omits either is refused rather
@@ -75,17 +110,26 @@ are accepted. Unknown event data fails closed, and the event graph is scanned
 for MCP and process-environment secret leakage before the store replacement is
 published.
 
-Restore durably claims each source-to-destination aggregate mapping before the
-first `POST /sync/replay`, replays one complete aggregate per call in
-parent-before-child order, and rechecks ownership plus exact event equality
-after every call. Allowed absolute path fields must be inside the captured cwd
-and are rebased to the destination cwd; an escaping path is rejected.
+Restore durably claims the source-to-destination aggregate mapping before the
+first `POST /sync/replay`, replays the aggregate in one call, and rechecks
+ownership afterwards. Allowed absolute path fields must be inside the captured
+cwd and are rebased to the destination cwd; an escaping path is rejected.
+
+Verification is prefix-exact rather than equality-exact. The destination must
+contain the complete stored generation, in order, from its first event; a
+destination that is behind the capture is completed by replay, and one that is
+ahead of it keeps the native events the harness appended after the snapshot —
+a session title it settled, a timestamp it touched — which are neither replayed
+over nor removed. Whenever the two disagree at any position they share, the
+restore fails closed instead. Requiring byte equality with the whole live
+aggregate would make every stored session unrestorable the moment OpenCode
+wrote to it once more after the snapshot.
 
 The same committed bundle is the recovery boundary for a loaded session after
-an unexpected shared-server exit. Recovery is graph-complete and exact before
-the next prompt is submitted; native state that does not match the committed
-event generation fails closed instead of accepting a prompt on ambiguous
-state.
+an unexpected shared-server exit. Recovery restores the session's complete
+committed generation before the next prompt is submitted; native state that
+contradicts that generation fails closed instead of accepting a prompt on
+ambiguous state.
 
 Hosts that reconcile their own turn checkpoints can call
 `InspectSessionStoreTerminalState` with the logical ACP session id and the
@@ -100,7 +144,8 @@ fail closed; a valid snapshot without a terminal assistant returns an empty
 A snapshot is blocked while any input, permission, elicitation, or generation is
 pending, so a snapshot never captures a half-finished turn. `session/delete`
 removes a stored session and leaves a tombstone so the id is not silently
-reused. The tombstone is final in the store itself: an `Append` or a `Replace`
+reused. A tombstone belongs to the id it names: another session's `Replace`
+neither fails because of it nor resurrects it. The tombstone is final in the store itself: an `Append` or a `Replace`
 addressed to a tombstoned key writes nothing, clears nothing, and returns
 success. A custom `SessionStore` owes the same rule — the deleted state is
 already the caller's answer, and a store that leaves the rule to its caller

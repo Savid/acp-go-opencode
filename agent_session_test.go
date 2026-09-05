@@ -701,9 +701,10 @@ func TestForkPermissionMustInherit(t *testing.T) {
 	client := newFakeOpenCodeClient()
 	agent := NewAgent()
 	parent := testSession(t, agent, client)
+	parent.cwd = t.TempDir()
 	parent.permission = openCodePermissionDeny
 	agent.sessions[parent.id] = parent
-	_, err := agent.forkSession(context.Background(), ForkSessionRequest(parent.id, t.TempDir(),
+	_, err := agent.forkSession(context.Background(), ForkSessionRequest(parent.id, parent.cwd,
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodePermission("allow")))))
 	require.ErrorContains(t, err, "child_permission_must_inherit")
 }
@@ -1343,8 +1344,12 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 	agentRandRead = oldRead
 	t.Cleanup(func() { agentRandRead = oldRead })
 	_, err := failedEntropy.Initialize(context.Background(), acp.InitializeRequest{})
+	// The construction verdict is one closed token. The joined prose stays on
+	// the wrapped Go error for the operator's log and never reaches the wire.
 	require.ErrorContains(t, err, "fingerprint entropy failed")
-	require.Contains(t, requireInternalErrorData(t, err)[jsonFieldError], "fingerprint entropy failed")
+	data := requireInternalErrorData(t, err)
+	require.Equal(t, errValueInvalidOptions, data[jsonFieldError])
+	require.Len(t, data, 1)
 
 	for name, option := range map[string]Option{
 		"health":       WithOpenCodeHealthCheckTimeout(0),
@@ -1489,14 +1494,14 @@ func TestDirectoryBindingFingerprintAndResourceBranches(t *testing.T) {
 	require.NotEmpty(t, fingerprint)
 	require.Empty(t, mustDirectoryFingerprint(t, agent, nil))
 
-	release, err := agent.bindDirectory("one", link, servers)
+	release, err := agent.bindDirectory("one", "", link, servers)
 	require.NoError(t, err)
-	_, err = agent.bindDirectory("two", realDir, servers)
+	_, err = agent.bindDirectory("two", "", realDir, servers)
 	require.Error(t, err)
-	_, err = agent.bindDirectory("one", realDir, []opencode.MCPServerConfig{{Name: "other", URL: "https://other"}})
+	_, err = agent.bindDirectory("one", "", realDir, []opencode.MCPServerConfig{{Name: "other", URL: "https://other"}})
 	require.Error(t, err)
 	release()
-	_, err = agent.bindDirectory("one", filepath.Join(root, "missing"), nil)
+	_, err = agent.bindDirectory("one", "", filepath.Join(root, "missing"), nil)
 	require.ErrorContains(t, err, "canonicalize cwd")
 }
 
@@ -1610,13 +1615,16 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 		agent := NewAgent()
 		agent.runtime = client
 		parent := testSession(t, agent, client)
+		// A fork inherits its parent's workspace, so the parent's cwd has to be
+		// a directory the runtime can canonicalize.
+		parent.cwd = t.TempDir()
 		agent.sessions[parent.id] = parent
 
 		return agent, client, parent
 	}
 
 	agent, _, parent := newForkAgent()
-	response, err := agent.forkSession(ctx, ForkSessionRequest(parent.id, t.TempDir()))
+	response, err := agent.forkSession(ctx, ForkSessionRequest(parent.id, parent.cwd))
 	require.NoError(t, err)
 	require.NotEmpty(t, response.SessionId)
 
@@ -1631,7 +1639,7 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			testAgent, client, testParent := newForkAgent()
 			configure(testAgent, client)
-			_, testErr := testAgent.forkSession(ctx, ForkSessionRequest(testParent.id, t.TempDir()))
+			_, testErr := testAgent.forkSession(ctx, ForkSessionRequest(testParent.id, testParent.cwd))
 			require.Error(t, testErr)
 		})
 	}
@@ -1639,13 +1647,13 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 	agent, _, parent = newForkAgent()
 	oldReader := sessionIDRandReader
 	sessionIDRandReader = errorReader{err: errors.New("entropy failed")}
-	_, err = agent.forkSession(ctx, ForkSessionRequest(parent.id, t.TempDir()))
+	_, err = agent.forkSession(ctx, ForkSessionRequest(parent.id, parent.cwd))
 	require.ErrorContains(t, err, "entropy failed")
 	sessionIDRandReader = oldReader
 
 	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: parent.id, Cwd: "relative"})
 	require.Error(t, err)
-	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: parent.id, Cwd: t.TempDir(), Meta: map[string]any{opencodeMetaKey: "bad"}})
+	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: parent.id, Cwd: parent.cwd, Meta: map[string]any{opencodeMetaKey: "bad"}})
 	require.Error(t, err)
 	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: "missing", Cwd: t.TempDir()})
 	require.Error(t, err)
@@ -1660,6 +1668,7 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 		agent := NewAgent()
 		agent.runtime = client
 		parent := testSession(t, agent, client)
+		parent.cwd = t.TempDir()
 		parent.carrier = newSessionCarrier(map[string]string{"WAGIE_API_TOKEN": "parent-token"}, []string{absTestPath("parent", "bin")})
 		agent.sessions[parent.id] = parent
 
@@ -1667,13 +1676,13 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 	}
 
 	agent, client, parent := newForkAgent()
-	_, err := agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir()))
+	_, err := agent.forkSession(t.Context(), ForkSessionRequest(parent.id, parent.cwd))
 	require.NoError(t, err)
 	require.Equal(t, []string{absTestPath("parent", "bin")}, client.scopes()[0].ExtraPathDirs)
 	require.Equal(t, map[string]string{"WAGIE_API_TOKEN": "parent-token"}, client.scopes()[0].Env)
 
 	agent, client, parent = newForkAgent()
-	_, err = agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir(),
+	_, err = agent.forkSession(t.Context(), ForkSessionRequest(parent.id, parent.cwd,
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeExtraPathDirs(absTestPath("child", "bin")))),
 	))
 	require.NoError(t, err)
@@ -1684,7 +1693,7 @@ func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 	// A child that names an environment replaces the parent's outright, and an
 	// empty map is a replacement rather than an omission.
 	agent, client, parent = newForkAgent()
-	_, err = agent.forkSession(t.Context(), ForkSessionRequest(parent.id, t.TempDir(),
+	_, err = agent.forkSession(t.Context(), ForkSessionRequest(parent.id, parent.cwd,
 		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{}))),
 	))
 	require.NoError(t, err)
@@ -1790,6 +1799,7 @@ func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing
 	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
 	agent.runtime = client
 	parent := testSession(t, agent, client)
+	parent.cwd = t.TempDir()
 	agent.sessions[parent.id] = parent
 
 	_, err := agent.forkSession(context.Background(), acp.UnstableForkSessionRequest{
@@ -1799,7 +1809,7 @@ func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing
 	})
 	require.Error(t, err)
 
-	_, err = agent.forkSession(context.Background(), ForkSessionRequest(parent.id, t.TempDir()))
+	_, err = agent.forkSession(context.Background(), ForkSessionRequest(parent.id, parent.cwd))
 	require.ErrorContains(t, err, "backpressure")
 
 	configs := nativeMCPServerConfigs([]acp.McpServer{
@@ -2041,6 +2051,7 @@ func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
 		agent.setAgentClient(connection)
 		agent.runtime = client
 		parent := testSession(t, agent, client)
+		parent.cwd = t.TempDir()
 		agent.sessions[parent.id] = parent
 
 		// The parent was established by the test helper; only what the fork
@@ -2049,7 +2060,7 @@ func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
 		connection.updates = nil
 		connection.mu.Unlock()
 
-		_, err := agent.forkSession(ctx, ForkSessionRequest(parent.id, t.TempDir()))
+		_, err := agent.forkSession(ctx, ForkSessionRequest(parent.id, parent.cwd))
 		require.NoError(t, err)
 		requireNothingPublished(t, connection)
 	})
@@ -2361,4 +2372,171 @@ func TestAgentStoreAndActiveLoadMatchEdges(t *testing.T) {
 		sessionMeta{PermissionSet: true, Permission: "allow"}, sessionCarrier{}))
 	require.False(t, activeLoadRequestMatches(snapshot, active, absTestPath("cwd"), nil, nil, nil,
 		sessionMeta{OutputSchema: map[string]any{"type": "array"}}, sessionCarrier{}))
+}
+
+// A stored snapshot this adapter will not replay is the one internal failure a
+// host can act on, so `session/load` and `session/resume` classify it instead of
+// reducing it to the unclassified handler token. A restore error that already
+// carries its own wire classification keeps it, and neither shape ever carries
+// native or store prose.
+func TestRestoreFailureIsClassifiedAndCarriesNoProse(t *testing.T) {
+	const storeSecret = "sourceCwd /home/operator/private escapes target"
+
+	agent := NewAgent()
+
+	t.Run("already classified errors pass through", func(t *testing.T) {
+		refusal := unsupportedField("_meta.opencode.options.model")
+
+		got := agent.classifyRestoreFailure(t.Context(), "session-1", fmt.Errorf("wrapped: %w", refusal))
+
+		var reqErr *acp.RequestError
+		require.ErrorAs(t, got, &reqErr)
+		require.Equal(t, -32602, reqErr.Code)
+		require.Equal(t, map[string]any{
+			jsonFieldError: errValueUnsupported,
+			jsonFieldField: "_meta.opencode.options.model",
+		}, reqErr.Data)
+	})
+
+	t.Run("a store that failed its own I/O passes through", func(t *testing.T) {
+		storeErr := errors.New("store failed")
+
+		got := agent.classifyRestoreFailure(t.Context(), "session-1", storeErr)
+
+		require.Same(t, storeErr, got)
+	})
+
+	t.Run("an unrestorable snapshot becomes the closed restore token", func(t *testing.T) {
+		got := agent.classifyRestoreFailure(t.Context(), "session-1", unrestorableSnapshot(errors.New(storeSecret)))
+
+		var reqErr *acp.RequestError
+		require.ErrorAs(t, got, &reqErr)
+		require.Equal(t, -32603, reqErr.Code)
+		require.Equal(t, map[string]any{jsonFieldError: errValueRestoreFailed}, reqErr.Data)
+
+		encoded, err := json.Marshal(reqErr)
+		require.NoError(t, err)
+		require.NotContains(t, string(encoded), storeSecret)
+		require.NotContains(t, string(encoded), errValueInternalFailure)
+	})
+
+	t.Run("an agent with no logger still classifies", func(t *testing.T) {
+		got := (&Agent{}).classifyRestoreFailure(t.Context(), "session-1", unrestorableSnapshot(errors.New(storeSecret)))
+
+		var reqErr *acp.RequestError
+		require.ErrorAs(t, got, &reqErr)
+		require.Equal(t, map[string]any{jsonFieldError: errValueRestoreFailed}, reqErr.Data)
+	})
+}
+
+// forkLineageAgent builds an agent whose fake runtime answers a parent and a
+// forked native session, each with its own sync aggregate. OpenCode's native
+// fork copies the branched history into the fork's own aggregate, so the fake
+// models the same thing: two independent aggregates, and a fork whose native
+// directory is the parent's.
+func forkLineageAgent(t *testing.T) (*Agent, *fakeOpenCodeClient) {
+	t.Helper()
+
+	client := newFakeOpenCodeClient()
+	client.createSession = testNativeSession("native-parent")
+	client.forkSession = testNativeSession("native-fork")
+	client.getSessionFunc = func(_ context.Context, id string) (opencode.NativeSession, error) {
+		return testNativeSession(id), nil
+	}
+	client.ensureSyncAggregate("native-parent")
+	client.ensureSyncAggregate("native-fork")
+
+	agent := NewAgent()
+	agent.runtime = client
+	agent.setAgentClient(newRecordingAgentClient())
+
+	t.Cleanup(func() { _ = agent.Close() })
+
+	return agent, client
+}
+
+// TestForkInheritsTheParentWorkspace pins the one cwd rule fork can honour.
+// OpenCode's `POST /session/{id}/fork` keeps the source session's directory and
+// ignores the `directory` query parameter, so a fork that named another
+// workspace would report a cwd its native session does not have. The refusal is
+// the family-uniform invalid-params shape rather than a token of this adapter's
+// own.
+func TestForkInheritsTheParentWorkspace(t *testing.T) {
+	ctx := context.Background()
+	agent, _ := forkLineageAgent(t)
+	cwd := t.TempDir()
+
+	parent, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	_, err = agent.forkSession(ctx, ForkSessionRequest(parent.SessionId, t.TempDir()))
+	requireInvalidParamsData(t, err, map[string]any{
+		jsonFieldError: errValueUnsupported,
+		jsonFieldField: jsonFieldCwd,
+	})
+
+	// A relative cwd takes the same verdict on the same field: one uniform
+	// answer for every cwd this surface refuses.
+	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: parent.SessionId, Cwd: "relative"})
+	requireInvalidParamsData(t, err, map[string]any{
+		jsonFieldError: errValueUnsupported,
+		jsonFieldField: jsonFieldCwd,
+	})
+
+	// The parent's own spelling is accepted, and so is a differently spelled
+	// path naming the same directory; either way the fork records the parent's.
+	fork, err := agent.forkSession(ctx, ForkSessionRequest(parent.SessionId, cwd+string(filepath.Separator)))
+	require.NoError(t, err)
+
+	agent.mu.Lock()
+	forked := agent.sessions[fork.SessionId]
+	agent.mu.Unlock()
+
+	require.NotNil(t, forked)
+	require.Equal(t, cwd, forked.snapshot().cwd)
+	require.Equal(t, string(parent.SessionId), forked.snapshot().idmap.ParentSessionID)
+}
+
+// TestForkSharesTheParentDirectoryPrincipal proves a fork is admitted alongside
+// its parent in one canonical directory. It has to be: the native fork cannot
+// leave the parent's workspace, so refusing the second holder would make fork
+// unusable while its parent is loaded. Sharing is limited to one fork lineage —
+// an unrelated session still owns the directory exclusively.
+func TestForkSharesTheParentDirectoryPrincipal(t *testing.T) {
+	ctx := context.Background()
+	agent, _ := forkLineageAgent(t)
+	cwd := t.TempDir()
+
+	parent, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	fork, err := agent.forkSession(ctx, ForkSessionRequest(parent.SessionId, cwd))
+	require.NoError(t, err)
+
+	// An unrelated session naming the same directory is still refused.
+	_, err = agent.bindDirectory("unrelated", "", cwd, nil)
+	require.ErrorContains(t, err, errValueBackpressure)
+
+	// Either direction of the lineage may join, whichever holder is present.
+	release, err := agent.bindDirectory("later-fork", parent.SessionId, cwd, nil)
+	require.NoError(t, err)
+	release()
+
+	// A closed parent does not orphan the lineage: the fork's durable parent
+	// identity still names the root the parent resumes into.
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: parent.SessionId})
+	require.NoError(t, err)
+
+	_, err = agent.ResumeSession(ctx, ResumeSessionRequest(parent.SessionId, cwd))
+	require.NoError(t, err)
+
+	// The principal survives while a co-holder remains and is gone once the
+	// last holder leaves.
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: fork.SessionId})
+	require.NoError(t, err)
+	require.NotEmpty(t, agent.directoryHoldersForTest(t, cwd))
+
+	_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: parent.SessionId})
+	require.NoError(t, err)
+	require.Empty(t, agent.directoryHoldersForTest(t, cwd))
 }

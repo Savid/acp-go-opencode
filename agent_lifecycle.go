@@ -121,6 +121,10 @@ func refuseLifecycleRawMeta(params json.RawMessage) error {
 func (a *Agent) promptSubmission(meta map[string]any) (lifecycle.Submission, error) {
 	submission, refusal := lifecycle.DecodePromptCorrelation(meta, a.lifecycleNegotiated())
 	if refusal != nil {
+		if refusal.Missing {
+			return lifecycle.Submission{}, missingField(refusal.Field)
+		}
+
 		return lifecycle.Submission{}, unsupportedField(refusal.Field)
 	}
 

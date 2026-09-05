@@ -14,6 +14,7 @@ import (
 
 	"errors"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
@@ -294,9 +295,39 @@ func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, client.syncEvents, 1)
 
+	// Content this bundle did not write is refused: the destination and the
+	// stored generation are the same length and disagree, so neither is the
+	// other's prefix.
 	client.syncEvents[0].Data["info"] = json.RawMessage(`{"id":"foreign","directory":` + jsonTestPath("target") + `}`)
 	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
-	require.ErrorContains(t, err, "owned by another restore")
+	require.ErrorContains(t, err, "diverge from the stored generation")
+}
+
+// TestRestoreAcceptsNativeEventsAppendedAfterTheCapture proves a stored
+// generation stays restorable once the harness has written to the aggregate
+// again. OpenCode settles a session title and touches timestamps after a turn
+// ends, so a destination that is ahead of the capture is the ordinary case, not
+// a conflict — the stored generation only has to be present as the ordered
+// prefix.
+func TestRestoreAcceptsNativeEventsAppendedAfterTheCapture(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	client.getSession = testNativeSession("native")
+	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
+
+	_, err := restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("source"))
+	require.NoError(t, err)
+	require.Len(t, client.syncEvents, 1)
+
+	// The harness appends one more event of its own after the capture.
+	later := cloneSyncEvent(client.syncEvents[0])
+	later.ID = "evt-later"
+	later.Sequence = 1
+	later.Type = syncTypeSessionUpdated
+	client.syncEvents = append(client.syncEvents, later)
+
+	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("source"))
+	require.NoError(t, err)
+	require.Len(t, client.syncEvents, 2, "a later native event is neither replayed over nor removed")
 }
 
 func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testing.T) {
@@ -476,39 +507,37 @@ func TestSyncSnapshotValidationEveryFailureShape(t *testing.T) {
 	}
 }
 
+// TestSyncSnapshotRejectsNonCanonicalGraphAndEventOrder pins the shape of a
+// stored bundle's graph. A bundle carries exactly one node — its own session —
+// because an OpenCode fork owns an independent aggregate and no session's
+// restore needs another session's events. The node's fork lineage is metadata:
+// it may name a parent the bundle does not contain, and it may never disagree
+// with the carrier it belongs to.
 func TestSyncSnapshotRejectsNonCanonicalGraphAndEventOrder(t *testing.T) {
 	base := validSyncSnapshot("session", "native", absTestPath("source"))
-	childEvent := syncTestEvent("child-native", 0, "session.created.1", nil)
-	base.Graph = append(base.Graph, stateSnapshotNode{
-		SessionID: "child", NativeSessionID: "child-native",
-		ParentSessionID: "session", NativeParentID: "native",
-		SourceCwd: absTestPath("source"), Permission: "ask",
-	})
-	base.Events["child-native"] = []opencode.SyncEvent{childEvent}
 	require.NoError(t, validateSyncSnapshot("session", base))
+
+	// A fork's own bundle names the lineage it branched from and restores from
+	// its own aggregate alone, whether or not the parent is still loaded.
+	fork := validSyncSnapshot("fork", "fork-native", absTestPath("source"))
+	fork.Session.ParentSessionID, fork.Session.NativeParentSessionID = "session", "native"
+	fork.Graph[0].ParentSessionID, fork.Graph[0].NativeParentID = "session", "native"
+	require.NoError(t, validateSyncSnapshot("fork", fork))
 
 	tests := map[string]func(*stateSnapshot){
 		"empty graph": func(value *stateSnapshot) {
 			value.Graph = nil
 		},
-		"duplicate logical identity": func(value *stateSnapshot) {
-			value.Graph[1].SessionID = value.Graph[0].SessionID
+		"second node": func(value *stateSnapshot) {
+			value.Graph = append(value.Graph, stateSnapshotNode{
+				SessionID: "child", NativeSessionID: "child-native",
+				ParentSessionID: "session", NativeParentID: "native",
+				SourceCwd: absTestPath("source"), Permission: "ask",
+			})
+			value.Events["child-native"] = []opencode.SyncEvent{syncTestEvent("child-native", 0, "session.created.1", nil)}
 		},
 		"half parent identity": func(value *stateSnapshot) {
-			value.Graph[1].NativeParentID = ""
-		},
-		"root has parent": func(value *stateSnapshot) {
 			value.Graph[0].ParentSessionID = "parent"
-			value.Graph[0].NativeParentID = "parent-native"
-		},
-		"child before parent": func(value *stateSnapshot) {
-			value.Graph[0], value.Graph[1] = value.Graph[1], value.Graph[0]
-		},
-		"dangling logical parent": func(value *stateSnapshot) {
-			value.Graph[1].ParentSessionID = "missing"
-		},
-		"mismatched native parent": func(value *stateSnapshot) {
-			value.Graph[1].NativeParentID = "missing-native"
 		},
 		"selected logical mismatch": func(value *stateSnapshot) {
 			value.Graph[0].SessionID = "other"
@@ -516,6 +545,10 @@ func TestSyncSnapshotRejectsNonCanonicalGraphAndEventOrder(t *testing.T) {
 		"selected parent mismatch": func(value *stateSnapshot) {
 			value.Session.ParentSessionID = "parent"
 			value.Session.NativeParentSessionID = "parent-native"
+		},
+		"selected native parent mismatch": func(value *stateSnapshot) {
+			value.Graph[0].ParentSessionID, value.Graph[0].NativeParentID = "parent", "parent-native"
+			value.Session.ParentSessionID = "parent"
 		},
 		"selected cwd mismatch": func(value *stateSnapshot) {
 			value.Session.Cwd = absTestPath("other")
@@ -652,8 +685,14 @@ func TestHydrateRebaseAndSyncComparisonBranches(t *testing.T) {
 	require.Equal(t, samePathEvent.Data["info"], samePath[0].Data["info"], "same-path restore must preserve native JSON bytes")
 
 	event := snapshot.Events["native"][0]
-	require.True(t, syncEventPrefix(nil, []opencode.SyncEvent{event}))
-	require.False(t, syncEventPrefix([]opencode.SyncEvent{event, event}, []opencode.SyncEvent{event}))
+	// Agreement is symmetric: a destination behind the stored generation and one
+	// ahead of it both describe the same history, and a differing event does not.
+	require.True(t, syncEventsAgree(nil, []opencode.SyncEvent{event}))
+	require.True(t, syncEventsAgree([]opencode.SyncEvent{event, event}, []opencode.SyncEvent{event}))
+	require.True(t, syncEventsAgree([]opencode.SyncEvent{event}, []opencode.SyncEvent{event, event}))
+	diverged := cloneSyncEvent(event)
+	diverged.ID = "diverged"
+	require.False(t, syncEventsAgree([]opencode.SyncEvent{diverged, event}, []opencode.SyncEvent{event}))
 	require.False(t, syncEventsEqual(nil, []opencode.SyncEvent{event}))
 	changed := cloneSyncEvent(event)
 	changed.ID = "changed"
@@ -798,7 +837,7 @@ func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranch
 	client = newFakeOpenCodeClient()
 	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) { return nil, nil }
 	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
-	require.ErrorContains(t, err, "failed exact replay verification")
+	require.ErrorContains(t, err, "failed replay verification")
 
 	client = newFakeOpenCodeClient()
 	historyCalls = 0
@@ -1135,4 +1174,107 @@ func TestStateStoreValidationReachableEdges(t *testing.T) {
 	})
 	_, err = InspectSessionStoreTerminalState("session", []SessionStoreEntry{terminal})
 	require.ErrorContains(t, err, "decode OpenCode message event")
+}
+
+// TestForkLineageRestoresInEveryCloseOrder is the fixture the fork bugs needed.
+// A forked lineage must be restorable whichever member is closed first, so both
+// orders are driven end to end: close, then resume and load every member that
+// was closed.
+func TestForkLineageRestoresInEveryCloseOrder(t *testing.T) {
+	orders := map[string]bool{"parent first": true, "fork first": false}
+
+	for name, parentFirst := range orders {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			agent, _ := forkLineageAgent(t)
+			cwd := t.TempDir()
+
+			parent, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+			require.NoError(t, err)
+
+			fork, err := agent.forkSession(ctx, ForkSessionRequest(parent.SessionId, cwd))
+			require.NoError(t, err)
+
+			first, second := parent.SessionId, fork.SessionId
+			if !parentFirst {
+				first, second = fork.SessionId, parent.SessionId
+			}
+
+			_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: first})
+			require.NoError(t, err)
+			_, err = agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: second})
+			require.NoError(t, err)
+
+			// Every member restores, in either direction, through both restore
+			// surfaces.
+			for _, id := range []acp.SessionId{parent.SessionId, fork.SessionId} {
+				resumed, resumeErr := agent.ResumeSession(ctx, ResumeSessionRequest(id, cwd))
+				require.NoError(t, resumeErr, "resume %s", id)
+				require.NotNil(t, resumed.Meta)
+
+				_, closeErr := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: id})
+				require.NoError(t, closeErr)
+
+				loaded, loadErr := agent.LoadSession(ctx, LoadSessionRequest(id, cwd))
+				require.NoError(t, loadErr, "load %s", id)
+				require.NotNil(t, loaded.Meta)
+			}
+		})
+	}
+}
+
+// TestForkBundleCarriesItsOwnAggregateOnly pins the store-format fact a
+// downstream reader depends on: one `main` entry per logical session, whose
+// `graph` holds that session's node alone and whose `events` map holds that
+// session's aggregate alone. The fork's node still names the lineage it came
+// from.
+func TestForkBundleCarriesItsOwnAggregateOnly(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemorySessionStore()
+	agent, _ := forkLineageAgent(t)
+	agent.options.SessionStore = store
+	cwd := t.TempDir()
+
+	parent, err := agent.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	fork, err := agent.forkSession(ctx, ForkSessionRequest(parent.SessionId, cwd))
+	require.NoError(t, err)
+
+	parentBundle := requireStoredSnapshot(t, store, string(parent.SessionId))
+	require.Len(t, parentBundle.Graph, 1)
+	require.Equal(t, string(parent.SessionId), parentBundle.Graph[0].SessionID)
+	require.Empty(t, parentBundle.Graph[0].ParentSessionID)
+	require.Equal(t, cwd, parentBundle.Graph[0].SourceCwd)
+	require.Equal(t, []string{"native-parent"}, aggregateIDs(parentBundle))
+
+	forkBundle := requireStoredSnapshot(t, store, string(fork.SessionId))
+	require.Len(t, forkBundle.Graph, 1)
+	require.Equal(t, string(fork.SessionId), forkBundle.Graph[0].SessionID)
+	require.Equal(t, string(parent.SessionId), forkBundle.Graph[0].ParentSessionID)
+	require.Equal(t, "native-parent", forkBundle.Graph[0].NativeParentID)
+	require.Equal(t, cwd, forkBundle.Graph[0].SourceCwd)
+	require.Equal(t, []string{"native-fork"}, aggregateIDs(forkBundle))
+}
+
+func requireStoredSnapshot(t *testing.T, store SessionStore, sessionID string) stateSnapshot {
+	t.Helper()
+
+	entries, err := store.Load(context.Background(), SessionKey{SessionID: sessionID, Subpath: SessionStoreMainSubpath})
+	require.NoError(t, err)
+	require.NotEmpty(t, entries)
+
+	snapshot, err := decodeStateSnapshot(entries[len(entries)-1])
+	require.NoError(t, err)
+
+	return snapshot
+}
+
+func aggregateIDs(snapshot stateSnapshot) []string {
+	ids := make([]string, 0, len(snapshot.Events))
+	for id := range snapshot.Events {
+		ids = append(ids, id)
+	}
+
+	return ids
 }

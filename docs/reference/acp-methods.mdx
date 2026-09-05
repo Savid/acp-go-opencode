@@ -26,7 +26,13 @@ extension. This page lists each method and its behavior.
 ## Extensions and unsupported methods
 
 - `_opencode/session/fork` — the only fork surface; branches a session's native
-  state into a new session.
+  state into a new session in the **same** workspace. OpenCode's native fork
+  keeps the source session's directory, so the request's `cwd` must be the
+  parent's; another one is `-32602` with
+  `{"error":"unsupported","field":"cwd"}` (see
+  [Sessions](/docs/core/sessions)). Params this adapter cannot decode, or that
+  fail validation as a whole, are `-32602` with
+  `{"error":"unsupported","field":"params"}`.
 - `_opencode/rawEvent` — an outbound notification, not a request (see
   [Raw events](/docs/features/raw-events)).
 - `_opencode/auth/methods`, `_opencode/auth/authorize`,

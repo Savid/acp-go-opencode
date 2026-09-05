@@ -92,19 +92,79 @@ func TestSessionMetaWrongTypedKnownOptionsRejected(t *testing.T) {
 	}
 }
 
+// A malformed member of the owned `_meta.opencode` namespace is refused with
+// the same {"error":"unsupported","field":"<request path>"} data an unknown
+// member gets. A host switching on `error` and reading `field` must never have
+// to fall back to prose, and a wrong-typed container is exactly as nameable as
+// a wrong-typed leaf.
+func TestVendorMetaMalformedMembersNameTheirPath(t *testing.T) {
+	for name, tc := range map[string]struct {
+		meta  map[string]any
+		field string
+	}{
+		"vendor namespace not an object": {
+			meta:  map[string]any{opencodeMetaKey: 5},
+			field: "_meta.opencode",
+		},
+		"options not an object": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: 5}},
+			field: "_meta.opencode.options",
+		},
+		"options is a string": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: "bad"}},
+			field: "_meta.opencode.options",
+		},
+		"rawEvent not an object": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{rawEventKey: 5}},
+			field: "_meta.opencode.rawEvent",
+		},
+		"rawEvent.enabled not a boolean": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{rawEventKey: map[string]any{rawEventEnabledKey: "yes"}}},
+			field: "_meta.opencode.rawEvent.enabled",
+		},
+		"unknown rawEvent member": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{rawEventKey: map[string]any{"nope": true}}},
+			field: "_meta.opencode.rawEvent.nope",
+		},
+		"unknown vendor member": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{"nope": true}},
+			field: "_meta.opencode.nope",
+		},
+		"unknown option": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{"bogus": 1}}},
+			field: "_meta.opencode.options.bogus",
+		},
+		"output schema not an object": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: 7}}},
+			field: "_meta.opencode.options.outputSchema",
+		},
+		"output schema empty": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{}}}},
+			field: "_meta.opencode.options.outputSchema",
+		},
+		"output schema not serializable": {
+			meta:  map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"bad": make(chan int)}}}},
+			field: "_meta.opencode.options.outputSchema",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := sessionMetaFromVendorOptions(tc.meta)
+			if err == nil {
+				t.Fatalf("malformed %s accepted", name)
+			}
+			requireInvalidParamsData(t, err, map[string]any{
+				jsonFieldError: errValueUnsupported,
+				jsonFieldField: tc.field,
+			})
+		})
+	}
+}
+
 // Malformed lifecycle _meta surfaces as invalid params (-32602) on every
-// lifecycle route, never as an internal error.
+// lifecycle route, never as an internal error, and every route names the same
+// field path.
 func TestLifecycleMetaErrorsAreInvalidParams(t *testing.T) {
-	if got := vendorOptionsMetaError(unsupportedField("_meta.opencode.x")); !reflect.DeepEqual(got, unsupportedField("_meta.opencode.x")) {
-		t.Fatalf("request error not passed through: %#v", got)
-	}
-
-	wrapped := vendorOptionsMetaError(errors.New("_meta.opencode must be an object"))
-
 	var reqErr *acp.RequestError
-	if !errors.As(wrapped, &reqErr) || reqErr.Code != -32602 {
-		t.Fatalf("wrapped error = %#v, want -32602", wrapped)
-	}
 
 	ctx := context.Background()
 	badMeta := map[string]any{opencodeMetaKey: map[string]any{metaOptionsKey: "bad"}}
@@ -114,19 +174,32 @@ func TestLifecycleMetaErrorsAreInvalidParams(t *testing.T) {
 		t.Fatal("new session with malformed meta succeeded")
 	} else if !errors.As(err, &reqErr) || reqErr.Code != -32602 {
 		t.Fatalf("new session malformed meta err = %#v, want -32602", err)
+	} else {
+		requireInvalidParamsData(t, err, uniformOptionsRefusal)
 	}
 
 	if _, err := agent.LoadSession(ctx, LoadSessionRequest("11111111-1111-4111-8111-111111111111", t.TempDir(), WithSessionMeta(badMeta))); err == nil {
 		t.Fatal("load session with malformed meta succeeded")
 	} else if !errors.As(err, &reqErr) || reqErr.Code != -32602 {
 		t.Fatalf("load session malformed meta err = %#v, want -32602", err)
+	} else {
+		requireInvalidParamsData(t, err, uniformOptionsRefusal)
 	}
 
 	if _, err := agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: "parent", Cwd: t.TempDir(), Meta: badMeta}); err == nil {
 		t.Fatal("fork session with malformed meta succeeded")
 	} else if !errors.As(err, &reqErr) || reqErr.Code != -32602 {
 		t.Fatalf("fork session malformed meta err = %#v, want -32602", err)
+	} else {
+		requireInvalidParamsData(t, err, uniformOptionsRefusal)
 	}
+}
+
+// uniformOptionsRefusal is the data every lifecycle route answers for the same
+// malformed `_meta.opencode.options`.
+var uniformOptionsRefusal = map[string]any{
+	jsonFieldError: errValueUnsupported,
+	jsonFieldField: "_meta.opencode.options",
 }
 
 func TestSessionExtraPathDirsMeta(t *testing.T) {
@@ -166,16 +239,10 @@ func TestSessionExtraPathDirsMeta(t *testing.T) {
 	_, err = sessionMetaFromVendorOptions(options(map[string]any{
 		metaExtraPathDirsKey: []any{absTestPath("session", "bin"), "tools/bin"},
 	}))
-	require.Equal(t, acp.NewInvalidParams(map[string]any{
-		jsonFieldError: errValueAbsolutePathRequired,
-		jsonFieldField: extraPathDirsOptionPath + "[1]",
-	}), err)
+	require.Equal(t, unsupportedField(extraPathDirsOptionPath+"[1]"), err)
 
 	for _, value := range []string{"", absTestPath("session", "bin") + string(os.PathListSeparator) + absTestPath("tools", "bin")} {
 		_, err = sessionMetaFromVendorOptions(options(map[string]any{metaExtraPathDirsKey: []any{value}}))
-		require.Equal(t, acp.NewInvalidParams(map[string]any{
-			jsonFieldError: errValueAbsolutePathRequired,
-			jsonFieldField: extraPathDirsOptionPath + "[0]",
-		}), err)
+		require.Equal(t, unsupportedField(extraPathDirsOptionPath+"[0]"), err)
 	}
 }

@@ -54,9 +54,11 @@ func TestRouteEnvelopeRemainingShapes(t *testing.T) {
 	require.Nil(t, requestRouteCarrier(" \t\n"))
 	require.Nil(t, requestRouteCarrier(strings.Repeat("n", routeTurnNonceMaxBytes+1)))
 	_, err = parseInboundTurnRoute(routeCarrier(" \t\n"))
-	require.ErrorContains(t, err, "empty turnNonce")
+	requireInvalidParamsData(t, err,
+		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldTurnNonce)})
 	_, err = parseInboundTurnRoute(routeCarrier(strings.Repeat("n", routeTurnNonceMaxBytes+1)))
-	require.ErrorContains(t, err, "maximum size")
+	requireInvalidParamsData(t, err,
+		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldTurnNonce)})
 
 	_, err = outboundRoute(elicitationScope{})
 	require.ErrorContains(t, err, "incomplete")
@@ -96,3 +98,22 @@ func TestRouteEnvelopeRemainingShapes(t *testing.T) {
 }
 
 func requestIDNumberPointer(value acp.RequestIdNumber) *acp.RequestIdNumber { return &value }
+
+// TestRouteVersionAcceptsAnEmbeddedHostInteger proves the version reads the same
+// whether it arrived as decoded JSON (float64) or was written by an embedding Go
+// host (int).
+func TestRouteVersionAcceptsAnEmbeddedHostInteger(t *testing.T) {
+	parsed, err := parseInboundTurnRoute(map[string]any{routeEnvelopeKey: map[string]any{
+		routeFieldVersion:   routeEnvelopeVersion,
+		routeFieldTurnNonce: "nonce",
+	}})
+	require.NoError(t, err)
+	require.Equal(t, routeEnvelopeVersion, parsed.Version)
+
+	_, err = parseInboundTurnRoute(map[string]any{routeEnvelopeKey: map[string]any{
+		routeFieldVersion:   "1",
+		routeFieldTurnNonce: "nonce",
+	}})
+	requireInvalidParamsData(t, err,
+		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldVersion)})
+}

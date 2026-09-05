@@ -146,8 +146,9 @@ func TestAgentAndRouteRemainingPublicBranches(t *testing.T) {
 	client.ensureSyncAggregate("native-child")
 	agent.runtime = client
 	parent := testSession(t, agent, client)
+	parent.cwd = t.TempDir()
 	agent.sessions[parent.id] = parent
-	request := ForkSessionRequest(parent.id, t.TempDir())
+	request := ForkSessionRequest(parent.id, parent.cwd)
 	value, err := agent.HandleExtensionMethod(context.Background(), ForkSessionMethod, mustJSON(t, request))
 	require.NoError(t, err)
 	require.NotNil(t, value)

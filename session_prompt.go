@@ -125,17 +125,22 @@ func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (resp acp.
 	// value is submission identity: neither is derived from the other, the route
 	// is validated first so a prompt never reports two rejections, and both
 	// verdicts are reached before anything is dispatched to the harness.
+	//
+	// Both reserved keys are read before the session id is resolved. A host that
+	// got a family literal wrong is owed that answer whichever session it
+	// addressed, so the refusal is observable on an unknown session too rather
+	// than being masked by `unknown session`.
 	route, err := parseInboundTurnRoute(params.Meta)
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
 
-	session, err := a.session(params.SessionId)
+	submission, err := a.promptSubmission(params.Meta)
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
 
-	submission, err := a.promptSubmission(params.Meta)
+	session, err := a.session(params.SessionId)
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
@@ -841,13 +846,15 @@ func (s *session) completePromptTurn(
 
 	s.cancelActions(settleCtx)
 
+	// A native incarnation lost mid-turn leaves the turn's settlement unproven.
+	// From the host's side that is a turn that failed on its transport, and the
+	// prompt path has exactly one envelope for that: the lost incarnation is
+	// named on the debug stream, never in a cause of its own outside the closed
+	// vocabulary.
 	if end.lost != nil {
 		s.fenceLifecycle("native incarnation lost")
 
-		return acp.PromptResponse{}, acp.NewInternalError(map[string]any{
-			jsonFieldError: "opencode_turn_settlement_unproven",
-			jsonFieldCause: "native_incarnation_lost",
-		})
+		return acp.PromptResponse{}, acp.NewInternalError(turnFailedData(causeTransport, "native incarnation lost", 0, ""))
 	}
 
 	response, outcome, stopReason, turnErr := s.promptOutcome(settleCtx, turnCtx, params, cycle, end, dispatch)
@@ -998,11 +1005,19 @@ func (s *session) finalAssistantMessage(ctx context.Context, cycle *foregroundCy
 // A command whose route refused the frame reports the command error, and the
 // command catalog is re-read so a stale entry cannot be offered again.
 func (s *session) classifyTurnFailure(ctx context.Context, err error, dispatch nativeDispatch) error {
+	// A turn that settled with no assistant step this cycle owns is a turn the
+	// provider never answered — the native runtime accepted the frame and then
+	// refused it, which is the `provider` cause and not a class of its own. The
+	// missing identity is the symptom this adapter observed, not something a
+	// host can act on, so it stays in the debug stream and the wire carries the
+	// one contracted turn-failure envelope every sibling emits.
 	if errors.Is(err, errTurnAssistantIdentityMissing) {
-		return acp.NewInternalError(map[string]any{
-			jsonFieldError: "opencode_turn_assistant_identity_missing",
-			jsonFieldCause: causeProvider,
-		})
+		if s.agent != nil && s.agent.log != nil {
+			s.agent.log.DebugContext(ctx, "OpenCode turn produced no assistant identity",
+				slog.String("session_id", string(s.id)))
+		}
+
+		return acp.NewInternalError(turnFailedData(causeProvider, err.Error(), 0, ""))
 	}
 
 	var assistantErr *opencode.AssistantError

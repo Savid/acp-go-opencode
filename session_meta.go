@@ -2,7 +2,6 @@ package opencodeacp
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,8 +12,16 @@ import (
 )
 
 const (
-	envOptionPath           = "_meta.opencode.options." + metaEnvKey
-	extraPathDirsOptionPath = "_meta.opencode.options." + metaExtraPathDirsKey
+	// metaVendorPath and its descendants are the request paths every refusal on
+	// this namespace names. A malformed member is refused with the same
+	// {error, field} shape as an unknown one: a host switching on `error` and
+	// reading `field` must not have to fall back to prose for one of the two.
+	metaVendorPath   = "_meta." + opencodeMetaKey
+	metaOptionsPath  = metaVendorPath + "." + metaOptionsKey
+	metaRawEventPath = metaVendorPath + "." + rawEventKey
+
+	envOptionPath           = metaOptionsPath + "." + metaEnvKey
+	extraPathDirsOptionPath = metaOptionsPath + "." + metaExtraPathDirsKey
 )
 
 type sessionMeta struct {
@@ -103,7 +110,7 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 	if rawModel, ok := optionsMap[metaModelKey]; ok {
 		model, ok := rawModel.(string)
 		if !ok {
-			return opencodeMetaOptions{}, unsupportedField("_meta.opencode.options." + metaModelKey)
+			return opencodeMetaOptions{}, unsupportedField(metaOptionsPath + "." + metaModelKey)
 		}
 
 		options.Model = model
@@ -120,7 +127,7 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 	if rawMode, ok := optionsMap[metaModeKey]; ok {
 		mode, ok := rawMode.(string)
 		if !ok {
-			return opencodeMetaOptions{}, unsupportedField("_meta.opencode.options." + metaModeKey)
+			return opencodeMetaOptions{}, unsupportedField(metaOptionsPath + "." + metaModeKey)
 		}
 
 		options.Mode = mode
@@ -129,7 +136,7 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 	if rawPermission, ok := optionsMap[metaPermissionKey]; ok {
 		permission, ok := rawPermission.(string)
 		if !ok {
-			return opencodeMetaOptions{}, unsupportedField("_meta.opencode.options.permission")
+			return opencodeMetaOptions{}, unsupportedField(metaOptionsPath + "." + metaPermissionKey)
 		}
 
 		if err := validateOpenCodePermission(permission); err != nil {
@@ -219,10 +226,7 @@ func extraPathDirsFromMeta(value any) ([]string, error) {
 		}
 
 		if dir == "" || !filepath.IsAbs(dir) || strings.ContainsRune(dir, os.PathListSeparator) {
-			return nil, acp.NewInvalidParams(map[string]any{
-				jsonFieldError: errValueAbsolutePathRequired,
-				jsonFieldField: field,
-			})
+			return nil, unsupportedField(field)
 		}
 
 		dirs = append(dirs, dir)
@@ -243,7 +247,7 @@ func validateVendorOptionsMeta(meta map[string]any) error {
 	opencodeMeta, ok := meta[opencodeMetaKey].(map[string]any)
 	if !ok {
 		if _, exists := meta[opencodeMetaKey]; exists {
-			return fmt.Errorf("_meta.opencode must be an object")
+			return unsupportedField(metaVendorPath)
 		}
 
 		return nil
@@ -254,58 +258,56 @@ func validateVendorOptionsMeta(meta map[string]any) error {
 		case metaOptionsKey:
 			optionsMap, ok := value.(map[string]any)
 			if !ok {
-				return fmt.Errorf("_meta.opencode.options must be an object")
+				return unsupportedField(metaOptionsPath)
 			}
 
 			for optionKey := range optionsMap {
 				switch optionKey {
 				case configModel, "outputSchema", configMode, metaPermissionKey, metaEnvKey, metaExtraPathDirsKey:
 				default:
-					return unsupportedField("_meta.opencode.options." + optionKey)
+					return unsupportedField(metaOptionsPath + "." + optionKey)
 				}
 			}
 		case rawEventKey:
 			rawEvent, ok := value.(map[string]any)
 			if !ok {
-				return fmt.Errorf("_meta.opencode.rawEvent must be an object")
+				return unsupportedField(metaRawEventPath)
 			}
 
 			for rawKey, rawValue := range rawEvent {
 				switch rawKey {
 				case rawEventEnabledKey:
 					if _, ok := rawValue.(bool); !ok {
-						return fmt.Errorf("_meta.opencode.rawEvent.enabled must be a boolean")
+						return unsupportedField(metaRawEventPath + "." + rawEventEnabledKey)
 					}
 				default:
-					return unsupportedField("_meta.opencode.rawEvent." + rawKey)
+					return unsupportedField(metaRawEventPath + "." + rawKey)
 				}
 			}
 		default:
-			return unsupportedField("_meta.opencode." + key)
+			return unsupportedField(metaVendorPath + "." + key)
 		}
 	}
 
 	return nil
 }
 
-func unsupportedField(path string) error {
+func unsupportedField(path string) *acp.RequestError {
 	return acp.NewInvalidParams(map[string]any{
 		jsonFieldError: errValueUnsupported,
 		jsonFieldField: path,
 	})
 }
 
-// vendorOptionsMetaError normalizes vendor `_meta.opencode` validation failures
-// to invalid params (-32602): structured request errors pass through unchanged
-// and plain validation errors are wrapped so malformed `_meta` never surfaces as
-// an internal error.
-func vendorOptionsMetaError(err error) error {
-	var reqErr *acp.RequestError
-	if errors.As(err, &reqErr) {
-		return reqErr
-	}
-
-	return acp.NewInvalidParams(map[string]any{jsonFieldError: "OpenCode option validation failed"})
+// missingField refuses a reserved key the contract requires on this surface and
+// the caller left out. It is the sibling verdict of unsupportedField and never
+// substituted for it: `unsupported` always means a value that is present and
+// refused, `missing` always means one that is required and absent.
+func missingField(path string) *acp.RequestError {
+	return acp.NewInvalidParams(map[string]any{
+		jsonFieldError: errValueMissing,
+		jsonFieldField: path,
+	})
 }
 
 func validateOpenCodePermission(permission string) error {
@@ -313,7 +315,7 @@ func validateOpenCodePermission(permission string) error {
 	case "", openCodePermissionAsk, openCodePermissionAllow, openCodePermissionDeny:
 		return nil
 	default:
-		return unsupportedField("_meta.opencode.options.permission")
+		return unsupportedField(metaOptionsPath + "." + metaPermissionKey)
 	}
 }
 
@@ -325,14 +327,18 @@ func normalizeOpenCodePermission(permission string) string {
 	return permission
 }
 
+// validateSchemaObject refuses an output schema this adapter will not forward.
+// Both refusals name the option path rather than describing the value: an
+// embedded Go caller can hand over a map no JSON encoder accepts, and the host
+// is owed the same {error, field} shape either way.
 func validateSchemaObject(schema any) error {
 	obj, ok := schema.(map[string]any)
 	if !ok || len(obj) == 0 {
-		return fmt.Errorf("output schema must be a non-empty JSON object")
+		return unsupportedField(outputSchemaOptionPath)
 	}
 
 	if _, err := json.Marshal(obj); err != nil {
-		return fmt.Errorf("output schema must be JSON serializable: %w", err)
+		return unsupportedField(outputSchemaOptionPath)
 	}
 
 	return nil

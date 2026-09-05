@@ -55,6 +55,15 @@ type SessionStoreReplacement struct {
 // clears nothing, and returns success. An implementation that leaves the rule to
 // its caller resurrects a deleted session whenever a settlement races the delete
 // that already answered for it.
+//
+// Every `Replace` is one session's, and enforcing that is the store's obligation
+// too. Before writing anything, an implementation must refuse a replacement key
+// whose `SessionID` differs from the addressed `main.SessionID`, and a
+// `{SessionID, Subpath}` the set lists twice, with an error naming the offending
+// key; a refused call leaves the store exactly as it was. The set must carry the
+// addressed main key exactly once, and every other key in it is a subpath of the
+// same session. A store that admits a foreign key lets one session's commit
+// silently retire another session's rows.
 type SessionStore interface {
 	Append(ctx context.Context, key SessionKey, entries []SessionStoreEntry) error
 	Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error)
@@ -160,9 +169,12 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		return fmt.Errorf("main subpath must be %q", SessionStoreMainSubpath)
 	}
 
+	// Every Replace is one session's. The addressed main key names that session,
+	// and a replacement key naming any other is refused before a single entry is
+	// written, alongside a key the set lists twice. Both refusals happen up
+	// front, so a set this store will not accept leaves it exactly as it was.
 	seenReplacement := make(map[SessionKey]struct{}, len(replacements))
-	members := make(map[string]struct{}, len(replacements))
-	mainCounts := make(map[string]int, len(replacements))
+	mainKeys := 0
 
 	for _, replacement := range replacements {
 		// The refusal names the key it refused. A replacement set lists many keys
@@ -174,59 +186,48 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		}
 
 		seenReplacement[replacement.Key] = struct{}{}
+
 		if replacement.Key.SessionID == "" {
 			return fmt.Errorf("replacement session id is required")
 		}
 
-		members[replacement.Key.SessionID] = struct{}{}
+		if replacement.Key.SessionID != main.SessionID {
+			return fmt.Errorf("replacement key for a foreign session: session %q subpath %q, addressed session %q",
+				replacement.Key.SessionID, replacement.Key.Subpath, main.SessionID)
+		}
+
 		if replacement.Key.Subpath == SessionStoreMainSubpath {
-			mainCounts[replacement.Key.SessionID]++
+			mainKeys++
 		}
 	}
 
-	if mainCounts[main.SessionID] != 1 {
+	if mainKeys != 1 {
 		return fmt.Errorf("replacements must include addressed main key exactly once")
-	}
-
-	for member := range members {
-		if mainCounts[member] != 1 {
-			return fmt.Errorf("replacements must include exactly one main key for session %q", member)
-		}
 	}
 
 	// A tombstone is final and the store is where that finality lives, not the
 	// adapter above it: a replacement addressed to a deleted session writes
 	// nothing, clears nothing, and answers success, because the delete already
-	// gave the host its answer for that id. The addressed session decides the
-	// whole call, and a graph member deleted on its own drops out of the set the
-	// call still applies to the rest.
+	// gave the host its answer for that id.
 	if s.isTombstonedLocked(main) {
 		return nil
 	}
 
 	now := time.Now().UnixMilli()
 
-	live := make([]SessionStoreReplacement, 0, len(replacements))
-	replacedSessions := make(map[string]struct{}, len(replacements))
-
-	for _, replacement := range replacements {
-		if s.isTombstonedLocked(mainSessionKey(replacement.Key.SessionID)) {
-			continue
-		}
-
-		live = append(live, replacement)
-		replacedSessions[replacement.Key.SessionID] = struct{}{}
-	}
-
+	// The addressed session's whole subtree is retired first, so a subpath the
+	// new set no longer lists cannot survive as a stale sibling of the ones it
+	// does. Nothing outside that session is reachable from here: every key in
+	// the set was proved to name it above.
 	for candidate := range s.entries {
-		if _, replacing := replacedSessions[candidate.SessionID]; replacing {
+		if candidate.SessionID == main.SessionID {
 			delete(s.entries, candidate)
 			delete(s.updatedAt, candidate)
 			s.tombstones[candidate] = now
 		}
 	}
 
-	for _, replacement := range live {
+	for _, replacement := range replacements {
 		s.entries[replacement.Key] = cloneStoreEntries(replacement.Entries)
 		s.updatedAt[replacement.Key] = now
 		delete(s.tombstones, replacement.Key)
