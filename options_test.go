@@ -73,6 +73,10 @@ type optionTestAuthority struct{}
 
 func (optionTestAuthority) NativeEnvironment() map[string]string            { return map[string]string{} }
 func (optionTestAuthority) PrepareNativeTree(context.Context, string) error { return nil }
+func (optionTestAuthority) WriteNativeAppendLog(context.Context, string, [][]byte) error {
+	return ErrHostAuthorityUnavailable
+}
+
 func (optionTestAuthority) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
 	return nil, nil
 }
