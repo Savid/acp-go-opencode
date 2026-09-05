@@ -96,6 +96,10 @@ func (a *authorityTrace) PrepareNativeTree(_ context.Context, path string) error
 	return nil
 }
 
+func (*authorityTrace) WriteNativeAppendLog(context.Context, string, [][]byte) error {
+	return ErrHostAuthorityUnavailable
+}
+
 func (*authorityTrace) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
 	return nil, nil
 }
@@ -507,6 +511,10 @@ func (*fixedProcessAuthority) NativeEnvironment() map[string]string {
 func (*fixedProcessAuthority) PrepareNativeTree(context.Context, string) error {
 	return nil
 }
+func (*fixedProcessAuthority) WriteNativeAppendLog(context.Context, string, [][]byte) error {
+	return ErrHostAuthorityUnavailable
+}
+
 func (*fixedProcessAuthority) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
 	return nil, nil
 }
@@ -974,6 +982,10 @@ func (a edgeAuthority) PrepareNativeTree(ctx context.Context, path string) error
 
 	return a.prepare(ctx, path)
 }
+func (a edgeAuthority) WriteNativeAppendLog(context.Context, string, [][]byte) error {
+	return ErrHostAuthorityUnavailable
+}
+
 func (a edgeAuthority) ReadNativeAppendLog(ctx context.Context, path string, offset uint64) ([][]byte, error) {
 	if a.read == nil {
 		return nil, nil

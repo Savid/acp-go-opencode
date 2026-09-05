@@ -27,13 +27,15 @@ must keep affected resources out of reuse.
 ## Host authority
 
 Omitting `WithHostAuthority` selects ordinary same-identity execution. A
-managed host implements this exact boundary:
+managed host implements this exact boundary. The append-log members are present
+in the interface; this adapter does not invoke either for provider state:
 
 ```go
 type HostAuthority interface {
 	NativeEnvironment() map[string]string
 	PrepareNativeTree(context.Context, string) error
 	ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error)
+	WriteNativeAppendLog(context.Context, string, [][]byte) error
 	ReclaimNativeTree(context.Context, string) error
 	StartNative(context.Context, NativeRequest) (NativeProcess, error)
 }
