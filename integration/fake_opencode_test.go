@@ -121,9 +121,10 @@ func TestOpenCodeACPAgentFakeExecutablePermissionDocFailClosed(t *testing.T) {
 	}
 	// The fake drops only the native permission-reply path, so version
 	// validation must reject the runtime and fail session creation closed. The
-	// wire error is a generic internal error by design: the adapter reduces every
-	// handler failure to "handler failed" and never leaks the failing detail,
-	// which the -debug stream carries instead. The ok-mode tests share this
+	// wire error is a generic internal error by design: the adapter reduces an
+	// unclassified handler failure to the closed "opencode_internal_failure"
+	// token and never leaks the failing detail, which the -debug stream carries
+	// instead. The ok-mode tests share this
 	// fixture minus that one path and create sessions, so the dropped path is
 	// what fails this one.
 	_, err := conn.NewSession(ctx, opencodeacp.NewSessionRequest(t.TempDir()))

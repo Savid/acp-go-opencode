@@ -18,10 +18,21 @@ type ParamError struct {
 	// Field is the full request path, from MetaPath down to the offending
 	// member.
 	Field string
+	// Missing distinguishes the two verdicts a host reads from this path. It is
+	// true only when the contract requires the key on this surface and the
+	// caller left it out; a value that is present and refused — the key on a
+	// surface that carries none, a malformed member — is never missing.
+	Missing bool
 }
 
 // Error implements error.
-func (e *ParamError) Error() string { return "unsupported " + e.Field }
+func (e *ParamError) Error() string {
+	if e.Missing {
+		return "missing " + e.Field
+	}
+
+	return "unsupported " + e.Field
+}
 
 func paramError(members ...string) *ParamError {
 	field := MetaPath
@@ -30,6 +41,12 @@ func paramError(members ...string) *ParamError {
 	}
 
 	return &ParamError{Field: field}
+}
+
+// missingParamError names the reserved key a surface requires and the caller
+// omitted.
+func missingParamError() *ParamError {
+	return &ParamError{Field: MetaPath, Missing: true}
 }
 
 // RefuseKey reports the refusal a surface carrying no lifecycle value answers
@@ -95,7 +112,7 @@ func DecodePromptCorrelation(meta map[string]any, negotiated Negotiated) (Submis
 	case !negotiated.Present():
 		return Submission{}, nil
 	case !present:
-		return Submission{}, paramError()
+		return Submission{}, missingParamError()
 	}
 
 	fields, ok := raw.(map[string]any)

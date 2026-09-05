@@ -190,7 +190,10 @@ func TestActiveReplacementAndArtifactLoadEdges(t *testing.T) {
 		_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(current.id, cwd,
 			WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{"COLOR": "new"}))),
 		))
-		require.ErrorContains(t, err, "changed during replacement")
+		require.Equal(t, map[string]any{
+			jsonFieldError: errValueInternalFailure,
+			jsonFieldClass: classSessionReplacementRaced,
+		}, requireInternalErrorData(t, err))
 	})
 
 	t.Run("missing image artifact blocks hydration", func(t *testing.T) {

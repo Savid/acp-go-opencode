@@ -174,7 +174,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent.runtimeGeneration = 1
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, _, _, err := agent.newOpenCodeClient(ctx, "session", t.TempDir(), nil, sessionCarrier{})
+		_, _, _, err := agent.newOpenCodeClient(ctx, "session", "", t.TempDir(), nil, sessionCarrier{})
 		require.ErrorIs(t, err, context.Canceled)
 	})
 
@@ -318,7 +318,7 @@ func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {
 	canonical, err = runtimeAbs(canonical)
 	require.NoError(t, err)
 
-	staleRelease, err := agent.bindDirectory("session-1", cwd, nil)
+	staleRelease, err := agent.bindDirectory("session-1", "", cwd, nil)
 	require.NoError(t, err)
 
 	// Runtime retirement clears the old generation's principal map before its
@@ -328,7 +328,7 @@ func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {
 	agent.directories = make(map[string]directoryBinding)
 	agent.mu.Unlock()
 
-	recoveredRelease, err := agent.bindDirectory("session-1", cwd, nil)
+	recoveredRelease, err := agent.bindDirectory("session-1", "", cwd, nil)
 	require.NoError(t, err)
 
 	releaseStale := make(chan struct{})
@@ -346,8 +346,8 @@ func TestStaleDirectoryReleaseCannotDeleteRecoveredBinding(t *testing.T) {
 	recovered, ok := agent.directories[canonical]
 	agent.mu.Unlock()
 	require.True(t, ok)
-	require.Equal(t, acp.SessionId("session-1"), recovered.SessionID)
-	require.NotZero(t, recovered.Incarnation)
+	require.Len(t, recovered.Holders, 1)
+	require.NotZero(t, recovered.Holders["session-1"])
 
 	recoveredRelease()
 	agent.mu.Lock()

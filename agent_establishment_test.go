@@ -101,6 +101,8 @@ func TestEstablishmentIsWrittenAfterTheEstablishingResponse(t *testing.T) {
 
 	t.Cleanup(func() { _ = agent.Close() })
 
+	cwd := t.TempDir()
+
 	transport := newWireTransport(t, agent)
 	transport.send(t, 1, acp.AgentMethodInitialize, map[string]any{
 		"protocolVersion":    acp.ProtocolVersionNumber,
@@ -110,7 +112,7 @@ func TestEstablishmentIsWrittenAfterTheEstablishingResponse(t *testing.T) {
 	require.EqualValues(t, 1, transport.next(t)["id"])
 
 	transport.send(t, 2, acp.AgentMethodSessionNew, map[string]any{
-		jsonFieldCwd: t.TempDir(),
+		jsonFieldCwd: cwd,
 		"mcpServers": []any{},
 	})
 
@@ -133,10 +135,11 @@ func TestEstablishmentIsWrittenAfterTheEstablishingResponse(t *testing.T) {
 	require.Equal(t, sessionUpdateAvailableCommands, update["sessionUpdate"])
 
 	// The fork route establishes a session too, and it reaches the transport
-	// through the extension dispatcher rather than the stable one.
+	// through the extension dispatcher rather than the stable one. A fork
+	// inherits its parent's workspace, so it names the same cwd.
 	transport.send(t, 3, ForkSessionMethod, map[string]any{
 		"sessionId":  result["sessionId"],
-		jsonFieldCwd: t.TempDir(),
+		jsonFieldCwd: cwd,
 	})
 
 	forked := transport.next(t)

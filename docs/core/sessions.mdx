@@ -72,7 +72,8 @@ extension for fork:
 - `session/close` — end a session at its containment boundary and commit the
   final snapshot.
 - `session/delete` — remove a stored session, leaving a tombstone.
-- `_opencode/session/fork` — branch a session's native state into a new session.
+- `_opencode/session/fork` — branch a session's native state into a new session
+  in the same workspace.
 
 `session/close` is a ladder and runs in one order: the session's native work is
 interrupted and acknowledged, the state a reload restores from is read while the
@@ -120,17 +121,41 @@ and carries that prompt's exact route envelope.
 A session start that fails on a caller-supplied option — a seeded file the
 runtime home cannot accept, a start path that is not absolute, an unusable
 `_meta.opencode` option — is rejected with `-32602` and the uniform
-`{"error":"unsupported","field":"<json path>"}` data. Every other startup
-failure is `-32603`. When a loopback call to the native server failed, the
+`{"error":"unsupported","field":"<json path>"}` data. A `cwd` that is not an
+absolute path takes that same verdict on the `cwd` field, on `session/new`,
+`session/load`, `session/resume`, and `_opencode/session/fork` alike, and so
+does a `_opencode/*` params body the adapter cannot decode or that fails
+validation as a whole, which names `params`. Every other startup failure is
+`-32603`. When a loopback call to the native server failed, the
 message names the method, route, and status of that call alone: native response
 bodies, query strings, model names, configuration, and credentials never reach
 the client.
 
+A `session/load` or `session/resume` whose stored snapshot cannot be replayed is
+`-32603` with the closed `{"error":"opencode_restore_failed"}` data, so a host
+can tell an unrestorable stored session from any other internal failure. The
+store entry is neither deleted nor tombstoned by the failure. Every remaining
+unclassified handler error is `{"error":"opencode_internal_failure"}`, optionally
+with a closed `class`. The complete off-prompt `-32603` vocabulary — including
+`opencode_invalid_options`, `opencode_runtime_unavailable`, and
+`opencode_session_poisoned` — is listed in
+[Metadata reference](/reference/meta).
+
 If the shared native server exits, the adapter fails every in-flight turn on
 that server with the uniform `opencode_turn_failed` transport error but retains
-the loaded logical sessions. A later prompt first
-starts a new runtime generation, reopens the session's directory/MCP scope,
-and verifies or completes replay of the last committed sync-event generation.
+the loaded logical sessions. A runtime that merely exited is an epoch fence, not
+a verdict on the `Agent`: the next explicit operation that needs a runtime —
+`session/new`, `session/load`, `session/resume`, or a prompt on a session
+awaiting rebind — admits exactly one replacement generation, and no replacement
+is started speculatively before one asks. `session/list` and `session/delete`
+need no runtime and keep working either way. The one state that refuses recovery
+is a previous incarnation whose process tree is still alive and un-containable,
+or a directory scope whose MCP disconnect could not be proven; those answer
+every runtime-needing operation with `-32603`
+`{"error":"opencode_runtime_unavailable"}` until the host recovers the identity.
+A later prompt first starts a new runtime generation, reopens the session's
+directory/MCP scope, and verifies or completes replay of the last committed
+sync-event generation.
 Only a session fenced to that current runtime generation can publish its route
 and send the prompt; a replacement that crashes during reconstruction is
 discarded without routing the user prompt to it.
@@ -152,6 +177,40 @@ proof fails, close returns an error and retains the logical session/principal so
 the host can retry; admission never races ahead of uncertain native cleanup.
 Directory-scoped clients cannot own or initiate shutdown of the shared base
 runtime.
+
+## Forking
+
+`_opencode/session/fork` branches a loaded session. OpenCode's native fork keeps
+the source session's directory: `POST /session/{id}/fork` accepts a `directory`
+query parameter and ignores it, the forked session's `directory` and `projectID`
+are always the parent's, and no native call can move a session to another
+directory afterwards. A fork therefore **inherits its parent's `cwd`**, and a
+request naming a different one is refused before anything native happens, with
+`-32602` and `{"error":"unsupported","field":"cwd"}`. A request that names the
+parent's own directory in any equivalent spelling is accepted, and the fork
+records the parent's spelling.
+
+Because the fork lives in the parent's workspace, the two hold that canonical
+directory's MCP principal jointly: a fork is admitted alongside its parent, and
+the principal is released when the last member of the lineage leaves. Sharing is
+limited to one fork lineage — any other session naming a directory that is
+already held is still refused with `-32600`
+`{"error":"backpressure","limit":"directory_mcp_principal"}`, and a differing MCP
+set is `{"error":"mcp_principal_conflict","cwd":"<canonical>"}` whoever asks.
+Because a directory's MCP registration belongs to the directory rather than to
+one scope, a co-holder that leaves takes the registration with it and the
+surviving members re-register before their next prompt.
+
+A fork's ACP `_meta.opencode.options.permission` must equal its parent's;
+supplying a different one is `-32602` with
+`{"error":"child_permission_must_inherit","field":"_meta.opencode.options.permission"}`.
+The fork inherits the parent's carrier, model, mode, and emitted image
+artifacts; an explicitly supplied carrier half replaces the inherited one.
+
+The native fork is an independent session: it owns a complete copy of the branched
+history and its native parent id is unset. The lineage is therefore adapter-owned
+metadata, and a fork restores from its own stored state alone — in any order its
+parent was closed in. See [Session store](/docs/features/session-store).
 
 ## Load versus resume
 

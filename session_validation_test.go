@@ -7,14 +7,14 @@ import (
 )
 
 func TestValidationHelperBranches(t *testing.T) {
-	// A malformed start path is not an unsupported field: an absent path is
-	// `required` and a relative one names the format it failed.
+	// A start path that is not absolute takes one uniform verdict, and an empty
+	// one is not absolute either: both name the field that carried the value.
 	requireInvalidParamsData(t, validateSessionStartPaths("relative", nil),
-		map[string]any{jsonFieldError: errValueAbsolutePathRequired, jsonFieldField: jsonFieldCwd})
+		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: jsonFieldCwd})
 	requireInvalidParamsData(t, validateRequiredAbsolutePath(jsonFieldCwd, ""),
-		map[string]any{jsonFieldCwd: validationRequired})
+		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: jsonFieldCwd})
 	requireInvalidParamsData(t, validateSessionStartPaths(absTestPath("tmp", "project"), []string{"relative"}),
-		map[string]any{jsonFieldError: errValueAbsolutePathRequired, jsonFieldField: "additionalDirectories[0]"})
+		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "additionalDirectories[0]"})
 	value := absTestPath("tmp", "project")
 	if err := validateOptionalAbsolutePath("cwd", &value); err != nil {
 		t.Fatalf("validateOptionalAbsolutePath: %v", err)

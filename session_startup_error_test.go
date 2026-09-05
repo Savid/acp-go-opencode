@@ -91,7 +91,12 @@ func TestSessionStartHTTPFailuresNameTheRouteAndNeverTheBody(t *testing.T) {
 
 			data, ok := reqErr.Data.(map[string]any)
 			require.True(t, ok, "error data = %#v", reqErr.Data)
-			require.Equal(t, "handler failed", data[jsonFieldError])
+			// A native loopback failure at startup reduces to one closed
+			// vendor-scoped token plus the one documented class, never to prose
+			// a host would have to parse.
+			require.Equal(t, errValueInternalFailure, data[jsonFieldError])
+			require.Equal(t, classNativeStartup, data[jsonFieldClass])
+			require.Len(t, data, 2)
 
 			encoded, marshalErr := json.Marshal(reqErr)
 			require.NoError(t, marshalErr)

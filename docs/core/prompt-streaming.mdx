@@ -192,12 +192,21 @@ tool call to attribute to, is replaced by the same guidance as agent text. Only
 a session-store failure (`reason: "storage_failed"`) still ends the turn with a
 `stage: "image_output"` envelope.
 
+`agent_message_chunk` and `agent_thought_chunk` are **append-only deltas**. A
+client renders a turn's assistant text as the in-order concatenation of every
+chunk it received, so a chunk is never a snapshot, a repeat, or a correction of
+text already streamed in the same turn.
+
 OpenCode text and reasoning part events carry the complete part plus, on live
 updates, an explicit appended `delta`. The adapter forwards that delta and
-reconciles the final REST response against what was already delivered, so a
-metadata-only part change never repeats text. A final non-append rewrite cannot
-be represented by ACP chunk updates; it is diagnosed without logging content
-and is not appended as corrupt duplicate text.
+reconciles the final REST response against what was already delivered, so the
+terminal full-message frame contributes only the suffix the deltas did not
+carry, and nothing when they carried all of it. A harness turn that delivers no
+deltas at all produces exactly one chunk with that text, and a turn carrying
+several native assistant messages produces each message's text once, in native
+order, deduplicated on native message identity rather than on text. A final
+non-append rewrite cannot be represented by ACP chunk updates; it is diagnosed
+without logging content and is not appended as corrupt duplicate text.
 
 Each native tool part produces exactly one `tool_call`. Later pending,
 in-progress, completed, or failed states for the same call produce

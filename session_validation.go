@@ -37,13 +37,13 @@ func validateSessionStartPaths(cwd string, additionalDirectories []string) error
 	return nil
 }
 
+// validateRequiredAbsolutePath refuses a start path that is not absolute. An
+// empty value is not absolute either, so both take the one uniform verdict the
+// contract fixes for this field: a value that is present in the request and
+// refused. No separate token and no message-shaped data object.
 func validateRequiredAbsolutePath(field string, value string) error {
-	if value == "" {
-		return acp.NewInvalidParams(map[string]any{field: validationRequired})
-	}
-
 	if !filepath.IsAbs(value) {
-		return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueAbsolutePathRequired, jsonFieldField: field})
+		return unsupportedField(field)
 	}
 
 	return nil

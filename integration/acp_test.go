@@ -54,14 +54,39 @@ func TestOpenCodeACPAgentBinarySessionLifecycle(t *testing.T) {
 	if _, err := conn.LoadSession(ctx, opencodeacp.LoadSessionRequest(session.SessionId, cwd)); err != nil {
 		t.Fatalf("load from shared runtime store: %v\nstderr:\n%s", err, agent.stderrString())
 	}
-	forkCwd := t.TempDir()
-	fork, err := opencodeacp.CallForkSession(ctx, conn, opencodeacp.ForkSessionRequest(session.SessionId, forkCwd))
+	// OpenCode's native fork keeps the source session's directory, so a fork
+	// inherits its parent's workspace and a request naming another one is
+	// refused before anything native happens.
+	if _, err := opencodeacp.CallForkSession(ctx, conn, opencodeacp.ForkSessionRequest(session.SessionId, t.TempDir())); err == nil {
+		t.Fatal("fork into a different cwd was accepted")
+	}
+	fork, err := opencodeacp.CallForkSession(ctx, conn, opencodeacp.ForkSessionRequest(session.SessionId, cwd))
 	if err != nil {
 		t.Fatalf("extension fork session: %v\nstderr:\n%s", err, agent.stderrString())
 	}
 	if fork.SessionId == "" || fork.SessionId == session.SessionId {
 		t.Fatalf("fork response = %#v", fork)
 	}
+
+	// A forked lineage is restorable whichever member is closed first. The
+	// parent goes first here, which is the order that leaves the fork rooting a
+	// graph whose parent is no longer loaded.
+	if _, err := conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId}); err != nil {
+		t.Fatalf("close forked parent: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	if _, err := conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: fork.SessionId}); err != nil {
+		t.Fatalf("close fork: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	if _, err := conn.ResumeSession(ctx, opencodeacp.ResumeSessionRequest(fork.SessionId, cwd)); err != nil {
+		t.Fatalf("resume fork after the parent closed first: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	if _, err := conn.ResumeSession(ctx, opencodeacp.ResumeSessionRequest(session.SessionId, cwd)); err != nil {
+		t.Fatalf("resume forked parent: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+	if _, err := conn.LoadSession(ctx, opencodeacp.LoadSessionRequest(session.SessionId, cwd)); err != nil {
+		t.Fatalf("load forked parent: %v\nstderr:\n%s", err, agent.stderrString())
+	}
+
 	if _, err := conn.UnstableDeleteSession(ctx, opencodeacp.DeleteSessionRequest(fork.SessionId)); err != nil {
 		t.Fatalf("delete forked session: %v\nstderr:\n%s", err, agent.stderrString())
 	}

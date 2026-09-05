@@ -130,7 +130,8 @@ func TestLocalConnectionRequiresInitializeAndStrictCancelRoute(t *testing.T) {
 	require.Nil(t, reqErr)
 	_, reqErr = conn.handle(context.Background(), acp.AgentMethodSessionCancel, mustJSON(t, acp.CancelNotification{SessionId: "missing"}))
 	require.NotNil(t, reqErr)
-	require.Contains(t, reqErr.Data, "reason")
+	requireInvalidParamsData(t, reqErr,
+		map[string]any{jsonFieldError: errValueMissing, jsonFieldField: routeMetaPath})
 }
 
 func TestLocalConnectionRejectsClosedBeforeDispatchOrDecode(t *testing.T) {

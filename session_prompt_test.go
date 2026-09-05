@@ -1739,37 +1739,29 @@ func TestPoisonedSessionRejectsFollowUpOperations(t *testing.T) {
 	agent.sessions[s.id] = s
 	agent.mu.Unlock()
 
-	if err := s.poison(ctx, "native drift without advertisement"); err == nil ||
-		!strings.Contains(err.Error(), "opencode_native_session_id_drift") {
-		t.Fatalf("poison error = %v", err)
-	}
+	// The poisoned refusal is an internal error carrying one closed token and
+	// one closed cause. Neither the drifting field nor the two native ids reach
+	// the wire.
+	poisoned := map[string]any{jsonFieldError: errValueSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift}
+
+	err := s.poison(ctx, poisonCauseNativeSessionDrift)
+	require.Equal(t, poisoned, requireInternalErrorData(t, err))
+
 	if conn.updateCount() != 0 {
 		t.Fatalf("poison without commands emitted updates: %#v", conn.updates)
 	}
-	if err := s.poison(ctx, "second poison"); err == nil ||
-		!strings.Contains(err.Error(), "session_poisoned") ||
-		!strings.Contains(err.Error(), "native drift without advertisement") {
-		t.Fatalf("second poison error = %v", err)
-	}
-	if _, err := s.acquireTurn(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
-		t.Fatalf("acquire poisoned session error = %v", err)
-	}
-	if err := s.refreshCommands(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
-		t.Fatalf("refresh poisoned session error = %v", err)
-	}
-	if err := agent.Cancel(ctx, CancelRequest(s.id, "nonce")); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
-		t.Fatalf("cancel poisoned session error = %v", err)
-	}
-	if _, err := agent.SetSessionConfigOption(ctx, SetModelRequest(s.id, "openai/gpt-test")); err == nil ||
-		!strings.Contains(err.Error(), "session_poisoned") {
-		t.Fatalf("set config poisoned session error = %v", err)
-	}
-	if err := s.replayMessages(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
-		t.Fatalf("replay poisoned session error = %v", err)
-	}
-	if err := s.snapshotToStore(ctx); err == nil || !strings.Contains(err.Error(), "session_poisoned") {
-		t.Fatalf("snapshot poisoned session error = %v", err)
-	}
+
+	require.Equal(t, poisoned, requireInternalErrorData(t, s.poison(ctx, "second poison")))
+
+	_, err = s.acquireTurn(ctx)
+	require.Equal(t, poisoned, requireInternalErrorData(t, err))
+	require.Equal(t, poisoned, requireInternalErrorData(t, s.refreshCommands(ctx)))
+	require.Equal(t, poisoned, requireInternalErrorData(t, agent.Cancel(ctx, CancelRequest(s.id, "nonce"))))
+
+	_, err = agent.SetSessionConfigOption(ctx, SetModelRequest(s.id, "openai/gpt-test"))
+	require.Equal(t, poisoned, requireInternalErrorData(t, err))
+	require.Equal(t, poisoned, requireInternalErrorData(t, s.replayMessages(ctx)))
+	require.Equal(t, poisoned, requireInternalErrorData(t, s.snapshotToStore(ctx)))
 	if store.replaceCount() != 0 {
 		t.Fatalf("store writes after poisoned follow-up = %d, want 0", store.replaceCount())
 	}
@@ -1787,9 +1779,10 @@ func assertNativeSessionDriftPoison(
 	gotNativeID string,
 ) {
 	t.Helper()
-	if err == nil || !strings.Contains(err.Error(), "opencode_native_session_id_drift") || !strings.Contains(err.Error(), gotNativeID) {
-		t.Fatalf("drift error = %v", err)
-	}
+
+	poisoned := map[string]any{jsonFieldError: errValueSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift}
+	require.Equal(t, poisoned, requireInternalErrorData(t, err))
+	require.NotContains(t, err.Error(), gotNativeID, "the drifting native id never reaches the wire")
 	if conn.updateCount() != 2 {
 		t.Fatalf("updates after poison = %#v", conn.updates)
 	}
@@ -1801,9 +1794,7 @@ func assertNativeSessionDriftPoison(
 		t.Fatalf("store writes after poison = %d, want 0", store.replaceCount())
 	}
 	_, nextErr := session.Prompt(context.Background(), acp.PromptRequest{SessionId: session.id, Prompt: []acp.ContentBlock{acp.TextBlock("again")}})
-	if nextErr == nil || !strings.Contains(nextErr.Error(), "session_poisoned") || !strings.Contains(nextErr.Error(), gotNativeID) {
-		t.Fatalf("subsequent poison error = %v", nextErr)
-	}
+	require.Equal(t, poisoned, requireInternalErrorData(t, nextErr))
 }
 
 type countingSessionStore struct {
@@ -3581,7 +3572,9 @@ func TestTimedOutTurnWhoseInterruptIsRefusedReportsAnUnprovenSettlement(t *testi
 	current := testSession(t, NewAgent(WithTurnTimeout(20*time.Millisecond)), client)
 
 	_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
-	require.ErrorContains(t, err, "opencode_turn_settlement_unproven")
+	// A lost native incarnation is a transport-cause turn failure, not a token
+	// of its own outside the closed prompt-path vocabulary.
+	require.Equal(t, turnFailedData(causeTransport, "", 0, ""), requireInternalErrorData(t, err))
 	require.NotContains(t, err.Error(), "harness refused the interrupt")
 }
 
@@ -3822,9 +3815,11 @@ func TestTurnWithNoReadableTranscriptFails(t *testing.T) {
 		current := testSession(t, NewAgent(), client)
 
 		_, err := current.Prompt(context.Background(), TextPromptRequest(current.id, internalSeamTurnNonce, "hello"))
-		data := requireInternalErrorData(t, err)
-		require.Equal(t, "opencode_turn_assistant_identity_missing", data[jsonFieldError])
-		require.Equal(t, causeProvider, data[jsonFieldCause])
+		// The turn settled with no assistant step this cycle owns: the wire
+		// carries the contracted provider turn failure, and the missing
+		// identity stays a debug-stream symptom.
+		data := assertTurnFailed(t, err, causeProvider, "")
+		require.NotContains(t, data, jsonFieldStatusCode)
 	})
 }
 

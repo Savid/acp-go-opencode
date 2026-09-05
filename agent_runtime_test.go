@@ -499,7 +499,7 @@ func TestDirectoryBindingRemainingOSHashAndReleaseBranches(t *testing.T) {
 	agent := NewAgent()
 	runtimeEvalSymlinks = func(string) (string, error) { return "relative", nil }
 	runtimeAbs = func(string) (string, error) { return "", errors.New("abs failed") }
-	_, err := agent.bindDirectory("session", "cwd", nil)
+	_, err := agent.bindDirectory("session", "", "cwd", nil)
 	require.ErrorContains(t, err, "abs failed")
 
 	runtimeEvalSymlinks = originalEval
@@ -507,7 +507,7 @@ func TestDirectoryBindingRemainingOSHashAndReleaseBranches(t *testing.T) {
 	runtimeJSONMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal failed") }
 	_, err = agent.directoryMCPFingerprint([]opencode.MCPServerConfig{{Name: "same"}, {Name: "same"}})
 	require.ErrorContains(t, err, "marshal failed")
-	_, err = agent.bindDirectory("session", t.TempDir(), []opencode.MCPServerConfig{{Name: "same"}})
+	_, err = agent.bindDirectory("session", "", t.TempDir(), []opencode.MCPServerConfig{{Name: "same"}})
 	require.ErrorContains(t, err, "marshal failed")
 
 	runtimeJSONMarshal = originalMarshal
@@ -517,10 +517,10 @@ func TestDirectoryBindingRemainingOSHashAndReleaseBranches(t *testing.T) {
 	require.NoError(t, err)
 
 	cwd := t.TempDir()
-	release, err := agent.bindDirectory("one", cwd, nil)
+	release, err := agent.bindDirectory("one", "", cwd, nil)
 	require.NoError(t, err)
 	agent.mu.Lock()
-	agent.directories[cwd] = directoryBinding{SessionID: "two"}
+	agent.directories[cwd] = directoryBinding{Holders: map[acp.SessionId]directoryBindingIncarnation{"two": 1}}
 	agent.mu.Unlock()
 	release()
 	release()
@@ -533,13 +533,13 @@ func TestScopeCleanupFailureRetainsDirectoryPrincipal(t *testing.T) {
 	agent := NewAgent()
 	agent.runtime = client
 
-	scoped, release, generation, err := agent.newOpenCodeClient(context.Background(), "session", cwd, []opencode.MCPServerConfig{{Name: "tools"}}, sessionCarrier{})
+	scoped, release, generation, err := agent.newOpenCodeClient(context.Background(), "session", "", cwd, []opencode.MCPServerConfig{{Name: "tools"}}, sessionCarrier{})
 	require.ErrorIs(t, err, opencode.ErrMCPDisconnectUnproven)
 	require.Nil(t, scoped)
 	require.Nil(t, release)
 	require.Zero(t, generation)
 	require.Len(t, agent.directories, 1, "unproven native cleanup must retain directory ownership")
-	scoped, release, generation, err = agent.newOpenCodeClient(context.Background(), "session", cwd, []opencode.MCPServerConfig{{Name: "tools"}}, sessionCarrier{})
+	scoped, release, generation, err = agent.newOpenCodeClient(context.Background(), "session", "", cwd, []opencode.MCPServerConfig{{Name: "tools"}}, sessionCarrier{})
 	require.ErrorIs(t, err, opencode.ErrMCPDisconnectUnproven)
 	require.Nil(t, scoped)
 	require.Nil(t, release)
@@ -756,4 +756,76 @@ func TestSharedRuntimeConstructionEdges(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, runtime)
 	require.ErrorIs(t, startOptions.PrepareTree(t.Context(), t.TempDir()), ErrHostAuthorityUnavailable)
+}
+
+// TestDirectoryPrincipalCoHoldingBranches covers the bookkeeping the shared
+// principal adds: the same session rebinding its own directory, and a co-holder
+// leaving a directory that carries MCP registrations, which the survivors must
+// reinstate before their next prompt because the registration is per directory
+// rather than per scope.
+func TestDirectoryPrincipalCoHoldingBranches(t *testing.T) {
+	client := newFakeOpenCodeClient()
+	agent := NewAgent()
+	agent.runtime = client
+	cwd := t.TempDir()
+	servers := []opencode.MCPServerConfig{{Name: "tools", URL: "https://tools.test"}}
+
+	parent := testSession(t, agent, client)
+	parent.cwd = cwd
+	parent.mcpServers = servers
+
+	fork := testSession(t, agent, client)
+	fork.id = "fork"
+	fork.cwd = cwd
+	fork.mcpServers = servers
+	fork.idmap.ParentSessionID = string(parent.id)
+
+	agent.mu.Lock()
+	agent.sessions[parent.id] = parent
+	agent.sessions[fork.id] = fork
+	agent.mu.Unlock()
+
+	parentRelease, err := agent.bindDirectory(parent.id, "", cwd, servers)
+	require.NoError(t, err)
+
+	// The same session rebinding its own principal is always admitted.
+	rebind, err := agent.bindDirectory(parent.id, "", cwd, servers)
+	require.NoError(t, err)
+
+	forkRelease, err := agent.bindDirectory(fork.id, parent.id, cwd, servers)
+	require.NoError(t, err)
+
+	fork.mu.Lock()
+	fork.mcpRefreshPending = false
+	fork.mu.Unlock()
+
+	// The parent leaving unregisters the directory's servers for everyone, so
+	// the surviving co-holder is marked for re-registration.
+	rebind()
+	parentRelease()
+
+	fork.mu.Lock()
+	pending := fork.mcpRefreshPending
+	fork.mu.Unlock()
+	require.True(t, pending, "a surviving co-holder must re-register the directory MCP servers")
+
+	require.Len(t, agent.directoryHoldersForTest(t, cwd), 1)
+
+	forkRelease()
+	require.Empty(t, agent.directoryHoldersForTest(t, cwd))
+}
+
+// directoryHoldersForTest reads the holders of one canonical directory.
+func (a *Agent) directoryHoldersForTest(t *testing.T, cwd string) map[acp.SessionId]directoryBindingIncarnation {
+	t.Helper()
+
+	canonical, err := runtimeEvalSymlinks(cwd)
+	require.NoError(t, err)
+	canonical, err = runtimeAbs(canonical)
+	require.NoError(t, err)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.directories[canonical].Holders
 }

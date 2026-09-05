@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -922,6 +923,29 @@ func (s *session) wasCancelled() bool {
 	return s.cancelled
 }
 
+// parentSessionID names this session's ACP fork parent, or the empty id for a
+// lineage root. It is durable identity: it is set when the session is created or
+// hydrated and survives every runtime recovery.
+func (s *session) parentSessionID() acp.SessionId {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return acp.SessionId(s.idmap.ParentSessionID)
+}
+
+// requireMCPRefresh marks this session's directory MCP registration as needing
+// re-registration before its next prompt. A co-holder of the same canonical
+// directory unregistered the shared servers when it left, and the registration
+// is per directory rather than per scope, so the survivors reinstate it.
+func (s *session) requireMCPRefresh() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.mcpServers) > 0 {
+		s.mcpRefreshPending = true
+	}
+}
+
 func (s *session) ensureNotPoisoned() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -934,24 +958,39 @@ func (s *session) poisonedErrorLocked() error {
 		return nil
 	}
 
-	return acp.NewInvalidRequest(map[string]any{
-		jsonFieldError: "session_poisoned",
-		"cause":        s.poisonCause,
+	return poisonedSessionError(s.poisonCause)
+}
+
+// poisonCauseNativeSessionDrift is the one poison cause this adapter can reach:
+// the native harness attributed a message or part to a session id the logical
+// session does not own. The vocabulary is closed, so the drifting field and the
+// two ids stay in the debug stream rather than on the wire.
+const poisonCauseNativeSessionDrift = "native_session_id_drift"
+
+// poisonedSessionError is the refusal a poisoned session answers every operation
+// but close and delete with. It is an internal error, never invalid request: the
+// caller's params are fine and the session's own state is what refuses.
+func poisonedSessionError(cause string) error {
+	return acp.NewInternalError(map[string]any{
+		jsonFieldError: errValueSessionPoisoned,
+		jsonFieldCause: cause,
 	})
 }
 
 func (s *session) poisonNativeSessionDrift(ctx context.Context, field string, actual string) error {
-	expected := s.idmap.NativeSessionID
-	cause := fmt.Sprintf("%s native session id drift: expected %q, got %q", field, expected, actual)
+	if s.agent != nil && s.agent.log != nil {
+		s.agent.log.DebugContext(ctx, "OpenCode native session id drift",
+			slog.String("session_id", string(s.id)),
+			slog.String("field", field),
+			slog.String("expected_native_session_id", s.idmap.NativeSessionID),
+			slog.String("actual_native_session_id", actual))
+	}
 
-	return s.poison(ctx, cause)
+	return s.poison(ctx, poisonCauseNativeSessionDrift)
 }
 
 func (s *session) poison(ctx context.Context, cause string) error {
-	err := acp.NewInternalError(map[string]any{
-		jsonFieldError: "opencode_native_session_id_drift",
-		"cause":        cause,
-	})
+	err := poisonedSessionError(cause)
 
 	s.mu.Lock()
 	if s.poisonCause != "" {
@@ -1623,7 +1662,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 			return err
 		}
 
-		client, releaseDirectory, generation, err := s.agent.newOpenCodeClient(ctx, id, cwd, mcpServers, carrier)
+		client, releaseDirectory, generation, err := s.agent.newOpenCodeClient(ctx, id, s.parentSessionID(), cwd, mcpServers, carrier)
 		if err != nil {
 			return err
 		}

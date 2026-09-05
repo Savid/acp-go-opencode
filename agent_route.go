@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
+	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
@@ -81,36 +83,85 @@ func turnRouteMetaFromContext(ctx context.Context) map[string]any {
 	return routeCarrier(turnNonce)
 }
 
+// routeMetaPath is the request path a route refusal names. It is the reserved
+// family literal spelled as a JSON path, so a host reads one field value and
+// knows exactly which key it got wrong.
+const routeMetaPath = `_meta["` + routeEnvelopeKey + `"]`
+
+func routeMemberPath(member string) string {
+	return routeMetaPath + "." + member
+}
+
+// parseInboundTurnRoute reads the reserved turn route envelope. The refusal is
+// the uniform -32602 {error, field} data: an absent key is `missing` on the bare
+// path, and a present but unacceptable value is `unsupported` naming the
+// offending member — `version`, `turnNonce`, or the unknown key — falling back
+// to the bare path when the value as a whole is not an object. It never carries
+// a prose token or a `reason` member.
 func parseInboundTurnRoute(meta map[string]any) (inboundTurnRoute, error) {
 	raw, ok := meta[routeEnvelopeKey]
 	if !ok {
-		return inboundTurnRoute{}, invalidRoute("missing route envelope")
+		return inboundTurnRoute{}, missingField(routeMetaPath)
 	}
 
 	obj, ok := raw.(map[string]any)
-	if !ok || len(obj) != 2 {
-		return inboundTurnRoute{}, invalidRoute("route envelope must contain exactly version and turnNonce")
+	if !ok {
+		return inboundTurnRoute{}, unsupportedField(routeMetaPath)
 	}
 
-	version, ok := obj[routeFieldVersion].(float64)
-	if !ok {
-		if value, intOK := obj[routeFieldVersion].(int); intOK {
-			version, ok = float64(value), true
+	// Unknown members are named before the known ones so a host that added a
+	// field learns about the field rather than about a value it got right. The
+	// key set is sorted so two unknown members always produce the same verdict.
+	unknown := make([]string, 0, len(obj))
+
+	for key := range obj {
+		if key != routeFieldVersion && key != routeFieldTurnNonce {
+			unknown = append(unknown, key)
 		}
 	}
 
-	nonce, nonceOK := obj[routeFieldTurnNonce].(string)
-	if !ok || version != routeEnvelopeVersion || !nonceOK || strings.TrimSpace(nonce) == "" {
-		return inboundTurnRoute{}, invalidRoute("unknown route version or empty turnNonce")
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+
+		return inboundTurnRoute{}, unsupportedField(routeMemberPath(unknown[0]))
 	}
 
-	if len(nonce) > routeTurnNonceMaxBytes {
-		return inboundTurnRoute{}, invalidRoute("route turnNonce exceeds the maximum size")
+	version, ok := routeIntegerValue(obj[routeFieldVersion])
+	if !ok || version != routeEnvelopeVersion {
+		return inboundTurnRoute{}, unsupportedField(routeMemberPath(routeFieldVersion))
+	}
+
+	nonce, ok := obj[routeFieldTurnNonce].(string)
+	if !ok || !validRouteTurnNonce(nonce) {
+		return inboundTurnRoute{}, unsupportedField(routeMemberPath(routeFieldTurnNonce))
 	}
 
 	return inboundTurnRoute{Version: routeEnvelopeVersion, TurnNonce: nonce}, nil
 }
 
+// routeIntegerValue reads one JSON integer version. A decoded wire value arrives
+// as a float64 and an embedding Go host writes an int; both name the same
+// integer, and a fractional value names none.
+func routeIntegerValue(raw any) (int, bool) {
+	switch value := raw.(type) {
+	case float64:
+		if value != math.Trunc(value) || value < math.MinInt32 || value > math.MaxInt32 {
+			return 0, false
+		}
+
+		return int(value), true
+	case int:
+		return value, true
+	default:
+		return 0, false
+	}
+}
+
+// invalidRoute refuses a route this adapter itself resolved against live turn
+// state — a stale cancel, or a native callback naming a tool call the session
+// never published. Neither reaches a host as a response: a cancel is a
+// notification and answers wire-silently, and a native refusal goes back to the
+// harness. The wire-facing envelope refusals are the uniform shapes above.
 func invalidRoute(reason string) error {
 	return acp.NewInvalidParams(map[string]any{jsonFieldError: "invalid_route_envelope", "reason": reason})
 }

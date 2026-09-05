@@ -656,7 +656,16 @@ func (a *Agent) retryRetiredNativeTrees(ctx context.Context) error {
 	return result
 }
 
-func (a *Agent) bindDirectory(id acp.SessionId, cwd string, servers []opencode.MCPServerConfig) (func(), error) {
+// bindDirectory admits one logical session to a canonical directory's MCP
+// principal. parentID is the requesting session's ACP fork parent, or empty for
+// a lineage root; it is what lets a fork join the principal its parent already
+// holds. Every other pair of sessions still owns a directory exclusively.
+func (a *Agent) bindDirectory(
+	id acp.SessionId,
+	parentID acp.SessionId,
+	cwd string,
+	servers []opencode.MCPServerConfig,
+) (func(), error) {
 	canonical, err := runtimeEvalSymlinks(cwd)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize cwd: %w", err)
@@ -679,31 +688,113 @@ func (a *Agent) bindDirectory(id acp.SessionId, cwd string, servers []opencode.M
 		return nil, a.runtimeFatalErr
 	}
 
-	if existing, ok := a.directories[canonical]; ok {
-		if existing.MCPFingerprint != fingerprint {
+	binding, ok := a.directories[canonical]
+	if ok {
+		// A differing MCP set is a conflict whoever asks: one directory has one
+		// registered tool catalog, and two sessions cannot disagree about it.
+		if binding.MCPFingerprint != fingerprint {
 			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: "mcp_principal_conflict", jsonFieldCwd: canonical})
 		}
 
-		if existing.SessionID != id {
+		if !a.admitsDirectoryHolderLocked(binding, id, parentID) {
 			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "directory_mcp_principal"})
+		}
+	} else {
+		binding = directoryBinding{
+			Holders:        make(map[acp.SessionId]directoryBindingIncarnation),
+			MCPFingerprint: fingerprint,
 		}
 	}
 
 	incarnation := a.nextDirectoryBindingIncarnationLocked()
-	a.directories[canonical] = directoryBinding{
-		SessionID:      id,
-		MCPFingerprint: fingerprint,
-		Incarnation:    incarnation,
+	binding.Holders[id] = incarnation
+	a.directories[canonical] = binding
+
+	return func() { a.releaseDirectory(canonical, id, incarnation) }, nil
+}
+
+// admitsDirectoryHolderLocked reports whether the requesting session may join a
+// principal another session already holds. The same session rebinding always
+// may; another session may only when the two are in one fork lineage. The caller
+// must hold a.mu.
+func (a *Agent) admitsDirectoryHolderLocked(binding directoryBinding, id, parentID acp.SessionId) bool {
+	if _, held := binding.Holders[id]; held {
+		return true
 	}
 
-	return func() {
-		a.mu.Lock()
-		if current, ok := a.directories[canonical]; ok &&
-			current.SessionID == id && current.Incarnation == incarnation {
-			delete(a.directories, canonical)
+	root := a.lineageRootLocked(id, parentID)
+
+	for holder := range binding.Holders {
+		holderParent := acp.SessionId("")
+		if member := a.sessions[holder]; member != nil {
+			holderParent = member.parentSessionID()
 		}
+
+		if a.lineageRootLocked(holder, holderParent) == root {
+			return true
+		}
+	}
+
+	return false
+}
+
+// lineageRootLocked names the session a fork lineage descends from. The chain is
+// walked over durable parent identity rather than over live sessions, so a
+// lineage keeps its root while an ancestor is closed: a fork whose parent is no
+// longer loaded still roots at that parent's id. The caller must hold a.mu.
+func (a *Agent) lineageRootLocked(id, parentID acp.SessionId) acp.SessionId {
+	root := id
+	for parentID != "" {
+		root = parentID
+
+		member := a.sessions[root]
+		if member == nil {
+			break
+		}
+
+		parentID = member.parentSessionID()
+	}
+
+	return root
+}
+
+// releaseDirectory drops one holder. The principal itself survives while a
+// co-holder remains; the surviving holders re-register the directory's MCP
+// servers before their next prompt, because the leaving scope's teardown
+// unregisters them for the whole directory.
+func (a *Agent) releaseDirectory(canonical string, id acp.SessionId, incarnation directoryBindingIncarnation) {
+	a.mu.Lock()
+
+	binding, ok := a.directories[canonical]
+	if !ok || binding.Holders[id] != incarnation {
 		a.mu.Unlock()
-	}, nil
+
+		return
+	}
+
+	delete(binding.Holders, id)
+
+	var survivors []*session
+
+	if len(binding.Holders) == 0 {
+		delete(a.directories, canonical)
+	} else {
+		a.directories[canonical] = binding
+
+		if binding.MCPFingerprint != "" {
+			for holder := range binding.Holders {
+				if member := a.sessions[holder]; member != nil {
+					survivors = append(survivors, member)
+				}
+			}
+		}
+	}
+
+	a.mu.Unlock()
+
+	for _, member := range survivors {
+		member.requireMCPRefresh()
+	}
 }
 
 func (a *Agent) directoryMCPFingerprint(servers []opencode.MCPServerConfig) (string, error) {

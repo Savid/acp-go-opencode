@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-opencode/internal/lifecycle"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 type agentClient interface {
@@ -245,14 +246,17 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 	}
 }
 
+// decodeLocalAgentParams reads one in-process request body. Params this adapter
+// cannot decode, or that fail validation as a whole, take the uniform rejection
+// naming the params body itself rather than a prose token with no field.
 func decodeLocalAgentParams[Req any, ReqPtr localAgentParams[Req]](params json.RawMessage) (Req, *acp.RequestError) {
 	var value Req
 	if err := json.Unmarshal(params, &value); err != nil {
-		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: "invalid request parameters"})
+		return value, unsupportedField(jsonFieldParams)
 	}
 
 	if err := ReqPtr(&value).Validate(); err != nil {
-		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: "request validation failed"})
+		return value, unsupportedField(jsonFieldParams)
 	}
 
 	return value, nil
@@ -357,7 +361,33 @@ func requestError(ctx context.Context, err error) *acp.RequestError {
 		return reqErr
 	}
 
-	return acp.NewInternalError(map[string]any{jsonFieldError: "handler failed"})
+	// A shared runtime that is gone and cannot be replaced is the one runtime
+	// state a host can act on: no operation that needs a runtime can succeed
+	// until the host recovers the identity. Two conditions reach it — a previous
+	// incarnation whose process tree is still alive and un-containable, and a
+	// directory scope whose MCP disconnect could not be proven, which quarantines
+	// the generation for the same reason. A runtime that merely exited never
+	// reaches here: the next explicit operation admits a replacement generation.
+	if errors.Is(err, ErrContainmentIncomplete) || errors.Is(err, opencode.ErrMCPDisconnectUnproven) {
+		return acp.NewInternalError(map[string]any{jsonFieldError: errValueRuntimeUnavailable})
+	}
+
+	// An error carrying no wire classification of its own is the only one whose
+	// prose is unknown to this package, so it is the only one reduced to a bare
+	// token. The token is closed and vendor-scoped rather than a sentence: a
+	// host cannot act on prose, and every classified refusal above already
+	// names itself. A native loopback call that failed at runtime or session
+	// start adds the one closed class this adapter documents; its route, status,
+	// and body stay off the wire.
+	var startup *startupError
+	if errors.As(err, &startup) {
+		return acp.NewInternalError(map[string]any{
+			jsonFieldError: errValueInternalFailure,
+			jsonFieldClass: classNativeStartup,
+		})
+	}
+
+	return acp.NewInternalError(map[string]any{jsonFieldError: errValueInternalFailure})
 }
 
 func scopedElicitationParams(

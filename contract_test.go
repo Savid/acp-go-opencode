@@ -4,9 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
+	"github.com/savid/acp-go-opencode/internal/lifecycle"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
@@ -316,4 +321,326 @@ func TestProviderAuthFailureWireShape(t *testing.T) {
 	require.Equal(t, authCauseTransport, data[jsonFieldCause])
 	require.Equal(t, true, data["retryable"])
 	require.NotContains(t, encoded, "connection refused")
+}
+
+// TestAssistantTextIsAppendOnly is the append-only streaming conformance
+// fixture. A client renders a turn's assistant text as the in-order
+// concatenation of every chunk it received, so a chunk is never a snapshot, a
+// repeat, or a correction of text already sent.
+func TestAssistantTextIsAppendOnly(t *testing.T) {
+	ctx := context.Background()
+
+	// A streamed turn whose terminal frame repeats the assembled text: the
+	// concatenation of the emitted chunks equals the final text exactly once.
+	t.Run("terminal frame repeats the streamed text", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(t, agent, client)
+
+		const final = "the quick brown fox"
+
+		require.NoError(t, session.applyNativeEvent(ctx, opencode.Event{
+			Type:       opencode.EventMessageUpdated,
+			Properties: json.RawMessage(`{"info":{"id":"asst","sessionID":"native-1","role":"assistant"}}`),
+		}))
+
+		for _, assembled := range []string{"the ", "the quick ", "the quick brown ", final} {
+			require.NoError(t, session.applyNativeEvent(ctx, opencode.Event{
+				Type: "message.part.updated",
+				Properties: json.RawMessage(`{"part":{"id":"part-1","sessionID":"native-1","messageID":"asst","type":"text","text":` +
+					strconv.Quote(assembled) + `}}`),
+			}))
+		}
+
+		// The terminal full-message frame repeats the whole assembled text.
+		require.NoError(t, session.emitMessage(ctx, opencode.NativeMessage{
+			Info:  opencode.NativeMessageInfo{ID: "asst", SessionID: "native-1", Role: "assistant", Finish: "stop"},
+			Parts: []opencode.NativePart{{ID: "part-1", SessionID: "native-1", MessageID: "asst", Type: "text", Text: final}},
+		}, false))
+
+		require.Equal(t, final, assembledAgentText(conn))
+	})
+
+	// A harness that delivers only a terminal full-message frame, with no
+	// deltas, produces exactly one chunk carrying that text.
+	t.Run("deltas-free harness yields one chunk", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(t, agent, client)
+
+		require.NoError(t, session.emitMessage(ctx, opencode.NativeMessage{
+			Info:  opencode.NativeMessageInfo{ID: "asst", SessionID: "native-1", Role: "assistant", Finish: "stop"},
+			Parts: []opencode.NativePart{{ID: "only", SessionID: "native-1", MessageID: "asst", Type: "text", Text: "one shot"}},
+		}, false))
+
+		require.Len(t, agentTextChunks(conn), 1)
+		require.Equal(t, "one shot", assembledAgentText(conn))
+	})
+
+	// Several native assistant messages in one turn produce each message's text
+	// exactly once, in native order, deduplicated on native identity.
+	t.Run("multi-message turn emits each message once", func(t *testing.T) {
+		client := newFakeOpenCodeClient()
+		conn := newRecordingAgentClient()
+		agent := NewAgent()
+		agent.setAgentClient(conn)
+		session := testSession(t, agent, client)
+
+		first := opencode.NativeMessage{
+			Info:  opencode.NativeMessageInfo{ID: "asst-1", SessionID: "native-1", Role: "assistant", Finish: "stop"},
+			Parts: []opencode.NativePart{{ID: "p1", SessionID: "native-1", MessageID: "asst-1", Type: "text", Text: "first."}},
+		}
+		second := opencode.NativeMessage{
+			Info:  opencode.NativeMessageInfo{ID: "asst-2", SessionID: "native-1", Role: "assistant", Finish: "stop"},
+			Parts: []opencode.NativePart{{ID: "p2", SessionID: "native-1", MessageID: "asst-2", Type: "text", Text: "second."}},
+		}
+
+		require.NoError(t, session.emitMessage(ctx, first, false))
+		require.NoError(t, session.emitMessage(ctx, second, false))
+		// Repeating either native identity contributes nothing further.
+		require.NoError(t, session.emitMessage(ctx, first, false))
+		require.NoError(t, session.emitMessage(ctx, second, false))
+
+		require.Len(t, agentTextChunks(conn), 2)
+		require.Equal(t, "first.second.", assembledAgentText(conn))
+	})
+}
+
+func agentTextChunks(conn *recordingAgentClient) []string {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	var chunks []string
+
+	for _, update := range conn.updates {
+		chunk := update.Update.AgentMessageChunk
+		if chunk != nil && chunk.Content.Text != nil {
+			chunks = append(chunks, chunk.Content.Text.Text)
+		}
+	}
+
+	return chunks
+}
+
+func assembledAgentText(conn *recordingAgentClient) string {
+	return strings.Join(agentTextChunks(conn), "")
+}
+
+// TestReservedPromptKeysRefusalShapes is the table-driven conformance fixture
+// for the two reserved keys a `session/prompt` carries. An absent key is
+// `missing` on the bare path; a present but unacceptable value is `unsupported`
+// naming the offending member. Route validation runs first, so a prompt that
+// fails both reports the route refusal alone.
+func TestReservedPromptKeysRefusalShapes(t *testing.T) {
+	ctx := context.Background()
+	overBound := strings.Repeat("n", routeTurnNonceMaxBytes+1)
+	goodRoute := map[string]any{routeFieldVersion: 1, routeFieldTurnNonce: "nonce"}
+	goodLifecycle := map[string]any{
+		"version":    1,
+		"submission": map[string]any{"submissionId": "sub", "clientNonce": "cli"},
+	}
+
+	tests := map[string]struct {
+		meta  map[string]any
+		error string
+		field string
+	}{
+		"route absent": {
+			meta:  map[string]any{lifecycle.MetaKey: goodLifecycle},
+			error: errValueMissing, field: routeMetaPath,
+		},
+		"route non-object": {
+			meta:  map[string]any{routeEnvelopeKey: 7, lifecycle.MetaKey: goodLifecycle},
+			error: errValueUnsupported, field: routeMetaPath,
+		},
+		"route wrong version": {
+			meta:  map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: 2, routeFieldTurnNonce: "nonce"}},
+			error: errValueUnsupported, field: routeMemberPath(routeFieldVersion),
+		},
+		"route fractional version": {
+			meta:  map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: 1.5, routeFieldTurnNonce: "nonce"}},
+			error: errValueUnsupported, field: routeMemberPath(routeFieldVersion),
+		},
+		"route empty nonce": {
+			meta:  map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: 1, routeFieldTurnNonce: ""}},
+			error: errValueUnsupported, field: routeMemberPath(routeFieldTurnNonce),
+		},
+		"route over-bound nonce": {
+			meta:  map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: 1, routeFieldTurnNonce: overBound}},
+			error: errValueUnsupported, field: routeMemberPath(routeFieldTurnNonce),
+		},
+		"route unknown member": {
+			meta: map[string]any{routeEnvelopeKey: map[string]any{
+				routeFieldVersion: 1, routeFieldTurnNonce: "nonce", "extra": true,
+			}},
+			error: errValueUnsupported, field: routeMemberPath("extra"),
+		},
+		"lifecycle absent": {
+			meta:  map[string]any{routeEnvelopeKey: goodRoute},
+			error: errValueMissing, field: lifecycle.MetaPath,
+		},
+		"lifecycle non-object": {
+			meta:  map[string]any{routeEnvelopeKey: goodRoute, lifecycle.MetaKey: 7},
+			error: errValueUnsupported, field: lifecycle.MetaPath,
+		},
+		"lifecycle wrong version": {
+			meta: map[string]any{routeEnvelopeKey: goodRoute, lifecycle.MetaKey: map[string]any{
+				"version": 2, "submission": map[string]any{"submissionId": "sub", "clientNonce": "cli"},
+			}},
+			error: errValueUnsupported, field: lifecycle.MetaPath + ".version",
+		},
+		"lifecycle empty identifier": {
+			meta: map[string]any{routeEnvelopeKey: goodRoute, lifecycle.MetaKey: map[string]any{
+				"version": 1, "submission": map[string]any{"submissionId": "", "clientNonce": "cli"},
+			}},
+			error: errValueUnsupported, field: lifecycle.MetaPath + ".submission.submissionId",
+		},
+		"lifecycle unknown member": {
+			meta: map[string]any{routeEnvelopeKey: goodRoute, lifecycle.MetaKey: map[string]any{
+				"version":    1,
+				"submission": map[string]any{"submissionId": "sub", "clientNonce": "cli"},
+				"extra":      true,
+			}},
+			error: errValueUnsupported, field: lifecycle.MetaPath + ".extra",
+		},
+		// Both wrong: the route refusal is the only one reported.
+		"both malformed": {
+			meta: map[string]any{
+				routeEnvelopeKey:  map[string]any{routeFieldVersion: 2, routeFieldTurnNonce: "nonce"},
+				lifecycle.MetaKey: 7,
+			},
+			error: errValueUnsupported, field: routeMemberPath(routeFieldVersion),
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			agent := negotiatedAgent(t)
+			agent.setAgentClient(newRecordingAgentClient())
+			client := newFakeOpenCodeClient()
+			session := testSession(t, agent, client)
+			agent.sessions[session.id] = session
+
+			dispatched := false
+			client.dispatchMessage = func(context.Context, string, opencode.MessageRequest) (opencode.NativeMessage, error) {
+				dispatched = true
+
+				return opencode.NativeMessage{}, nil
+			}
+
+			_, err := agent.Prompt(ctx, acp.PromptRequest{
+				SessionId: session.id,
+				Prompt:    []acp.ContentBlock{acp.TextBlock("hello")},
+				Meta:      test.meta,
+			})
+			requireInvalidParamsData(t, err, map[string]any{jsonFieldError: test.error, jsonFieldField: test.field})
+			require.False(t, dispatched, "the prompt reached the harness")
+
+			// The same verdict is owed on a session that does not exist: the
+			// reserved keys are read before the session id is resolved.
+			_, err = agent.Prompt(ctx, acp.PromptRequest{
+				SessionId: "no-such-session",
+				Prompt:    []acp.ContentBlock{acp.TextBlock("hello")},
+				Meta:      test.meta,
+			})
+			requireInvalidParamsData(t, err, map[string]any{jsonFieldError: test.error, jsonFieldField: test.field})
+		})
+	}
+}
+
+// TestOffPromptInternalErrorVocabulary drives every off-prompt `-32603` this
+// adapter can reach and pins the closed token, the closed `class`/`cause`
+// values, and the absence of any prose: no `message` member, no Go error text,
+// no native text.
+func TestOffPromptInternalErrorVocabulary(t *testing.T) {
+	ctx := context.Background()
+
+	tests := map[string]struct {
+		reach func(t *testing.T) error
+		data  map[string]any
+	}{
+		"construction verdict": {
+			reach: func(t *testing.T) error {
+				t.Helper()
+				_, err := NewAgent(WithTurnTimeout(-time.Second)).Initialize(ctx, acp.InitializeRequest{})
+
+				return err
+			},
+			data: map[string]any{jsonFieldError: errValueInvalidOptions},
+		},
+		"unrestorable store entry": {
+			reach: func(t *testing.T) error {
+				t.Helper()
+
+				store := NewInMemorySessionStore()
+				require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+					Key:     SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath},
+					Entries: []SessionStoreEntry{[]byte(`{"format":"opencode-sync-events-v1"}`)},
+				}}))
+
+				agent := NewAgent(WithSessionStore(store))
+				agent.runtime = newFakeOpenCodeClient()
+
+				_, err := agent.ResumeSession(ctx, ResumeSessionRequest("session", t.TempDir()))
+
+				return err
+			},
+			data: map[string]any{jsonFieldError: errValueRestoreFailed},
+		},
+		"un-containable runtime": {
+			reach: func(t *testing.T) error {
+				t.Helper()
+
+				agent := NewAgent()
+				agent.runtime = newFakeOpenCodeClient()
+				agent.runtimeFatalErr = errors.Join(ErrContainmentIncomplete, errors.New("native tree still alive"))
+
+				_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+
+				return err
+			},
+			data: map[string]any{jsonFieldError: errValueRuntimeUnavailable},
+		},
+		"poisoned session": {
+			reach: func(t *testing.T) error {
+				t.Helper()
+
+				agent := NewAgent()
+				agent.setAgentClient(newRecordingAgentClient())
+				session := testSession(t, agent, newFakeOpenCodeClient())
+
+				return session.poison(ctx, poisonCauseNativeSessionDrift)
+			},
+			data: map[string]any{jsonFieldError: errValueSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift},
+		},
+		"unclassified failure": {
+			reach: func(t *testing.T) error {
+				t.Helper()
+
+				return errors.New("a native detail no host may read")
+			},
+			data: map[string]any{jsonFieldError: errValueInternalFailure},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := test.reach(t)
+			require.Error(t, err)
+
+			reqErr := requestError(ctx, err)
+			require.Equal(t, -32603, reqErr.Code)
+			require.Equal(t, "Internal error", reqErr.Message)
+			require.Equal(t, test.data, reqErr.Data)
+
+			encoded, marshalErr := json.Marshal(reqErr.Data)
+			require.NoError(t, marshalErr)
+			require.NotContains(t, string(encoded), jsonFieldMessage)
+			require.NotContains(t, string(encoded), "native detail")
+		})
+	}
 }
