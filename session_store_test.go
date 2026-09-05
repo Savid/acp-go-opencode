@@ -294,46 +294,133 @@ func TestInMemoryStoreReplaceValidation(t *testing.T) {
 	}
 }
 
-func TestInMemoryStoreReplaceRequiresOneMainPerNamedMemberAtomically(t *testing.T) {
+// TestInMemoryStoreReplaceIsOneSessionsAndRefusesBeforeWriting is the
+// store-contract conformance fixture for the rule every host store owes: a
+// `Replace` is one session's. A replacement key naming another session, and a
+// `{SessionID, Subpath}` the set lists twice, are both refused with an error
+// naming the offending key — and refused *before* anything is written, so a set
+// the store will not accept leaves it byte-for-byte as it was.
+func TestInMemoryStoreReplaceIsOneSessionsAndRefusesBeforeWriting(t *testing.T) {
 	ctx := t.Context()
-	store := NewInMemorySessionStore()
 	sMain := SessionKey{SessionID: "s"}
-	xMain := SessionKey{SessionID: "x"}
-	require.NoError(t, store.Replace(ctx, sMain, []SessionStoreReplacement{{
-		Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"before"}`)},
-	}}))
+	sArtifact := SessionKey{SessionID: "s", Subpath: "artifact"}
+	foreign := SessionKey{SessionID: "x", Subpath: "artifact"}
 
-	err := store.Replace(ctx, sMain, []SessionStoreReplacement{
-		{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
-		{Key: SessionKey{SessionID: "x", Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{"x":true}`)}},
-	})
-	require.ErrorContains(t, err, `exactly one main key for session "x"`)
+	seed := func(t *testing.T) *InMemorySessionStore {
+		t.Helper()
 
-	entries, loadErr := store.Load(ctx, sMain)
-	require.NoError(t, loadErr)
-	require.JSONEq(t, `{"generation":"before"}`, string(entries[0]))
-	xArtifact, loadErr := store.Load(ctx, SessionKey{SessionID: "x", Subpath: "artifact"})
-	require.NoError(t, loadErr)
-	require.Empty(t, xArtifact, "refused replacement mutated an unaddressed member")
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Replace(ctx, sMain, []SessionStoreReplacement{
+			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"before"}`)}},
+			{Key: sArtifact, Entries: []SessionStoreEntry{json.RawMessage(`{"artifact":"before"}`)}},
+		}))
 
-	require.NoError(t, store.Replace(ctx, sMain, []SessionStoreReplacement{
-		{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"after"}`)}},
-		{Key: SessionKey{SessionID: "s", Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{"s":true}`)}},
-		{Key: xMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"x"}`)}},
-		{Key: SessionKey{SessionID: "x", Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{"x":true}`)}},
-	}))
-
-	for key, expected := range map[SessionKey]string{
-		sMain:                                 `{"generation":"after"}`,
-		{SessionID: "s", Subpath: "artifact"}: `{"s":true}`,
-		xMain:                                 `{"generation":"x"}`,
-		{SessionID: "x", Subpath: "artifact"}: `{"x":true}`,
-	} {
-		stored, storedErr := store.Load(ctx, key)
-		require.NoError(t, storedErr)
-		require.Len(t, stored, 1)
-		require.JSONEq(t, expected, string(stored[0]))
+		return store
 	}
+
+	requireUntouched := func(t *testing.T, store *InMemorySessionStore) {
+		t.Helper()
+
+		for key, expected := range map[SessionKey]string{
+			sMain:     `{"generation":"before"}`,
+			sArtifact: `{"artifact":"before"}`,
+		} {
+			stored, err := store.Load(ctx, key)
+			require.NoError(t, err)
+			require.Len(t, stored, 1, "a refused replacement wrote to %v", key)
+			require.JSONEq(t, expected, string(stored[0]), "a refused replacement rewrote %v", key)
+		}
+
+		stored, err := store.Load(ctx, foreign)
+		require.NoError(t, err)
+		require.Empty(t, stored, "a refused replacement wrote to an unaddressed session")
+
+		subkeys, err := store.ListSubkeys(ctx, sMain)
+		require.NoError(t, err)
+		require.Equal(t, []string{"artifact"}, subkeys, "a refused replacement changed the addressed subtree")
+	}
+
+	t.Run("foreign session id", func(t *testing.T) {
+		store := seed(t)
+		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
+			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
+			{Key: foreign, Entries: []SessionStoreEntry{json.RawMessage(`{"x":true}`)}},
+		})
+		// The refusal names the key it refused and the session that was addressed.
+		require.ErrorContains(t, err, `replacement key for a foreign session: session "x" subpath "artifact", addressed session "s"`)
+		requireUntouched(t, store)
+	})
+
+	t.Run("foreign main key", func(t *testing.T) {
+		store := seed(t)
+		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
+			{Key: SessionKey{SessionID: "x"}, Entries: []SessionStoreEntry{json.RawMessage(`{"x":true}`)}},
+		})
+		require.ErrorContains(t, err, `replacement key for a foreign session: session "x" subpath "", addressed session "s"`)
+		requireUntouched(t, store)
+	})
+
+	t.Run("duplicate key", func(t *testing.T) {
+		store := seed(t)
+		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
+			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
+			{Key: sArtifact, Entries: []SessionStoreEntry{json.RawMessage(`{"artifact":"one"}`)}},
+			{Key: sArtifact, Entries: []SessionStoreEntry{json.RawMessage(`{"artifact":"two"}`)}},
+		})
+		require.ErrorContains(t, err, `duplicate replacement key: session "s" subpath "artifact"`)
+		requireUntouched(t, store)
+	})
+
+	t.Run("duplicate main key", func(t *testing.T) {
+		store := seed(t)
+		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
+			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"one"}`)}},
+			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"two"}`)}},
+		})
+		require.ErrorContains(t, err, `duplicate replacement key: session "s" subpath ""`)
+		requireUntouched(t, store)
+	})
+
+	t.Run("no main key", func(t *testing.T) {
+		store := seed(t)
+		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
+			{Key: sArtifact, Entries: []SessionStoreEntry{json.RawMessage(`{"artifact":"only"}`)}},
+		})
+		require.ErrorContains(t, err, "replacements must include addressed main key exactly once")
+		requireUntouched(t, store)
+	})
+
+	t.Run("empty replacement session id", func(t *testing.T) {
+		store := seed(t)
+		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
+			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
+			{Key: SessionKey{Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+		})
+		require.ErrorContains(t, err, "replacement session id is required")
+		requireUntouched(t, store)
+	})
+
+	// An accepted set replaces the addressed session's whole subtree, and a
+	// subpath it no longer lists does not survive as a stale sibling.
+	t.Run("accepted set replaces the whole subtree", func(t *testing.T) {
+		store := seed(t)
+		require.NoError(t, store.Replace(ctx, sMain, []SessionStoreReplacement{
+			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"after"}`)}},
+			{Key: SessionKey{SessionID: "s", Subpath: "other"}, Entries: []SessionStoreEntry{json.RawMessage(`{"other":true}`)}},
+		}))
+
+		stored, err := store.Load(ctx, sMain)
+		require.NoError(t, err)
+		require.JSONEq(t, `{"generation":"after"}`, string(stored[0]))
+
+		stored, err = store.Load(ctx, sArtifact)
+		require.NoError(t, err)
+		require.Empty(t, stored, "a subpath the new set omits survived the replacement")
+
+		subkeys, err := store.ListSubkeys(ctx, sMain)
+		require.NoError(t, err)
+		require.Equal(t, []string{"other"}, subkeys)
+	})
 }
 
 // TestInMemoryStoreEnforcesTombstoneFinality proves the store itself is where a
@@ -402,30 +489,31 @@ func TestInMemoryStoreEnforcesTombstoneFinality(t *testing.T) {
 		requireStillDeleted(t, store)
 	})
 
-	// A graph replacement carries one member per session. A member the host
-	// deleted on its own drops out of the set; the addressed session is still
-	// written, because the delete answered for that one id and no other.
-	t.Run("replace drops a separately deleted graph member", func(t *testing.T) {
+	// A sibling session's own deletion is not the addressed session's business:
+	// a Replace is one session's, so a delete of another id can neither refuse
+	// this call nor be resurrected by it.
+	t.Run("a sibling session's tombstone does not reach the addressed one", func(t *testing.T) {
 		store := NewInMemorySessionStore()
-		child := SessionKey{SessionID: "s2", Subpath: SessionStoreMainSubpath}
+		sibling := SessionKey{SessionID: "s2", Subpath: SessionStoreMainSubpath}
 
 		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
 			{Key: main, Entries: []SessionStoreEntry{bundle}},
-			{Key: child, Entries: []SessionStoreEntry{bundle}},
 		}))
-		require.NoError(t, store.Delete(ctx, child))
+		require.NoError(t, store.Replace(ctx, sibling, []SessionStoreReplacement{
+			{Key: sibling, Entries: []SessionStoreEntry{bundle}},
+		}))
+		require.NoError(t, store.Delete(ctx, sibling))
 
 		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
 			{Key: main, Entries: []SessionStoreEntry{bundle}},
-			{Key: child, Entries: []SessionStoreEntry{bundle}},
 		}))
 
 		entries, err := store.Load(ctx, main)
 		require.NoError(t, err)
-		require.Len(t, entries, 1, "the addressed session was refused along with the deleted member")
+		require.Len(t, entries, 1, "the addressed session was refused because a sibling was deleted")
 
-		entries, err = store.Load(ctx, child)
+		entries, err = store.Load(ctx, sibling)
 		require.NoError(t, err)
-		require.Empty(t, entries, "a deleted graph member was resurrected by its parent's replacement")
+		require.Empty(t, entries, "a deleted sibling was resurrected by another session's replacement")
 	})
 }
