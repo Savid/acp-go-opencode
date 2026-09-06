@@ -574,7 +574,7 @@ func TestHostAuthoritySnapshotNeverAccessesPreparedRuntimeTree(t *testing.T) {
 	require.NoError(t, os.Rename(root, hidden))
 	require.NoError(t, os.MkdirAll(opencode.ControlRootForXDG(root), 0o700))
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	originalRoot := client.xdg.Root
 	t.Cleanup(func() { _ = os.RemoveAll(originalRoot) })
 	client.xdg = opencode.XDGDirs{Root: root}

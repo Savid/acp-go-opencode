@@ -41,7 +41,7 @@ func TestOutputSchemaInvalidRejected(t *testing.T) {
 
 func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.closeErr = errors.Join(errors.New("close failed"), ErrContainmentIncomplete)
 	agent := NewAgent()
 	session := testSession(t, agent, client)
@@ -79,7 +79,7 @@ func TestServeCloseErrorAndAgentCloneFallbacks(t *testing.T) {
 
 func TestAgentCloseAuthAndRawEventHelpers(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent := NewAgent()
 	session := testSession(t, agent, client)
 	agent.mu.Lock()
@@ -140,7 +140,7 @@ func TestAgentAndRouteRemainingPublicBranches(t *testing.T) {
 	}})
 	require.Error(t, err)
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.forkSession = testNativeSession("native-child")
 	client.getSession = testNativeSession("native-child")
 	client.ensureSyncAggregate("native-child")
@@ -204,7 +204,7 @@ func TestScopedElicitationRemainingURLMetadataAndEncodingBranches(t *testing.T) 
 
 func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.agents = []opencode.NativeAgent{{Name: "build"}, {Name: "plan"}}
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
@@ -227,7 +227,7 @@ func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
 func TestAgentCloseRunsTheDurableRungAWireCloseOwes(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-shutdown")
 	client.getSession = testNativeSession("native-shutdown")
 	client.agents = []opencode.NativeAgent{{Name: "build"}, {Name: "plan"}}

@@ -37,7 +37,7 @@ func newAuthAgent(t *testing.T) authHarness {
 	)
 	require.NotNil(t, agent.providerAuth)
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	session := testSession(t, agent, client)
 
 	agent.mu.Lock()
@@ -53,7 +53,7 @@ func withBrokerFactory(t *testing.T, agent *Agent) *fakeOpenCodeClient {
 
 	neutralizeBrowserShimWhereUnsupported(t)
 
-	broker := newFakeOpenCodeClient()
+	broker := newFakeOpenCodeClient(t)
 	agent.options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 		broker.mu.Lock()
 		if broker.closed {

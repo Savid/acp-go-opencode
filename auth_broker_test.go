@@ -38,9 +38,11 @@ type brokerRootLifecycleClient struct {
 	shutdownErr       error
 }
 
-func newBrokerRootLifecycleClient() *brokerRootLifecycleClient {
+func newBrokerRootLifecycleClient(t *testing.T) *brokerRootLifecycleClient {
+	t.Helper()
+
 	return &brokerRootLifecycleClient{
-		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		fakeOpenCodeClient: newFakeOpenCodeClient(t),
 		runtimeRunning:     true,
 	}
 }
@@ -150,7 +152,7 @@ func TestDestroyShutsDownTheRootRuntimeBeforeRemovingItsHome(t *testing.T) {
 	restoreBrokerSeams(t)
 
 	home := t.TempDir()
-	node := newBrokerRootLifecycleClient()
+	node := newBrokerRootLifecycleClient(t)
 	broker := &authBroker{home: home, client: node, log: slog.New(slog.DiscardHandler)}
 	broker.destroy(context.Background())
 
@@ -163,7 +165,7 @@ func TestDestroyShutsDownTheRootRuntimeBeforeRemovingItsHome(t *testing.T) {
 func TestDestroyReportsShutdownAndRemoveFailures(t *testing.T) {
 	restoreBrokerSeams(t)
 
-	node := newBrokerRootLifecycleClient()
+	node := newBrokerRootLifecycleClient(t)
 	node.shutdownErr = errors.New("shutdown")
 
 	brokerRemoveAll = func(string) error { return errors.New("remove") }
@@ -197,7 +199,7 @@ func TestDestroyWaitsOutDescendantsStillWritingIntoTheHome(t *testing.T) {
 		return os.RemoveAll(path)
 	}
 
-	broker := &authBroker{home: home, shim: nil, client: newFakeOpenCodeClient(), log: slog.New(slog.DiscardHandler)}
+	broker := &authBroker{home: home, shim: nil, client: newFakeOpenCodeClient(t), log: slog.New(slog.DiscardHandler)}
 	broker.destroy(context.Background())
 
 	require.Equal(t, 3, attempts)
@@ -236,7 +238,7 @@ func TestProviderAuthBrokerRunsOrdinaryWithoutAdapterPrivateEnvironment(t *testi
 	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
 		handed = options
 
-		return newFakeOpenCodeClient(), nil
+		return newFakeOpenCodeClient(t), nil
 	}
 
 	created, err := broker.startBroker(context.Background())

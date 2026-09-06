@@ -24,7 +24,7 @@ import (
 func handoffSession(t *testing.T, root string, opts ...Option) *session {
 	t.Helper()
 
-	return testSession(t, NewAgent(append([]Option{WithInputHandoffRoot(root)}, opts...)...), newFakeOpenCodeClient())
+	return testSession(t, NewAgent(append([]Option{WithInputHandoffRoot(root)}, opts...)...), newFakeOpenCodeClient(t))
 }
 
 // writeHandoffFile places bytes under root and returns the absolute path.
@@ -334,7 +334,7 @@ func TestHandoffFormRejectsAnUnsetRoot(t *testing.T) {
 	decoded := fixtureImage(t, "valid.png")
 	path := writeHandoffFile(t, root, "shot.png", decoded)
 
-	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	requireInvalidParamsData(t, validatePromptMediaError(session, handoffBlock(mimePNG, path, handoffEnvelope(decoded))), map[string]any{
 		jsonFieldField:   fieldPromptImage,
 		jsonFieldError:   imageErrorInvalidHandoff,
@@ -917,7 +917,7 @@ func TestHandoffUnsetRootAnswersAheadOfTheBlockCap(t *testing.T) {
 		blocks = append(blocks, handoffBlock(mimePNG, path, handoffEnvelope(png)))
 	}
 
-	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 
 	requireInvalidParamsData(t, validatePromptMediaError(session, blocks...), map[string]any{
 		jsonFieldField:   fieldPromptImage,
@@ -1126,7 +1126,7 @@ func TestHandoffMessagesAreConstants(t *testing.T) {
 			root := t.TempDir()
 			block, options := tt.build(t, root)
 
-			session := testSession(t, NewAgent(options...), newFakeOpenCodeClient())
+			session := testSession(t, NewAgent(options...), newFakeOpenCodeClient(t))
 
 			var reqErr *acp.RequestError
 			require.ErrorAs(t, validatePromptMediaError(session, block), &reqErr)

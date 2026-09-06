@@ -32,7 +32,7 @@ func TestImageArtifactStoreLifecycle(t *testing.T) {
 	require.Equal(t, "data:image/png;base64,"+record.Data, record.nativeDataURL())
 
 	t.Run("register, lookup, clone, union", func(t *testing.T) {
-		sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		require.NoError(t, sess.registerImageArtifact(ctx, "id-1", record))
 		// Identical bytes under a second identity register once.
 		require.NoError(t, sess.registerImageArtifact(ctx, "id-2", record))
@@ -52,7 +52,7 @@ func TestImageArtifactStoreLifecycle(t *testing.T) {
 	})
 
 	t.Run("setImageArtifacts rebuilds identity index", func(t *testing.T) {
-		sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		sess.setImageArtifacts(map[string]imageArtifactRecord{fingerprint: record})
 		got, ok := sess.imageArtifactByIdentity("native-id")
 		require.True(t, ok)
@@ -60,7 +60,7 @@ func TestImageArtifactStoreLifecycle(t *testing.T) {
 	})
 
 	t.Run("store append failure is storage_failed", func(t *testing.T) {
-		sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		sess.agent.options.SessionStore = &errorSessionStore{err: errors.New("append boom")}
 		err := sess.registerImageArtifact(ctx, "id-1", record)
 		data := assertTurnFailed(t, err, causeTransport, "")
@@ -68,7 +68,7 @@ func TestImageArtifactStoreLifecycle(t *testing.T) {
 	})
 
 	t.Run("marshal failure is storage_failed", func(t *testing.T) {
-		sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		original := imageJSONMarshal
 		imageJSONMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal boom") }
 		t.Cleanup(func() { imageJSONMarshal = original })
@@ -94,7 +94,7 @@ func TestLoadSessionImageArtifacts(t *testing.T) {
 	}
 
 	t.Run("loads a live record", func(t *testing.T) {
-		sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		require.NoError(t, sess.registerImageArtifact(ctx, "id-1", newRecord()))
 		loaded, err := sess.agent.loadSessionImageArtifacts(ctx, string(sess.id))
 		require.NoError(t, err)
@@ -102,7 +102,7 @@ func TestLoadSessionImageArtifacts(t *testing.T) {
 	})
 
 	t.Run("sweeps an expired record", func(t *testing.T) {
-		sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		require.NoError(t, sess.registerImageArtifact(ctx, "id-1", newRecord()))
 
 		original := imageArtifactNow
@@ -119,7 +119,7 @@ func TestLoadSessionImageArtifacts(t *testing.T) {
 	})
 
 	t.Run("corrupt record fails closed", func(t *testing.T) {
-		sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		key := SessionKey{SessionID: string(sess.id), Subpath: imageArtifactSubpath("deadbeef")}
 		require.NoError(t, sess.agent.sessionStore().Append(ctx, key, []SessionStoreEntry{json.RawMessage(`{`)}))
 		_, err := sess.agent.loadSessionImageArtifacts(ctx, string(sess.id))
@@ -128,7 +128,7 @@ func TestLoadSessionImageArtifacts(t *testing.T) {
 	})
 
 	t.Run("list failure propagates", func(t *testing.T) {
-		sess := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		sess.agent.options.SessionStore = &errorSessionStore{err: errors.New("list boom")}
 		_, err := sess.agent.loadSessionImageArtifacts(ctx, string(sess.id))
 		require.Error(t, err)

@@ -37,7 +37,7 @@ func TestUnstreamedActionIsRefusedBeforeHostRegistration(t *testing.T) {
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 
 	agent.mu.Lock()
@@ -56,7 +56,7 @@ func TestUnstreamedActionIsRefusedBeforeHostRegistration(t *testing.T) {
 }
 
 func TestCancellationTerminalizationRaceSettlesEachActionOnce(t *testing.T) {
-	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	client, ok := current.currentClient().(*fakeOpenCodeClient)
 	require.True(t, ok)
 
@@ -528,7 +528,7 @@ func TestStreamlessIncarnationRefusesToOpenAnAgentTurn(t *testing.T) {
 	newTurnNonceRead = failingRouteReader{}.Read
 
 	current := newSession(agent, "session-1", absTestPath("tmp", "project"), nil, testNativeSession("native-1"),
-		newFakeOpenCodeClient(), sessionMeta{}, idmapRecord{
+		newFakeOpenCodeClient(t), sessionMeta{}, idmapRecord{
 			SessionID: "session-1", NativeSessionID: "native-1", Format: SessionStoreFormat,
 		})
 
@@ -551,7 +551,7 @@ func TestActionAndTranscriptRepliesNeedARuntimeBinding(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	current.stopPump()
 
 	current.mu.Lock()
@@ -612,7 +612,7 @@ func TestRemovedOldGenerationActionsCannotTouchRecoveredStream(t *testing.T) {
 		require.True(t, held)
 	}
 
-	replacement := newFakeOpenCodeClient()
+	replacement := newFakeOpenCodeClient(t)
 	replacement.ensureSyncAggregate(current.idmap.NativeSessionID)
 	current.mu.Lock()
 	current.client = replacement

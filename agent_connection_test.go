@@ -355,7 +355,7 @@ func TestCommandCatalogFollowsTheResponseAndTurnUpdatesCarryExactRoute(t *testin
 	defer cancel()
 
 	agent, _, wireClient, peer := newWireCoverageConnection(t)
-	nativeClient := newFakeOpenCodeClient()
+	nativeClient := newFakeOpenCodeClient(t)
 	nativeClient.createSession = testNativeSession("native-boundary")
 	nativeClient.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
 	agent.runtime = nativeClient

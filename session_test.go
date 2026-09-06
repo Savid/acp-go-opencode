@@ -15,7 +15,7 @@ import (
 )
 
 func TestTurnFenceHelperBranches(t *testing.T) {
-	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	registry := testIncarnation(session).registry
 	claimed, err := registry.claim(&pendingAction{id: "perm"})
 	require.NoError(t, err)
@@ -32,7 +32,7 @@ func TestSessionContextWindow(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("caches lookups per model", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		session := testSession(t, NewAgent(), client)
 		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 1000 {
 			t.Fatalf("first lookup = %d, want 1000", got)
@@ -44,7 +44,7 @@ func TestSessionContextWindow(t *testing.T) {
 	})
 
 	t.Run("provider error reports unknown", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.providersErr = errors.New("boom")
 		session := testSession(t, NewAgent(), client)
 		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 0 {
@@ -53,7 +53,7 @@ func TestSessionContextWindow(t *testing.T) {
 	})
 
 	t.Run("nil client reports unknown", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		session.client = nil
 		if got := session.contextWindow(ctx, "openai", "gpt-test"); got != 0 {
 			t.Fatalf("nil client lookup = %d, want 0", got)
@@ -71,7 +71,7 @@ func TestModelValueSplitAndJoin(t *testing.T) {
 }
 func TestSessionTurnAdmissionAndCancellationFailureShapes(t *testing.T) {
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 
 	cancelled, cancel := context.WithCancel(context.Background())
@@ -101,7 +101,7 @@ func TestSessionTurnAdmissionAndCancellationFailureShapes(t *testing.T) {
 
 func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	native := opencode.NativeSession{ID: "native"}
 	native.Model.ID = "fallback-model"
 	current := newSession(agent, "session", absTestPath("repo"), []string{"/other"}, native, client, sessionMeta{},
@@ -145,7 +145,7 @@ func TestSessionIdentityModeOwnershipAndCloseHelpers(t *testing.T) {
 }
 
 func TestSessionCloseReleasesDirectoryOnlyAfterNativeMCPDisconnect(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.closeErr = errors.New("disconnect failed")
 	current := testSession(t, NewAgent(), client)
 	releases := 0
@@ -165,7 +165,7 @@ func TestSessionCloseReleasesDirectoryOnlyAfterNativeMCPDisconnect(t *testing.T)
 
 func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 	released := false
 	current.directoryRelease = func() { released = true }
@@ -183,7 +183,7 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 	current.mu.Unlock()
 	require.NoError(t, current.DeleteNativeAndClose(context.Background()))
 
-	client = newFakeOpenCodeClient()
+	client = newFakeOpenCodeClient(t)
 	client.deleteErr = errors.New("delete failed")
 	current = testSession(t, agent, client)
 	require.ErrorContains(t, current.DeleteNativeAndClose(context.Background()), "delete failed")
@@ -205,7 +205,7 @@ func TestSessionFailRuntimeAndDeleteNativeBranches(t *testing.T) {
 // session's current turn is refused before any native interrupt.
 func TestCancelRequiresTheActiveTurnRoute(t *testing.T) {
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 
 	require.Error(t, current.requireActiveTurn("missing"), "a cancel with no active turn was admitted")
@@ -222,7 +222,7 @@ func TestCancelRequiresTheActiveTurnRoute(t *testing.T) {
 // this session's native id and reports a refusal from the harness as a failure the
 // open cycle escalates on.
 func TestCancelTurnInterruptsOnlyTheAddressedNativeSession(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, NewAgent(), client)
 	current.beginTurn(context.Background(), "nonce")
 
@@ -246,7 +246,7 @@ func TestCancelTurnInterruptsOnlyTheAddressedNativeSession(t *testing.T) {
 // that never reports idle after an interrupt is a settlement failure rather than a
 // clean cancellation.
 func TestAwaitNativeSettlementReportsTheMissingAcknowledgement(t *testing.T) {
-	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	require.NoError(t, current.awaitNativeSettlement(context.Background(), nil))
 
 	cycle := &foregroundCycle{id: "cycle-1", turnID: "turn-1", signal: make(chan struct{})}
@@ -259,7 +259,7 @@ func TestAwaitNativeSettlementReportsTheMissingAcknowledgement(t *testing.T) {
 }
 
 func TestDeleteNativeAndCloseSettlesTheSession(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, NewAgent(), client)
 	current.beginTurn(context.Background(), "nonce")
 	require.NoError(t, current.DeleteNativeAndClose(context.Background()))
@@ -273,7 +273,7 @@ func TestInterruptNativeWorkNeedsABindingAndReportsRefusals(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, NewAgent(), client)
 	current.stopPump()
 
@@ -404,7 +404,7 @@ func TestCloseStopsAtTheFirstUnprovenStep(t *testing.T) {
 	t.Run("refused interrupt", func(t *testing.T) {
 		t.Parallel()
 
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.abortErr = errors.New("harness refused the interrupt")
 		current := testSession(t, NewAgent(), client)
 		current.stopPump()
@@ -417,7 +417,7 @@ func TestCloseStopsAtTheFirstUnprovenStep(t *testing.T) {
 	t.Run("unacknowledged interrupt", func(t *testing.T) {
 		t.Parallel()
 
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		current := testSession(t, NewAgent(), client)
 		current.stopPump()
 		cycle := openTestCycle(current, false)
@@ -439,7 +439,7 @@ func TestCloseStopsAtTheFirstUnprovenStep(t *testing.T) {
 func TestCloseCommitsOnlyAfterTheContainmentProof(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
 	connection := newRecordingAgentClient()
@@ -484,7 +484,7 @@ func TestCloseCommitsOnlyAfterTheContainmentProof(t *testing.T) {
 func TestAnIncompleteContainmentTerminalizesNothingAndStillFences(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.closeErr = errors.Join(errors.New("close failed"), ErrContainmentIncomplete)
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
@@ -527,7 +527,7 @@ func TestAnIncompleteContainmentTerminalizesNothingAndStillFences(t *testing.T) 
 func TestRecoveryWithoutACommittedGenerationRefusesThePrompt(t *testing.T) {
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := NewAgent(WithSessionStore(store))
-	current := testSession(t, agent, newFakeOpenCodeClient())
+	current := testSession(t, agent, newFakeOpenCodeClient(t))
 
 	store.onLoad = func(SessionKey) ([]SessionStoreEntry, error) {
 		// A concurrent recovery installs a fresh binding while this read is in
@@ -567,7 +567,7 @@ func TestCloseOnAFencedIncarnationEmitsNothingAndKeepsItsDurableRecord(t *testin
 		t.Parallel()
 
 		ctx := context.Background()
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 		agent := negotiatedAgent(t, WithSessionStore(store))
 		connection := newRecordingAgentClient()
@@ -621,7 +621,7 @@ func TestCloseOnAFencedIncarnationEmitsNothingAndKeepsItsDurableRecord(t *testin
 	t.Run("never opened", func(t *testing.T) {
 		t.Parallel()
 
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 		agent := NewAgent(WithSessionStore(store))
 		connection := newRecordingAgentClient()
@@ -660,7 +660,7 @@ func TestCloseOnAFencedIncarnationEmitsNothingAndKeepsItsDurableRecord(t *testin
 func TestCloseAfterALatchedLiveStreamContainsAndRemovesSession(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
 	connection := newRecordingAgentClient()
@@ -707,7 +707,7 @@ func TestCloseAfterALatchedLiveStreamContainsAndRemovesSession(t *testing.T) {
 func TestCloseRefusesToSettleOnAnInterruptTheHarnessRefused(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.abortErr = errors.New("harness refused the interrupt")
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
@@ -759,7 +759,7 @@ func TestDeleteSettlesOnTheSameEvidenceCloseDoes(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	store := NewInMemorySessionStore()
 	agent := negotiatedAgent(t, WithSessionStore(store))
 	connection := newRecordingAgentClient()
@@ -794,7 +794,7 @@ func TestDeleteSettlesOnTheSameEvidenceCloseDoes(t *testing.T) {
 func TestCloseCommitsAGenerationCapturedBeforeAConcurrentFence(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
 	connection := newRecordingAgentClient()
@@ -836,7 +836,7 @@ func TestCloseCommitsAGenerationCapturedBeforeAConcurrentFence(t *testing.T) {
 func TestCloseFailsOnACaptureItCannotRead(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.syncHistoryErr = errors.New("sync history unavailable")
 	agent := negotiatedAgent(t, WithSessionStore(NewInMemorySessionStore()))
 	agent.setAgentClient(newRecordingAgentClient())
@@ -875,7 +875,7 @@ func TestCloseFailsOnACaptureItCannotRead(t *testing.T) {
 func TestCloseRetriesTheWholeBoundaryAfterARefusedDurableRung(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
 	connection := newRecordingAgentClient()
@@ -960,7 +960,7 @@ func endingIdleTransitions(t *testing.T, connection *recordingAgentClient) []map
 func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.abortErr = errors.New("harness refused the interrupt")
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
@@ -1002,7 +1002,7 @@ func TestAFailedCloseLaundersNoUnprovenStop(t *testing.T) {
 func TestDeleteOnAFencedIncarnationSettlesBothBoundaries(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := negotiatedAgent(t, WithSessionStore(store))
 	agent.setAgentClient(newRecordingAgentClient())

@@ -24,7 +24,7 @@ func lifecycleSession(t *testing.T, options ...Option) (*session, *fakeOpenCodeC
 	agent := negotiatedAgent(t, options...)
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 
 	agent.mu.Lock()
@@ -882,9 +882,9 @@ func TestCancellingOneSessionLeavesAPeerRunning(t *testing.T) {
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
 
-	clientA := newFakeOpenCodeClient()
+	clientA := newFakeOpenCodeClient(t)
 	first := testSession(t, agent, clientA)
-	clientB := newFakeOpenCodeClient()
+	clientB := newFakeOpenCodeClient(t)
 	second := newSession(agent, "session-2", absTestPath("tmp", "project"), nil, testNativeSession("native-2"), clientB, sessionMeta{}, idmapRecord{
 		SessionID: "session-2", NativeSessionID: "native-2", Format: SessionStoreFormat,
 	})
@@ -987,9 +987,9 @@ func TestConcurrentSessionsPromptWithoutAGlobalGate(t *testing.T) {
 	agent := negotiatedAgent(t)
 	agent.setAgentClient(newRecordingAgentClient())
 
-	clientA := newFakeOpenCodeClient()
+	clientA := newFakeOpenCodeClient(t)
 	first := testSession(t, agent, clientA)
-	clientB := newFakeOpenCodeClient()
+	clientB := newFakeOpenCodeClient(t)
 	second := newSession(agent, "session-2", absTestPath("tmp", "project"), nil, testNativeSession("native-2"), clientB, sessionMeta{}, idmapRecord{
 		SessionID: "session-2", NativeSessionID: "native-2", Format: SessionStoreFormat,
 	})
@@ -1072,7 +1072,7 @@ func TestRecoveryOpensANewIncarnationWithItsOwnSnapshot(t *testing.T) {
 	current.detachRuntime(current.runtimeGeneration, "shared OpenCode runtime exited")
 	require.Error(t, current.lifecycleFailure())
 
-	replacement := newFakeOpenCodeClient()
+	replacement := newFakeOpenCodeClient(t)
 	replacement.xdg = client.xdg
 	replacement.getSession = testNativeSession(current.idmap.NativeSessionID)
 	replacement.ensureSyncAggregate(current.idmap.NativeSessionID)
@@ -1136,7 +1136,7 @@ func TestUnnegotiatedConnectionRefusesActions(t *testing.T) {
 	agent := NewAgent()
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 	require.NoError(t, current.establish(context.Background()))
 	t.Cleanup(current.stopPump)
@@ -1330,7 +1330,7 @@ func TestStaleStreamTerminalCannotFenceAFreshGeneration(t *testing.T) {
 	oldGeneration := current.runtimeGeneration
 	oldBinding := testIncarnation(current)
 
-	replacement := newFakeOpenCodeClient()
+	replacement := newFakeOpenCodeClient(t)
 	replacement.ensureSyncAggregate(current.idmap.NativeSessionID)
 	current.agent.mu.Lock()
 	current.agent.runtime = replacement
@@ -1379,7 +1379,7 @@ func TestAnEventTheStreamsOwnRulesRefuseLatchesIt(t *testing.T) {
 // session refuses to establish rather than opening a stream it can never deliver.
 func TestLifecycleDeliveryWithoutAConnectionFailsTheEstablishingRequest(t *testing.T) {
 	agent := negotiatedAgent(t)
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.ensureSyncAggregate("native-1")
 
 	current := newSession(agent, "session-1", absTestPath("tmp", "project"), nil, testNativeSession("native-1"),
@@ -1668,7 +1668,7 @@ func TestPanickingPermissionRequestFailsItsActionInstead(t *testing.T) {
 	agent := negotiatedAgent(t)
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(&panickingPermissionClient{recordingAgentClient: connection})
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 	require.NoError(t, current.establish(context.Background()))
 	t.Cleanup(current.stopPump)
@@ -1775,7 +1775,7 @@ func TestCorrectionAcceptPromptDeliveryFailure(t *testing.T) {
 }
 
 func TestCorrectionLifecycleDirectFailureBranches(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := &session{}
 	current.stampIncarnationGeneration(client, 7)
 	require.NotNil(t, current.incarnation)

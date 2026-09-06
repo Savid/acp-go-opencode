@@ -148,7 +148,7 @@ func TestCarrierScopeOptionsClone(t *testing.T) {
 // the other's addressed native scope.
 func TestConcurrentSessionsCarryDistinctBearersAndDirectories(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 
 	var created atomic.Int64
 
@@ -198,7 +198,7 @@ func TestConcurrentSessionsCarryDistinctBearersAndDirectories(t *testing.T) {
 // bearer disappears entirely.
 func TestRebindRotatesOneSessionAndLeavesItsPeerAlone(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 
 	var created atomic.Int64
 
@@ -259,10 +259,10 @@ func TestRebindRotatesOneSessionAndLeavesItsPeerAlone(t *testing.T) {
 // session to the carrier it was admitted under rather than to an empty one.
 func TestRecoveredSessionKeepsItsCarrier(t *testing.T) {
 	ctx := context.Background()
-	first := newFakeOpenCodeClient()
+	first := newFakeOpenCodeClient(t)
 	first.createSession = testNativeSession("native-first")
 	first.agents = []opencode.NativeAgent{{Name: "build"}}
-	second := newFakeOpenCodeClient()
+	second := newFakeOpenCodeClient(t)
 	second.xdg = first.xdg
 	second.getSession = testNativeSession("native-first")
 	second.agents = []opencode.NativeAgent{{Name: "build"}}
@@ -318,7 +318,7 @@ func TestRecoveredSessionKeepsItsCarrier(t *testing.T) {
 // rather than of the turn that installed it.
 func TestSecondTurnKeepsTheCarrier(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-turns")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 
@@ -350,7 +350,7 @@ func TestSecondTurnKeepsTheCarrier(t *testing.T) {
 
 func TestCarrierSecretNeedlesProtectThePortableEventGraph(t *testing.T) {
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent.runtime = client
 	member := testSession(t, agent, client)
 	member.carrier = newSessionCarrier(map[string]string{

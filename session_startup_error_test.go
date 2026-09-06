@@ -69,7 +69,7 @@ func TestSessionStartHTTPFailuresNameTheRouteAndNeverTheBody(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			httpErr := startupHTTPError(test.method, test.path)
-			client := newFakeOpenCodeClient()
+			client := newFakeOpenCodeClient(t)
 			client.createSession = testNativeSession("native-1")
 			client.providers = testProviders()
 			agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {

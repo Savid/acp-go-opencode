@@ -70,7 +70,7 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 
 func TestSessionConfigBranchesAndValidation(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{
 		{ID: "", Models: map[string]opencode.ProviderModel{"skip": {}}},
 		{ID: "p", Models: map[string]opencode.ProviderModel{
@@ -193,7 +193,7 @@ func assertConfigOptionBuilders(t *testing.T, client *fakeOpenCodeClient) {
 // request-specific assistant identity.
 func TestUnknownModelReachesOpenCodeAndFailsClosedWithoutExactAssistant(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-unknown-model")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 	// One provider is resolved, and the host asks for a model outside it.
@@ -278,7 +278,7 @@ const nativeAgentNotFoundMessage = `Agent not found: "does-not-exist-mode". Avai
 // unrelated native error can replace the missing request-specific assistant.
 func TestUnadvertisedModeReachesOpenCodeAndFailsClosedWithoutExactAssistant(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-unknown-mode")
 	client.providers = testProviders()
 	// The advertisement carries one agent, and the host asks for another.
@@ -363,7 +363,7 @@ func TestUnadvertisedModeReachesOpenCodeAndFailsClosedWithoutExactAssistant(t *t
 // frame exactly as the session-start route's does.
 func TestUnknownModelSetThroughConfigOptionReachesOpenCode(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-config-model")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 	client.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
@@ -441,7 +441,7 @@ func TestUnknownModelSetThroughConfigOptionReachesOpenCode(t *testing.T) {
 // been listed under cannot be advertised at all.
 func TestSetModeSurvivesAgentCatalogFailure(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-agentless")
 	client.providers = testProviders()
 	client.agentsErr = errors.New("agents unreachable")
@@ -495,7 +495,7 @@ func TestConfigOptionCatalogFailureIsReported(t *testing.T) {
 	var logs bytes.Buffer
 
 	agent := NewAgent(WithLogger(slog.New(slog.NewJSONHandler(&logs, nil))))
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.providersErr = errors.New("providers unreachable")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 	sess := testSession(t, agent, client)
@@ -514,7 +514,7 @@ func TestConfigOptionCatalogFailureIsReported(t *testing.T) {
 	// failure the same way.
 	logs.Reset()
 
-	modeless := newFakeOpenCodeClient()
+	modeless := newFakeOpenCodeClient(t)
 	modeless.providers = testProviders()
 	modeless.agentsErr = errors.New("agents unreachable")
 	modelessSession := testSession(t, agent, modeless)

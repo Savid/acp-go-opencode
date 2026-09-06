@@ -304,7 +304,7 @@ func TestPromptCorrelationIsRequiredWhileNegotiated(t *testing.T) {
 
 	agent := negotiatedAgent(t)
 	agent.setAgentClient(newRecordingAgentClient())
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
@@ -353,7 +353,7 @@ func TestPromptCorrelationIsRefusedWhileUnnegotiated(t *testing.T) {
 	t.Parallel()
 
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
@@ -384,7 +384,7 @@ func TestPromptBindsBothEnvelopesToTheSameTurn(t *testing.T) {
 	agent := negotiatedAgent(t)
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 
@@ -434,7 +434,7 @@ func TestCancelCarryingTheKeyNeverReachesTheHarness(t *testing.T) {
 
 	agent := negotiatedAgent(t)
 	agent.setAgentClient(newRecordingAgentClient())
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 	session.beginTurn(context.Background(), "nonce")
@@ -468,7 +468,7 @@ func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
 
 	agent := negotiatedAgent(t)
 	agent.setAgentClient(newRecordingAgentClient())
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	session := testSession(t, agent, client)
 	agent.sessions[session.id] = session
 	session.beginTurn(context.Background(), "nonce")

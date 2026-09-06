@@ -12,7 +12,7 @@ import (
 )
 
 func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.xdg.Root = ""
 	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	node := snapshot.Graph[0]
@@ -74,7 +74,7 @@ func preserveRestoreOwnershipSeams(t *testing.T) {
 }
 
 func TestRestoreOwnershipRemainingPropagationConflictAndLossBranches(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	node := snapshot.Graph[0]
 	path := filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName)
@@ -94,43 +94,43 @@ func TestWriteRestoreOwnershipEveryInjectedFilesystemFailure(t *testing.T) {
 
 	t.Run("mkdir", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		restoreMkdirAll = func(string, os.FileMode) error { return errors.New("mkdir failed") }
 		require.ErrorContains(t, writeRestoreOwnership(client, registry), "mkdir failed")
 	})
 	t.Run("marshal", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		restoreJSONMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal failed") }
 		require.ErrorContains(t, writeRestoreOwnership(client, registry), "marshal failed")
 	})
 	t.Run("create temp", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		restoreCreateTemp = func(string, string) (*os.File, error) { return nil, errors.New("create failed") }
 		require.ErrorContains(t, writeRestoreOwnership(client, registry), "create failed")
 	})
 	t.Run("chmod", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		restoreChmod = func(*os.File, os.FileMode) error { return errors.New("chmod failed") }
 		require.ErrorContains(t, writeRestoreOwnership(client, registry), "chmod failed")
 	})
 	t.Run("write", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		restoreWrite = func(*os.File, []byte) (int, error) { return 0, errors.New("write failed") }
 		require.ErrorContains(t, writeRestoreOwnership(client, registry), "write failed")
 	})
 	t.Run("sync", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		restoreSync = func(*os.File) error { return errors.New("sync failed") }
 		require.ErrorContains(t, writeRestoreOwnership(client, registry), "sync failed")
 	})
 	t.Run("close", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		originalClose := restoreClose
 		restoreClose = func(file *os.File) error {
 			_ = originalClose(file)
@@ -141,13 +141,13 @@ func TestWriteRestoreOwnershipEveryInjectedFilesystemFailure(t *testing.T) {
 	})
 	t.Run("rename", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		restoreRename = func(string, string) error { return errors.New("rename failed") }
 		require.ErrorContains(t, writeRestoreOwnership(client, registry), "rename failed")
 	})
 	t.Run("open directory", func(t *testing.T) {
 		preserveRestoreOwnershipSeams(t)
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		restoreOpen = func(string) (*os.File, error) { return nil, errors.New("open failed") }
 		requireDirectoryFlushOutcome(t, writeRestoreOwnership(client, registry), "open failed")
 	})
@@ -156,7 +156,7 @@ func TestActiveReplacementAndArtifactLoadEdges(t *testing.T) {
 	t.Run("zero replacement timeout takes the default", func(t *testing.T) {
 		cwd := t.TempDir()
 		store := NewInMemorySessionStore()
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		agent := NewAgent(WithSessionStore(store))
 		agent.sessionReplacementTimeout = 0
 		current := testSession(t, agent, client)
@@ -174,7 +174,7 @@ func TestActiveReplacementAndArtifactLoadEdges(t *testing.T) {
 	t.Run("replacement detects a changed active mapping", func(t *testing.T) {
 		cwd := t.TempDir()
 		store := NewInMemorySessionStore()
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		agent := NewAgent(WithSessionStore(store))
 		current := testSession(t, agent, client)
 		current.cwd = cwd

@@ -23,7 +23,7 @@ import (
 
 func TestAgentOwnsOneSharedRuntimeForManyDirectories(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	var created atomic.Int64
 	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
 		return testNativeSession(fmt.Sprintf("native-%d", created.Add(1))), nil
@@ -65,7 +65,7 @@ func TestAgentOwnsOneSharedRuntimeForManyDirectories(t *testing.T) {
 func TestDirectoryMCPPrincipalFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
 		return testNativeSession(fmt.Sprintf("native-%d", len(client.syncEvents)+1)), nil
 	}
@@ -91,7 +91,7 @@ func TestDirectoryMCPPrincipalFailsClosed(t *testing.T) {
 func TestDirectoryWithoutExplicitMCPStillHasOneSessionPrincipal(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-one")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
@@ -107,7 +107,7 @@ func TestDirectoryWithoutExplicitMCPStillHasOneSessionPrincipal(t *testing.T) {
 func TestLifecycleMCPRefreshesImmediatelyBeforeFirstNativePrompt(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-refresh")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 
@@ -175,7 +175,7 @@ func TestLifecycleMCPRefreshesImmediatelyBeforeFirstNativePrompt(t *testing.T) {
 func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-refresh-failure")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 	client.refreshMCPErr = errors.Join(opencode.ErrMCPDisconnectUnproven, errors.New("delete failed"))
@@ -218,7 +218,7 @@ func TestLifecycleMCPRefreshFailureBlocksPromptAndRetainsPrincipal(t *testing.T)
 
 func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T) {
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 	releases := 0
 	current.directoryRelease = func() { releases++ }
@@ -244,7 +244,7 @@ func TestCloseSessionRetainsPrincipalUntilNativeScopeCloseSucceeds(t *testing.T)
 func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemorySessionStore()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
@@ -341,7 +341,7 @@ func TestCancellationPublishesInterruptedPrefixWithoutRetiringTheRuntime(t *test
 func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemorySessionStore()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent := negotiatedAgent(t, WithHome(t.TempDir()), WithSessionStore(store))
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
@@ -397,10 +397,10 @@ func TestCancellationCaptureFailureFencesInsteadOfSettling(t *testing.T) {
 
 func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *testing.T) {
 	ctx := context.Background()
-	first := newFakeOpenCodeClient()
+	first := newFakeOpenCodeClient(t)
 	first.createSession = testNativeSession("native-first")
 	first.agents = []opencode.NativeAgent{{Name: "build"}}
-	second := newFakeOpenCodeClient()
+	second := newFakeOpenCodeClient(t)
 	second.xdg = first.xdg
 	second.getSession = testNativeSession("native-first")
 	second.agents = []opencode.NativeAgent{{Name: "build"}}
@@ -439,17 +439,17 @@ func TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt(t *tes
 
 func TestRecoverySkipsCrashedReplacementGenerationBeforePrompt(t *testing.T) {
 	ctx := context.Background()
-	first := newFakeOpenCodeClient()
+	first := newFakeOpenCodeClient(t)
 	first.createSession = testNativeSession("native-first")
 	first.agents = []opencode.NativeAgent{{Name: "build"}}
 
-	second := newFakeOpenCodeClient()
+	second := newFakeOpenCodeClient(t)
 	second.xdg = first.xdg
 	second.getSession = testNativeSession("native-first")
 	second.agents = []opencode.NativeAgent{{Name: "build"}}
 	close(second.runtimeExited)
 
-	third := newFakeOpenCodeClient()
+	third := newFakeOpenCodeClient(t)
 	third.xdg = first.xdg
 	third.getSession = testNativeSession("native-first")
 	third.agents = []opencode.NativeAgent{{Name: "build"}}
@@ -485,13 +485,13 @@ func TestRecoverySkipsCrashedReplacementGenerationBeforePrompt(t *testing.T) {
 
 func TestRuntimeCrashFailsInflightTurnThenRecoversBeforeFollowingPrompt(t *testing.T) {
 	ctx := context.Background()
-	first := newFakeOpenCodeClient()
+	first := newFakeOpenCodeClient(t)
 	first.createSession = testNativeSession("native-first")
 	first.agents = []opencode.NativeAgent{{Name: "build"}}
 	started := make(chan struct{})
 	first.hangsAfterDispatch(started)
 
-	second := newFakeOpenCodeClient()
+	second := newFakeOpenCodeClient(t)
 	second.xdg = first.xdg
 	second.getSession = testNativeSession("native-first")
 	second.agents = []opencode.NativeAgent{{Name: "build"}}
@@ -623,7 +623,7 @@ func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 	const sessionCount = 8
 
 	ctx := context.Background()
-	runtime := &fanoutRuntime{fakeOpenCodeClient: newFakeOpenCodeClient()}
+	runtime := &fanoutRuntime{fakeOpenCodeClient: newFakeOpenCodeClient(t)}
 	runtime.agents = []opencode.NativeAgent{{Name: "build"}}
 	agent := NewAgent(WithHome(t.TempDir()), func(options *Options) {
 		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
@@ -698,7 +698,7 @@ func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 }
 
 func TestForkPermissionMustInherit(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent := NewAgent()
 	parent := testSession(t, agent, client)
 	parent.cwd = t.TempDir()
@@ -711,7 +711,7 @@ func TestForkPermissionMustInherit(t *testing.T) {
 func TestAgentLifecycleNewLoadResumeListCloseDelete(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-lifecycle")
 	client.getSession = testNativeSession("native-lifecycle")
 	client.messages = []opencode.NativeMessage{{
@@ -811,7 +811,7 @@ func TestActiveLoadResumeReuseAnUnchangedCarrierWithoutConsumingCapacity(t *test
 	} {
 		t.Run(method.name, func(t *testing.T) {
 			cwd := t.TempDir()
-			client := newFakeOpenCodeClient()
+			client := newFakeOpenCodeClient(t)
 			agent := NewAgent(
 				WithSessionStore(NewInMemorySessionStore()),
 				WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
@@ -847,7 +847,7 @@ func TestActiveLoadResumeReuseAnUnchangedCarrierWithoutConsumingCapacity(t *test
 func TestActiveResumeHardCutsChangedCarrierBeforeSuccessorAdmission(t *testing.T) {
 	cwd := t.TempDir()
 	store := NewInMemorySessionStore()
-	predecessorClient := newFakeOpenCodeClient()
+	predecessorClient := newFakeOpenCodeClient(t)
 	agent := NewAgent(
 		WithSessionStore(store),
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
@@ -857,7 +857,7 @@ func TestActiveResumeHardCutsChangedCarrierBeforeSuccessorAdmission(t *testing.T
 	predecessor.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "old"}, []string{absTestPath("old", "bin")})
 	require.NoError(t, predecessor.snapshotToStore(t.Context()))
 
-	successorClient := newFakeOpenCodeClient()
+	successorClient := newFakeOpenCodeClient(t)
 	successorClient.getSession = testNativeSession(predecessor.idmap.NativeSessionID)
 	successorClient.scopeFunc = func(opencode.ScopeOptions) error {
 		require.True(t, predecessorClient.isClosed(), "successor overlapped its predecessor")
@@ -894,7 +894,7 @@ func TestActiveResumeHardCutsChangedCarrierBeforeSuccessorAdmission(t *testing.T
 func TestActiveResumeRebindsAnUnchangedCarrierAfterRuntimeLoss(t *testing.T) {
 	cwd := t.TempDir()
 	store := NewInMemorySessionStore()
-	predecessorClient := newFakeOpenCodeClient()
+	predecessorClient := newFakeOpenCodeClient(t)
 	agent := NewAgent(
 		WithSessionStore(store),
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
@@ -906,7 +906,7 @@ func TestActiveResumeRebindsAnUnchangedCarrierAfterRuntimeLoss(t *testing.T) {
 
 	current.detachRuntime(current.runtimeGeneration, valSharedRuntimeExited)
 
-	successorClient := newFakeOpenCodeClient()
+	successorClient := newFakeOpenCodeClient(t)
 	successorClient.getSession = testNativeSession(current.idmap.NativeSessionID)
 	agent.mu.Lock()
 	agent.runtime = successorClient
@@ -932,7 +932,7 @@ func TestActiveResumeRebindsAnUnchangedCarrierAfterRuntimeLoss(t *testing.T) {
 func TestActiveResumePublishesNoSuccessorWhenHardCutContainmentFails(t *testing.T) {
 	cwd := t.TempDir()
 	store := NewInMemorySessionStore()
-	predecessorClient := newFakeOpenCodeClient()
+	predecessorClient := newFakeOpenCodeClient(t)
 	agent := NewAgent(
 		WithSessionStore(store),
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
@@ -943,7 +943,7 @@ func TestActiveResumePublishesNoSuccessorWhenHardCutContainmentFails(t *testing.
 	require.NoError(t, predecessor.snapshotToStore(t.Context()))
 	predecessorClient.closeErr = errors.Join(errors.New("scope still live"), ErrContainmentIncomplete)
 
-	successorClient := newFakeOpenCodeClient()
+	successorClient := newFakeOpenCodeClient(t)
 	agent.mu.Lock()
 	agent.runtime = successorClient
 	agent.mu.Unlock()
@@ -968,7 +968,7 @@ func TestActiveResumePublishesNoSuccessorWhenHardCutContainmentFails(t *testing.
 func TestActiveResumeBoundsContendedPredecessorCloseAdmission(t *testing.T) {
 	cwd := t.TempDir()
 	store := NewInMemorySessionStore()
-	predecessorClient := newFakeOpenCodeClient()
+	predecessorClient := newFakeOpenCodeClient(t)
 	agent := NewAgent(
 		WithSessionStore(store),
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}),
@@ -988,7 +988,7 @@ func TestActiveResumeBoundsContendedPredecessorCloseAdmission(t *testing.T) {
 		}
 	}()
 
-	successorClient := newFakeOpenCodeClient()
+	successorClient := newFakeOpenCodeClient(t)
 	successorClient.getSession = testNativeSession(predecessor.idmap.NativeSessionID)
 	agent.mu.Lock()
 	agent.runtime = successorClient
@@ -1054,7 +1054,7 @@ func TestSessionLifecycleFlightsIsolateIDsFenceCloseAndCleanUp(t *testing.T) {
 		}}))
 	}
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.getSessionFunc = func(_ context.Context, id string) (opencode.NativeSession, error) {
 		return testNativeSession(id), nil
 	}
@@ -1164,7 +1164,7 @@ func TestSessionLifecycleFlightSerializesSameIDPublication(t *testing.T) {
 		return store.InMemorySessionStore.Load(t.Context(), key)
 	}
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.getSession = testNativeSession("native")
 	agent := NewAgent(WithSessionStore(store))
 	agent.runtime = client
@@ -1222,7 +1222,7 @@ func TestAgentCloseFromLifecycleStoreCallbackDoesNotDeadlock(t *testing.T) {
 	require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
 		Key: SessionKey{SessionID: "session"}, Entries: []SessionStoreEntry{encoded},
 	}}))
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.getSession = testNativeSession("native")
 	agent := NewAgent(WithSessionStore(store))
 	agent.runtime = client
@@ -1252,7 +1252,7 @@ func TestAgentLifecycleValidationAndStorageFailures(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent.runtime = client
 
 	_, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: "relative"})
@@ -1375,10 +1375,10 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 	agent := NewAgent()
 	agent.options.SessionStore = nil
 	require.NotNil(t, agent.sessionStore())
-	current := testSession(t, agent, newFakeOpenCodeClient())
+	current := testSession(t, agent, newFakeOpenCodeClient(t))
 	agent.runtime = nil
 	require.Error(t, agent.storeStartedSession(current), "missing runtime must reject publication")
-	agent.runtime = newFakeOpenCodeClient()
+	agent.runtime = newFakeOpenCodeClient(t)
 	require.NoError(t, agent.storeStartedSession(current))
 	require.False(t, agent.removeSessionIf(current.id, &session{}))
 	require.True(t, agent.removeSessionIf(current.id, current))
@@ -1543,7 +1543,7 @@ func TestNewSessionRemainingFailureStages(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			client := newFakeOpenCodeClient()
+			client := newFakeOpenCodeClient(t)
 			client.createSession = testNativeSession("native")
 			agent := NewAgent()
 			agent.runtime = client
@@ -1553,7 +1553,7 @@ func TestNewSessionRemainingFailureStages(t *testing.T) {
 		})
 	}
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native")
 	limited := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1, MaxConcurrentClientCalls: 1}))
 	limited.runtime = client
@@ -1588,7 +1588,7 @@ func TestLoadResumeRemainingFailureStages(t *testing.T) {
 		"get session": func(client *fakeOpenCodeClient) { client.getErr = errors.New("get failed") },
 	} {
 		t.Run(name, func(t *testing.T) {
-			client := newFakeOpenCodeClient()
+			client := newFakeOpenCodeClient(t)
 			client.getSession = testNativeSession("native")
 			configure(client)
 			agent := newStoredAgent(client)
@@ -1597,7 +1597,7 @@ func TestLoadResumeRemainingFailureStages(t *testing.T) {
 		})
 	}
 
-	agent := newStoredAgent(newFakeOpenCodeClient())
+	agent := newStoredAgent(newFakeOpenCodeClient(t))
 	agent.deleted["session"] = struct{}{}
 	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
 	require.Error(t, err)
@@ -1608,7 +1608,7 @@ func TestLoadResumeRemainingFailureStages(t *testing.T) {
 func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 	ctx := context.Background()
 	newForkAgent := func() (*Agent, *fakeOpenCodeClient, *session) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.forkSession = testNativeSession("native-child")
 		client.getSession = testNativeSession("native-child")
 		client.ensureSyncAggregate("native-child")
@@ -1661,7 +1661,7 @@ func TestForkSessionSuccessAndFailureStages(t *testing.T) {
 
 func TestForkCarrierInheritsUnlessExplicitlyReplaced(t *testing.T) {
 	newForkAgent := func() (*Agent, *fakeOpenCodeClient, *session) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.forkSession = testNativeSession("native-child")
 		client.getSession = testNativeSession("native-child")
 		client.ensureSyncAggregate("native-child")
@@ -1728,14 +1728,14 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 		return agent
 	}
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.getSession = testNativeSession("native")
 	client.messagesErr = errors.New("messages failed")
 	agent := storedAgent(client)
 	_, err = agent.LoadSession(ctx, LoadSessionRequest("session", cwd))
 	require.ErrorContains(t, err, "messages failed")
 
-	closed := storedAgent(newFakeOpenCodeClient())
+	closed := storedAgent(newFakeOpenCodeClient(t))
 	closed.closed = true
 	_, err = closed.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
 	require.Error(t, err)
@@ -1745,11 +1745,11 @@ func TestLifecycleRemainingReplayRefreshValidationAndPublicationBranches(t *test
 		{SessionId: "session", Cwd: cwd, McpServers: []acp.McpServer{{Sse: &acp.McpServerSseInline{Name: "bad"}}}},
 		{SessionId: "session", Cwd: cwd, Meta: map[string]any{opencodeMetaKey: "bad"}},
 	} {
-		_, err = storedAgent(newFakeOpenCodeClient()).ResumeSession(ctx, request)
+		_, err = storedAgent(newFakeOpenCodeClient(t)).ResumeSession(ctx, request)
 		require.Error(t, err)
 	}
 
-	client = newFakeOpenCodeClient()
+	client = newFakeOpenCodeClient(t)
 	client.getSession = testNativeSession("native")
 	agent = storedAgent(client)
 	agent.options.ConcurrencyLimits.MaxActiveSessions = 1
@@ -1770,7 +1770,7 @@ func TestListSessionsRemainingFilteringSortingAndCloseBranches(t *testing.T) {
 		{SessionID: "stored-a", Cwd: cwd, Title: "a", UpdatedAtUnixMilli: 30},
 	}}
 	agent := NewAgent(WithSessionStore(store))
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	active := testSession(t, agent, client)
 	active.id = "seen"
 	active.cwd = cwd
@@ -1792,7 +1792,7 @@ func TestListSessionsRemainingFilteringSortingAndCloseBranches(t *testing.T) {
 }
 
 func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.forkSession = testNativeSession("native-child")
 	client.getSession = testNativeSession("native-child")
 	client.ensureSyncAggregate("native-child")
@@ -1821,7 +1821,7 @@ func TestForkAndMCPMappingRemainingValidationCapacityAndUnionBranches(t *testing
 
 func TestSessionCarrierReachesTheAddressedNativeScopeOnly(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-env")
 	client.agents = []opencode.NativeAgent{{Name: "build"}}
 	var started opencode.StartOptions
@@ -1864,7 +1864,7 @@ func TestSessionExtraPathDirsFailBeforeNativeCreation(t *testing.T) {
 			options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 				launches++
 
-				return newFakeOpenCodeClient(), nil
+				return newFakeOpenCodeClient(t), nil
 			}
 		},
 	)
@@ -1878,7 +1878,7 @@ func TestSessionExtraPathDirsFailBeforeNativeCreation(t *testing.T) {
 
 func TestConcurrentSessionsCarryDistinctOrderedPathDirs(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 
 	var created atomic.Int64
 
@@ -1917,10 +1917,10 @@ func TestConcurrentSessionsCarryDistinctOrderedPathDirs(t *testing.T) {
 
 func TestRecoveredSessionKeepsItsExtraPathDirs(t *testing.T) {
 	ctx := context.Background()
-	first := newFakeOpenCodeClient()
+	first := newFakeOpenCodeClient(t)
 	first.createSession = testNativeSession("native-first")
 	first.agents = []opencode.NativeAgent{{Name: "build"}}
-	second := newFakeOpenCodeClient()
+	second := newFakeOpenCodeClient(t)
 	second.xdg = first.xdg
 	second.getSession = testNativeSession("native-first")
 	second.agents = []opencode.NativeAgent{{Name: "build"}}
@@ -1986,7 +1986,7 @@ func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
 	}
 
 	t.Run("new", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.createSession = testNativeSession("native")
 		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
 		agent := negotiatedAgent(t)
@@ -2012,7 +2012,7 @@ func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
 			Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{encoded},
 		}}))
 
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.getSession = testNativeSession("native")
 		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
 		agent := negotiatedAgent(t, WithSessionStore(store))
@@ -2040,7 +2040,7 @@ func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
 	})
 
 	t.Run("fork", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.forkSession = testNativeSession("native-child")
 		client.getSession = testNativeSession("native-child")
 		client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review changes"}}
@@ -2072,7 +2072,7 @@ func TestEstablishingHandlersPublishNothingBeforeTheyReturn(t *testing.T) {
 // the last rung of the ladder, so a store that is offline never costs the
 // containment proof that runs ahead of it.
 func TestCloseSessionRefusesWithoutADurableSnapshot(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent := NewAgent(WithSessionStore(&errorSessionStore{err: errors.New("store offline")}))
 	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
@@ -2096,7 +2096,7 @@ func TestCloseSessionRefusesWithoutADurableSnapshot(t *testing.T) {
 // that proved containment releases it.
 func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.closeErr = errors.Join(errors.New("scope refused to close"), ErrContainmentIncomplete)
 	store := NewInMemorySessionStore()
 	agent := NewAgent(WithSessionStore(store))
@@ -2146,7 +2146,7 @@ func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 // past the process that owned it.
 func TestAgentCloseSweepsTheScopeAFailedDeleteLeftBehind(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.closeErr = errors.Join(errors.New("scope refused to close"), ErrContainmentIncomplete)
 	agent := NewAgent(WithSessionStore(NewInMemorySessionStore()))
 	current := testSession(t, agent, client)
@@ -2171,7 +2171,7 @@ func TestACommitRacingASucceededDeleteRecreatesNothing(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemorySessionStore()
 	agent := NewAgent(WithSessionStore(store))
-	current := testSession(t, agent, newFakeOpenCodeClient())
+	current := testSession(t, agent, newFakeOpenCodeClient(t))
 	agent.sessions[current.id] = current
 	require.NoError(t, current.snapshotToStore(ctx))
 
@@ -2191,7 +2191,7 @@ func TestACommitRacingASucceededDeleteRecreatesNothing(t *testing.T) {
 // and would resurrect a session already reported gone.
 func TestDeleteLeavesNoWriteThatRecreatesTheRow(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
 	agent := NewAgent(WithSessionStore(store))
 	current := testSession(t, agent, client)
@@ -2230,7 +2230,7 @@ func TestLoadRacingDeleteSerializesTheSameLogicalSession(t *testing.T) {
 
 	ctx := context.Background()
 	cwd := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-race")
 	client.getSession = testNativeSession("native-race")
 
@@ -2334,7 +2334,7 @@ func TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes(t *testing.T) {
 		t.Parallel()
 
 		agent := NewAgent()
-		current := testSession(t, agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient(t))
 
 		requireInvalidParamsData(t, agent.rollbackStartedSession(current, refusal),
 			map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
@@ -2343,7 +2343,7 @@ func TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes(t *testing.T) {
 	t.Run("teardown that failed too", func(t *testing.T) {
 		t.Parallel()
 
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.closeErr = errors.New("disconnect failed")
 		agent := NewAgent()
 		current := testSession(t, agent, client)
@@ -2437,7 +2437,7 @@ func TestRestoreFailureIsClassifiedAndCarriesNoProse(t *testing.T) {
 func forkLineageAgent(t *testing.T) (*Agent, *fakeOpenCodeClient) {
 	t.Helper()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native-parent")
 	client.forkSession = testNativeSession("native-fork")
 	client.getSessionFunc = func(_ context.Context, id string) (opencode.NativeSession, error) {

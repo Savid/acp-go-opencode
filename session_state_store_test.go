@@ -154,7 +154,7 @@ func TestHydrateStateSnapshotRequiresEveryNonOmittedMemberBeforeNativeLaunch(t *
 			require.NoError(t, store.Replace(t.Context(), SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
 				Key: SessionKey{SessionID: "session"}, Entries: []SessionStoreEntry{raw},
 			}}))
-			client := newFakeOpenCodeClient()
+			client := newFakeOpenCodeClient(t)
 			client.getSession = testNativeSession("native")
 			agent := NewAgent(WithSessionStore(store))
 			agent.runtime = client
@@ -277,7 +277,7 @@ func decodeSnapshotOnly(raw []byte) error {
 }
 
 func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.getSession = testNativeSession("native")
 	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 	native, err := restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
@@ -310,7 +310,7 @@ func TestRestoreRebasesAndVerifiesExactEventSet(t *testing.T) {
 // a conflict — the stored generation only has to be present as the ordered
 // prefix.
 func TestRestoreAcceptsNativeEventsAppendedAfterTheCapture(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.getSession = testNativeSession("native")
 	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 
@@ -331,7 +331,7 @@ func TestRestoreAcceptsNativeEventsAppendedAfterTheCapture(t *testing.T) {
 }
 
 func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.getSession = testNativeSession("native")
 	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 
@@ -359,7 +359,7 @@ func TestRestoreComparesExistingNativeCarrierThroughPortableProjection(t *testin
 
 func TestRestoreRejectsMalformedCarrierInExistingAndVerifiedNativeHistory(t *testing.T) {
 	t.Run("existing", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 		require.NoError(t, recordSnapshotOwnership(client, snapshot))
 		malformed := cloneSyncEvent(snapshot.Events["native"][0])
@@ -371,7 +371,7 @@ func TestRestoreRejectsMalformedCarrierInExistingAndVerifiedNativeHistory(t *tes
 	})
 
 	t.Run("verified after replay", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 		historyCalls := 0
 		client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
@@ -392,7 +392,7 @@ func TestRestoreRejectsMalformedCarrierInExistingAndVerifiedNativeHistory(t *tes
 }
 
 func TestRestoreRejectsExistingAggregateWithoutDurableOwner(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.syncEvents = []opencode.SyncEvent{syncTestEvent("native", 0, "session.created.1", nil)}
 	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 
@@ -401,7 +401,7 @@ func TestRestoreRejectsExistingAggregateWithoutDurableOwner(t *testing.T) {
 }
 
 func TestRestoreRejectsPathOutsideCapturedCWD(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	snapshot := validSyncSnapshot("s", "native", absTestPath("source"))
 	snapshot.Events["native"][0].Data["info"] = json.RawMessage(`{"id":"native","directory":` + jsonTestPath("other") + `}`)
 
@@ -427,7 +427,7 @@ func TestSnapshotCredentialScanAllowsOnlyTheDurableCarrier(t *testing.T) {
 
 func TestReadSyncGenerationRemovesOnlyNativeSessionCarrierReference(t *testing.T) {
 	agent := NewAgent()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 	client.syncEvents[0].Data[syncFieldInfo] = json.RawMessage(`{
@@ -706,7 +706,7 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 	agent := NewAgent(WithEnv(map[string]string{
 		"API_TOKEN": "token", "PASSWORD": "password", "COOKIE": "cookie", "EMPTY_TOKEN": "", "NORMAL": "ignored",
 	}))
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 	agent.sessions[current.id] = current
 
@@ -740,7 +740,7 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	newSnapshotSession := func() (*session, *fakeOpenCodeClient) {
 		agent := NewAgent()
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		current := testSession(t, agent, client)
 		agent.sessions[current.id] = current
 
@@ -812,16 +812,16 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranches(t *testing.T) {
 	invalid := validSyncSnapshot("session", "native", absTestPath("source"))
 	invalid.Format = "wrong"
-	_, err := restoreSyncState(context.Background(), newFakeOpenCodeClient(), invalid, "native", absTestPath("target"))
+	_, err := restoreSyncState(context.Background(), newFakeOpenCodeClient(t), invalid, "native", absTestPath("target"))
 	require.Error(t, err)
 
 	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.syncReplayErr = errors.New("replay failed")
 	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "replay failed")
 
-	client = newFakeOpenCodeClient()
+	client = newFakeOpenCodeClient(t)
 	historyCalls := 0
 	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
 		historyCalls++
@@ -834,12 +834,12 @@ func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranch
 	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "verify history failed")
 
-	client = newFakeOpenCodeClient()
+	client = newFakeOpenCodeClient(t)
 	client.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) { return nil, nil }
 	_, err = restoreSyncState(context.Background(), client, snapshot, "native", absTestPath("target"))
 	require.ErrorContains(t, err, "failed replay verification")
 
-	client = newFakeOpenCodeClient()
+	client = newFakeOpenCodeClient(t)
 	historyCalls = 0
 	expected, err := rebaseSyncEvents(snapshot.Events["native"], absTestPath("source"), absTestPath("target"))
 	require.NoError(t, err)
@@ -880,7 +880,7 @@ func cloneStateSnapshot(t *testing.T, value stateSnapshot) stateSnapshot {
 }
 
 func TestCaptureStateSnapshotArtifactReplacementError(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.getSession = testNativeSession("native-1")
 	conn := newRecordingAgentClient()
 	agent := NewAgent()
@@ -904,7 +904,7 @@ func TestCaptureStateSnapshotArtifactReplacementError(t *testing.T) {
 func TestCaptureStateSnapshotRetriesUnstableSyncGeneration(t *testing.T) {
 	newSnapshotSession := func() (*session, *fakeOpenCodeClient) {
 		agent := NewAgent()
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		current := testSession(t, agent, client)
 		agent.sessions[current.id] = current
 

@@ -85,7 +85,7 @@ func recoveryFixture(t *testing.T, store SessionStore, factories ...opencode.Cli
 			return factories[index], nil
 		}
 	})
-	old := newFakeOpenCodeClient()
+	old := newFakeOpenCodeClient(t)
 	native := testNativeSession("native-1")
 	current := newSession(agent, "session-1", snapshot.Session.Cwd, nil, native, old, sessionMeta{}, idmapRecord{
 		SessionID: "session-1", NativeSessionID: "native-1", Format: SessionStoreFormat,
@@ -96,8 +96,9 @@ func recoveryFixture(t *testing.T, store SessionStore, factories ...opencode.Cli
 	return agent, current
 }
 
-func readyRecoveryClient() *recoveryClient {
-	fake := newFakeOpenCodeClient()
+func readyRecoveryClient(t *testing.T) *recoveryClient {
+	t.Helper()
+	fake := newFakeOpenCodeClient(t)
 	fake.getSession = testNativeSession("native-1")
 	fake.agents = []opencode.NativeAgent{{Name: "build"}}
 
@@ -107,17 +108,17 @@ func readyRecoveryClient() *recoveryClient {
 func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("store publication generation mismatch", func(t *testing.T) {
 		agent := NewAgent()
-		agent.runtime = newFakeOpenCodeClient()
+		agent.runtime = newFakeOpenCodeClient(t)
 		agent.runtimeGeneration = 2
-		current := testSession(t, agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient(t))
 		current.runtimeGeneration = 1
 		require.ErrorContains(t, agent.storeStartedSession(current), "runtime generation changed")
 	})
 
 	t.Run("shared runtime retires already exited generation", func(t *testing.T) {
-		exited := newFakeOpenCodeClient()
+		exited := newFakeOpenCodeClient(t)
 		close(exited.runtimeExited)
-		replacement := newFakeOpenCodeClient()
+		replacement := newFakeOpenCodeClient(t)
 		agent := NewAgent(func(options *Options) {
 			options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
 				return replacement, nil
@@ -136,13 +137,13 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent := NewAgent()
 		require.False(t, agent.runtimeGenerationIsCurrent(1))
 
-		nilExit := newFakeOpenCodeClient()
+		nilExit := newFakeOpenCodeClient(t)
 		nilExit.runtimeExited = nil
 		agent.runtime = nilExit
 		agent.runtimeGeneration = 1
 		require.True(t, agent.runtimeGenerationIsCurrent(1))
 
-		exited := newFakeOpenCodeClient()
+		exited := newFakeOpenCodeClient(t)
 		close(exited.runtimeExited)
 		agent.runtime = exited
 		require.False(t, agent.runtimeGenerationIsCurrent(1))
@@ -150,12 +151,12 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		agent = NewAgent()
 		agent.runtime = exited
 		agent.runtimeGeneration = 1
-		current := testSession(t, agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient(t))
 		installed, closed := current.installRecoveredRuntime(exited, func() {}, current.idmap, 1)
 		require.False(t, installed)
 		require.False(t, closed)
 
-		agent.runtime = newFakeOpenCodeClient()
+		agent.runtime = newFakeOpenCodeClient(t)
 		agent.runtimeGeneration = 2
 		installed, closed = current.installRecoveredRuntime(exited, func() {}, current.idmap, 1)
 		require.False(t, installed)
@@ -163,7 +164,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	})
 
 	t.Run("scope crash observes caller cancellation", func(t *testing.T) {
-		candidate := readyRecoveryClient()
+		candidate := readyRecoveryClient(t)
 		candidate.scopeFunc = func(context.Context, opencode.ScopeOptions) (opencode.Client, error) {
 			close(candidate.runtimeExited)
 
@@ -179,14 +180,14 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	})
 
 	t.Run("closed session", func(t *testing.T) {
-		agent, current := recoveryFixture(t, nil, readyRecoveryClient())
+		agent, current := recoveryFixture(t, nil, readyRecoveryClient(t))
 		current.closed = true
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), valSessionUnknown)
 		require.NoError(t, agent.Close())
 	})
 
 	t.Run("prompt fences watcher detach window", func(t *testing.T) {
-		candidate := readyRecoveryClient()
+		candidate := readyRecoveryClient(t)
 		agent, current := recoveryFixture(t, nil, candidate)
 		current.runtimeLostCause = ""
 		current.runtimeGeneration = 1
@@ -199,14 +200,14 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("store error", func(t *testing.T) {
 		store := &errorSessionStore{err: errors.New("store failed")}
 		agent := NewAgent(WithSessionStore(store))
-		current := testSession(t, agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient(t))
 		current.runtimeLostCause = "runtime exited"
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), "store failed")
 	})
 
 	t.Run("missing committed generation reaches prompt as the loss", func(t *testing.T) {
 		agent := NewAgent()
-		current := testSession(t, agent, newFakeOpenCodeClient())
+		current := testSession(t, agent, newFakeOpenCodeClient(t))
 		current.runtimeLostCause = "runtime exited"
 		_, err := current.promptWithRoute(context.Background(), TextPromptRequest(current.id, "turn", "hello"), "turn", lifecycle.Submission{})
 		assertTurnFailed(t, err, causeTransport, "runtime exited")
@@ -216,14 +217,14 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 		store := NewInMemorySessionStore()
 		ctx, cancel := context.WithCancel(context.Background())
 		wrapped := cancelOnLoadStore{SessionStore: store, cancel: cancel}
-		agent, current := recoveryFixture(t, wrapped, readyRecoveryClient())
+		agent, current := recoveryFixture(t, wrapped, readyRecoveryClient(t))
 		require.ErrorIs(t, current.ensureRuntime(ctx), context.Canceled)
 		require.NoError(t, agent.Close())
 	})
 
 	t.Run("cancelled between recovery attempts", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		crashed := readyRecoveryClient()
+		crashed := readyRecoveryClient(t)
 		crashed.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
 			close(crashed.runtimeExited)
 			cancel()
@@ -242,7 +243,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	})
 
 	t.Run("restore error on live generation", func(t *testing.T) {
-		candidate := readyRecoveryClient()
+		candidate := readyRecoveryClient(t)
 		candidate.syncHistoryErr = errors.New("history failed")
 		agent, current := recoveryFixture(t, nil, candidate)
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), "history failed")
@@ -250,13 +251,13 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	})
 
 	t.Run("restore discards exited generation", func(t *testing.T) {
-		crashed := readyRecoveryClient()
+		crashed := readyRecoveryClient(t)
 		crashed.syncHistoryFunc = func(context.Context, map[string]int64) ([]opencode.SyncEvent, error) {
 			close(crashed.runtimeExited)
 
 			return nil, errors.New("generation exited")
 		}
-		replacement := readyRecoveryClient()
+		replacement := readyRecoveryClient(t)
 		agent, current := recoveryFixture(t, nil, crashed, replacement)
 		require.NoError(t, current.ensureRuntime(context.Background()))
 		require.EqualValues(t, 2, current.runtimeGeneration)
@@ -264,7 +265,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	})
 
 	t.Run("restored native id drift", func(t *testing.T) {
-		candidate := readyRecoveryClient()
+		candidate := readyRecoveryClient(t)
 		candidate.getSession = testNativeSession("other-native")
 		agent, current := recoveryFixture(t, nil, candidate)
 		require.ErrorContains(t, current.ensureRuntime(context.Background()), "native session id drift")
@@ -272,7 +273,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	})
 
 	t.Run("session closes during recovery", func(t *testing.T) {
-		candidate := readyRecoveryClient()
+		candidate := readyRecoveryClient(t)
 		agent, current := recoveryFixture(t, nil, candidate)
 		candidate.getFunc = func(context.Context, string) (opencode.NativeSession, error) {
 			current.mu.Lock()
@@ -291,7 +292,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 // dispatches: the loss is the answer, and no turn is accepted against a runtime
 // this session no longer holds.
 func TestLostRuntimeFailsAPromptBeforeItIsAccepted(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, NewAgent(), client)
 
 	dispatched := false
@@ -367,7 +368,7 @@ func TestArtifactLoadRejectsCorruptRecordOnRecoveryPaths(t *testing.T) {
 	}
 
 	t.Run("load or resume", func(t *testing.T) {
-		agent, current := recoveryFixture(t, nil, readyRecoveryClient())
+		agent, current := recoveryFixture(t, nil, readyRecoveryClient(t))
 		corrupt(t, agent)
 		_, err := agent.loadOrResumeSession(context.Background(), "session-1", current.cwd, nil, nil, nil)
 		require.Error(t, err)
@@ -375,7 +376,7 @@ func TestArtifactLoadRejectsCorruptRecordOnRecoveryPaths(t *testing.T) {
 	})
 
 	t.Run("ensure runtime", func(t *testing.T) {
-		agent, current := recoveryFixture(t, nil, readyRecoveryClient())
+		agent, current := recoveryFixture(t, nil, readyRecoveryClient(t))
 		corrupt(t, agent)
 		require.Error(t, current.ensureRuntime(context.Background()))
 		require.NoError(t, agent.Close())

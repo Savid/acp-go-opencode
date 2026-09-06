@@ -25,7 +25,7 @@ type panickingEventStreamClient struct{ *fakeOpenCodeClient }
 func TestSessionPumpOwnershipHasNoLeak(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	current.stopPump()
 }
 
@@ -466,13 +466,13 @@ func TestSettleAgentCycleSettlesTheRecordedOutcome(t *testing.T) {
 
 	ctx := context.Background()
 
-	session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	failed := &foregroundCycle{id: "cycle-1", failure: errors.New("native turn failed"), signal: make(chan struct{})}
 	require.NoError(t, session.settleAgentCycle(ctx, failed))
 	require.True(t, failed.settled)
 
 	store := &errorSessionStore{err: errors.New("commit refused")}
-	blocked := testSession(t, NewAgent(WithSessionStore(store)), newFakeOpenCodeClient())
+	blocked := testSession(t, NewAgent(WithSessionStore(store)), newFakeOpenCodeClient(t))
 	cycle := &foregroundCycle{id: "cycle-2", signal: make(chan struct{})}
 	require.ErrorContains(t, blocked.settleAgentCycle(ctx, cycle), "commit refused")
 	require.False(t, cycle.settled)
@@ -595,7 +595,7 @@ func TestUndecodableQuestionFailsTheOpenCycle(t *testing.T) {
 // exact incarnation releases a reserved POST even though no request-specific
 // user-message evidence arrived.
 func TestStreamTerminalBeforeAcceptanceFailsTheAwaitingDispatch(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := testSession(t, NewAgent(), client)
 	client.omitPromptEvidence = true
 	client.dispatchMessage = func(ctx context.Context, _ string, _ opencode.MessageRequest) (opencode.NativeMessage, error) {
@@ -615,7 +615,7 @@ func TestStreamTerminalBeforeAcceptanceFailsTheAwaitingDispatch(t *testing.T) {
 // runtime binding: a session with no binding starts none. A prompt is not
 // dispatched in this state because native idle would have no ordered consumer.
 func TestPumpWithoutARuntimeBindingRoutesNothing(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.commands = []opencode.NativeCommand{{Name: "review", Description: "Review", Source: "command"}}
 	agent := NewAgent()
 	agent.setAgentClient(newRecordingAgentClient())
@@ -687,7 +687,7 @@ func TestCorrectionPumpBarrierAndRoutingBranches(t *testing.T) {
 	}()
 	require.ErrorIs(t, cancelDuring.pauseForDispatch(duringCtx), context.Canceled)
 
-	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	binding := testIncarnation(current)
 	require.NotNil(t, binding)
 
@@ -703,7 +703,7 @@ func TestCorrectionPumpBarrierAndRoutingBranches(t *testing.T) {
 	pausedCancel()
 	<-paused.done
 
-	emptyClient := newFakeOpenCodeClient()
+	emptyClient := newFakeOpenCodeClient(t)
 	emptyBinding := &nativeIncarnationBinding{client: emptyClient, registry: newActionRegistry()}
 	emptySession := &session{idmap: idmapRecord{NativeSessionID: "native"}, incarnation: emptyBinding}
 	emptyPump := &sessionPump{
@@ -732,7 +732,7 @@ func TestCorrectionPumpBarrierAndRoutingBranches(t *testing.T) {
 }
 
 func TestCorrectionObservedOwnershipAndNativeFailureBranches(t *testing.T) {
-	current := testSession(t, NewAgent(), newFakeOpenCodeClient())
+	current := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 	current.stopPump()
 	binding := testIncarnation(current)
 	other := &nativeIncarnationBinding{registry: newActionRegistry()}
@@ -913,7 +913,7 @@ func TestUnidentifiedNativeStepsNameNoCycle(t *testing.T) {
 func TestPumpDropsAnEventReceivedForARetiredBinding(t *testing.T) {
 	t.Parallel()
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	retired := &nativeIncarnationBinding{client: client, registry: newActionRegistry()}
 	replaced := &session{idmap: idmapRecord{NativeSessionID: "native"}}
 	pump := &sessionPump{

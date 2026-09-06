@@ -89,7 +89,7 @@ func (w *wireTransport) next(t *testing.T) map[string]any {
 // first, and the opening lifecycle snapshot and the initial command catalog
 // follow it, in that order.
 func TestEstablishmentIsWrittenAfterTheEstablishingResponse(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSession = testNativeSession("native")
 	client.forkSession = testNativeSession("native-child")
 	client.getSession = testNativeSession("native-child")
@@ -364,7 +364,7 @@ func TestIncompleteEstablishingResponsePermanentlyFencesExactSession(t *testing.
 	} {
 		t.Run(method, func(t *testing.T) {
 			agent := NewAgent()
-			client := newFakeOpenCodeClient()
+			client := newFakeOpenCodeClient(t)
 			id := acp.SessionId(fmt.Sprintf("session-%d", index))
 			current := newSession(agent, id, absTestPath("repo"), nil, testNativeSession("native-1"), client,
 				sessionMeta{}, idmapRecord{SessionID: string(id), NativeSessionID: "native-1", Format: SessionStoreFormat})
@@ -465,7 +465,7 @@ func TestEstablishmentReportsEveryStageItCannotComplete(t *testing.T) {
 	agent := negotiatedAgent(t)
 	connection := newRecordingAgentClient()
 	agent.setAgentClient(connection)
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.commandsErr = errors.New("commands failed")
 	current := testSession(t, agent, client)
 
@@ -534,7 +534,7 @@ func lifecycleSessionWithBrokenStream(t *testing.T) *session {
 	connection.updateErr = errors.New("wire down")
 	agent.setAgentClient(connection)
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := newSession(agent, "session-broken", absTestPath("tmp", "project"), nil, testNativeSession("native-broken"), client, sessionMeta{}, idmapRecord{
 		SessionID: "session-broken", NativeSessionID: "native-broken", Format: SessionStoreFormat,
 	})

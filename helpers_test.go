@@ -171,7 +171,7 @@ func newImageSession(t *testing.T) (*session, *recordingAgentClient) {
 	conn := newRecordingAgentClient()
 	agent := NewAgent()
 	agent.setAgentClient(conn)
-	session := testSession(t, agent, newFakeOpenCodeClient())
+	session := testSession(t, agent, newFakeOpenCodeClient(t))
 	session.cwd = t.TempDir()
 
 	return session, conn
@@ -399,11 +399,9 @@ type fakeQuestionReject struct {
 	route     opencode.QuestionRoute
 }
 
-func newFakeOpenCodeClient() *fakeOpenCodeClient {
-	runtimeState, err := os.MkdirTemp("", "acp-go-opencode-test-state-")
-	if err != nil {
-		panic(err)
-	}
+func newFakeOpenCodeClient(t *testing.T) *fakeOpenCodeClient {
+	t.Helper()
+	runtimeState := t.TempDir()
 
 	return &fakeOpenCodeClient{
 		xdg:              opencode.XDGDirs{Root: runtimeState, State: runtimeState},
@@ -1390,10 +1388,7 @@ func testSession(t *testing.T, agent *Agent, client *fakeOpenCodeClient) *sessio
 	}
 
 	if client.xdg.Root == "" {
-		root, err := os.MkdirTemp("", "acp-go-opencode-test-*")
-		if err == nil {
-			client.xdg, _ = opencode.CreateRuntimeXDGDirs(filepath.Join(root, "session-1"))
-		}
+		client.xdg, _ = opencode.CreateRuntimeXDGDirs(filepath.Join(t.TempDir(), "session-1"))
 	}
 	client.ensureSyncAggregate("native-1")
 	agent.mu.Lock()

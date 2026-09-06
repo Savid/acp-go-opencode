@@ -60,7 +60,7 @@ func rawEventSession(t *testing.T, id acp.SessionId, conn agentClient) *session 
 	t.Helper()
 	agent := NewAgent()
 	agent.setAgentClient(conn)
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	sess := newSession(agent, id, absTestPath("tmp", "project"), nil, testNativeSession(string(id)), client, sessionMeta{}, idmapRecord{
 		SessionID:       string(id),
 		NativeSessionID: string(id),
@@ -350,7 +350,7 @@ func TestRawEventEmitFailureDoesNotFailTurn(t *testing.T) {
 	failing := &failThenRecordRawClient{recordingAgentClient: conn, failures: 1}
 	agent := NewAgent()
 	agent.setAgentClient(failing)
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	sess := testSession(t, agent, client)
 	sess.rawMessages = rawMessageConfig{enabled: true}
 	client.dispatchMessage = func(_ context.Context, id string, request opencode.MessageRequest) (opencode.NativeMessage, error) {
@@ -403,7 +403,7 @@ func TestRawEventDefaultOffEmitsNothing(t *testing.T) {
 // payload for the session_prompt turn limit.
 func TestSessionPromptBackpressureLimitString(t *testing.T) {
 	ctx := context.Background()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent := NewAgent()
 	session := testSession(t, agent, client)
 

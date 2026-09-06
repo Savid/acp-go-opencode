@@ -24,7 +24,7 @@ func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testi
 	agent, broker := harness.agent, harness.broker
 	restoreBrokerSeams(t)
 
-	node := newFakeOpenCodeClient()
+	node := newFakeOpenCodeClient(t)
 
 	var handed opencode.StartOptions
 
@@ -59,7 +59,7 @@ func TestDestroyReportsBrowserShimRemovalFailure(t *testing.T) {
 
 	// The removal failure is injected, and the shim survives destruction.
 	broker := &authBroker{
-		home: t.TempDir(), shim: shim, client: newFakeOpenCodeClient(), log: slog.New(slog.DiscardHandler),
+		home: t.TempDir(), shim: shim, client: newFakeOpenCodeClient(t), log: slog.New(slog.DiscardHandler),
 		removeShim: func() error { return errors.New("remove shim") },
 	}
 	broker.destroy(context.Background())

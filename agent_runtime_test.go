@@ -43,7 +43,7 @@ func TestAgentSessionDefaultsToOrdinaryExecution(t *testing.T) {
 
 	var launched opencode.StartOptions
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
 		return testNativeSession("ordinary-native-session"), nil
 	}
@@ -103,7 +103,7 @@ func (client *proofFailureRuntimeClient) Shutdown(context.Context) error {
 func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 	containmentErr := errors.Join(errors.New("containment failed"), ErrContainmentIncomplete)
 	client := &proofFailureRuntimeClient{
-		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		fakeOpenCodeClient: newFakeOpenCodeClient(t),
 		entered:            make(chan struct{}),
 		resume:             make(chan struct{}),
 		err:                containmentErr,
@@ -123,7 +123,7 @@ func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 	require.ErrorIs(t, first, containmentErr)
 	require.EqualValues(t, 1, client.calls.Load())
 
-	secondClient := newFakeOpenCodeClient()
+	secondClient := newFakeOpenCodeClient(t)
 	agent.mu.Lock()
 	agent.runtime = secondClient
 	agent.runtimeGeneration = 2
@@ -138,13 +138,13 @@ func TestRuntimeRetirementMemoizesExactGenerationResult(t *testing.T) {
 	require.ErrorIs(t, missing.retireSharedRuntime(9, "fatal"), containmentErr)
 
 	sessionless := NewAgent(WithHome(t.TempDir()))
-	sessionless.runtime = newFakeOpenCodeClient()
+	sessionless.runtime = newFakeOpenCodeClient(t)
 	sessionless.runtimeGeneration = 1
 	require.NoError(t, sessionless.retireSharedRuntime(1, "no sessions"))
 }
 
 func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	current := &session{
 		client:            client,
 		runtimeGeneration: 1,
@@ -172,7 +172,7 @@ func TestRuntimeRetirementContainsDetachPanic(t *testing.T) {
 
 func TestRuntimeRetirementIncompleteProofFencesConfiguredHomeUntilRetry(t *testing.T) {
 	home := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.closeErr = errors.Join(ErrContainmentIncomplete, opencode.ErrProcessContainmentIncomplete)
 	agent := NewAgent(WithHome(home))
 	agent.runtime = client
@@ -184,7 +184,7 @@ func TestRuntimeRetirementIncompleteProofFencesConfiguredHomeUntilRetry(t *testi
 	require.Nil(t, agent.runtimeFatalErr)
 
 	var starts atomic.Int32
-	replacement := newFakeOpenCodeClient()
+	replacement := newFakeOpenCodeClient(t)
 	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
 		starts.Add(1)
 		require.Equal(t, home, options.Root)
@@ -205,7 +205,7 @@ func TestRuntimeRetirementIncompleteProofFencesConfiguredHomeUntilRetry(t *testi
 }
 
 func TestHostAuthorityLossFencesEverySharedRuntimeSession(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.closeErr = errors.Join(errors.New("authority connection closed"), ErrHostAuthorityUnavailable)
 	agent := NewAgent(WithHome(t.TempDir()))
 	agent.runtime = client
@@ -235,7 +235,7 @@ func TestHostAuthorityLossFencesEverySharedRuntimeSession(t *testing.T) {
 }
 
 func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
-	shutdownBase := newFakeOpenCodeClient()
+	shutdownBase := newFakeOpenCodeClient(t)
 	tests := []struct {
 		name      string
 		client    opencode.Client
@@ -292,7 +292,7 @@ func TestRuntimeExitWatcherPublishesBoundaryPanics(t *testing.T) {
 func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.T) {
 	containmentErr := errors.Join(errors.New("containment failed"), ErrContainmentIncomplete)
 	client := &proofFailureRuntimeClient{
-		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		fakeOpenCodeClient: newFakeOpenCodeClient(t),
 		entered:            make(chan struct{}),
 		resume:             make(chan struct{}),
 		err:                containmentErr,
@@ -331,7 +331,7 @@ func TestAgentCloseMemoizesRetirementAndWaitsForOneAlreadyInProgress(t *testing.
 func TestAgentCloseWaitsForConstructionCleanupAndReturnsContainmentFailure(t *testing.T) {
 	containmentErr := errors.Join(errors.New("containment failed"), ErrContainmentIncomplete)
 	client := &proofFailureRuntimeClient{
-		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		fakeOpenCodeClient: newFakeOpenCodeClient(t),
 		entered:            make(chan struct{}),
 		resume:             make(chan struct{}),
 		err:                containmentErr,
@@ -388,7 +388,7 @@ func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
 	_, _, err = waiting.sharedRuntimeBinding(cancelled)
 	require.ErrorIs(t, err, context.Canceled)
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	ready := NewAgent()
 	ready.runtimeStarting = make(chan struct{})
 	go func() {
@@ -417,20 +417,20 @@ func TestSharedRuntimeRemainingCoordinationBranches(t *testing.T) {
 
 func TestWatchSharedRuntimeRemainingBranches(t *testing.T) {
 	require.NotPanics(t, func() {
-		NewAgent().watchSharedRuntime(context.Background(), &panickingRuntimeExitClient{fakeOpenCodeClient: newFakeOpenCodeClient()}, 0)
+		NewAgent().watchSharedRuntime(context.Background(), &panickingRuntimeExitClient{fakeOpenCodeClient: newFakeOpenCodeClient(t)}, 0)
 	})
 
-	nilExit := newFakeOpenCodeClient()
+	nilExit := newFakeOpenCodeClient(t)
 	nilExit.runtimeExited = nil
 	NewAgent().watchSharedRuntime(context.Background(), nilExit, 0)
 
-	stale := newFakeOpenCodeClient()
+	stale := newFakeOpenCodeClient(t)
 	close(stale.runtimeExited)
 	agent := NewAgent()
-	agent.runtime = newFakeOpenCodeClient()
+	agent.runtime = newFakeOpenCodeClient(t)
 	agent.watchSharedRuntime(context.Background(), stale, 0)
 
-	closedClient := newFakeOpenCodeClient()
+	closedClient := newFakeOpenCodeClient(t)
 	close(closedClient.runtimeExited)
 	agent.runtime = closedClient
 	agent.closed = true
@@ -439,7 +439,7 @@ func TestWatchSharedRuntimeRemainingBranches(t *testing.T) {
 
 func TestStartSharedRuntimeRemainingFailureAndDefaultBranches(t *testing.T) {
 	home := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	var handed opencode.StartOptions
 	agent := NewAgent(WithHome(home))
 	agent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
@@ -528,7 +528,7 @@ func TestDirectoryBindingRemainingOSHashAndReleaseBranches(t *testing.T) {
 
 func TestScopeCleanupFailureRetainsDirectoryPrincipal(t *testing.T) {
 	cwd := t.TempDir()
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.scopeErr = errors.Join(opencode.ErrMCPDisconnectUnproven, errors.New("delete failed"))
 	agent := NewAgent()
 	agent.runtime = client
@@ -549,7 +549,7 @@ func TestScopeCleanupFailureRetainsDirectoryPrincipal(t *testing.T) {
 }
 
 func TestDirectoryScopeCloseFailureQuarantinesWithoutRelease(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	client.closeErr = errors.New("disconnect failed")
 	agent := NewAgent()
 	agent.runtime = client
@@ -587,7 +587,7 @@ func TestDirectoryBindingIncarnationSkipsZeroAfterWrap(t *testing.T) {
 func TestReadySharedRuntimeSessionReleaseGate(t *testing.T) {
 	const repetitions = 5
 
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	var launches atomic.Int32
 	var nativeSessions atomic.Int32
 	client.createSessionFunc = func(context.Context, string) (opencode.NativeSession, error) {
@@ -645,19 +645,19 @@ func TestSharedRuntimeCoordinationEdges(t *testing.T) {
 	require.ErrorIs(t, classifyRuntimeShutdown(cancelled, context.Canceled), opencode.ErrProcessContainmentIncomplete)
 	require.False(t, retryableRuntimeCleanup(errors.Join(internalContainment, ErrHostAuthorityUnavailable)))
 
-	revoked := &revokedRuntimeClient{fakeOpenCodeClient: newFakeOpenCodeClient()}
+	revoked := &revokedRuntimeClient{fakeOpenCodeClient: newFakeOpenCodeClient(t)}
 	agent := NewAgent()
 	agent.runtime = revoked
 	agent.runtimeGeneration = 1
 	agent.handleSharedRuntimeExit(revoked, 1)
 
-	retirement := &runtimeRetirement{runtime: newFakeOpenCodeClient()}
+	retirement := &runtimeRetirement{runtime: newFakeOpenCodeClient(t)}
 	require.NoError(t, agent.retryRuntimeCleanup(t.Context(), retirement))
 
 	changedAgent := NewAgent()
 	changedRetirement := &runtimeRetirement{}
 	changedRetirement.runtime = &shutdownHookClient{
-		fakeOpenCodeClient: newFakeOpenCodeClient(),
+		fakeOpenCodeClient: newFakeOpenCodeClient(t),
 		shutdown: func(context.Context) error {
 			changedAgent.mu.Lock()
 			changedAgent.runtimeSequencing = nil
@@ -670,7 +670,7 @@ func TestSharedRuntimeCoordinationEdges(t *testing.T) {
 	require.ErrorContains(t, changedAgent.retryRuntimeCleanup(t.Context(), changedRetirement), "shutdown refused")
 
 	fatalAgent := NewAgent()
-	fatalClient := newFakeOpenCodeClient()
+	fatalClient := newFakeOpenCodeClient(t)
 	fatalClient.closeErr = ErrContainmentIncomplete
 	fatalRetirement := &runtimeRetirement{runtime: fatalClient}
 	fatalAgent.runtimeSequencing = fatalRetirement
@@ -679,7 +679,7 @@ func TestSharedRuntimeCoordinationEdges(t *testing.T) {
 	require.Nil(t, fatalAgent.runtimeSequencing)
 
 	closeAgent := NewAgent()
-	closeAgent.runtimeSequencing = &runtimeRetirement{runtime: newFakeOpenCodeClient()}
+	closeAgent.runtimeSequencing = &runtimeRetirement{runtime: newFakeOpenCodeClient(t)}
 	require.NoError(t, closeAgent.Close())
 
 	retained := NewAgent()
@@ -750,7 +750,7 @@ func TestSharedRuntimeConstructionEdges(t *testing.T) {
 	prepareAgent.options.clientFactory = func(_ context.Context, options opencode.StartOptions) (opencode.Client, error) {
 		startOptions = options
 
-		return newFakeOpenCodeClient(), nil
+		return newFakeOpenCodeClient(t), nil
 	}
 	runtime, err := prepareAgent.startSharedRuntime(t.Context())
 	require.NoError(t, err)
@@ -764,7 +764,7 @@ func TestSharedRuntimeConstructionEdges(t *testing.T) {
 // reinstate before their next prompt because the registration is per directory
 // rather than per scope.
 func TestDirectoryPrincipalCoHoldingBranches(t *testing.T) {
-	client := newFakeOpenCodeClient()
+	client := newFakeOpenCodeClient(t)
 	agent := NewAgent()
 	agent.runtime = client
 	cwd := t.TempDir()

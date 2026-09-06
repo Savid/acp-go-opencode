@@ -158,7 +158,7 @@ func TestMediaEnvelopeAdvertisesTheBoundTheGateReports(t *testing.T) {
 				declaration[handoffFieldSizeBytes] = tt.want + 1
 
 				block := handoffBlock(mimePNG, path, declaration)
-				requireInvalidParamsData(t, validatePromptMediaError(testSession(t, agent, newFakeOpenCodeClient()), block), map[string]any{
+				requireInvalidParamsData(t, validatePromptMediaError(testSession(t, agent, newFakeOpenCodeClient(t)), block), map[string]any{
 					jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 					jsonFieldSizeBytes: tt.want + 1, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxBytes],
 				})
@@ -184,7 +184,7 @@ func TestMediaEnvelopeAdvertisesTheBoundTheGateReports(t *testing.T) {
 		require.Equal(t, perPrompt, envelope[mediaEnvelopeFieldMaxPromptBytes])
 
 		block := handoffBlock(mimePNG, path, handoffEnvelope(decoded))
-		requireInvalidParamsData(t, validatePromptMediaError(testSession(t, agent, newFakeOpenCodeClient()), block, block), map[string]any{
+		requireInvalidParamsData(t, validatePromptMediaError(testSession(t, agent, newFakeOpenCodeClient(t)), block, block), map[string]any{
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
 			jsonFieldSizeBytes: 2 * perImage, jsonFieldMaxBytes: envelope[mediaEnvelopeFieldMaxPromptBytes],
 		})
@@ -333,7 +333,7 @@ func TestAssistantTextIsAppendOnly(t *testing.T) {
 	// A streamed turn whose terminal frame repeats the assembled text: the
 	// concatenation of the emitted chunks equals the final text exactly once.
 	t.Run("terminal frame repeats the streamed text", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		conn := newRecordingAgentClient()
 		agent := NewAgent()
 		agent.setAgentClient(conn)
@@ -366,7 +366,7 @@ func TestAssistantTextIsAppendOnly(t *testing.T) {
 	// A harness that delivers only a terminal full-message frame, with no
 	// deltas, produces exactly one chunk carrying that text.
 	t.Run("deltas-free harness yields one chunk", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		conn := newRecordingAgentClient()
 		agent := NewAgent()
 		agent.setAgentClient(conn)
@@ -384,7 +384,7 @@ func TestAssistantTextIsAppendOnly(t *testing.T) {
 	// Several native assistant messages in one turn produce each message's text
 	// exactly once, in native order, deduplicated on native identity.
 	t.Run("multi-message turn emits each message once", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		conn := newRecordingAgentClient()
 		agent := NewAgent()
 		agent.setAgentClient(conn)
@@ -521,7 +521,7 @@ func TestReservedPromptKeysRefusalShapes(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			agent := negotiatedAgent(t)
 			agent.setAgentClient(newRecordingAgentClient())
-			client := newFakeOpenCodeClient()
+			client := newFakeOpenCodeClient(t)
 			session := testSession(t, agent, client)
 			agent.sessions[session.id] = session
 
@@ -583,7 +583,7 @@ func TestOffPromptInternalErrorVocabulary(t *testing.T) {
 				}}))
 
 				agent := NewAgent(WithSessionStore(store))
-				agent.runtime = newFakeOpenCodeClient()
+				agent.runtime = newFakeOpenCodeClient(t)
 
 				_, err := agent.ResumeSession(ctx, ResumeSessionRequest("session", t.TempDir()))
 
@@ -596,7 +596,7 @@ func TestOffPromptInternalErrorVocabulary(t *testing.T) {
 				t.Helper()
 
 				agent := NewAgent()
-				agent.runtime = newFakeOpenCodeClient()
+				agent.runtime = newFakeOpenCodeClient(t)
 				agent.runtimeFatalErr = errors.Join(ErrContainmentIncomplete, errors.New("native tree still alive"))
 
 				_, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
@@ -611,7 +611,7 @@ func TestOffPromptInternalErrorVocabulary(t *testing.T) {
 
 				agent := NewAgent()
 				agent.setAgentClient(newRecordingAgentClient())
-				session := testSession(t, agent, newFakeOpenCodeClient())
+				session := testSession(t, agent, newFakeOpenCodeClient(t))
 
 				return session.poison(ctx, poisonCauseNativeSessionDrift)
 			},

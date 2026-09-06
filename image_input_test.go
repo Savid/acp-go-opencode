@@ -99,7 +99,7 @@ func TestValidatePromptImagesInputTaxonomy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+			session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 			requireInvalidParamsData(t, validatePromptMediaError(session, tt.block), tt.want)
 		})
 	}
@@ -110,7 +110,7 @@ func TestValidatePromptImagesSizeLimits(t *testing.T) {
 	decodedSize := int64(len(fixtureImage(t, "valid.png")))
 
 	t.Run("per image", func(t *testing.T) {
-		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerImage: 1})), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerImage: 1})), newFakeOpenCodeClient(t))
 		requireInvalidParamsData(t, validatePromptMediaError(session,
 			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
 		), map[string]any{
@@ -120,7 +120,7 @@ func TestValidatePromptImagesSizeLimits(t *testing.T) {
 	})
 
 	t.Run("per prompt aggregate", func(t *testing.T) {
-		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: decodedSize + 1})), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: decodedSize + 1})), newFakeOpenCodeClient(t))
 		err := validatePromptMediaError(session,
 			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
 			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: png, MimeType: mimePNG}},
@@ -143,7 +143,7 @@ func TestValidatePromptMediaGatesBlobResourceChannel(t *testing.T) {
 		// Larger than the per-image limit the same adapter enforces for an
 		// image blob, which this channel previously accepted unbounded.
 		oversize := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("P"), 6295951))
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		requireInvalidParamsData(t, validatePromptMediaError(session, blobResourceBlock(oversize, &pdfMime)), map[string]any{
 			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 			jsonFieldSizeBytes: int64(6295951), jsonFieldMaxBytes: defaultImageLimitBytes,
@@ -151,7 +151,7 @@ func TestValidatePromptMediaGatesBlobResourceChannel(t *testing.T) {
 	})
 
 	t.Run("corrupt base64 blob is rejected", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		requireInvalidParamsData(t, validatePromptMediaError(session, blobResourceBlock("!!!!", &pdfMime)), map[string]any{
 			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidBase64, jsonFieldIndex: 0,
 		})
@@ -162,7 +162,7 @@ func TestValidatePromptMediaGatesBlobResourceChannel(t *testing.T) {
 		document := bytes.Repeat([]byte("P"), 64)
 		limit := int64(len(png)) + int64(len(document)) - 1
 
-		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient(t))
 		requireInvalidParamsData(t, validatePromptMediaError(session,
 			blobResourceBlock(base64.StdEncoding.EncodeToString(document), &pdfMime),
 			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", Data: base64.StdEncoding.EncodeToString(png), MimeType: mimePNG}},
@@ -174,7 +174,7 @@ func TestValidatePromptMediaGatesBlobResourceChannel(t *testing.T) {
 
 	t.Run("conforming pdf blob still maps to its unchanged native form", func(t *testing.T) {
 		document := base64.StdEncoding.EncodeToString([]byte("%PDF-1.7"))
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		block := blobResourceBlock(document, &pdfMime)
 		require.NoError(t, validatePromptMediaError(session, block))
 
@@ -184,12 +184,12 @@ func TestValidatePromptMediaGatesBlobResourceChannel(t *testing.T) {
 	})
 
 	t.Run("blob without data is left alone", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		require.NoError(t, validatePromptMediaError(session, blobResourceBlock("", &pdfMime)))
 	})
 
 	t.Run("blob without a declared media type is gated as a document", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		requireInvalidParamsData(t, validatePromptMediaError(session, blobResourceBlock("!!!!", nil)), map[string]any{
 			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidBase64, jsonFieldIndex: 0,
 		})
@@ -206,7 +206,7 @@ func TestValidatePromptMediaGatesBlobResourceChannel(t *testing.T) {
 		wrapped := wrapBase64(canonical, 76)
 		require.Contains(t, wrapped, "\n")
 
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 
 		for _, mime := range []*string{&pngMime, &pdfMime} {
 			blocks := []acp.ContentBlock{blobResourceBlock(wrapped, mime)}
@@ -243,7 +243,7 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 	}
 
 	t.Run("unsupported rejects", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.providers = providersWith(boolPtr(false))
 		session := testSession(t, NewAgent(), client)
 		requireInvalidParamsData(t, validatePromptMediaError(session, block), map[string]any{
@@ -254,7 +254,7 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 
 	t.Run("unsupported names the first raster block", func(t *testing.T) {
 		pdfMime := "application/pdf"
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.providers = providersWith(boolPtr(false))
 		session := testSession(t, NewAgent(), client)
 		requireInvalidParamsData(t, validatePromptMediaError(session,
@@ -271,7 +271,7 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 	// prompt.image for it would point the host at a block that is not there.
 	t.Run("unsupported names the member the raster arrived on", func(t *testing.T) {
 		pngMime := mimePNG
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.providers = providersWith(boolPtr(false))
 		session := testSession(t, NewAgent(), client)
 		requireInvalidParamsData(t, validatePromptMediaError(session,
@@ -285,7 +285,7 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 
 	t.Run("a document-only prompt never consults the image model gate", func(t *testing.T) {
 		pdfMime := "application/pdf"
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.providers = providersWith(boolPtr(false))
 		session := testSession(t, NewAgent(), client)
 		require.NoError(t, validatePromptMediaError(session,
@@ -294,39 +294,39 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 	})
 
 	t.Run("supported forwards", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.providers = providersWith(boolPtr(true))
 		session := testSession(t, NewAgent(), client)
 		require.NoError(t, validatePromptMediaError(session, block))
 	})
 
 	t.Run("unknown catalog forwards", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		require.NoError(t, validatePromptMediaError(session, block))
 	})
 
 	t.Run("no images returns nil", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		require.NoError(t, validatePromptMediaError(session, acp.TextBlock("hi")))
 	})
 }
 
 func TestSelectedModelImageSupportSources(t *testing.T) {
 	t.Run("empty model is unknown", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		session.providerID = ""
 		session.modelID = ""
 		require.Equal(t, imageInputUnknown, session.selectedModelImageSupport(context.Background()))
 	})
 
 	t.Run("nil client is unknown", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		session.client = nil
 		require.Equal(t, imageInputUnknown, session.selectedModelImageSupport(context.Background()))
 	})
 
 	t.Run("provider error is unknown", func(t *testing.T) {
-		client := newFakeOpenCodeClient()
+		client := newFakeOpenCodeClient(t)
 		client.providersErr = errors.New("catalog down")
 		session := testSession(t, NewAgent(), client)
 		require.Equal(t, imageInputUnknown, session.selectedModelImageSupport(context.Background()))
@@ -404,7 +404,7 @@ func TestValidatePromptMediaChargesTextResources(t *testing.T) {
 		text := strings.Repeat("t", 1024)
 		limit := int64(len(text)*2) - 1
 
-		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient(t))
 		requireInvalidParamsData(t, validatePromptMediaError(session,
 			textBlock(text, "file:///tmp/notes"),
 			textBlock(text, "file:///tmp/notes"),
@@ -419,7 +419,7 @@ func TestValidatePromptMediaChargesTextResources(t *testing.T) {
 		text := strings.Repeat("t", 64)
 		limit := int64(len(png)+len(text)) - 1
 
-		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient(t))
 		requireInvalidParamsData(t, validatePromptMediaError(session,
 			textBlock(text, ""),
 			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", MimeType: mimePNG, Data: base64.StdEncoding.EncodeToString(png)}},
@@ -433,7 +433,7 @@ func TestValidatePromptMediaChargesTextResources(t *testing.T) {
 		uri := "file:///tmp/" + strings.Repeat("u", 512)
 		limit := int64(len(uri)) - 1
 
-		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: limit})), newFakeOpenCodeClient(t))
 		requireInvalidParamsData(t, validatePromptMediaError(session, textBlock("", uri)), map[string]any{
 			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 			jsonFieldSizeBytes: int64(len(uri)), jsonFieldMaxBytes: limit,
@@ -441,7 +441,7 @@ func TestValidatePromptMediaChargesTextResources(t *testing.T) {
 	})
 
 	t.Run("a charged text resource still maps to its unchanged native form", func(t *testing.T) {
-		session := testSession(t, NewAgent(), newFakeOpenCodeClient())
+		session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		block := textBlock("notes", "file:///tmp/notes")
 		require.NoError(t, validatePromptMediaError(session, block))
 
@@ -460,7 +460,7 @@ func TestValidatePromptImagesRejectsBytesPastTheTransportBound(t *testing.T) {
 
 	// The per-image policy limit is disabled, so only the transport bound can
 	// decide, and it is the bound the advertisement reports.
-	session := testSession(t, NewAgent(WithImageLimits(ImageLimits{})), newFakeOpenCodeClient())
+	session := testSession(t, NewAgent(WithImageLimits(ImageLimits{})), newFakeOpenCodeClient(t))
 	block := acp.ContentBlock{Image: &acp.ContentBlockImage{
 		Type: "image", MimeType: mimePNG, Data: base64.StdEncoding.EncodeToString(oversize),
 	}}
