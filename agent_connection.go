@@ -252,11 +252,11 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 func decodeLocalAgentParams[Req any, ReqPtr localAgentParams[Req]](params json.RawMessage) (Req, *acp.RequestError) {
 	var value Req
 	if err := json.Unmarshal(params, &value); err != nil {
-		return value, unsupportedField(jsonFieldParams)
+		return value, unsupportedRequest(jsonFieldParams)
 	}
 
 	if err := ReqPtr(&value).Validate(); err != nil {
-		return value, unsupportedField(jsonFieldParams)
+		return value, unsupportedRequest(jsonFieldParams)
 	}
 
 	return value, nil
@@ -369,7 +369,7 @@ func requestError(ctx context.Context, err error) *acp.RequestError {
 	// the generation for the same reason. A runtime that merely exited never
 	// reaches here: the next explicit operation admits a replacement generation.
 	if errors.Is(err, ErrContainmentIncomplete) || errors.Is(err, opencode.ErrMCPDisconnectUnproven) {
-		return acp.NewInternalError(map[string]any{jsonFieldError: errValueRuntimeUnavailable})
+		return acp.NewInternalError(map[string]any{jsonFieldError: valRuntimeUnavailable})
 	}
 
 	// An error carrying no wire classification of its own is the only one whose
@@ -382,12 +382,12 @@ func requestError(ctx context.Context, err error) *acp.RequestError {
 	var startup *startupError
 	if errors.As(err, &startup) {
 		return acp.NewInternalError(map[string]any{
-			jsonFieldError: errValueInternalFailure,
+			jsonFieldError: valInternalFailure,
 			jsonFieldClass: classNativeStartup,
 		})
 	}
 
-	return acp.NewInternalError(map[string]any{jsonFieldError: errValueInternalFailure})
+	return acp.NewInternalError(map[string]any{jsonFieldError: valInternalFailure})
 }
 
 func scopedElicitationParams(

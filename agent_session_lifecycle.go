@@ -24,7 +24,7 @@ func (a *Agent) acquireSessionLifecycle(ctx context.Context, id acp.SessionId) (
 		if a.lifecycleFenced {
 			a.lifecycleAdmissionMu.Unlock()
 
-			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: valAgentClosed})
 		}
 
 		if a.lifecycleFlights == nil {
@@ -47,7 +47,7 @@ func (a *Agent) acquireSessionLifecycle(ctx context.Context, id acp.SessionId) (
 		select {
 		case <-done:
 		case <-fence:
-			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: valAgentClosed})
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

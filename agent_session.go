@@ -171,7 +171,7 @@ func (a *Agent) loadOrResumeSession(
 	}
 
 	if a.isDeleted(id) {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	if err := validateProviderAuthOptions(a.options); err != nil {
@@ -236,7 +236,7 @@ func (a *Agent) loadOrResumeSession(
 
 		if !a.removeSessionIf(id, active) {
 			return nil, acp.NewInternalError(map[string]any{
-				jsonFieldError: errValueInternalFailure,
+				jsonFieldError: valInternalFailure,
 				jsonFieldClass: classSessionReplacementRaced,
 			})
 		}
@@ -254,7 +254,7 @@ func (a *Agent) loadOrResumeSession(
 	}
 
 	if !ok {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	if meta.Model == "" {
@@ -341,7 +341,7 @@ func (a *Agent) classifyRestoreFailure(ctx context.Context, id acp.SessionId, er
 			slog.String("session_id", string(id)), loggableError(err))
 	}
 
-	return acp.NewInternalError(map[string]any{jsonFieldError: errValueRestoreFailed})
+	return acp.NewInternalError(map[string]any{jsonFieldError: valRestoreFailed})
 }
 
 // activeLoadRequestMatches reports whether load/resume can keep the active
@@ -900,11 +900,11 @@ func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
 
 	for index, server := range servers {
 		if server.Sse != nil {
-			return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Sse.Name})
+			return acp.NewInvalidParams(map[string]any{jsonFieldError: valUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Sse.Name})
 		}
 
 		if server.Acp != nil {
-			return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Acp.Name})
+			return acp.NewInvalidParams(map[string]any{jsonFieldError: valUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Acp.Name})
 		}
 
 		var name string
@@ -916,7 +916,7 @@ func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
 			name = server.Stdio.Name
 		default:
 			return acp.NewInvalidParams(map[string]any{
-				jsonFieldError: errValueNoTransport,
+				jsonFieldError: valNoTransport,
 				jsonFieldField: fmt.Sprintf("mcpServers[%d]", index),
 			})
 		}

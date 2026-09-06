@@ -93,11 +93,17 @@ func TestWithHostAuthorityMarksTheManagedBoundary(t *testing.T) {
 	}
 }
 func TestRuntimeOptionAndScratchEdges(t *testing.T) {
-	require.Error(t, validateRuntimeOptions(Options{Env: map[string]string{"home": "/reserved"}}))
+	for _, env := range []map[string]string{
+		{envHomeKey: "/reserved"}, {"OPENCODE_DB": "/reserved"}, {privateAdapterEnvPrefix + "TOKEN": "x"}, {"acp_go_opencode_internal_token": "x"},
+		{"NODE_OPTIONS": "--require x"}, {"BASH_ENV": "/init"}, {"ENV": "/init"}, {"LD_PRELOAD": "/lib"},
+		{"": "x"}, {"A=B": "x"}, {"A": "x\x00y"},
+	} {
+		require.Error(t, validateRuntimeOptions(Options{Env: env}), env)
+	}
+	require.NoError(t, validateRuntimeOptions(Options{Env: map[string]string{"PATH": "/usr/bin", "https_proxy": "", "home": "own"}}))
 	require.Error(t, validateRuntimeOptions(Options{Home: "relative"}))
 	require.Error(t, validateRuntimeOptions(Options{hostAuthorityConfigured: true}))
 	require.Error(t, validateDurableHomePath("/tmp/control\npath"))
-	require.True(t, reservedOpenCodeEnvKey(privateAdapterEnvPrefix+"TOKEN"))
 	require.True(t, adapterPrivateEnvKey(privateAdapterEnvPrefix+"TOKEN"))
 
 	homeAgent := &Agent{options: Options{Home: absTestPath("durable", "home")}}

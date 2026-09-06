@@ -451,53 +451,53 @@ func TestReservedPromptKeysRefusalShapes(t *testing.T) {
 	}{
 		"route absent": {
 			meta:  map[string]any{lifecycle.MetaKey: goodLifecycle},
-			error: errValueMissing, field: routeMetaPath,
+			error: valMissing, field: routeMetaPath,
 		},
 		"route non-object": {
 			meta:  map[string]any{routeEnvelopeKey: 7, lifecycle.MetaKey: goodLifecycle},
-			error: errValueUnsupported, field: routeMetaPath,
+			error: valUnsupported, field: routeMetaPath,
 		},
 		"route wrong version": {
 			meta:  map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: 2, routeFieldTurnNonce: "nonce"}},
-			error: errValueUnsupported, field: routeMemberPath(routeFieldVersion),
+			error: valUnsupported, field: routeMemberPath(routeFieldVersion),
 		},
 		"route fractional version": {
 			meta:  map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: 1.5, routeFieldTurnNonce: "nonce"}},
-			error: errValueUnsupported, field: routeMemberPath(routeFieldVersion),
+			error: valUnsupported, field: routeMemberPath(routeFieldVersion),
 		},
 		"route empty nonce": {
 			meta:  map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: 1, routeFieldTurnNonce: ""}},
-			error: errValueUnsupported, field: routeMemberPath(routeFieldTurnNonce),
+			error: valUnsupported, field: routeMemberPath(routeFieldTurnNonce),
 		},
 		"route over-bound nonce": {
 			meta:  map[string]any{routeEnvelopeKey: map[string]any{routeFieldVersion: 1, routeFieldTurnNonce: overBound}},
-			error: errValueUnsupported, field: routeMemberPath(routeFieldTurnNonce),
+			error: valUnsupported, field: routeMemberPath(routeFieldTurnNonce),
 		},
 		"route unknown member": {
 			meta: map[string]any{routeEnvelopeKey: map[string]any{
 				routeFieldVersion: 1, routeFieldTurnNonce: "nonce", "extra": true,
 			}},
-			error: errValueUnsupported, field: routeMemberPath("extra"),
+			error: valUnsupported, field: routeMemberPath("extra"),
 		},
 		"lifecycle absent": {
 			meta:  map[string]any{routeEnvelopeKey: goodRoute},
-			error: errValueMissing, field: lifecycle.MetaPath,
+			error: valMissing, field: lifecycle.MetaPath,
 		},
 		"lifecycle non-object": {
 			meta:  map[string]any{routeEnvelopeKey: goodRoute, lifecycle.MetaKey: 7},
-			error: errValueUnsupported, field: lifecycle.MetaPath,
+			error: valUnsupported, field: lifecycle.MetaPath,
 		},
 		"lifecycle wrong version": {
 			meta: map[string]any{routeEnvelopeKey: goodRoute, lifecycle.MetaKey: map[string]any{
 				"version": 2, "submission": map[string]any{"submissionId": "sub", "clientNonce": "cli"},
 			}},
-			error: errValueUnsupported, field: lifecycle.MetaPath + ".version",
+			error: valUnsupported, field: lifecycle.MetaPath + ".version",
 		},
 		"lifecycle empty identifier": {
 			meta: map[string]any{routeEnvelopeKey: goodRoute, lifecycle.MetaKey: map[string]any{
 				"version": 1, "submission": map[string]any{"submissionId": "", "clientNonce": "cli"},
 			}},
-			error: errValueUnsupported, field: lifecycle.MetaPath + ".submission.submissionId",
+			error: valUnsupported, field: lifecycle.MetaPath + ".submission.submissionId",
 		},
 		"lifecycle unknown member": {
 			meta: map[string]any{routeEnvelopeKey: goodRoute, lifecycle.MetaKey: map[string]any{
@@ -505,7 +505,7 @@ func TestReservedPromptKeysRefusalShapes(t *testing.T) {
 				"submission": map[string]any{"submissionId": "sub", "clientNonce": "cli"},
 				"extra":      true,
 			}},
-			error: errValueUnsupported, field: lifecycle.MetaPath + ".extra",
+			error: valUnsupported, field: lifecycle.MetaPath + ".extra",
 		},
 		// Both wrong: the route refusal is the only one reported.
 		"both malformed": {
@@ -513,7 +513,7 @@ func TestReservedPromptKeysRefusalShapes(t *testing.T) {
 				routeEnvelopeKey:  map[string]any{routeFieldVersion: 2, routeFieldTurnNonce: "nonce"},
 				lifecycle.MetaKey: 7,
 			},
-			error: errValueUnsupported, field: routeMemberPath(routeFieldVersion),
+			error: valUnsupported, field: routeMemberPath(routeFieldVersion),
 		},
 	}
 
@@ -570,7 +570,7 @@ func TestOffPromptInternalErrorVocabulary(t *testing.T) {
 
 				return err
 			},
-			data: map[string]any{jsonFieldError: errValueInvalidOptions},
+			data: map[string]any{jsonFieldError: valInvalidOptions},
 		},
 		"unrestorable store entry": {
 			reach: func(t *testing.T) error {
@@ -589,7 +589,7 @@ func TestOffPromptInternalErrorVocabulary(t *testing.T) {
 
 				return err
 			},
-			data: map[string]any{jsonFieldError: errValueRestoreFailed},
+			data: map[string]any{jsonFieldError: valRestoreFailed},
 		},
 		"un-containable runtime": {
 			reach: func(t *testing.T) error {
@@ -603,7 +603,7 @@ func TestOffPromptInternalErrorVocabulary(t *testing.T) {
 
 				return err
 			},
-			data: map[string]any{jsonFieldError: errValueRuntimeUnavailable},
+			data: map[string]any{jsonFieldError: valRuntimeUnavailable},
 		},
 		"poisoned session": {
 			reach: func(t *testing.T) error {
@@ -615,7 +615,7 @@ func TestOffPromptInternalErrorVocabulary(t *testing.T) {
 
 				return session.poison(ctx, poisonCauseNativeSessionDrift)
 			},
-			data: map[string]any{jsonFieldError: errValueSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift},
+			data: map[string]any{jsonFieldError: valSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift},
 		},
 		"unclassified failure": {
 			reach: func(t *testing.T) error {
@@ -623,7 +623,7 @@ func TestOffPromptInternalErrorVocabulary(t *testing.T) {
 
 				return errors.New("a native detail no host may read")
 			},
-			data: map[string]any{jsonFieldError: errValueInternalFailure},
+			data: map[string]any{jsonFieldError: valInternalFailure},
 		},
 	}
 

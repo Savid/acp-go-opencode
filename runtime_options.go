@@ -8,10 +8,8 @@ import (
 )
 
 func validateRuntimeOptions(options Options) error {
-	for key := range options.Env {
-		if reservedOpenCodeEnvKey(key) {
-			return errors.New("environment key " + key + " is reserved for OpenCode runtime management")
-		}
+	if err := validateAgentEnv(options.Env); err != nil {
+		return err
 	}
 
 	if options.Home != "" {
@@ -50,18 +48,12 @@ const (
 	envOpenCodeDBKey            = "OPENCODE_DB"
 )
 
-func reservedOpenCodeEnvKey(key string) bool {
-	upper := strings.ToUpper(key)
-
-	return strings.HasPrefix(upper, privateAdapterEnvPrefix) || managedOpenCodeRootEnvKey(upper)
-}
-
 // managedOpenCodeRootEnvKey reports whether name, already resolved to the
 // identity its caller compares under, is a runtime root the adapter manages
 // on OpenCode's behalf.
 func managedOpenCodeRootEnvKey(name string) bool {
 	switch name {
-	case "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
+	case envHomeKey, "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
 		envOpenCodeConfigKey, envOpenCodeConfigContentKey, envOpenCodeConfigDirKey, envOpenCodeDBKey:
 		return true
 	default:

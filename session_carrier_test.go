@@ -76,7 +76,7 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 // so Path is PATH there and an ordinary variable of its own everywhere else.
 func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T) {
 	for _, spelling := range []string{"path", "Path", "PaTh"} {
-		simulateSessionEnvPlatform(t, platformWindows)
+		simulateSessionEnvPlatform(t, "windows")
 
 		_, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 			metaEnvKey: map[string]any{spelling: absTestPath("attacker", "bin")},

@@ -43,7 +43,7 @@ const (
 	authFieldInput              = "input"
 	authFieldBindingGeneration  = "bindingGeneration"
 
-	errValueInvalid = "invalid"
+	valInvalid = "invalid"
 )
 
 // Closed cause enum returned by a provider-auth leg.
@@ -472,7 +472,7 @@ func loggableError(_ error) slog.Attr {
 
 func invalidAuthField(path string) error {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: errValueInvalid,
+		jsonFieldError: valInvalid,
 		jsonFieldField: path,
 	})
 }

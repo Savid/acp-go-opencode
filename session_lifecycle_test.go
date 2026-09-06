@@ -1437,7 +1437,7 @@ func TestASecondForegroundCycleIsRefused(t *testing.T) {
 	require.NotNil(t, current.currentCycle(), "no agent-origin cycle opened")
 
 	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, internalSeamTurnNonce, "hello"))
-	require.ErrorContains(t, err, errValueBackpressure)
+	require.ErrorContains(t, err, valBackpressure)
 
 	require.Zero(t, dispatches.Load(), "the losing prompt reached native dispatch")
 	require.Zero(t, client.abortCount(), "the losing prompt acquired cancellation authority")
@@ -1498,7 +1498,7 @@ func TestEitherConcurrentPromptWinnerLeavesTheLoserWithoutPostOrAbortAuthority(t
 			<-loserStarted
 			close(release)
 
-			require.ErrorContains(t, <-loserDone, errValueBackpressure)
+			require.ErrorContains(t, <-loserDone, valBackpressure)
 			require.EqualValues(t, 1, posts.Load())
 			require.Zero(t, client.abortCount())
 
@@ -1531,7 +1531,7 @@ func TestObservationBeforePromptImmutablyWinsAgentOwnership(t *testing.T) {
 		return opencode.NativeMessage{}, nil
 	}
 	_, err := current.Prompt(context.Background(), correlatedPrompt(current.id, "losing-prompt", "hello"))
-	require.ErrorContains(t, err, errValueBackpressure)
+	require.ErrorContains(t, err, valBackpressure)
 	require.Zero(t, dispatches.Load())
 	require.Zero(t, client.abortCount())
 

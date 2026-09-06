@@ -276,9 +276,15 @@ func validateVendorOptionsMeta(meta map[string]any) error {
 	return nil
 }
 
-func unsupportedField(path string) *acp.RequestError {
+func unsupportedField(path string) error {
+	return unsupportedRequest(path)
+}
+
+// unsupportedRequest is the uniform refusal of one request member, typed for
+// the in-process handlers that answer with the JSON-RPC error directly.
+func unsupportedRequest(path string) *acp.RequestError {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: errValueUnsupported,
+		jsonFieldError: valUnsupported,
 		jsonFieldField: path,
 	})
 }
@@ -287,9 +293,9 @@ func unsupportedField(path string) *acp.RequestError {
 // the caller left out. It is the sibling verdict of unsupportedField and never
 // substituted for it: `unsupported` always means a value that is present and
 // refused, `missing` always means one that is required and absent.
-func missingField(path string) *acp.RequestError {
+func missingField(path string) error {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: errValueMissing,
+		jsonFieldError: valMissing,
 		jsonFieldField: path,
 	})
 }

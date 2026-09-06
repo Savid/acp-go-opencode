@@ -70,19 +70,19 @@ func validateMCPServers(servers []acp.McpServer) error {
 			name = server.Http.Name
 		case server.Sse != nil:
 			return acp.NewInvalidParams(map[string]any{
-				jsonFieldError:  errValueUnsupported,
+				jsonFieldError:  valUnsupported,
 				jsonFieldField:  fmt.Sprintf("mcpServers[%d]", index),
 				jsonFieldServer: server.Sse.Name,
 			})
 		case server.Acp != nil:
 			return acp.NewInvalidParams(map[string]any{
-				jsonFieldError:  errValueUnsupported,
+				jsonFieldError:  valUnsupported,
 				jsonFieldField:  fmt.Sprintf("mcpServers[%d]", index),
 				jsonFieldServer: server.Acp.Name,
 			})
 		default:
 			return acp.NewInvalidParams(map[string]any{
-				jsonFieldError: errValueNoTransport,
+				jsonFieldError: valNoTransport,
 				jsonFieldField: fmt.Sprintf("mcpServers[%d]", index),
 			})
 		}

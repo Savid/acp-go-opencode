@@ -55,10 +55,10 @@ func TestRouteEnvelopeRemainingShapes(t *testing.T) {
 	require.Nil(t, requestRouteCarrier(strings.Repeat("n", routeTurnNonceMaxBytes+1)))
 	_, err = parseInboundTurnRoute(routeCarrier(" \t\n"))
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldTurnNonce)})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: routeMemberPath(routeFieldTurnNonce)})
 	_, err = parseInboundTurnRoute(routeCarrier(strings.Repeat("n", routeTurnNonceMaxBytes+1)))
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldTurnNonce)})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: routeMemberPath(routeFieldTurnNonce)})
 
 	_, err = outboundRoute(elicitationScope{})
 	require.ErrorContains(t, err, "incomplete")
@@ -115,5 +115,5 @@ func TestRouteVersionAcceptsAnEmbeddedHostInteger(t *testing.T) {
 		routeFieldTurnNonce: "nonce",
 	}})
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldVersion)})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: routeMemberPath(routeFieldVersion)})
 }

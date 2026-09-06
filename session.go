@@ -439,7 +439,7 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 
 	if exclusive {
 		if s.exclusiveTurn || len(turn) > 0 {
-			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: limitSessionPrompt})
+			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: valBackpressure, jsonFieldLimit: limitSessionPrompt})
 		}
 
 		s.exclusiveTurn = true
@@ -456,7 +456,7 @@ func (s *session) acquireTurnSlot(ctx context.Context, exclusive bool) (func(), 
 	}
 
 	if s.exclusiveTurn || len(turn) >= cap(turn) {
-		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: limitSessionPrompt})
+		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: valBackpressure, jsonFieldLimit: limitSessionPrompt})
 	}
 
 	turn <- struct{}{}
@@ -972,7 +972,7 @@ const poisonCauseNativeSessionDrift = "native_session_id_drift"
 // caller's params are fine and the session's own state is what refuses.
 func poisonedSessionError(cause string) error {
 	return acp.NewInternalError(map[string]any{
-		jsonFieldError: errValueSessionPoisoned,
+		jsonFieldError: valSessionPoisoned,
 		jsonFieldCause: cause,
 	})
 }
@@ -1610,7 +1610,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 	if s.closed {
 		s.mu.Unlock()
 
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueSessionUnknown})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: valSessionUnknown})
 	}
 
 	if s.runtimeLostCause == "" {
@@ -1625,7 +1625,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 		// detaches each session. A prompt entering in that narrow interval
 		// performs the same idempotent detach itself rather than touching the
 		// already-fenced client.
-		s.detachRuntime(generation, errValueSharedRuntimeExited)
+		s.detachRuntime(generation, valSharedRuntimeExited)
 		s.mu.Lock()
 	}
 
@@ -1706,7 +1706,7 @@ func (s *session) ensureRuntime(ctx context.Context) error {
 		_ = releaseCandidate()
 
 		if closed {
-			return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueSessionUnknown})
+			return acp.NewInvalidRequest(map[string]any{jsonFieldError: valSessionUnknown})
 		}
 	}
 }

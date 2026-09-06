@@ -425,8 +425,8 @@ func TestSessionPromptBackpressureLimitString(t *testing.T) {
 	if !ok {
 		t.Fatalf("backpressure data = %#v, want map", reqErr.Data)
 	}
-	if data[jsonFieldError] != errValueBackpressure {
-		t.Fatalf("backpressure error tag = %#v, want %q", data[jsonFieldError], errValueBackpressure)
+	if data[jsonFieldError] != valBackpressure {
+		t.Fatalf("backpressure error tag = %#v, want %q", data[jsonFieldError], valBackpressure)
 	}
 	if data[jsonFieldLimit] != limitSessionPrompt {
 		t.Fatalf("backpressure limit = %#v, want %q", data[jsonFieldLimit], limitSessionPrompt)

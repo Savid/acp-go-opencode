@@ -1,63 +1,83 @@
 package opencodeacp
 
 import (
+	"fmt"
 	"maps"
-	"runtime"
 	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
+
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const (
-	errValueAmbiguous = "ambiguous"
-
-	platformWindows = "windows"
+	valAmbiguous = "ambiguous"
 
 	envNodeOptionsKey = "NODE_OPTIONS"
 	envBashEnvKey     = "BASH_ENV"
 	envShellEnvKey    = "ENV"
+	envHomeKey        = "HOME"
 )
-
-var sessionEnvPlatform = runtime.GOOS
-
-// sessionEnvIdentity is the name the target platform resolves an environment
-// key by: the exact bytes on Unix, where PATH and path are two variables, and
-// the upper-cased spelling on Windows, where they are one.
-func sessionEnvIdentity(key string) string {
-	if sessionEnvPlatform == platformWindows {
-		return strings.ToUpper(key)
-	}
-
-	return key
-}
 
 func validEnvName(key string) bool {
 	return key != "" && !strings.ContainsAny(key, "=\x00")
 }
 
-// blockedSessionEnvKey reports whether a session env key names a variable the
-// adapter refuses to install on the addressed native session. The private
-// adapter namespace is refused under every spelling. PATH is owned by
-// extraPathDirs alone; the managed runtime roots and the loader, node, and
-// shell injection names are read by the native process under an exact
-// platform spelling, so those compare through the platform identity.
-func blockedSessionEnvKey(key string) bool {
+// blockedAgentEnvKey reports whether a caller-supplied env key names a
+// variable the adapter refuses on every surface. The private adapter
+// namespace is refused under every spelling; the managed runtime roots and
+// the loader, node, and shell injection names are read by the native process
+// under an exact platform spelling, so those compare through the platform
+// identity.
+func blockedAgentEnvKey(key string) bool {
 	if strings.HasPrefix(strings.ToUpper(key), privateAdapterEnvPrefix) {
 		return true
 	}
 
-	name := sessionEnvIdentity(key)
+	name := opencode.EnvironmentKey(key)
 	if managedOpenCodeRootEnvKey(name) {
 		return true
 	}
 
 	switch name {
-	case envPathKey, envNodeOptionsKey, envBashEnvKey, envShellEnvKey:
+	case envNodeOptionsKey, envBashEnvKey, envShellEnvKey:
 		return true
 	default:
 		return strings.HasPrefix(name, "LD_") || strings.HasPrefix(name, "DYLD_")
 	}
+}
+
+// blockedSessionEnvKey additionally refuses PATH in a session env: the ordered
+// extraPathDirs option is the only session-scoped search-path authority.
+func blockedSessionEnvKey(key string) bool {
+	return blockedAgentEnvKey(key) || opencode.EnvironmentKey(key) == envPathKey
+}
+
+// validateAgentEnv applies the session name rule to the static Agent-scoped
+// environment, with PATH allowed because that surface establishes the shared
+// server's native base search path. A refusal fails Agent construction.
+func validateAgentEnv(env map[string]string) error {
+	seen := make(map[string]string, len(env))
+
+	for _, key := range slices.Sorted(maps.Keys(env)) {
+		if !validEnvName(key) || strings.ContainsRune(env[key], '\x00') {
+			return fmt.Errorf("environment key %q is not a variable name", key)
+		}
+
+		if blockedAgentEnvKey(key) {
+			return fmt.Errorf("environment key %q is reserved for OpenCode runtime management", key)
+		}
+
+		identity := opencode.EnvironmentKey(key)
+		if previous, duplicate := seen[identity]; duplicate {
+			return fmt.Errorf("environment keys %q and %q name the same variable", previous, key)
+		}
+
+		seen[identity] = key
+	}
+
+	return nil
 }
 
 // validateSessionEnv checks a session environment in sorted key order, so the
@@ -74,7 +94,7 @@ func validateSessionEnv(env map[string]string, path string) error {
 			return unsupportedField(path + "." + key)
 		}
 
-		identity := sessionEnvIdentity(key)
+		identity := opencode.EnvironmentKey(key)
 		if _, duplicate := seen[identity]; duplicate {
 			return ambiguousField(path + "." + key)
 		}
@@ -85,9 +105,9 @@ func validateSessionEnv(env map[string]string, path string) error {
 	return nil
 }
 
-func ambiguousField(path string) *acp.RequestError {
+func ambiguousField(path string) error {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: errValueAmbiguous,
+		jsonFieldError: valAmbiguous,
 		jsonFieldField: path,
 	})
 }

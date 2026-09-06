@@ -3,16 +3,17 @@ package opencodeacp
 import (
 	"testing"
 
+	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
 func simulateSessionEnvPlatform(t *testing.T, platform string) {
 	t.Helper()
 
-	previous := sessionEnvPlatform
-	t.Cleanup(func() { sessionEnvPlatform = previous })
+	previous := opencode.Platform
+	t.Cleanup(func() { opencode.Platform = previous })
 
-	sessionEnvPlatform = platform
+	opencode.Platform = platform
 }
 
 func TestSessionEnvAcceptsEveryStructurallyValidName(t *testing.T) {
@@ -41,10 +42,10 @@ func TestSessionEnvRefusesBlockedNamesUnderThePlatformIdentity(t *testing.T) {
 	blocked := []string{
 		envPathKey, "NODE_OPTIONS", "BASH_ENV", "ENV",
 		"LD_PRELOAD", "DYLD_INSERT_LIBRARIES",
-		"HOME", "XDG_CONFIG_HOME", envOpenCodeConfigDirKey, envOpenCodeDBKey,
+		envHomeKey, "XDG_CONFIG_HOME", envOpenCodeConfigDirKey, envOpenCodeDBKey,
 	}
 
-	for _, platform := range []string{"linux", platformWindows} {
+	for _, platform := range []string{"linux", "windows"} {
 		simulateSessionEnvPlatform(t, platform)
 
 		for _, key := range blocked {
@@ -58,7 +59,7 @@ func TestSessionEnvRefusesBlockedNamesUnderThePlatformIdentity(t *testing.T) {
 		}
 	}
 
-	simulateSessionEnvPlatform(t, platformWindows)
+	simulateSessionEnvPlatform(t, "windows")
 
 	for _, key := range []string{"Node_Options", "ld_preload", "home", "opencode_db", "xdg_state_home"} {
 		_, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{metaEnvKey: map[string]any{key: "x"}}))
@@ -91,7 +92,7 @@ func TestSessionEnvRefusesTwoSpellingsOfOneWindowsVariable(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, meta.Env, 2)
 
-	simulateSessionEnvPlatform(t, platformWindows)
+	simulateSessionEnvPlatform(t, "windows")
 
 	_, err = sessionMetaFromVendorOptions(carrierOptions(map[string]any{metaEnvKey: env}))
 	require.Equal(t, ambiguousField(envOptionPath+".https_proxy"), err)

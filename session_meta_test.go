@@ -87,7 +87,7 @@ func TestSessionMetaWrongTypedKnownOptionsRejected(t *testing.T) {
 			if err == nil {
 				t.Fatalf("wrong-typed %s option accepted", name)
 			}
-			requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: tc.field})
+			requireInvalidParamsData(t, err, map[string]any{jsonFieldError: valUnsupported, jsonFieldField: tc.field})
 		})
 	}
 }
@@ -153,7 +153,7 @@ func TestVendorMetaMalformedMembersNameTheirPath(t *testing.T) {
 				t.Fatalf("malformed %s accepted", name)
 			}
 			requireInvalidParamsData(t, err, map[string]any{
-				jsonFieldError: errValueUnsupported,
+				jsonFieldError: valUnsupported,
 				jsonFieldField: tc.field,
 			})
 		})
@@ -198,7 +198,7 @@ func TestLifecycleMetaErrorsAreInvalidParams(t *testing.T) {
 // uniformOptionsRefusal is the data every lifecycle route answers for the same
 // malformed `_meta.opencode.options`.
 var uniformOptionsRefusal = map[string]any{
-	jsonFieldError: errValueUnsupported,
+	jsonFieldError: valUnsupported,
 	jsonFieldField: "_meta.opencode.options",
 }
 

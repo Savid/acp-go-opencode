@@ -1296,7 +1296,7 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 				{Audio: &acp.ContentBlockAudio{Type: "audio", Data: "AA==", MimeType: "audio/wav"}},
 			},
 		})
-		requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "prompt"})
+		requireInvalidParamsData(t, err, map[string]any{jsonFieldError: valUnsupported, jsonFieldField: "prompt"})
 	})
 
 	t.Run("command part conversion errors use the uniform prompt shape", func(t *testing.T) {
@@ -1309,7 +1309,7 @@ func TestPromptSlashCommandMixedContent(t *testing.T) {
 			if err == nil {
 				t.Fatalf("unconvertible command block accepted: %#v", block)
 			}
-			requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "prompt"})
+			requireInvalidParamsData(t, err, map[string]any{jsonFieldError: valUnsupported, jsonFieldField: "prompt"})
 		}
 		if _, err := blobResourceOpenCodePart(&acp.BlobResourceContents{}, ""); err == nil {
 			t.Fatal("empty blob resource accepted")
@@ -1742,7 +1742,7 @@ func TestPoisonedSessionRejectsFollowUpOperations(t *testing.T) {
 	// The poisoned refusal is an internal error carrying one closed token and
 	// one closed cause. Neither the drifting field nor the two native ids reach
 	// the wire.
-	poisoned := map[string]any{jsonFieldError: errValueSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift}
+	poisoned := map[string]any{jsonFieldError: valSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift}
 
 	err := s.poison(ctx, poisonCauseNativeSessionDrift)
 	require.Equal(t, poisoned, requireInternalErrorData(t, err))
@@ -1780,7 +1780,7 @@ func assertNativeSessionDriftPoison(
 ) {
 	t.Helper()
 
-	poisoned := map[string]any{jsonFieldError: errValueSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift}
+	poisoned := map[string]any{jsonFieldError: valSessionPoisoned, jsonFieldCause: poisonCauseNativeSessionDrift}
 	require.Equal(t, poisoned, requireInternalErrorData(t, err))
 	require.NotContains(t, err.Error(), gotNativeID, "the drifting native id never reaches the wire")
 	if conn.updateCount() != 2 {

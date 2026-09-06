@@ -71,7 +71,7 @@ func (a *Agent) sharedRuntimeBinding(
 		if a.closed {
 			a.mu.Unlock()
 
-			return nil, 0, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+			return nil, 0, acp.NewInvalidRequest(map[string]any{jsonFieldError: valAgentClosed})
 		}
 
 		if a.runtimeFatalErr != nil {
@@ -149,7 +149,7 @@ func (a *Agent) sharedRuntimeBinding(
 		}
 
 		if err == nil {
-			err = acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+			err = acp.NewInvalidRequest(map[string]any{jsonFieldError: valAgentClosed})
 		}
 		a.mu.Unlock()
 
@@ -203,7 +203,7 @@ func (a *Agent) handleSharedRuntimeExit(runtime opencode.Client, generation uint
 		return
 	}
 
-	cause := errValueSharedRuntimeExited
+	cause := valSharedRuntimeExited
 	if reporter, ok := runtime.(interface{ RuntimeRevoked() bool }); ok && reporter.RuntimeRevoked() {
 		cause = "shared OpenCode runtime revoked"
 	}
@@ -697,7 +697,7 @@ func (a *Agent) bindDirectory(
 		}
 
 		if !a.admitsDirectoryHolderLocked(binding, id, parentID) {
-			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "directory_mcp_principal"})
+			return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: valBackpressure, jsonFieldLimit: "directory_mcp_principal"})
 		}
 	} else {
 		binding = directoryBinding{

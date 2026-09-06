@@ -49,24 +49,24 @@ const (
 	jsonFieldServer                    = "server"
 	jsonFieldCommand                   = "command"
 	jsonFieldMessageID                 = "messageId"
-	errValueAgentClosed                = "agent closed"
+	valAgentClosed                     = "agent closed"
 	// The closed off-prompt `-32603` vocabulary. Every internal error this
 	// adapter answers with off the prompt-turn path carries exactly one of these
 	// tokens in `data.error`, `message` stays the JSON-RPC constant, and the data
-	// never carries native or Go text. errValueInvalidOptions is the
-	// construction verdict, errValueRestoreFailed names a stored session this
-	// adapter will not replay, errValueRuntimeUnavailable names a shared runtime
-	// that is gone and un-containable, errValueSessionPoisoned names a session
-	// that refuses everything but close and delete, and errValueInternalFailure
+	// never carries native or Go text. valInvalidOptions is the
+	// construction verdict, valRestoreFailed names a stored session this
+	// adapter will not replay, valRuntimeUnavailable names a shared runtime
+	// that is gone and un-containable, valSessionPoisoned names a session
+	// that refuses everything but close and delete, and valInternalFailure
 	// is the catch-all.
-	errValueInvalidOptions     = "opencode_invalid_options"
-	errValueRestoreFailed      = "opencode_restore_failed"
-	errValueRuntimeUnavailable = "opencode_runtime_unavailable"
-	errValueSessionPoisoned    = "opencode_session_poisoned"
-	errValueInternalFailure    = "opencode_internal_failure"
-	jsonFieldClass             = "class"
-	jsonFieldParams            = "params"
-	// The closed `class` vocabulary errValueInternalFailure may carry.
+	valInvalidOptions     = "opencode_invalid_options"
+	valRestoreFailed      = "opencode_restore_failed"
+	valRuntimeUnavailable = "opencode_runtime_unavailable"
+	valSessionPoisoned    = "opencode_session_poisoned"
+	valInternalFailure    = "opencode_internal_failure"
+	jsonFieldClass        = "class"
+	jsonFieldParams       = "params"
+	// The closed `class` vocabulary valInternalFailure may carry.
 	// classNativeStartup names a loopback call that failed while a runtime or a
 	// native session was being started; classSessionReplacementRaced names a
 	// logical session whose active incarnation changed under a replacement.
@@ -99,19 +99,19 @@ const (
 	jsonTypeArray                = "array"
 	validationRequired           = "required"
 	validationDuplicate          = "duplicate"
-	errValueBackpressure         = "backpressure"
-	errValueUnsupported          = "unsupported"
-	// errValueMissing is the -32602 verdict for a reserved key the contract
-	// requires and the caller left out. It is distinct from errValueUnsupported,
+	valBackpressure              = "backpressure"
+	valUnsupported               = "unsupported"
+	// valMissing is the -32602 verdict for a reserved key the contract
+	// requires and the caller left out. It is distinct from valUnsupported,
 	// which names a value that is present and refused, and the two are never
 	// collapsed: a host reading `missing` fixes its own request, a host reading
 	// `unsupported` on a bare key path stops sending the key on that surface.
-	errValueMissing             = "missing"
-	errValueNoTransport         = "no_transport"
-	errValueSessionUnknown      = "unknown session"
-	errValueSharedRuntimeExited = "shared OpenCode runtime exited"
-	elicitationModeForm         = "form"
-	elicitationModeURL          = "url"
+	valMissing             = "missing"
+	valNoTransport         = "no_transport"
+	valSessionUnknown      = "unknown session"
+	valSharedRuntimeExited = "shared OpenCode runtime exited"
+	elicitationModeForm    = "form"
+	elicitationModeURL     = "url"
 
 	rawMarkerTruncated      = "truncated"
 	rawMarkerReason         = "reason"

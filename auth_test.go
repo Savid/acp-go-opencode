@@ -438,7 +438,7 @@ func TestValidateProviderAuthOptionsRejectsDirectHome(t *testing.T) {
 	require.ErrorAs(t, err, &reqErr)
 	require.Equal(t, -32602, reqErr.Code)
 	require.Equal(t, map[string]any{
-		jsonFieldError: errValueUnsupported,
+		jsonFieldError: valUnsupported,
 		jsonFieldField: optionFieldProviderAuthDirectHome,
 	}, reqErr.Data)
 }

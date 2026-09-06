@@ -351,7 +351,7 @@ func (s *session) reservePromptCycle(
 		s.lifecycleMu.Unlock()
 
 		return nil, nil, acp.NewInvalidRequest(map[string]any{
-			jsonFieldError: errValueBackpressure,
+			jsonFieldError: valBackpressure,
 			jsonFieldLimit: limitSessionPrompt,
 		})
 	}

@@ -26,7 +26,7 @@ func environmentMap(entries []string) map[string]string {
 	for _, entry := range entries {
 		key, value, ok := strings.Cut(entry, "=")
 		if ok && key != "" {
-			values[canonicalEnvironmentKey(key)] = value
+			values[EnvironmentKey(key)] = value
 		}
 	}
 
@@ -67,7 +67,7 @@ func composeEnvironment(phases ...map[string]string) map[string]string {
 		slices.Sort(keys)
 
 		for _, key := range keys {
-			values[canonicalEnvironmentKey(key)] = phase[key]
+			values[EnvironmentKey(key)] = phase[key]
 		}
 	}
 

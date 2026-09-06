@@ -211,7 +211,7 @@ func TestSessionConfigAndCloneRemainingBranches(t *testing.T) {
 
 	boolean := true
 	_, err := agent.SetSessionConfigOption(context.Background(), acp.SetSessionConfigOptionRequest{Boolean: &acp.SetSessionConfigOptionBoolean{SessionId: session.id, ConfigId: configMode, Value: boolean}})
-	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: jsonFieldType})
+	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: valUnsupported, jsonFieldField: jsonFieldType})
 	_, err = agent.SetSessionConfigOption(context.Background(), SetConfigOptionRequest(session.id, configMode, "plan"))
 	require.NoError(t, err)
 

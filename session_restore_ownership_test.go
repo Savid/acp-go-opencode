@@ -191,7 +191,7 @@ func TestActiveReplacementAndArtifactLoadEdges(t *testing.T) {
 			WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{"COLOR": "new"}))),
 		))
 		require.Equal(t, map[string]any{
-			jsonFieldError: errValueInternalFailure,
+			jsonFieldError: valInternalFailure,
 			jsonFieldClass: classSessionReplacementRaced,
 		}, requireInternalErrorData(t, err))
 	})

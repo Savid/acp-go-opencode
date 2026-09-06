@@ -181,7 +181,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 	t.Run("closed session", func(t *testing.T) {
 		agent, current := recoveryFixture(t, nil, readyRecoveryClient())
 		current.closed = true
-		require.ErrorContains(t, current.ensureRuntime(context.Background()), errValueSessionUnknown)
+		require.ErrorContains(t, current.ensureRuntime(context.Background()), valSessionUnknown)
 		require.NoError(t, agent.Close())
 	})
 
@@ -281,7 +281,7 @@ func TestRuntimeGenerationAndRecoveryFailureBranches(t *testing.T) {
 
 			return testNativeSession("native-1"), nil
 		}
-		require.ErrorContains(t, current.ensureRuntime(context.Background()), errValueSessionUnknown)
+		require.ErrorContains(t, current.ensureRuntime(context.Background()), valSessionUnknown)
 		require.NoError(t, agent.Close())
 	})
 }

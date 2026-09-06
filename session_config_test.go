@@ -105,14 +105,14 @@ func assertSetSessionConfigOptionBranches(t *testing.T, ctx context.Context, age
 	t.Helper()
 	// Every refusal on this method carries the uniform two-key rejection, so a
 	// host reads one token rather than matching prose per sibling.
-	unsupportedValue := map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: jsonFieldValue}
+	unsupportedValue := map[string]any{jsonFieldError: valUnsupported, jsonFieldField: jsonFieldValue}
 
 	_, err := agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{})
 	requireInvalidParamsData(t, err, unsupportedValue)
 
 	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest("missing", configModel, "p/m"))
 	requireInvalidParamsData(t, err, map[string]any{
-		jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID,
+		jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID,
 	})
 
 	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, ""))
@@ -120,7 +120,7 @@ func assertSetSessionConfigOptionBranches(t *testing.T, ctx context.Context, age
 
 	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, "unknown", "x"))
 	requireInvalidParamsData(t, err, map[string]any{
-		jsonFieldError: errValueUnsupported, jsonFieldField: "configId",
+		jsonFieldError: valUnsupported, jsonFieldField: "configId",
 	})
 
 	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "p/m")); err != nil {

@@ -78,7 +78,7 @@ authority error is never retried through ordinary execution.
 | `WithScratchDir` | Parent for a generated shared runtime root and transient adapter material; empty uses the system temp directory. |
 | `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
-| `WithEnv` | Agent-wide ordinary-variable overlays. Managed OpenCode/XDG roots remain adapter-owned. |
+| `WithEnv` | Agent-wide ordinary-variable overlays. The managed OpenCode and XDG roots are refused under the platform identity. Names follow the session `env` rule with `PATH` allowed: a key is non-empty and free of `=` and NUL, the value is free of NUL, the injection names `NODE_OPTIONS`, `BASH_ENV`, `ENV`, and any `LD_` or `DYLD_` prefix are refused under the platform identity, the private adapter namespace is refused under every spelling, and two spellings of one Windows variable are refused; a refusal fails Agent construction. |
 | `WithSeedFiles` | Immutable files materialized in the shared config root before launch. |
 | `WithPluginSeedDir` | Cache of the OpenCode plugin install copied into new runtime roots; empty uses `plugin-seed` under the user cache directory. |
 | `WithPluginSeed` | Enable or disable the plugin install cache; enabled by default. |

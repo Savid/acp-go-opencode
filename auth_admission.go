@@ -120,7 +120,7 @@ func (p *providerAuth) reopenSession(sessionID acp.SessionId) {
 
 func authSessionUnknown() error {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: errValueSessionUnknown,
+		jsonFieldError: valSessionUnknown,
 		jsonFieldField: jsonFieldSessionID,
 	})
 }

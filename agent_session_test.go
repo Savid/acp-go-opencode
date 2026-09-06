@@ -904,7 +904,7 @@ func TestActiveResumeRebindsAnUnchangedCarrierAfterRuntimeLoss(t *testing.T) {
 	current.carrier = newSessionCarrier(map[string]string{"SESSION_COLOR": "same"}, []string{absTestPath("same", "bin")})
 	require.NoError(t, current.snapshotToStore(t.Context()))
 
-	current.detachRuntime(current.runtimeGeneration, errValueSharedRuntimeExited)
+	current.detachRuntime(current.runtimeGeneration, valSharedRuntimeExited)
 
 	successorClient := newFakeOpenCodeClient()
 	successorClient.getSession = testNativeSession(current.idmap.NativeSessionID)
@@ -1206,7 +1206,7 @@ func TestSessionLifecycleFlightSerializesSameIDPublication(t *testing.T) {
 	require.NoError(t, agent.Close())
 	select {
 	case callbackErr := <-callbackResult:
-		require.ErrorContains(t, callbackErr, errValueAgentClosed)
+		require.ErrorContains(t, callbackErr, valAgentClosed)
 	case <-time.After(time.Second):
 		t.Fatal("Agent.Close store callback could not reenter an independent lifecycle operation")
 	}
@@ -1348,7 +1348,7 @@ func TestAgentConstructionInitializationAndStoreBranches(t *testing.T) {
 	// the wrapped Go error for the operator's log and never reaches the wire.
 	require.ErrorContains(t, err, "fingerprint entropy failed")
 	data := requireInternalErrorData(t, err)
-	require.Equal(t, errValueInvalidOptions, data[jsonFieldError])
+	require.Equal(t, valInvalidOptions, data[jsonFieldError])
 	require.Len(t, data, 1)
 
 	for name, option := range map[string]Option{
@@ -1445,7 +1445,7 @@ func TestLifecycleMCPPaginationAndRequestBuilderHelpers(t *testing.T) {
 	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Sse: &acp.UnstableMcpServerSse{Name: "sse"}}}))
 	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Acp: &acp.UnstableMcpServerAcpInline{Name: "acp"}}}))
 	requireInvalidParamsData(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{}}), map[string]any{
-		jsonFieldError: errValueNoTransport,
+		jsonFieldError: valNoTransport,
 		jsonFieldField: "mcpServers[0]",
 	})
 	require.Error(t, validateUnstableMCPServers([]acp.UnstableMcpServer{{Http: &acp.UnstableMcpServerHttp{}}}))
@@ -2118,10 +2118,10 @@ func TestDeleteHidesTheSessionEvenWhenTeardownFails(t *testing.T) {
 	require.Empty(t, stored, "the tombstone was cleared by the failed teardown")
 
 	_, err = agent.LoadSession(ctx, LoadSessionRequest(current.id, t.TempDir()))
-	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 
 	_, err = agent.ResumeSession(ctx, ResumeSessionRequest(current.id, t.TempDir()))
-	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	requireInvalidParamsData(t, err, map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 
 	// The scope the failed teardown left behind is reclaimed by the next delete,
 	// which runs the same containment again rather than answering for a session
@@ -2315,7 +2315,7 @@ func TestLoadRacingDeleteSerializesTheSameLogicalSession(t *testing.T) {
 	require.Empty(t, rows, "the deleted session's durable row came back")
 
 	_, reloadErr := agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
-	requireInvalidParamsData(t, reloadErr, map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+	requireInvalidParamsData(t, reloadErr, map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 }
 
 // TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes proves the answer to a
@@ -2327,7 +2327,7 @@ func TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes(t *testing.T) {
 	t.Parallel()
 
 	refusal := acp.NewInvalidParams(map[string]any{
-		jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID,
+		jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID,
 	})
 
 	t.Run("clean teardown", func(t *testing.T) {
@@ -2337,7 +2337,7 @@ func TestRollbackStartedSessionKeepsTheRefusalTheRequestOwes(t *testing.T) {
 		current := testSession(t, agent, newFakeOpenCodeClient())
 
 		requireInvalidParamsData(t, agent.rollbackStartedSession(current, refusal),
-			map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+			map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	})
 
 	t.Run("teardown that failed too", func(t *testing.T) {
@@ -2393,7 +2393,7 @@ func TestRestoreFailureIsClassifiedAndCarriesNoProse(t *testing.T) {
 		require.ErrorAs(t, got, &reqErr)
 		require.Equal(t, -32602, reqErr.Code)
 		require.Equal(t, map[string]any{
-			jsonFieldError: errValueUnsupported,
+			jsonFieldError: valUnsupported,
 			jsonFieldField: "_meta.opencode.options.model",
 		}, reqErr.Data)
 	})
@@ -2412,12 +2412,12 @@ func TestRestoreFailureIsClassifiedAndCarriesNoProse(t *testing.T) {
 		var reqErr *acp.RequestError
 		require.ErrorAs(t, got, &reqErr)
 		require.Equal(t, -32603, reqErr.Code)
-		require.Equal(t, map[string]any{jsonFieldError: errValueRestoreFailed}, reqErr.Data)
+		require.Equal(t, map[string]any{jsonFieldError: valRestoreFailed}, reqErr.Data)
 
 		encoded, err := json.Marshal(reqErr)
 		require.NoError(t, err)
 		require.NotContains(t, string(encoded), storeSecret)
-		require.NotContains(t, string(encoded), errValueInternalFailure)
+		require.NotContains(t, string(encoded), valInternalFailure)
 	})
 
 	t.Run("an agent with no logger still classifies", func(t *testing.T) {
@@ -2425,7 +2425,7 @@ func TestRestoreFailureIsClassifiedAndCarriesNoProse(t *testing.T) {
 
 		var reqErr *acp.RequestError
 		require.ErrorAs(t, got, &reqErr)
-		require.Equal(t, map[string]any{jsonFieldError: errValueRestoreFailed}, reqErr.Data)
+		require.Equal(t, map[string]any{jsonFieldError: valRestoreFailed}, reqErr.Data)
 	})
 }
 
@@ -2471,7 +2471,7 @@ func TestForkInheritsTheParentWorkspace(t *testing.T) {
 
 	_, err = agent.forkSession(ctx, ForkSessionRequest(parent.SessionId, t.TempDir()))
 	requireInvalidParamsData(t, err, map[string]any{
-		jsonFieldError: errValueUnsupported,
+		jsonFieldError: valUnsupported,
 		jsonFieldField: jsonFieldCwd,
 	})
 
@@ -2479,7 +2479,7 @@ func TestForkInheritsTheParentWorkspace(t *testing.T) {
 	// answer for every cwd this surface refuses.
 	_, err = agent.forkSession(ctx, acp.UnstableForkSessionRequest{SessionId: parent.SessionId, Cwd: "relative"})
 	requireInvalidParamsData(t, err, map[string]any{
-		jsonFieldError: errValueUnsupported,
+		jsonFieldError: valUnsupported,
 		jsonFieldField: jsonFieldCwd,
 	})
 
@@ -2515,7 +2515,7 @@ func TestForkSharesTheParentDirectoryPrincipal(t *testing.T) {
 
 	// An unrelated session naming the same directory is still refused.
 	_, err = agent.bindDirectory("unrelated", "", cwd, nil)
-	require.ErrorContains(t, err, errValueBackpressure)
+	require.ErrorContains(t, err, valBackpressure)
 
 	// Either direction of the lineage may join, whichever holder is present.
 	release, err := agent.bindDirectory("later-fork", parent.SessionId, cwd, nil)

@@ -320,7 +320,7 @@ func TestPromptCorrelationIsRequiredWhileNegotiated(t *testing.T) {
 	_, err := agent.Prompt(context.Background(), request)
 	// The host left the required key out: that is `missing`, not `unsupported`.
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueMissing, jsonFieldField: lifecycle.MetaPath})
+		map[string]any{jsonFieldError: valMissing, jsonFieldField: lifecycle.MetaPath})
 	require.False(t, dispatched, "the prompt reached the harness")
 
 	// A stale route nonce is refused before the correlation is examined, so a
@@ -330,7 +330,7 @@ func TestPromptCorrelationIsRequiredWhileNegotiated(t *testing.T) {
 
 	_, err = agent.Prompt(context.Background(), stale)
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldTurnNonce)})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: routeMemberPath(routeFieldTurnNonce)})
 
 	// Both reserved keys are read before the session id is resolved, so a host
 	// that got one wrong reads that answer even on a session that does not
@@ -340,11 +340,11 @@ func TestPromptCorrelationIsRequiredWhileNegotiated(t *testing.T) {
 
 	_, err = agent.Prompt(context.Background(), unknown)
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueMissing, jsonFieldField: lifecycle.MetaPath})
+		map[string]any{jsonFieldError: valMissing, jsonFieldField: lifecycle.MetaPath})
 
 	_, err = agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "missing-session", Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueMissing, jsonFieldField: routeMetaPath})
+		map[string]any{jsonFieldError: valMissing, jsonFieldField: routeMetaPath})
 }
 
 // TestPromptCorrelationIsRefusedWhileUnnegotiated proves a present key on a
@@ -480,7 +480,7 @@ func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
 
 	err := agent.Cancel(context.Background(), acp.CancelNotification{SessionId: session.id, Meta: both})
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldVersion)})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: routeMemberPath(routeFieldVersion)})
 
 	client.mu.Lock()
 	aborts := len(client.aborts)
@@ -501,7 +501,7 @@ func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
 
 	_, err = agent.Prompt(context.Background(), request)
 	requireInvalidParamsData(t, err,
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: routeMemberPath(routeFieldVersion)})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: routeMemberPath(routeFieldVersion)})
 	require.False(t, dispatched, "the prompt reached the harness")
 }
 
@@ -525,7 +525,7 @@ func requireUnsupportedField(t *testing.T, err error, field string) {
 
 	require.ErrorAs(t, err, &reqErr)
 	require.Equal(t, acp.NewInvalidParams(map[string]any{
-		jsonFieldError: errValueUnsupported,
+		jsonFieldError: valUnsupported,
 		jsonFieldField: field,
 	}).Error(), reqErr.Error())
 }

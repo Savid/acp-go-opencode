@@ -1159,12 +1159,12 @@ func promptToOpenCodeParts(blocks []acp.ContentBlock, handoff resolvedPromptMedi
 		case block.Image != nil:
 			parts = append(parts, handoff.imagePart(position, block.Image))
 		default:
-			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fieldPrompt})
+			return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: valUnsupported, jsonFieldField: fieldPrompt})
 		}
 	}
 
 	if len(parts) == 0 {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: fieldPrompt})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: valUnsupported, jsonFieldField: fieldPrompt})
 	}
 
 	return parts, nil
@@ -1184,7 +1184,7 @@ func commandPromptParts(blocks []acp.ContentBlock, handoff resolvedPromptMedia) 
 
 		if !ok {
 			return nil, acp.NewInvalidParams(map[string]any{
-				jsonFieldError: errValueUnsupported,
+				jsonFieldError: valUnsupported,
 				jsonFieldField: fieldPrompt,
 			})
 		}

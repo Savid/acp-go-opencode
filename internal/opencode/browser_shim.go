@@ -86,8 +86,8 @@ func browserShimEnviron(env []string, dir string) []string {
 	}
 
 	return append(kept,
-		canonicalEnvironmentKey(pathEnv)+"="+search,
-		canonicalEnvironmentKey(browserShimBrowserEnv)+"="+browserShimCommand(dir),
+		EnvironmentKey(pathEnv)+"="+search,
+		EnvironmentKey(browserShimBrowserEnv)+"="+browserShimCommand(dir),
 	)
 }
 

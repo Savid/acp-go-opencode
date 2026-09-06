@@ -94,7 +94,7 @@ func TestSessionStartHTTPFailuresNameTheRouteAndNeverTheBody(t *testing.T) {
 			// A native loopback failure at startup reduces to one closed
 			// vendor-scoped token plus the one documented class, never to prose
 			// a host would have to parse.
-			require.Equal(t, errValueInternalFailure, data[jsonFieldError])
+			require.Equal(t, valInternalFailure, data[jsonFieldError])
 			require.Equal(t, classNativeStartup, data[jsonFieldClass])
 			require.Len(t, data, 2)
 
@@ -120,7 +120,7 @@ func TestSessionStartRejectsAnUnsupportedNativeFieldAsInvalidParams(t *testing.T
 
 	_, err := agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
 	requireInvalidParamsData(t, err, map[string]any{
-		jsonFieldError: errValueUnsupported,
+		jsonFieldError: valUnsupported,
 		jsonFieldField: "seedFiles[../escape.json]",
 	})
 }

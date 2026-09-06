@@ -488,7 +488,7 @@ func (a *Agent) ensureOpen() error {
 	defer a.mu.Unlock()
 
 	if a.closed {
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: valAgentClosed})
 	}
 
 	if a.optionsErr != nil {
@@ -509,7 +509,7 @@ func (a *Agent) ensureOpen() error {
 func (a *Agent) optionsError() error {
 	return errors.Join(
 		a.optionsErr,
-		acp.NewInternalError(map[string]any{jsonFieldError: errValueInvalidOptions}),
+		acp.NewInternalError(map[string]any{jsonFieldError: valInvalidOptions}),
 	)
 }
 
@@ -537,7 +537,7 @@ func (a *Agent) acquireClientCall(ctx context.Context) (func(), error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
-		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "client_calls"})
+		return nil, acp.NewInvalidRequest(map[string]any{jsonFieldError: valBackpressure, jsonFieldLimit: "client_calls"})
 	}
 }
 
@@ -546,12 +546,12 @@ func (a *Agent) session(id acp.SessionId) (*session, error) {
 	defer a.mu.Unlock()
 
 	if _, ok := a.deleted[id]; ok {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	session := a.sessions[id]
 	if session == nil {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	return session, nil
@@ -569,15 +569,15 @@ func (a *Agent) storeStartedSession(session *session) error {
 	defer a.mu.Unlock()
 
 	if a.closed {
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueAgentClosed})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: valAgentClosed})
 	}
 
 	if _, deleted := a.deleted[session.id]; deleted {
-		return acp.NewInvalidParams(map[string]any{jsonFieldError: errValueSessionUnknown, jsonFieldField: jsonFieldSessionID})
+		return acp.NewInvalidParams(map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
 	}
 
 	if a.runtime == nil {
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueSharedRuntimeExited})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: valSharedRuntimeExited})
 	}
 
 	if session.runtimeGeneration != a.runtimeGeneration {
@@ -585,7 +585,7 @@ func (a *Agent) storeStartedSession(session *session) error {
 	}
 
 	if len(a.sessions) >= a.options.ConcurrencyLimits.MaxActiveSessions {
-		return acp.NewInvalidRequest(map[string]any{jsonFieldError: errValueBackpressure, jsonFieldLimit: "active_sessions"})
+		return acp.NewInvalidRequest(map[string]any{jsonFieldError: valBackpressure, jsonFieldLimit: "active_sessions"})
 	}
 
 	a.sessions[session.id] = session

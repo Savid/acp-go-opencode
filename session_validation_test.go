@@ -10,11 +10,11 @@ func TestValidationHelperBranches(t *testing.T) {
 	// A start path that is not absolute takes one uniform verdict, and an empty
 	// one is not absolute either: both name the field that carried the value.
 	requireInvalidParamsData(t, validateSessionStartPaths("relative", nil),
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: jsonFieldCwd})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: jsonFieldCwd})
 	requireInvalidParamsData(t, validateRequiredAbsolutePath(jsonFieldCwd, ""),
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: jsonFieldCwd})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: jsonFieldCwd})
 	requireInvalidParamsData(t, validateSessionStartPaths(absTestPath("tmp", "project"), []string{"relative"}),
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "additionalDirectories[0]"})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: "additionalDirectories[0]"})
 	value := absTestPath("tmp", "project")
 	if err := validateOptionalAbsolutePath("cwd", &value); err != nil {
 		t.Fatalf("validateOptionalAbsolutePath: %v", err)
@@ -22,11 +22,11 @@ func TestValidationHelperBranches(t *testing.T) {
 	// The MCP transport rejections keep their own shapes: the third `server`
 	// key and the `no_transport` token are family-wide, not local spellings.
 	requireInvalidParamsData(t, validateMCPServers([]acp.McpServer{{Sse: &acp.McpServerSseInline{Name: "sse"}}}),
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "mcpServers[0]", jsonFieldServer: "sse"})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: "mcpServers[0]", jsonFieldServer: "sse"})
 	requireInvalidParamsData(t, validateMCPServers([]acp.McpServer{{Acp: &acp.McpServerAcpInline{Name: "acp"}}}),
-		map[string]any{jsonFieldError: errValueUnsupported, jsonFieldField: "mcpServers[0]", jsonFieldServer: "acp"})
+		map[string]any{jsonFieldError: valUnsupported, jsonFieldField: "mcpServers[0]", jsonFieldServer: "acp"})
 	requireInvalidParamsData(t, validateMCPServers([]acp.McpServer{{}}),
-		map[string]any{jsonFieldError: errValueNoTransport, jsonFieldField: "mcpServers[0]"})
+		map[string]any{jsonFieldError: valNoTransport, jsonFieldField: "mcpServers[0]"})
 	if err := validateMCPServers([]acp.McpServer{
 		{Http: &acp.McpServerHttpInline{Name: "http", Url: "https://mcp.example"}},
 		{Stdio: &acp.McpServerStdio{Name: "stdio", Command: "server"}},
