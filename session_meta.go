@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const (
@@ -156,45 +155,30 @@ func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
 // an operation that clears a variable is asking for the empty value, not for
 // the key to be dropped.
 func sessionEnvFromMeta(value any) (map[string]string, error) {
-	var values map[string]any
+	var env map[string]string
 
 	switch typed := value.(type) {
 	case map[string]string:
-		values = make(map[string]any, len(typed))
-		for key, entry := range typed {
-			values[key] = entry
-		}
+		env = cloneStringMap(typed)
 	case map[string]any:
-		values = typed
+		env = make(map[string]string, len(typed))
+		for key, raw := range typed {
+			text, ok := raw.(string)
+			if !ok {
+				return nil, unsupportedField(envOptionPath + "." + key)
+			}
+
+			env[key] = text
+		}
 	default:
 		return nil, unsupportedField(envOptionPath)
 	}
 
-	env := make(map[string]string, len(values))
-
-	for key, raw := range values {
-		text, ok := raw.(string)
-		if !ok || !validEnvName(key) {
-			return nil, unsupportedField(envOptionPath + "." + key)
-		}
-
-		env[key] = text
+	if err := validateSessionEnv(env, envOptionPath); err != nil {
+		return nil, err
 	}
 
 	return env, nil
-}
-
-// validEnvName refuses names a child process cannot carry, the roots the
-// adapter manages on OpenCode's behalf, and the one name this option is not
-// allowed to own. PATH is refused by environment identity rather than by
-// spelling: only where the child resolves names case-insensitively does Path
-// address the search path, and refusing it elsewhere would deny a session an
-// ordinary variable of its own.
-func validEnvName(key string) bool {
-	return key != "" &&
-		!opencode.EnvironmentKeyEqual(key, envPathKey) &&
-		!reservedOpenCodeEnvKey(key) &&
-		!strings.ContainsAny(key, "=\x00")
 }
 
 // extraPathDirsFromMeta reads the directories placed ahead of the inherited

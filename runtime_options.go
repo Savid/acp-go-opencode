@@ -41,18 +41,28 @@ func validateDurableHomePath(path string) error {
 	return nil
 }
 
-const privateAdapterEnvPrefix = "ACP_" + "GO_OPENCODE_INTERNAL_"
+const (
+	privateAdapterEnvPrefix = "ACP_" + "GO_OPENCODE_INTERNAL_"
+
+	envOpenCodeConfigKey        = "OPENCODE_CONFIG"
+	envOpenCodeConfigContentKey = "OPENCODE_CONFIG_CONTENT"
+	envOpenCodeConfigDirKey     = "OPENCODE_CONFIG_DIR"
+	envOpenCodeDBKey            = "OPENCODE_DB"
+)
 
 func reservedOpenCodeEnvKey(key string) bool {
 	upper := strings.ToUpper(key)
 
-	if strings.HasPrefix(upper, privateAdapterEnvPrefix) {
-		return true
-	}
+	return strings.HasPrefix(upper, privateAdapterEnvPrefix) || managedOpenCodeRootEnvKey(upper)
+}
 
-	switch upper {
+// managedOpenCodeRootEnvKey reports whether name, already resolved to the
+// identity its caller compares under, is a runtime root the adapter manages
+// on OpenCode's behalf.
+func managedOpenCodeRootEnvKey(name string) bool {
+	switch name {
 	case "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
-		"OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR", "OPENCODE_DB":
+		envOpenCodeConfigKey, envOpenCodeConfigContentKey, envOpenCodeConfigDirKey, envOpenCodeDBKey:
 		return true
 	default:
 		return false

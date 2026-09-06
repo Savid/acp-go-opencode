@@ -58,7 +58,7 @@ Lifecycle requests accept:
 | `options.mode` | An OpenCode agent name. |
 | `options.permission` | `ask`, `allow`, or `deny`; empty is treated as `ask`. |
 | `options.outputSchema` | JSON Schema object for native structured output. |
-| `options.env` | Environment the addressed native session's shell tools run under. `PATH` is refused without regard to case. |
+| `options.env` | Environment the addressed native session's shell tools run under. Blocked names are listed below. |
 | `options.extraPathDirs` | Absolute directories placed ahead of the addressed native session's shell-tool `PATH`, in order. |
 | `rawEvent.enabled` | Opt in to `_opencode/rawEvent` notifications. |
 
@@ -76,11 +76,22 @@ session replaces the stored half outright, including with an empty value. A
 request that omits a half restores it from the durable session record.
 
 A relative, empty, or path-list `extraPathDirs` entry is rejected before a
-native session is created. Inside `options.env`, a non-string value, an empty
-name, a name containing `=` or NUL, a managed OpenCode or XDG root, and `PATH`
-in any casing are each rejected at the indexed field that owns them — a raw
-search path fails at `_meta.opencode.options.env.PATH`. Empty string values are
-preserved: clearing a variable is expressed by its empty value.
+native session is created. Inside `options.env`, a non-string value is rejected
+at the field that owns it.
+
+Session `env` names are checked in sorted key order on every establishing
+request, so the first refusal is the same each time. A key is accepted when
+it is non-empty and free of `=` and NUL and its value is free of NUL; case is
+not a rule, so `https_proxy` and `HTTPS_PROXY` are two ordinary variables.
+Blocked names fail as `{"error":"unsupported","field":"_meta.opencode.options.env.<key>"}`
+naming the key exactly as sent: `PATH`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, any `LD_` or `DYLD_` prefix, `HOME`, the XDG cache, config, data, runtime, and state roots, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, `OPENCODE_DB`, and `ACP_GO_OPENCODE_INTERNAL_*`. All but the adapter's own
+namespace compare through the platform identity, exact on Unix and
+case-insensitive on Windows; the adapter namespace is refused under every
+spelling. Two keys that resolve to one variable under that identity fail as
+`{"error":"ambiguous","field":"_meta.opencode.options.env.<later key in sorted order>"}`.
+An empty value is delivered as `KEY=`. `ValidateOpenCodeSessionMeta` runs this
+parsing on a `_meta` map without an agent, so a host can check a request
+before sending it.
 
 `session/prompt` and an active `session/cancel` require a top-level
 `_meta["acp-go.dev/route"]` object containing exactly `version: 1` and a

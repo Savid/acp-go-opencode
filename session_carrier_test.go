@@ -3,7 +3,6 @@ package opencodeacp
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -77,16 +76,18 @@ func TestSessionEnvMetaRefusesEveryInvalidEntry(t *testing.T) {
 // so Path is PATH there and an ordinary variable of its own everywhere else.
 func TestSessionEnvMetaRefusesThePathVariableByEnvironmentIdentity(t *testing.T) {
 	for _, spelling := range []string{"path", "Path", "PaTh"} {
+		simulateSessionEnvPlatform(t, platformWindows)
+
+		_, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
+			metaEnvKey: map[string]any{spelling: absTestPath("attacker", "bin")},
+		}))
+		require.Equal(t, unsupportedField(envOptionPath+"."+spelling), err)
+
+		simulateSessionEnvPlatform(t, "linux")
+
 		meta, err := sessionMetaFromVendorOptions(carrierOptions(map[string]any{
 			metaEnvKey: map[string]any{spelling: absTestPath("attacker", "bin")},
 		}))
-
-		if runtime.GOOS == "windows" {
-			require.Equal(t, unsupportedField(envOptionPath+"."+spelling), err)
-
-			continue
-		}
-
 		require.NoError(t, err)
 		require.Equal(t, map[string]string{spelling: absTestPath("attacker", "bin")}, meta.Env)
 	}

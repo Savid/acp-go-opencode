@@ -161,9 +161,12 @@ Session options include `WithSessionMCPServers`,
 `OpenCodeOptions` is built with `NewOpenCodeOptions` plus model, output-schema,
 mode, permission, environment, and extra-path options. Session environment and
 extra path directories are scoped to the addressed native session rather than
-the shared server. `PATH` and managed runtime roots are refused in session
-environment. Ordered extra paths persist across load, resume, recovery, and
-fork; environment is supplied again on reload instead of storing bearer values.
+the shared server. `PATH`, injection names, and managed runtime roots are
+refused in session environment; see [Metadata](/docs/reference/meta). Ordered
+extra paths persist across load, resume, recovery, and fork; environment is
+supplied again on reload instead of storing bearer values.
+`ValidateOpenCodeSessionMeta(meta)` returns the refusal a session-establishing
+request carrying that `_meta` map would receive, or nil, without an agent.
 
 `ErrRuntimeLockUnsupported` means the platform cannot provide the runtime
 home's advisory single-writer fence. Construction fails rather than continuing
