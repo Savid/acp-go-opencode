@@ -335,6 +335,7 @@ func (s *session) commandDispatch(ctx context.Context, params acp.PromptRequest,
 	req := opencode.CommandRequest{
 		Agent:     agent,
 		Model:     model,
+		Variant:   s.currentVariant(),
 		Command:   command.Name,
 		Arguments: invocation.arguments,
 		Parts:     parts,
@@ -372,8 +373,9 @@ func (s *session) messageDispatch(ctx context.Context, params acp.PromptRequest)
 	modelSelector, hasModel := s.modelSelector()
 
 	req := opencode.MessageRequest{
-		Parts: parts,
-		Agent: s.currentMode(),
+		Parts:   parts,
+		Agent:   s.currentMode(),
+		Variant: s.currentVariant(),
 	}
 	if len(s.outputSchema) > 0 {
 		req.Format = &opencode.OutputFormat{

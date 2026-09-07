@@ -26,11 +26,10 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 					"context": float64(1000),
 					"output":  float64(200),
 				},
-				Reasoning:    true,
-				ToolCall:     true,
 				Capabilities: &opencode.ProviderModelCapabilities{Input: opencode.ProviderModelInputCapabilities{Image: boolPtr(true)}},
-				Options: map[string]any{
-					"reasoningEffort": map[string]any{"options": []any{"low", "medium"}},
+				Variants: map[string]map[string]any{
+					"medium": {"reasoningEffort": "medium"},
+					"low":    {"reasoningEffort": "low"},
 				},
 			},
 		},
@@ -63,9 +62,9 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 	if got, present := meta["capabilities"]; present {
 		t.Fatalf("capabilities meta unexpectedly present: %#v", got)
 	}
-	if got := meta["supportedEffortLevels"]; !containsStringAny(got, "low") || !containsStringAny(got, "medium") {
-		t.Fatalf("effort meta = %#v", got)
-	}
+	// The levels are the model's preset names in effort order, never the
+	// map's iteration order.
+	require.Equal(t, []string{"low", "medium"}, meta["supportedEffortLevels"])
 }
 
 func TestSessionConfigBranchesAndValidation(t *testing.T) {
@@ -75,8 +74,8 @@ func TestSessionConfigBranchesAndValidation(t *testing.T) {
 		{ID: "", Models: map[string]opencode.ProviderModel{"skip": {}}},
 		{ID: "p", Models: map[string]opencode.ProviderModel{
 			"m": {
-				Limit:   map[string]any{"context": int(42), "output": json.Number("7")},
-				Options: map[string]any{"reasoningEffort": []any{"medium"}},
+				Limit:    map[string]any{"context": int(42), "output": json.Number("7")},
+				Variants: map[string]map[string]any{"medium": {"reasoningEffort": "medium"}},
 			},
 		}},
 	}}
@@ -123,12 +122,31 @@ func assertSetSessionConfigOptionBranches(t *testing.T, ctx context.Context, age
 		jsonFieldError: valUnsupported, jsonFieldField: "configId",
 	})
 
-	if _, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "p/m")); err != nil {
+	set, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configModel, "p/m"))
+	if err != nil {
 		t.Fatalf("set model: %v", err)
 	}
 	if conn.updateCount() == 0 {
 		t.Fatal("set model did not emit config update")
 	}
+	// Selecting a model with presets advertises its effort select, starting on
+	// the no-variant state.
+	require.Equal(t, acp.SessionConfigValueId(effortDefault),
+		requireConfigOption(t, set.ConfigOptions, configEffort).CurrentValue)
+
+	// The effort door is the model door: the value is stored and advertised
+	// as current, listed or not, and the default value clears it again.
+	set, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configEffort, "xhigh"))
+	require.NoError(t, err)
+	require.Equal(t, acp.SessionConfigValueId("xhigh"),
+		requireConfigOption(t, set.ConfigOptions, configEffort).CurrentValue)
+	require.Equal(t, "xhigh", sess.currentVariant())
+
+	set, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(sess.id, configEffort, effortDefault))
+	require.NoError(t, err)
+	require.Equal(t, acp.SessionConfigValueId(effortDefault),
+		requireConfigOption(t, set.ConfigOptions, configEffort).CurrentValue)
+	require.Empty(t, sess.currentVariant())
 }
 
 func assertConfigOptionBuilders(t *testing.T, client *fakeOpenCodeClient) {
@@ -152,24 +170,33 @@ func assertConfigOptionBuilders(t *testing.T, client *fakeOpenCodeClient) {
 	if empty := modeConfigOption(sessionSnapshot{}, []opencode.NativeAgent{{}}); empty.Select != nil {
 		t.Fatalf("empty mode option = %#v", empty)
 	}
-	efforts := supportedEfforts(client.providers.Providers[1].Models["m"])
-	if len(efforts) != 1 || efforts[0] != "medium" {
-		t.Fatalf("supportedEfforts = %#v", efforts)
-	}
-	efforts = supportedEfforts(opencode.ProviderModel{Options: map[string]any{
-		"temperature":     []any{"ignored"},
-		"reasoningEffort": []string{"low", "", "high"},
-		"effortOptions":   map[string]any{"values": []any{"medium"}},
-	}})
-	if len(efforts) != 3 || efforts[0] != "high" || efforts[1] != "low" || efforts[2] != "medium" {
-		t.Fatalf("normalized efforts = %#v", efforts)
-	}
-	if values := optionStringValues(map[string]any{"unknown": []any{"x"}}); values != nil {
-		t.Fatalf("unknown option values = %#v", values)
-	}
-	if values := optionStringValues(42); values != nil {
-		t.Fatalf("numeric option values = %#v", values)
-	}
+	require.Equal(t, []string{"medium"}, effortLevels(client.providers.Providers[1].Models["m"]))
+	// Ranked names sort by effort, an unranked preset sorts after them, and an
+	// empty name is not a preset.
+	require.Equal(t, []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "custom", "deep"},
+		effortLevels(opencode.ProviderModel{Variants: map[string]map[string]any{
+			"deep": {}, "max": {}, "high": {}, "": {}, "custom": {}, "none": {},
+			"low": {}, "xhigh": {}, "medium": {}, "minimal": {},
+		}}))
+	require.Empty(t, effortLevels(opencode.ProviderModel{}))
+
+	// The effort select follows the session's model: a preset-less or unknown
+	// model advertises none, a model with presets advertises them behind the
+	// default value, and the current value is the session's own, listed or not.
+	effort := effortConfigOption(sessionSnapshot{providerID: "p", modelID: "m"}, client.providers)
+	require.NotNil(t, effort.Select)
+	require.Equal(t, acp.SessionConfigId(configEffort), effort.Select.Id)
+	require.Equal(t, acp.SessionConfigOptionCategoryThoughtLevel, *effort.Select.Category)
+	require.Equal(t, acp.SessionConfigValueId(effortDefault), effort.Select.CurrentValue)
+	require.Equal(t, acp.SessionConfigSelectOptionsUngrouped{
+		{Name: effortDefaultName, Value: effortDefault},
+		{Name: "Medium", Value: "medium"},
+	}, *effort.Select.Options.Ungrouped)
+	require.Equal(t, acp.SessionConfigValueId("unlisted"),
+		effortConfigOption(sessionSnapshot{providerID: "p", modelID: "m", variant: "unlisted"}, client.providers).Select.CurrentValue)
+	require.Nil(t, effortConfigOption(sessionSnapshot{providerID: "p", modelID: "other"}, client.providers).Select)
+	require.Nil(t, effortConfigOption(sessionSnapshot{providerID: "p", modelID: "m"}, opencode.ProvidersResponse{}).Select)
+	require.Nil(t, effortConfigOption(sessionSnapshot{}, client.providers).Select)
 	if unstableConfigOptions(nil) != nil {
 		t.Fatal("empty unstable config options returned non-nil")
 	}
@@ -529,21 +556,122 @@ func TestConfigOptionCatalogFailureIsReported(t *testing.T) {
 	require.NotContains(t, record, "agents unreachable")
 }
 
-func containsStringAny(value any, want string) bool {
-	values, _ := value.([]string)
-	for _, value := range values {
-		if value == want {
-			return true
-		}
+// TestEffortSetThroughConfigOptionReachesOpenCode proves the effort door is
+// the model door: a preset chosen through `session/set_config_option` is what
+// the session advertises as current and what the next frame carries as its
+// native variant, and choosing the default value takes it off the frame again.
+func TestEffortSetThroughConfigOptionReachesOpenCode(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeOpenCodeClient(t)
+	client.createSession = testNativeSession("native-effort")
+	client.agents = []opencode.NativeAgent{{Name: "build"}}
+	client.providers = opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
+		ID: "openai",
+		Models: map[string]opencode.ProviderModel{"gpt-test": {ID: "gpt-test", Variants: map[string]map[string]any{
+			"high": {"reasoningEffort": "high"},
+			"low":  {"reasoningEffort": "low"},
+		}}},
+	}}}
+
+	dispatched := make(chan opencode.MessageRequest, 2)
+	client.dispatchMessage = func(_ context.Context, _ string, req opencode.MessageRequest) (opencode.NativeMessage, error) {
+		dispatched <- req
+
+		return opencode.NativeMessage{}, nil
 	}
-	anyValues, _ := value.([]any)
-	for _, value := range anyValues {
-		if value == want {
-			return true
+
+	agent := NewAgent(WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)), func(options *Options) {
+		options.clientFactory = func(context.Context, opencode.StartOptions) (opencode.Client, error) {
+			return client, nil
+		}
+	})
+	agent.setAgentClient(newRecordingAgentClient())
+
+	created, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	establishCreatedSession(t, agent, created.SessionId)
+
+	// The session starts on the model's default, and the advertisement lists
+	// that state ahead of the presets.
+	effort := requireConfigOption(t, created.ConfigOptions, configEffort)
+	require.Equal(t, acp.SessionConfigValueId(effortDefault), effort.CurrentValue)
+	require.Equal(t, acp.SessionConfigSelectOptionsUngrouped{
+		{Name: effortDefaultName, Value: effortDefault},
+		{Name: "Low", Value: "low"},
+		{Name: "High", Value: "high"},
+	}, *effort.Options.Ungrouped)
+
+	set, err := agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(created.SessionId, configEffort, "high"))
+	require.NoError(t, err)
+	require.Equal(t, acp.SessionConfigValueId("high"), requireConfigOption(t, set.ConfigOptions, configEffort).CurrentValue)
+
+	promptWithVariant := func(label string, want string) {
+		t.Helper()
+
+		done := make(chan error, 1)
+
+		go func() {
+			_, promptErr := agent.Prompt(ctx, TextPromptRequest(created.SessionId, label, "hello"))
+			done <- promptErr
+		}()
+
+		select {
+		case req := <-dispatched:
+			require.Equal(t, want, req.Variant, "the frame must carry the preset the host chose")
+		case <-time.After(2 * time.Second):
+			t.Fatal("the prompt never reached OpenCode")
+		}
+
+		nativeErr := &opencode.NativeError{Name: "UnknownError"}
+		nativeErr.Data.Message = "settled"
+		client.publishEvent(opencode.Event{
+			Type:       opencode.EventSessionError,
+			Properties: mustJSON(t, opencode.SessionError{SessionID: "native-effort", Error: nativeErr}),
+		})
+		client.publishSessionIdle("native-effort")
+
+		select {
+		case promptErr := <-done:
+			assertTurnFailed(t, promptErr, causeProvider, "")
+		case <-time.After(5 * time.Second):
+			t.Fatal("prompt did not settle")
 		}
 	}
 
-	return false
+	promptWithVariant("effort-high", "high")
+
+	_, err = agent.SetSessionConfigOption(ctx, SetConfigOptionRequest(created.SessionId, configEffort, effortDefault))
+	require.NoError(t, err)
+	promptWithVariant("effort-default", "")
+}
+
+// TestResumedSessionCarriesStoredEffort proves the preset survives the store:
+// a resumed session advertises and sends the variant its snapshot recorded.
+func TestResumedSessionCarriesStoredEffort(t *testing.T) {
+	ctx := context.Background()
+	cwd := t.TempDir()
+	snapshot := validSyncSnapshot("session", "native", cwd)
+	snapshot.Session.Model = stateSnapshotModel{ProviderID: "openai", ModelID: "gpt-test", Agent: "build", Variant: "high"}
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Replace(ctx, SessionKey{SessionID: "session"}, []SessionStoreReplacement{{
+		Key: SessionKey{SessionID: "session", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{encoded},
+	}}))
+
+	client := newFakeOpenCodeClient(t)
+	client.getSession = testNativeSession("native")
+	agent := negotiatedAgent(t, WithSessionStore(store))
+	agent.setAgentClient(newRecordingAgentClient())
+	agent.runtime = client
+
+	_, err = agent.ResumeSession(ctx, ResumeSessionRequest("session", cwd))
+	require.NoError(t, err)
+
+	resumed, err := agent.session("session")
+	require.NoError(t, err)
+	require.Equal(t, "high", resumed.currentVariant())
 }
 
 func TestTitleASCII(t *testing.T) {

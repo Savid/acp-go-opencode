@@ -124,6 +124,7 @@ type stateSnapshotModel struct {
 	ProviderID string `json:"providerID,omitempty"`
 	ModelID    string `json:"modelID,omitempty"`
 	Agent      string `json:"agent,omitempty"`
+	Variant    string `json:"variant,omitempty"`
 }
 
 type stateSnapshotNode struct {
@@ -242,7 +243,10 @@ func (s *session) captureStateSnapshot(
 				ParentSessionID:       memberSnapshot.idmap.ParentSessionID,
 				NativeParentSessionID: memberSnapshot.idmap.NativeParentSessionID,
 				Cwd:                   memberSnapshot.cwd, Title: memberSnapshot.title,
-				Model:         stateSnapshotModel{ProviderID: memberSnapshot.providerID, ModelID: memberSnapshot.modelID, Agent: memberSnapshot.mode},
+				Model: stateSnapshotModel{
+					ProviderID: memberSnapshot.providerID, ModelID: memberSnapshot.modelID,
+					Agent: memberSnapshot.mode, Variant: memberSnapshot.variant,
+				},
 				Env:           durableEnv,
 				ExtraPathDirs: append([]string{}, memberSnapshot.carrier.ExtraPathDirs...),
 			},

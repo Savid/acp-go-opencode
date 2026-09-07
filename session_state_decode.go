@@ -152,7 +152,7 @@ func validateStateSnapshotJSONShape(raw []byte) error {
 	}
 
 	if _, modelErr := exactJSONObject(session[snapshotFieldModel], "snapshot.session.model",
-		[]string{"providerID", "modelID", provenanceAgent}, nil); modelErr != nil {
+		[]string{"providerID", "modelID", provenanceAgent, "variant"}, nil); modelErr != nil {
 		return modelErr
 	}
 

@@ -81,6 +81,7 @@ type session struct {
 	providerID            string
 	modelID               string
 	mode                  string
+	variant               string
 	permission            string
 	secretNeedles         []string
 	outputSchema          map[string]any
@@ -120,7 +121,11 @@ type session struct {
 	dispatchGate sync.Mutex
 	// lifecycleMu guards the lifecycle stream and the foreground cycle. Both the
 	// pump and a foreground prompt emit, so one mutex fixes one order.
-	lifecycleMu              sync.Mutex
+	lifecycleMu sync.Mutex
+	// settlements counts detached agent-cycle settlements still running. A
+	// close waits for them before it reports the boundary complete, so nothing
+	// writes the session's state after the host was told it is closed.
+	settlements              sync.WaitGroup
 	incarnation              *nativeIncarnationBinding
 	lifecycleFailed          error
 	lifecycleOpened          bool
@@ -183,6 +188,7 @@ type sessionSnapshot struct {
 	providerID            string
 	modelID               string
 	mode                  string
+	variant               string
 	permission            string
 	rawMessages           rawMessageConfig
 	carrier               sessionCarrier
@@ -229,6 +235,7 @@ func newSession(agent *Agent, id acp.SessionId, cwd string, additionalDirectorie
 		providerID:              providerID,
 		modelID:                 modelID,
 		mode:                    firstNonEmpty(meta.Mode, native.Agent, defaultMode),
+		variant:                 meta.Effort,
 		permission:              normalizeOpenCodePermission(meta.Permission),
 		outputSchema:            cloneAnyMap(meta.OutputSchema),
 		rawMessages:             meta.RawMessages,
@@ -829,9 +836,26 @@ func (s *session) failNativeIncarnationCause(
 		return
 	}
 
+	// A closing session's boundary settles its own cycle, so no detached
+	// settlement is started for it. The reservation is taken under the same
+	// mutex the close sets its flag under: a settlement that saw the session
+	// open is counted before the close can start waiting.
+	s.mu.Lock()
+
+	closing := s.closed
+	if !closing {
+		s.settlements.Add(1)
+	}
+
+	s.mu.Unlock()
+
 	s.lifecycleMu.Lock()
 	if s.incarnation != binding {
 		s.lifecycleMu.Unlock()
+
+		if !closing {
+			s.settlements.Done()
+		}
 
 		return
 	}
@@ -870,8 +894,12 @@ func (s *session) failNativeIncarnationCause(
 		s.lifecycleFailed = loss
 	}
 
-	agentOrigin := cycle != nil && cycle.origin != lifecycle.CauseSubmission
+	agentOrigin := cycle != nil && cycle.origin != lifecycle.CauseSubmission && !closing
 	s.lifecycleMu.Unlock()
+
+	if !agentOrigin && !closing {
+		s.settlements.Done()
+	}
 
 	if cancel != nil {
 		cancel()
@@ -883,6 +911,8 @@ func (s *session) failNativeIncarnationCause(
 
 	if agentOrigin {
 		go func() {
+			defer s.settlements.Done()
+
 			ctx := context.Background()
 			defer recoverAgentGoroutine(ctx, agentLogger(s.agent), "failed OpenCode agent cycle settlement")
 
@@ -1107,6 +1137,7 @@ func (s *session) snapshot() sessionSnapshot {
 		providerID:            s.providerID,
 		modelID:               s.modelID,
 		mode:                  s.mode,
+		variant:               s.variant,
 		permission:            s.permission,
 		rawMessages:           s.rawMessages,
 		carrier:               s.carrier.clone(),
@@ -1127,6 +1158,22 @@ func (s *session) setMode(value string) {
 	s.mu.Lock()
 	s.mode = value
 	s.mu.Unlock()
+}
+
+// setEffort records the native request preset this session's frames carry
+// from now on. An empty value is the model's own default: the frame then
+// carries no variant at all.
+func (s *session) setEffort(variant string) {
+	s.mu.Lock()
+	s.variant = variant
+	s.mu.Unlock()
+}
+
+func (s *session) currentVariant() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.variant
 }
 
 // modelSelector reports the model this session addresses its native frames
@@ -1355,6 +1402,7 @@ func (s *session) closeSession(ctx context.Context, commitResumable bool) error 
 
 	s.fenceBoundary()
 	s.delivery.close()
+	s.settlements.Wait()
 
 	if err != nil {
 		return err

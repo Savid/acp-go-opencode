@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -416,8 +417,11 @@ func newFakeOpenCodeClient(t *testing.T) *fakeOpenCodeClient {
 func testProviders() opencode.ProvidersResponse {
 	return opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
 		ID: "openai", Name: "OpenAI", Models: map[string]opencode.ProviderModel{
-			"gpt-test":  {ID: "gpt-test", Name: "GPT Test", Limit: map[string]any{"context": float64(1000), "output": float64(200)}, Reasoning: true, ToolCall: true},
-			"gpt-other": {ID: "gpt-other", Name: "GPT Other"},
+			"gpt-test": {ID: "gpt-test", Name: "GPT Test", Limit: map[string]any{"context": float64(1000), "output": float64(200)}},
+			"gpt-other": {ID: "gpt-other", Name: "GPT Other", Variants: map[string]map[string]any{
+				"high": {"reasoningEffort": "high"},
+				"low":  {"reasoningEffort": "low"},
+			}},
 		},
 	}}}
 }
@@ -1709,4 +1713,27 @@ func requireLifecycleReduces(t *testing.T, connection *recordingAgentClient) lif
 	}
 
 	return reducer.State()
+}
+
+// TestMain gives the suite one temp root. A runtime generation's scratch lands under
+// os.TempDir until the Agent closes, and many tests never close the Agents
+// they start, so the root removes on the way out whatever a test left behind.
+// TMP and TEMP cover the Windows lookup.
+func TestMain(m *testing.M) {
+	suiteTemp, err := os.MkdirTemp("", "acp-go-opencode-suite-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "create suite temp root:", err)
+		os.Exit(1)
+	}
+
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		if err = os.Setenv(name, suiteTemp); err != nil {
+			fmt.Fprintln(os.Stderr, "set suite "+name+":", err)
+			os.Exit(1)
+		}
+	}
+
+	code := m.Run()
+	_ = os.RemoveAll(suiteTemp)
+	os.Exit(code)
 }

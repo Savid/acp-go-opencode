@@ -1,6 +1,7 @@
 package opencodeacp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -69,6 +70,8 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		session.setModel(value)
 	case configMode:
 		session.setMode(value)
+	case configEffort:
+		session.setEffort(effortVariant(value))
 	default:
 		return acp.SetSessionConfigOptionResponse{}, unsupportedField("configId")
 	}
@@ -95,10 +98,19 @@ func (s *session) configOptions(ctx context.Context) []acp.SessionConfigOption {
 
 	var options []acp.SessionConfigOption
 
+	// The effort select is built from the same catalog read as the model
+	// select: a model's presets live on its catalog entry, so one read feeds
+	// both and a failed read withholds both.
 	if providers, err := snapshot.client.ConfigProviders(ctx); err != nil {
 		s.reportConfigOptionUnavailable(ctx, configModel, err)
-	} else if model := modelConfigOption(snapshot, providers); model.Select != nil {
-		options = append(options, model)
+	} else {
+		if model := modelConfigOption(snapshot, providers); model.Select != nil {
+			options = append(options, model)
+		}
+
+		if effort := effortConfigOption(snapshot, providers); effort.Select != nil {
+			options = append(options, effort)
+		}
 	}
 
 	if agents, err := snapshot.client.Agents(ctx); err != nil {
@@ -251,73 +263,121 @@ func modelMeta(providerID string, modelID string, model opencode.ProviderModel) 
 		meta["maxOutputTokens"] = n
 	}
 
-	efforts := supportedEfforts(model)
-	if len(efforts) > 0 {
-		meta["supportedEffortLevels"] = efforts
+	if levels := effortLevels(model); len(levels) > 0 {
+		meta["supportedEffortLevels"] = levels
 	}
 
 	return meta
 }
 
-func supportedEfforts(model opencode.ProviderModel) []string {
-	seen := map[string]struct{}{}
+// effortLevels names the model's request presets from least to most reasoning.
+// OpenCode keys a reasoning model's presets by effort name and a prompt selects
+// one by that key, so the keys are the effort levels the model supports.
+func effortLevels(model opencode.ProviderModel) []string {
+	levels := make([]string, 0, len(model.Variants))
 
-	for key, raw := range model.Options {
-		if !strings.Contains(strings.ToLower(key), "effort") {
+	for name := range model.Variants {
+		if name != "" {
+			levels = append(levels, name)
+		}
+	}
+
+	slices.SortFunc(levels, compareEffort)
+
+	return levels
+}
+
+// effortOrder ranks the preset names OpenCode's catalog uses. A name outside
+// it is still a preset the model declares; it sorts after the ranked ones,
+// alphabetically.
+var effortOrder = map[string]int{
+	"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6, //nolint:goconst // "high" is a preset name here, not the todo priority the existing constant names.
+}
+
+func compareEffort(a, b string) int {
+	rankA, knownA := effortOrder[a]
+	rankB, knownB := effortOrder[b]
+
+	switch {
+	case knownA && knownB:
+		return cmp.Compare(rankA, rankB)
+	case knownA:
+		return -1
+	case knownB:
+		return 1
+	default:
+		return strings.Compare(a, b)
+	}
+}
+
+// effortConfigOption advertises the current model's presets as the effort
+// select. A model the catalog gives no presets advertises nothing, because
+// there is no level a frame could carry. The first value names OpenCode's
+// no-variant state, in which the model runs its own default; as with mode, the
+// current value is what the session will send, listed or not.
+func effortConfigOption(snapshot sessionSnapshot, providers opencode.ProvidersResponse) acp.SessionConfigOption {
+	model, ok := catalogModel(providers, snapshot.providerID, snapshot.modelID)
+	if !ok {
+		return acp.SessionConfigOption{}
+	}
+
+	levels := effortLevels(model)
+	if len(levels) == 0 {
+		return acp.SessionConfigOption{}
+	}
+
+	category := acp.SessionConfigOptionCategoryThoughtLevel
+	values := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(levels)+1)
+	values = append(values, acp.SessionConfigSelectOption{Name: effortDefaultName, Value: effortDefault})
+
+	for _, level := range levels {
+		values = append(values, acp.SessionConfigSelectOption{
+			Name:  titleASCII(level),
+			Value: acp.SessionConfigValueId(level),
+		})
+	}
+
+	return acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{
+		Id:           configEffort,
+		Name:         "Effort",
+		Category:     &category,
+		Type:         configTypeSelect,
+		CurrentValue: acp.SessionConfigValueId(firstNonEmpty(snapshot.variant, effortDefault)),
+		Options:      acp.SessionConfigSelectOptions{Ungrouped: &values},
+	}}
+}
+
+// catalogModel finds the session's model in the authenticated catalog under
+// the same provider id and model id the model select advertises it by.
+func catalogModel(providers opencode.ProvidersResponse, providerID string, modelID string) (opencode.ProviderModel, bool) {
+	if providerID == "" || modelID == "" {
+		return opencode.ProviderModel{}, false
+	}
+
+	for _, provider := range providers.Providers {
+		if provider.ID != providerID {
 			continue
 		}
 
-		for _, value := range optionStringValues(raw) {
-			seen[value] = struct{}{}
-		}
-	}
-
-	out := make([]string, 0, len(seen))
-	for value := range seen {
-		out = append(out, value)
-	}
-
-	slices.Sort(out)
-
-	return out
-}
-
-func optionStringValues(raw any) []string {
-	switch value := raw.(type) {
-	case []string:
-		return compactNonEmptyStrings(value)
-	case []any:
-		out := make([]string, 0, len(value))
-		for _, item := range value {
-			if str, _ := item.(string); str != "" {
-				out = append(out, str)
-			}
-		}
-
-		return compactNonEmptyStrings(out)
-	case map[string]any:
-		for _, key := range []string{metaOptionsKey, "values", jsonFieldEnum} {
-			if values := optionStringValues(value[key]); len(values) > 0 {
-				return values
+		for key, model := range provider.Models {
+			if firstNonEmpty(model.ID, key) == modelID {
+				return model, true
 			}
 		}
 	}
 
-	return nil
+	return opencode.ProviderModel{}, false
 }
 
-func compactNonEmptyStrings(values []string) []string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			out = append(out, value)
-		}
+// effortVariant maps a host's effort value onto the variant a frame carries.
+// The default value clears it; any other travels to the runtime unjudged, as
+// model and mode do.
+func effortVariant(value string) string {
+	if value == effortDefault {
+		return ""
 	}
 
-	slices.Sort(out)
-
-	return slices.Compact(out)
+	return value
 }
 
 func unstableConfigOptions(options []acp.SessionConfigOption) []acp.UnstableSessionConfigOption {

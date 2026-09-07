@@ -135,8 +135,8 @@ OpenTelemetry providers.
   flows.
 - MCP stdio and streamable HTTP server configuration through ACP session
   requests.
-- Model and mode selection through ACP session config options and
-  `_meta.opencode.options`.
+- Model, mode, and effort selection through ACP session config options; model
+  and mode also through `_meta.opencode.options`.
 - Durable, credential-free native event snapshots through a host-provided
   `SessionStore`; stored rows use `opencode-sync-events-v1`, keyed by
   `{SessionID, Subpath}` and requiring OpenCode `1.18.3` or newer.

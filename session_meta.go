@@ -24,9 +24,13 @@ const (
 )
 
 type sessionMeta struct {
-	Model            string
-	OutputSchema     map[string]any
-	Mode             string
+	Model        string
+	OutputSchema map[string]any
+	Mode         string
+	// Effort is the native request preset a restored or forked session starts
+	// with. No session-start option sets it; a host chooses one on the live
+	// session through the effort config option.
+	Effort           string
 	Permission       string
 	PermissionSet    bool
 	Env              map[string]string

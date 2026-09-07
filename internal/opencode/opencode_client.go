@@ -694,6 +694,7 @@ type MessageRequest struct {
 	MessageID string           `json:"messageID,omitempty"`
 	Model     *ModelSelector   `json:"model,omitempty"`
 	Agent     string           `json:"agent,omitempty"`
+	Variant   string           `json:"variant,omitempty"`
 	Parts     []map[string]any `json:"parts"`
 	Format    *OutputFormat    `json:"format,omitempty"`
 }
@@ -709,6 +710,7 @@ type CommandRequest struct {
 	MessageID string           `json:"messageID,omitempty"`
 	Agent     string           `json:"agent,omitempty"`
 	Model     string           `json:"model,omitempty"`
+	Variant   string           `json:"variant,omitempty"`
 	Command   string           `json:"command"`
 	Arguments string           `json:"arguments"`
 	Parts     []map[string]any `json:"parts,omitempty"`
@@ -749,10 +751,12 @@ type ProviderModel struct {
 	ID           string                     `json:"id"`
 	Name         string                     `json:"name"`
 	Limit        map[string]any             `json:"limit"`
-	Reasoning    bool                       `json:"reasoning"`
-	ToolCall     bool                       `json:"tool_call"`
 	Capabilities *ProviderModelCapabilities `json:"capabilities"`
 	Options      map[string]any             `json:"options"`
+	// Variants are the model's named request presets, keyed by the name a
+	// prompt selects one with. On a reasoning model the catalog names them by
+	// effort level, so the keys are the effort levels the model supports.
+	Variants map[string]map[string]any `json:"variants"`
 }
 
 // ProviderModelCapabilities is the authenticated provider catalog's exhaustive

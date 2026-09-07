@@ -265,6 +265,8 @@ func (a *Agent) loadOrResumeSession(
 		meta.Mode = snapshot.Session.Model.Agent
 	}
 
+	meta.Effort = snapshot.Session.Model.Variant
+
 	carrier := carrierFromMeta(meta, newSessionCarrier(snapshot.Session.Env, snapshot.Session.ExtraPathDirs))
 	meta.Env, meta.ExtraPathDirs = carrier.Env, carrier.ExtraPathDirs
 
@@ -674,6 +676,8 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 	if meta.Mode == "" {
 		meta.Mode = parentSnapshot.mode
 	}
+
+	meta.Effort = parentSnapshot.variant
 
 	mcpConfigs := nativeMCPServerConfigsFromUnstable(params.McpServers)
 

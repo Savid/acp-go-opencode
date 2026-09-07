@@ -3,11 +3,11 @@ title: Models and Config
 description: Select the model and mode for a session, request native structured output, and seed a custom provider.
 ---
 
-Model and mode are ACP config options; structured output is a native OpenCode
-feature the adapter turns on per session. This page covers each and how a failed
-structured-output turn surfaces to the host.
+Model, mode, and effort are ACP config options; structured output is a native
+OpenCode feature the adapter turns on per session. This page covers each and
+how a failed structured-output turn surfaces to the host.
 
-## Model and mode options
+## Model, mode, and effort options
 
 The model selector is an ACP config option with id `model` and category
 `model`. Values are built from authenticated `GET /config/providers` as
@@ -17,13 +17,27 @@ Mode selection uses config id `mode` and category `mode` when OpenCode agents
 are enumerable. The mode is the native agent name carried on the `agent` field
 of every frame the session sends.
 
+Effort selection uses config id `effort` and category `thought_level`. Its
+values are the current model's native variants — the named request presets
+OpenCode's catalog carries per model, keyed by effort level (`low`, `medium`,
+`high`, `xhigh`, ...) — behind a first value, `default`, that names OpenCode's
+no-variant state. The chosen value travels on the `variant` field of every
+frame the session sends; `default` sends no variant, so the model runs its own
+default preset. A model whose catalog entry carries no variants advertises no
+effort option, and the option follows the model: switching models re-reads it
+from the new model's entry. The same variant names appear on each model
+select value as `_meta.opencode.supportedEffortLevels`, so a host can learn a
+model's levels from the catalog without selecting it.
+
 | Option | Config id | Category | Values |
 |---|---|---|---|
 | Model | `model` | `model` | `provider/model`, from authenticated providers |
 | Mode | `mode` | `mode` | Enumerable OpenCode agents, when available |
+| Effort | `effort` | `thought_level` | `default`, then the current model's variants in effort order |
 
-Set either at session start via `_meta.opencode.options` or on a running session
-with `session/set_config_option`.
+Set model or mode at session start via `_meta.opencode.options` or on a running
+session with `session/set_config_option`; effort is set on the running session
+only, and a stored session restores the effort it last carried.
 
 The advertised `currentValue` of each option is what the session will actually
 send, listed or not. An option never renames a host's selection to a value the
@@ -31,12 +45,12 @@ list happens to carry.
 
 ### Values are passed through, never gated
 
-The adapter checks neither a model nor a mode value against the advertised set.
-Both are carried to OpenCode exactly as the host asked for them, at session
-start, on `session/set_config_option`, and on every prompt; OpenCode owns model
-and agent resolution and answers for a name it does not know. Both doors behave
-the same way — there is no value the session-start route accepts and
-`session/set_config_option` refuses.
+The adapter checks none of a model, a mode, or an effort value against the
+advertised set. All three are carried to OpenCode exactly as the host asked for
+them, at session start, on `session/set_config_option`, and on every prompt;
+OpenCode owns model, agent, and variant resolution and answers for a name it
+does not know. The doors behave the same way — there is no value the
+session-start route accepts and `session/set_config_option` refuses.
 
 The advertisement is why. `GET /config/providers` and `GET /agent` report what
 the `opencode serve` process resolved when it started, and that answer does not
@@ -75,12 +89,12 @@ sure of what runs.
 ### A failed catalog read is reported, not hidden
 
 Each config option is built from its own native read. When
-`GET /config/providers` fails, the model option is left out of the advertised
-set, the options that read successfully are still advertised, and the session
-is not refused — the next call repeats the read. The omission is never silent:
-its cause is logged on `stderr` as `OpenCode config option is unavailable` with
-the session id, the config id, and the native error. The mode option follows
-the same rule for `GET /agent`.
+`GET /config/providers` fails, the model and effort options it feeds are left
+out of the advertised set, the options that read successfully are still
+advertised, and the session is not refused — the next call repeats the read.
+The omission is never silent: its cause is logged on `stderr` as
+`OpenCode config option is unavailable` with the session id, the config id, and
+the native error. The mode option follows the same rule for `GET /agent`.
 
 A failed read withholds only the advertisement. Because no read stands between
 a host's value and the session, `session/set_config_option` still sets a model
