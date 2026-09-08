@@ -27,14 +27,12 @@ Use `-home` when the host assigns an exact exclusive runtime XDG root. Use
 assigned. Either location must resolve to an approved local filesystem; remote,
 overlay, and unrecognized filesystems are rejected before native startup.
 
-OpenCode npm-installs its plugin loader into every fresh runtime root, which
-takes minutes. The adapter caches that install per `opencode` binary in the
+OpenCode installs its plugin loader into fresh runtime roots. For ordinary
+execution, the adapter caches that install per `opencode` binary in the
 [plugin seed cache](/docs/reference/cli#plugin-seed-cache) and copies it into
 every new root before launch. The first boot of a new binary fills the cache
-through a session-free priming launch, so it pays the install once per binary,
-and every runtime root after that, in ordinary and managed execution alike,
-starts in seconds. A persistent `-home` reaches the same steady state on its
-own after one cold boot.
+through a session-free priming launch. A persistent `-home` can also retain
+the install across launches.
 
 ## Embedded
 
@@ -80,3 +78,8 @@ launch through `StartNative`. An unavailable or invalid authority refuses
 startup before ordinary execution can be selected. Provider-auth methods are
 withheld in this mode because their login brokers are intentionally
 ordinary-only.
+
+Managed execution skips the plugin seed cache because its executable selector
+belongs to the authority and cannot be resolved or inspected by the adapter.
+A fresh managed root performs its native plugin install within the configured
+readiness budget.

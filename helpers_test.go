@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -62,14 +63,6 @@ func testFileURI(path string) string {
 	return "file://" + testURIPath(path)
 }
 
-func boolPtr(value bool) *bool {
-	return &value
-}
-
-func stringPtr(value string) *string {
-	return &value
-}
-
 const internalSeamTurnNonce = "test-turn-nonce"
 
 var testPromptSubmissionCounter atomic.Uint64
@@ -81,9 +74,7 @@ func (s *session) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Pr
 		request.Meta = map[string]any{}
 	}
 	if _, present := request.Meta[routeEnvelopeKey]; !present {
-		for key, value := range requestRouteCarrier(internalSeamTurnNonce) {
-			request.Meta[key] = value
-		}
+		maps.Copy(request.Meta, requestRouteCarrier(internalSeamTurnNonce))
 	}
 	if s.agent.lifecycleNegotiated().Present() {
 		if _, present := request.Meta[lifecycle.MetaKey]; !present {

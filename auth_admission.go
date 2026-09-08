@@ -89,7 +89,7 @@ func (p *providerAuth) publishFlow(key authFlowKey, flow *authFlow) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if _, closed := p.closedSessions[key.sessionID]; closed {
+	if !p.sessionAdmitted(key.sessionID) {
 		return authSessionUnknown()
 	}
 
@@ -104,7 +104,7 @@ func (p *providerAuth) publishFlow(key authFlowKey, flow *authFlow) error {
 func (p *providerAuth) sessionAdmitted(sessionID acp.SessionId) bool {
 	_, closed := p.closedSessions[sessionID]
 
-	return !closed
+	return !p.closed && !closed
 }
 
 // reopenSession drops the closed mark when the agent registers a session under

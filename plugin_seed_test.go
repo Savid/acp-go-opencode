@@ -41,6 +41,11 @@ func TestPluginSeedDirResolution(t *testing.T) {
 		require.Empty(t, agent.pluginSeedDir(context.Background()))
 	})
 
+	t.Run("managed selectors are opaque to cache identity resolution", func(t *testing.T) {
+		agent := NewAgent(WithHostAuthority(&fixedProcessAuthority{}), WithPluginSeedDir(absTestPath("srv", "seed")))
+		require.Empty(t, agent.pluginSeedDir(context.Background()))
+	})
+
 	t.Run("unknown user cache directory disables seeding", func(t *testing.T) {
 		runtimeUserCacheDir = func() (string, error) { return "", errors.New("no cache home") }
 		t.Cleanup(func() { runtimeUserCacheDir = func() (string, error) { return cacheRoot, nil } })

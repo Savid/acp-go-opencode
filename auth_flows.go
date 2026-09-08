@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"time"
@@ -194,7 +195,9 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 		return nil, authFailed(authCauseProcess, request.providerID, request.method, "")
 	}
 
-	p.supersede(key, authReasonSuperseded)
+	if err := p.supersede(key, authReasonSuperseded); err != nil {
+		return nil, authFailed(authCauseProcess, request.providerID, request.method, "")
+	}
 
 	now := authNow()
 	record := authLedgerRecord{
@@ -409,12 +412,19 @@ func (p *providerAuth) mintPresentation(ctx context.Context, flow *authFlow) (au
 		return result, ""
 	}
 
-	broker, err := p.startBroker(ctx)
+	broker, err := p.startBroker(ctx, flow.sessionID)
 	if err != nil {
 		return authAuthorizeResult{}, authCauseProcess
 	}
 
 	p.mu.Lock()
+	if authTerminal(flow.state) || !p.sessionAdmitted(flow.sessionID) {
+		p.mu.Unlock()
+		_ = p.retireBroker(ctx, broker)
+
+		return authAuthorizeResult{}, authCauseFlowCancelled
+	}
+
 	flow.broker = broker
 	p.mu.Unlock()
 
@@ -536,7 +546,7 @@ func (p *providerAuth) expire(flow *authFlow) {
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 
-	broker.destroy(ctx)
+	_ = p.retireBroker(ctx, broker)
 	p.waitCompletion(ctx, flow)
 }
 
@@ -546,14 +556,14 @@ func (p *providerAuth) expire(flow *authFlow) {
 // anything from it, so a stale native approval completes into a store that no
 // longer exists. A flow that already terminalized was not superseded by
 // anything and keeps both its record and its id.
-func (p *providerAuth) supersede(key authFlowKey, reason string) {
+func (p *providerAuth) supersede(key authFlowKey, reason string) error {
 	p.mu.Lock()
 
 	flow, ok := p.flows[key]
 	if !ok {
 		p.mu.Unlock()
 
-		return
+		return nil
 	}
 
 	p.retire(key, flow.authorizeRequestID)
@@ -561,7 +571,7 @@ func (p *providerAuth) supersede(key authFlowKey, reason string) {
 	if authTerminal(flow.state) {
 		p.mu.Unlock()
 
-		return
+		return nil
 	}
 
 	delete(p.flows, key)
@@ -577,8 +587,10 @@ func (p *providerAuth) supersede(key authFlowKey, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 
-	broker.destroy(ctx)
+	err := p.retireBroker(ctx, broker)
 	p.waitCompletion(ctx, flow)
+
+	return err
 }
 
 func (f *authFlow) stopCompleter() {
@@ -603,12 +615,12 @@ func (f *authFlow) takeBroker() *authBroker {
 
 // destroyBroker claims the flow's broker under p.mu and destroys it outside the
 // lock, because destruction terminates a process and walks a directory tree.
-func (p *providerAuth) destroyBroker(ctx context.Context, flow *authFlow) {
+func (p *providerAuth) destroyBroker(ctx context.Context, flow *authFlow) error {
 	p.mu.Lock()
 	broker := flow.takeBroker()
 	p.mu.Unlock()
 
-	broker.destroy(ctx)
+	return p.retireBroker(ctx, broker)
 }
 
 func (p *providerAuth) waitCompletion(ctx context.Context, flow *authFlow) {
@@ -762,7 +774,9 @@ func (p *providerAuth) completeOAuth(ctx context.Context, session *session, flow
 	destroyCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 
-	p.destroyBroker(destroyCtx, flow)
+	if err := p.destroyBroker(destroyCtx, flow); err != nil {
+		return nil, authFailed(authCauseProcess, flow.providerID, flow.method.ID, flow.id)
+	}
 
 	return authFlowIDResult{FlowID: flow.id}, nil
 }
@@ -907,7 +921,9 @@ func (p *providerAuth) fail(flow *authFlow, cause string, materialInFlight bool)
 		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 		defer cancel()
 
-		p.destroyBroker(ctx, flow)
+		if err := p.destroyBroker(ctx, flow); err != nil {
+			cause = authCauseProcess
+		}
 	}
 
 	return authFailed(cause, flow.providerID, flow.method.ID, flow.id)
@@ -980,6 +996,10 @@ func (p *providerAuth) cancel(ctx context.Context, params json.RawMessage) (any,
 	if authTerminal(flow.state) {
 		p.mu.Unlock()
 
+		if cleanupErr := p.retryBrokerCleanup(ctx, flow.sessionID); cleanupErr != nil {
+			return nil, authFailed(authCauseProcess, flow.providerID, flow.method.ID, flow.id)
+		}
+
 		return authFlowIDResult{FlowID: flow.id}, nil
 	}
 
@@ -990,8 +1010,12 @@ func (p *providerAuth) cancel(ctx context.Context, params json.RawMessage) (any,
 	flow.stopCompleter()
 	p.mu.Unlock()
 
-	broker.destroy(ctx)
+	err = p.retireBroker(ctx, broker)
 	p.waitCompletion(ctx, flow)
+
+	if err != nil {
+		return nil, authFailed(authCauseProcess, flow.providerID, flow.method.ID, flow.id)
+	}
 
 	return authFlowIDResult{FlowID: flow.id}, nil
 }
@@ -1113,33 +1137,36 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 	return struct{}{}, nil
 }
 
-// closeSession cancels every pending flow the session owns, terminalizing each
-// as cancelled/session_closed and destroying its broker home, and drops every
-// record the session could still replay an idempotency key from. It runs before
-// the native interrupt, so a flow is never abandoned to a process already being
-// torn down.
-//
-// The session is marked closed in the same critical section that takes the
-// cleanup set, and an authorize still in flight is refused at publication
-// rather than waited for. Waiting would be the other way to keep the invariant
-// that no flow escapes this set, but it would block close for the length of an
-// unbounded native login.
-func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId) {
-	p.mu.Lock()
+// closeSession fences publication, retires flows, and joins their cleanup.
+func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId) error {
+	return p.closeFlows(ctx, sessionID, false)
+}
 
-	p.closedSessions[sessionID] = struct{}{}
+func (p *providerAuth) close(ctx context.Context) error {
+	return p.closeFlows(ctx, "", true)
+}
+
+func (p *providerAuth) closeFlows(ctx context.Context, sessionID acp.SessionId, all bool) error {
+	p.mu.Lock()
+	if all {
+		p.closed = true
+	} else {
+		p.closedSessions[sessionID] = struct{}{}
+	}
 
 	brokers := make([]*authBroker, 0, len(p.flows))
-	completions := make([]chan struct{}, 0, len(p.flows))
+	if p.completionCleanup == nil {
+		p.completionCleanup = make(map[chan struct{}]acp.SessionId)
+	}
 
 	for key := range p.retired {
-		if key.sessionID == sessionID {
+		if all || key.sessionID == sessionID {
 			delete(p.retired, key)
 		}
 	}
 
 	for key, flow := range p.flows {
-		if key.sessionID != sessionID {
+		if !all && key.sessionID != sessionID {
 			continue
 		}
 
@@ -1147,35 +1174,56 @@ func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId
 		delete(p.byID, flow.id)
 
 		if flow.completionDone != nil {
-			completions = append(completions, flow.completionDone)
+			p.completionCleanup[flow.completionDone] = flow.sessionID
 		}
 
-		if authTerminal(flow.state) {
-			brokers = append(brokers, flow.takeBroker())
-
-			continue
+		if !authTerminal(flow.state) {
+			flow.state = authStateCancelled
+			flow.reason = authReasonSessionClosed
+			flow.stopCompleter()
 		}
 
-		flow.state = authStateCancelled
-		flow.reason = authReasonSessionClosed
-
-		flow.stopCompleter()
-		brokers = append(brokers, flow.takeBroker())
+		if broker := flow.takeBroker(); broker != nil {
+			brokers = append(brokers, broker)
+		}
 	}
 
+	completions := make([]chan struct{}, 0, len(p.completionCleanup))
+	for done, owner := range p.completionCleanup {
+		if all || owner == sessionID {
+			completions = append(completions, done)
+		}
+	}
 	p.mu.Unlock()
 
+	p.brokerMu.Lock()
+	if p.brokers == nil {
+		p.brokers = make(map[*authBroker]bool)
+	}
+
 	for _, broker := range brokers {
-		broker.destroy(ctx)
+		p.brokers[broker] = true
+	}
+
+	err := p.cleanupBrokersLocked(ctx, sessionID, true)
+	p.brokerMu.Unlock()
+
+	if err != nil {
+		return err
 	}
 
 	for _, done := range completions {
 		select {
 		case <-done:
+			p.mu.Lock()
+			delete(p.completionCleanup, done)
+			p.mu.Unlock()
 		case <-ctx.Done():
-			return
+			return errors.Join(err, ctx.Err())
 		}
 	}
+
+	return err
 }
 
 // authNativeCause classifies a native failure without forwarding any of its

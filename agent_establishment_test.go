@@ -284,6 +284,7 @@ func TestEstablishmentTagReaderTagsOnlyEstablishingRequests(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"session-1"}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"session/new"}`,
 		`{"jsonrpc":"2.0","id":3,"method":"session/new","params":[]}`,
+		`{"jsonrpc":"2.0","id":3,"method":"session/new","params":null}`,
 	}
 
 	for _, line := range untouched {

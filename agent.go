@@ -40,6 +40,7 @@ type Agent struct {
 	observe      *observer.Observer
 	optionsErr   error
 	providerAuth *providerAuth
+	imageRoots   managedImageRoots
 
 	mu                   sync.Mutex
 	closed               bool
@@ -146,7 +147,7 @@ func NewAgent(opts ...Option) *Agent {
 		directories:               make(map[string]directoryBinding),
 		runtimeRetirements:        make(map[uint64]*runtimeRetirement),
 		retiredNativeTrees:        make(map[string]retiredNativeTree),
-		clientCalls:               make(chan struct{}, limits.MaxConcurrentClientCalls),
+		clientCalls:               make(chan struct{}, max(0, limits.MaxConcurrentClientCalls)),
 		sessionReplacementTimeout: settlementTimeout,
 	}
 	if _, err := agentRandRead(agent.fingerprintKey[:]); err != nil {
@@ -199,6 +200,43 @@ func (a *Agent) connection() agentClient {
 
 func (a *Agent) Close() error {
 	a.fenceSessionLifecycle()
+	defer a.closeManagedImageRoots()
+
+	// Broker containment precedes retirement of the credential runtime. A
+	// failed attempt keeps sessions, runtime, and exact broker handles reachable
+	// so a later Close can finish cleanup and the owed session commits.
+	a.mu.Lock()
+	a.closed = true
+	a.mu.Unlock()
+
+	if a.providerAuth != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), settlementTimeout)
+		err := a.providerAuth.close(ctx)
+
+		cancel()
+
+		if err != nil {
+			// Stop foreground work even when broker containment needs another
+			// attempt. Keep the shared runtime available for owed close commits.
+			a.mu.Lock()
+
+			pending := make([]*session, 0, len(a.sessions))
+
+			for _, current := range a.sessions {
+				pending = append(pending, current)
+			}
+			a.mu.Unlock()
+
+			for _, current := range pending {
+				closeCtx, closeCancel := context.WithTimeout(context.Background(), settlementTimeout)
+				err = errors.Join(err, current.CloseAndCommit(closeCtx))
+
+				closeCancel()
+			}
+
+			return containmentFailure(err)
+		}
+	}
 
 	a.mu.Lock()
 	if a.closeDone != nil {

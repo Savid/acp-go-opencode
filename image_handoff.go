@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
@@ -176,7 +177,7 @@ func (s *session) readHandoffImage(ctx context.Context, media promptMedia, limit
 		return nil, cancelled
 	}
 
-	file, err := handoffOpen(dir, reference.path, media.index)
+	file, err := s.openInputHandoff(dir, reference.path, media.index)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +201,30 @@ func (s *session) readHandoffImage(ctx context.Context, media promptMedia, limit
 	}
 
 	return decoded, nil
+}
+
+func (s *session) openInputHandoff(dir, path string, index int) (io.ReadCloser, error) {
+	if s.agent == nil || !s.agent.options.hostAuthorityConfigured {
+		return handoffOpen(dir, path, index)
+	}
+
+	file, err := s.agent.openManagedImage(path, []string{dir})
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, handoffInputError(index, imageErrorMissingFile, handoffCauseAbsent)
+		}
+
+		return nil, handoffInputError(index, imageErrorPathNotAllowed, handoffCauseOutsideRoot)
+	}
+
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = file.Close()
+
+		return nil, handoffInputError(index, imageErrorPathNotAllowed, handoffCauseNotRegular)
+	}
+
+	return file, nil
 }
 
 // handoffOpen is the seam the handoff read opens through, so a test can observe
@@ -318,17 +343,48 @@ func handoffEnvelopeFields(raw any) (map[string]json.RawMessage, bool) {
 // token check is required because a quoted numeral decodes into a JSON number
 // without complaint.
 func handoffInteger(raw json.RawMessage) (int64, bool) {
-	token := bytes.TrimSpace(raw)
-	if len(token) == 0 || (token[0] != '-' && (token[0] < '0' || token[0] > '9')) {
+	token := string(bytes.TrimSpace(raw))
+	if !json.Valid(raw) || token == "" || (token[0] != '-' && (token[0] < '0' || token[0] > '9')) {
 		return 0, false
 	}
 
-	value, err := json.Number(token).Int64()
-	if err != nil {
+	negative := strings.HasPrefix(token, "-")
+	mantissa := strings.TrimPrefix(token, "-")
+
+	exponent := "0"
+	if index := strings.IndexAny(mantissa, "eE"); index >= 0 {
+		exponent, mantissa = mantissa[index+1:], mantissa[:index]
+	}
+
+	whole, fraction, _ := strings.Cut(mantissa, ".")
+
+	digits := strings.TrimLeft(whole+fraction, "0")
+	if digits == "" {
+		return 0, true
+	}
+
+	shift, err := strconv.ParseInt(exponent, 10, 64)
+	// Bound arithmetic and allocation by the token's length, never its exponent.
+	bound := int64(len(token)) + 19
+	if err != nil || shift > bound || shift < -bound {
 		return 0, false
 	}
 
-	return value, true
+	trimmed := strings.TrimRight(digits, "0")
+
+	shift += int64(len(digits)-len(trimmed)) - int64(len(fraction))
+	if shift < 0 || shift > 19 || int64(len(trimmed))+shift > 19 {
+		return 0, false
+	}
+
+	integer := trimmed + strings.Repeat("0", int(shift))
+	if negative {
+		integer = "-" + integer
+	}
+
+	value, err := strconv.ParseInt(integer, 10, 64)
+
+	return value, err == nil
 }
 
 func handoffDigestSyntax(value string) bool {

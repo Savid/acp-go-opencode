@@ -282,17 +282,24 @@ func tagEstablishingRequest(line []byte) []byte {
 		return line
 	}
 
-	members := make(map[string]json.RawMessage)
-	if err := json.Unmarshal(frame.Params, &members); err != nil {
+	body := bytes.TrimSpace(frame.Params)
+	if !json.Valid(body) || len(body) < 2 || body[0] != '{' {
 		return line
 	}
 
-	// Nothing here can fail to marshal: the id is a string, and every member is
-	// raw JSON this function has already decoded, so the errors are discarded
-	// rather than turned into branches no input can reach.
 	hookID, _ := json.Marshal(establishmentResponseID(frame.ID))
-	members[establishmentHookParam] = hookID
-	frame.Params, _ = json.Marshal(members)
+
+	tagged := append([]byte(nil), body[:len(body)-1]...)
+	if len(bytes.TrimSpace(body[1:len(body)-1])) != 0 {
+		tagged = append(tagged, ',')
+	}
+
+	hookName, _ := json.Marshal(establishmentHookParam)
+	tagged = append(tagged, hookName...)
+	tagged = append(tagged, ':')
+	tagged = append(tagged, hookID...)
+	tagged = append(tagged, '}')
+	frame.Params = tagged
 
 	encoded, _ := json.Marshal(frame)
 

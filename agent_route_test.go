@@ -69,7 +69,7 @@ func TestRouteEnvelopeRemainingShapes(t *testing.T) {
 	_, err = outboundRoute(elicitationScope{SessionID: "session", TurnNonce: strings.Repeat("n", routeTurnNonceMaxBytes+1)})
 	require.ErrorContains(t, err, "maximum size")
 
-	requestID := acp.RequestId{Number: requestIDNumberPointer(7)}
+	requestID := acp.RequestId{Number: new(acp.RequestIdNumber(7))}
 	_, err = outboundRoute(elicitationScope{SessionID: "session", TurnNonce: "nonce", RequestID: &requestID})
 	require.ErrorContains(t, err, "exactly one")
 
@@ -96,8 +96,6 @@ func TestRouteEnvelopeRemainingShapes(t *testing.T) {
 	require.Nil(t, turnRouteMetaFromContext(nil)) //nolint:staticcheck // Explicitly verify the nil-context guard.
 	require.Nil(t, turnRouteMetaFromContext(context.Background()))
 }
-
-func requestIDNumberPointer(value acp.RequestIdNumber) *acp.RequestIdNumber { return &value }
 
 // TestRouteVersionAcceptsAnEmbeddedHostInteger proves the version reads the same
 // whether it arrived as decoded JSON (float64) or was written by an embedding Go

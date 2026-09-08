@@ -59,7 +59,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 	carrier := newSessionCarrier(meta.Env, meta.ExtraPathDirs)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, "", params.Cwd, mcpConfigs, carrier)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, "", params.Cwd, mcpConfigs, carrier, params.AdditionalDirectories...)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -277,7 +277,7 @@ func (a *Agent) loadOrResumeSession(
 
 	mcpConfigs := nativeMCPServerConfigs(mcpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, acp.SessionId(idmap.ParentSessionID), cwd, mcpConfigs, carrier)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, acp.SessionId(idmap.ParentSessionID), cwd, mcpConfigs, carrier, additionalDirectories...)
 	if err != nil {
 		return nil, err
 	}
@@ -543,6 +543,10 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDe
 		return acp.UnstableDeleteSessionResponse{}, refusal
 	}
 
+	if err := a.ensureOpen(); err != nil {
+		return acp.UnstableDeleteSessionResponse{}, err
+	}
+
 	if params.SessionId == "" {
 		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
 	}
@@ -681,7 +685,7 @@ func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionR
 
 	mcpConfigs := nativeMCPServerConfigsFromUnstable(params.McpServers)
 
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.SessionId, cwd, mcpConfigs, carrier)
+	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.SessionId, cwd, mcpConfigs, carrier, params.AdditionalDirectories...)
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -821,7 +825,10 @@ func (a *Agent) newOpenCodeClient(
 	cwd string,
 	mcpServers []opencode.MCPServerConfig,
 	carrier sessionCarrier,
+	additionalDirectories ...string,
 ) (opencode.Client, func(), uint64, error) {
+	a.rememberImageWorkspaces(cwd, additionalDirectories)
+
 	for {
 		releaseDirectory, err := a.bindDirectory(id, parentID, cwd, mcpServers)
 		if err != nil {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/url"
 	"path"
 	"reflect"
@@ -205,10 +206,6 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 		return poisonErr
 	}
 
-	if err := session.requireActiveTurn(route.TurnNonce); err != nil {
-		return err
-	}
-
 	// Cancellation is session-scoped. It interrupts the addressed native session
 	// and returns; the turn's own settlement — every blocking action cancelled,
 	// the native-safe prefix committed, the terminal transition emitted — is
@@ -216,7 +213,7 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 	cancelCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 
-	return session.cancelTurn(cancelCtx)
+	return session.cancelTurnForNonce(cancelCtx, route.TurnNonce)
 }
 
 func (s *session) promptWithRoute(
@@ -1958,13 +1955,9 @@ func eventQuestion(data json.RawMessage) (opencode.QuestionRequest, bool) {
 
 func mergeMeta(left, right map[string]any) map[string]any {
 	out := make(map[string]any, len(left)+len(right))
-	for key, value := range left {
-		out[key] = value
-	}
+	maps.Copy(out, left)
 
-	for key, value := range right {
-		out[key] = value
-	}
+	maps.Copy(out, right)
 
 	return out
 }
@@ -2202,9 +2195,7 @@ func (s *session) emitRawOpenCodeEvent(ctx context.Context, event opencode.Event
 	}
 
 	preflight := make(map[string]any, len(payload)+1)
-	for key, value := range payload {
-		preflight[key] = value
-	}
+	maps.Copy(preflight, payload)
 
 	preflight[jsonFieldSequence] = int64(^uint64(0) >> 1)
 	if _, err := capRawEventPayload(preflight); err != nil {

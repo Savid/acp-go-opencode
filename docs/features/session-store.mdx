@@ -3,11 +3,11 @@ title: Session Store
 description: Persist and restore native OpenCode session state across process restarts through a host-provided store.
 ---
 
-Session persistence is opt-in and host-owned. Wire a `SessionStore` and the
-adapter snapshots each session's native OpenCode state into it, then restores
-that state on `session/load`, `session/resume`, and `_opencode/session/fork`.
-Without a store, an in-memory implementation is used and state does not survive
-the process.
+Every Agent uses a `SessionStore` for session discovery and snapshots. The
+default in-memory store lasts for the Agent's lifetime. Supply a durable store
+to restore sessions across process restarts with `session/load` or
+`session/resume`. `_opencode/session/fork` branches an already loaded session
+and stores the child's independent aggregate.
 
 ## Wiring a store
 
@@ -25,8 +25,8 @@ agent := opencodeacp.NewAgent(
 ```
 
 `WithSessionStoreLoadTimeout` bounds each store read during hydration; it
-defaults to `10s`. Store writes are bounded separately by a fixed `60s`
-deadline, so a slow store can never stall a snapshot commit indefinitely.
+defaults to `10s`. Snapshot commits have a `60s` deadline, shortened by any
+earlier caller deadline.
 
 ## Image artifacts
 
@@ -63,7 +63,7 @@ session the refused set mentioned. `NewInMemorySessionStore` enforces all of
 this, and the same battery is the conformance bar for a host store.
 
 An accepted set replaces the addressed session's **whole** subtree: a subpath
-the new set does not list does not survive as a stale sibling of the ones it
+the new set does not list does not survive alongside the ones it
 does. Because the set can never name another session, one session's commit can
 never retire another session's rows.
 
@@ -115,6 +115,11 @@ first `POST /sync/replay`, replays the aggregate in one call, and rechecks
 ownership afterwards. Allowed absolute path fields must be inside the captured
 cwd and are rebased to the destination cwd; an escaping path is rejected.
 
+Successive captures of the same logical/native mapping retain its ownership
+token. A failed store replacement therefore leaves the previous committed
+snapshot's ownership valid; event-prefix verification still checks its exact
+contents during restore.
+
 Verification is prefix-exact rather than equality-exact. The destination must
 contain the complete stored generation, in order, from its first event; a
 destination that is behind the capture is completed by replay, and one that is
@@ -141,13 +146,15 @@ the terminal assistant. Malformed, unsupported, or non-contiguous snapshots
 fail closed; a valid snapshot without a terminal assistant returns an empty
 `MessageID`.
 
-A snapshot is blocked while any input, permission, elicitation, or generation is
-pending, so a snapshot never captures a half-finished turn. `session/delete`
-removes a stored session and leaves a tombstone so the id is not silently
-reused. A tombstone belongs to the id it names: another session's `Replace`
-neither fails because of it nor resurrects it. The tombstone is final in the store itself: an `Append` or a `Replace`
-addressed to a tombstoned key writes nothing, clears nothing, and returns
-success. A custom `SessionStore` owes the same rule — the deleted state is
-already the caller's answer, and a store that leaves the rule to its caller
-resurrects a session whenever a settlement races the delete that answered for
-it.
+Pending foreground input, actions, and generation block capture. Interrupted
+capture requires native settlement evidence, and the two sync-history reads
+must prove a stable prefix. This is a resumable session boundary, not proof
+that the entire shared runtime is quiescent.
+
+`session/delete` removes the stored subtree and leaves a final main-key
+tombstone. Any later `Append` or `Replace` for that session succeeds without
+writing or clearing anything, including when settlement races deletion.
+Another session's replacement cannot affect that tombstone. A non-main
+tombstone suppresses appends to its own key; an accepted replacement may
+explicitly restore that subpath. Custom stores must enforce these rules
+atomically.

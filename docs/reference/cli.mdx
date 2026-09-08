@@ -42,12 +42,12 @@ host-owned native process boundary embed the Go package and pass
 OpenCode installs its plugin loader, the `@opencode-ai/plugin` npm package,
 into `<XDG_CONFIG_HOME>/opencode/` the first time a runtime root names any
 plugin. This adapter always names one, its session carrier, and without `-home`
-every launch gets a fresh root, so a cold boot waits minutes for that install.
+every launch gets a fresh root, so a cold boot must wait for that install.
 
 The adapter therefore keeps one copy of the tree OpenCode produced, keyed by the
 identity of the `opencode` binary, in the plugin seed cache and copies it into
 each new runtime root before launch. OpenCode finds the install complete and
-skips it, so a warm boot answers `session/new` in seconds. Stale entries are
+skips it. Stale entries are
 removed after thirty days and the cache keeps a handful of binaries at most.
 
 When the cache holds no entry for the running binary, the adapter fills it
@@ -59,10 +59,9 @@ The tree it leaves is harvested into the cache and the root is removed, and the
 runtime then restores from the fresh entry. No session ever reaches the priming
 runtime, which is what makes its tree safe to copy into every later root. The
 priming launch has its own readiness budget of ten minutes, so the first boot
-of a new binary no longer needs a raised `-opencode-health-timeout`; a binary
-upgrade changes the key and primes again on the next boot. Under a host
-authority the priming root is prepared, started, and reclaimed through the same
-authority, and is read only after reclaim.
+uses that separate budget; a binary upgrade changes the key and primes again
+on the next boot. Embedded execution with `WithHostAuthority` skips the cache
+because only the authority can resolve its executable selector.
 
 The default location is `acp-go-opencode/plugin-seed` beneath the user cache
 directory: `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on

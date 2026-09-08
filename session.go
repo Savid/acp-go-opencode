@@ -112,6 +112,10 @@ type session struct {
 
 	turn chan struct{}
 	mu   sync.Mutex
+	// interruptMu keeps a session-addressed abort from outliving its prompt.
+	// OpenCode's abort endpoint carries no native turn id, so finishTurn must
+	// join the interrupt before releasing the slot for another prompt.
+	interruptMu sync.Mutex
 	// pump is the session-owned consumer of the native event stream for the
 	// current runtime binding.
 	pump *sessionPump
@@ -147,6 +151,7 @@ type session struct {
 	turnNonce               string
 	submission              lifecycle.Submission
 	imageArtifacts          map[string]imageArtifactRecord
+	imageArtifactMu         sync.Mutex
 	imageArtifactIdentities map[string]string
 	emittedToolContent      map[string][]imageOutputItem
 	emittedFileParts        map[string]struct{}
@@ -561,6 +566,9 @@ func (s *session) takePendingDispatchFailure() error {
 }
 
 func (s *session) finishTurn() {
+	s.interruptMu.Lock()
+	defer s.interruptMu.Unlock()
+
 	s.lifecycleMu.Lock()
 	cancel := s.cancel
 	s.cancel = nil
@@ -601,7 +609,22 @@ func (s *session) currentTurnNonce() string {
 // touched: routine cancellation is one session putting its own work down, not a
 // containment event.
 func (s *session) cancelTurn(ctx context.Context) error {
+	return s.cancelTurnForNonce(ctx, "")
+}
+
+// cancelTurnForNonce validates an addressed cancel and claims its interrupt in
+// one critical section. An empty nonce is reserved for internal close/settlement.
+func (s *session) cancelTurnForNonce(ctx context.Context, expectedNonce string) error {
+	s.interruptMu.Lock()
+	defer s.interruptMu.Unlock()
+
 	s.lifecycleMu.Lock()
+	if expectedNonce != "" && (s.cancel == nil || s.turnNonce != expectedNonce) {
+		s.lifecycleMu.Unlock()
+
+		return invalidRoute("cancel route is missing, stale, or does not target the active turn")
+	}
+
 	cancel := s.cancel
 	alreadyCancelled := s.cancelled
 	s.cancelled = true
@@ -672,19 +695,6 @@ func (s *session) interruptNativeWork(ctx context.Context) {
 	if err := client.Abort(ctx, nativeID); err != nil {
 		s.recordInterruptFailure(err)
 	}
-}
-
-// requireActiveTurn refuses a cancel that does not address the session's current
-// turn. A stale or absent route is never applied to a later turn.
-func (s *session) requireActiveTurn(turnNonce string) error {
-	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-
-	if s.cancel == nil || turnNonce == "" || s.turnNonce != turnNonce {
-		return invalidRoute("cancel route is missing, stale, or does not target the active turn")
-	}
-
-	return nil
 }
 
 // recordInterruptFailure records that the native interrupt itself failed. The
@@ -1450,9 +1460,13 @@ func (s *session) closeBoundary(commitResumable bool) error {
 	// abandoned to a process that is already being torn down.
 	if s.agent != nil && s.agent.providerAuth != nil {
 		flowCtx, flowCancel := context.WithTimeout(context.Background(), closeTimeout)
-		s.agent.providerAuth.closeSession(flowCtx, s.id)
+		flowErr := s.agent.providerAuth.closeSession(flowCtx, s.id)
 
 		flowCancel()
+
+		if flowErr != nil {
+			return containmentFailure(flowErr)
+		}
 	}
 
 	if err := s.containNativeScope(); err != nil {
@@ -1584,9 +1598,8 @@ func (s *session) containNativeScope() error {
 	return nil
 }
 
-// tombstoned reports that this session's id is durably deleted. A tombstoned
-// session owns no store row: writing one would unlist a tombstone this session
-// did not create and resurrect a session already reported gone.
+// tombstoned reports that this session's id is durably deleted. Skip work that
+// could only be discarded by the store's main-key tombstone guard.
 func (s *session) tombstoned() bool {
 	return s.agent != nil && s.agent.isDeleted(s.id)
 }

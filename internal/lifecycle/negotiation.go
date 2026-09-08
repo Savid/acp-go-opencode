@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"encoding/json"
 	"math"
+	"strings"
 )
 
 // MetaPath is the request path a rejection names. Negotiation and correlation
@@ -35,12 +36,14 @@ func (e *ParamError) Error() string {
 }
 
 func paramError(members ...string) *ParamError {
-	field := MetaPath
+	var field strings.Builder
+	field.WriteString(MetaPath)
+
 	for _, member := range members {
-		field += "." + member
+		field.WriteString("." + member)
 	}
 
-	return &ParamError{Field: field}
+	return &ParamError{Field: field.String()}
 }
 
 // missingParamError names the reserved key a surface requires and the caller
@@ -71,9 +74,9 @@ func DecodeCapability(meta map[string]any) (bool, *ParamError) {
 		return false, nil
 	}
 
-	fields, ok := raw.(map[string]any)
-	if !ok {
-		return false, paramError()
+	fields, refusal := negotiationFields(raw)
+	if refusal != nil {
+		return false, refusal
 	}
 
 	for key := range fields {
@@ -115,9 +118,9 @@ func DecodePromptCorrelation(meta map[string]any, negotiated Negotiated) (Submis
 		return Submission{}, missingParamError()
 	}
 
-	fields, ok := raw.(map[string]any)
-	if !ok {
-		return Submission{}, paramError()
+	fields, refusal := negotiationFields(raw)
+	if refusal != nil {
+		return Submission{}, refusal
 	}
 
 	for key := range fields {
@@ -168,16 +171,16 @@ func integerValue(raw any) (int, bool) {
 	case json.Number:
 		number, err := value.Int64()
 
-		return int(number), err == nil
+		return int(number), err == nil && int64(int(number)) == number
 	default:
 		return 0, false
 	}
 }
 
 func decodeSubmission(raw any) (Submission, *ParamError) {
-	fields, ok := raw.(map[string]any)
-	if !ok {
-		return Submission{}, paramError(fieldSubmission)
+	fields, refusal := negotiationFields(raw, fieldSubmission)
+	if refusal != nil {
+		return Submission{}, refusal
 	}
 
 	for key := range fields {

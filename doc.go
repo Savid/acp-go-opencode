@@ -9,9 +9,10 @@
 //
 // Hosts should use [Serve] for the JSON-RPC transport; hosts that embed the
 // agent directly construct one with [NewAgent] and the same [Option] values.
-// OpenCode authentication and provider credentials remain owned by the local
-// OpenCode installation. [WithHome] selects the Agent's exclusive shared XDG
-// root. When it is empty, the adapter materializes the root beneath the parent
+// OpenCode owns provider execution. In ordinary mode, configured provider-auth
+// methods broker explicit credential operations. [WithHome] selects the
+// Agent's exclusive shared XDG root. When it is empty, the adapter materializes
+// the root beneath the parent
 // selected by [WithScratchDir].
 //
 // [WithHostAuthority] delegates native environment, tree ownership, process
@@ -20,8 +21,9 @@
 //
 // Hosts that need durable remote resume can provide [WithSessionStore]. A
 // session store receives `opencode-sync-events-v1` native event bundles keyed
-// by the ACP-visible session ID and subpath, can back session/list, and can
-// replay an adopted parent/child graph through OpenCode's online sync API.
+// by the ACP-visible session ID and subpath. The store is authoritative for
+// session/list; each bundle restores one session's native aggregate through
+// OpenCode's online sync API. The default store lasts for the Agent's lifetime.
 //
 // Hosts that need structured output can attach [OpenCodeOptions] with
 // [WithSessionOpenCodeOptions] or use [WithSessionOutputSchema]. Parsed

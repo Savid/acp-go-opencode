@@ -15,6 +15,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestInvalidConcurrencyLimitsDoNotPanicAtConstruction(t *testing.T) {
+	for _, limits := range []ConcurrencyLimits{
+		{MaxActiveSessions: -1},
+		{MaxConcurrentClientCalls: -1},
+		{MaxActiveSessions: -1, MaxConcurrentClientCalls: -1},
+	} {
+		var agent *Agent
+		require.NotPanics(t, func() { agent = NewAgent(WithConcurrencyLimits(limits)) })
+		_, err := agent.Initialize(context.Background(), acp.InitializeRequest{})
+		require.Equal(t, map[string]any{jsonFieldError: valInvalidOptions}, requestError(context.Background(), err).Data)
+		require.NoError(t, agent.Close())
+	}
+}
+
 func TestOutputSchemaAccepted(t *testing.T) {
 	schema := map[string]any{"type": "object"}
 	meta, err := sessionMetaFromVendorOptions(OpenCodeOptions{OutputSchema: schema}.Meta())

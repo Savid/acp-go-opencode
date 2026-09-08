@@ -208,14 +208,62 @@ func TestCancelRequiresTheActiveTurnRoute(t *testing.T) {
 	client := newFakeOpenCodeClient(t)
 	current := testSession(t, agent, client)
 
-	require.Error(t, current.requireActiveTurn("missing"), "a cancel with no active turn was admitted")
+	require.Error(t, current.cancelTurnForNonce(t.Context(), "missing"), "a cancel with no active turn was admitted")
 
 	current.beginTurn(context.Background(), "nonce")
-	require.Error(t, current.requireActiveTurn("stale"))
-	require.NoError(t, current.requireActiveTurn("nonce"))
+	require.Error(t, current.cancelTurnForNonce(t.Context(), "stale"))
+	current.finishTurn()
+	current.beginTurn(t.Context(), "successor")
+	require.Error(t, current.cancelTurnForNonce(t.Context(), "nonce"))
+	require.False(t, current.wasCancelled(), "a stale cancel marked the successor cancelled")
 	current.finishTurn()
 
 	require.Zero(t, client.abortCount(), "a refused cancel reached the harness")
+}
+
+func TestPromptReleaseJoinsItsSessionAddressedAbort(t *testing.T) {
+	client := newFakeOpenCodeClient(t)
+	current := testSession(t, NewAgent(), client)
+	current.beginTurn(t.Context(), "nonce")
+
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	client.abortFunc = func(string) error {
+		close(entered)
+		<-unblock
+
+		return nil
+	}
+	defer func() {
+		select {
+		case <-unblock:
+		default:
+			close(unblock)
+		}
+	}()
+
+	cancelled := make(chan error, 1)
+	go func() { cancelled <- current.cancelTurnForNonce(t.Context(), "nonce") }()
+	<-entered
+
+	finished := make(chan struct{})
+	go func() {
+		current.finishTurn()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+		t.Fatal("prompt released its turn while its session-addressed abort was still in flight")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(unblock)
+	require.NoError(t, <-cancelled)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("prompt did not join the completed interrupt")
+	}
 }
 
 // TestCancelTurnInterruptsOnlyTheAddressedNativeSession proves the interrupt names

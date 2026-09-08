@@ -383,8 +383,8 @@ func normalizeNumber(lexeme string) (normalizedNumber, bool) {
 	}
 
 	whole, fraction := mantissa, ""
-	if index := strings.IndexByte(mantissa, '.'); index >= 0 {
-		whole, fraction = mantissa[:index], mantissa[index+1:]
+	if before, after, ok := strings.Cut(mantissa, "."); ok {
+		whole, fraction = before, after
 	}
 
 	digits := whole + fraction

@@ -1,6 +1,7 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -251,9 +252,31 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 // naming the params body itself rather than a prose token with no field.
 func decodeLocalAgentParams[Req any, ReqPtr localAgentParams[Req]](params json.RawMessage) (Req, *acp.RequestError) {
 	var value Req
+
+	meta := localRequestMeta(&value)
+
+	var (
+		retained any
+		present  bool
+	)
+	if meta != nil {
+		params, retained, present = lifecycle.PreserveRequestMeta(params)
+	}
+
+	params, owned := preserveRequestNumbers(params)
 	if err := json.Unmarshal(params, &value); err != nil {
 		return value, unsupportedRequest(jsonFieldParams)
 	}
+
+	if present {
+		if *meta == nil {
+			*meta = make(map[string]any)
+		}
+
+		(*meta)[lifecycle.MetaKey] = retained
+	}
+
+	owned.restore(&value)
 
 	if err := ReqPtr(&value).Validate(); err != nil {
 		return value, unsupportedRequest(jsonFieldParams)
@@ -443,4 +466,176 @@ func scopedElicitationParams(
 	payload["_meta"] = meta
 
 	return json.Marshal(payload)
+}
+
+// localRequestMeta names the SDK request fields this dispatcher carries. The
+// owned lifecycle value is restored here after SDK defaults and decoding.
+func localRequestMeta(value any) *map[string]any { //nolint:gocritic // The SDK decoder replaces the map; retain the address of its field.
+	switch request := value.(type) {
+	case *acp.InitializeRequest:
+		return &request.Meta
+	case *acp.AuthenticateRequest:
+		return &request.Meta
+	case *acp.LogoutRequest:
+		return &request.Meta
+	case *acp.CancelNotification:
+		return &request.Meta
+	case *acp.CloseSessionRequest:
+		return &request.Meta
+	case *acp.UnstableDeleteSessionRequest:
+		return &request.Meta
+	case *acp.ListSessionsRequest:
+		return &request.Meta
+	case *acp.LoadSessionRequest:
+		return &request.Meta
+	case *acp.NewSessionRequest:
+		return &request.Meta
+	case *acp.PromptRequest:
+		return &request.Meta
+	case *acp.ResumeSessionRequest:
+		return &request.Meta
+	case *acp.SetSessionModeRequest:
+		return &request.Meta
+	default:
+		return nil
+	}
+}
+
+// retainedRequestNumbers keeps route and image-handoff values out of the SDK's
+// float64 maps. Their existing validators still decide when they are relevant.
+type retainedRequestNumbers struct {
+	route        any
+	routePresent bool
+	handoffs     map[int]any
+}
+
+func preserveRequestNumbers(params json.RawMessage) (json.RawMessage, retainedRequestNumbers) {
+	retained := retainedRequestNumbers{handoffs: make(map[int]any)}
+	sanitized := rewriteRequestObject(params, func(key string, raw json.RawMessage) json.RawMessage {
+		switch {
+		case strings.EqualFold(key, "_meta"):
+			if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				retained.route, retained.routePresent = nil, false
+			}
+
+			return rewriteRequestObject(raw, func(namespace string, value json.RawMessage) json.RawMessage {
+				if namespace != routeEnvelopeKey {
+					return value
+				}
+
+				retained.route, retained.routePresent = rawOwnedValue(value), true
+
+				return json.RawMessage("null")
+			})
+		case strings.EqualFold(key, "prompt"):
+			var blocks []json.RawMessage
+			if json.Unmarshal(raw, &blocks) != nil {
+				return raw
+			}
+
+			clear(retained.handoffs)
+
+			for index, block := range blocks {
+				var header struct {
+					Type string `json:"type"`
+				}
+				if json.Unmarshal(block, &header) != nil || header.Type != mediaTypeImage {
+					continue
+				}
+
+				blocks[index] = rewriteRequestObject(block, func(member string, content json.RawMessage) json.RawMessage {
+					if !strings.EqualFold(member, "_meta") {
+						return content
+					}
+
+					if bytes.Equal(bytes.TrimSpace(content), []byte("null")) {
+						delete(retained.handoffs, index)
+					}
+
+					return rewriteRequestObject(content, func(namespace string, value json.RawMessage) json.RawMessage {
+						if namespace != handoffEnvelopeKey {
+							return value
+						}
+
+						retained.handoffs[index] = rawOwnedValue(value)
+
+						return json.RawMessage("null")
+					})
+				})
+			}
+
+			encoded, _ := json.Marshal(blocks)
+
+			return encoded
+		default:
+			return raw
+		}
+	})
+
+	return sanitized, retained
+}
+
+func (r retainedRequestNumbers) restore(value any) {
+	meta := localRequestMeta(value)
+	if r.routePresent && meta != nil {
+		if *meta == nil {
+			*meta = make(map[string]any)
+		}
+
+		(*meta)[routeEnvelopeKey] = r.route
+	}
+
+	request, ok := value.(*acp.PromptRequest)
+	if !ok {
+		return
+	}
+
+	for index, handoff := range r.handoffs {
+		if index < len(request.Prompt) && request.Prompt[index].Image != nil {
+			request.Prompt[index].Image.Meta[handoffEnvelopeKey] = handoff
+		}
+	}
+}
+
+func rawOwnedValue(raw json.RawMessage) any {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+
+	var value any
+
+	_ = decoder.Decode(&value)
+
+	return value
+}
+
+// rewriteRequestObject preserves SDK member order and foreign duplicate keys.
+// It rewrites only values selected by the owning metadata decoder.
+func rewriteRequestObject(raw json.RawMessage, rewrite func(string, json.RawMessage) json.RawMessage) json.RawMessage {
+	if !json.Valid(raw) || !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+		return raw
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	_, _ = decoder.Token()
+	out := []byte{'{'}
+
+	for decoder.More() {
+		token, _ := decoder.Token()
+		key, _ := token.(string)
+
+		var value json.RawMessage
+
+		_ = decoder.Decode(&value)
+
+		if len(out) > 1 {
+			out = append(out, ',')
+		}
+
+		name, _ := json.Marshal(key)
+		out = append(out, name...)
+		out = append(out, ':')
+		out = append(out, rewrite(key, value)...)
+	}
+
+	return append(out, '}')
 }

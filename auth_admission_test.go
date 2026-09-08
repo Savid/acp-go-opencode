@@ -213,7 +213,7 @@ func TestSessionCloseRefusesAnAuthorizeThatHasNotPublished(t *testing.T) {
 
 	<-release.arrived
 
-	fixture.broker.closeSession(context.Background(), fixture.session.id)
+	require.NoError(t, fixture.broker.closeSession(context.Background(), fixture.session.id))
 
 	close(release.release)
 
@@ -255,7 +255,7 @@ func TestRetiredAuthorizeRequestIDLeavesItsSuccessorAlone(t *testing.T) {
 
 	// The tombstones are session-scoped, so closing the session that minted them
 	// drops them with everything else the session could still be asked about.
-	fixture.broker.closeSession(context.Background(), fixture.session.id)
+	require.NoError(t, fixture.broker.closeSession(context.Background(), fixture.session.id))
 
 	fixture.broker.mu.Lock()
 	defer fixture.broker.mu.Unlock()
@@ -270,7 +270,7 @@ func TestRetiredAuthorizeRequestIDLeavesItsSuccessorAlone(t *testing.T) {
 func TestAReloadedSessionIsAdmittedAgain(t *testing.T) {
 	fixture := newAuthFixture(t)
 
-	fixture.broker.closeSession(context.Background(), fixture.session.id)
+	require.NoError(t, fixture.broker.closeSession(context.Background(), fixture.session.id))
 
 	_, err := fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
 	requireInvalidParams(t, err, jsonFieldSessionID)
@@ -483,7 +483,7 @@ func TestAReopenedSessionCannotSlipPastAHeldGate(t *testing.T) {
 
 	<-hold.arrived
 
-	fixture.broker.closeSession(context.Background(), fixture.session.id)
+	require.NoError(t, fixture.broker.closeSession(context.Background(), fixture.session.id))
 	require.NoError(t, fixture.agent.storeStartedSession(fixture.session))
 
 	second := make(chan struct{})

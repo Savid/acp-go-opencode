@@ -359,7 +359,7 @@ func TestCarrierSecretNeedlesProtectThePortableEventGraph(t *testing.T) {
 	}, nil)
 	agent.sessions[member.id] = member
 
-	needles := agent.graphSecretNeedles([]*session{member})
+	needles := member.snapshotSecretNeedles()
 	require.Contains(t, needles, "bearer-secret")
 	require.NotContains(t, needles, "ordinary")
 }

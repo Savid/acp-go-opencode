@@ -34,7 +34,7 @@ func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testi
 		return node, nil
 	}
 
-	created, err := broker.startBroker(context.Background())
+	created, err := broker.startBroker(context.Background(), "")
 	require.NoError(t, err)
 	require.NotNil(t, handed.BrowserShim)
 	require.Same(t, created.shim, handed.BrowserShim)
@@ -47,7 +47,7 @@ func TestStartBrokerShadowsLaunchersAndKeepsControlBelowTraversableHome(t *testi
 	require.True(t, strings.HasPrefix(filepath.Base(handed.BrowserShim.Dir()), "acp-go-opencode-browser-shim-"))
 	require.FileExists(t, filepath.Join(handed.BrowserShim.Dir(), "open"))
 
-	created.destroy(context.Background())
+	require.NoError(t, created.destroy(context.Background()))
 	require.NoDirExists(t, handed.BrowserShim.Dir())
 }
 
@@ -62,7 +62,7 @@ func TestDestroyReportsBrowserShimRemovalFailure(t *testing.T) {
 		home: t.TempDir(), shim: shim, client: newFakeOpenCodeClient(t), log: slog.New(slog.DiscardHandler),
 		removeShim: func() error { return errors.New("remove shim") },
 	}
-	broker.destroy(context.Background())
+	require.ErrorContains(t, broker.destroy(context.Background()), "remove shim")
 
 	require.DirExists(t, shim.Dir())
 }

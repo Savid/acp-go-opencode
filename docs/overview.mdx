@@ -14,8 +14,7 @@ Use it two ways: as a standalone subprocess an editor or host launches
 
 ## What the adapter owns
 
-The adapter is a thin translation layer. Its responsibilities stop at the ACP
-boundary: ACP dispatch, shared-runtime ownership, directory/session routing,
+The adapter owns ACP dispatch, shared-runtime ownership, directory/session routing,
 REST/SSE event mapping, permission and question bridging, config-option
 resolution, and `opencode-sync-events-v1` session storage.
 
@@ -23,13 +22,15 @@ The runtime binds to `127.0.0.1`, uses a random basic-auth password, and owns
 one exclusive XDG data/config/cache/state root. Native session IDs and
 directory-scoped event streams keep session traffic separate. One canonical
 working directory can have only one live session principal, because OpenCode's
-dynamic MCP registration is directory-scoped.
+dynamic MCP registration is directory-scoped. Forks in the same lineage may
+share that principal when their MCP configuration matches.
 
 ## What the adapter does not own
 
-OpenCode owns model execution, provider authentication, and native session
-state. The adapter never manages provider credentials or signs in to a provider
-on your behalf.
+OpenCode owns model execution and native session state. In ordinary execution,
+the adapter's configured [provider-auth methods](/docs/features/authentication)
+broker explicit credential operations through OpenCode. ACP `logout` only
+clears adapter-owned session state.
 
 ## Where to go next
 

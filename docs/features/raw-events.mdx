@@ -42,7 +42,7 @@ small marker (`truncated: true`, `maxBytes`, `reason`, and the original
 than sending the oversized body. The capability, its enable path, and the byte
 cap are advertised under `_meta.opencode.rawEvent` in the initialize response.
 
-Image payloads are the one exception to the unredacted rule: a base64 image data
+Provider-auth frames are suppressed entirely. Image payloads are redacted: a base64 image data
 URL collapses to a `data:<mime>;base64,[redacted N bytes]` marker, where N is the
 length of the base64 payload that was dropped, and a remote `url`/`uri` loses its
 query and fragment, so a raw event never duplicates emitted image bytes or a

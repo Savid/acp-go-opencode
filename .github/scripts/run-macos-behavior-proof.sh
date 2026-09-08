@@ -3,7 +3,7 @@ set -euo pipefail
 
 provider=opencode
 packages=(./internal/opencode)
-selector='^(TestOrdinaryWindowsExecutableAndEnvironmentBehavior|TestOrdinaryWindowsTeardownKillsTheShimGrandchild|TestWindowsEnvironmentCollapsesRepeatedSpellingsDeterministically)$'
+selector='^(TestOrdinaryResolverSkipsUnusableEarlierPATHCandidate|TestOrdinaryProcessAwaitCancellation|TestOrdinaryProcessDeliversTheTailWrittenBeforeExit|TestOrdinaryProcessReportsNaturalAndRevokedResults)$'
 
 # The hosted image supplies MinGW-w64; Go's race runtime requires its
 # synchronization library (https://go.dev/doc/articles/race_detector).

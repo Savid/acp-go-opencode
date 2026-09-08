@@ -35,14 +35,9 @@ const (
 	parentPathSegment          = ".."
 )
 
-// A native write that lands between the two /sync/history reads invalidates the
-// generation being exported. The reads are loopback-fast (measured p50 3ms, max
-// 28ms) while native writes on a working session arrive hundreds of milliseconds
-// apart (measured p50 96-278ms, max 1.23s), and a settling session stops writing
-// within about 0.75s of its turn going idle. Re-reading a whole generation is
-// therefore near-certain to land in a quiet window: five retries spend 1.55s of
-// backoff, which outlasts both the longest measured write gap and the longest
-// measured post-idle tail.
+// A native write between the two /sync/history reads invalidates the exported
+// generation. Retry the complete read with bounded exponential backoff so a
+// transient overlap can settle without weakening the watermark check.
 const (
 	stateCaptureAttempts    = 6
 	stateCaptureBackoffBase = 50 * time.Millisecond
@@ -57,12 +52,8 @@ var errGraphChangedDuringExport = errors.New("OpenCode graph changed during expo
 var sessionStateReplaceTimeout = 60 * time.Second
 var restoreRandRead = rand.Read
 
-// stateCaptureSettleBudget caps the wall clock the retries may add to a single
-// snapshot, so a session that never stops writing cannot make the snapshot
-// outlive the turn or the cancellation containment it belongs to. The prompt
-// path snapshots under a context detached from the turn, so without this bound
-// nothing would stop the loop; the cancellation path already carries a deadline
-// and keeps whichever bound expires first.
+// stateCaptureSettleBudget bounds native reads and retry waits together. A
+// shorter caller deadline still applies, including during cancellation.
 var stateCaptureSettleBudget = 5 * time.Second
 
 var stateCaptureWait = func(ctx context.Context, delay time.Duration) error {
@@ -149,12 +140,10 @@ func (s *session) snapshotToStore(ctx context.Context) error {
 	return s.commitStateSnapshot(ctx, captured)
 }
 
-// captureStateSnapshot reads one stable native sync generation without
-// publishing it. Cancellation uses the split capture/commit path so it can
-// collect the just-aborted turn while the loopback API is still online, prove
-// the complete native process tree is gone, and only then perform remote store
-// I/O. allowInterruptedGeneration is valid only after the native abort request
-// has settled; pending permissions and elicitations remain hard blockers.
+// captureStateSnapshot reads one session's stable native aggregate without
+// publishing it. A close captures while REST remains available, then commits
+// after its directory scope settles. Interrupted capture is allowed only after
+// native terminal evidence; pending actions remain blockers.
 func (s *session) captureStateSnapshot(
 	ctx context.Context,
 	allowInterruptedGeneration bool,
@@ -163,13 +152,8 @@ func (s *session) captureStateSnapshot(
 		return capturedStateSnapshot{}, err
 	}
 
-	// Cancellation retires and proves the complete shared native process tree
-	// before the cancelled ACP turn settles. detachRuntime records that loss
-	// before the loopback server is stopped. A later session/close must retain
-	// the last committed sync-event generation: the interrupted native
-	// generation is no longer an online snapshot source and reconnecting to its
-	// dead loopback address can neither make that generation durable nor improve
-	// the prior checkpoint.
+	// A retired runtime is no longer an online snapshot source. Preserve the
+	// last committed generation until recovery binds a replacement runtime.
 	s.mu.Lock()
 	runtimeLost := s.runtimeLostCause != ""
 	s.mu.Unlock()
@@ -178,108 +162,84 @@ func (s *session) captureStateSnapshot(
 		return capturedStateSnapshot{}, nil
 	}
 
-	// A stored bundle is exactly one logical session's. OpenCode's native fork
-	// produces an independent aggregate — the forked session owns a complete
-	// copy of the history it branched from and its native parentID is unset — so
-	// no session's restore needs another session's events, and a bundle that
-	// carried them would go stale the moment that other session did any work.
-	// Lineage is recorded as identity on the node and the carrier instead.
-	graph := []*session{s}
-	for _, member := range graph {
-		if reason := member.snapshotBlockedReason(); reason != "" {
-			if !allowInterruptedGeneration || member != s || reason != snapshotBlockGeneration {
-				return capturedStateSnapshot{}, fmt.Errorf("cannot snapshot OpenCode graph while %s pending", reason)
-			}
+	if reason := s.snapshotBlockedReason(); reason != "" {
+		if !allowInterruptedGeneration || reason != snapshotBlockGeneration {
+			return capturedStateSnapshot{}, fmt.Errorf("cannot snapshot OpenCode graph while %s pending", reason)
 		}
 	}
 
-	allow := make(map[string]stateSnapshotNode, len(graph))
-	nodes := make([]stateSnapshotNode, 0, len(graph))
-
-	for _, member := range graph {
-		snapshot := member.snapshot()
-		node := stateSnapshotNode{
-			SessionID: string(snapshot.id), NativeSessionID: snapshot.idmap.NativeSessionID,
-			ParentSessionID: snapshot.idmap.ParentSessionID,
-			NativeParentID:  snapshot.idmap.NativeParentSessionID,
-			SourceCwd:       snapshot.cwd, Permission: snapshot.permission,
-		}
-		allow[node.NativeSessionID] = node
-		nodes = append(nodes, node)
+	snapshot := s.snapshot()
+	node := stateSnapshotNode{
+		SessionID: string(snapshot.id), NativeSessionID: snapshot.idmap.NativeSessionID,
+		ParentSessionID: snapshot.idmap.ParentSessionID,
+		NativeParentID:  snapshot.idmap.NativeParentSessionID,
+		SourceCwd:       snapshot.cwd, Permission: snapshot.permission,
 	}
-
-	// Emitted image bytes live once, in the canonical artifact records that
-	// ride this same replacement set; the captured native events keep
-	// references instead of a second base64 copy.
-	artifacts := unionImageArtifacts(graph)
+	nodes := []stateSnapshotNode{node}
+	allow := map[string]stateSnapshotNode{node.NativeSessionID: node}
+	artifacts := s.cloneImageArtifacts()
 
 	events, err := s.stableSyncGeneration(ctx, allow, artifacts)
 	if err != nil {
 		return capturedStateSnapshot{}, err
 	}
 
-	generation, err := newRestoreGeneration()
+	s.agent.restoreMu.Lock()
+	defer s.agent.restoreMu.Unlock()
+
+	generation, err := snapshotRestoreGeneration(snapshot.client, node)
 	if err != nil {
 		return capturedStateSnapshot{}, err
 	}
 
-	now := time.Now().UnixMilli()
-	replacements := make([]SessionStoreReplacement, 0, len(graph))
-
-	for _, member := range graph {
-		memberSnapshot := member.snapshot()
-
-		durableEnv := cloneStringMap(memberSnapshot.carrier.Env)
-		if durableEnv == nil {
-			durableEnv = map[string]string{}
-		}
-
-		bundle := stateSnapshot{
-			Format: SessionStoreFormat, AdapterVersion: s.agent.options.AgentVersion,
-			NativeVersion: s.client.NativeVersion(), EventSchemaVersion: syncEventSchemaVersion,
-			CapturedAtUnixMilli: now, RestoreGeneration: generation,
-			Session: stateSnapshotSession{
-				SessionID: string(memberSnapshot.id), NativeSessionID: memberSnapshot.idmap.NativeSessionID,
-				ParentSessionID:       memberSnapshot.idmap.ParentSessionID,
-				NativeParentSessionID: memberSnapshot.idmap.NativeParentSessionID,
-				Cwd:                   memberSnapshot.cwd, Title: memberSnapshot.title,
-				Model: stateSnapshotModel{
-					ProviderID: memberSnapshot.providerID, ModelID: memberSnapshot.modelID,
-					Agent: memberSnapshot.mode, Variant: memberSnapshot.variant,
-				},
-				Env:           durableEnv,
-				ExtraPathDirs: append([]string{}, memberSnapshot.carrier.ExtraPathDirs...),
-			},
-			Graph: nodes, Events: events,
-		}
-
-		// The closed typed tree contains only sync-event RawMessages already validated as JSON.
-		entry, _ := json.Marshal(bundle)
-
-		if err := scanStateSnapshot(bundle, s.agent.graphSecretNeedles(graph)); err != nil {
-			return capturedStateSnapshot{}, err
-		}
-
-		replacements = append(replacements, SessionStoreReplacement{
-			Key:     SessionKey{SessionID: string(memberSnapshot.id), Subpath: SessionStoreMainSubpath},
-			Entries: []SessionStoreEntry{entry},
-		})
-
-		artifactReplacements, artifactErr := imageArtifactReplacements(string(memberSnapshot.id), artifacts)
-		if artifactErr != nil {
-			return capturedStateSnapshot{}, artifactErr
-		}
-
-		replacements = append(replacements, artifactReplacements...)
+	// Fork lineage is metadata only. Each fork owns an independent native
+	// aggregate, and this replacement never includes its parent's state.
+	durableEnv := cloneStringMap(snapshot.carrier.Env)
+	if durableEnv == nil {
+		durableEnv = map[string]string{}
 	}
 
-	s.agent.restoreMu.Lock()
-	ownershipErr := recordSnapshotOwnership(s.client, stateSnapshot{
+	bundle := stateSnapshot{
+		Format: SessionStoreFormat, AdapterVersion: s.agent.options.AgentVersion,
+		NativeVersion: snapshot.client.NativeVersion(), EventSchemaVersion: syncEventSchemaVersion,
+		CapturedAtUnixMilli: time.Now().UnixMilli(), RestoreGeneration: generation,
+		Session: stateSnapshotSession{
+			SessionID: string(snapshot.id), NativeSessionID: snapshot.idmap.NativeSessionID,
+			ParentSessionID:       snapshot.idmap.ParentSessionID,
+			NativeParentSessionID: snapshot.idmap.NativeParentSessionID,
+			Cwd:                   snapshot.cwd, Title: snapshot.title,
+			Model: stateSnapshotModel{
+				ProviderID: snapshot.providerID, ModelID: snapshot.modelID,
+				Agent: snapshot.mode, Variant: snapshot.variant,
+			},
+			Env:           durableEnv,
+			ExtraPathDirs: append([]string{}, snapshot.carrier.ExtraPathDirs...),
+		},
+		Graph: nodes, Events: events,
+	}
+
+	// The typed tree contains only sync-event RawMessages validated as JSON.
+	entry, _ := json.Marshal(bundle)
+	if scanErr := scanStateSnapshot(bundle, s.snapshotSecretNeedles()); scanErr != nil {
+		return capturedStateSnapshot{}, scanErr
+	}
+
+	artifactReplacements, err := imageArtifactReplacements(string(snapshot.id), artifacts)
+	if err != nil {
+		return capturedStateSnapshot{}, err
+	}
+
+	replacements := make([]SessionStoreReplacement, 0, 1+len(artifactReplacements))
+	replacements = append(replacements, SessionStoreReplacement{
+		Key:     SessionKey{SessionID: string(snapshot.id), Subpath: SessionStoreMainSubpath},
+		Entries: []SessionStoreEntry{entry},
+	})
+	replacements = append(replacements, artifactReplacements...)
+
+	ownershipErr := recordSnapshotOwnership(snapshot.client, stateSnapshot{
 		RestoreGeneration: generation,
 		Graph:             nodes,
 	})
-	s.agent.restoreMu.Unlock()
-
 	if ownershipErr != nil {
 		return capturedStateSnapshot{}, ownershipErr
 	}
@@ -302,6 +262,9 @@ func (s *session) stableSyncGeneration(
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
+
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 
 	var changed error
 
@@ -377,10 +340,8 @@ func (s *session) commitStateSnapshot(ctx context.Context, captured capturedStat
 		return nil
 	}
 
-	// A tombstoned session writes nothing. A replacement unlists the tombstone
-	// for every key it writes, so a settlement racing the delete that already
-	// succeeded would recreate the row and make a deleted session listable and
-	// loadable again.
+	// Avoid an unnecessary write after delete. The store independently enforces
+	// main-key tombstone finality when deletion races this check.
 	if s.tombstoned() {
 		return nil
 	}
@@ -411,19 +372,13 @@ func (s *session) snapshotBlockedReason() string {
 	return ""
 }
 
-func (a *Agent) graphSecretNeedles(graph []*session) []string {
-	var needles []string
+func (s *session) snapshotSecretNeedles() []string {
+	s.mu.Lock()
+	needles := append([]string(nil), s.secretNeedles...)
+	needles = append(needles, sensitiveEnvNeedles(s.carrier.Env)...)
+	s.mu.Unlock()
 
-	for _, member := range graph {
-		member.mu.Lock()
-		needles = append(needles, member.secretNeedles...)
-		needles = append(needles, sensitiveEnvNeedles(member.carrier.Env)...)
-		member.mu.Unlock()
-	}
-
-	needles = append(needles, sensitiveEnvNeedles(a.options.Env)...)
-
-	return needles
+	return append(needles, sensitiveEnvNeedles(s.agent.options.Env)...)
 }
 
 // sensitiveEnvNeedles names the process-environment values a stored snapshot

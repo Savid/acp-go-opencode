@@ -46,7 +46,7 @@ quiescence because native status polling cannot prove it.
 One lifecycle incarnation retains at most 8,192 emitted frames, 1,024 turn
 identities, and 1,024 action identities. Reaching the next frame or identity
 fails and contains that exact incarnation. These are emitter-only ownership
-bounds; a canonical consumer reducer retains the full incarnation history so
+bounds; the host reducer retains the full incarnation history so
 exact retransmission checks never weaken with age.
 
 ## Stream mapping

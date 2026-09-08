@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"slices"
@@ -152,6 +153,10 @@ func routeIntegerValue(raw any) (int, bool) {
 		return int(value), true
 	case int:
 		return value, true
+	case json.Number:
+		wide, ok := handoffInteger(json.RawMessage(value))
+
+		return int(wide), ok && wide >= math.MinInt32 && wide <= math.MaxInt32
 	default:
 		return 0, false
 	}

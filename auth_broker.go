@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
+
+	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
@@ -29,12 +32,18 @@ const authBrokerPrefix = "acp-go-opencode-auth-broker-"
 // opencode serve with its own XDG root, never the long-lived runtime server
 // whose store is the durable credential root. It holds no durable credential —
 // the single fenced install lands in the shared runtime root — and it is
-// destroyed on every terminal transition of its flow.
+// retired on every terminal transition of its flow. Cleanup retains its native
+// handle, home, and browser shim until shutdown is proven.
 type authBroker struct {
-	home   string
-	shim   *opencode.BrowserShim
-	client opencode.Client
-	log    *slog.Logger
+	mu           sync.Mutex
+	sessionID    acp.SessionId
+	shutdownDone bool
+	destroyed    bool
+	startErr     error
+	home         string
+	shim         *opencode.BrowserShim
+	client       opencode.Client
+	log          *slog.Logger
 
 	// removeShim replaces shim deletion. Destruction must report a shim it
 	// failed to delete, so the failure is injected per broker. A package-level
@@ -53,7 +62,23 @@ func (b *authBroker) removeBrowserShim() error {
 
 // startBroker creates the broker home under the adapter-supplied scratch
 // parent and starts the broker server inside it.
-func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
+func (p *providerAuth) startBroker(ctx context.Context, sessionID acp.SessionId) (*authBroker, error) {
+	p.brokerMu.Lock()
+	defer p.brokerMu.Unlock()
+
+	p.mu.Lock()
+	admitted := p.sessionAdmitted(sessionID)
+	p.mu.Unlock()
+
+	if !admitted {
+		return nil, authSessionUnknown()
+	}
+	// Drain retired ownership before allocating another residence. A failed
+	// cleanup cannot accumulate an unbounded sequence of abandoned launches.
+	if err := p.cleanupBrokersLocked(ctx, "", false); err != nil {
+		return nil, err
+	}
+
 	agent := p.agent
 
 	parent, err := agent.ensureScratchParent()
@@ -94,6 +119,14 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 	// StartServer protects ControlRoot as 0700. Keep it below the broker home.
 	controlRoot := filepath.Join(home, "control")
 
+	broker := &authBroker{home: home, shim: shim, sessionID: sessionID, log: agent.log}
+
+	if p.brokers == nil {
+		p.brokers = make(map[*authBroker]bool)
+	}
+
+	p.brokers[broker] = false
+
 	client, err := factory(ctx, opencode.StartOptions{
 		Root:          nativeHome,
 		ControlRoot:   controlRoot,
@@ -111,48 +144,130 @@ func (p *providerAuth) startBroker(ctx context.Context) (*authBroker, error) {
 		ExistingXDG:     xdg,
 		SkipVersionGate: true,
 	})
+
+	broker.client = client
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("start provider auth broker: %w", err), shim.Remove(), brokerRemoveAll(home))
+		// A failed start may have no retry handle. Preserve its residences when
+		// containment was not proved; never infer safety from a nil client.
+		if client == nil && (errors.Is(err, opencode.ErrProcessContainmentIncomplete) || errors.Is(err, ErrContainmentIncomplete)) {
+			broker.startErr = err
+		}
+
+		p.brokers[broker] = true
+
+		return nil, errors.Join(fmt.Errorf("start provider auth broker: %w", err), p.destroyBrokerLocked(ctx, broker))
 	}
 
-	return &authBroker{home: home, shim: shim, client: client, log: agent.log}, nil
+	return broker, nil
 }
 
-// authBrokerRemoveAttempts bounds how long destruction waits out descendants of
-// the broker process that are still writing into the home. A plugin install
-// running under the server keeps creating directories as removal walks them, so
-// the first pass fails with a not-empty directory the caller never sees again.
+// authBrokerRemoveAttempts bounds retries of transient filesystem failures.
 const authBrokerRemoveAttempts = 5
 
-// authBrokerRemoveBackoff is the pause between removal attempts.
 var authBrokerRemoveBackoff = 100 * time.Millisecond
 
-// destroy terminates the broker process first and removes its directory after.
-// Removing the directory alone would leave a live server holding credentials in
-// memory and able to recreate its own path.
-func (b *authBroker) destroy(ctx context.Context) {
+// destroy retains both the native home and browser neutralizer until shutdown
+// proves completion. Concurrent cleanup callers join through the broker lock.
+func (b *authBroker) destroy(ctx context.Context) error {
 	if b == nil {
-		return
+		return nil
 	}
 
-	if err := b.client.Shutdown(context.Background()); err != nil {
-		b.log.WarnContext(ctx, "shutdown provider auth broker failed", loggableError(err))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.destroyed {
+		return nil
+	}
+
+	if b.startErr != nil {
+		return containmentFailure(b.startErr)
+	}
+
+	if !b.shutdownDone {
+		if b.client != nil {
+			if err := b.client.Shutdown(ctx); err != nil {
+				return containmentFailure(err)
+			}
+		}
+
+		b.shutdownDone = true
 	}
 
 	if err := removeBrokerHome(b.home); err != nil {
-		b.log.WarnContext(ctx, "remove provider auth broker home failed", loggableError(err))
+		return fmt.Errorf("remove provider auth broker home: %w", err)
+	}
+	// The neutralizer outlives every process it shadows.
+	if err := b.removeBrowserShim(); err != nil {
+		return fmt.Errorf("remove provider auth broker browser shim: %w", err)
 	}
 
-	// The shim outlives the process it shadows, so it goes last.
-	if err := b.removeBrowserShim(); err != nil {
-		b.log.WarnContext(ctx, "remove provider auth broker browser shim failed", loggableError(err))
-	}
+	b.destroyed = true
+
+	return nil
 }
 
-// removeBrokerHome removes the home, retrying while a descendant of the closed
-// broker keeps repopulating it. Destruction is what guarantees a stale native
-// approval lands in a store that no longer exists, so a home that survives is
-// the one failure this leg cannot report as success on the first try.
+// retireBroker transfers the exact handle from a flow to agent cleanup ownership.
+func (p *providerAuth) retireBroker(ctx context.Context, broker *authBroker) error {
+	if broker == nil {
+		return nil
+	}
+
+	p.brokerMu.Lock()
+	defer p.brokerMu.Unlock()
+
+	if p.brokers == nil {
+		p.brokers = make(map[*authBroker]bool)
+	}
+
+	p.brokers[broker] = true
+
+	return p.destroyBrokerLocked(ctx, broker)
+}
+
+func (p *providerAuth) destroyBrokerLocked(ctx context.Context, broker *authBroker) error {
+	if err := broker.destroy(ctx); err != nil {
+		p.agent.log.WarnContext(ctx, "provider auth broker cleanup failed", loggableError(err))
+
+		return err
+	}
+
+	delete(p.brokers, broker)
+
+	return nil
+}
+
+// cleanupBrokersLocked retries retained cleanup. Closing selects active brokers
+// too, including starts whose flow has not yet received the runtime handle.
+func (p *providerAuth) cleanupBrokersLocked(ctx context.Context, sessionID acp.SessionId, closing bool) error {
+	var result error
+
+	for broker, retired := range p.brokers {
+		if sessionID != "" && broker.sessionID != sessionID {
+			continue
+		}
+
+		if closing {
+			retired = true
+			p.brokers[broker] = true
+		}
+
+		if retired {
+			result = errors.Join(result, p.destroyBrokerLocked(ctx, broker))
+		}
+	}
+
+	return result
+}
+
+func (p *providerAuth) retryBrokerCleanup(ctx context.Context, sessionID acp.SessionId) error {
+	p.brokerMu.Lock()
+	defer p.brokerMu.Unlock()
+
+	return p.cleanupBrokersLocked(ctx, sessionID, false)
+}
+
+// removeBrokerHome retries transient filesystem failures after shutdown.
 func removeBrokerHome(home string) error {
 	var err error
 

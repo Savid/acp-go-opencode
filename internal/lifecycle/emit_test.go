@@ -117,7 +117,7 @@ func TestEmitterTurnAndActionRegistriesFailAtTheirExactBounds(t *testing.T) {
 		stream := NewStream("stream-turns", promptContained())
 		_, err := stream.Emit(SnapshotEvent(Foreground{State: ForegroundIdle, CycleID: "cycle-0"}, nil, QuiescenceFact{}))
 		require.NoError(t, err)
-		for index := 0; index < EmitterTurnLimit; index++ {
+		for index := range EmitterTurnLimit {
 			turnID := fmt.Sprintf("turn-%d", index)
 			cycleID := fmt.Sprintf("cycle-%d", index)
 			_, err = stream.Emit(AcceptedEvent(Submission{SubmissionID: fmt.Sprintf("submission-%d", index), ClientNonce: "nonce"}, turnID))
@@ -148,7 +148,7 @@ func TestEmitterTurnAndActionRegistriesFailAtTheirExactBounds(t *testing.T) {
 		require.NoError(t, err)
 		_, err = stream.Emit(TransitionEvent(ForegroundRunning, "cycle-1", "turn-1", CauseSubmission))
 		require.NoError(t, err)
-		for index := 0; index < EmitterActionLimit; index++ {
+		for index := range EmitterActionLimit {
 			actionID := fmt.Sprintf("action-%d", index)
 			_, err = stream.Emit(ActionEvent(PendingAction(actionID, ActionPermission, Owner{Type: OwnerTurn, ID: "turn-1"}, false)))
 			require.NoError(t, err)

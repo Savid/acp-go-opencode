@@ -21,6 +21,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestDeleteRefusesInvalidOptionsBeforeStoreMutation(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemorySessionStore()
+	key := SessionKey{SessionID: "retained-session"}
+	require.NoError(t, store.Append(ctx, key, []SessionStoreEntry{json.RawMessage(`{}`)}))
+	agent := NewAgent(WithSessionStore(store), WithTurnTimeout(-time.Second))
+	_, err := agent.UnstableDeleteSession(ctx, DeleteSessionRequest(acp.SessionId(key.SessionID)))
+	require.Error(t, err)
+	require.Equal(t, map[string]any{jsonFieldError: valInvalidOptions}, requestError(ctx, err).Data)
+	entries, err := store.Load(ctx, key)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.False(t, agent.isDeleted(acp.SessionId(key.SessionID)))
+}
+
 func TestAgentOwnsOneSharedRuntimeForManyDirectories(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeOpenCodeClient(t)
@@ -644,17 +659,14 @@ func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 	for index := range cases {
 		cases[index].cwd = t.TempDir()
 		cases[index].marker = fmt.Sprintf("cwd-marker-%d", index)
-		createGroup.Add(1)
 
-		go func() {
-			defer createGroup.Done()
-
+		createGroup.Go(func() {
 			created, err := agent.NewSession(ctx, NewSessionRequest(cases[index].cwd))
 			if err == nil {
 				cases[index].id = created.SessionId
 			}
 			createErrors <- err
-		}()
+		})
 	}
 	createGroup.Wait()
 	close(createErrors)
@@ -670,17 +682,13 @@ func TestSharedRuntimeEightSessionRaceNativeCWDIsolation(t *testing.T) {
 	var promptGroup sync.WaitGroup
 	promptErrors := make(chan error, sessionCount)
 	for index := range cases {
-		promptGroup.Add(1)
-
-		go func() {
-			defer promptGroup.Done()
-
+		promptGroup.Go(func() {
 			response, err := agent.Prompt(ctx, TextPromptRequest(cases[index].id, fmt.Sprintf("turn-%d", index), cases[index].marker))
 			if err == nil && response.StopReason != acp.StopReasonEndTurn {
 				err = fmt.Errorf("stop reason = %q", response.StopReason)
 			}
 			promptErrors <- err
-		}()
+		})
 	}
 	promptGroup.Wait()
 	close(promptErrors)
@@ -2266,13 +2274,9 @@ func TestLoadRacingDeleteSerializesTheSameLogicalSession(t *testing.T) {
 		loadErr error
 	)
 
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		_, loadErr = agent.LoadSession(ctx, LoadSessionRequest(created.SessionId, cwd))
-	}()
+	})
 
 	select {
 	case <-reached:
