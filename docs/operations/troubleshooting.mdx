@@ -20,23 +20,18 @@ The overall readiness budget defaults to 60 seconds and is configurable with
 session creation stays slow, raise `-debug` logging and watch the per-stage
 startup timings on stderr.
 
-Health and OpenAPI usually answer within seconds; the long wait, when there is
-one, is OpenCode npm-installing its plugin loader into a fresh runtime root
-before it will load the adapter's session carrier. The adapter pays that once
-per binary, in a priming launch with a readiness budget of its own, and serves
-every runtime root from the
-[plugin seed cache](/docs/reference/cli#plugin-seed-cache) afterwards. A boot
-that still waits minutes with `-debug` on will log why: a
+OpenCode installs its plugin loader into a fresh runtime root before loading
+the adapter's session carrier. Ordinary execution can reuse the
+[plugin seed cache](/docs/reference/cli#plugin-seed-cache), populated by a
+session-free priming launch with its own readiness budget. With `-debug`, a
 `plugin seed not restored` line names why the cache was not used, such as an
 unresolvable executable, a cache directory owned by another user, or
 `-no-plugin-seed`, and a `plugin seed not primed` line names why the priming
 launch could not fill it, such as a missing `-scratch-dir` parent, a native
 process that failed to start, or an install OpenCode never completed. The
-first `session/new` after a binary upgrade is the priming launch itself and
-takes minutes; the runtime that follows it boots warm.
-
-Reproduced by `TestHealthAttemptDeadlineReleaseGate` in
-`internal/opencode/opencode_client_lifecycle_test.go`.
+first `session/new` after a binary upgrade waits for priming before its runtime
+starts. Managed execution skips the cache to preserve executable-selector
+opacity; allow enough readiness time for the native install in a fresh root.
 
 ## Denied tools raise no permission callback
 
@@ -69,20 +64,13 @@ the command error. It never re-sends the slash text as a plain prompt, which
 would silently run something other than what the user asked for. A failed
 catalog refresh is logged without emitting a misleading commands update.
 
-Reproduced by `TestPromptSlashCommandStaleRaceRefreshesWithoutPlainRetry` in
-`session_prompt_test.go`.
-
 ## Native server exits unexpectedly
 
 All of an Agent's sessions share one `opencode serve` runtime. When that
-process exits unexpectedly, the adapter releases the dead runtime's resources,
-retains the loaded sessions, and recovers them on a fresh runtime before the
-next prompt runs; that prompt then completes normally on the replacement
-server.
-
-Reproduced by
-`TestUnexpectedSharedRuntimeExitRecoversLoadedSessionBeforeNextPrompt` in
-`agent_session_test.go`.
+process exits unexpectedly, the adapter retains loaded sessions and attempts
+recovery before their next prompt. Replacement admission waits for the retired
+runtime's cleanup boundary and restores each session's committed snapshot.
+Unproven cleanup or contradictory native state fails the request.
 
 ## Startup fails on a version mismatch
 
@@ -104,12 +92,8 @@ without waiting on any client answer.
 
 A client that never advertised the elicitation form capability never sees a
 question at all — the adapter rejects it immediately by design instead of
-surfacing a prompt the client cannot answer. Reproduced by
-`TestQuestionToolElicitationAcceptDeclineAndNoCapability` in
-`session_prompt_test.go`.
+surfacing a prompt the client cannot answer.
 
 A question naming a tool call other than the one the active turn just
 published — a stale or foreign call ID — is rejected the same way instead of
-reaching the client. Reproduced by
-`TestPermissionAndQuestionCallbacksFollowExactToolStartOnACPWire` in
-`session_prompt_test.go`.
+reaching the client.

@@ -145,25 +145,27 @@ they do, and each is visible to a host as an ordinary leg answer:
   own context ends while it waits for the slot answers `timeout` and mutates
   nothing.
 
-`session/close` marks the session closed in the same step that takes its cleanup
-set. It never waits for an in-flight leg, because a native login has no bound
-short enough to block a close on. An `authorize` that had already passed session
-lookup is instead refused when it goes to publish its flow, with the same
-unknown-session answer an unknown id gets, and it starts no broker.
+`session/close` fences new flow publication and joins broker cleanup. An
+`authorize` that has not published is refused; a broker start already in flight
+remains owned by the cleanup registry even before its flow receives the handle.
+Cleanup waits use bounded contexts, and failed cleanup remains available to retry.
 
 ### Per-flow broker homes
 
 A device or paste-back flow runs against a dedicated short-lived
 `opencode serve` in its own XDG root under the scratch parent, named
 `acp-go-opencode-auth-broker-*`. On native completion the adapter reads the
-finished credential out of that broker home's own store, performs one fenced
-install into the durable runtime store, and destroys the home — terminating the
-ordinary process first, waiting for exit, then removing the directory. Destruction happens on every
-terminal transition, including expiry, cancellation, and failure, and a
-superseding `authorize` destroys the abandoned home without installing anything
-from it. Removal is retried while descendants of the closed server are still
-writing into the tree, because a home that survives its flow is a home a stale
-native approval can still complete into.
+finished credential from that broker's store and performs one fenced install
+into the durable runtime store. Every terminal transition retires the broker,
+including expiry, cancellation, failure, and supersession.
+
+The agent retains the exact runtime, native home, and browser neutralizer until
+shutdown succeeds. A failed or uncertain shutdown removes neither directory.
+Filesystem cleanup follows shutdown and retries transient removal failures.
+Failed cleanup survives flow retirement and blocks further broker launches;
+repeated cancel, session close, or `Agent.Close` can retry it. Auth legs report
+cleanup failure through the existing `process` cause. `Agent.Close` retains the
+shared runtime and session state needed to finish outstanding close commits.
 
 ### Neutralized browser launches
 
@@ -175,8 +177,8 @@ parent, placed ahead of every other entry on the broker's `PATH`. `BROWSER`
 points at the same no-op. Setting `BROWSER` on its own would not be enough: a
 launcher that execs `open` directly never reads it, and OpenCode's login
 callback listens on this host, so a tab that reached it would complete a real
-grant unattended. The directory is removed with the broker home on every
-terminal transition.
+grant unattended. The directory is removed after the broker runtime has stopped and its home
+has been removed.
 
 Browser shadowing is impossible on Windows: the system directory resolves ahead
 of every `PATH` entry and the `start` that opens a URL is a shell builtin with

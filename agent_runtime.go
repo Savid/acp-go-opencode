@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -478,6 +479,10 @@ func (a *Agent) startSharedRuntime(ctx context.Context) (opencode.Client, error)
 	a.nativeAdmissionMu.Lock()
 	defer a.nativeAdmissionMu.Unlock()
 
+	if err := a.prepareManagedImageRoots(); err != nil {
+		return nil, err
+	}
+
 	if a.options.hostAuthorityConfigured && a.options.Home != "" {
 		seedPaths := make([]string, 0, len(a.options.SeedFiles))
 		for path := range a.options.SeedFiles {
@@ -612,9 +617,7 @@ func (a *Agent) retryRetiredNativeTrees(ctx context.Context) error {
 	a.mu.Lock()
 
 	trees := make(map[string]retiredNativeTree, len(a.retiredNativeTrees))
-	for path, tree := range a.retiredNativeTrees {
-		trees[path] = tree
-	}
+	maps.Copy(trees, a.retiredNativeTrees)
 	a.mu.Unlock()
 
 	var result error

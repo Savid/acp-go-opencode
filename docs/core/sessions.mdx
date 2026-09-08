@@ -10,7 +10,7 @@ subscriptions also carry the canonical working directory.
 
 OpenCode registers MCP dynamically at directory scope. The adapter therefore
 admits only one live session principal for a canonical working directory. A
-second live session in that directory is rejected, and a changed MCP
+second unrelated live session in that directory is rejected, and a changed MCP
 fingerprint is rejected as a principal conflict.
 
 ## Session environment and tool paths
@@ -55,7 +55,7 @@ its latest generation and proves its native scope contained before its active
 slot is released and the successor is hydrated. Failed containment publishes
 no successor, so old and new credential carriers never overlap.
 
-`PATH` is refused inside `env`, without regard to case, because the map replaces
+`PATH` is refused inside `env` (case-insensitively on Windows), because the map replaces
 whole values. `extraPathDirs` is the additive mechanism that owns the search
 path. Static environment values configured with `WithEnv` remain shared by the
 Agent's native server and never carry session values.
@@ -126,10 +126,9 @@ absolute path takes that same verdict on the `cwd` field, on `session/new`,
 `session/load`, `session/resume`, and `_opencode/session/fork` alike, and so
 does a `_opencode/*` params body the adapter cannot decode or that fails
 validation as a whole, which names `params`. Every other startup failure is
-`-32603`. When a loopback call to the native server failed, the
-message names the method, route, and status of that call alone: native response
-bodies, query strings, model names, configuration, and credentials never reach
-the client.
+`-32603` with closed adapter error data. Native response bodies, request
+details, model names, configuration, and credentials are not exposed as error
+diagnostics to the client.
 
 A `session/load` or `session/resume` whose stored snapshot cannot be replayed is
 `-32603` with the closed `{"error":"opencode_restore_failed"}` data, so a host

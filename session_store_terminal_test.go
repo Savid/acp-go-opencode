@@ -13,7 +13,7 @@ func TestInspectSessionStoreTerminalStateIgnoresLateDuplicateUser(t *testing.T) 
 	snapshot := terminalTestSnapshot(t,
 		terminalMessageEvent("native", 1, "user-created", "user", "", nil),
 		terminalMessageEvent("native", 2, "assistant-terminal", "assistant", "stop", nil),
-		terminalMessageEvent("native", 3, "assistant-terminal", "assistant", "stop", int64Pointer(300)),
+		terminalMessageEvent("native", 3, "assistant-terminal", "assistant", "stop", new(int64(300))),
 		syncTestEvent("native", 4, "session.updated.1", nil),
 		terminalMessageEvent("native", 5, "user-created", "user", "", nil),
 	)
@@ -27,7 +27,7 @@ func TestInspectSessionStoreTerminalStateNoTerminalAssistant(t *testing.T) {
 	snapshot := terminalTestSnapshot(t,
 		terminalMessageEvent("native", 1, "user", "user", "", nil),
 		terminalMessageEvent("native", 2, "assistant-pending", "assistant", "", nil),
-		terminalMessageEvent("native", 3, "assistant-completed-only", "assistant", "", int64Pointer(100)),
+		terminalMessageEvent("native", 3, "assistant-completed-only", "assistant", "", new(int64(100))),
 		terminalMessageEvent("native", 4, "user", "user", "", nil),
 	)
 
@@ -38,9 +38,9 @@ func TestInspectSessionStoreTerminalStateNoTerminalAssistant(t *testing.T) {
 
 func TestInspectSessionStoreTerminalStateSelectsLatestAssistantTerminal(t *testing.T) {
 	snapshot := terminalTestSnapshot(t,
-		terminalMessageEvent("native", 1, "assistant-tool", "assistant", "tool-calls", int64Pointer(100)),
+		terminalMessageEvent("native", 1, "assistant-tool", "assistant", "tool-calls", new(int64(100))),
 		terminalMessageEvent("native", 2, "user", "user", "", nil),
-		terminalMessageEvent("native", 3, "assistant-final", "assistant", "stop", int64Pointer(200)),
+		terminalMessageEvent("native", 3, "assistant-final", "assistant", "stop", new(int64(200))),
 		terminalMessageEvent("native", 4, "user", "user", "", nil),
 	)
 
@@ -51,7 +51,7 @@ func TestInspectSessionStoreTerminalStateSelectsLatestAssistantTerminal(t *testi
 
 func TestInspectSessionStoreTerminalStateRejectsMalformedOrUnsupportedEntry(t *testing.T) {
 	valid := terminalTestSnapshot(t,
-		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", int64Pointer(100)),
+		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", new(int64(100))),
 	)
 
 	tests := map[string]struct {
@@ -110,7 +110,7 @@ func TestInspectSessionStoreTerminalStateRejectsMalformedOrUnsupportedEntry(t *t
 
 func TestInspectSessionStoreTerminalStateUsesTheStrictSnapshotReader(t *testing.T) {
 	valid := string(terminalTestSnapshot(t,
-		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", int64Pointer(100)),
+		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", new(int64(100))),
 	))
 
 	for name, raw := range map[string]string{
@@ -174,8 +174,4 @@ func terminalMessageEvent(
 	return syncTestEvent(nativeID, sequence, "message.updated.1", map[string]json.RawMessage{
 		syncFieldInfo: encoded,
 	})
-}
-
-func int64Pointer(value int64) *int64 {
-	return &value
 }

@@ -16,9 +16,11 @@ const pluginSeedDirName = "plugin-seed"
 // pluginSeedDir resolves the plugin seed cache the shared runtime may restore
 // from and populate. Empty disables seeding: when the operator turned it off,
 // when OpenCode runs pure and installs no plugin loader, or when no user cache
-// directory can be determined.
+// directory can be determined. Managed execution also disables it: its logical
+// executable selector cannot be resolved or inspected by the adapter to build
+// the binary-identity key.
 func (a *Agent) pluginSeedDir(ctx context.Context) string {
-	if a.options.PluginSeedDisabled || a.options.Pure {
+	if a.options.PluginSeedDisabled || a.options.Pure || a.options.hostAuthorityConfigured {
 		return ""
 	}
 

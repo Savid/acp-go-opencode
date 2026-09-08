@@ -5,12 +5,12 @@ package integration
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -66,6 +66,7 @@ func TestMain(m *testing.M) {
 	slog.SetDefault(integrationLogger)
 
 	code := m.Run()
+	cleanupIntegrationBinary()
 
 	slog.SetDefault(previousLogger)
 	os.Exit(code)
@@ -145,24 +146,6 @@ func (c *recordingClient) elicitationCount() int {
 	return len(c.elicitations)
 }
 
-type safeBuffer struct {
-	mu sync.Mutex
-	b  []byte
-}
-
-func (b *safeBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.b = append(b.b, p...)
-	return len(p), nil
-}
-
-func (b *safeBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return string(b.b)
-}
-
 func requireRunIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv(envRunIntegration) != "1" {
@@ -180,28 +163,30 @@ func requireRunLiveTokens(t *testing.T) {
 
 func integrationOpenCodePath(t *testing.T) string {
 	t.Helper()
+	if os.Getenv(envRunIntegration) != "1" {
+		t.Skipf("set %s=1 to run opencode integration tests", envRunIntegration)
+	}
 	path := os.Getenv(envHarnessPath)
 	if path == "" {
 		path = "opencode"
 	}
 	resolved, err := exec.LookPath(path)
 	if err != nil {
-		t.Fatalf("find opencode CLI: %v", err)
+		if os.Getenv(envRunLiveTokens) == "1" || os.Getenv("ACP_GO_OPENCODE_RUN_ATTENDED") == "1" || os.Getenv("ACP_GO_OPENCODE_RUN_KEYSTORE") == "1" {
+			t.Fatalf("requested opencode integration tier requires the CLI: %v", err)
+		}
+		t.Skipf("opencode CLI absent for smoke: %v; set ACP_GO_OPENCODE_HARNESS_PATH", err)
 	}
 	return resolved
 }
 
 // agentCommand builds the wrapper invocation every integration launch goes
 // through.
-func agentCommand(ctx context.Context, args ...string) *exec.Cmd {
-	if binary := os.Getenv(envAgentBinary); binary != "" {
-		return exec.CommandContext(ctx, binary, args...) // #nosec G204,G702 -- opt-in integration test command.
-	}
-	commandArgs := make([]string, 0, 2+len(args))
-	commandArgs = append(commandArgs, "run", "./cmd/acp-go-opencode")
-	commandArgs = append(commandArgs, args...)
-	cmd := exec.CommandContext(ctx, "go", commandArgs...) // #nosec G204,G702 -- test runs the local wrapper command.
+func agentCommand(t *testing.T, ctx context.Context, args ...string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.CommandContext(ctx, integrationBinaryPath(t), args...)
 	cmd.Dir = repoRoot()
+	cmd.WaitDelay = 5 * time.Second
 	return cmd
 }
 
@@ -213,48 +198,11 @@ func repoRoot() string {
 	return filepath.Dir(filepath.Dir(file))
 }
 
-type liveAgent struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    io.Reader
-	stderr    safeBuffer
-	done      chan error
-	closeOnce sync.Once
-}
+type liveAgent struct{ *integrationProcess }
 
-// startAgent launches the wrapper with the given flags and registers its
-// teardown with t.Cleanup, so a failed test still shuts the wrapper and the
-// native runtime it owns down instead of leaving an orphaned opencode serve.
 func startAgent(t *testing.T, ctx context.Context, args ...string) *liveAgent {
 	t.Helper()
-
-	cmd := agentCommand(ctx, args...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// A cancelled test context ends the ACP connection the way a host does
-	// rather than killing the wrapper before it can tear its runtime down; the
-	// kill only follows a wrapper that ignores the closed input.
-	cmd.Cancel = stdin.Close
-	cmd.WaitDelay = agentExitGrace
-
-	agent := &liveAgent{cmd: cmd, stdin: stdin, stdout: stdout, done: make(chan error, 1)}
-	cmd.Stderr = &agent.stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-
-	go func() { agent.done <- cmd.Wait() }()
-
-	t.Cleanup(agent.close)
-
-	return agent
+	return &liveAgent{startIntegrationProcess(t, agentCommand(t, ctx, args...))}
 }
 
 func startLiveAgent(t *testing.T, ctx context.Context, home string, extraArgs ...string) *liveAgent {
@@ -268,23 +216,6 @@ func startLiveAgent(t *testing.T, ctx context.Context, home string, extraArgs ..
 	args = append(args, extraArgs...)
 
 	return startAgent(t, ctx, args...)
-}
-
-// close shuts the wrapper down the way a host does: closing stdin ends the ACP
-// connection and the wrapper tears its native runtime down before it exits.
-// Killing the process is the fallback for a wrapper that does not exit in time,
-// and a killed wrapper cannot stop its runtime, so the grace period comes first.
-func (a *liveAgent) close() {
-	a.closeOnce.Do(func() {
-		_ = a.stdin.Close()
-
-		select {
-		case <-a.done:
-		case <-time.After(agentExitGrace):
-			_ = a.cmd.Process.Kill()
-			<-a.done
-		}
-	})
 }
 
 func (a *liveAgent) stderrString() string {
@@ -323,4 +254,69 @@ func envOrDefault(name string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func TestIntegrationHarnessPrerequisites(t *testing.T) {
+	if os.Args[len(os.Args)-1] == "harness-prerequisite-child" {
+		path := integrationOpenCodePath(t)
+		t.Log("resolved harness " + path)
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, integration, tier, value, outcome string
+		available                               bool
+	}{
+		{name: "ungated", outcome: "SKIP"},
+		{name: "disabled", integration: "0", outcome: "SKIP"},
+		{name: "invalid_gate", integration: "true", outcome: "SKIP"},
+		{name: "missing_smoke", integration: "1", outcome: "SKIP"},
+		{name: "disabled_live", integration: "1", tier: "RUN_LIVE_TOKENS", value: "0", outcome: "SKIP"},
+		{name: "missing_live", integration: "1", tier: "RUN_LIVE_TOKENS", value: "1", outcome: "FAIL"},
+		{name: "missing_attended", integration: "1", tier: "RUN_ATTENDED", value: "1", outcome: "FAIL"},
+		{name: "missing_keystore", integration: "1", tier: "RUN_KEYSTORE", value: "1", outcome: "FAIL"},
+		{name: "fake_path", integration: "1", outcome: "PASS", available: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, suffix := range []string{"RUN_INTEGRATION", "RUN_LIVE_TOKENS", "RUN_ATTENDED", "RUN_KEYSTORE"} {
+				t.Setenv("ACP_GO_OPENCODE_"+suffix, "0")
+			}
+			t.Setenv("ACP_GO_OPENCODE_RUN_INTEGRATION", tc.integration)
+			if tc.tier != "" {
+				t.Setenv("ACP_GO_OPENCODE_"+tc.tier, tc.value)
+			}
+			dir := t.TempDir()
+			harness := filepath.Join(dir, "opencode")
+			if runtime.GOOS == "windows" {
+				harness += ".exe"
+			}
+			if tc.available {
+				// Resolution only: this file is never executed.
+				if err := os.WriteFile(harness, []byte("fake harness path"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("ACP_GO_OPENCODE_HARNESS_PATH", harness)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestIntegrationHarnessPrerequisites$", "-test.v", "--", "harness-prerequisite-child")
+			cmd.WaitDelay = time.Second
+			output, runErr := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatal(ctx.Err())
+			}
+			if (runErr != nil) != (tc.outcome == "FAIL") {
+				t.Fatalf("unexpected child result: %v\n%s", runErr, output)
+			}
+			if !strings.Contains(string(output), "--- "+tc.outcome+": TestIntegrationHarnessPrerequisites") {
+				t.Fatalf("want child %s:\n%s", tc.outcome, output)
+			}
+			if tc.available && !strings.Contains(string(output), "resolved harness "+harness) {
+				t.Fatalf("fake harness selection was lost:\n%s", output)
+			}
+		})
+	}
 }

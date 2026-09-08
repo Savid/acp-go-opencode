@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -64,7 +65,7 @@ func newAuthFixture(t *testing.T) *authFixture {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 
-		fixture.broker.closeSession(ctx, fixture.session.id)
+		require.NoError(t, fixture.broker.closeSession(ctx, fixture.session.id))
 		fixture.releaseCallback()
 	})
 
@@ -340,7 +341,7 @@ func TestAuthorizeStopsReplayingOnceTheSessionCloses(t *testing.T) {
 
 	first := fixture.authorize(t, nil)
 
-	fixture.broker.closeSession(context.Background(), fixture.session.id)
+	require.NoError(t, fixture.broker.closeSession(context.Background(), fixture.session.id))
 
 	_, err := fixture.broker.authorize(context.Background(), fixture.authorizeParams(t, nil))
 	requireInvalidParams(t, err, jsonFieldSessionID)
@@ -761,9 +762,7 @@ func TestCallbackAddressingFailures(t *testing.T) {
 
 	for _, field := range []string{authFieldSessionID, authFieldProviderID, authFieldMethod, authFieldFlowID, authFieldInput} {
 		params := map[string]any{}
-		for key, value := range base {
-			params[key] = value
-		}
+		maps.Copy(params, base)
 
 		delete(params, field)
 
@@ -1193,9 +1192,7 @@ func TestStatusAddressingFailures(t *testing.T) {
 
 	for _, field := range []string{authFieldSessionID, authFieldProviderID, authFieldFlowID} {
 		params := map[string]any{}
-		for key, value := range base {
-			params[key] = value
-		}
+		maps.Copy(params, base)
 
 		delete(params, field)
 
@@ -1339,9 +1336,7 @@ func TestDisconnectAddressingFailures(t *testing.T) {
 
 	for _, field := range []string{authFieldSessionID, authFieldProviderID, authFieldConnectionID, authFieldBindingGeneration} {
 		params := map[string]any{}
-		for key, value := range base {
-			params[key] = value
-		}
+		maps.Copy(params, base)
 
 		delete(params, field)
 
@@ -1481,13 +1476,13 @@ func TestCloseSessionSkipsTerminalAndForeignFlows(t *testing.T) {
 	record.state = authStateSaved
 	fixture.broker.mu.Unlock()
 
-	fixture.broker.closeSession(context.Background(), "other-session")
+	require.NoError(t, fixture.broker.closeSession(context.Background(), "other-session"))
 
 	fixture.broker.mu.Lock()
 	require.Len(t, fixture.broker.flows, 1)
 	fixture.broker.mu.Unlock()
 
-	fixture.broker.closeSession(context.Background(), fixture.session.id)
+	require.NoError(t, fixture.broker.closeSession(context.Background(), fixture.session.id))
 
 	fixture.broker.mu.Lock()
 	defer fixture.broker.mu.Unlock()
@@ -1518,7 +1513,11 @@ func TestCloseSessionStopsWaitingWhenContextEnds(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	broker.closeSession(ctx, sessionID)
+	require.ErrorIs(t, broker.closeSession(ctx, sessionID), context.Canceled)
+	require.Len(t, broker.completionCleanup, 1)
+	close(completion)
+	require.NoError(t, broker.closeSession(context.Background(), sessionID))
+	require.Empty(t, broker.completionCleanup)
 	require.Equal(t, authStateCancelled, flow.state)
 }
 
@@ -1609,7 +1608,7 @@ func TestStopCompleterIsIdempotent(t *testing.T) {
 
 func TestDestroyBrokerToleratesNoBroker(t *testing.T) {
 	broker := newAuthAgent(t).broker
-	broker.destroyBroker(context.Background(), &authFlow{})
+	require.NoError(t, broker.destroyBroker(context.Background(), &authFlow{}))
 }
 
 func TestApplySecretFailsWhenTheInstallFails(t *testing.T) {

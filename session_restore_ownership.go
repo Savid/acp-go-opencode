@@ -40,6 +40,34 @@ type restoreOwnership struct {
 	DestinationAggregateID string `json:"destinationAggregateId"`
 }
 
+// snapshotRestoreGeneration keeps one ownership token for a logical/native
+// mapping. Rotating it at capture would disown the previous committed snapshot
+// if its replacement failed. Event-prefix verification still checks the exact
+// contents of whichever snapshot is restored. The caller holds restoreMu until
+// recordSnapshotOwnership publishes the selected token.
+func snapshotRestoreGeneration(client opencode.Client, node stateSnapshotNode) (string, error) {
+	if client.XDGDirs().Root == "" {
+		return "", fmt.Errorf("restore ownership state directory is empty")
+	}
+
+	registry, err := readRestoreOwnership(client)
+	if err != nil {
+		return "", err
+	}
+
+	owner, found := registry.Aggregates[node.NativeSessionID]
+	if !found {
+		return newRestoreGeneration()
+	}
+
+	if owner.RestoreGeneration == "" || owner.SessionID != node.SessionID ||
+		owner.SourceAggregateID != node.NativeSessionID || owner.DestinationAggregateID != node.NativeSessionID {
+		return "", fmt.Errorf("destination aggregate %q is owned by another restore", node.NativeSessionID)
+	}
+
+	return owner.RestoreGeneration, nil
+}
+
 func recordSnapshotOwnership(client opencode.Client, snapshot stateSnapshot) error {
 	if client.XDGDirs().Root == "" {
 		return fmt.Errorf("restore ownership state directory is empty")

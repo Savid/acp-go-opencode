@@ -17,6 +17,8 @@ func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
 	snapshot := validSyncSnapshot("session", "native", absTestPath("source"))
 	node := snapshot.Graph[0]
 	require.Error(t, recordSnapshotOwnership(client, snapshot))
+	_, err := snapshotRestoreGeneration(client, node)
+	require.Error(t, err)
 	require.Error(t, claimRestoreOwnership(client, snapshot, nil))
 	require.Error(t, verifyRestoreOwnership(client, snapshot, node))
 
@@ -28,10 +30,15 @@ func TestRestoreOwnershipRegistryFailureAndSuccessShapes(t *testing.T) {
 	require.NoError(t, recordSnapshotOwnership(client, snapshot))
 	require.NoError(t, claimRestoreOwnership(client, snapshot, nil))
 	require.NoError(t, verifyRestoreOwnership(client, snapshot, node))
+	generation, err := snapshotRestoreGeneration(client, node)
+	require.NoError(t, err)
+	require.Equal(t, snapshot.RestoreGeneration, generation)
 
 	path := filepath.Join(restoreOwnershipDirectory(client), restoreOwnershipFileName)
 	require.NoError(t, os.WriteFile(path, []byte(`{`), 0o600))
 	_, err = readRestoreOwnership(client)
+	require.ErrorContains(t, err, "decode restore ownership")
+	_, err = snapshotRestoreGeneration(client, node)
 	require.ErrorContains(t, err, "decode restore ownership")
 	require.NoError(t, os.WriteFile(path, []byte(`{"format":"wrong","aggregates":{}}`), 0o600))
 	_, err = readRestoreOwnership(client)
@@ -87,6 +94,8 @@ func TestRestoreOwnershipRemainingPropagationConflictAndLossBranches(t *testing.
 	require.NoError(t, os.WriteFile(path, []byte(`{"format":"opencode-restore-ownership-v1","aggregates":{"native":{"sessionId":"other","restoreGeneration":"other","sourceAggregateId":"native","destinationAggregateId":"native"}}}`), 0o600))
 	require.ErrorContains(t, claimRestoreOwnership(client, snapshot, nil), "owned by another restore")
 	require.ErrorContains(t, verifyRestoreOwnership(client, snapshot, node), "lost durable restore ownership")
+	_, err := snapshotRestoreGeneration(client, node)
+	require.ErrorContains(t, err, "owned by another restore")
 }
 
 func TestWriteRestoreOwnershipEveryInjectedFilesystemFailure(t *testing.T) {

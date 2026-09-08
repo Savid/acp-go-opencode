@@ -4,8 +4,9 @@ description: The adapter's trust boundaries, native-launch authority, stdout dis
 ---
 
 The adapter's security posture rests on exclusive runtime access, exact
-session/turn routing, fail-closed native launch, and keeping credentials out of
-anything it persists or streams.
+session/turn routing, fail-closed native launch, and explicit credential
+boundaries. Provider-auth values are excluded from raw events and snapshots;
+accepted session environment values are persisted in the protected store.
 
 ## Native execution boundary
 
@@ -122,10 +123,9 @@ runtime root. It is executable code, and the adapter treats it accordingly:
 - A restore is a real copy. Symbolic links are recreated only when relative and
   confined to the tree, so nothing inside a runtime root refers back into the
   cache, and a later npm run inside that root cannot write into it.
-- Under `WithHostAuthority` the priming launch goes through the same authority
-  as every runtime: its root is prepared and reclaimed like any other, and the
-  tree is read only after reclaim has returned it. The runtime's own tree is
-  restored before it is prepared and is never read back.
+- `WithHostAuthority` disables the cache. Its executable selector is opaque
+  to the adapter, so it cannot supply the inspected binary identity this cache
+  requires.
 
 Point `-plugin-seed-dir` only at a directory private to the user running the
 adapter, or disable the cache with `-no-plugin-seed`.
@@ -133,9 +133,8 @@ adapter, or disable the cache with `-no-plugin-seed`.
 ## Session and handoff boundaries
 
 Native session IDs, canonical directory scopes, and turn nonces bind every
-prompt, abort, permission, question, and event route. A route is exactly scalar
-version `1`; malformed, duplicate, fractional, trailing, or unsupported values
-are rejected.
+prompt, abort, permission, question, and event route. Route versions must equal the integer value `1`; malformed, fractional, and
+unsupported values are rejected.
 
 Prompt images are read from a local path only when `WithInputHandoffRoot`
 configures one, and only from beneath it. The envelope, URI, media type, and
@@ -144,6 +143,27 @@ opened relative to the root, must be regular, is read with a strict bound, and
 must match the declared digest. The adapter never writes, moves, or deletes
 anything under this read root, and no resolved path reaches the native request
 or logs. Without the option no inbound path is read.
+
+With `WithHostAuthority`, the adapter reserves the configured Home and complete
+scratch allocation domain before native work. It compares directory identities
+and ancestors, then pins handles for disjoint handoff, workspace, and additional
+directories known at that point. Broad roots overlapping a preparation domain
+are refused, including an ancestor of a future scratch child. The adjacent
+adapter control root is adapter-owned, not a prepared native tree.
+
+Managed media reads use those handles, not later ambient path resolution. New
+sessions can read local output only through a captured root or a directory
+derived beneath one, and each session remains limited to its own workspace and
+additional directories. Ordinary output retains its existing workspace, scratch,
+and temporary-directory allowlist. Handles survive shared runtime retirement
+and reclaim, and close with the Agent, so handoff validation can precede runtime
+recovery.
+
+The host must keep the complete reserved and read directory domains disjoint
+for the Agent lifetime, including pre-existing mount/volume aliases and protection
+against native replacement of their roots or ancestors. Initial directory
+identity checks and descriptor confinement do not enforce a hostile host's mount
+namespace. Use a dedicated handoff root outside Home and scratch.
 
 The read root bounds name resolution, not the bytes a directory entry points
 at. A hard link placed beneath it by something already able to write there is

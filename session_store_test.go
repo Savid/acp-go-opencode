@@ -396,7 +396,7 @@ func TestInMemoryStoreReplaceIsOneSessionsAndRefusesBeforeWriting(t *testing.T) 
 			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
 			{Key: SessionKey{Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
 		})
-		require.ErrorContains(t, err, "replacement session id is required")
+		require.ErrorContains(t, err, `replacement session id is required: session "" subpath "artifact"`)
 		requireUntouched(t, store)
 	})
 

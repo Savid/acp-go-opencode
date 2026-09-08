@@ -137,9 +137,10 @@ OpenTelemetry providers.
   requests.
 - Model, mode, and effort selection through ACP session config options; model
   and mode also through `_meta.opencode.options`.
-- Durable, credential-free native event snapshots through a host-provided
+- Durable native event snapshots through a host-provided
   `SessionStore`; stored rows use `opencode-sync-events-v1`, keyed by
-  `{SessionID, Subpath}` and requiring OpenCode `1.18.3` or newer.
+  `{SessionID, Subpath}` and requiring OpenCode `1.18.3` or newer. Snapshots
+  retain accepted session environment values, so protect the store accordingly.
 - Versioned `acp-go.dev/route` envelopes bind each prompt and its causal updates,
   raw events, and elicitations to one turn nonce. Agent-origin work between
   prompts omits a route and never borrows a later nonce. Permission requests are

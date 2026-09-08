@@ -45,7 +45,8 @@ const (
 
 // promptMedia is one byte-bearing prompt block: an image content block, an
 // embedded blob resource, or an embedded text resource. Indexes are assigned
-// across these blocks in request order and stay stable in errors; block records
+// across images and gated blobs only; text resources spend bytes without
+// consuming an index. The block field records
 // the position in the prompt slice so validated bytes reach native mapping.
 type promptMedia struct {
 	index int
@@ -112,23 +113,25 @@ func handoffInputError(index int, errValue, message string) error {
 // harness is validated first.
 func promptMediaBlocks(blocks []acp.ContentBlock) []promptMedia {
 	media := make([]promptMedia, 0, len(blocks))
+	index := 0
 
 	for position, block := range blocks {
 		switch {
 		case block.Image != nil:
 			media = append(media, promptMedia{
-				index:  len(media),
+				index:  index,
 				block:  position,
 				raster: true,
 				mime:   block.Image.MimeType,
 				data:   block.Image.Data,
 				image:  block.Image,
 			})
+			index++
 		case block.Resource != nil && block.Resource.Resource.TextResourceContents != nil:
 			contents := block.Resource.Resource.TextResourceContents
 
 			media = append(media, promptMedia{
-				index: len(media),
+				index: index,
 				block: position,
 				text:  true,
 				data:  firstNonEmpty(contents.Text, contents.Uri),
@@ -142,12 +145,13 @@ func promptMediaBlocks(blocks []acp.ContentBlock) []promptMedia {
 			}
 
 			media = append(media, promptMedia{
-				index:  len(media),
+				index:  index,
 				block:  position,
 				raster: isImageMediaType(declared),
 				mime:   declared,
 				data:   blob.Blob,
 			})
+			index++
 		}
 	}
 
@@ -171,15 +175,13 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 	promptGate := effectiveInputBytesPerPrompt(limits.MaxInputBytesPerPrompt)
 	handoffRoot := s.inputHandoffRoot()
 
-	// The selected-model gate answers for the first raster in the prompt, which
-	// may have arrived on a resource blob rather than on an image block. Its
-	// field is carried alongside its index so the verdict names the member the
-	// bytes came in on, as every other media verdict does.
+	// Model refusal names the first gated block, even when a document blob
+	// precedes the raster that requires image support.
 	var (
-		totalBytes  int64
-		handoffs    int
-		firstRaster = -1
-		rasterField string
+		totalBytes int64
+		handoffs   int
+		hasRaster  bool
+		firstGated *promptMedia
 	)
 
 	for _, block := range media {
@@ -205,10 +207,11 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 			return nil, err
 		}
 
-		if block.raster && firstRaster < 0 {
-			firstRaster = block.index
-			rasterField = block.field()
+		if !block.text && firstGated == nil {
+			firstGated = &block
 		}
+
+		hasRaster = hasRaster || block.raster
 
 		// The base64 native mapping forwards is re-encoded from the bytes the
 		// gates measured, for a blob resource as much as for an image block: the
@@ -227,8 +230,8 @@ func (s *session) validatePromptMedia(ctx context.Context, blocks []acp.ContentB
 		}
 	}
 
-	if firstRaster >= 0 && s.selectedModelImageSupport(ctx) == imageInputUnsupported {
-		return nil, mediaInputError(rasterField, imageErrorUnsupportedByModel, firstRaster)
+	if hasRaster && s.selectedModelImageSupport(ctx) == imageInputUnsupported {
+		return nil, mediaInputError(firstGated.field(), imageErrorUnsupportedByModel, firstGated.index)
 	}
 
 	return resolved, nil

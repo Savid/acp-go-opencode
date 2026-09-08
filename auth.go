@@ -102,13 +102,20 @@ type providerAuth struct {
 	// OpenCode is the provider id.
 	slots *authGate[string]
 
-	mu             sync.Mutex
-	generation     string
-	catalog        map[string][]authCatalogMethod
-	flows          map[authFlowKey]*authFlow
-	byID           map[string]*authFlow
-	retired        map[authFlowKey]map[string]struct{}
-	closedSessions map[acp.SessionId]struct{}
+	// brokerMu serializes native broker admission and cleanup. Retired entries
+	// remain owned independently of flow records and fence further launches.
+	brokerMu sync.Mutex
+	brokers  map[*authBroker]bool // true once retired
+	closed   bool                 // guarded by mu
+
+	mu                sync.Mutex
+	generation        string
+	catalog           map[string][]authCatalogMethod
+	flows             map[authFlowKey]*authFlow
+	byID              map[string]*authFlow
+	retired           map[authFlowKey]map[string]struct{}
+	closedSessions    map[acp.SessionId]struct{}
+	completionCleanup map[chan struct{}]acp.SessionId
 }
 
 type authFlowKey struct {

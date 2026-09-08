@@ -69,6 +69,9 @@ func imageFingerprint(decoded []byte) string {
 // is emitted. Identical bytes register once; later identities share the
 // record.
 func (s *session) registerImageArtifact(ctx context.Context, identity string, record imageArtifactRecord) error {
+	s.imageArtifactMu.Lock()
+	defer s.imageArtifactMu.Unlock()
+
 	s.mu.Lock()
 	if s.imageArtifacts == nil {
 		s.imageArtifacts = map[string]imageArtifactRecord{}
@@ -78,11 +81,9 @@ func (s *session) registerImageArtifact(ctx context.Context, identity string, re
 		s.imageArtifactIdentities = map[string]string{}
 	}
 
-	s.imageArtifactIdentities[identity] = record.Fingerprint
-
 	_, exists := s.imageArtifacts[record.Fingerprint]
-	if !exists {
-		s.imageArtifacts[record.Fingerprint] = record
+	if exists {
+		s.imageArtifactIdentities[identity] = record.Fingerprint
 	}
 
 	agent := s.agent
@@ -105,6 +106,11 @@ func (s *session) registerImageArtifact(ctx context.Context, identity string, re
 	if err := agent.sessionStore().Append(storeCtx, key, []SessionStoreEntry{entry}); err != nil {
 		return imageOutputFailure(outputReasonStorageFailed, fmt.Sprintf("store image artifact: %v", err), 0, 0)
 	}
+
+	s.mu.Lock()
+	s.imageArtifacts[record.Fingerprint] = record
+	s.imageArtifactIdentities[identity] = record.Fingerprint
+	s.mu.Unlock()
 
 	return nil
 }
@@ -147,19 +153,6 @@ func (s *session) setImageArtifacts(records map[string]imageArtifactRecord) {
 			s.imageArtifactIdentities[nativeID] = fingerprint
 		}
 	}
-}
-
-func unionImageArtifacts(graph []*session) map[string]imageArtifactRecord {
-	union := map[string]imageArtifactRecord{}
-
-	for _, member := range graph {
-		cloned := member.cloneImageArtifacts()
-		for fingerprint := range cloned {
-			union[fingerprint] = cloned[fingerprint]
-		}
-	}
-
-	return union
 }
 
 // imageArtifactReplacements returns one replacement per artifact so state

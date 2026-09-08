@@ -48,22 +48,22 @@ func TestValidatePromptImagesInputTaxonomy(t *testing.T) {
 		},
 		{
 			name:  "blob resource case-variant media type",
-			block: blobResourceBlock(png, stringPtr("IMAGE/PNG")),
+			block: blobResourceBlock(png, new("IMAGE/PNG")),
 			want:  map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
 		},
 		{
 			name:  "blob resource leading-whitespace media type",
-			block: blobResourceBlock(png, stringPtr(" image/png")),
+			block: blobResourceBlock(png, new(" image/png")),
 			want:  map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
 		},
 		{
 			name:  "blob resource parameterized media type",
-			block: blobResourceBlock(png, stringPtr("image/png; charset=binary")),
+			block: blobResourceBlock(png, new("image/png; charset=binary")),
 			want:  map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidMediaType, jsonFieldIndex: 0},
 		},
 		{
 			name:  "blob resource rejected deep in the raster chain",
-			block: blobResourceBlock(fixtureImageBase64(t, "truncated.png"), stringPtr(mimePNG)),
+			block: blobResourceBlock(fixtureImageBase64(t, "truncated.png"), new(mimePNG)),
 			want:  map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorInvalidDimensions, jsonFieldIndex: 0},
 		},
 		{
@@ -244,7 +244,7 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 
 	t.Run("unsupported rejects", func(t *testing.T) {
 		client := newFakeOpenCodeClient(t)
-		client.providers = providersWith(boolPtr(false))
+		client.providers = providersWith(new(false))
 		session := testSession(t, NewAgent(), client)
 		requireInvalidParamsData(t, validatePromptMediaError(session, block), map[string]any{
 			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorUnsupportedByModel,
@@ -252,17 +252,19 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 		})
 	})
 
-	t.Run("unsupported names the first raster block", func(t *testing.T) {
+	t.Run("unsupported names the first gated block", func(t *testing.T) {
 		pdfMime := "application/pdf"
 		client := newFakeOpenCodeClient(t)
-		client.providers = providersWith(boolPtr(false))
+		client.providers = providersWith(new(false))
 		session := testSession(t, NewAgent(), client)
 		requireInvalidParamsData(t, validatePromptMediaError(session,
+			textResourceBlock("before"),
 			blobResourceBlock(base64.StdEncoding.EncodeToString([]byte("%PDF-1.7")), &pdfMime),
+			textResourceBlock("between"),
 			block,
 		), map[string]any{
-			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorUnsupportedByModel,
-			jsonFieldIndex: 1,
+			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorUnsupportedByModel,
+			jsonFieldIndex: 0,
 		})
 	})
 
@@ -272,10 +274,11 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 	t.Run("unsupported names the member the raster arrived on", func(t *testing.T) {
 		pngMime := mimePNG
 		client := newFakeOpenCodeClient(t)
-		client.providers = providersWith(boolPtr(false))
+		client.providers = providersWith(new(false))
 		session := testSession(t, NewAgent(), client)
 		requireInvalidParamsData(t, validatePromptMediaError(session,
 			acp.TextBlock("look at this"),
+			textResourceBlock("notes"),
 			blobResourceBlock(fixtureImageBase64(t, "valid.png"), &pngMime),
 		), map[string]any{
 			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorUnsupportedByModel,
@@ -286,7 +289,7 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 	t.Run("a document-only prompt never consults the image model gate", func(t *testing.T) {
 		pdfMime := "application/pdf"
 		client := newFakeOpenCodeClient(t)
-		client.providers = providersWith(boolPtr(false))
+		client.providers = providersWith(new(false))
 		session := testSession(t, NewAgent(), client)
 		require.NoError(t, validatePromptMediaError(session,
 			blobResourceBlock(base64.StdEncoding.EncodeToString([]byte("%PDF-1.7")), &pdfMime),
@@ -295,7 +298,7 @@ func TestValidatePromptImagesModelGate(t *testing.T) {
 
 	t.Run("supported forwards", func(t *testing.T) {
 		client := newFakeOpenCodeClient(t)
-		client.providers = providersWith(boolPtr(true))
+		client.providers = providersWith(new(true))
 		session := testSession(t, NewAgent(), client)
 		require.NoError(t, validatePromptMediaError(session, block))
 	})
@@ -339,7 +342,7 @@ func TestSelectedModelImageSupportSources(t *testing.T) {
 		supported := opencode.ProvidersResponse{Providers: []opencode.ProviderInfo{{
 			ID: "openai", Models: map[string]opencode.ProviderModel{
 				"gpt-test": {ID: "gpt-test", Capabilities: &opencode.ProviderModelCapabilities{
-					Input: opencode.ProviderModelInputCapabilities{Image: boolPtr(true)},
+					Input: opencode.ProviderModelInputCapabilities{Image: new(true)},
 				}},
 			},
 		}}}
@@ -409,7 +412,7 @@ func TestValidatePromptMediaChargesTextResources(t *testing.T) {
 			textBlock(text, "file:///tmp/notes"),
 			textBlock(text, "file:///tmp/notes"),
 		), map[string]any{
-			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
+			jsonFieldField: fieldPromptResource, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 			jsonFieldSizeBytes: int64(2 * len(text)), jsonFieldMaxBytes: limit,
 		})
 	})
@@ -424,7 +427,7 @@ func TestValidatePromptMediaChargesTextResources(t *testing.T) {
 			textBlock(text, ""),
 			acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", MimeType: mimePNG, Data: base64.StdEncoding.EncodeToString(png)}},
 		), map[string]any{
-			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 1,
+			jsonFieldField: fieldPromptImage, jsonFieldError: imageErrorTooLarge, jsonFieldIndex: 0,
 			jsonFieldSizeBytes: int64(len(png) + len(text)), jsonFieldMaxBytes: limit,
 		})
 	})
@@ -471,4 +474,32 @@ func TestValidatePromptImagesRejectsBytesPastTheTransportBound(t *testing.T) {
 		jsonFieldSizeBytes: imageFrameBoundBytes + 1, jsonFieldMaxBytes: imageFrameBoundBytes,
 	})
 	require.Empty(t, resolved)
+}
+
+func textResourceBlock(text string) acp.ContentBlock {
+	return acp.ContentBlock{Resource: &acp.ContentBlockResource{Type: "resource", Resource: acp.EmbeddedResourceResource{
+		TextResourceContents: &acp.TextResourceContents{Text: text},
+	}}}
+}
+
+func TestMediaErrorsCountOnlyImagesAndGatedBlobs(t *testing.T) {
+	png := acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", MimeType: mimePNG, Data: fixtureImageBase64(t, "valid.png")}}
+	for _, row := range []struct {
+		name  string
+		last  acp.ContentBlock
+		field string
+	}{
+		{"image", acp.ContentBlock{Image: &acp.ContentBlockImage{Type: "image", MimeType: mimePNG, Data: "!"}}, fieldPromptImage},
+		{"blob", blobResourceBlock("!", nil), fieldPromptResource},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			session := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
+			requireInvalidParamsData(t, validatePromptMediaError(session,
+				textResourceBlock("before"), png, textResourceBlock("between"),
+				blobResourceBlock("YQ==", nil), acp.TextBlock("text"),
+				acp.ContentBlock{ResourceLink: &acp.ContentBlockResourceLink{Type: "resource_link", Uri: "file:///notes", Name: "notes"}},
+				textResourceBlock("after"), row.last,
+			), map[string]any{jsonFieldField: row.field, jsonFieldError: imageErrorInvalidBase64, jsonFieldIndex: 2})
+		})
+	}
 }

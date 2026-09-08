@@ -67,10 +67,10 @@ func TestScopedElicitationStampsExactRouteAndRejectsCollision(t *testing.T) {
 
 func TestHostRequestRegistrationRequiresTheExactFullyWrittenFrame(t *testing.T) {
 	frame := func(method, streamID, actionID string) []byte {
-		return []byte(fmt.Sprintf(
+		return fmt.Appendf(nil,
 			`{"jsonrpc":"2.0","id":1,"method":%q,"params":{"_meta":{%q:{"version":1,"streamId":%q,"action":{"actionId":%q}}}}}`,
 			method, lifecycle.MetaKey, streamID, actionID,
-		))
+		)
 	}
 
 	for _, method := range []string{acp.ClientMethodSessionRequestPermission, acp.ClientMethodElicitationCreate} {
@@ -546,4 +546,153 @@ func TestRequestErrorReportsATornDownConnectionByItsOwnError(t *testing.T) {
 	invalid := acp.NewInvalidParams(map[string]any{jsonFieldError: "cwd must be absolute"})
 	require.Same(t, invalid, requestError(tornDown, errors.Join(invalid, context.Canceled)))
 	require.Equal(t, -32603, requestError(tornDown, context.Canceled).Code)
+}
+
+// Requests pass through exported Serve, SDK defaults, and local dispatch. No
+// session is created, so none can launch a native process.
+func metadataWireRPC(t *testing.T, options ...Option) func(string, string) map[string]json.RawMessage {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	inReader, inWriter := io.Pipe()
+	outReader, outWriter := io.Pipe()
+	closePipes := func() {
+		_ = inReader.Close()
+		_ = inWriter.Close()
+		_ = outReader.Close()
+		_ = outWriter.Close()
+	}
+	stop := context.AfterFunc(ctx, closePipes)
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, inReader, outWriter, options...) }()
+	t.Cleanup(func() { cancel(); closePipes(); stop(); <-done })
+	decoder := json.NewDecoder(outReader)
+	id := 0
+
+	return func(method, params string) map[string]json.RawMessage {
+		t.Helper()
+		id++
+		_, err := fmt.Fprintf(inWriter, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":%q,\"params\":%s}\n", id, method, params)
+		require.NoError(t, err)
+		var response map[string]json.RawMessage
+		require.NoError(t, decoder.Decode(&response))
+		require.JSONEq(t, fmt.Sprint(id), string(response["id"]))
+
+		return response
+	}
+}
+
+func requireWireMetadataError(t *testing.T, response map[string]json.RawMessage, code int, token, field string) {
+	t.Helper()
+	var failure acp.RequestError
+	require.NoError(t, json.Unmarshal(response["error"], &failure))
+	require.Equal(t, code, failure.Code)
+	if code == -32602 {
+		require.Equal(t, "Invalid params", failure.Message)
+	}
+	want := map[string]any{"error": token}
+	if field != "" {
+		want["field"] = field
+	}
+	require.Equal(t, want, failure.Data)
+}
+
+func TestServePreservesLifecycleMetadata(t *testing.T) {
+	const owned = `"acp-go.dev/lifecycle":`
+	for _, row := range []struct{ name, metadata, field string }{
+		{"valid", `"_meta":{` + owned + `{"version":1}}`, ""},
+		{"foreign duplicates", `"_meta":{"foreign":{"a":0,"a":1}},"_meta":{"foreign":true}`, ""},
+		{"duplicate version", `"_meta":{` + owned + `{"version":2,"version":1}}`, ".version"},
+		{"SDK alias", `"_META":{` + owned + `{"version":2,"version":1}}`, ".version"},
+		{"aliased erasure", `"_META":{` + owned + `{"version":1}},"_meta":null`, "root"},
+		{"rounded fraction", `"_meta":{` + owned + `{"version":1.0000000000000001}}`, ".version"},
+		{"decimal", `"_meta":{` + owned + `{"version":1.0}}`, ".version"},
+		{"exponent", `"_meta":{` + owned + `{"version":1e0}}`, ".version"},
+		{"overflow", `"_meta":{` + owned + `{"version":1e400}}`, ".version"},
+		{"duplicate namespace", `"_meta":{` + owned + `{"version":2},` + owned + `{"version":1}}`, "root"},
+		{"erased namespace", `"_meta":{` + owned + `{"version":2}},"_meta":{}`, "root"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			rpc := metadataWireRPC(t)
+			response := rpc("initialize", `{"protocolVersion":1,`+row.metadata+`}`)
+			if row.field == "" {
+				require.NotContains(t, response, "error")
+
+				return
+			}
+			field := lifecycle.MetaPath
+			if row.field != "root" {
+				field += row.field
+			}
+			requireWireMetadataError(t, response, -32602, "unsupported", field)
+		})
+	}
+	t.Run("construction precedes owned decode", func(t *testing.T) {
+		rpc := metadataWireRPC(t, WithInputHandoffRoot("relative"))
+		response := rpc("initialize", `{"protocolVersion":1,"_meta":{`+owned+`{"version":1e400}}}`)
+		requireWireMetadataError(t, response, -32603, "opencode_invalid_options", "")
+	})
+}
+
+func TestServePromptLifecyclePreservesMembersAndRoutePrecedence(t *testing.T) {
+	rpc := metadataWireRPC(t)
+	require.NotContains(t, rpc("initialize", `{"protocolVersion":1,"_meta":{"acp-go.dev/lifecycle":{"version":1}}}`), "error")
+	const route = `"acp-go.dev/route":{"version":1,"turnNonce":"nonce"}`
+	for _, row := range []struct{ value, suffix string }{
+		{`{"version":2,"version":1,"submission":{"submissionId":"s","clientNonce":"n"}}`, ".version"},
+		{`{"version":1.0000000000000001,"submission":{"submissionId":"s","clientNonce":"n"}}`, ".version"},
+		{`{"version":1,"submission":{"submissionId":"old","submissionId":"s","clientNonce":"n"}}`, ".submission.submissionId"},
+	} {
+		response := rpc("session/prompt", `{"sessionId":"missing","prompt":[],"_meta":{`+route+`,"acp-go.dev/lifecycle":`+row.value+`}}`)
+		requireWireMetadataError(t, response, -32602, "unsupported", lifecycle.MetaPath+row.suffix)
+	}
+	response := rpc("session/prompt", `{"sessionId":"missing","prompt":[],"_meta":{"acp-go.dev/lifecycle":{"version":1e400}}}`)
+	requireWireMetadataError(t, response, -32602, "missing", routeMetaPath)
+	response = rpc("session/prompt", `{"sessionId":"missing","prompt":[],"_meta":{`+route+`}}`)
+	requireWireMetadataError(t, response, -32602, "missing", lifecycle.MetaPath)
+	response = rpc("session/new", `{"cwd":"/unused","mcpServers":[],"_META":{"acp-go.dev/lifecycle":{"version":1}},"_meta":{}}`)
+	requireWireMetadataError(t, response, -32602, "unsupported", lifecycle.MetaPath)
+}
+
+func TestServeRejectsInexactRouteNumbers(t *testing.T) {
+	rpc := metadataWireRPC(t)
+	require.NotContains(t, rpc("initialize", `{"protocolVersion":1}`), "error")
+	for _, number := range []string{"1.0000000000000001", "1e400", "-1e-400"} {
+		response := rpc("session/prompt", `{"sessionId":"missing","prompt":[],"_META":{"acp-go.dev/route":{"version":`+number+`,"turnNonce":"nonce"}}}`)
+		requireWireMetadataError(t, response, -32602, "unsupported", routeMemberPath(routeFieldVersion))
+	}
+	// Route uses numeric value, without lifecycle's scalar spelling policy.
+	for _, number := range []string{"1.0", "1e0"} {
+		response := rpc("session/prompt", `{"sessionId":"missing","prompt":[],"_meta":{"acp-go.dev/route":{"version":`+number+`,"turnNonce":"nonce"}}}`)
+		requireWireMetadataError(t, response, -32602, valSessionUnknown, "sessionId")
+	}
+}
+
+func TestSDKDecodedHandoffPreservesExactNumbers(t *testing.T) {
+	root := t.TempDir()
+	png := fixtureImage(t, "valid.png")
+	path := writeHandoffFile(t, root, "input.png", png)
+	session := handoffSession(t, root)
+	for _, row := range []struct{ name, version, size, cause string }{
+		{"version fraction", "1.0000000000000001", "1", handoffCauseVersion},
+		{"size fraction", "1", "1.0000000000000001", handoffCauseSizeBytes},
+		{"negative underflow", "1", "-1e-400", handoffCauseSizeBytes},
+		{"size overflow", "1", "1e400", handoffCauseSizeBytes},
+		{"exact alternate spelling", "1e0", fmt.Sprint(len(png)) + ".0", ""},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			params := fmt.Appendf(nil, `{"sessionId":"s","prompt":[{"type":"image","mimeType":"image/png","data":"","uri":%q,"_META":{"acp-go.dev/handoff":{"version":%s,"sizeBytes":%s,"digest":%q}}}]}`, "file://"+testURIPath(path), row.version, row.size, handoffDigestHex(png))
+			request, refusal := decodeLocalAgentParams[acp.PromptRequest, *acp.PromptRequest](params)
+			require.Nil(t, refusal)
+			if row.cause != "" {
+				requireHandoffVerdict(t, session, request.Prompt[0], imageErrorInvalidHandoff, row.cause)
+
+				return
+			}
+			require.NoError(t, validatePromptMediaError(session, request.Prompt[0]))
+		})
+	}
+	params := fmt.Appendf(nil, `{"sessionId":"s","prompt":[{"type":"image","mimeType":"image/png","data":%q,"_meta":{"acp-go.dev/handoff":{"version":1e400,"sizeBytes":-1e-400}}}]}`, fixtureImageBase64(t, "valid.png"))
+	request, refusal := decodeLocalAgentParams[acp.PromptRequest, *acp.PromptRequest](params)
+	require.Nil(t, refusal)
+	require.NoError(t, validatePromptMediaError(session, request.Prompt[0]), "nonempty embedded data wins before handoff validation")
 }

@@ -16,7 +16,7 @@ func TestOpenCodeACPAgentBinaryClosedInput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := agentCommand(ctx,
+	cmd := agentCommand(t, ctx,
 		"-path", integrationOpenCodePath(t),
 		"-scratch-dir", t.TempDir(),
 		"-opencode-pure",

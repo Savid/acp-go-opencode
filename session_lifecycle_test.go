@@ -1266,8 +1266,7 @@ func TestHeldEventOverflowFailsClosed(t *testing.T) {
 	}
 	pump.held = make([]queuedNativeEvent, heldEventCapacity)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	current.dispatchGate.Lock()
 	client.publishEvent(opencode.Event{Type: opencode.EventSessionIdle, Properties: json.RawMessage(`{"sessionID":"native-1"}`)})

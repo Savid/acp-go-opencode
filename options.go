@@ -69,6 +69,8 @@ type Options struct {
 	// PluginSeedDir is the adapter-owned cache of the npm tree OpenCode installs
 	// for its plugin loader, copied into each new runtime root before launch.
 	// Empty resolves to plugin-seed beneath the adapter's user cache directory.
+	// Managed execution leaves the cache unused because executable identity is
+	// owned by HostAuthority.
 	PluginSeedDir string
 	// PluginSeedDisabled turns the plugin seed cache off entirely: every cold
 	// runtime root then waits for OpenCode's own install.

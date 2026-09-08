@@ -39,7 +39,7 @@ func TestStartBrokerRefusesWhereTheBrowserCannotBeNeutralised(t *testing.T) {
 
 	brokerNewBrowserShim = opencode.NewBrowserShim
 
-	created, err := broker.startBroker(context.Background())
+	created, err := broker.startBroker(context.Background(), "")
 	require.Nil(t, created)
 	require.ErrorContains(t, err, "neutralize provider auth broker browser launch")
 	require.ErrorContains(t, err, "browser launch cannot be neutralised on this platform")

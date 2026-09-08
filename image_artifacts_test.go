@@ -31,7 +31,7 @@ func TestImageArtifactStoreLifecycle(t *testing.T) {
 	}
 	require.Equal(t, "data:image/png;base64,"+record.Data, record.nativeDataURL())
 
-	t.Run("register, lookup, clone, union", func(t *testing.T) {
+	t.Run("register, lookup, clone", func(t *testing.T) {
 		sess := testSession(t, NewAgent(), newFakeOpenCodeClient(t))
 		require.NoError(t, sess.registerImageArtifact(ctx, "id-1", record))
 		// Identical bytes under a second identity register once.
@@ -46,9 +46,6 @@ func TestImageArtifactStoreLifecycle(t *testing.T) {
 
 		cloned := sess.cloneImageArtifacts()
 		require.Len(t, cloned, 1)
-
-		union := unionImageArtifacts([]*session{sess})
-		require.Len(t, union, 1)
 	})
 
 	t.Run("setImageArtifacts rebuilds identity index", func(t *testing.T) {
@@ -65,6 +62,16 @@ func TestImageArtifactStoreLifecycle(t *testing.T) {
 		err := sess.registerImageArtifact(ctx, "id-1", record)
 		data := assertTurnFailed(t, err, causeTransport, "")
 		require.Equal(t, outputReasonStorageFailed, data[jsonFieldReason])
+		_, exists := sess.imageArtifactByIdentity("id-1")
+		require.False(t, exists, "failed persistence published an artifact identity")
+		require.Empty(t, sess.cloneImageArtifacts())
+
+		store := NewInMemorySessionStore()
+		sess.agent.options.SessionStore = store
+		require.NoError(t, sess.registerImageArtifact(ctx, "id-1", record))
+		entries, err := store.Load(ctx, SessionKey{SessionID: string(sess.id), Subpath: imageArtifactSubpath(fingerprint)})
+		require.NoError(t, err)
+		require.Len(t, entries, 1, "retry skipped the durable artifact write")
 	})
 
 	t.Run("marshal failure is storage_failed", func(t *testing.T) {

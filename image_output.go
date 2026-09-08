@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -440,6 +441,10 @@ func (s *session) allowedImageRoots() []string {
 // symlink-safe resolution, regular-file and allowed-root checks, and a read
 // bounded before allocating the declared size.
 func (s *session) materializeLocalImage(path string) ([]byte, error) {
+	if s.agent != nil && s.agent.options.hostAuthorityConfigured {
+		return s.materializeManagedLocalImage(path)
+	}
+
 	resolved, err := imageEvalSymlinks(path)
 	if err != nil {
 		return nil, imageOutputFailure(outputReasonMissingFile, outputMessageUnreadable, 0, 0)
@@ -469,6 +474,40 @@ func (s *session) materializeLocalImage(path string) ([]byte, error) {
 	}
 	defer file.Close()
 
+	return readLocalImageBytes(file, maxBytes)
+}
+
+func (s *session) materializeManagedLocalImage(path string) ([]byte, error) {
+	roots := append([]string{s.cwd}, s.additionalDirectories...)
+
+	file, err := s.agent.openManagedImage(path, roots)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, imageOutputFailure(outputReasonMissingFile, outputMessageUnreadable, 0, 0)
+		}
+
+		return nil, imageOutputFailure(outputReasonPathNotAllowed, outputMessageOutsideRoots, 0, 0)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, imageOutputFailure(outputReasonMissingFile, outputMessageUnreadable, 0, 0)
+	}
+
+	if !info.Mode().IsRegular() {
+		return nil, imageOutputFailure(outputReasonPathNotAllowed, outputMessageNotRegular, 0, 0)
+	}
+
+	maxBytes := effectiveOutputLimit(s.imageLimits().MaxOutputBytesPerImage)
+	if info.Size() > maxBytes {
+		return nil, imageOutputFailure(outputReasonTooLarge, "image output exceeds the per-image limit", info.Size(), maxBytes)
+	}
+
+	return readLocalImageBytes(file, maxBytes)
+}
+
+func readLocalImageBytes(file io.Reader, maxBytes int64) ([]byte, error) {
 	decoded, err := imageReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
 		return nil, imageOutputFailure(outputReasonMissingFile, outputMessageUnreadable, 0, 0)

@@ -2553,8 +2553,8 @@ func (s *openCodeServer) readEventStreamWithLimit(ctx context.Context, eventLimi
 			continue
 		}
 
-		if strings.HasPrefix(line, "data:") {
-			fragment := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if after, ok := strings.CutPrefix(line, "data:"); ok {
+			fragment := strings.TrimSpace(after)
 
 			separator := 0
 			if data.Len() > 0 {
@@ -3000,10 +3000,8 @@ func openAPIObjectHasRequiredProperty(schema map[string]any, property string) bo
 			}
 		}
 	case []string:
-		for _, value := range required {
-			if value == property {
-				return true
-			}
+		if slices.Contains(required, property) {
+			return true
 		}
 	}
 
@@ -3033,10 +3031,8 @@ func openAPIStringEnumContains(schema map[string]any, want string) bool {
 			}
 		}
 	case []string:
-		for _, value := range values {
-			if value == want {
-				return true
-			}
+		if slices.Contains(values, want) {
+			return true
 		}
 	}
 
@@ -3337,10 +3333,8 @@ func validateOpenCodeSeedPath(rel string) (string, error) {
 		return "", unsupportedField(seedFileField(rel))
 	}
 
-	for _, segment := range strings.Split(filepath.ToSlash(rel), "/") {
-		if segment == ".." {
-			return "", unsupportedField(seedFileField(rel))
-		}
+	if slices.Contains(strings.Split(filepath.ToSlash(rel), "/"), "..") {
+		return "", unsupportedField(seedFileField(rel))
 	}
 
 	clean := filepath.Clean(rel)
@@ -3376,9 +3370,7 @@ func unsupportedField(path string) error {
 // merged recursively, and override wins for every conflicting key.
 func deepMergeJSON(base, override map[string]any) map[string]any {
 	merged := make(map[string]any, len(base)+len(override))
-	for key, value := range base {
-		merged[key] = value
-	}
+	maps.Copy(merged, base)
 
 	for key, value := range override {
 		if existing, ok := merged[key].(map[string]any); ok {

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,9 +36,7 @@ func syncTestEvent(aggregate string, sequence int64, kind string, extra map[stri
 		"sessionID": json.RawMessage(`"` + aggregate + `"`),
 		"info":      json.RawMessage(`{"id":"` + aggregate + `","directory":` + jsonTestPath("source") + `}`),
 	}
-	for key, value := range extra {
-		data[key] = value
-	}
+	maps.Copy(data, extra)
 
 	return opencode.SyncEvent{ID: aggregate + "-evt", AggregateID: aggregate, Sequence: sequence, Type: kind, Data: data}
 }
@@ -723,7 +722,7 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 	require.Empty(t, current.snapshotBlockedReason())
 
 	current.secretNeedles = []string{"mcp-secret"}
-	needles := agent.graphSecretNeedles([]*session{current})
+	needles := current.snapshotSecretNeedles()
 	require.ElementsMatch(t, []string{"mcp-secret", "token", "password", "cookie"}, needles)
 
 	oldRead := restoreRandRead
@@ -735,6 +734,26 @@ func TestSnapshotBlockSecretsAndGenerationBranches(t *testing.T) {
 	generation, err := newRestoreGeneration()
 	require.NoError(t, err)
 	require.Len(t, generation, 32)
+}
+
+func TestFailedSnapshotCommitPreservesCommittedRestoreOwnership(t *testing.T) {
+	store := &hookSessionStore{InMemorySessionStore: NewInMemorySessionStore()}
+	current := testSession(t, NewAgent(WithSessionStore(store)), newFakeOpenCodeClient(t))
+	require.NoError(t, current.snapshotToStore(t.Context()))
+	key := mainSessionKey(string(current.id))
+	entries, err := store.Load(t.Context(), key)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	committed, err := decodeStateSnapshot(entries[0])
+	require.NoError(t, err)
+
+	store.onReplace = func(SessionKey) error { return errors.New("commit refused") }
+	require.ErrorContains(t, current.snapshotToStore(t.Context()), "commit refused")
+	retained, err := store.Load(t.Context(), key)
+	require.NoError(t, err)
+	require.Equal(t, entries, retained)
+	require.NoError(t, claimRestoreOwnership(current.client, committed, committed.Events),
+		"an uncommitted capture must not disown the last committed generation")
 }
 
 func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
@@ -807,6 +826,12 @@ func TestSnapshotToStoreRemainingFailureStages(t *testing.T) {
 	current, client = newSnapshotSession()
 	client.xdg.Root = ""
 	require.ErrorContains(t, current.snapshotToStore(context.Background()), "state directory is empty")
+
+	current, _ = newSnapshotSession()
+	previousMkdirAll := restoreMkdirAll
+	restoreMkdirAll = func(string, os.FileMode) error { return errors.New("ownership write failed") }
+	t.Cleanup(func() { restoreMkdirAll = previousMkdirAll })
+	require.ErrorContains(t, current.snapshotToStore(t.Context()), "ownership write failed")
 }
 
 func TestRestoreSyncStateRemainingValidationReplayVerificationAndOwnershipBranches(t *testing.T) {
@@ -1005,6 +1030,23 @@ func TestCaptureStateSnapshotRetriesUnstableSyncGeneration(t *testing.T) {
 		require.Empty(t, *waits)
 	})
 
+	t.Run("bounds a blocked native read", func(t *testing.T) {
+		current, client := newSnapshotSession()
+		originalBudget := stateCaptureSettleBudget
+		stateCaptureSettleBudget = 10 * time.Millisecond
+		t.Cleanup(func() { stateCaptureSettleBudget = originalBudget })
+		client.syncHistoryFunc = func(ctx context.Context, _ map[string]int64) ([]opencode.SyncEvent, error) {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok, "the native read must receive the capture deadline")
+			require.WithinDuration(t, time.Now(), deadline, time.Second)
+			<-ctx.Done()
+
+			return nil, ctx.Err()
+		}
+
+		require.ErrorIs(t, current.snapshotToStore(t.Context()), context.DeadlineExceeded)
+	})
+
 	t.Run("surfaces a cancelled backoff", func(t *testing.T) {
 		current, client := newSnapshotSession()
 		attempts := 0
@@ -1165,7 +1207,7 @@ func TestStateStoreValidationReachableEdges(t *testing.T) {
 	require.Error(t, scanStateSnapshot(badMarshal, nil))
 
 	terminal := terminalTestSnapshot(t,
-		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", int64Pointer(100)),
+		terminalMessageEvent("native", 1, "assistant", "assistant", "stop", new(int64(100))),
 	)
 	terminal = mutateTerminalTestSnapshot(t, terminal, func(value *stateSnapshot) {
 		value.Events["native"][1].Data[syncFieldInfo] = json.RawMessage(

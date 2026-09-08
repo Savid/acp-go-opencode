@@ -188,7 +188,8 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		seenReplacement[replacement.Key] = struct{}{}
 
 		if replacement.Key.SessionID == "" {
-			return fmt.Errorf("replacement session id is required")
+			return fmt.Errorf("replacement session id is required: session %q subpath %q",
+				replacement.Key.SessionID, replacement.Key.Subpath)
 		}
 
 		if replacement.Key.SessionID != main.SessionID {

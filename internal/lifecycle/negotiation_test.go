@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"encoding/json"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -202,7 +203,7 @@ func TestIntegerValueReadsOnlyTheIntegersAnIntHolds(t *testing.T) {
 		{"go int", 1, 1},
 		{"negative", -7.0, -7},
 		{"zero", 0.0, 0},
-		{"largest exact float integer", float64(1 << 53), 1 << 53},
+		{"largest universally exact float integer", float64(1 << 30), 1 << 30},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
@@ -293,4 +294,39 @@ func TestPromptCorrelationMissingIsItsOwnVerdict(t *testing.T) {
 	require.NotNil(t, refusal)
 	require.False(t, refusal.Missing)
 	require.Equal(t, "unsupported "+MetaPath, refusal.Error())
+}
+
+// The 386 run exercises integers that would otherwise wrap into version 1.
+func TestJSONIntegerVersionDoesNotNarrow(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{"4294967297", "-4294967295", "2147483648", "-2147483649", "9223372036854775808", "-9223372036854775809"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+
+			number := json.Number(raw)
+			wide, err := number.Int64()
+			_, ok := integerValue(number)
+			require.Equal(t, err == nil && wide >= math.MinInt && wide <= math.MaxInt, ok)
+			_, refusal := DecodePromptCorrelation(map[string]any{MetaKey: map[string]any{
+				"version": number, "submission": map[string]any{"submissionId": "sub", "clientNonce": "nonce"},
+			}}, Negotiated{Version: 1})
+			require.NotNil(t, refusal)
+			require.Equal(t, MetaPath+".version", refusal.Field)
+		})
+	}
+	for _, endpoint := range []int{math.MinInt, math.MaxInt} {
+		value, ok := integerValue(json.Number(strconv.FormatInt(int64(endpoint), 10)))
+		require.True(t, ok)
+		require.Equal(t, endpoint, value)
+	}
+	upper := math.Ldexp(1, strconv.IntSize-1)
+	_, ok := integerValue(upper)
+	require.False(t, ok)
+	lower, ok := integerValue(-upper)
+	require.True(t, ok)
+	require.Equal(t, math.MinInt, lower)
+	below := math.Trunc(math.Nextafter(upper, 0))
+	value, ok := integerValue(below)
+	require.True(t, ok)
+	require.Equal(t, below, float64(value))
 }

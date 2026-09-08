@@ -136,7 +136,7 @@ func TestRawEventSequenceIsContiguous(t *testing.T) {
 	conn := newRecordingAgentClient()
 	sess := rawEventSession(t, "session-1", conn)
 	const total = 5
-	for i := 0; i < total; i++ {
+	for i := range total {
 		event := normalRawEvent("n")
 		if i == 2 {
 			event = oversizeRawEvent()
@@ -196,7 +196,7 @@ func TestRawEventCrossSessionSequenceIsolation(t *testing.T) {
 	conn := newRecordingAgentClient()
 	sessA := rawEventSession(t, "session-a", conn)
 	sessB := rawEventSession(t, "session-b", conn)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := sessA.emitRawOpenCodeEvent(context.Background(), normalRawEvent("a")); err != nil {
 			t.Fatalf("emit a %d: %v", i, err)
 		}
@@ -389,7 +389,7 @@ func TestRawEventDefaultOffEmitsNothing(t *testing.T) {
 	conn := newRecordingAgentClient()
 	sess := rawEventSession(t, "session-1", conn)
 	sess.rawMessages = rawMessageConfig{}
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		if err := sess.emitRawOpenCodeEvent(context.Background(), oversizeRawEvent()); err != nil {
 			t.Fatalf("emit: %v", err)
 		}

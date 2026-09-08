@@ -26,7 +26,7 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 					"context": float64(1000),
 					"output":  float64(200),
 				},
-				Capabilities: &opencode.ProviderModelCapabilities{Input: opencode.ProviderModelInputCapabilities{Image: boolPtr(true)}},
+				Capabilities: &opencode.ProviderModelCapabilities{Input: opencode.ProviderModelInputCapabilities{Image: new(true)}},
 				Variants: map[string]map[string]any{
 					"medium": {"reasoningEffort": "medium"},
 					"low":    {"reasoningEffort": "low"},

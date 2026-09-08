@@ -46,8 +46,9 @@ not-found response also proves absence). A failed deletion makes close fail
 loudly, retains both the remaining registrations and directory principal, and
 can be retried; another session cannot enter that directory while disconnection
 is unproven. Because registration is directory-scoped, one canonical directory
-admits only one live session principal; a second session or a different
-credential fingerprint is rejected.
+admits only one live session principal. Forks in that lineage may share the
+principal with identical MCP configuration; unrelated sessions and changed
+credential fingerprints are rejected.
 
 If initial scope setup fails and its partial registration cannot be disproved,
 there is no live session handle through which cleanup could be retried. The
