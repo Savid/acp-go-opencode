@@ -1,10 +1,9 @@
 ---
 title: ACP Methods
-description: The ACP methods the adapter implements and the one namespaced extension it adds.
+description: The ACP methods the adapter implements and its namespaced extensions.
 ---
 
-The adapter implements the standard ACP method set plus one namespaced fork
-extension. This page lists each method and its behavior.
+The adapter implements standard ACP methods and namespaced extensions. This page lists each method and its behavior.
 
 ## Stable methods
 
@@ -33,6 +32,8 @@ extension. This page lists each method and its behavior.
   [Sessions](/docs/core/sessions)). Params this adapter cannot decode, or that
   fail validation as a whole, are `-32602` with
   `{"error":"unsupported","field":"params"}`.
+- `_opencode/rateLimits` — read structured OpenCode Go subscription windows or
+  OpenRouter key allowances; see [Rate limits](#rate-limits).
 - `_opencode/rawEvent` — an outbound notification, not a request (see
   [Raw events](/docs/features/raw-events)).
 - `_opencode/auth/methods`, `_opencode/auth/authorize`,
@@ -60,3 +61,130 @@ After `Agent.Close`, the connection rejects every incoming request with
 invalid-request (`-32600`) before initialization gating, method lookup,
 extension dispatch, or parameter decoding. A malformed or unknown call cannot
 overtake the closed-agent fence.
+
+## Rate Limits
+
+`_opencode/rateLimits` reads provider quota observations. This read does
+not submit a prompt, run a slash command, or spend inference tokens. It works
+alongside prompt work and leaves the selected model and credentials unchanged.
+
+### Request
+
+```json
+{"providerId":"opencode-go","sessionId":"session-1"}
+```
+
+Both selectors are optional nonblank strings. A supplied `sessionId` must name
+a live session and selects that session's native configuration. Unknown, closed,
+unloaded, and deleted sessions return invalid params with
+`{"error":"unknown session","field":"sessionId"}`, even for an unsupported
+provider or when the session closes during a read. Poisoned sessions retain
+their normal internal error; caller cancellation takes priority. An omitted
+provider is inferred only when the selected session, all live configurations,
+or the configured default identify one provider; ambiguity returns
+`{"error":"missing","field":"providerId"}`.
+
+Provider-only reads compare the running native runtime and live directory
+scopes. They return `unavailable/session_required` when those scopes disagree
+about credentials or when no runtime is available. A quota read never starts
+a runtime. An explicit unknown provider returns `unsupported`.
+
+OpenCode Go models using the official OpenAI-compatible, Anthropic, and OpenAI
+SDKs share the same Go account when their effective base URL is
+`https://opencode.ai/zen/go/v1`. Mixed SDKs do not require a selected model.
+Custom SDKs, endpoints, and credential overrides remain subject to the native
+binding checks. See OpenCode's [Go endpoints](https://opencode.ai/docs/go/#endpoints).
+
+Absent params, `null`, and `{}` select the default context. Duplicate or unknown
+members, nonstring or blank selectors, invalid Unicode, malformed JSON,
+whitespace-only input, and trailing JSON return invalid params with
+`{"error":"unsupported","field":"<member-or-params>"}`.
+
+### Response
+
+```json
+{
+  "providerId": "opencode-go",
+  "availability": "available",
+  "pools": [{
+    "id": "opencode-go",
+    "windows": [{
+      "id": "rolling",
+      "usedPercent": 0,
+      "status": "ok",
+      "observedAt": "2026-09-08T10:00:00Z",
+      "resetsAt": "2026-09-08T14:00:00Z"
+    }]
+  }]
+}
+```
+
+`available` includes one or more observed pools and no reason. `unavailable`
+has `pools: []` and a reason: `not_observed`, `not_authenticated`, `read_failed`,
+`disabled`, or `session_required`. `unsupported` has `pools: []` without a reason.
+
+An HTTP 401 from the primary endpoint is `unavailable/not_authenticated`. Other primary HTTP refusals are
+`unavailable/read_failed`, including Go's HTTP 403 for an authenticated key
+without a Go subscription. Native error messages are not returned.
+
+Every pool has an ID and a `windows` array, which is empty for a balance-only
+pool. Windows contain a native percentage or status and a UTC `observedAt`;
+optional reset timestamps are UTC too. Balance amounts are major currency
+units with an uppercase currency code. Omitted numeric fields mean no
+observation; zero is retained. These measurements are informational and do
+not decide whether a prompt may run.
+
+### Supported readers
+
+| Provider ID | Source and normalized observations |
+|---|---|
+| `opencode-go` | Bearer-authenticated `GET https://opencode.ai/zen/go/v1/usage`. One `opencode-go` pool preserves native `rolling`, `weekly`, and `monthly` windows, their percentages, reset timestamps, and `ok` or `rate-limited` status. The latter maps to `exhausted`. No duration or monetary value is inferred. |
+| `openrouter` | Bearer-authenticated `GET https://openrouter.ai/api/v1/key`, followed by optional `GET https://openrouter.ai/api/v1/credits` with the same key. The `openrouter` pool contains a `key` balance in USD. A capped key preserves native `limit`, `limit_remaining`, and an available `limit_reset`. A null limit produces `uncapped: true` and the native lifetime usage as `used`. Capped balances omit `used` because lifetime usage is not the active reset allowance. A successful credits read adds the separate `openrouter-account` pool with a `credits` balance: `used` is native `total_usage`, and `remaining` is `total_credits - total_usage`, both in USD. |
+
+Every other provider, including `xai`, returns `unsupported`. OpenRouter's
+uncapped key does not imply unlimited account funds. Account credit preserves
+zero and negative remaining amounts and has no fabricated limit, percentage,
+or reset. Purchased credits are not a key spending cap.
+
+The optional credits read uses only the same resolved inference key. Denied,
+malformed, timed-out, or failed credits responses omit the account pool while
+preserving usable key observations. OpenRouter's
+[credits documentation](https://openrouter.ai/docs/api/api-reference/credits/get-remaining-credits)
+states that a management key is required; a read verified on 2026-09-08 also
+accepted an ordinary inference key. Access remains provider-controlled. The
+adapter never requests a management credential or broader scopes. USD units
+follow OpenRouter's [credit system](https://openrouter.ai/docs/faq#credit-and-billing-systems).
+
+The adapter reads the effective native `/config/providers` response in the
+addressed directory scope. A configured `options.apiKey` takes precedence over
+the native provider key. The selected model must use the official endpoint and
+the reviewed SDK: `@ai-sdk/openai-compatible`, `@ai-sdk/anthropic`, or `@ai-sdk/openai` for Go,
+and `@openrouter/ai-sdk-provider` for OpenRouter. Gateway endpoints, replacement
+authentication headers, and custom plugins are unsupported. The adapter's own
+session-carrier plugin is allowed. No credential-store file or unrelated home
+is searched, and no login or refresh flow is initiated.
+
+These mappings were checked against OpenCode 1.18.29 and provider sources on
+2026-09-08: the native
+[provider configuration implementation](https://github.com/anomalyco/opencode/blob/v1.18.29/packages/opencode/src/provider/provider.ts),
+the [Go usage handler](https://github.com/anomalyco/opencode/blob/v1.18.29/packages/console/app/src/routes/zen/go/v1/usage.ts),
+and [OpenRouter current-key documentation](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key).
+Native quota routes are not exposed by the reviewed OpenCode server. Future
+native configuration or source-shape changes may make a read unavailable or
+unsupported until reviewed.
+
+### Controls and freshness
+
+Direct reads are enabled by default. `WithOpenCodeDirectAPI(false)` and
+`-opencode-direct-api=false` disable both readers. The method stays available
+and reports `unavailable/disabled` for those providers.
+
+Every acquisition has a 30-second total deadline, shortened by the caller's
+deadline. The optional OpenRouter credits read has a five-second deadline
+within that budget. Cancellation reaches native and provider HTTP work. Redirects are
+refused, response bodies are bounded, and source error bodies are not returned.
+Each read obtains a new observation; no quota data is cached or persisted.
+`observedAt` records receipt of the complete source response. The adapter
+rechecks credential configuration and fences authentication, session, and
+runtime changes before returning an observation. Windows whose reset has
+elapsed are omitted; if none remain, the result is `unavailable/not_observed`.

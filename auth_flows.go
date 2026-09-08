@@ -832,6 +832,9 @@ func (p *providerAuth) install(ctx context.Context, session *session, flow *auth
 	callCtx, cancel := context.WithTimeout(ctx, authNativeCallTimeout)
 	defer cancel()
 
+	finishQuotaMutation := p.agent.beginQuotaAuthMutation()
+	defer finishQuotaMutation()
+
 	if err := client.SetProviderAuth(callCtx, flow.providerID, credential); err != nil {
 		return p.failInstall(flow, authNativeCause(err))
 	}
@@ -1102,6 +1105,9 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 	if !ok || record.ConnectionID != connectionID || record.BindingGeneration != bindingGeneration {
 		return nil, authFailed(authCauseBindingConflict, providerID, "", "")
 	}
+
+	finishQuotaMutation := p.agent.beginQuotaAuthMutation()
+	defer finishQuotaMutation()
 
 	record.BindingGeneration++
 	record.UpdatedAt = authNow().UnixMilli()

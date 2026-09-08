@@ -61,6 +61,7 @@ type Options struct {
 	SeedFiles               map[string]string
 	ImageLimits             ImageLimits
 
+	DirectAPI          bool
 	Pure               bool
 	QuestionTool       bool
 	LogLevel           string
@@ -83,6 +84,7 @@ type Options struct {
 func applyOptions(opts []Option) Options {
 	options := Options{
 		AgentName:               defaultAgentName,
+		DirectAPI:               true,
 		AgentTitle:              defaultAgentName,
 		AgentVersion:            "0.1.0",
 		SessionStoreLoadTimeout: 10 * time.Second,
@@ -307,4 +309,9 @@ func WithTurnTimeout(timeout time.Duration) Option {
 	return func(options *Options) {
 		options.TurnTimeout = timeout
 	}
+}
+
+// WithOpenCodeDirectAPI enables direct provider account-usage requests. It is enabled by default.
+func WithOpenCodeDirectAPI(enabled bool) Option {
+	return func(options *Options) { options.DirectAPI = enabled }
 }

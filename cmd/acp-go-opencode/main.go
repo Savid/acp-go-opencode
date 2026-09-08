@@ -37,6 +37,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	model := flags.String("model", "", "default OpenCode model as provider/model")
 	debug := flags.Bool("debug", false, "write debug logs to stderr")
 	printVersion := flags.Bool("version", false, "print adapter version and exit")
+	directAPI := flags.Bool("opencode-direct-api", true, "enable direct provider account-usage requests")
 	pure := flags.Bool("opencode-pure", false, "start OpenCode without external plugins")
 	questionTool := flags.Bool("opencode-question-tool", false, "enable OpenCode native question tool mapping")
 	logLevel := flags.String("opencode-log-level", "", "OpenCode native server log level")
@@ -109,6 +110,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		opencodeacp.WithDefaultModel(*model),
 		opencodeacp.WithLogger(logger),
 		opencodeacp.WithOpenCodePure(*pure),
+		opencodeacp.WithOpenCodeDirectAPI(*directAPI),
 		opencodeacp.WithOpenCodeQuestionTool(*questionTool),
 		opencodeacp.WithOpenCodeLogLevel(*logLevel),
 		opencodeacp.WithOpenCodeHealthCheckTimeout(*healthTimeout),

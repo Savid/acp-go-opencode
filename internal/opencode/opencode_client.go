@@ -174,6 +174,7 @@ type Client interface {
 	Fork(context.Context, string, string) (NativeSession, error)
 	Todos(context.Context, string) ([]NativeTodo, error)
 	ConfigProviders(context.Context) (ProvidersResponse, error)
+	ProviderQuotaAllowed(context.Context) (bool, error)
 	Agents(context.Context) ([]NativeAgent, error)
 	PendingPermissions(context.Context) ([]PermissionRequest, error)
 	ReplyPermission(context.Context, PermissionRequest, string, string) error
@@ -325,6 +326,7 @@ type openCodeServer struct {
 	reclaimTree             func(context.Context, string) error
 	sessionCarrierBroker    *sessionCarrierBroker
 	sessionCarrierReference string
+	quotaCarrierPlugin      string
 	pure                    bool
 }
 
@@ -1165,6 +1167,7 @@ func startServer(ctx context.Context, options StartOptions) (_ *openCodeServer, 
 		ordinaryHomeLock: homeLock, process: process, settlement: settlement,
 		preparedTrees: preparedTrees, reclaimTree: options.ReclaimTree,
 		sessionCarrierBroker: sessionCarrier.Broker, pure: options.Pure,
+		quotaCarrierPlugin: sessionCarrier.URL,
 	}
 	transferred = true
 
@@ -1701,6 +1704,7 @@ func (s *openCodeServer) Scope(ctx context.Context, options ScopeOptions) (Clien
 		sessionCarrierBroker:    s.sessionCarrierBroker,
 		sessionCarrierReference: carrierReference,
 		pure:                    s.pure,
+		quotaCarrierPlugin:      s.quotaCarrierPlugin,
 	}
 
 	if err := scope.registerMCP(ctx, options.MCPServers); err != nil {

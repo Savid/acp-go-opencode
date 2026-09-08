@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -35,12 +36,13 @@ var (
 
 // Agent exposes OpenCode through ACP.
 type Agent struct {
-	options      Options
-	log          *slog.Logger
-	observe      *observer.Observer
-	optionsErr   error
-	providerAuth *providerAuth
-	imageRoots   managedImageRoots
+	options         Options
+	log             *slog.Logger
+	observe         *observer.Observer
+	optionsErr      error
+	providerAuth    *providerAuth
+	quotaHTTPClient *http.Client
+	imageRoots      managedImageRoots
 
 	mu                   sync.Mutex
 	closed               bool
@@ -55,6 +57,8 @@ type Agent struct {
 	lifecycle            lifecycle.Negotiated
 	runtime              opencode.Client
 	runtimeGeneration    uint64
+	quotaRevision        uint64
+	quotaAuthMutations   int
 	runtimeStarting      chan struct{}
 	runtimeStartErr      error
 	runtimeFatalErr      error
@@ -155,6 +159,7 @@ func NewAgent(opts ...Option) *Agent {
 	}
 
 	agent.providerAuth = newProviderAuth(agent)
+	agent.quotaHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 	return agent
 }
@@ -494,6 +499,8 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 	}
 
 	switch method {
+	case RateLimitsMethod:
+		return a.handleRateLimits(ctx, params)
 	case ForkSessionMethod:
 		// Params this adapter cannot decode, or that fail validation as a whole,
 		// name the params body itself in the uniform refusal. A member that is

@@ -128,6 +128,7 @@ selector to derive a binary cache key. See the
 
 | Option | Purpose | Default |
 |---|---|---|
+| `WithOpenCodeDirectAPI` | Enable direct provider account-usage reads. | on |
 | `WithOpenCodePure` | Start OpenCode without external plugins. | off |
 | `WithOpenCodeQuestionTool` | Enable native question-tool elicitation. | off |
 | `WithOpenCodeLogLevel` | Native server log level. | native default |
@@ -181,3 +182,17 @@ the default implementation. Rows use `SessionStoreFormat`
 `InspectSessionStoreTerminalState` validates the committed entries for a
 logical ACP session and returns the latest durable terminal assistant message
 identity for host checkpoint reconciliation.
+
+## Quotas and balances
+
+`RateLimitsMethod` is `_opencode/rateLimits`. Send `RateLimitsRequest` through
+`HandleExtensionMethod`; it accepts optional `ProviderID` and `SessionID`.
+`RateLimitsResponse` contains `ProviderID`, `Availability`, optional `Reason`,
+and `Pools`. Each `RateLimitPool` groups `RateLimitWindow` observations and
+optional `RateLimitBalance` values. Monetary values use `RateLimitMoney`.
+Optional numeric observations are pointers, preserving an observed zero.
+
+`WithOpenCodeDirectAPI(false)` disables all direct account-usage reads. The
+extension remains implemented and supported readers return
+`unavailable/disabled`. See [Rate limits](/docs/reference/acp-methods#rate-limits) for
+selection, response fields, and source-specific meaning.

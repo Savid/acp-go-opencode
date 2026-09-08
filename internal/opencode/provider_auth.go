@@ -25,6 +25,7 @@ const (
 	providerAuthMethodField = "method"
 	providerModelsField     = "models"
 	providerSourceField     = "source"
+	providerOptionsField    = "options"
 )
 
 // providerCatalogAllowlist names every key the adapter reads from a native
@@ -33,7 +34,7 @@ const (
 // each entry through this list drops it before any decoder can forward it.
 var catalogMarshal = json.Marshal
 
-var providerCatalogAllowlist = []string{fieldID, fieldName, "env", providerModelsField, "options", providerSourceField}
+var providerCatalogAllowlist = []string{fieldID, fieldName, "env", providerModelsField, providerOptionsField, providerSourceField}
 
 // ProviderCatalogEntry is one allowlisted entry of the native `all` provider
 // catalog.
@@ -85,8 +86,8 @@ type ProviderAuthorization struct {
 	Instructions string `json:"instructions"`
 }
 
-// ProviderAuthCredential is one entry of the native credential store. It is the
-// only native shape carrying credential material, so it decodes strictly.
+// ProviderAuthCredential is one entry of the native credential store. Its
+// closed credential-store shape decodes strictly.
 type ProviderAuthCredential struct {
 	Type          string            `json:"type"`
 	Refresh       string            `json:"refresh,omitempty"`

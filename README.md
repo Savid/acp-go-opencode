@@ -33,6 +33,10 @@ The `acp-go-opencode` binary speaks ACP over stdin/stdout and reserves stdout
 for ACP JSON-RPC while diagnostics go to stderr; an editor or ACP host launches
 it as a subprocess rather than a human-facing chat UI.
 
+The `_opencode/rateLimits` extension reads OpenCode Go subscription windows and
+OpenRouter key allowances. See [Rate limits](docs/reference/acp-methods.mdx#rate-limits)
+for provider selection and direct-read controls.
+
 ## Quickstart
 
 The example programs run from a checkout of this repo, so clone it first:

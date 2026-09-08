@@ -79,6 +79,7 @@ type session struct {
 	title                 string
 	updatedAt             string
 	providerID            string
+	quotaRevision         uint64
 	modelID               string
 	mode                  string
 	variant               string
@@ -1161,6 +1162,7 @@ func (s *session) setModel(value string) {
 	s.mu.Lock()
 	s.providerID = provider
 	s.modelID = model
+	s.quotaRevision++
 	s.mu.Unlock()
 }
 

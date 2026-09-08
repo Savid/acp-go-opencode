@@ -1728,3 +1728,5 @@ func TestMain(m *testing.M) {
 	_ = os.RemoveAll(suiteTemp)
 	os.Exit(code)
 }
+
+func (c *fakeOpenCodeClient) ProviderQuotaAllowed(context.Context) (bool, error) { return true, nil }

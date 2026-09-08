@@ -34,6 +34,10 @@
 // notifications only when a session request opts in with
 // [WithSessionRawEvents].
 //
+// [RateLimitsMethod] reads structured OpenCode Go subscription windows and
+// OpenRouter key allowances. [WithOpenCodeDirectAPI] controls direct account
+// usage requests; quota reads do not submit prompts or spend inference tokens.
+//
 // Hosts that need adapter telemetry can provide OpenTelemetry providers with
 // [WithTracerProvider] and [WithMeterProvider]. The package never configures
 // global OpenTelemetry providers; the acp-go-opencode binary handles
