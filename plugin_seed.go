@@ -3,11 +3,8 @@ package opencodeacp
 import (
 	"context"
 	"log/slog"
-	"os"
 	"path/filepath"
 )
-
-var runtimeUserCacheDir = os.UserCacheDir
 
 // pluginSeedDirName is the directory beneath the adapter's user cache root that
 // holds the OpenCode plugin install seeded into new runtime roots.

@@ -50,10 +50,15 @@ type Options struct {
 	ProviderAuthDirectHome string
 	DefaultModel           string
 	Env                    map[string]string
-	Logger                 *slog.Logger
-	TracerProvider         trace.TracerProvider
-	MeterProvider          metric.MeterProvider
-	TextMapPropagator      propagation.TextMapPropagator
+	// AmbientEnvironment replaces the adapter's own process environment as the
+	// block ordinary execution inherits from. Its names are judged exactly as
+	// inherited names are; WithEnv and session environments overlay it. Nil
+	// inherits from the adapter's process. Managed execution never reads it.
+	AmbientEnvironment map[string]string
+	Logger             *slog.Logger
+	TracerProvider     trace.TracerProvider
+	MeterProvider      metric.MeterProvider
+	TextMapPropagator  propagation.TextMapPropagator
 
 	SessionStore            SessionStore
 	SessionStoreLoadTimeout time.Duration
@@ -91,11 +96,12 @@ func applyOptions(opts []Option) Options {
 		HealthCheckTimeout:      opencode.HealthCheckTimeout,
 		ImageLimits:             defaultImageLimits(),
 		clientFactory:           opencode.StartServer,
-		implicitEnvironment:     captureAmbientEnvironment(),
 	}
 	for _, opt := range opts {
 		opt(&options)
 	}
+
+	options.implicitEnvironment = ambientEnvironmentSnapshot(ambientEnvironmentEntries(options))
 
 	return options
 }
@@ -198,6 +204,16 @@ func WithDefaultModel(model string) Option {
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)
+	}
+}
+
+// WithAmbientEnvironment supplies the block ordinary execution inherits from in
+// place of the adapter's own process environment. Entries are filtered like
+// inherited entries; an entry that could not be an environment entry fails
+// Agent construction. Managed execution reads nothing from it.
+func WithAmbientEnvironment(env map[string]string) Option {
+	return func(options *Options) {
+		options.AmbientEnvironment = cloneStringMap(env)
 	}
 }
 

@@ -543,7 +543,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 	helper := fakeOpenCodeExecutable(t)
 	root := t.TempDir()
 	logger := slog.New(slog.DiscardHandler)
-	client, err := StartServer(context.Background(), StartOptions{
+	client, err := StartServer(context.Background(), testStartOptions(StartOptions{
 		Root:            root,
 		ExecutablePath:  helper,
 		Env:             map[string]string{"BASE_ENV": "base"},
@@ -554,7 +554,7 @@ func TestStartOpenCodeServerWithFakeExecutable(t *testing.T) {
 		HealthTimeout:   5 * time.Second,
 		Logger:          logger,
 		SkipVersionGate: false,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("StartServer: %v", err)
 	}
@@ -934,19 +934,19 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("create xdg", func(t *testing.T) {
-		_, err := StartServer(ctx, StartOptions{Root: filepath.Join(t.TempDir(), string([]byte{0}))})
+		_, err := StartServer(ctx, testStartOptions(StartOptions{Root: filepath.Join(t.TempDir(), string([]byte{0}))}))
 		require.Error(t, err)
 	})
 
 	t.Run("incomplete existing xdg", func(t *testing.T) {
-		_, err := StartServer(ctx, StartOptions{ExistingXDG: XDGDirs{Root: filepath.Join(t.TempDir(), "root")}})
+		_, err := StartServer(ctx, testStartOptions(StartOptions{ExistingXDG: XDGDirs{Root: filepath.Join(t.TempDir(), "root")}}))
 		require.Error(t, err)
 	})
 
 	t.Run("runtime config", func(t *testing.T) {
-		_, err := StartServer(ctx, StartOptions{
+		_, err := StartServer(ctx, testStartOptions(StartOptions{
 			ExistingXDG: testXDGDirs(t), SeedFiles: map[string]string{"../escape": "bad"},
-		})
+		}))
 		require.Error(t, err)
 	})
 
@@ -955,44 +955,44 @@ func TestStartOpenCodeServerFaultInjection(t *testing.T) {
 		openCodeListen = func(string, string) (net.Listener, error) {
 			return nil, errors.New("listen failed")
 		}
-		_, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t), Pure: true})
+		_, err := StartServer(ctx, testStartOptions(StartOptions{ExistingXDG: testXDGDirs(t), Pure: true}))
 		require.ErrorContains(t, err, "listen failed")
 	})
 
 	t.Run("entropy", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeRandReader = errorReader{err: errors.New("entropy failed")}
-		_, err := StartServer(ctx, StartOptions{ExistingXDG: testXDGDirs(t)})
+		_, err := StartServer(ctx, testStartOptions(StartOptions{ExistingXDG: testXDGDirs(t)}))
 		require.ErrorContains(t, err, "entropy failed")
 	})
 
 	t.Run("start process", func(t *testing.T) {
 		want := errors.New("native spawn refused")
-		_, err := StartServer(ctx, StartOptions{
+		_, err := StartServer(ctx, testStartOptions(StartOptions{
 			ExistingXDG: testXDGDirs(t), Pure: true,
 			StartProcess: func(context.Context, string, []string, []string, string) (ProcessHandle, error) {
 				return ProcessHandle{}, want
 			},
-		})
+		}))
 		require.ErrorIs(t, err, want)
 	})
 
 	t.Run("incomplete process", func(t *testing.T) {
-		_, err := StartServer(ctx, StartOptions{
+		_, err := StartServer(ctx, testStartOptions(StartOptions{
 			ExistingXDG: testXDGDirs(t), Pure: true,
 			StartProcess: func(context.Context, string, []string, []string, string) (ProcessHandle, error) {
 				return ProcessHandle{}, nil
 			},
-		})
+		}))
 		require.ErrorContains(t, err, "native process handle is incomplete")
 	})
 
 	t.Run("readiness", func(t *testing.T) {
 		helper := fakeOpenCodeExecutable(t)
-		_, err := StartServer(ctx, StartOptions{
+		_, err := StartServer(ctx, testStartOptions(StartOptions{
 			Root: t.TempDir(), ExecutablePath: helper, MinVersion: "99.0.0",
 			HealthTimeout: 5 * time.Second, Logger: slog.New(slog.DiscardHandler),
-		})
+		}))
 		require.ErrorContains(t, err, "below minimum supported")
 	})
 }
@@ -2584,14 +2584,14 @@ func TestColdStartupReleaseGate(t *testing.T) {
 
 	for range releaseGateRepetitions {
 		started := time.Now()
-		client, err := StartServer(context.Background(), StartOptions{
+		client, err := StartServer(context.Background(), testStartOptions(StartOptions{
 			Root:            t.TempDir(),
 			ExecutablePath:  executable,
 			MinVersion:      "1.18.3",
 			HealthTimeout:   5 * time.Second,
 			SkipVersionGate: false,
 			Pure:            true,
-		})
+		}))
 		durations = append(durations, time.Since(started))
 		require.NoError(t, err)
 		require.NoError(t, client.Shutdown(context.Background()))

@@ -11,7 +11,8 @@ withholds that entire provider-auth surface.
 ## Native credential input
 
 Ordinary execution starts from the environment captured when the agent is
-constructed, applies `WithEnv`, strips adapter-private and managed-root keys,
+constructed, from the adapter's process or from `WithAmbientEnvironment`,
+applies `WithEnv`, strips adapter-private and managed-root keys,
 and then installs the generated OpenCode/XDG values. Provider API-key variables
 may be supplied with `WithEnv` or inherited from that captured environment.
 

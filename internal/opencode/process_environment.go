@@ -2,14 +2,11 @@ package opencode
 
 import (
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 )
 
 const pathEnv = "PATH"
-
-var processEnviron = os.Environ
 
 func ValidateEnvironment(environment map[string]string) error {
 	for key, value := range environment {
@@ -34,10 +31,6 @@ func environmentMap(entries []string) map[string]string {
 }
 
 func buildProcessEnvironmentFrom(base map[string]string, overlays ...map[string]string) (map[string]string, error) {
-	if base == nil {
-		base = captureProcessEnvironment()
-	}
-
 	if err := ValidateEnvironment(base); err != nil {
 		return nil, err
 	}
@@ -112,10 +105,6 @@ func managedRuntimeRootEnvKey(key string) bool {
 	default:
 		return false
 	}
-}
-
-func captureProcessEnvironment() map[string]string {
-	return environmentMap(processEnviron())
 }
 
 func withoutManagedRootOverrides(environment map[string]string) map[string]string {

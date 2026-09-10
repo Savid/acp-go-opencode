@@ -791,10 +791,6 @@ var (
 const HealthCheckTimeout = 60 * time.Second
 
 func normalizedStartOptions(options StartOptions) StartOptions {
-	if options.NativeEnvironment == nil {
-		options.NativeEnvironment = captureProcessEnvironment
-	}
-
 	if options.StartProcess == nil {
 		options.StartProcess = startOrdinaryProcess
 	}

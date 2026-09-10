@@ -124,6 +124,7 @@ func NewAgent(opts ...Option) *Agent {
 	optionsErr = errors.Join(optionsErr, validateImageLimits(options.ImageLimits))
 	optionsErr = errors.Join(optionsErr, validateInputHandoffRoot(options.InputHandoffRoot))
 	optionsErr = errors.Join(optionsErr, validateProviderAuthRoot(options))
+	optionsErr = errors.Join(optionsErr, validateAmbientEnvironment(options.AmbientEnvironment))
 
 	log := options.Logger
 	if log == nil {

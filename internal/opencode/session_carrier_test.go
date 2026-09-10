@@ -404,9 +404,9 @@ func TestStartServerReportsSessionCarrierMaterializationFailure(t *testing.T) {
 	want := errors.New("carrier root refused")
 	sessionCarrierMkdirTemp = func(string, string) (string, error) { return "", want }
 
-	_, err := StartServer(t.Context(), StartOptions{
+	_, err := StartServer(t.Context(), testStartOptions(StartOptions{
 		Root: filepath.Join(t.TempDir(), "runtime"), ExecutablePath: "/missing",
-	})
+	}))
 	require.ErrorIs(t, err, want)
 }
 
@@ -430,13 +430,13 @@ func TestStartServerRefusesARuntimeWhoseCarrierNeverLoaded(t *testing.T) {
 		return write(path, data, mode)
 	}
 
-	_, err := StartServer(t.Context(), StartOptions{
+	_, err := StartServer(t.Context(), testStartOptions(StartOptions{
 		Root:            t.TempDir(),
 		ExecutablePath:  fakeOpenCodeExecutable(t),
 		MinVersion:      "1.18.3",
 		HealthTimeout:   2 * time.Second,
 		SkipVersionGate: false,
-	})
+	}))
 	require.ErrorContains(t, err, "did not load")
 }
 
@@ -1226,13 +1226,13 @@ func TestStartServerRefusesARuntimeWhoseBootstrapSurvives(t *testing.T) {
 	want := errors.New("module is pinned")
 	sessionCarrierRemove = func(string) error { return want }
 
-	_, err := StartServer(t.Context(), StartOptions{
+	_, err := StartServer(t.Context(), testStartOptions(StartOptions{
 		Root:            t.TempDir(),
 		ExecutablePath:  fakeOpenCodeExecutable(t),
 		MinVersion:      "1.18.3",
 		HealthTimeout:   5 * time.Second,
 		SkipVersionGate: false,
-	})
+	}))
 	require.ErrorIs(t, err, want)
 }
 
@@ -1250,14 +1250,14 @@ func TestStartServerLeavesAPreparedTreesBootstrapAlone(t *testing.T) {
 		return nil
 	}
 
-	client, err := StartServer(t.Context(), StartOptions{
+	client, err := StartServer(t.Context(), testStartOptions(StartOptions{
 		Root:            t.TempDir(),
 		ExecutablePath:  fakeOpenCodeExecutable(t),
 		HealthTimeout:   5 * time.Second,
 		SkipVersionGate: true,
 		PrepareTree:     func(context.Context, string) error { return nil },
 		ReclaimTree:     func(context.Context, string) error { return nil },
-	})
+	}))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Shutdown(context.Background()) })
 

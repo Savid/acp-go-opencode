@@ -79,8 +79,9 @@ authority error is never retried through ordinary execution.
 | `WithHome` | Exact exclusive shared OpenCode XDG root owned by this Agent. |
 | `WithDefaultModel` | Default `provider/model` for new sessions. |
 | `WithEnv` | Agent-wide ordinary-variable overlays. The managed OpenCode and XDG roots are refused under the platform identity. Names follow the session `env` rule with `PATH` allowed: a key is non-empty and free of `=` and NUL, the value is free of NUL, the injection names `NODE_OPTIONS`, `BASH_ENV`, `ENV`, and any `LD_` or `DYLD_` prefix are refused under the platform identity, the private adapter namespace is refused under every spelling, and two spellings of one Windows variable are refused; a refusal fails Agent construction. |
+| `WithAmbientEnvironment` | Replaces the adapter's own process environment as the block ordinary execution inherits from. The same private-carrier and managed-root filtering applies to it, and `WithEnv` overlays it; a supplied map is folded in sorted key order. Nil inherits from the adapter's process; an empty map inherits nothing. An entry that could not be an environment entry fails Agent construction. Every mode validates it; managed execution reads nothing from it. |
 | `WithSeedFiles` | Immutable files materialized in the shared config root before launch. |
-| `WithPluginSeedDir` | Ordinary-execution plugin install cache; empty uses `plugin-seed` under the user cache directory. Ignored with `WithHostAuthority`. |
+| `WithPluginSeedDir` | Ordinary-execution plugin install cache; empty uses `plugin-seed` under the adapter account's cache directory. Ignored with `WithHostAuthority`. |
 | `WithPluginSeed` | Enable or disable the plugin install cache; enabled by default. |
 | `WithSessionStore` | Host-provided persistence backend. |
 | `WithSessionStoreLoadTimeout` | Bound each store read during hydration; default `10s`. |

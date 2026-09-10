@@ -90,7 +90,7 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 	shim, err := NewBrowserShim(t.TempDir())
 	require.NoError(t, err)
 
-	client, err := StartServer(context.Background(), StartOptions{
+	client, err := StartServer(context.Background(), testStartOptions(StartOptions{
 		Root:            t.TempDir(),
 		ExecutablePath:  browserLaunchingOpenCodeExecutable(t),
 		BrowserShim:     shim,
@@ -98,7 +98,7 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 		HealthTimeout:   30 * time.Second,
 		Logger:          slog.New(slog.DiscardHandler),
 		SkipVersionGate: true,
-	})
+	}))
 	require.NoError(t, err)
 
 	t.Cleanup(func() { require.NoError(t, client.Shutdown(context.Background())) })

@@ -854,10 +854,10 @@ func TestStartServerPluginSeedLifecycle(t *testing.T) {
 	start := func(t *testing.T, root string, logger *slog.Logger, mutate func(*StartOptions)) Client {
 		t.Helper()
 
-		options := StartOptions{
+		options := testStartOptions(StartOptions{
 			Root: root, ExecutablePath: executable, PluginSeedDir: seedDir,
 			HealthTimeout: 10 * time.Second, Logger: logger, SkipVersionGate: true,
-		}
+		})
 
 		if mutate != nil {
 			mutate(&options)
@@ -1198,13 +1198,13 @@ func TestStartServerPluginSeedLifecycle(t *testing.T) {
 		logger, logs := debugLogger(t)
 		want := errors.New("launch refused")
 
-		_, err := StartServer(t.Context(), StartOptions{
+		_, err := StartServer(t.Context(), testStartOptions(StartOptions{
 			Root: t.TempDir(), ExecutablePath: filepath.Join(t.TempDir(), "missing"), PluginSeedDir: filepath.Join(t.TempDir(), "other-seed"),
 			Logger: logger,
 			StartProcess: func(context.Context, string, []string, []string, string) (ProcessHandle, error) {
 				return ProcessHandle{}, want
 			},
-		})
+		}))
 		require.ErrorIs(t, err, want)
 		require.Contains(t, logs.String(), "resolve native executable for plugin seed key")
 	})
@@ -1212,10 +1212,10 @@ func TestStartServerPluginSeedLifecycle(t *testing.T) {
 	t.Run("unbuildable environment still fails after tree bookkeeping", func(t *testing.T) {
 		logger, _ := debugLogger(t)
 
-		_, err := StartServer(t.Context(), StartOptions{
+		_, err := StartServer(t.Context(), testStartOptions(StartOptions{
 			Root: t.TempDir(), ExecutablePath: executable, PluginSeedDir: seedDir, Logger: logger,
 			Env: map[string]string{"BAD=KEY": "x"},
-		})
+		}))
 		require.ErrorContains(t, err, "invalid environment entry")
 	})
 }

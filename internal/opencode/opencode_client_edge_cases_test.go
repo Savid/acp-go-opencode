@@ -69,17 +69,11 @@ func TestRuntimeXDGAndRetentionEdges(t *testing.T) {
 }
 
 func TestProcessEnvironmentAndSettlementEdges(t *testing.T) {
-	originalEnviron := processEnviron
-	processEnviron = func() []string {
-		return []string{
-			"PATH=/captured",
-			privateEnvironmentPrefix + "TOKEN=secret",
-			"OPENCODE_CONFIG_CONTENT=managed",
-		}
-	}
-	t.Cleanup(func() { processEnviron = originalEnviron })
-
-	environment, err := buildProcessEnvironmentFrom(nil)
+	environment, err := buildProcessEnvironmentFrom(map[string]string{
+		"PATH":                             "/captured",
+		privateEnvironmentPrefix + "TOKEN": "secret",
+		"OPENCODE_CONFIG_CONTENT":          "managed",
+	})
 	require.NoError(t, err)
 	require.Equal(t, "/captured", environment[pathEnv])
 	require.NotContains(t, environment, privateEnvironmentPrefix+"TOKEN")
@@ -172,10 +166,10 @@ func TestOpenCodeServerAccessorsAndNilAssistantError(t *testing.T) {
 
 func TestStartServerRejectsIncompleteTreeAuthorityBeforeMutation(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "absent")
-	_, err := StartServer(context.Background(), StartOptions{
+	_, err := StartServer(context.Background(), testStartOptions(StartOptions{
 		Root:        root,
 		PrepareTree: func(context.Context, string) error { return nil },
-	})
+	}))
 	require.ErrorContains(t, err, "native tree authority is incomplete")
 	require.NoDirExists(t, root)
 }
@@ -247,23 +241,23 @@ func TestStartServerOrdinaryHomeLockFailurePrecedesLaunch(t *testing.T) {
 	openCodeAcquireHomeLock = func(string) (*homelock.Lock, error) { return nil, want }
 	launched := false
 
-	_, err := StartServer(context.Background(), StartOptions{
+	_, err := StartServer(context.Background(), testStartOptions(StartOptions{
 		Root: t.TempDir(), Pure: true,
 		StartProcess: func(context.Context, string, []string, []string, string) (ProcessHandle, error) {
 			launched = true
 
 			return ProcessHandle{}, errors.New("unexpected launch")
 		},
-	})
+	}))
 	require.ErrorIs(t, err, want)
 	require.False(t, launched)
 }
 
 func TestStartServerRejectsAnUnbuildableNativeEnvironment(t *testing.T) {
-	_, err := StartServer(context.Background(), StartOptions{
+	_, err := StartServer(context.Background(), testStartOptions(StartOptions{
 		Root: t.TempDir(), Pure: true,
 		Env: map[string]string{"BAD=KEY": "x"},
-	})
+	}))
 	require.ErrorContains(t, err, "invalid environment entry")
 }
 
@@ -298,6 +292,7 @@ func TestReclaimPreparedTreesContinuesAfterFailure(t *testing.T) {
 func TestStartServerOwnershipFailureEdges(t *testing.T) {
 	want := errors.New("native start failed")
 	authority := func(options StartOptions) StartOptions {
+		options = testStartOptions(options)
 		options.PrepareTree = func(context.Context, string) error { return nil }
 		options.ReclaimTree = func(context.Context, string) error { return nil }
 
@@ -362,7 +357,7 @@ func TestStartServerMaterializationFailureEdges(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeListen = func(string, string) (net.Listener, error) { return nil, errors.New("listen failed") }
 		root := filepath.Join(t.TempDir(), "generated")
-		_, err := StartServer(t.Context(), StartOptions{Root: root, RemoveRoot: true})
+		_, err := StartServer(t.Context(), testStartOptions(StartOptions{Root: root, RemoveRoot: true}))
 		require.ErrorContains(t, err, "listen failed")
 		require.NoDirExists(t, root)
 	})
@@ -370,22 +365,22 @@ func TestStartServerMaterializationFailureEdges(t *testing.T) {
 	t.Run("prepared carrier cleanup", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeListen = func(string, string) (net.Listener, error) { return nil, errors.New("listen failed") }
-		_, err := StartServer(t.Context(), StartOptions{ExistingXDG: testXDGDirs(t)})
+		_, err := StartServer(t.Context(), testStartOptions(StartOptions{ExistingXDG: testXDGDirs(t)}))
 		require.ErrorContains(t, err, "listen failed")
 	})
 
 	t.Run("control root", func(t *testing.T) {
-		_, err := StartServer(t.Context(), StartOptions{
+		_, err := StartServer(t.Context(), testStartOptions(StartOptions{
 			ExistingXDG: testXDGDirs(t), Pure: true,
 			ControlRoot: filepath.Join(t.TempDir(), string([]byte{0})),
-		})
+		}))
 		require.Error(t, err)
 	})
 
 	t.Run("password entropy", func(t *testing.T) {
 		restoreOpenCodeClientSeams(t)
 		openCodeRandReader = errorReader{err: errors.New("entropy failed")}
-		_, err := StartServer(t.Context(), StartOptions{ExistingXDG: testXDGDirs(t), Pure: true})
+		_, err := StartServer(t.Context(), testStartOptions(StartOptions{ExistingXDG: testXDGDirs(t), Pure: true}))
 		require.ErrorContains(t, err, "entropy failed")
 	})
 
