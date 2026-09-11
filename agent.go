@@ -125,6 +125,7 @@ func NewAgent(opts ...Option) *Agent {
 	optionsErr = errors.Join(optionsErr, validateInputHandoffRoot(options.InputHandoffRoot))
 	optionsErr = errors.Join(optionsErr, validateProviderAuthRoot(options))
 	optionsErr = errors.Join(optionsErr, validateAmbientEnvironment(options.AmbientEnvironment))
+	optionsErr = errors.Join(optionsErr, validateConfiguredModels(options.ConfiguredModels))
 
 	log := options.Logger
 	if log == nil {

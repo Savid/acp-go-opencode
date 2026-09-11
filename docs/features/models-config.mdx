@@ -108,6 +108,16 @@ catalog that states nothing forwards the turn and lets the provider decide. The
 gate is evaluated per prompt against the current selection, so a mid-session
 model switch takes effect on the next prompt.
 
+### Host-listed models
+
+A host that knows what its endpoint serves lists those ids with
+`WithConfiguredModels`, each as `<provider>/<model>`. Each id follows the
+native rows on every route under the group its provider prefix names, as the
+id alone with no metadata and no effort presets, so a session can carry a menu
+for a provider whose catalog OpenCode did not enumerate. An id the catalog
+already carries keeps its native row and facts. An empty, whitespace,
+unqualified, or duplicate id fails construction.
+
 ## Structured output
 
 Structured output is native. Supplying a JSON Schema object at

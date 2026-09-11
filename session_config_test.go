@@ -34,7 +34,7 @@ func TestModelConfigOptionMetadataMapping(t *testing.T) {
 			},
 		},
 	}}}
-	option := modelConfigOption(sessionSnapshot{}, providers)
+	option := modelConfigOption(sessionSnapshot{}, providers, nil)
 	if option.Select == nil {
 		t.Fatal("missing select option")
 	}
@@ -151,11 +151,11 @@ func assertSetSessionConfigOptionBranches(t *testing.T, ctx context.Context, age
 
 func assertConfigOptionBuilders(t *testing.T, client *fakeOpenCodeClient) {
 	t.Helper()
-	fallback := modelConfigOption(sessionSnapshot{providerID: "p", modelID: "m"}, opencode.ProvidersResponse{})
+	fallback := modelConfigOption(sessionSnapshot{providerID: "p", modelID: "m"}, opencode.ProvidersResponse{}, nil)
 	if fallback.Select == nil || fallback.Select.Options.Ungrouped == nil || fallback.Select.CurrentValue != "p/m" {
 		t.Fatalf("fallback model option = %#v", fallback)
 	}
-	if empty := modelConfigOption(sessionSnapshot{}, opencode.ProvidersResponse{}); empty.Select != nil {
+	if empty := modelConfigOption(sessionSnapshot{}, opencode.ProvidersResponse{}, nil); empty.Select != nil {
 		t.Fatalf("empty model option = %#v", empty)
 	}
 	// A mode the list does not carry is still the mode this session uses, so it

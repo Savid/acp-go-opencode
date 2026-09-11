@@ -104,7 +104,7 @@ func (s *session) configOptions(ctx context.Context) []acp.SessionConfigOption {
 	if providers, err := snapshot.client.ConfigProviders(ctx); err != nil {
 		s.reportConfigOptionUnavailable(ctx, configModel, err)
 	} else {
-		if model := modelConfigOption(snapshot, providers); model.Select != nil {
+		if model := modelConfigOption(snapshot, providers, s.agent.options.ConfiguredModels); model.Select != nil {
 			options = append(options, model)
 		}
 
@@ -132,7 +132,11 @@ func (s *session) reportConfigOptionUnavailable(ctx context.Context, configID ac
 	)
 }
 
-func modelConfigOption(snapshot sessionSnapshot, providers opencode.ProvidersResponse) acp.SessionConfigOption {
+func modelConfigOption(
+	snapshot sessionSnapshot,
+	providers opencode.ProvidersResponse,
+	hostListed []string,
+) acp.SessionConfigOption {
 	category := acp.SessionConfigOptionCategoryModel
 	current := snapshot.modelValue()
 
@@ -173,6 +177,8 @@ func modelConfigOption(snapshot sessionSnapshot, providers opencode.ProvidersRes
 			groups = append(groups, group)
 		}
 	}
+
+	groups = appendHostListedModels(groups, hostListed, &current)
 
 	if len(groups) == 0 {
 		if current == "" {
