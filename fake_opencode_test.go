@@ -247,16 +247,16 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
-	text := ""
+	var text strings.Builder
 	for _, part := range request.Parts {
 		if v, ok := part["text"].(string); ok {
-			text += v
+			text.WriteString(v)
 		}
 	}
-	if text == "CRASH" {
+	if text.String() == "CRASH" {
 		os.Exit(17)
 	}
-	if text == "REFUSE" {
+	if text.String() == "REFUSE" {
 		f.mu.Unlock()
 		w.WriteHeader(400)
 		fakeWrite(w, map[string]any{"name": "APIError", "data": map[string]any{"message": "provider refused prompt"}})
@@ -265,7 +265,7 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 	}
 	user := opencode.NativeMessageInfo{ID: request.MessageID, SessionID: id, Role: roleUser}
 	f.append(id, "message.updated", map[string]any{"info": user})
-	f.append(id, "message.part.updated", map[string]any{"part": opencode.NativePart{ID: opencode.NewID("prt_"), MessageID: user.ID, SessionID: id, Type: "text", Text: text}, "time": time.Now().UnixMilli()})
+	f.append(id, "message.part.updated", map[string]any{"part": opencode.NativePart{ID: opencode.NewID("prt_"), MessageID: user.ID, SessionID: id, Type: "text", Text: text.String()}, "time": time.Now().UnixMilli()})
 	info := opencode.NativeMessageInfo{ID: opencode.NewMessageID(), ParentID: user.ID, SessionID: id, Role: roleAssistant, ModelID: session.Model.ID, ProviderID: session.Model.ProviderID}
 	if request.Model != nil {
 		info.ModelID = request.Model.ModelID
@@ -275,7 +275,7 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 	pending := make(chan struct{})
 	f.pending[id] = pending
 	f.mu.Unlock()
-	if text == "SLOW" {
+	if text.String() == "SLOW" {
 		select {
 		case <-pending:
 		case <-r.Context().Done():
@@ -291,14 +291,14 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 	default:
 		info.Finish = "stop"
 	}
-	if text == "PERMISSION" || text == "QUESTION" {
+	if text.String() == "PERMISSION" || text.String() == "QUESTION" {
 		callID := opencode.NewID("call_")
 		part := opencode.NativePart{ID: opencode.NewID("prt_"), SessionID: id, MessageID: info.ID, Type: "tool", CallID: callID, Tool: "bash", State: json.RawMessage(`{"status":"running","input":{"command":"echo test"}}`)}
 		f.append(id, "message.part.updated", map[string]any{"part": part, "time": time.Now().UnixMilli()})
 		requestID := opencode.NewID("req_")
 		answer := make(chan json.RawMessage, 1)
 		f.answers[requestID] = answer
-		if text == "PERMISSION" {
+		if text.String() == "PERMISSION" {
 			f.publish("permission.asked", opencode.PermissionRequest{ID: requestID, SessionID: id, Permission: "bash", Patterns: []string{"echo test"}, Tool: opencode.PermissionTool{CallID: callID, MessageID: info.ID}})
 		} else {
 			f.publish("question.asked", opencode.QuestionRequest{ID: requestID, SessionID: id, Tool: opencode.QuestionTool{CallID: callID, MessageID: info.ID}, Questions: []opencode.QuestionInfo{{Question: "Pick a color", Options: []opencode.QuestionOption{{Label: "blue"}, {Label: "red"}}}}})
@@ -312,8 +312,8 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 		part.State = json.RawMessage(`{"status":"completed","output":"done"}`)
 		f.append(id, "message.part.updated", map[string]any{"part": part, "time": time.Now().UnixMilli()})
 	}
-	output := "hello " + text
-	if text == "ENV" {
+	output := "hello " + text.String()
+	if text.String() == "ENV" {
 		carrier, _ := session.Metadata[opencode.CarrierKey].(map[string]any)
 		data, _ := json.Marshal(carrier)
 		output = string(data)
@@ -326,7 +326,7 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 	}
 	part := opencode.NativePart{ID: opencode.NewID("prt_"), SessionID: id, MessageID: info.ID, Type: "text", Text: output}
 	f.append(id, "message.part.updated", map[string]any{"part": part, "time": time.Now().UnixMilli()})
-	if text == "IMAGE" {
+	if text.String() == "IMAGE" {
 		path := filepath.Join(session.Directory, "output.png")
 		file, err := os.Create(path)
 		if err != nil {

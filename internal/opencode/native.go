@@ -72,10 +72,12 @@ func ConfigDir(lookup func(string) (string, bool)) string {
 // WritePlugin registers the environment hook alongside the caller's native config.
 func WritePlugin(root, config string, ownsHome bool) (string, error) {
 	proof, _ := json.Marshal(filepath.Join(root, "ready"))
+
 	keys := []string{"OPENCODE_SERVER_USERNAME", "OPENCODE_SERVER_PASSWORD", "OPENCODE_CONFIG_CONTENT", "OPENCODE_ENABLE_QUESTION_TOOL"}
 	if ownsHome {
 		keys = append(keys, "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME")
 	}
+
 	encoded, _ := json.Marshal(keys)
 	source := strings.ReplaceAll(environmentPlugin, "__PROOF_ROOT__", string(proof))
 	source = strings.ReplaceAll(source, "__OWNED_KEYS__", string(encoded))

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -27,9 +28,7 @@ type imageArtifact struct {
 
 func cloneArtifacts(values map[string]imageArtifact) map[string]imageArtifact {
 	result := make(map[string]imageArtifact, len(values))
-	for k, v := range values {
-		result[k] = v
-	}
+	maps.Copy(result, values)
 
 	return result
 }
