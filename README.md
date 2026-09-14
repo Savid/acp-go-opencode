@@ -1,195 +1,115 @@
 # acp-go-opencode
 
-Go ACP agent that exposes the local OpenCode CLI as an [Agent Client Protocol](https://agentclientprotocol.com/) agent.
+`acp-go-opencode` exposes [OpenCode](https://opencode.ai) as an
+[Agent Client Protocol](https://agentclientprotocol.com) agent. One
+`opencode serve` process handles the Agent's sessions through authenticated
+loopback HTTP and a shared event stream.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/savid/acp-go-opencode.svg)](https://pkg.go.dev/github.com/savid/acp-go-opencode)
-[![CI](https://github.com/savid/acp-go-opencode/actions/workflows/go-test.yml/badge.svg)](https://github.com/savid/acp-go-opencode/actions/workflows/go-test.yml)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-
-It runs one authenticated `opencode serve` runtime for all sessions owned by an
-agent instance, speaks ACP over JSON-RPC streams, and builds on
-[`github.com/coder/acp-go-sdk`](https://github.com/coder/acp-go-sdk).
-
-Use it as either:
-
-- a standalone ACP subprocess: `acp-go-opencode`
-- an embedded Go adapter through `opencodeacp.Serve`
-
-## Install
-
-Library:
+Sessions use OpenCode's native IDs and storage. After closing the adapter,
+continue a session in the same directory and native home:
 
 ```sh
-go get github.com/savid/acp-go-opencode
+opencode run --session SESSION_ID "Continue the task"
 ```
 
-CLI:
+## Install and run
 
 ```sh
 go install github.com/savid/acp-go-opencode/cmd/acp-go-opencode@latest
+acp-go-opencode [-path opencode] [-home DIR] [-scratch-dir DIR] [-model provider/id] [-seed-file rel=host]... [-debug]
 ```
 
-The `acp-go-opencode` binary speaks ACP over stdin/stdout and reserves stdout
-for ACP JSON-RPC while diagnostics go to stderr; an editor or ACP host launches
-it as a subprocess rather than a human-facing chat UI.
+Requires OpenCode 1.18.30 or newer. A bare `-path` is resolved on the inherited
+PATH. `-home` maps `DIR/data`, `DIR/config`, `DIR/cache`, and `DIR/state` to the
+four XDG home variables; omit it to use native home resolution. Native CLI
+continuation uses those same variables when a home was supplied.
+`-seed-file` writes a relative file inside OpenCode's configuration directory.
+`-scratch-dir` holds the temporary environment plugin. `-version` prints the
+adapter version. Standard `OTEL_*` variables configure telemetry exporters.
 
-The `_opencode/rateLimits` extension reads OpenCode Go subscription windows and
-OpenRouter key allowances. See [Rate limits](docs/reference/acp-methods.mdx#rate-limits)
-for provider selection and direct-read controls.
-
-## Quickstart
-
-The example programs run from a checkout of this repo, so clone it first:
-
-```sh
-git clone https://github.com/savid/acp-go-opencode && cd acp-go-opencode
-```
-
-Run a tiny local client against the agent:
-
-```sh
-go run ./examples/minimal-client "Reply with a short hello from ACP."
-```
-
-Start an interactive session against the agent:
-
-```sh
-go run ./examples/interactive-chat
-```
-
-Load and resume a stored session transcript:
-
-```sh
-go run ./examples/resume-from-file -file ./examples/resume-from-file/session.jsonl
-```
-
-## Embedded Go
+## Embed
 
 ```go
-package main
-
-import (
-	"context"
-	"log"
-	"os"
-
-	opencodeacp "github.com/savid/acp-go-opencode"
+err := opencodeacp.Serve(ctx, os.Stdin, os.Stdout,
+    opencodeacp.WithHome("/srv/opencode"),
+    opencodeacp.WithSessionStore(store),
 )
-
-func main() {
-	err := opencodeacp.Serve(context.Background(), os.Stdin, os.Stdout,
-		opencodeacp.WithDefaultModel("openai/gpt-default"),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
 ```
 
-See the [Go API reference](https://pkg.go.dev/github.com/savid/acp-go-opencode)
-for options such as the OpenCode executable path, the exclusive runtime home,
-scratch parent, default model, process environment, session storage, and
-OpenTelemetry providers.
+Options: `WithExecutablePath`, `WithHome`, `WithScratchDir`,
+`WithInputHandoffRoot`, `WithDefaultModel`, `WithConfiguredModels`, `WithEnv`,
+`WithSeedFiles`, `WithSessionStore`, `WithSessionStoreLoadTimeout`,
+`WithTurnTimeout`, `WithConcurrencyLimits`, `WithImageLimits`, `WithLogger`,
+`WithTracerProvider`, `WithMeterProvider`, `WithTextMapPropagator`,
+`WithAgentName`, `WithAgentTitle`, `WithAgentVersion`.
 
-## What It Provides
+### Session options
 
-- ACP session lifecycle: create, prompt, cancel, close, list, load, resume, and
-  fork.
-- One Agent-owned `opencode serve` process and shared XDG root. `-home` /
-  `WithHome` selects that exclusive root; `-scratch-dir` / `WithScratchDir`
-  selects the parent used when the adapter materializes one. The root must be
-  on an approved local filesystem; network, overlay, and unknown filesystem
-  semantics fail closed before the native process starts.
-- Native sessions remain independently routed inside the shared runtime.
-  Directory-scoped MCP is bound to one live session principal per canonical
-  working directory. Routine cancel and timeout interrupt only the addressed
-  session and await its native idle acknowledgement.
-- Native stream gaps, runtime exits, and host delivery failures fence and retire
-  the exact producing runtime generation before replacement admission. Omitting
-  `WithHostAuthority` selects ordinary same-identity execution. An embedded
-  managed host supplies `HostAuthority`; every native launch then uses its exact
-  environment and process/tree operations, and authority loss fails closed with
-  no ordinary-launch retry. Runtime teardown closes the native protocol first,
-  revokes the process tree, waits for terminality, reclaims prepared trees, and
-  only then removes generated roots.
-- A native-server crash fails the active turn, retains loaded logical
-  sessions, and reconstructs a session from its last committed sync-event
-  generation before a following prompt can reach the replacement runtime.
-- Native OpenCode REST calls and a bounded, ordered, lossless SSE event/terminal
-  channel mapped to ACP streaming for messages, reasoning, plans, tool calls,
-  usage, and session metadata. EOF or delivery failure fences the exact native
-  generation; it is never hidden by reconnecting the same generation.
-- Prompt image and resource-blob input gated before a turn starts, with the
-  effective per-image and per-prompt byte bounds advertised at initialize under
-  `acp-go.dev/mediaEnvelope` so a host can pre-check against the exact numbers
-  the gates enforce. `WithInputHandoffRoot` additionally accepts a
-  digest-verified local handoff form: an image block whose bytes are read from
-  beneath that read root instead of being carried inline. Unset, no inbound path
-  is ever read.
-- Brokered provider logins through the seven `_opencode/auth/*` extension
-  methods during ordinary execution, advertised only while both
-  `-provider-auth-root` / `WithProviderAuthRoot` and `-home` / `WithHome` are
-  configured. The surface is withheld when `WithHostAuthority` is supplied. The adapter
-  installs a completed credential into OpenCode's own durable store and hands
-  none back: there is no credential leg and no injection key. Each device or
-  paste-back flow runs in a short-lived broker home destroyed on every terminal
-  transition, and the durable ledger under the auth root records slot identity
-  and provenance only, never credential material.
-- Permission and question requests bridged to ACP permission and elicitation
-  flows.
-- MCP stdio and streamable HTTP server configuration through ACP session
-  requests.
-- Model, mode, and effort selection through ACP session config options; model
-  and mode also through `_meta.opencode.options`.
-- Durable native event snapshots through a host-provided
-  `SessionStore`; stored rows use `opencode-sync-events-v1`, keyed by
-  `{SessionID, Subpath}` and requiring OpenCode `1.18.3` or newer. Snapshots
-  retain accepted session environment values, so protect the store accordingly.
-- Versioned `acp-go.dev/route` envelopes bind each prompt and its causal updates,
-  raw events, and elicitations to one turn nonce. Agent-origin work between
-  prompts omits a route and never borrows a later nonce. Permission requests are
-  fenced structurally by session id plus a published tool-call id. Permission
-  and elicitation JSON-RPC requests are registered before their ordered pending
-  action update.
-- Optional raw native event notifications through `_opencode/rawEvent`.
-- OpenTelemetry adapter telemetry without recording prompt or tool secrets by
-  default.
+Pass `_meta.opencode.options` on new, load, or resume, or use
+`WithSessionOpenCodeOptions` from Go.
 
-## Slash Commands
+| Field | Meaning |
+|---|---|
+| `model` | Provider-qualified model ID |
+| `mode` | Native agent name, such as `build` or `plan` |
+| `effort` | Native model variant, forwarded unchanged |
+| `permission` | Native tool policy: `ask`, `allow`, or `deny`; default `ask` |
+| `env` | Environment overlay for tools in this session |
+| `extraPathDirs` | Absolute directories prepended to the session's PATH in order |
+| `outputSchema` | Nonempty JSON Schema passed through native structured output |
 
-Native OpenCode commands are refreshed from the running `opencode serve` process
-and projected into ACP `AvailableCommand` entries as the session's command set
-changes. A slash-prefixed prompt that matches a command runs it natively.
+The environment plugin reads the addressed session's metadata through OpenCode's
+API. Child sessions inherit that carrier through their native parent. OpenCode
+keeps its native authentication and configuration. Nonempty `mcpServers` and
+unknown owned options are invalid parameters.
 
-## Docs
+`session/set_config_option` accepts nonempty `model`, `mode`, and `effort`
+values. The native provider catalog supplies model names, image capabilities,
+context windows, and available variants. Configured and selected models are
+included even when absent from the catalog. Structured results appear at
+`_meta.opencode.structuredOutput` on the prompt response.
 
-- [Overview](docs/overview.mdx)
-- [Run modes](docs/get-started/run-modes.mdx)
-- [Go API](docs/reference/go-api.mdx)
-- [ACP methods](docs/reference/acp-methods.mdx)
-- [Observability](docs/operations/observability.mdx)
+Native permission requests use ACP permissions; native questions use ACP form
+elicitation. Missing or cancelled answers reject the native request. Commands
+come from OpenCode's command catalog. An exact `/name` match uses the native
+command endpoint; other text uses the message endpoint.
 
-Full Go API reference:
-[pkg.go.dev/github.com/savid/acp-go-opencode](https://pkg.go.dev/github.com/savid/acp-go-opencode).
+Images enter as inline base64 or validated file handoffs. Output supports native
+file parts and tool attachments, with bounded local reads and image limits.
+Remote URLs become resource links. `_meta.opencode.rawEvent.enabled` enables
+`_opencode/rawEvent`; image bytes are omitted from that diagnostic channel.
+Optional lifecycle negotiation supplies ordered session and turn updates.
+
+### Persistence and runtime
+
+`SessionStoreFormat` is `opencode-sync-events-v1`. The main subpath holds native
+sync events for one conversation and its descendants. The `config` sidecar
+holds accepted options and captured local image bytes. Complete generations
+commit atomically before a prompt returns. A second native history read fences
+each snapshot. The adapter never opens OpenCode's database files.
+
+Load imports missing events through the native sync API and replays ACP history.
+Resume imports without replay. Existing native history must agree at every
+shared sequence; newer native turns are adopted. Local image replay remains
+available after its original file is removed. The default store is in memory;
+supply a durable store to restore across adapter restarts.
+
+Close releases one session while peers retain the shared server. A server crash
+fails affected work, and the next operation starts a replacement and rebinds the
+addressed session. Delete tombstones the store entry. Native state remains
+available to OpenCode's CLI. A native-home file lock prevents two adapter servers
+from owning the same home concurrently.
 
 ## Development
 
 ```sh
+make test
+make lint
 make audit
 make test-integration-smoke
-make test-integration-live
-make test-integration-cover
+ACP_GO_OPENCODE_MODEL=provider/model make test-integration-live
 ```
 
-`make audit` runs the full local gate: format, lint, build, unit tests,
-coverage, cross-compile, vuln, and docs checks. Live integration tests require a
-local authenticated OpenCode `1.18.3`-or-newer CLI. `make test-integration-smoke` sets
-`ACP_GO_OPENCODE_RUN_INTEGRATION=1` and avoids model spend;
-`make test-integration-live` additionally sets `ACP_GO_OPENCODE_RUN_LIVE_TOKENS=1`
-and may spend model tokens; `make test-integration-cover` runs the smoke suite
-against a coverage-instrumented binary. Live tests always launch OpenCode under
-an isolated runtime scratch directory.
-
-## License
-
-Distributed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
+Unit tests use a scripted native HTTP server inside the test binary and require
+no installed OpenCode or credentials. Smoke tests use the installed CLI without
+model calls. Live tests copy native auth into temporary homes and spend tokens.
