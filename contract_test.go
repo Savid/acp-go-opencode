@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -95,7 +96,7 @@ func TestInitializeLifecycleStrictness(t *testing.T) {
 			require.Equal(t, -32602, requestErrorCode(t, err))
 
 			data := requestErrorData(t, err)
-			require.Equal(t, "unsupported", data[stopReasonError])
+			require.Equal(t, "unsupported", data[wire.FieldError])
 			require.Contains(t, data["field"], wire.LifecycleKey)
 		})
 	}
@@ -107,12 +108,8 @@ func TestProtocolAdmission(t *testing.T) {
 	h := newHarness(t)
 	h.initialize()
 
-	for _, method := range []string{"_opencode/anything"} {
-		_, err := h.conn.CallExtension(h.ctx(), method, map[string]any{})
-		require.Equal(t, -32601, requestErrorCode(t, err), method)
-	}
-
-	var err error
+	_, err := h.conn.CallExtension(h.ctx(), "_opencode/anything", map[string]any{})
+	require.Equal(t, -32601, requestErrorCode(t, err))
 
 	_, err = h.conn.SetSessionMode(h.ctx(), acp.SetSessionModeRequest{SessionId: "x", ModeId: "plan"})
 	require.Equal(t, -32601, requestErrorCode(t, err))
@@ -150,14 +147,14 @@ func TestSessionMetaStrictness(t *testing.T) {
 			h := newHarness(t)
 			h.initialize()
 
-			request := NewSessionRequest(t.TempDir())
+			request := wire.NewSessionRequest(t.TempDir())
 			request.Meta = tc.meta
 
 			_, err := h.conn.NewSession(h.ctx(), request)
 			require.Equal(t, -32602, requestErrorCode(t, err))
 
 			data := requestErrorData(t, err)
-			require.Equal(t, "unsupported", data[stopReasonError])
+			require.Equal(t, "unsupported", data[wire.FieldError])
 			require.Equal(t, tc.field, data["field"])
 		})
 	}
@@ -169,7 +166,7 @@ func TestForeignMetaIgnored(t *testing.T) {
 	h := newHarness(t)
 	h.initialize()
 
-	session := h.newSession(WithSessionMeta(map[string]any{"other": map[string]any{"x": 1}, "traceparent": "00-1-2-01"}))
+	session := h.newSession(wire.WithSessionMeta(map[string]any{"other": map[string]any{"x": 1}, "traceparent": "00-1-2-01"}))
 	require.NotEmpty(t, session.SessionId)
 }
 
@@ -190,17 +187,17 @@ func TestUniformRejections(t *testing.T) {
 
 	session := h.newSession()
 
-	_, err = h.conn.Prompt(h.ctx(), PromptRequest(session.SessionId))
+	_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId))
 	require.Equal(t, "prompt", requestErrorData(t, err)["field"])
 
-	_, err = h.conn.Prompt(h.ctx(), PromptRequest(session.SessionId, acp.ContentBlock{Audio: &acp.ContentBlockAudio{Data: "x", MimeType: "audio/wav"}}))
+	_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.ContentBlock{Audio: &acp.ContentBlockAudio{Data: "x", MimeType: "audio/wav"}}))
 	require.Equal(t, "prompt", requestErrorData(t, err)["field"])
 
-	_, err = h.conn.Prompt(h.ctx(), TextPromptRequest("00000000-0000-4000-8000-000000000000", "hi"))
+	_, err = h.conn.Prompt(h.ctx(), wire.TextPromptRequest("00000000-0000-4000-8000-000000000000", "hi"))
 	require.Equal(t, -32602, requestErrorCode(t, err))
-	require.Equal(t, "unknown session", requestErrorData(t, err)[stopReasonError])
+	require.Equal(t, "unknown session", requestErrorData(t, err)[wire.FieldError])
 
-	require.NoError(t, h.conn.Cancel(h.ctx(), CancelRequest("00000000-0000-4000-8000-000000000000")))
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest("00000000-0000-4000-8000-000000000000")))
 }
 
 func TestPromptCorrelationGate(t *testing.T) {
@@ -215,12 +212,12 @@ func TestPromptCorrelationGate(t *testing.T) {
 
 		_, err := h.prompt(session.SessionId, "HELLO", nil)
 		data := requestErrorData(t, err)
-		require.Equal(t, "missing", data[stopReasonError])
+		require.Equal(t, "missing", data[wire.FieldError])
 		require.Equal(t, `_meta["`+wire.LifecycleKey+`"]`, data["field"])
 
 		_, err = h.prompt(session.SessionId, "HELLO", map[string]any{wire.LifecycleKey: map[string]any{"version": 1, "submission": map[string]any{"submissionId": "", "clientNonce": "n"}}})
 		data = requestErrorData(t, err)
-		require.Equal(t, "unsupported", data[stopReasonError])
+		require.Equal(t, "unsupported", data[wire.FieldError])
 		require.Contains(t, data["field"], "submissionId")
 	})
 
@@ -233,7 +230,7 @@ func TestPromptCorrelationGate(t *testing.T) {
 
 		_, err := h.prompt(session.SessionId, "HELLO", promptMeta(1))
 		data := requestErrorData(t, err)
-		require.Equal(t, "unsupported", data[stopReasonError])
+		require.Equal(t, "unsupported", data[wire.FieldError])
 		require.Equal(t, `_meta["`+wire.LifecycleKey+`"]`, data["field"])
 	})
 
@@ -245,7 +242,7 @@ func TestPromptCorrelationGate(t *testing.T) {
 		session := h.newSession()
 
 		_, err := h.prompt(session.SessionId, "HELLO", map[string]any{wire.LifecycleKey: map[string]any{"version": json.Number("1.0"), "submission": map[string]any{"submissionId": "s", "clientNonce": "n"}}})
-		require.Equal(t, "unsupported", requestErrorData(t, err)[stopReasonError])
+		require.Equal(t, "unsupported", requestErrorData(t, err)[wire.FieldError])
 	})
 }
 
@@ -273,11 +270,11 @@ func TestInvalidOptionsVerdict(t *testing.T) {
 			require.Equal(t, -32603, requestErrorCode(t, err))
 
 			data := requestErrorData(t, err)
-			require.Equal(t, "opencode_invalid_options", data[stopReasonError])
+			require.Equal(t, "opencode_invalid_options", data[wire.FieldError])
 			require.Equal(t, field, data["field"])
 
-			_, err = agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
-			require.Equal(t, "opencode_invalid_options", requestErrorData(t, err)[stopReasonError])
+			_, err = agent.NewSession(context.Background(), wire.NewSessionRequest(t.TempDir()))
+			require.Equal(t, "opencode_invalid_options", requestErrorData(t, err)[wire.FieldError])
 		})
 	}
 }
@@ -300,10 +297,10 @@ func TestPromptBackpressure(t *testing.T) {
 
 	_, err := h.prompt(session.SessionId, "HELLO", promptMeta(2))
 	require.Equal(t, -32600, requestErrorCode(t, err))
-	require.Equal(t, "backpressure", requestErrorData(t, err)[stopReasonError])
+	require.Equal(t, "backpressure", requestErrorData(t, err)[wire.FieldError])
 	require.Equal(t, "session_prompt", requestErrorData(t, err)["limit"])
 
-	require.NoError(t, h.conn.Cancel(h.ctx(), CancelRequest(session.SessionId)))
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 	require.NoError(t, <-done)
 }
 
@@ -314,8 +311,8 @@ func TestActiveSessionLimit(t *testing.T) {
 	h.initialize()
 	h.newSession()
 
-	_, err := h.conn.NewSession(h.ctx(), NewSessionRequest(t.TempDir()))
-	require.Equal(t, "backpressure", requestErrorData(t, err)[stopReasonError])
+	_, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
+	require.Equal(t, "backpressure", requestErrorData(t, err)[wire.FieldError])
 	require.Equal(t, "active_sessions", requestErrorData(t, err)["limit"])
 }
 
@@ -325,9 +322,9 @@ func TestVersionFloor(t *testing.T) {
 	h := newHarness(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", fakeOpenCodeEnvVersion: "0.1.0"}))
 	h.initialize()
 
-	_, err := h.conn.NewSession(h.ctx(), NewSessionRequest(t.TempDir()))
+	_, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
 	require.Equal(t, -32603, requestErrorCode(t, err))
-	require.Equal(t, "opencode_internal_failure", requestErrorData(t, err)[stopReasonError])
+	require.Equal(t, "opencode_internal_failure", requestErrorData(t, err)[wire.FieldError])
 	require.Equal(t, "native_start", requestErrorData(t, err)["class"])
 }
 
@@ -338,7 +335,7 @@ func TestClosedAgentRefusesRequests(t *testing.T) {
 	require.NoError(t, agent.Close())
 	require.NoError(t, agent.Close())
 
-	_, err := agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
+	_, err := agent.NewSession(context.Background(), wire.NewSessionRequest(t.TempDir()))
 	require.Equal(t, -32600, requestErrorCode(t, err))
 }
 
@@ -347,5 +344,83 @@ func TestNegativeClientCallLimitReturnsOptionsError(t *testing.T) {
 	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxConcurrentClientCalls: -1}))
 	defer agent.Close()
 	_, err := agent.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
-	require.Equal(t, "opencode_invalid_options", requestErrorData(t, err)[stopReasonError])
+	require.Equal(t, "opencode_invalid_options", requestErrorData(t, err)[wire.FieldError])
+}
+
+// Form elicitation is relayed only when the client advertises form support,
+// in every shape the capability can take; without it the native question is
+// answered with no client call.
+func TestElicitationCapabilityGating(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name, json string
+		form       bool
+	}{
+		{"omitted", `{}`, false},
+		{"empty", `{"elicitation":{}}`, false},
+		{"form", `{"elicitation":{"form":{}}}`, true},
+		{"url", `{"elicitation":{"url":{}}}`, false},
+		{"both", `{"elicitation":{"form":{},"url":{}}}`, true},
+		{"null", `{"elicitation":{"form":null,"url":null}}`, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+
+			var calls atomic.Int32
+
+			h.rec.mu.Lock()
+			h.rec.elicit = func(acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
+				calls.Add(1)
+
+				return acp.UnstableCreateElicitationResponse{Accept: &acp.UnstableCreateElicitationAccept{Content: map[string]any{"0": "blue"}}}, nil
+			}
+			h.rec.mu.Unlock()
+
+			h.initialize(func(request *acp.InitializeRequest) {
+				require.NoError(t, json.Unmarshal([]byte(tc.json), &request.ClientCapabilities))
+			})
+			session := h.newSession()
+
+			response, err := h.prompt(session.SessionId, "QUESTION", nil)
+			require.NoError(t, err)
+			require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+
+			expected := int32(0)
+			if tc.form {
+				expected = 1
+			}
+
+			require.Equal(t, expected, calls.Load())
+		})
+	}
+}
+
+// Lines the server writes to its stdout and stderr never reach the ACP
+// stream.
+func TestNativeNoiseCannotCorruptACPStdout(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "NOISE", nil)
+	require.NoError(t, err)
+	require.Contains(t, agentText(h.rec.snapshot()), "hello NOISE")
+
+	for _, update := range h.rec.snapshot() {
+		encoded, marshalErr := json.Marshal(update)
+		require.NoError(t, marshalErr)
+		require.NotContains(t, string(encoded), "not a json record at all")
+		require.NotContains(t, string(encoded), "chatter on stderr")
+	}
+
+	list, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Len(t, list.Sessions, 1)
 }

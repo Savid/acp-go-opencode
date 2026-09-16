@@ -26,17 +26,16 @@ const (
 	stopReasonMaxTokens = "max_tokens"
 	stopReasonError     = "error"
 
-	// nativeCauseMaxBytes bounds the native cause text a failure carries.
-	nativeCauseMaxBytes = 2048
 	// processExitGrace is how long failure classification waits for a dead
 	// child to be reaped after its stdout closed.
 	processExitGrace = 2 * time.Second
 )
 
-// nativePrompt is one mapped prompt: the message text plus attached images.
+// nativePrompt retains ordered native parts and the text used for command routing.
 type nativePrompt struct {
 	message string
 	images  []map[string]any
+	parts   []map[string]any
 }
 
 // mapPrompt converts ACP prompt content to opencode's prompt shape. Embedded
@@ -60,66 +59,65 @@ func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) (nat
 		return nativePrompt{}, refusal.InvalidParams()
 	}
 
+	prompt := nativePrompt{}
 	textParts := make([]string, 0, len(blocks))
-	contextParts := make([]string, 0)
+	appendText := func(text string) {
+		if strings.TrimSpace(text) == "" {
+			return
+		}
 
-	for _, block := range blocks {
-		switch {
-		case block.Text != nil:
-			if audienceIsUserOnly(block.Text.Annotations) {
+		textParts = append(textParts, text)
+		prompt.parts = append(prompt.parts, map[string]any{fieldType: fieldText, fieldText: text})
+	}
+
+	media := make(map[int]image.Decoded, len(decoded))
+	for _, item := range decoded {
+		media[item.Block] = item
+	}
+
+	for index, block := range blocks {
+		if item, gated := media[index]; gated {
+			if !image.IsImageMIME(item.MIME) {
+				if block.Resource != nil && block.Resource.Resource.BlobResourceContents != nil {
+					appendText(block.Resource.Resource.BlobResourceContents.Uri)
+				}
+
 				continue
 			}
 
-			textParts = append(textParts, block.Text.Text)
-		case block.Image != nil:
-		case block.ResourceLink != nil:
-			textParts = append(textParts, strings.TrimSpace(block.ResourceLink.Uri))
-		case block.Resource != nil:
-			if blob := block.Resource.Resource.BlobResourceContents; blob != nil {
-				textParts = append(textParts, strings.TrimSpace(blob.Uri))
+			if supported := s.modelImageCapability(); supported != nil && !*supported {
+				return nativePrompt{}, image.UnsupportedByModel(item.Field, item.Index).InvalidParams()
 			}
 
+			part := map[string]any{fieldType: partFile, "mime": item.MIME, "url": "data:" + item.MIME + ";base64," + base64.StdEncoding.EncodeToString(item.Data)}
+			prompt.images = append(prompt.images, part)
+			prompt.parts = append(prompt.parts, part)
+
+			continue
+		}
+
+		switch {
+		case block.Text != nil:
+			if !wire.AudienceIsUserOnly(block.Text.Annotations) {
+				appendText(block.Text.Text)
+			}
+		case block.ResourceLink != nil:
+			appendText(block.ResourceLink.Uri)
+		case block.Resource != nil:
 			if text := block.Resource.Resource.TextResourceContents; text != nil {
-				textParts = append(textParts, strings.TrimSpace(text.Uri))
-				contextParts = append(contextParts, contextResourceText(text.Uri, text.Text))
+				appendText(wire.ContextResourceText(text.Uri, text.Text))
 			}
 		default:
 			return nativePrompt{}, wire.Unsupported("prompt")
 		}
 	}
 
-	prompt := nativePrompt{
-		message: strings.Join(append(textParts, contextParts...), "\n"),
-		images:  make([]map[string]any, 0, len(decoded)),
-	}
-
-	for index := range decoded {
-		if decoded[index].Field == image.FieldPromptResource && !image.IsImageMIME(decoded[index].MIME) {
-			continue
-		}
-
-		if supported := s.modelImageCapability(); supported != nil && !*supported {
-			return nativePrompt{}, image.UnsupportedByModel(decoded[index].Field, decoded[index].Index).InvalidParams()
-		}
-
-		prompt.images = append(prompt.images, map[string]any{fieldType: partFile, "mime": decoded[index].MIME, "url": "data:" + decoded[index].MIME + ";base64," + base64.StdEncoding.EncodeToString(decoded[index].Data)})
-	}
-
-	if strings.TrimSpace(prompt.message) == "" && len(prompt.images) == 0 {
+	prompt.message = strings.Join(textParts, "\n")
+	if len(prompt.parts) == 0 {
 		return nativePrompt{}, wire.Unsupported("prompt")
 	}
 
 	return prompt, nil
-}
-
-func audienceIsUserOnly(annotations *acp.Annotations) bool {
-	return annotations != nil && len(annotations.Audience) == 1 && annotations.Audience[0] == acp.RoleUser
-}
-
-func contextResourceText(uri string, text string) string {
-	escape := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
-
-	return "\n<context ref=\"" + escape.Replace(uri) + "\">\n" + escape.Replace(text) + "\n</context>"
 }
 
 // prompt sends one turn to opencode and streams updates until the run settles.
@@ -128,7 +126,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 	submission, paramErr := lifecycle.DecodePromptCorrelation(meta, s.lifecycleNegotiated())
 	if paramErr != nil {
-		return acp.PromptResponse{}, invalidParam(paramErr)
+		return acp.PromptResponse{}, wire.ParamRefusal(paramErr)
 	}
 
 	if err := s.admissionError(); err != nil {
@@ -141,44 +139,25 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	}
 	defer release()
 
-	s.mu.Lock()
-	busy := s.cycle != nil
-	s.mu.Unlock()
-
-	if busy {
-		return acp.PromptResponse{}, wire.Backpressure(limitSessionPrompt)
-	}
-
-	mapped, err := s.mapPrompt(ctx, params.Prompt)
-	if err != nil {
-		if ctx.Err() != nil {
-			return cancelledResponse(params), nil
-		}
-
-		return acp.PromptResponse{}, err
-	}
-
-	// session/cancel cancels this request's context through the SDK. A cancel
-	// that lands before native dispatch creates neither submission nor turn and
-	// answers cancelled.
-	if ctx.Err() != nil {
-		return cancelledResponse(params), nil
-	}
-
-	rt, err := s.ensureRuntime(ctx)
-	if err != nil {
-		return acp.PromptResponse{}, err
-	}
+	// The turn runs under its own cancellation, not the request's: the SDK
+	// cancels a prompt's context when the next prompt for the session arrives,
+	// and a refused peer prompt must not end this turn.
+	turnCtx, cancelTurn := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelTurn()
 
 	t := &turn{
-		cycle:      cycle{origin: lifecycle.CauseSubmission, state: cycleState{}},
+		cycle:      cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseSubmission}, state: cycleState{}},
 		submission: submission,
+		cancelTurn: cancelTurn,
 		settled:    make(chan struct{}),
 		finished:   make(chan struct{}),
 		messageID:  opencode.NewMessageID(),
 	}
 	defer close(t.finished)
 
+	// The turn is installed before the request-scoped work a cancel has to be
+	// able to interrupt, and the busy check shares its critical section so a
+	// cycle the pump opens can neither be missed nor wedge the session.
 	s.mu.Lock()
 	if s.cycle != nil || s.closing {
 		s.mu.Unlock()
@@ -197,6 +176,40 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 		s.mu.Unlock()
 	}()
 
+	mapped, err := s.mapPrompt(turnCtx, params.Prompt)
+	if err != nil {
+		if turnCtx.Err() != nil {
+			return wire.CancelledResponse(params), nil
+		}
+
+		return acp.PromptResponse{}, err
+	}
+
+	rt, err := s.ensureRuntime(turnCtx)
+	if err != nil {
+		if turnCtx.Err() != nil {
+			return wire.CancelledResponse(params), nil
+		}
+
+		return acp.PromptResponse{}, err
+	}
+
+	// A cancel that lands before native dispatch answers cancelled with no
+	// native work.
+	if turnCtx.Err() != nil {
+		return wire.CancelledResponse(params), nil
+	}
+
+	s.mu.Lock()
+	if s.runtime != rt || !rt.alive() {
+		s.mu.Unlock()
+
+		return acp.PromptResponse{}, s.transportFailure(context.WithoutCancel(ctx), rt, nil)
+	}
+
+	t.runtime = rt
+	s.mu.Unlock()
+
 	if timeout := s.agent.options.TurnTimeout; timeout > 0 {
 		timer := time.AfterFunc(timeout, func() { s.timeout(context.WithoutCancel(ctx), t) })
 		defer timer.Stop()
@@ -214,7 +227,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 		var message opencode.NativeMessage
 
-		err := rt.client.Do(requestCtx, s.cwd, http.MethodPost, opencode.SessionPath(string(s.id))+path, body, &message)
+		err := rt.client.Do(requestCtx, s.cwd, http.MethodPost, opencode.SessionPath(s.nativeID)+path, body, &message)
 		select {
 		case rt.results <- nativePromptResult{turn: t, message: message, err: err}:
 		case <-requestCtx.Done():
@@ -224,9 +237,9 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 	select {
 	case <-t.settled:
-	case <-ctx.Done():
-		s.cancel(ctx)
-
+	case <-turnCtx.Done():
+		// Whoever ended the turn already interrupted opencode; this bounds how
+		// long settlement may take before the binding is dropped.
 		select {
 		case <-t.settled:
 		case <-time.After(sessionAbortTimeout):
@@ -238,17 +251,13 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	return s.settleTurn(ctx, rt, t, params)
 }
 
-func cancelledResponse(params acp.PromptRequest) acp.PromptResponse {
-	return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}
-}
-
 // dispatchFailure classifies a prompt command opencode never accepted: a native
 // rejection carries its text as a provider failure, a dead child is a
 // process exit, and everything else is transport.
 func (s *session) dispatchFailure(ctx context.Context, rt *binding, err error) error {
 	var commandErr *opencode.HTTPError
 	if errors.As(err, &commandErr) {
-		return turnFailure(wire.CauseProvider, nativeErrorText(&commandErr.Native))
+		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProvider, Message: nativeErrorText(&commandErr.Native)})
 	}
 
 	return s.transportFailure(ctx, rt, err)
@@ -267,11 +276,11 @@ func (s *session) transportFailure(ctx context.Context, rt *binding, err error) 
 			message = fmt.Sprintf("opencode process was killed by signal %d", result.Signal)
 		}
 
-		if line := rt.server.stderr.lastLine(); line != "" {
+		if line := rt.server.proc.StderrLastLine(); line != "" {
 			message += ": " + line
 		}
 
-		return turnFailure(wire.CauseProcessExit, message)
+		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProcessExit, Message: message})
 	}
 
 	if err == nil {
@@ -282,21 +291,7 @@ func (s *session) transportFailure(ctx context.Context, rt *binding, err error) 
 		err = errors.New("opencode event stream closed mid-turn")
 	}
 
-	return turnFailure(wire.CauseTransport, err.Error())
-}
-
-func turnFailure(cause string, message string) *acp.RequestError {
-	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: cause, Message: boundNativeCause(message)})
-}
-
-// boundNativeCause is the single gate every native cause text passes through
-// before it reaches a client.
-func boundNativeCause(message string) string {
-	if len(message) > nativeCauseMaxBytes {
-		message = message[:nativeCauseMaxBytes]
-	}
-
-	return strings.TrimSpace(strings.ToValidUTF8(message, ""))
+	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: err.Error()})
 }
 
 // cycleVerdict is how one cycle ended, in the terms the lifecycle stream and
@@ -309,19 +304,19 @@ type cycleVerdict struct {
 
 // judgeCycle records how a natively settled cycle finished. The cancel guard
 // runs before every failure mapping.
-func judgeCycle(c *cycle, cancelled bool) cycleVerdict {
+func judgeCycle(c *cycle, failure error, cancelled bool) cycleVerdict {
 	switch {
 	case cancelled:
 		return cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
-	case c.failure != nil:
-		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: c.failure}
+	case failure != nil:
+		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: failure}
 	case c.state.stopReason == stopReasonError:
 		message := strings.TrimSpace(c.state.errorMessage)
 		if message == "" {
 			message = "opencode reported a turn error"
 		}
 
-		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: turnFailure(wire.CauseProvider, message)}
+		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProvider, Message: message})}
 	}
 
 	stop := acp.StopReasonEndTurn
@@ -336,7 +331,7 @@ func judgeCycle(c *cycle, cancelled bool) cycleVerdict {
 		outcome = lifecycle.OutcomeCancelled
 	case statusComplete, "stop", "tool-calls":
 	default:
-		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: turnFailure(wire.CauseProvider, "unknown native finish status: "+c.state.stopReason)}
+		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProvider, Message: "unknown native finish status: " + c.state.stopReason})}
 	}
 
 	return cycleVerdict{outcome: outcome, stopReason: string(stop)}
@@ -359,11 +354,11 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	case cancelled:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
 	case timedOut:
-		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: turnFailure(wire.CauseTimeout, fmt.Sprintf("opencode turn exceeded %s", s.agent.options.TurnTimeout))}
+		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTimeout, Message: fmt.Sprintf("opencode turn exceeded %s", s.agent.options.TurnTimeout)})}
 	case t.ended == turnTransportEnded:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.transportFailure(settleCtx, rt, nil)}
 	default:
-		verdict = judgeCycle(&t.cycle, false)
+		verdict = judgeCycle(&t.cycle, s.cycleFailure(&t.cycle), false)
 	}
 
 	if t.ended == turnSettled {
@@ -372,20 +367,23 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 			s.emitSessionInfo(settleCtx, params.Prompt)
 		}
 
-		if err := s.commitMirror(settleCtx); err != nil {
+		if err := s.commitMirror(settleCtx, rt); err != nil {
 			s.stopRuntime(settleCtx, rt)
-			s.lcFence()
+			s.lc.Fence()
 			verdict.failure = s.mirrorFailure(err)
 			verdict.outcome = lifecycle.OutcomeFailed
 		}
 	}
 
-	if err := s.lcIdle(settleCtx, &t.cycle, verdict); err != nil && verdict.failure == nil {
+	if err := s.lc.Idle(settleCtx, t.Cycle, verdict.stopReason, verdict.outcome); err != nil && verdict.failure == nil {
 		verdict.failure = err
 	}
 
-	if t.ended == turnTransportEnded {
-		s.lcFence()
+	// The incarnation ends with the generation that ran the turn, not with how
+	// the turn ended: a native exit after a settled turn must not leave the
+	// next process publishing on this stream.
+	if t.ended == turnTransportEnded || !s.boundTo(rt) {
+		s.lc.Fence()
 	}
 
 	if verdict.failure != nil {
@@ -412,34 +410,40 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 func (s *session) mirrorFailure(err error) error {
 	s.agent.log.Error("session mirror commit failed", slog.String(nativeSessionIDKey, string(s.id)), slog.String("reason", err.Error()))
 
-	return turnFailure(wire.CauseTransport, "session mirror commit failed")
+	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: "session mirror commit failed"})
+}
+
+// boundTo reports whether rt is still this session's live binding.
+func (s *session) boundTo(rt *binding) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.runtime == rt && rt.alive()
 }
 
 func (s *session) promptRequest(mapped nativePrompt, id string) (string, any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	parts := []map[string]any{}
-	if mapped.message != "" {
-		parts = append(parts, map[string]any{fieldType: fieldText, fieldText: mapped.message})
-	}
+	head, args, _ := strings.Cut(mapped.message, " ")
 
-	parts = append(parts, mapped.images...)
-	for _, command := range s.commands {
-		head, args, _ := strings.Cut(mapped.message, " ")
-		if head == "/"+command.Name && s.options.OutputSchema == nil {
-			return nativeCommandPath, opencode.CommandRequest{MessageID: id, Agent: s.mode, Model: s.model, Variant: s.effort, Command: command.Name, Arguments: args, Parts: mapped.images}
+	if s.options.OutputSchema == nil {
+		for _, command := range s.commands {
+			// The catalog publishes only sanitized names, so only those route.
+			if wire.ValidCommandName(command.Name) && head == "/"+command.Name {
+				return nativeCommandPath, opencode.CommandRequest{MessageID: id, Agent: s.mode, Model: s.model, Variant: s.effort, Command: command.Name, Arguments: args, Parts: mapped.images}
+			}
 		}
 	}
 
-	req := opencode.MessageRequest{MessageID: id, Agent: s.mode, Variant: s.effort, Parts: parts}
+	req := opencode.MessageRequest{MessageID: id, Agent: s.mode, Variant: s.effort, Parts: mapped.parts}
 	if s.model != "" {
 		provider, model, _ := strings.Cut(s.model, "/")
 		req.Model = &opencode.ModelSelector{ProviderID: provider, ModelID: model}
 	}
 
 	if s.options.OutputSchema != nil {
-		req.Format = &opencode.OutputFormat{Type: opencode.OutputFormatJSONSchema, Schema: cloneAnyMap(s.options.OutputSchema)}
+		req.Format = &opencode.OutputFormat{Type: opencode.OutputFormatJSONSchema, Schema: wire.CloneMap(s.options.OutputSchema)}
 	}
 
 	return "/message", req

@@ -22,6 +22,7 @@ const (
 type session struct {
 	agent                 *Agent
 	id                    acp.SessionId
+	nativeID              string
 	cwd                   string
 	additionalDirectories []string
 	options               OpenCodeOptions
@@ -33,24 +34,26 @@ type session struct {
 	effort                string
 	models                opencode.Catalog
 	artifacts             map[string]imageArtifact
-	nativeMessages        map[string]opencode.NativeMessageInfo
-	completedParents      map[string]bool
-	mode                  string
-	agents                []opencode.NativeAgent
-	commands              []opencode.NativeCommand
-	title                 string
-	updatedAt             string
-	closing               bool
-	closeDone             chan struct{}
-	closeErr              error
-	poison                string
-	turn                  *turn
-	cycle                 *cycle
-	dialogs               map[string]*dialog
-	callbacks             sync.WaitGroup
-	mirrorMu              sync.Mutex
-	lcMu                  sync.Mutex
-	lc                    lifecycleState
+	// nativeMessages is the latest native message info by id, and
+	// completedParents the user messages whose generation already ended.
+	nativeMessages   map[string]opencode.NativeMessageInfo
+	completedParents map[string]bool
+	mode             string
+	agents           []opencode.NativeAgent
+	commands         []opencode.NativeCommand
+	title            string
+	updatedAt        string
+	closing          bool
+	closeDone        chan struct{}
+	closeErr         error
+	poison           string
+	turn             *turn
+	cycle            *cycle
+	dialogs          map[string]*dialog
+	callbacks        sync.WaitGroup
+	mirrorMu         sync.Mutex
+	lcMu             sync.Mutex
+	lc               lifecycle.Publisher
 }
 
 // binding routes the shared server's events to one held conversation.
@@ -58,12 +61,28 @@ type binding struct {
 	server   *runtime
 	client   *opencode.Client
 	cancel   context.CancelFunc
+	ending   <-chan struct{}
 	bound    chan struct{}
 	bindOnce sync.Once
 	done     chan struct{}
 	events   chan opencode.Event
 	results  chan nativePromptResult
 }
+
+// alive reports whether this binding still routes native events: its generation
+// has not been ended and its server has not ended. Liveness reads the binding's
+// own cancellation rather than its pump: done closes only after runtimeEnded has
+// run the generation's lifecycle tail, and a binding handed out during that tail
+// takes a prompt no pump is left to settle.
+func (b *binding) alive() bool {
+	select {
+	case <-b.ending:
+		return false
+	default:
+		return b.server.alive()
+	}
+}
+
 type nativePromptResult struct {
 	turn    *turn
 	message opencode.NativeMessage
@@ -71,9 +90,7 @@ type nativePromptResult struct {
 }
 
 type cycle struct {
-	turnID  string
-	cycleID string
-	origin  lifecycle.Cause
+	lifecycle.Cycle
 	state   cycleState
 	failure error
 	done    chan struct{}
@@ -90,6 +107,11 @@ const (
 type turn struct {
 	cycle
 	submission lifecycle.Submission
+	runtime    *binding
+	// cancelTurn ends the turn's own context. The session owns it, so a
+	// refused peer prompt cancelling this prompt's request context never ends
+	// a live turn.
+	cancelTurn context.CancelFunc
 	accepted   bool
 	cancelled  bool
 	timedOut   bool
@@ -113,7 +135,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 	rt := s.runtime
 	s.mu.Unlock()
 
-	if rt != nil && rt.server.alive() {
+	if rt != nil && rt.alive() {
 		return rt, nil
 	}
 
@@ -141,7 +163,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 		return nil, err
 	}
 
-	if err := s.configureRuntime(ctx, rt, s.model, string(s.id)); err != nil {
+	if err := s.configureRuntime(ctx, rt, s.model, s.nativeID); err != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
 		return nil, err
@@ -184,7 +206,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			end := turnSettled
 
 			if result.err != nil {
-				t.failure = s.dispatchFailure(ctx, rt, result.err)
+				s.recordFailure(&t.cycle, s.dispatchFailure(ctx, rt, result.err))
 
 				var nativeErr *opencode.HTTPError
 				if !errors.As(result.err, &nativeErr) {
@@ -193,29 +215,20 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			} else {
 				s.acceptTurn(ctx, t)
 
-				messages, err := rt.client.Messages(ctx, s.cwd, string(s.id))
+				messages, err := rt.client.Messages(ctx, s.cwd, s.nativeID)
 				if err != nil {
-					t.failure = err
+					s.recordFailure(&t.cycle, err)
 				} else {
 					for index := range messages {
 						message := &messages[index]
 						if message.Info.ParentID == t.messageID {
-							if err := s.projectMessage(ctx, &t.cycle, *message); err != nil {
-								t.failure = err
-							}
+							s.recordFailure(&t.cycle, s.projectMessage(ctx, &t.cycle, *message))
 						}
 					}
 				}
 
-				if err := s.projectMessage(ctx, &t.cycle, result.message); err != nil {
-					t.failure = err
-				}
-
-				if s.completedParents == nil {
-					s.completedParents = map[string]bool{}
-				}
-
-				s.completedParents[t.messageID] = true
+				s.recordFailure(&t.cycle, s.projectMessage(ctx, &t.cycle, result.message))
+				s.completeParent(t.messageID)
 			}
 
 			s.cancelDialogs()
@@ -232,10 +245,14 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 		}
 	}
 }
+
+// runtimeEnded ends this generation: it runs the incarnation's lifecycle tail
+// first and drops the binding last, so an operation that relaunches waits on
+// this pump and opens an incarnation no earlier fence can reach.
 func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 	rt.server.mu.Lock()
-	if rt.server.bindings[string(s.id)] == rt {
-		delete(rt.server.bindings, string(s.id))
+	if rt.server.bindings[s.nativeID] == rt {
+		delete(rt.server.bindings, s.nativeID)
 	}
 	rt.server.mu.Unlock()
 	s.mu.Lock()
@@ -245,15 +262,20 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 		return
 	}
 
-	s.runtime = nil
 	t, c, closing := s.turn, s.cycle, s.closing
+	if t != nil && t.runtime != rt {
+		t = nil
+	}
+
 	s.cycle = nil
 	s.mu.Unlock()
 	s.cancelDialogs()
 	s.callbacks.Wait()
 
 	if t != nil {
+		t.cancelTurn()
 		t.settle(turnTransportEnded)
+		s.clearRuntime(rt)
 
 		return
 	}
@@ -264,15 +286,69 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 			verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
 		}
 
-		_ = s.lcIdle(context.WithoutCancel(ctx), c, verdict)
+		_ = s.lc.Idle(context.WithoutCancel(ctx), c.Cycle, verdict.stopReason, verdict.outcome)
 		close(c.done)
 	}
 
 	if !closing {
-		s.lcFence()
+		s.lc.Fence()
+	}
+
+	s.clearRuntime(rt)
+}
+
+// clearRuntime drops the binding once its generation's lifecycle tail has run.
+func (s *session) clearRuntime(rt *binding) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.runtime == rt {
+		s.runtime = nil
 	}
 }
 func (s *session) stopRuntime(_ context.Context, rt *binding) { rt.cancel(); <-rt.done }
+
+// completeParent records a user message whose generation ended, so a later
+// native event naming it opens no agent cycle.
+func (s *session) completeParent(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.completedParents == nil {
+		s.completedParents = map[string]bool{}
+	}
+
+	s.completedParents[id] = true
+}
+
+// parentCompleted reports whether either identity belongs to a generation that
+// already ended.
+func (s *session) parentCompleted(id string, parentID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.completedParents[id] || s.completedParents[parentID]
+}
+
+// rememberMessage stores the latest native info for one message.
+func (s *session) rememberMessage(info opencode.NativeMessageInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.nativeMessages == nil {
+		s.nativeMessages = map[string]opencode.NativeMessageInfo{}
+	}
+
+	s.nativeMessages[info.ID] = info
+}
+
+// nativeMessage reads the remembered info for one message.
+func (s *session) nativeMessage(id string) opencode.NativeMessageInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.nativeMessages[id]
+}
 
 // abort interrupts the native run under a bounded context detached from the
 // caller's cancellation.
@@ -280,7 +356,7 @@ func (s *session) abort(ctx context.Context, rt *binding) {
 	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionAbortTimeout)
 	defer cancel()
 
-	if err := rt.client.Interrupt(abortCtx, s.cwd, string(s.id)); err != nil {
+	if err := rt.client.Interrupt(abortCtx, s.cwd, s.nativeID); err != nil {
 		s.agent.log.DebugContext(abortCtx, "opencode abort failed", slog.String(nativeSessionIDKey, string(s.id)))
 	}
 }
@@ -300,7 +376,7 @@ func (s *session) cancel(ctx context.Context) {
 
 	t.cancelled = true
 	s.mu.Unlock()
-
+	t.cancelTurn()
 	s.cancelDialogs()
 
 	if rt != nil {
@@ -321,7 +397,7 @@ func (s *session) timeout(ctx context.Context, t *turn) {
 
 	t.timedOut = true
 	s.mu.Unlock()
-
+	t.cancelTurn()
 	s.cancelDialogs()
 
 	if rt != nil {
@@ -424,12 +500,7 @@ func (s *session) acquireGate(limit string) (func(), error) {
 		return nil, wire.UnknownSession()
 	}
 
-	select {
-	case s.gate <- struct{}{}:
-		return func() { <-s.gate }, nil
-	default:
-		return nil, wire.Backpressure(limit)
-	}
+	return wire.AcquireSessionGate(s.gate, limit)
 }
 
 // close interrupts and joins session work, captures native state, and releases its binding.
@@ -451,6 +522,11 @@ func (s *session) close(ctx context.Context) error {
 		t.cancelled = true
 	}
 	s.mu.Unlock()
+
+	if t != nil {
+		t.cancelTurn()
+	}
+
 	s.cancelDialogs()
 	s.callbacks.Wait()
 
@@ -481,14 +557,14 @@ func (s *session) close(ctx context.Context) error {
 	var errs []error
 
 	if rt != nil {
-		if err := s.commitMirror(commitCtx); err != nil {
+		if err := s.commitMirror(commitCtx, rt); err != nil {
 			errs = append(errs, err)
 		}
 
 		s.stopRuntime(commitCtx, rt)
 	}
 
-	s.lcFence()
+	s.lc.Fence()
 	s.mu.Lock()
 	s.closeErr = errors.Join(errs...)
 	close(s.closeDone)

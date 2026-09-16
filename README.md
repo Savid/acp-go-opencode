@@ -5,12 +5,17 @@
 `opencode serve` process handles the Agent's sessions through authenticated
 loopback HTTP and a shared event stream.
 
-Sessions use OpenCode's native IDs and storage. After closing the adapter,
+Sessions retain OpenCode's native storage. After closing the adapter,
 continue a session in the same directory and native home:
 
 ```sh
-opencode run --session SESSION_ID "Continue the task"
+opencode run --session NATIVE_SESSION_ID "Continue the task"
 ```
+
+New, load, and resume responses and session-list entries expose the current
+native ID as `_meta.opencode.nativeSessionId`. Use it for native CLI continuation.
+ACP requests continue to use the stable ACP `sessionId`. The store's configuration
+record saves both IDs with the matching native history.
 
 ## Install and run
 
@@ -71,8 +76,9 @@ included even when absent from the catalog. Structured results appear at
 
 Native permission requests use ACP permissions; native questions use ACP form
 elicitation. Missing or cancelled answers reject the native request. Commands
-come from OpenCode's command catalog. An exact `/name` match uses the native
-command endpoint; other text uses the message endpoint.
+come from OpenCode's command catalog. An exact `/name` match against an
+advertised command uses the native command endpoint; other text uses the
+message endpoint.
 
 Images enter as inline base64 or validated file handoffs. Output supports native
 file parts and tool attachments, with bounded local reads and image limits.

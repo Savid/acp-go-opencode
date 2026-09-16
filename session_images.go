@@ -95,7 +95,7 @@ func (s *session) imageBytes(file opencode.NativeAttachment) ([]byte, string, *i
 		}
 	}
 
-	if file.ID != "" {
+	if storableArtifact(file) {
 		s.mu.Lock()
 		if s.artifacts == nil {
 			s.artifacts = map[string]imageArtifact{}
@@ -125,13 +125,15 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 	}
 
 	if refusal != nil {
-		s.mu.Lock()
-		if s.artifacts == nil {
-			s.artifacts = map[string]imageArtifact{}
-		}
+		if storableArtifact(file) {
+			s.mu.Lock()
+			if s.artifacts == nil {
+				s.artifacts = map[string]imageArtifact{}
+			}
 
-		s.artifacts[file.ID] = imageArtifact{Refusal: refusal.Reason, Reference: imageReference(file.URL)}
-		s.mu.Unlock()
+			s.artifacts[file.ID] = imageArtifact{Refusal: refusal.Reason, Reference: imageReference(file.URL)}
+			s.mu.Unlock()
+		}
 
 		guidance, _ := refusal.Guidance()
 
@@ -140,14 +142,26 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 
 	return []acp.ContentBlock{acp.ImageBlock(base64.StdEncoding.EncodeToString(data), mime)}
 }
+
+// captureImages admits every image the mirror cannot replay from its own rows
+// through the output gate, which stores the sidecar copy a later replay reads.
+// Only a storable artifact is decoded: a data URL carries its bytes in the
+// mirrored row, so rastering it here would cost a decode on every commit and
+// store nothing.
 func (s *session) captureImages(rows [][]byte) {
-	messages := nativeMessages(rows, string(s.id))
+	capture := func(file opencode.NativeAttachment, used *int64) {
+		if image.IsImageMIME(file.Mime) && storableArtifact(file) {
+			_ = s.outputFile(file, used)
+		}
+	}
+
+	messages := nativeMessages(rows, s.nativeID)
 	for index := range messages {
 		message := &messages[index]
 		for index := range message.Parts {
 			part := &message.Parts[index]
-			if part.Type == partFile && image.IsImageMIME(part.Mime) {
-				_ = s.outputFile(opencode.NativeAttachment{ID: part.ID, Mime: part.Mime, URL: part.URL}, nil)
+			if part.Type == partFile {
+				capture(opencode.NativeAttachment{ID: part.ID, Mime: part.Mime, URL: part.URL}, nil)
 			}
 
 			if part.Type == partTool {
@@ -162,13 +176,18 @@ func (s *session) captureImages(rows [][]byte) {
 
 				for index, file := range state.Attachments {
 					file.ID = attachmentID(part.ID, index)
-					if image.IsImageMIME(file.Mime) {
-						_ = s.outputFile(file, &used)
-					}
+					capture(file, &used)
 				}
 			}
 		}
 	}
+}
+
+// storableArtifact reports whether an admitted image needs its own sidecar
+// copy. A data URL already carries its bytes in the mirrored native row, so a
+// second copy in the configuration record would be written on every commit.
+func storableArtifact(file opencode.NativeAttachment) bool {
+	return file.ID != "" && !strings.HasPrefix(file.URL, "data:")
 }
 
 func attachmentID(part string, index int) string { return part + "/" + strconv.Itoa(index) }
@@ -196,7 +215,7 @@ func validateStoredImages(rows [][]byte, record sessionRecord) error {
 		return nil
 	}
 
-	messages := nativeMessages(rows, record.SessionID)
+	messages := nativeMessages(rows, record.NativeSessionID)
 	for mi := range messages {
 		message := &messages[mi]
 		for pi := range message.Parts {

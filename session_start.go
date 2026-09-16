@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -20,7 +21,7 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 	}
 
 	readCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	rt := &binding{server: server, client: server.client, cancel: cancel, bound: make(chan struct{}), done: make(chan struct{}), events: make(chan opencode.Event, 256), results: make(chan nativePromptResult, 1)}
+	rt := &binding{server: server, client: server.client, cancel: cancel, ending: readCtx.Done(), bound: make(chan struct{}), done: make(chan struct{}), events: make(chan opencode.Event, 256), results: make(chan nativePromptResult, 1)}
 
 	s.mu.Lock()
 	s.runtime = rt
@@ -53,6 +54,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expe
 			return s.startFailure(ctx, err)
 		}
 
+		s.nativeID = native.ID
 		s.id = acp.SessionId(native.ID)
 	} else {
 		var err error
@@ -101,7 +103,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expe
 	s.updatedAt = time.UnixMilli(native.Time.Updated).UTC().Format(time.RFC3339)
 	s.mu.Unlock()
 
-	if err := s.refreshModels(ctx, rt); err != nil {
+	if err := s.refreshCatalogs(ctx, rt); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
@@ -125,12 +127,12 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expe
 	return nil
 }
 func (s *session) carrierMetadata(base map[string]any) map[string]any {
-	result := cloneAnyMap(base)
+	result := wire.CloneMap(base)
 	if result == nil {
 		result = map[string]any{}
 	}
 
-	env := cloneStringMap(s.options.Env)
+	env := maps.Clone(s.options.Env)
 	if env == nil {
 		env = map[string]string{}
 	}

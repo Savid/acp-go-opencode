@@ -5,7 +5,7 @@
 This Go module exposes the local `opencode` CLI as an Agent Client Protocol agent.
 One shared `opencode serve` process handles the Agent's sessions through native
 HTTP and SSE. Native storage stays in its XDG home. After closing the adapter,
-continue with `opencode run --session SESSION_ID` in the same directory and home.
+continue with `opencode run --session NATIVE_SESSION_ID` in the same directory and home.
 
 ## Project Map
 
@@ -16,7 +16,7 @@ continue with `opencode run --session SESSION_ID` in the same directory and home
   prompt turns, permissions and elicitation, lifecycle stream, store mirror,
   replay, config options, and image input/output.
 - `internal/opencode`: native HTTP/SSE client, sync-event import/export,
-  launch arguments, and native version validation.
+  launch arguments, and the native version floor and probe.
 - `integration`: gated tests against the installed opencode.
 - `examples`: runnable ACP clients.
 

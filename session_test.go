@@ -1,0 +1,357 @@
+package opencodeacp
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	acp "github.com/coder/acp-go-sdk"
+	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/sessionlog"
+	"github.com/savid/acp-go-core/wire"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSharedRuntimeAndFreshHomeRestore(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	cwd := t.TempDir()
+	first, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	second, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	one, err := a.session(t.Context(), first.SessionId)
+	require.NoError(t, err)
+	two, err := a.session(t.Context(), second.SessionId)
+	require.NoError(t, err)
+	require.Same(t, one.runtime.server, two.runtime.server)
+	response, err := a.Prompt(t.Context(), wire.TextPromptRequest(first.SessionId, "remember"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	_, err = a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: first.SessionId})
+	require.NoError(t, err)
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(second.SessionId, "peer"))
+	require.NoError(t, err)
+	require.NoError(t, a.Close())
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(first.SessionId, cwd))
+	require.NoError(t, err)
+	require.Contains(t, agentText(h.rec.snapshot()), "hello remember")
+	_, err = h.prompt(first.SessionId, "restored", nil)
+	require.NoError(t, err)
+	require.Contains(t, agentText(h.rec.snapshot()), "hello restored")
+}
+func TestNativeCallbacksHaveToolIdentity(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.initialize(withLifecycle(), withFormElicitation())
+	h.rec.elicit = func(request acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
+		require.NotNil(t, request.Form)
+		require.Contains(t, request.Form.RequestedSchema.Properties, "0")
+
+		return acp.UnstableCreateElicitationResponse{Accept: &acp.UnstableCreateElicitationAccept{Content: map[string]any{"0": "blue"}}}, nil
+	}
+	session := h.newSession(WithSessionRawEvents(true))
+	for i, text := range []string{"PERMISSION", "QUESTION"} {
+		_, err := h.prompt(session.SessionId, text, promptMeta(i))
+		require.NoError(t, err)
+	}
+	h.rec.mu.Lock()
+	permissions := append([]acp.RequestPermissionRequest(nil), h.rec.permissions...)
+	raw := len(h.rec.raw)
+	h.rec.mu.Unlock()
+	require.Len(t, permissions, 1)
+	require.Positive(t, raw)
+	callID := permissions[0].ToolCall.ToolCallId
+	found := false
+	for _, notification := range h.rec.snapshot() {
+		if call := notification.Update.ToolCall; call != nil && call.ToolCallId == callID {
+			found = true
+		}
+	}
+	require.True(t, found, "permission references an emitted native tool")
+	events := lifecycleEvents(h.rec.snapshot())
+	count := 0
+	for _, event := range events {
+		if event["type"] == "action_update" {
+			count++
+		}
+	}
+	require.Equal(t, 4, count)
+}
+func TestEnvironmentAndStructuredOptionsSurviveRestore(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	cwd := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "bin")
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	options := NewOpenCodeOptions(WithOpenCodeEnv(map[string]string{"PATH": "/usr/bin", "CUSTOM": "one"}), WithOpenCodeExtraPathDirs(dir), WithOpenCodeMode("plan"), WithOpenCodePermission("allow"), WithOpenCodeOutputSchema(map[string]any{"type": "object"}), WithOpenCodeEffort("high"))
+	session, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd, WithSessionOpenCodeOptions(options)))
+	require.NoError(t, err)
+	_, err = h.prompt(session.SessionId, "ENV", nil)
+	require.NoError(t, err)
+	require.Contains(t, agentText(h.rec.snapshot()), "CUSTOM")
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
+	require.NoError(t, err)
+	rows, err := loadEntries(t.Context(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: sessionlog.ConfigSubpath})
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	var record sessionRecord
+	require.NoError(t, json.Unmarshal(rows[0], &record))
+	require.Equal(t, "plan", record.Mode)
+	require.Equal(t, "high", record.Effort)
+	require.Equal(t, "allow", record.Permission)
+	require.Equal(t, options.Env, record.Env)
+	require.Equal(t, []string{dir}, record.ExtraPathDirs)
+	require.NotNil(t, record.OutputSchema)
+}
+func TestRuntimeDeathRebindsPeers(t *testing.T) {
+	t.Parallel()
+	a := NewAgent(testOptions(t, WithLogger(slog.Default()))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	one, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	two, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	old := a.runtime
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(one.SessionId, "CRASH"))
+	require.Error(t, err)
+	require.Equal(t, "process_exit", requestErrorData(t, err)["cause"])
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err = a.Prompt(ctx, wire.TextPromptRequest(two.SessionId, "peer survived"))
+	require.NoError(t, err)
+	require.NotSame(t, old, a.runtime)
+	_, err = a.Prompt(ctx, wire.TextPromptRequest(one.SessionId, "first survived"))
+	require.NoError(t, err)
+}
+
+func TestImageReplaySurvivesNativeFileRemoval(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	cwd := t.TempDir()
+	session, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd, WithSessionRawEvents(true)))
+	require.NoError(t, err)
+	_, err = h.prompt(session.SessionId, "IMAGE", nil)
+	require.NoError(t, err)
+	var original string
+	for _, notification := range h.rec.snapshot() {
+		if chunk := notification.Update.AgentMessageChunk; chunk != nil && chunk.Content.Image != nil {
+			original = chunk.Content.Image.Data
+		}
+	}
+	require.NotEmpty(t, original)
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(filepath.Join(cwd, "output.png")))
+	restored := newHarness(t, WithSessionStore(store))
+	restored.initialize()
+	_, err = restored.conn.LoadSession(restored.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
+	require.NoError(t, err)
+	var replayed string
+	for _, notification := range restored.rec.snapshot() {
+		if chunk := notification.Update.AgentMessageChunk; chunk != nil && chunk.Content.Image != nil {
+			replayed = chunk.Content.Image.Data
+		}
+	}
+	require.Equal(t, original, replayed)
+}
+
+// The SDK cancels a prompt's request context when the next prompt for the same
+// session arrives; the refused peer prompt leaves the turn in flight running to
+// its own end.
+func TestRefusedPeerPromptLeavesTheLiveTurn(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize(withLifecycle(), withFormElicitation())
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	h.rec.elicit = func(acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
+		close(entered)
+		<-release
+
+		return acp.UnstableCreateElicitationResponse{Accept: &acp.UnstableCreateElicitationAccept{Content: map[string]any{"0": "blue"}}}, nil
+	}
+
+	session := h.newSession()
+
+	done := make(chan acp.PromptResponse, 1)
+	failed := make(chan error, 1)
+
+	go func() {
+		response, err := h.prompt(session.SessionId, "QUESTION", promptMeta(1))
+		done <- response
+		failed <- err
+	}()
+
+	<-entered
+
+	_, err := h.prompt(session.SessionId, "HELLO", promptMeta(2))
+	require.Equal(t, "backpressure", requestErrorData(t, err)[wire.FieldError])
+
+	close(release)
+	require.NoError(t, <-failed)
+	require.Equal(t, acp.StopReasonEndTurn, (<-done).StopReason)
+}
+
+// An explicit session/cancel ends the turn in flight, and its terminal idle
+// reports the cancelled outcome.
+func TestSessionCancelEndsTheTurnAsCancelled(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize(withLifecycle())
+	session := h.newSession()
+
+	done := make(chan acp.PromptResponse, 1)
+	failed := make(chan error, 1)
+
+	go func() {
+		response, err := h.prompt(session.SessionId, "SLOW", promptMeta(1))
+		done <- response
+		failed <- err
+	}()
+
+	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool { return len(lifecycleEvents(updates)) >= 3 })
+
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
+	require.NoError(t, <-failed)
+	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
+
+	cancelled := false
+
+	for _, event := range lifecycleEvents(h.rec.snapshot()) {
+		if event["type"] == "state_update" && event["state"] == "idle" && event["outcome"] == "cancelled" {
+			cancelled = true
+		}
+	}
+
+	require.True(t, cancelled, "the turn's terminal idle reports the cancelled outcome")
+}
+
+// While the pump runs a generation's lifecycle tail the session still holds the
+// binding, so a prompt that arrives in that window joins the departing pump and
+// relaunches instead of dispatching on a binding no pump is left to settle.
+func TestDepartingBindingIsNeverHandedToAPrompt(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+	require.NotNil(t, rt)
+
+	// A registered dialog holds the tail at callbacks.Wait, so the generation
+	// stays in the window the fence is about until the test releases it.
+	var once sync.Once
+
+	entered := make(chan struct{})
+
+	release, registered := s.registerDialog("held-tail", func(error) { once.Do(func() { close(entered) }) })
+	require.True(t, registered)
+	t.Cleanup(release)
+
+	rt.cancel()
+
+	select {
+	case <-entered:
+	case <-time.After(testTimeout):
+		t.Fatal("the ended generation never reached its lifecycle tail")
+	}
+
+	s.mu.Lock()
+	bound := s.runtime == rt
+	s.mu.Unlock()
+	require.True(t, bound, "the tail runs before the binding is cleared")
+	require.False(t, rt.alive(), "a binding whose generation ended routes nothing")
+
+	settled := make(chan error, 1)
+
+	go func() {
+		_, promptErr := a.Prompt(context.WithoutCancel(t.Context()), wire.TextPromptRequest(created.SessionId, "after the tail"))
+		settled <- promptErr
+	}()
+
+	select {
+	case <-settled:
+		t.Fatal("the prompt settled on the binding whose generation was still ending")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	release()
+
+	select {
+	case promptErr := <-settled:
+		require.NoError(t, promptErr, "the prompt runs on the incarnation that replaced the departed one")
+	case <-time.After(testTimeout):
+		t.Fatal("the prompt never settled: it was dispatched on a departed binding")
+	}
+}
+
+func TestEndedBindingCannotCancelReplacementPrompt(t *testing.T) {
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	s := a.sessions[created.SessionId]
+	old := s.runtime
+	old.server.mu.Lock()
+	unlock := sync.OnceFunc(old.server.mu.Unlock)
+	defer unlock()
+	old.cancel()
+	type result struct {
+		response acp.PromptResponse
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		response, promptErr := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "replacement prompt"))
+		done <- result{response: response, err: promptErr}
+	}()
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		return s.turn != nil
+	}, testTimeout, time.Millisecond)
+	unlock()
+	select {
+	case answered := <-done:
+		require.NoError(t, answered.err)
+		require.Equal(t, acp.StopReasonEndTurn, answered.response.StopReason, "old binding cleanup cancelled a prompt that had not bound to it")
+	case <-time.After(testTimeout):
+		t.Fatal("replacement prompt did not settle")
+	}
+}

@@ -1,0 +1,70 @@
+[
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_0",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_0",
+          "role": "user",
+          "sessionID": "fixture-session",
+          "time": {
+            "created": 1789390428504
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "cloudflare-ai-gateway",
+            "modelID": "anthropic/claude-sonnet-4.6"
+          }
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_1",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "text",
+          "text": "native event ordering probe",
+          "messageID": "msg_fixture_0",
+          "sessionID": "fixture-session",
+          "id": "prt_fixture_0"
+        },
+        "time": 1789390428507
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_2",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "idle"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_3",
+      "type": "session.idle",
+      "properties": {
+        "sessionID": "fixture-session"
+      }
+    }
+  }
+]

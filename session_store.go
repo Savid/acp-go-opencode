@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -24,6 +25,7 @@ import (
 // sessionRecord carries the accepted session configuration beside its native export.
 type sessionRecord struct {
 	SessionID             string                   `json:"sessionId"`
+	NativeSessionID       string                   `json:"nativeSessionId"`
 	Cwd                   string                   `json:"cwd"`
 	AdditionalDirectories []string                 `json:"additionalDirectories,omitempty"`
 	Env                   map[string]string        `json:"env,omitempty"`
@@ -41,11 +43,11 @@ func (s *session) record() sessionRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return sessionRecord{SessionID: string(s.id), Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: cloneStringMap(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, OutputSchema: cloneAnyMap(s.options.OutputSchema), Artifacts: cloneArtifacts(s.artifacts), UpdatedAtUnixMilli: time.Now().UnixMilli()}
+	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, OutputSchema: wire.CloneMap(s.options.OutputSchema), Artifacts: cloneArtifacts(s.artifacts), UpdatedAtUnixMilli: time.Now().UnixMilli()}
 }
 
 func (r sessionRecord) validate(id string) error {
-	if r.SessionID != id || !filepath.IsAbs(r.Cwd) || r.UpdatedAtUnixMilli <= 0 {
+	if r.NativeSessionID == "" || r.SessionID != id || !filepath.IsAbs(r.Cwd) || r.UpdatedAtUnixMilli <= 0 {
 		return errors.New("invalid session record")
 	}
 
@@ -78,13 +80,14 @@ func (r sessionRecord) validate(id string) error {
 	return nil
 }
 
-// commitMirror replaces only a complete native snapshot and its matching carrier.
-func (s *session) commitMirror(ctx context.Context) error {
+// commitMirror replaces only a complete native snapshot and its matching
+// carrier, read through the binding the caller dispatched on.
+func (s *session) commitMirror(ctx context.Context, rt *binding) error {
 	s.mirrorMu.Lock()
 	defer s.mirrorMu.Unlock()
 
-	rows, err := s.snapshotRows(ctx)
-	if err != nil || len(rows) == 0 {
+	rows, err := s.snapshotRows(ctx, rt)
+	if err != nil {
 		return err
 	}
 
@@ -95,13 +98,11 @@ func (s *session) commitMirror(ctx context.Context) error {
 	return err
 }
 
-func (s *session) snapshotRows(ctx context.Context) ([][]byte, error) {
-	s.mu.Lock()
-	rt, id := s.runtime, s.id
-	s.mu.Unlock()
-
-	if rt == nil || id == "" {
-		return nil, nil
+// snapshotRows reads the whole native history of this session. A commit that
+// cannot be attempted is an error: the turn it belongs to is not durable.
+func (s *session) snapshotRows(ctx context.Context, rt *binding) ([][]byte, error) {
+	if rt == nil {
+		return nil, errors.New("session has no native binding")
 	}
 
 	rows, err := s.readSyncRows(ctx, rt)
@@ -132,16 +133,16 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 
 	var record sessionRecord
 
-	rows, err := sessionlog.Load(ctx, a.store, string(id), &record)
-	if err == nil && len(rows) != 0 {
+	rows, found, err := sessionlog.Load(ctx, a.store, string(id), &record)
+	if err == nil && found {
 		err = record.validate(string(id))
 	}
 
-	if err == nil && len(rows) > 0 {
-		_, err = decodeEvents(rows, string(id))
+	if err == nil && found {
+		_, err = decodeEvents(rows, record.NativeSessionID)
 	}
 
-	if err == nil && len(rows) > 0 {
+	if err == nil && found {
 		err = validateStoredImages(rows, record)
 	}
 
@@ -151,7 +152,7 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 		return storedSession{}, a.restoreRefused(ctx, id, err)
 	}
 
-	return storedSession{rows: rows, record: record, found: len(rows) > 0}, nil
+	return storedSession{rows: rows, record: record, found: found}, nil
 }
 
 // decodeEvents validates identities and contiguous sequences before native replay.
@@ -241,7 +242,7 @@ func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, erro
 		return nil, err
 	}
 
-	allowed := syncGraph(events, string(s.id))
+	allowed := syncGraph(events, s.nativeID)
 	selected := make([]opencode.SyncEvent, 0)
 	cursors := map[string]int64{}
 
@@ -259,7 +260,7 @@ func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, erro
 		return nil, err
 	}
 
-	fencedGraph := syncGraph(append(append([]opencode.SyncEvent{}, selected...), next...), string(s.id))
+	fencedGraph := syncGraph(append(append([]opencode.SyncEvent{}, selected...), next...), s.nativeID)
 	for _, event := range next {
 		if fencedGraph[event.AggregateID] {
 			return nil, errors.New("native history changed while snapshotting")
@@ -289,7 +290,7 @@ func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, erro
 	}
 
 	if len(rows) > 0 {
-		if _, err := decodeEvents(rows, string(s.id)); err != nil {
+		if _, err := decodeEvents(rows, s.nativeID); err != nil {
 			return nil, err
 		}
 	}
@@ -307,7 +308,7 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 	s.artifacts = cloneArtifacts(stored.record.Artifacts)
 	s.mu.Unlock()
 
-	want, err := decodeEvents(stored.rows, string(s.id))
+	want, err := decodeEvents(stored.rows, s.nativeID)
 	if err != nil {
 		return nil, s.agent.restoreRefused(ctx, s.id, err)
 	}
@@ -355,7 +356,7 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 		return nil, s.agent.restoreRefused(ctx, s.id, err)
 	}
 
-	verified, decodeErr := decodeEvents(result, string(s.id))
+	verified, decodeErr := decodeEvents(result, s.nativeID)
 	if decodeErr != nil {
 		return nil, s.agent.restoreRefused(ctx, s.id, decodeErr)
 	}
@@ -491,15 +492,23 @@ func nativeMessages(rows [][]byte, id string) []opencode.NativeMessage {
 func (s *session) replay(ctx context.Context, rows [][]byte) error {
 	c := &cycle{}
 
-	messages := nativeMessages(rows, string(s.id))
+	messages := nativeMessages(rows, s.nativeID)
 	for index := range messages {
 		message := &messages[index]
 		if message.Info.Role == roleUser {
 			for index := range message.Parts {
 				part := &message.Parts[index]
-				if part.Type == fieldText {
+
+				switch part.Type {
+				case fieldText:
 					if err := s.emit(ctx, acp.UpdateUserMessageText(part.Text)); err != nil {
 						return err
+					}
+				case partFile:
+					for _, block := range s.outputFile(opencode.NativeAttachment{ID: part.ID, Mime: part.Mime, URL: part.URL, Filename: part.Filename}, nil) {
+						if err := s.emit(ctx, acp.UpdateUserMessage(block)); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -521,7 +530,7 @@ func (s *session) requireNativeIdle(ctx context.Context, rt *binding) error {
 		return err
 	}
 
-	if state := statuses[string(s.id)].Type; state != "" && state != statusIdle {
+	if state := statuses[s.nativeID].Type; state != "" && state != statusIdle {
 		return errors.New("native session is still running")
 	}
 

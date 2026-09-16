@@ -15,14 +15,19 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/wire"
 	opencodeacp "github.com/savid/acp-go-opencode"
 	"github.com/stretchr/testify/require"
 )
 
-// TestNativePersistence exercises native creation and import without model calls.
+// TestNativePersistence exercises native creation, import, and delete without
+// model calls.
 func TestNativePersistence(t *testing.T) {
 	if os.Getenv("ACP_GO_OPENCODE_RUN_INTEGRATION") != "1" {
 		t.Skip("set ACP_GO_OPENCODE_RUN_INTEGRATION=1")
+	}
+	if _, err := exec.LookPath("opencode"); err != nil {
+		t.Skip("opencode is not installed on PATH")
 	}
 	store := acpcore.NewInMemorySessionStore()
 	a := opencodeacp.NewAgent(opencodeacp.WithHome(t.TempDir()), opencodeacp.WithSessionStore(store))
@@ -30,7 +35,7 @@ func TestNativePersistence(t *testing.T) {
 	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
 	cwd := t.TempDir()
-	session, err := a.NewSession(t.Context(), opencodeacp.NewSessionRequest(cwd))
+	session, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
 	require.NoError(t, err)
 	require.NotEmpty(t, session.SessionId)
 	require.NoError(t, a.Close())
@@ -38,8 +43,15 @@ func TestNativePersistence(t *testing.T) {
 	t.Cleanup(func() { _ = b.Close() })
 	_, err = b.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
-	_, err = b.LoadSession(t.Context(), opencodeacp.LoadSessionRequest(session.SessionId, cwd))
+	_, err = b.LoadSession(t.Context(), wire.LoadSessionRequest(session.SessionId, cwd))
 	require.NoError(t, err)
+	_, err = b.UnstableDeleteSession(t.Context(), wire.DeleteSessionRequest(session.SessionId))
+	require.NoError(t, err)
+	list, err := b.ListSessions(t.Context(), wire.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, list.Sessions)
+	_, err = b.LoadSession(t.Context(), wire.LoadSessionRequest(session.SessionId, cwd))
+	require.Error(t, err)
 	require.NoError(t, b.Close())
 }
 func TestNativeContinuation(t *testing.T) {
@@ -54,7 +66,7 @@ func TestNativeContinuation(t *testing.T) {
 	}
 	h := newHarness(t, opts...)
 	h.initialize(withLifecycle())
-	session, err := h.conn.NewSession(h.ctx(), opencodeacp.NewSessionRequest(cwd))
+	session, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
 	require.NoError(t, err)
 	response, err := h.prompt(session.SessionId, "Remember the project slug apricot-orbit. Reply with exactly apricot-orbit and nothing else. Do not use tools.", promptMeta(1))
 	require.NoError(t, err)
@@ -63,7 +75,7 @@ func TestNativeContinuation(t *testing.T) {
 	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
 	h.stop()
-	command := exec.CommandContext(h.ctx(), "opencode", "run", "--dir", cwd, "--format", "json", "--session", string(session.SessionId), "Remember the release label cobalt-lantern. Reply with the project slug and release label, and nothing else. Do not use tools.")
+	command := exec.CommandContext(h.ctx(), "opencode", "run", "--dir", cwd, "--format", "json", "--session", nativeSessionID(t, session.Meta), "Remember the release label cobalt-lantern. Reply with the project slug and release label, and nothing else. Do not use tools.")
 	command.Args = append(command.Args, "--model", os.Getenv("ACP_GO_OPENCODE_MODEL"))
 	command.WaitDelay = 2 * time.Second
 	var stderr bytes.Buffer
@@ -76,7 +88,7 @@ func TestNativeContinuation(t *testing.T) {
 	require.Contains(t, string(data), "cobalt-lantern")
 	restored := newHarness(t, opts...)
 	restored.initialize(withLifecycle())
-	_, err = restored.conn.LoadSession(restored.ctx(), opencodeacp.LoadSessionRequest(session.SessionId, cwd))
+	_, err = restored.conn.LoadSession(restored.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
 	require.NoError(t, err)
 	require.Contains(t, agentText(restored.rec.snapshot()), "apricot-orbit")
 	require.Contains(t, agentText(restored.rec.snapshot()), "cobalt-lantern")
@@ -89,7 +101,7 @@ func TestNativeContinuation(t *testing.T) {
 	restored.stop()
 	imported := newHarness(t, opencodeacp.WithHome(nativeHome(t)), opencodeacp.WithSessionStore(store))
 	imported.initialize(withLifecycle())
-	_, err = imported.conn.LoadSession(imported.ctx(), opencodeacp.LoadSessionRequest(session.SessionId, cwd))
+	_, err = imported.conn.LoadSession(imported.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
 	require.NoError(t, err)
 	require.Contains(t, agentText(imported.rec.snapshot()), "cobalt-lantern")
 	_, err = imported.prompt(session.SessionId, "What project slug and release label did we choose? Do not use tools.", promptMeta(3))
@@ -103,6 +115,7 @@ func nativeEnvironment(home string) []string {
 	for key, subdir := range map[string]string{"XDG_DATA_HOME": "data", "XDG_CONFIG_HOME": "config", "XDG_CACHE_HOME": "cache", "XDG_STATE_HOME": "state"} {
 		env = append(env, key+"="+filepath.Join(home, subdir))
 	}
+
 	return env
 }
 func nativeHome(t *testing.T) string {
@@ -115,6 +128,7 @@ func nativeHome(t *testing.T) string {
 	auth, err := os.ReadFile(filepath.Join(original, ".local", "share", "opencode", "auth.json"))
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(data, "auth.json"), auth, 0o600))
+
 	return home
 }
 func TestNativeCallbacksPathAndCancellation(t *testing.T) {
@@ -124,17 +138,18 @@ func TestNativeCallbacksPathAndCancellation(t *testing.T) {
 	home, cwd := nativeHome(t), t.TempDir()
 	directories := []string{t.TempDir(), t.TempDir()}
 	for index, dir := range directories {
-		script := "#!/bin/sh\nprintf '%s\\n' 'marker-" + strconv.Itoa(index) + "' \"$PATH\"\n"
+		script := "#!/bin/sh\nprintf '%s\\n' 'marker-" + strconv.Itoa(index) + "'\nprintf 'ACP_PATH=%s\\n' \"$PATH\"\n"
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "acpgogo-native-probe"), []byte(script), 0700))
 	}
 	h := newHarness(t, opencodeacp.WithHome(home), opencodeacp.WithDefaultModel(os.Getenv("ACP_GO_OPENCODE_MODEL")))
 	var questions atomic.Int32
 	h.rec.elicit = func(acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
 		questions.Add(1)
+
 		return acp.UnstableCreateElicitationResponse{Accept: &acp.UnstableCreateElicitationAccept{Content: map[string]any{"0": "cobalt"}}}, nil
 	}
 	h.initialize(withLifecycle(), withFormElicitation())
-	session, err := h.conn.NewSession(h.ctx(), opencodeacp.NewSessionRequest(cwd, opencodeacp.WithSessionRawEvents(true), opencodeacp.WithSessionOpenCodeOptions(opencodeacp.NewOpenCodeOptions(opencodeacp.WithOpenCodeExtraPathDirs(directories[0])))))
+	session, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd, opencodeacp.WithSessionRawEvents(true), opencodeacp.WithSessionOpenCodeOptions(opencodeacp.NewOpenCodeOptions(opencodeacp.WithOpenCodeExtraPathDirs(directories[0])))))
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(cwd, "remove-me.txt"), []byte("test-only"), 0600))
 	response, err := h.prompt(session.SessionId, "Use the bash tool to run exactly: rm remove-me.txt. Do not use any other tool. Reply DONE when finished.", promptMeta(1))
@@ -155,7 +170,7 @@ func TestNativeCallbacksPathAndCancellation(t *testing.T) {
 		if index > 0 {
 			_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
 			require.NoError(t, err)
-			_, err = h.conn.ResumeSession(h.ctx(), opencodeacp.ResumeSessionRequest(session.SessionId, cwd, opencodeacp.WithSessionRawEvents(true), opencodeacp.WithSessionOpenCodeOptions(opencodeacp.NewOpenCodeOptions(opencodeacp.WithOpenCodeExtraPathDirs(dir)))))
+			_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(session.SessionId, cwd, opencodeacp.WithSessionRawEvents(true), opencodeacp.WithSessionOpenCodeOptions(opencodeacp.NewOpenCodeOptions(opencodeacp.WithOpenCodeExtraPathDirs(dir)))))
 			require.NoError(t, err)
 		}
 		before := len(h.rec.snapshot())
@@ -163,7 +178,7 @@ func TestNativeCallbacksPathAndCancellation(t *testing.T) {
 		require.NoError(t, err)
 		output := toolText(h.rec.snapshot()[before:])
 		require.Contains(t, output, "marker-"+strconv.Itoa(index))
-		require.Contains(t, output, dir+string(os.PathListSeparator))
+		require.Contains(t, output, "ACP_PATH="+dir+string(os.PathListSeparator))
 		if index > 0 {
 			require.NotContains(t, output, directories[0])
 		}
@@ -175,7 +190,11 @@ func TestNativeCallbacksPathAndCancellation(t *testing.T) {
 		done <- response
 		failed <- promptErr
 	}()
-	require.Eventually(t, func() bool { _, statErr := os.Stat(filepath.Join(cwd, "sleep-started")); return statErr == nil }, 45*time.Second, 25*time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(filepath.Join(cwd, "sleep-started"))
+
+		return statErr == nil
+	}, 45*time.Second, 25*time.Millisecond)
 	require.NoError(t, h.conn.Cancel(h.ctx(), acp.CancelNotification{SessionId: session.SessionId}))
 	require.NoError(t, <-failed)
 	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
@@ -197,5 +216,17 @@ func toolText(updates []acp.SessionNotification) string {
 			}
 		}
 	}
+
 	return text.String()
+}
+
+func nativeSessionID(t *testing.T, meta map[string]any) string {
+	t.Helper()
+	binding, ok := meta["opencode"].(map[string]any)
+	require.True(t, ok)
+	id, ok := binding["nativeSessionId"].(string)
+	require.True(t, ok)
+	require.NotEmpty(t, id)
+
+	return id
 }

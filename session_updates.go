@@ -6,24 +6,23 @@ import (
 	"errors"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	acp "github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const (
-	statusComplete       = "complete"
-	statusInterrupted    = "interrupted"
-	fieldCwd             = "cwd"
-	nativeSessionIDKey   = "session_id"
-	fieldValue           = "value"
-	fieldType            = "type"
-	fieldText            = "text"
-	roleUser             = "user"
-	roleAssistant        = "assistant"
-	sessionTitleMaxRunes = 256
+	statusComplete     = "complete"
+	statusInterrupted  = "interrupted"
+	fieldCwd           = "cwd"
+	nativeSessionIDKey = "session_id"
+	fieldValue         = "value"
+	fieldType          = "type"
+	fieldText          = "text"
+	roleUser           = "user"
+	roleAssistant      = "assistant"
 )
 
 const (
@@ -81,14 +80,6 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		return
 	}
 
-	if s.nativeMessages == nil {
-		s.nativeMessages = map[string]opencode.NativeMessageInfo{}
-	}
-
-	if s.completedParents == nil {
-		s.completedParents = map[string]bool{}
-	}
-
 	info, valid := s.eventInfo(event, props)
 	if !valid {
 		rt.cancel()
@@ -103,7 +94,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		return
 	}
 
-	if info.ID != "" && (s.completedParents[info.ID] || s.completedParents[info.ParentID]) {
+	if info.ID != "" && s.parentCompleted(info.ID, info.ParentID) {
 		return
 	}
 
@@ -120,10 +111,8 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 
 		c = &t.cycle
 	} else if c == nil && info.ID != "" {
-		c = &cycle{origin: lifecycle.CauseActivity, done: make(chan struct{})}
-		if err := s.lcOpenAgentCycle(ctx, c); err != nil {
-			c.failure = err
-		}
+		c = &cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseActivity}, done: make(chan struct{})}
+		s.recordFailure(c, s.lc.OpenAgentCycle(ctx, &c.Cycle))
 
 		s.mu.Lock()
 		s.cycle = c
@@ -134,14 +123,10 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		return
 	}
 
-	err := s.projectEvent(ctx, rt, c, event, props, info)
-
-	if err != nil && c.failure == nil {
-		c.failure = err
-	}
+	s.recordFailure(c, s.projectEvent(ctx, rt, c, event, props, info))
 
 	if t == nil && (event.Type == "session.idle" || (event.Type == "session.status" && props.Status.Type == statusIdle)) {
-		s.settleAgentCycle(ctx, c)
+		s.settleAgentCycle(ctx, rt, c)
 	}
 }
 func nativeErrorText(native *opencode.NativeError) string {
@@ -400,7 +385,7 @@ func (s *session) emitSessionInfo(ctx context.Context, prompt []acp.ContentBlock
 	s.updatedAt = updatedAt
 
 	if s.title == "" {
-		if title := promptTitle(prompt); title != "" {
+		if title := wire.PromptTitle(prompt); title != "" {
 			s.title = title
 			update.Title = &title
 		}
@@ -408,31 +393,6 @@ func (s *session) emitSessionInfo(ctx context.Context, prompt []acp.ContentBlock
 	s.mu.Unlock()
 
 	_ = s.emit(ctx, acp.SessionUpdate{SessionInfoUpdate: &update})
-}
-
-func promptTitle(prompt []acp.ContentBlock) string {
-	for _, block := range prompt {
-		if block.Text == nil {
-			continue
-		}
-
-		if title := normalizeTitle(block.Text.Text); title != "" {
-			return title
-		}
-	}
-
-	return ""
-}
-
-func normalizeTitle(text string) string {
-	title := strings.Join(strings.Fields(text), " ")
-	if utf8.RuneCountInString(title) <= sessionTitleMaxRunes {
-		return title
-	}
-
-	runes := []rune(title)
-
-	return strings.TrimSpace(string(runes[:sessionTitleMaxRunes-3])) + "..."
 }
 
 func (s *session) sessionInfo() acp.SessionInfo {
@@ -446,6 +406,7 @@ func (s *session) sessionInfo() acp.SessionInfo {
 	}
 
 	info := acp.SessionInfo{
+		Meta:                  wire.NativeSessionMeta(vendor, s.nativeID),
 		SessionId:             s.id,
 		Title:                 &title,
 		Cwd:                   s.cwd,
@@ -476,25 +437,25 @@ func (s *session) eventInfo(event opencode.Event, props eventProperties) (openco
 	switch event.Type {
 	case "message.updated":
 		info = props.Info
-		s.nativeMessages[info.ID] = info
+		s.rememberMessage(info)
 	case "message.part.updated":
-		info = s.nativeMessages[props.Part.MessageID]
+		info = s.nativeMessage(props.Part.MessageID)
 	case "message.part.delta":
-		info = s.nativeMessages[props.MessageID]
+		info = s.nativeMessage(props.MessageID)
 	case eventPermissionAsked:
 		var request opencode.PermissionRequest
 		if json.Unmarshal(event.Properties, &request) != nil {
 			return opencode.NativeMessageInfo{}, false
 		}
 
-		info = s.nativeMessages[request.Tool.MessageID]
+		info = s.nativeMessage(request.Tool.MessageID)
 	case eventQuestionAsked:
 		var request opencode.QuestionRequest
 		if json.Unmarshal(event.Properties, &request) != nil {
 			return opencode.NativeMessageInfo{}, false
 		}
 
-		info = s.nativeMessages[request.Tool.MessageID]
+		info = s.nativeMessage(request.Tool.MessageID)
 	}
 
 	return info, true
@@ -531,7 +492,7 @@ func (s *session) projectEvent(ctx context.Context, rt *binding, c *cycle, event
 	return err
 }
 
-func (s *session) settleAgentCycle(ctx context.Context, c *cycle) {
+func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()
 
@@ -544,19 +505,25 @@ func (s *session) settleAgentCycle(ctx context.Context, c *cycle) {
 
 	s.emitUsage(settleCtx, &c.state)
 
-	if err := s.commitMirror(settleCtx); err != nil {
-		c.failure = s.mirrorFailure(err)
+	if err := s.commitMirror(settleCtx, rt); err != nil {
+		s.recordFailure(c, s.mirrorFailure(err))
+		s.lc.Fence()
+		// A fenced incarnation is terminal, so the binding ends with it and the
+		// next operation relaunches and opens a new one. This runs on the
+		// binding's own pump, which joins itself, so the cancel is the drop.
+		rt.cancel()
 	}
 
-	_ = s.lcIdle(settleCtx, c, judgeCycle(c, false))
+	verdict := judgeCycle(c, s.cycleFailure(c), false)
+	_ = s.lc.Idle(settleCtx, c.Cycle, verdict.stopReason, verdict.outcome)
 	close(c.done)
 
 	for id := range c.state.messages {
 		m := c.state.messages[id]
 		if m.Role == roleUser {
-			s.completedParents[id] = true
+			s.completeParent(id)
 		} else {
-			s.completedParents[m.ParentID] = true
+			s.completeParent(m.ParentID)
 		}
 	}
 

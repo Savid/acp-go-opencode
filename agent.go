@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"maps"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -29,9 +28,9 @@ const (
 	// RawEventMethod is the notification carrying one raw opencode event when a
 	// session opted in through _meta.opencode.rawEvent.enabled.
 	RawEventMethod = "_opencode/rawEvent"
-	// SessionStoreFormat identifies the store layout this package writes: native
-	// per-conversation JSON exports under main plus the adapter's session
-	// record under the config subpath.
+	// SessionStoreFormat identifies the store layout this package writes: the
+	// native sync-event graph under main plus the adapter's session record
+	// under the config subpath.
 	SessionStoreFormat = "opencode-sync-events-v1"
 
 	vendor = "opencode"
@@ -62,7 +61,6 @@ type Agent struct {
 	transport          *wire.Transport
 	closed             bool
 	clientCapabilities acp.ClientCapabilities
-	positionEncoding   acp.PositionEncodingKind
 	// lifecycle is the answer this connection gave at initialize. An absent
 	// answer leaves the extension dormant for every session on it.
 	lifecycle    lifecycle.Negotiated
@@ -72,11 +70,9 @@ type Agent struct {
 	clientCalls  chan struct{}
 	incarnations uint64
 
-	runtimeMu   sync.Mutex
-	runtime     *runtime
-	versionOnce sync.Once
-	versionErr  error
-	executable  string
+	runtimeMu  sync.Mutex
+	runtime    *runtime
+	executable process.Executable
 }
 
 var (
@@ -87,7 +83,7 @@ var (
 
 // NewAgent creates an ACP agent for the opencode coding agent CLI. Construction
 // never fails; a refused option is reported by Initialize and every
-// session-establishing method as pi_invalid_options.
+// session-establishing method as opencode_invalid_options.
 func NewAgent(opts ...Option) *Agent {
 	options := applyOptions(opts)
 
@@ -111,12 +107,11 @@ func NewAgent(opts ...Option) *Agent {
 			TracerProvider: options.TracerProvider,
 			Version:        options.AgentVersion,
 		}),
-		processEnv:       os.Environ(),
-		store:            store,
-		sessions:         make(map[acp.SessionId]*session),
-		deleted:          make(map[acp.SessionId]struct{}),
-		clientCalls:      make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
-		positionEncoding: acp.PositionEncodingKindUtf16,
+		processEnv:  os.Environ(),
+		store:       store,
+		sessions:    make(map[acp.SessionId]*session),
+		deleted:     make(map[acp.SessionId]struct{}),
+		clientCalls: make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
 	}
 	agent.optionErr = agent.validateOptions()
 
@@ -132,8 +127,8 @@ func (a *Agent) validateOptions() *acp.RequestError {
 		field string
 		err   error
 	}{
-		{"home", validateOptionalAbsolute(options.Home)},
-		{"inputHandoffRoot", validateHandoffRoot(options.InputHandoffRoot)},
+		{"home", process.ValidateOptionalAbsolutePath(options.Home)},
+		{"inputHandoffRoot", image.ValidateHandoffRoot(options.InputHandoffRoot)},
 		{"defaultModel", validateOptionalModel(options.DefaultModel)},
 		{"configuredModels", validateConfiguredModels(options.ConfiguredModels)},
 		{metaEnvKey, process.ValidateNames(options.Env)},
@@ -152,22 +147,6 @@ func (a *Agent) validateOptions() *acp.RequestError {
 	}
 
 	return nil
-}
-
-func validateOptionalAbsolute(path string) error {
-	if path == "" || filepath.IsAbs(path) {
-		return nil
-	}
-
-	return errors.New("path must be absolute")
-}
-
-func validateHandoffRoot(root string) error {
-	if root == "" {
-		return nil
-	}
-
-	return image.ValidateHandoffRoot(root)
 }
 
 func validateOptionalModel(model string) error {
@@ -222,6 +201,8 @@ func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Optio
 	}()
 
 	transport := wire.NewTransport(input, output)
+	defer transport.Close()
+
 	conn := acp.NewAgentSideConnection(agent, transport.Writer(), transport.Reader())
 	conn.SetLogger(agent.log)
 	agent.attach(conn, transport)
@@ -294,15 +275,10 @@ func (a *Agent) ensureOpen() error {
 	defer a.mu.Unlock()
 
 	if a.closed {
-		return errAgentClosed()
+		return wire.AgentClosed()
 	}
 
 	return nil
-}
-
-// errAgentClosed answers every request after Close.
-func errAgentClosed() *acp.RequestError {
-	return acp.NewInvalidRequest(map[string]any{wire.FieldError: "agent closed"})
 }
 
 // Initialize implements ACP initialize.
@@ -319,21 +295,20 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 		meta = lifecycle.RetainRequestMetadata(meta, t.TakeRaw(acp.AgentMethodInitialize))
 	}
 
-	offer, present, paramErr := lifecycle.DecodeOffer(meta)
+	present, paramErr := lifecycle.DecodeOffer(meta)
 	if paramErr != nil {
-		return acp.InitializeResponse{}, invalidParam(paramErr)
+		return acp.InitializeResponse{}, wire.ParamRefusal(paramErr)
 	}
 
 	var negotiated lifecycle.Negotiated
 	if present {
-		negotiated = offer.Answer(lifecycle.Negotiated{UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}})
+		negotiated = lifecycle.Answer(lifecycle.Negotiated{UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}})
 	}
 
-	encoding := selectPositionEncoding(params.ClientCapabilities.PositionEncodings)
+	encoding := wire.SelectPositionEncoding(params.ClientCapabilities.PositionEncodings)
 
 	a.mu.Lock()
 	a.clientCapabilities = params.ClientCapabilities
-	a.positionEncoding = encoding
 	a.lifecycle = negotiated
 	a.mu.Unlock()
 
@@ -388,19 +363,11 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	}, nil
 }
 
-func selectPositionEncoding(encodings []acp.PositionEncodingKind) acp.PositionEncodingKind {
-	if slices.Contains(encodings, acp.PositionEncodingKindUtf8) {
-		return acp.PositionEncodingKindUtf8
-	}
-
-	return acp.PositionEncodingKindUtf16
-}
-
 // Authenticate exists because the SDK interface requires it. The harness
 // authenticates itself in its own home, outside ACP.
 func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
 	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
-		return acp.AuthenticateResponse{}, invalidParam(refusal)
+		return acp.AuthenticateResponse{}, wire.ParamRefusal(refusal)
 	}
 
 	return acp.AuthenticateResponse{}, acp.NewInvalidParams(map[string]any{"methodId": params.MethodId})
@@ -409,7 +376,7 @@ func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) 
 // Logout exists because the SDK interface requires it.
 func (a *Agent) Logout(_ context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
 	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
-		return acp.LogoutResponse{}, invalidParam(refusal)
+		return acp.LogoutResponse{}, wire.ParamRefusal(refusal)
 	}
 
 	return acp.LogoutResponse{}, acp.NewMethodNotFound(acp.AgentMethodLogout)
@@ -419,7 +386,7 @@ func (a *Agent) Logout(_ context.Context, params acp.LogoutRequest) (acp.LogoutR
 // are config options, never ACP session modes.
 func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
-		return acp.SetSessionModeResponse{}, invalidParam(refusal)
+		return acp.SetSessionModeResponse{}, wire.ParamRefusal(refusal)
 	}
 
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
@@ -434,7 +401,7 @@ func (a *Agent) HandleExtensionMethod(_ context.Context, method string, params j
 
 	if err := json.Unmarshal(params, &envelope); err == nil {
 		if refusal := lifecycle.RejectKey(envelope.Meta); refusal != nil {
-			return nil, invalidParam(refusal)
+			return nil, wire.ParamRefusal(refusal)
 		}
 	}
 
@@ -484,62 +451,17 @@ func (a *Agent) acquireClientCall() (func(), error) {
 	}
 }
 
-// invalidParam renders a lifecycle negotiation refusal as the uniform
-// invalid-params verdict.
-func invalidParam(err *lifecycle.ParamError) *acp.RequestError {
-	if err.Verdict == lifecycle.VerdictMissing {
-		return wire.Missing(err.Field)
-	}
-
-	return wire.Unsupported(err.Field)
-}
-
 // ensureExecutable resolves the opencode executable against the base environment
-// and probes its version once per agent.
+// and caches its completed version verdict through core.
 func (a *Agent) ensureExecutable(ctx context.Context) (string, error) {
-	a.versionOnce.Do(func() {
-		base, err := a.environment(nil, nil).Base()
-		if err != nil {
-			a.versionErr = err
-
-			return
-		}
-
-		selector := a.options.ExecutablePath
-		if selector == "" {
-			selector = vendor
-		}
-
-		executable, err := process.ResolveExecutable(selector, base)
-		if err != nil {
-			a.versionErr = err
-
-			return
-		}
-
-		version, err := opencode.ProbeVersion(ctx, executable, base)
-		if err != nil {
-			a.versionErr = err
-
-			return
-		}
-
-		if err := opencode.CheckMinimumVersion(version, opencode.MinimumVersion); err != nil {
-			a.versionErr = err
-
-			return
-		}
-
-		a.executable = executable
-	})
-
-	if a.versionErr != nil {
-		a.log.ErrorContext(ctx, "opencode version probe failed", slog.String("reason", a.versionErr.Error()))
+	executable, err := a.executable.Resolve(ctx, a.environment(nil, nil), a.options.ExecutablePath, vendor, opencode.MinimumVersion, opencode.ProbeVersion)
+	if err != nil {
+		a.log.ErrorContext(ctx, "opencode version probe failed", slog.String("reason", err.Error()))
 
 		return "", wire.InternalFailure(vendor, internalClassNativeStart)
 	}
 
-	return a.executable, nil
+	return executable, nil
 }
 
 // environment builds the merge for one launch: the inherited process

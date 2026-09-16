@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,11 +16,8 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
-const nativeSyncReplayPath = "/sync/replay"
-const nativeSyncHistoryPath = "/sync/history"
 const sessionShutdownTimeout = 10 * time.Second
 const sessionShutdownGrace = 2 * time.Second
-const stderrTailBytes = 8 << 10
 
 // runtime owns one shared server, SSE stream, and native home lock.
 type runtime struct {
@@ -30,7 +26,6 @@ type runtime struct {
 	stream    *opencode.Stream
 	root      string
 	lock      *process.FileLock
-	stderr    *stderrTail
 	cancel    context.CancelFunc
 	done      chan struct{}
 	closeOnce sync.Once
@@ -38,30 +33,6 @@ type runtime struct {
 	bindings  map[string]*binding
 }
 
-type stderrTail struct {
-	mu   sync.Mutex
-	data []byte
-}
-
-func (t *stderrTail) Write(p []byte) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.data = append(t.data, p...)
-	if len(t.data) > stderrTailBytes {
-		t.data = t.data[len(t.data)-stderrTailBytes:]
-	}
-
-	return len(p), nil
-}
-func (t *stderrTail) lastLine() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	lines := strings.Split(strings.TrimSpace(string(t.data)), "\n")
-
-	return strings.TrimSpace(lines[len(lines)-1])
-}
 func (rt *runtime) alive() bool {
 	select {
 	case <-rt.done:
@@ -93,6 +64,10 @@ func (a *Agent) ensureRuntime(ctx context.Context) (*runtime, error) {
 	if err != nil {
 		a.log.ErrorContext(ctx, "opencode server startup failed", slog.String("reason", err.Error()))
 
+		if refusal := wire.SeedFileRefusal(err); refusal != nil {
+			return nil, refusal
+		}
+
 		if a.runtime != nil {
 			return nil, wire.RuntimeUnavailable(vendor)
 		}
@@ -115,14 +90,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	parent := a.options.ScratchDir
-	if parent != "" {
-		if mkdirErr := os.MkdirAll(parent, 0o700); mkdirErr != nil {
-			return nil, mkdirErr
-		}
-	}
-
-	root, err := os.MkdirTemp(parent, "acp-go-opencode-")
+	root, err := a.scratchDir("plugin")
 	if err != nil {
 		return nil, err
 	}
@@ -142,23 +110,6 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 	}
 
 	lookup := func(key string) (string, bool) { return process.Lookup(base, key) }
-	if seedErr := process.WriteSeedFiles(opencode.ConfigDir(lookup), a.options.SeedFiles); seedErr != nil {
-		return nil, seedErr
-	}
-
-	config, _ := lookup("OPENCODE_CONFIG_CONTENT")
-
-	config, err = opencode.WritePlugin(root, config, a.options.Home != "")
-	if err != nil {
-		return nil, err
-	}
-
-	owned := map[string]string{"OPENCODE_SERVER_USERNAME": vendor, "OPENCODE_SERVER_PASSWORD": client.Password, "OPENCODE_CONFIG_CONTENT": config, "OPENCODE_ENABLE_QUESTION_TOOL": "1"}
-
-	env, err := a.environment(nil, owned).Build()
-	if err != nil {
-		return nil, err
-	}
 
 	lock, err := process.LockFile(filepath.Join(opencode.DataDir(lookup), ".acp-go-opencode.lock"))
 	if err != nil {
@@ -171,18 +122,40 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		}
 	}()
 
+	if seedErr := process.WriteSeedFiles(opencode.ConfigDir(lookup), a.options.SeedFiles); seedErr != nil {
+		return nil, seedErr
+	}
+
+	config, _ := lookup("OPENCODE_CONFIG_CONTENT")
+
+	config, err = opencode.WritePlugin(root, config, a.options.Home != "")
+	if err != nil {
+		return nil, err
+	}
+
+	owned := map[string]string{"OPENCODE_SERVER_USERNAME": opencode.ServerUsername, "OPENCODE_SERVER_PASSWORD": client.Password, "OPENCODE_CONFIG_CONTENT": config, "OPENCODE_ENABLE_QUESTION_TOOL": "1"}
+
+	env, err := a.environment(nil, owned).Build()
+	if err != nil {
+		return nil, err
+	}
+
 	proc, err := process.Start(ctx, process.Request{Executable: executable, Args: client.Args(), Env: env})
 	if err != nil {
 		return nil, err
 	}
 
-	tail := &stderrTail{}
-	go func() { _, _ = io.Copy(tail, proc.Stderr()) }()
 	go func() { _, _ = io.Copy(io.Discard, proc.Stdout()) }()
 
 	defer func() {
 		if !transferred {
-			_ = proc.Kill()
+			// The lock defer registered above runs after this one, so the
+			// child is reaped before the native home lock is released: two
+			// servers must never hold one native data directory.
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
+			defer shutdownCancel()
+
+			_ = proc.Shutdown(shutdownCtx, sessionShutdownGrace)
 			_ = proc.Close()
 		}
 	}()
@@ -195,14 +168,20 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 
 	for {
 		var health struct {
-			Healthy bool   `json:"healthy"`
-			Version string `json:"version"`
+			Healthy bool `json:"healthy"`
 		}
 		if healthErr := client.Do(readyCtx, "", http.MethodGet, "/global/health", nil, &health); healthErr == nil && health.Healthy {
 			break
 		}
 
 		select {
+		case <-proc.Done():
+			message := "opencode server exited before it was ready"
+			if line := proc.StderrLastLine(); line != "" {
+				message += ": " + line
+			}
+
+			return nil, errors.New(message)
 		case <-readyCtx.Done():
 			return nil, readyCtx.Err()
 		case <-ticker.C:
@@ -210,19 +189,12 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 	}
 
 	var doc struct {
-		Paths      map[string]any `json:"paths"`
 		Components struct {
 			Schemas map[string]any `json:"schemas"`
 		} `json:"components"`
 	}
 	if docErr := client.Do(readyCtx, "", http.MethodGet, "/doc", nil, &doc); docErr != nil {
 		return nil, docErr
-	}
-
-	for _, path := range []string{nativeSyncHistoryPath, nativeSyncReplayPath, nativeCommandPath, "/session/{sessionID}/message", "/session/{sessionID}/command", "/permission/{requestID}/reply", "/question/{requestID}/reply"} {
-		if doc.Paths[path] == nil {
-			return nil, errors.New("required native route missing: " + path)
-		}
 	}
 
 	if doc.Components.Schemas["OutputFormatJsonSchema"] == nil {
@@ -238,7 +210,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	rt := &runtime{proc: proc, client: client, stream: stream, root: root, lock: lock, stderr: tail, cancel: runtimeCancel, done: make(chan struct{}), bindings: map[string]*binding{}}
+	rt := &runtime{proc: proc, client: client, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), bindings: map[string]*binding{}}
 	transferred = true
 
 	go rt.pump(runtimeCtx)

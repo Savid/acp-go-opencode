@@ -21,6 +21,15 @@ import (
 const fakeOpenCodeEnv = "ACP_GO_OPENCODE_TEST_FAKE"
 const fakeOpenCodeEnvVersion = "ACP_GO_OPENCODE_TEST_VERSION"
 
+// fakeOpenCodeEnvResumeHold names a file the fake creates when a session
+// lookup arrives that it will not answer, so a test can act while the adapter
+// is still relaunching.
+const fakeOpenCodeEnvResumeHold = "ACP_GO_OPENCODE_TEST_RESUME_HOLD"
+
+// fakeOpenCodeResumeHold is how long a held lookup refuses to answer. It
+// outlasts the shutdown the adapter sends when it gives up on the relaunch.
+const fakeOpenCodeResumeHold = 30 * time.Second
+
 type fakeOpenCode struct {
 	mu          sync.Mutex
 	rows        []opencode.SyncEvent
@@ -113,13 +122,30 @@ func (f *fakeOpenCode) messages(id string) []opencode.NativeMessage {
 
 	return nativeMessages(rows, id)
 }
+
+// noiseIfAsked writes one non-JSON line to stdout and one to stderr for the
+// NOISE prompt.
+func noiseIfAsked(text string) {
+	if text == "NOISE" {
+		fmt.Fprintln(os.Stderr, "chatter on stderr")
+		fmt.Println("not a json record at all")
+	}
+}
+
+// isSessionLookup reports whether path reads one session record rather than
+// the status collection.
+func isSessionLookup(path string) bool {
+	pieces := strings.Split(strings.Trim(path, "/"), "/")
+
+	return strings.HasPrefix(path, "/session/") && len(pieces) == 2 && pieces[1] != "status"
+}
 func fakeWrite(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
 }
 func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	username, password, ok := r.BasicAuth()
-	if !ok || username != "opencode" || password != os.Getenv("OPENCODE_SERVER_PASSWORD") {
+	if !ok || username != opencode.ServerUsername || password != os.Getenv("OPENCODE_SERVER_PASSWORD") {
 		w.WriteHeader(http.StatusUnauthorized)
 
 		return
@@ -134,6 +160,15 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+	if hold := os.Getenv(fakeOpenCodeEnvResumeHold); hold != "" && r.Method == http.MethodGet && isSessionLookup(r.URL.Path) {
+		_ = os.WriteFile(hold, []byte("held\n"), 0o600)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(fakeOpenCodeResumeHold):
+		}
+
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	path := r.URL.Path
@@ -143,11 +178,7 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		return
 	case "/doc":
-		paths := map[string]any{}
-		for _, p := range []string{"/sync/history", "/sync/replay", "/command", "/session/{sessionID}/message", "/session/{sessionID}/command", "/permission/{requestID}/reply", "/question/{requestID}/reply"} {
-			paths[p] = map[string]any{}
-		}
-		fakeWrite(w, map[string]any{"paths": paths, "components": map[string]any{"schemas": map[string]any{"OutputFormatJsonSchema": map[string]any{}}}})
+		fakeWrite(w, map[string]any{"components": map[string]any{"schemas": map[string]any{"OutputFormatJsonSchema": map[string]any{}}}})
 
 		return
 	case "/config/providers":
@@ -159,7 +190,14 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		return
 	case "/command":
-		fakeWrite(w, []map[string]string{{"name": "inspect", "description": "Inspect workspace"}})
+		fakeWrite(w, []map[string]string{
+			{"name": "inspect", "description": "Inspect workspace"},
+			{"name": "", "description": "Empty"},
+			{"name": "group/nested", "description": "Slashed"},
+			{"name": "nb\u00a0sp", "description": "Unicode space"},
+			{"name": "zero\u200bwidth", "description": "Format rune"},
+			{"name": "bell\a", "description": "Control rune"},
+		})
 
 		return
 	case "/session/status":
@@ -234,7 +272,15 @@ func (f *fakeOpenCode) events(w http.ResponseWriter, r *http.Request) {
 func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 	id := strings.Split(strings.Trim(r.URL.Path, "/"), "/")[1]
 	var request opencode.MessageRequest
-	if json.NewDecoder(r.Body).Decode(&request) != nil {
+	var command opencode.CommandRequest
+	if strings.HasSuffix(r.URL.Path, "/command") {
+		if json.NewDecoder(r.Body).Decode(&command) != nil {
+			w.WriteHeader(400)
+
+			return
+		}
+		request = opencode.MessageRequest{MessageID: command.MessageID, Agent: command.Agent, Variant: command.Variant, Parts: command.Parts}
+	} else if json.NewDecoder(r.Body).Decode(&request) != nil {
 		w.WriteHeader(400)
 
 		return
@@ -265,7 +311,14 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 	}
 	user := opencode.NativeMessageInfo{ID: request.MessageID, SessionID: id, Role: roleUser}
 	f.append(id, "message.updated", map[string]any{"info": user})
-	f.append(id, "message.part.updated", map[string]any{"part": opencode.NativePart{ID: opencode.NewID("prt_"), MessageID: user.ID, SessionID: id, Type: "text", Text: text.String()}, "time": time.Now().UnixMilli()})
+	for _, part := range request.Parts {
+		native := opencode.NativePart{ID: opencode.NewID("prt_"), MessageID: user.ID, SessionID: id}
+		native.Type, _ = part["type"].(string)
+		native.Text, _ = part["text"].(string)
+		native.Mime, _ = part["mime"].(string)
+		native.URL, _ = part["url"].(string)
+		f.append(id, "message.part.updated", map[string]any{"part": native, "time": time.Now().UnixMilli()})
+	}
 	info := opencode.NativeMessageInfo{ID: opencode.NewMessageID(), ParentID: user.ID, SessionID: id, Role: roleAssistant, ModelID: session.Model.ID, ProviderID: session.Model.ProviderID}
 	if request.Model != nil {
 		info.ModelID = request.Model.ModelID
@@ -282,6 +335,7 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(30 * time.Second):
 		}
 	}
+	noiseIfAsked(text.String())
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.pending, id)
@@ -313,6 +367,19 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 		f.append(id, "message.part.updated", map[string]any{"part": part, "time": time.Now().UnixMilli()})
 	}
 	output := "hello " + text.String()
+	if command.Command != "" {
+		output = "command:" + command.Command + " args:" + command.Arguments
+	}
+	if text.String() == "AGENT" {
+		output = "agent:" + request.Agent + " variant:" + request.Variant
+	}
+	if text.String() == "STREAM" {
+		part := opencode.NativePart{ID: opencode.NewID("prt_"), SessionID: id, MessageID: info.ID, Type: "text"}
+		f.publish("message.part.delta", map[string]any{"sessionID": id, "messageID": info.ID, "partID": part.ID, "field": "text", "delta": "abc"})
+		part.Text = "abcdef"
+		f.append(id, "message.part.updated", map[string]any{"part": part, "time": time.Now().UnixMilli()})
+		output = ""
+	}
 	if text.String() == "ENV" {
 		carrier, _ := session.Metadata[opencode.CarrierKey].(map[string]any)
 		data, _ := json.Marshal(carrier)
@@ -339,6 +406,12 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 		f.append(id, "message.part.updated", map[string]any{"part": opencode.NativePart{ID: opencode.NewID("prt_"), SessionID: id, MessageID: info.ID, Type: "file", Mime: "image/png", URL: path}, "time": time.Now().UnixMilli()})
 	}
 	f.append(id, "message.updated", map[string]any{"info": info})
+	if text.String() == "FORGET" {
+		// The native store lost this session's history, so the turn's mirror
+		// commit has no complete snapshot to replace with.
+		f.rows = nil
+		f.save()
+	}
 	f.publish("session.status", map[string]any{"sessionID": id, "status": map[string]string{"type": "idle"}})
 	fakeWrite(w, opencode.NativeMessage{Info: info, Parts: []opencode.NativePart{part}})
 }

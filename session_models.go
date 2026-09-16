@@ -16,7 +16,9 @@ const configModel acp.SessionConfigId = "model"
 const configMode acp.SessionConfigId = "mode"
 const configEffort acp.SessionConfigId = "effort"
 
-func (s *session) refreshModels(ctx context.Context, rt *binding) error {
+// refreshCatalogs fetches the model, agent, and command catalogs this session
+// advertises.
+func (s *session) refreshCatalogs(ctx context.Context, rt *binding) error {
 	var models opencode.Catalog
 	if err := rt.client.Do(ctx, s.cwd, http.MethodGet, "/config/providers", nil, &models); err != nil {
 		return err
@@ -191,7 +193,8 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 		return nil, wire.Backpressure(limitSessionPrompt)
 	}
 
-	if _, err := s.ensureRuntime(ctx); err != nil {
+	rt, err := s.ensureRuntime(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -206,7 +209,7 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 	}
 	s.mu.Unlock()
 
-	if err := s.commitMirror(ctx); err != nil {
+	if err := s.commitMirror(ctx, rt); err != nil {
 		return nil, wire.InternalFailure(vendor, "")
 	}
 
@@ -221,7 +224,7 @@ func (s *session) emitCommands(ctx context.Context) error {
 
 	seen := map[string]bool{}
 	for _, c := range native {
-		if c.Name == "" || strings.ContainsAny(c.Name, " \t\r\n/") || seen[c.Name] {
+		if !wire.ValidCommandName(c.Name) || seen[c.Name] {
 			continue
 		}
 

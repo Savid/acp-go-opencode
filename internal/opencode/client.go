@@ -20,6 +20,10 @@ import (
 const MaxBodyBytes = 64 << 20
 const EventCapacity = 256
 
+// ServerUsername is the basic-auth user the adapter configures the native
+// server with and sends on every request.
+const ServerUsername = "opencode"
+
 // Client is an authenticated native HTTP endpoint shared by every session.
 type Client struct {
 	URL      string
@@ -86,7 +90,7 @@ func (c *Client) request(ctx context.Context, directory, method, path string, bo
 		return nil, err
 	}
 
-	request.SetBasicAuth("opencode", c.Password)
+	request.SetBasicAuth(ServerUsername, c.Password)
 	request.Header.Set("Content-Type", "application/json")
 
 	response, err := c.http.Do(request)

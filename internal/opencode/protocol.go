@@ -32,10 +32,7 @@ type NativeMessageInfo struct {
 	ParentID   string          `json:"parentID"`
 	ModelID    string          `json:"modelID"`
 	ProviderID string          `json:"providerID"`
-	Mode       string          `json:"mode"`
-	Agent      string          `json:"agent"`
 	Finish     string          `json:"finish"`
-	Cost       float64         `json:"cost"`
 	Tokens     NativeTokens    `json:"tokens"`
 	Structured json.RawMessage `json:"structured,omitempty"`
 	Error      *NativeError    `json:"error,omitempty"`
@@ -50,9 +47,7 @@ type NativeError struct {
 	Name    string `json:"name"`
 	Message string `json:"message"`
 	Data    struct {
-		Message      string `json:"message"`
-		StatusCode   int    `json:"statusCode"`
-		ResponseBody string `json:"responseBody"`
+		Message string `json:"message"`
 	} `json:"data"`
 }
 
@@ -65,12 +60,9 @@ type NativePart struct {
 	CallID    string          `json:"callID"`
 	Tool      string          `json:"tool"`
 	State     json.RawMessage `json:"state"`
-	Reason    string          `json:"reason"`
 	Mime      string          `json:"mime"`
 	Filename  string          `json:"filename"`
 	URL       string          `json:"url"`
-	Cost      float64         `json:"cost"`
-	Tokens    NativeTokens    `json:"tokens"`
 	Raw       json.RawMessage `json:"-"`
 }
 
@@ -100,7 +92,6 @@ func (p *NativePart) UnmarshalJSON(data []byte) error {
 }
 
 type NativeTokens struct {
-	Total     float64 `json:"total"`
 	Input     float64 `json:"input"`
 	Output    float64 `json:"output"`
 	Reasoning float64 `json:"reasoning"`
@@ -111,7 +102,6 @@ type NativeTokens struct {
 }
 
 type NativeTodo struct {
-	ID       string `json:"id"`
 	Content  string `json:"content"`
 	Status   string `json:"status"`
 	Priority string `json:"priority"`
@@ -122,18 +112,13 @@ type NativeSessionStatus struct {
 }
 
 type NativeAgent struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Mode        string `json:"mode"`
+	Name string `json:"name"`
+	Mode string `json:"mode"`
 }
 
 type NativeCommand struct {
 	Name        string   `json:"name"`
 	Description string   `json:"description,omitempty"`
-	Agent       string   `json:"agent,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Source      string   `json:"source,omitempty"`
-	Subtask     bool     `json:"subtask,omitempty"`
 	Hints       []string `json:"hints"`
 }
 
@@ -165,15 +150,13 @@ type PermissionTool struct {
 
 type QuestionInfo struct {
 	Question string           `json:"question"`
-	Header   string           `json:"header"`
 	Options  []QuestionOption `json:"options"`
 	Multiple bool             `json:"multiple"`
 	Custom   *bool            `json:"custom,omitempty"`
 }
 
 type QuestionOption struct {
-	Label       string `json:"label"`
-	Description string `json:"description"`
+	Label string `json:"label"`
 }
 
 type QuestionTool struct {
@@ -223,7 +206,6 @@ type ProviderModel struct {
 	Name         string                     `json:"name"`
 	Limit        map[string]any             `json:"limit"`
 	Capabilities *ProviderModelCapabilities `json:"capabilities"`
-	Options      map[string]any             `json:"options"`
 	// Variants are the model's named request presets, keyed by the name a
 	// prompt selects one with. On a reasoning model the catalog names them by
 	// effort level, so the keys are the effort levels the model supports.
@@ -251,9 +233,7 @@ type PermissionRequest struct {
 	SessionID  string         `json:"sessionID"`
 	Permission string         `json:"permission"`
 	Patterns   []string       `json:"patterns"`
-	Always     []string       `json:"always"`
 	Tool       PermissionTool `json:"tool"`
-	Metadata   map[string]any `json:"metadata"`
 }
 type QuestionRequest struct {
 	ID        string         `json:"id"`
