@@ -316,18 +316,6 @@ func TestActiveSessionLimit(t *testing.T) {
 	require.Equal(t, "active_sessions", requestErrorData(t, err)["limit"])
 }
 
-func TestVersionFloor(t *testing.T) {
-	t.Parallel()
-
-	h := newHarness(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", fakeOpenCodeEnvVersion: "0.1.0"}))
-	h.initialize()
-
-	_, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
-	require.Equal(t, -32603, requestErrorCode(t, err))
-	require.Equal(t, "opencode_internal_failure", requestErrorData(t, err)[wire.FieldError])
-	require.Equal(t, "native_start", requestErrorData(t, err)["class"])
-}
-
 func TestClosedAgentRefusesRequests(t *testing.T) {
 	t.Parallel()
 

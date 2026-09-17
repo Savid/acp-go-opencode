@@ -17,6 +17,7 @@ import (
 	"github.com/savid/acp-go-core/image"
 
 	"github.com/coder/acp-go-sdk"
+	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -126,7 +127,7 @@ type storedSession struct {
 }
 
 func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.options.SessionStoreLoadTimeout)
+	ctx, cancel := context.WithTimeout(ctx, acpcore.SessionStoreTimeout)
 	defer cancel()
 
 	ctx, finish := a.observe.StartSessionStore(ctx, "load")

@@ -114,7 +114,6 @@ type turn struct {
 	cancelTurn context.CancelFunc
 	accepted   bool
 	cancelled  bool
-	timedOut   bool
 	ended      turnEnd
 	settled    chan struct{}
 	settleOnce sync.Once
@@ -384,36 +383,9 @@ func (s *session) cancel(ctx context.Context) {
 	}
 }
 
-// timeout ends a turn that exceeded the configured deadline.
-func (s *session) timeout(ctx context.Context, t *turn) {
-	s.mu.Lock()
-	rt := s.runtime
-
-	if s.turn != t || t.cancelled || t.timedOut {
-		s.mu.Unlock()
-
-		return
-	}
-
-	t.timedOut = true
-	s.mu.Unlock()
-	t.cancelTurn()
-	s.cancelDialogs()
-
-	if rt != nil {
-		s.abort(ctx, rt)
-
-		select {
-		case <-t.settled:
-		case <-time.After(sessionAbortTimeout):
-			rt.cancel()
-		}
-	}
-}
-
 func (s *session) registerDialog(id string, cancel context.CancelCauseFunc) (func(), bool) {
 	s.mu.Lock()
-	if s.dialogs[id] != nil || s.closing || s.runtime == nil || (s.turn != nil && (s.turn.cancelled || s.turn.timedOut)) {
+	if s.dialogs[id] != nil || s.closing || s.runtime == nil || (s.turn != nil && s.turn.cancelled) {
 		s.mu.Unlock()
 		cancel(errDialogCancelled)
 

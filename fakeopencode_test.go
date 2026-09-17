@@ -19,7 +19,6 @@ import (
 )
 
 const fakeOpenCodeEnv = "ACP_GO_OPENCODE_TEST_FAKE"
-const fakeOpenCodeEnvVersion = "ACP_GO_OPENCODE_TEST_VERSION"
 
 // fakeOpenCodeEnvResumeHold names a file the fake creates when a session
 // lookup arrives that it will not answer, so a test can act while the adapter
@@ -29,6 +28,10 @@ const fakeOpenCodeEnvResumeHold = "ACP_GO_OPENCODE_TEST_RESUME_HOLD"
 // fakeOpenCodeResumeHold is how long a held lookup refuses to answer. It
 // outlasts the shutdown the adapter sends when it gives up on the relaunch.
 const fakeOpenCodeResumeHold = 30 * time.Second
+
+// fakeOpenCodeEnvStartHold names a file the server creates before it listens,
+// once a sibling ".armed" file exists; it stays down until the file is removed.
+const fakeOpenCodeEnvStartHold = "ACP_GO_OPENCODE_TEST_START_HOLD"
 
 type fakeOpenCode struct {
 	mu          sync.Mutex
@@ -41,15 +44,6 @@ type fakeOpenCode struct {
 }
 
 func runFakeOpenCode(args []string) int {
-	if len(args) == 1 && args[0] == "--version" {
-		version := os.Getenv(fakeOpenCodeEnvVersion)
-		if version == "" {
-			version = "1.18.30"
-		}
-		fmt.Println(version)
-
-		return 0
-	}
 	port := ""
 	for i, arg := range args {
 		if arg == "--port" && i+1 < len(args) {
@@ -70,6 +64,17 @@ func runFakeOpenCode(args []string) int {
 				if json.Unmarshal(event.Data["info"], &s) == nil && s.ID != "" {
 					f.sessions[s.ID] = s
 				}
+			}
+		}
+	}
+	if hold := os.Getenv(fakeOpenCodeEnvStartHold); hold != "" {
+		if _, err := os.Stat(hold + ".armed"); err == nil {
+			_ = os.WriteFile(hold, []byte("held\n"), 0o600)
+			for {
+				if _, err := os.Stat(hold); err != nil {
+					break
+				}
+				time.Sleep(time.Millisecond)
 			}
 		}
 	}

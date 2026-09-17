@@ -24,9 +24,21 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 	rt := &binding{server: server, client: server.client, cancel: cancel, ending: readCtx.Done(), bound: make(chan struct{}), done: make(chan struct{}), events: make(chan opencode.Event, 256), results: make(chan nativePromptResult, 1)}
 
 	s.mu.Lock()
-	s.runtime = rt
+	closing := s.closing
 
+	if !closing {
+		s.runtime = rt
+	}
 	s.mu.Unlock()
+
+	// A close that began during this launch has already sampled the binding it
+	// releases, so one bound now would outlive the session.
+	if closing {
+		cancel()
+
+		return nil, wire.UnknownSession()
+	}
+
 	go s.pump(readCtx, rt)
 
 	return rt, nil

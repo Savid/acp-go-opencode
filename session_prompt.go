@@ -210,11 +210,6 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	t.runtime = rt
 	s.mu.Unlock()
 
-	if timeout := s.agent.options.TurnTimeout; timeout > 0 {
-		timer := time.AfterFunc(timeout, func() { s.timeout(context.WithoutCancel(ctx), t) })
-		defer timer.Stop()
-	}
-
 	requestCtx, requestCancel := context.WithCancel(context.WithoutCancel(ctx))
 	requestDone := make(chan struct{})
 
@@ -345,7 +340,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	defer cancel()
 
 	s.mu.Lock()
-	cancelled, timedOut := t.cancelled, t.timedOut
+	cancelled := t.cancelled
 	s.mu.Unlock()
 
 	var verdict cycleVerdict
@@ -353,8 +348,6 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	switch {
 	case cancelled:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
-	case timedOut:
-		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTimeout, Message: fmt.Sprintf("opencode turn exceeded %s", s.agent.options.TurnTimeout)})}
 	case t.ended == turnTransportEnded:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.transportFailure(settleCtx, rt, nil)}
 	default:

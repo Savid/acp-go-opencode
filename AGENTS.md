@@ -16,9 +16,8 @@ continue with `opencode run --session NATIVE_SESSION_ID` in the same directory a
   prompt turns, permissions and elicitation, lifecycle stream, store mirror,
   replay, config options, and image input/output.
 - `internal/opencode`: native HTTP/SSE client, sync-event import/export,
-  launch arguments, and the native version floor and probe.
+  and launch arguments.
 - `integration`: gated tests against the installed opencode.
-- `examples`: runnable ACP clients.
 
 ## Commands
 

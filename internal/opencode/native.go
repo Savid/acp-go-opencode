@@ -1,7 +1,6 @@
 package opencode
 
 import (
-	"context"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -9,7 +8,6 @@ import (
 	"errors"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -20,17 +18,6 @@ const CarrierKey = "acp-go-opencode"
 //go:embed environment.mjs
 var environmentPlugin string
 
-func ProbeVersion(ctx context.Context, executable string, env []string) (string, error) {
-	cmd := exec.CommandContext(ctx, executable, "--version")
-	cmd.Env = env
-
-	data, err := cmd.Output()
-	if err != nil {
-		return "", errors.New("opencode version probe failed")
-	}
-
-	return strings.TrimSpace(string(data)), nil
-}
 func ModelSelectionShapeError(value string) error {
 	provider, id, ok := strings.Cut(value, "/")
 	if !ok || provider == "" || id == "" || strings.ContainsAny(value, " \t\r\n\x00") {

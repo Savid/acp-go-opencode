@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
-	"time"
 
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
@@ -62,10 +61,6 @@ type Options struct {
 	// SessionStore is the durability boundary for session rows. Nil installs a
 	// fresh in-memory store.
 	SessionStore acpcore.SessionStore
-	// SessionStoreLoadTimeout bounds store reads used for list, load, and resume.
-	SessionStoreLoadTimeout time.Duration
-	// TurnTimeout bounds one prompt turn. Zero means no deadline.
-	TurnTimeout time.Duration
 	// ConcurrencyLimits controls process-local backpressure.
 	ConcurrencyLimits ConcurrencyLimits
 	// SeedFiles maps paths relative to opencode's config root to file contents
@@ -105,7 +100,6 @@ func (l ImageLimits) core() image.Limits {
 const (
 	defaultMaxActiveSessions        = 32
 	defaultMaxConcurrentClientCalls = 16
-	defaultSessionStoreLoadTimeout  = 10 * time.Second
 )
 
 func applyOptions(opts []Option) Options {
@@ -135,10 +129,6 @@ func applyOptions(opts []Option) Options {
 
 	if options.ConcurrencyLimits.MaxConcurrentClientCalls == 0 {
 		options.ConcurrencyLimits.MaxConcurrentClientCalls = defaultMaxConcurrentClientCalls
-	}
-
-	if options.SessionStoreLoadTimeout == 0 {
-		options.SessionStoreLoadTimeout = defaultSessionStoreLoadTimeout
 	}
 
 	return options
@@ -220,17 +210,6 @@ func WithTextMapPropagator(propagator propagation.TextMapPropagator) Option {
 // WithSessionStore configures the session store.
 func WithSessionStore(store acpcore.SessionStore) Option {
 	return func(options *Options) { options.SessionStore = store }
-}
-
-// WithSessionStoreLoadTimeout bounds session store reads.
-func WithSessionStoreLoadTimeout(timeout time.Duration) Option {
-	return func(options *Options) { options.SessionStoreLoadTimeout = timeout }
-}
-
-// WithTurnTimeout bounds one prompt turn. On expiry the native turn is aborted
-// and session/prompt fails with cause "timeout".
-func WithTurnTimeout(timeout time.Duration) Option {
-	return func(options *Options) { options.TurnTimeout = timeout }
 }
 
 // WithConcurrencyLimits sets process-local backpressure limits.

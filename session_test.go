@@ -355,3 +355,74 @@ func TestEndedBindingCannotCancelReplacementPrompt(t *testing.T) {
 		t.Fatal("replacement prompt did not settle")
 	}
 }
+
+// A close that lands while a relaunch is still waiting for the server leaves
+// the session closed and binds nothing to it, so the session loads cleanly
+// afterwards.
+func TestCloseDuringRelaunchBindsNothing(t *testing.T) {
+	t.Parallel()
+
+	held := filepath.Join(t.TempDir(), "start-held")
+	h := newHarness(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", fakeOpenCodeEnvStartHold: held}))
+	h.initialize(withLifecycle())
+	cwd := t.TempDir()
+	session, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	_, err = h.prompt(session.SessionId, "CRASH", promptMeta(1))
+	require.Equal(t, "process_exit", requestErrorData(t, err)["cause"])
+	require.NoError(t, os.WriteFile(held+".armed", nil, 0o600))
+
+	relaunched := make(chan error, 1)
+
+	go func() {
+		_, configErr := h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configModel, "fake/text"))
+		relaunched <- configErr
+	}()
+
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(held)
+
+		return statErr == nil
+	}, testTimeout, time.Millisecond)
+
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(held))
+
+	err = <-relaunched
+	require.Equal(t, "unknown session", requestErrorData(t, err)[wire.FieldError], "the relaunch answers for the session that closed under it")
+
+	_, err = h.prompt(session.SessionId, "HELLO", promptMeta(2))
+	require.Equal(t, "unknown session", requestErrorData(t, err)[wire.FieldError])
+
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
+	require.NoError(t, err, "nothing from the abandoned relaunch stays bound to the native session")
+}
+
+// An empty executable path resolves the opencode binary from the base PATH.
+func TestEmptyExecutablePathResolvesOpenCodeFromPath(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	require.NoError(t, os.Symlink(os.Args[0], filepath.Join(base, "opencode")))
+
+	h := newHarness(t, WithExecutablePath(""), WithEnv(map[string]string{fakeOpenCodeEnv: "1", "PATH": base}))
+	h.initialize(withLifecycle())
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "HELLO", promptMeta(1))
+	require.NoError(t, err)
+}
+
+// A harness that cannot start is the native_start class of the internal failure.
+func TestNativeStartFailureClass(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, WithExecutablePath(filepath.Join(t.TempDir(), "missing-opencode")))
+	h.initialize()
+
+	_, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
+	require.Equal(t, -32603, requestErrorCode(t, err))
+	require.Equal(t, map[string]any{wire.FieldError: "opencode_internal_failure", wire.FieldClass: "native_start"}, requestErrorData(t, err))
+}

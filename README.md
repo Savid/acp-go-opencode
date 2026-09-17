@@ -24,7 +24,7 @@ go install github.com/savid/acp-go-opencode/cmd/acp-go-opencode@latest
 acp-go-opencode [-path opencode] [-home DIR] [-scratch-dir DIR] [-model provider/id] [-seed-file rel=host]... [-debug]
 ```
 
-Requires OpenCode 1.18.30 or newer. A bare `-path` is resolved on the inherited
+Verified against OpenCode 1.18.30. A bare `-path` is resolved on the inherited
 PATH. `-home` maps `DIR/data`, `DIR/config`, `DIR/cache`, and `DIR/state` to the
 four XDG home variables; omit it to use native home resolution. Native CLI
 continuation uses those same variables when a home was supplied.
@@ -43,9 +43,8 @@ err := opencodeacp.Serve(ctx, os.Stdin, os.Stdout,
 
 Options: `WithExecutablePath`, `WithHome`, `WithScratchDir`,
 `WithInputHandoffRoot`, `WithDefaultModel`, `WithConfiguredModels`, `WithEnv`,
-`WithSeedFiles`, `WithSessionStore`, `WithSessionStoreLoadTimeout`,
-`WithTurnTimeout`, `WithConcurrencyLimits`, `WithImageLimits`, `WithLogger`,
-`WithTracerProvider`, `WithMeterProvider`, `WithTextMapPropagator`,
+`WithSeedFiles`, `WithSessionStore`, `WithConcurrencyLimits`, `WithImageLimits`,
+`WithLogger`, `WithTracerProvider`, `WithMeterProvider`, `WithTextMapPropagator`,
 `WithAgentName`, `WithAgentTitle`, `WithAgentVersion`.
 
 ### Session options

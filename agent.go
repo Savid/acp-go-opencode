@@ -1,6 +1,7 @@
 package opencodeacp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,9 +71,8 @@ type Agent struct {
 	clientCalls  chan struct{}
 	incarnations uint64
 
-	runtimeMu  sync.Mutex
-	runtime    *runtime
-	executable process.Executable
+	runtimeMu sync.Mutex
+	runtime   *runtime
 }
 
 var (
@@ -451,17 +451,20 @@ func (a *Agent) acquireClientCall() (func(), error) {
 	}
 }
 
-// ensureExecutable resolves the opencode executable against the base environment
-// and caches its completed version verdict through core.
+// ensureExecutable resolves the opencode executable against the base
+// environment, so a session directory can never shadow it.
 func (a *Agent) ensureExecutable(ctx context.Context) (string, error) {
-	executable, err := a.executable.Resolve(ctx, a.environment(nil, nil), a.options.ExecutablePath, vendor, opencode.MinimumVersion, opencode.ProbeVersion)
-	if err != nil {
-		a.log.ErrorContext(ctx, "opencode version probe failed", slog.String("reason", err.Error()))
-
-		return "", wire.InternalFailure(vendor, internalClassNativeStart)
+	base, err := a.environment(nil, nil).Base()
+	if err == nil {
+		var executable string
+		if executable, err = process.ResolveExecutable(cmp.Or(a.options.ExecutablePath, vendor), base); err == nil {
+			return executable, nil
+		}
 	}
 
-	return executable, nil
+	a.log.ErrorContext(ctx, "opencode executable resolution failed", slog.String("reason", err.Error()))
+
+	return "", wire.InternalFailure(vendor, internalClassNativeStart)
 }
 
 // environment builds the merge for one launch: the inherited process
