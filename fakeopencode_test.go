@@ -232,7 +232,22 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fakeWrite(w, map[string]any{"components": map[string]any{"schemas": map[string]any{"OutputFormatJsonSchema": map[string]any{}}}})
 
 		return
+	case "/config":
+		fakeWrite(w, map[string]any{})
+
+		return
 	case "/config/providers":
+		if providersPath := os.Getenv("ACP_GO_OPENCODE_TEST_PROVIDERS"); providersPath != "" {
+			data, err := os.ReadFile(providersPath)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+
+				return
+			}
+			_, _ = w.Write(data)
+
+			return
+		}
 		fakeWrite(w, map[string]any{"providers": []any{map[string]any{"id": "fake", "name": "Fake", "models": map[string]any{"vision": map[string]any{"id": "vision", "name": "Vision", "limit": map[string]any{"context": 32000}, "capabilities": map[string]any{"input": map[string]any{"image": true}}, "variants": map[string]any{"low": map[string]any{}, "high": map[string]any{}}}, "text": map[string]any{"id": "text", "name": "Text", "capabilities": map[string]any{"input": map[string]any{"image": false}}}}}}, "default": map[string]string{"fake": "vision"}})
 
 		return

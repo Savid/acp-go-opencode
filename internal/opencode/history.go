@@ -15,7 +15,7 @@ import (
 
 // ReadHistory reads one conversation graph through the native database command.
 // The HTTP history route exports every session in the account in one response.
-func ReadHistory(ctx context.Context, executable string, environment []string, id string, cursors map[string]int64) ([]SyncEvent, error) {
+func ReadHistory(ctx context.Context, executable, scratchDir string, environment []string, id string, cursors map[string]int64) ([]SyncEvent, error) {
 	encoded, err := json.Marshal(cursors)
 	if err != nil {
 		return nil, err
@@ -32,7 +32,7 @@ LEFT JOIN cursors ON cursors.key = event.aggregate_id
 WHERE event.seq > COALESCE(cursors.value, -1)
 ORDER BY event.seq, event.id`
 
-	output, err := os.CreateTemp("", "acp-go-opencode-history-*.json")
+	output, err := os.CreateTemp(scratchDir, "acp-go-opencode-history-*.json")
 	if err != nil {
 		return nil, err
 	}

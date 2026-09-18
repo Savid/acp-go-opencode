@@ -119,3 +119,23 @@ ACP_GO_OPENCODE_MODEL=provider/model make test-integration-live
 Unit tests use a scripted native HTTP server inside the test binary and require
 no installed OpenCode or credentials. Smoke tests use the installed CLI without
 model calls. Live tests copy native auth into temporary homes and spend tokens.
+
+## Account usage
+
+`AccountUsageMethod` (`_opencode/accountUsage`) accepts `sessionId` and
+`providerId` (`opencode-go` or `openrouter`). Initialization advertises the
+method, session scope, and supported providers. Reads hold the session's
+foreground gate and spend no model tokens.
+
+The adapter resolves the directory's effective API key and route through the
+native server. Only official endpoints and verified API-key routes are read;
+custom plugins or authentication overrides yield `not_reported`. Credentials
+stay local. Provider HTTP reads come from `github.com/savid/acp-go-core/usage`.
+
+OpenCode Go reports rolling, weekly, and monthly percentage windows. OpenRouter
+reports key spending caps, lifetime spend, free-model request counts, and any
+account credit balance accessible with the same key. Dollar amounts are USD;
+a missing cap is explicitly uncapped, zero is a real value, and a negative
+remaining balance is preserved. Account credits and key caps remain separate.
+Each measurement retains its own observation and expiry times. Unavailable
+optional account credits do not discard key data.

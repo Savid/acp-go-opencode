@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -21,6 +22,8 @@ import (
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/usage/opencodego"
+	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
@@ -29,6 +32,8 @@ const (
 	// RawEventMethod is the notification carrying one raw opencode event when a
 	// session opted in through _meta.opencode.rawEvent.enabled.
 	RawEventMethod = "_opencode/rawEvent"
+	// AccountUsageMethod reads the addressed native provider's account usage.
+	AccountUsageMethod = "_opencode/accountUsage"
 	// SessionStoreFormat identifies the store layout this package writes: the
 	// native sync-event graph under main plus the adapter's session record
 	// under the config subpath.
@@ -49,10 +54,11 @@ type client interface {
 
 // Agent exposes the opencode coding agent through ACP.
 type Agent struct {
-	options   Options
-	log       *slog.Logger
-	observe   *observer.Observer
-	optionErr *acp.RequestError
+	options        Options
+	log            *slog.Logger
+	observe        *observer.Observer
+	optionErr      *acp.RequestError
+	usageTransport http.RoundTripper
 	// processEnv is the adapter's own environment, read once at construction.
 	processEnv []string
 	store      acpcore.SessionStore
@@ -316,7 +322,8 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 
 	capabilityMeta := map[string]any{
 		vendor: map[string]any{
-			"elicitation": map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
+			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, opencodego.ProviderID, openrouter.ProviderID),
+			"elicitation":                  map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
 			metaRawEventKey: map[string]any{
 				capabilityMethodKey: RawEventMethod, "enabledBy": "_meta.opencode.rawEvent.enabled",
 				"maxBytes": wire.RawEventMaxBytes, "defaultEnabled": false,
@@ -392,9 +399,12 @@ func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeReque
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
 
-// HandleExtensionMethod answers every extension method with method-not-found.
-// The only extension surface is the outbound RawEventMethod notification.
-func (a *Agent) HandleExtensionMethod(_ context.Context, method string, params json.RawMessage) (any, error) {
+// HandleExtensionMethod serves account usage and rejects unknown extension methods.
+func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
+	if method == AccountUsageMethod {
+		return a.accountUsage(ctx, params)
+	}
+
 	var envelope struct {
 		Meta map[string]any `json:"_meta"` //nolint:tagliatelle // ACP reserves this wire spelling.
 	}
