@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -31,7 +32,23 @@ LEFT JOIN cursors ON cursors.key = event.aggregate_id
 WHERE event.seq > COALESCE(cursors.value, -1)
 ORDER BY event.seq, event.id`
 
-	proc, err := process.Start(ctx, process.Request{Executable: executable, Args: []string{"db", query, "--format", "json"}, Env: environment})
+	output, err := os.CreateTemp("", "acp-go-opencode-history-*.json")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = output.Close()
+		_ = os.Remove(output.Name())
+	}()
+
+	// The native CLI exits before large piped stdout writes finish. A regular
+	// file makes its writes synchronous; positional arguments keep the query
+	// and executable out of the shell program.
+	proc, err := process.Start(ctx, process.Request{
+		Executable: "/bin/sh",
+		Args:       []string{"-c", `output=$1; shift; exec "$@" > "$output"`, "opencode-history", output.Name(), executable, "db", query, "--format", "json"},
+		Env:        environment,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -55,15 +72,6 @@ ORDER BY event.seq, event.id`
 
 	_ = proc.Stdin().Close()
 
-	data, err := io.ReadAll(io.LimitReader(proc.Stdout(), MaxBodyBytes+1))
-	if err != nil {
-		return nil, err
-	}
-
-	if len(data) > MaxBodyBytes {
-		return nil, errors.New("native session history exceeds size limit")
-	}
-
 	result, err := proc.Wait(ctx)
 	if err != nil {
 		return nil, err
@@ -71,6 +79,15 @@ ORDER BY event.seq, event.id`
 
 	if result.ExitCode != 0 {
 		return nil, fmt.Errorf("opencode database query exited with status %d", result.ExitCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(output, MaxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(data) > MaxBodyBytes {
+		return nil, errors.New("native session history exceeds size limit")
 	}
 
 	var rows []map[string]json.RawMessage

@@ -35,9 +35,21 @@ func TestNativePersistence(t *testing.T) {
 	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
 	cwd := t.TempDir()
-	session, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	// A carrier larger than a pipe buffer must survive the native database
+	// command's output and a restore into an empty home.
+	marker := strings.Repeat("history-payload-", 8192)
+	options := opencodeacp.NewOpenCodeOptions(opencodeacp.WithOpenCodeEnv(map[string]string{"HISTORY_PROBE": marker}))
+	session, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd, opencodeacp.WithSessionOpenCodeOptions(options)))
 	require.NoError(t, err)
 	require.NotEmpty(t, session.SessionId)
+	rows, err := store.Load(t.Context(), string(session.SessionId))
+	require.NoError(t, err)
+	require.NotEmpty(t, rows)
+	var mirrored bytes.Buffer
+	for _, row := range rows[""] {
+		mirrored.Write(row)
+	}
+	require.Contains(t, mirrored.String(), marker)
 	require.NoError(t, a.Close())
 	b := opencodeacp.NewAgent(opencodeacp.WithHome(t.TempDir()), opencodeacp.WithSessionStore(store))
 	t.Cleanup(func() { _ = b.Close() })

@@ -176,3 +176,38 @@ func TestAssistantTextIsAppendOnly(t *testing.T) {
 	require.Equal(t, "abcdef", agentText(h.rec.snapshot()),
 		"a finalized text that extends the streamed prefix delivers only the suffix")
 }
+
+func TestToolInputArrivesAfterPending(t *testing.T) {
+	t.Parallel()
+
+	rec := newRecorder()
+	a := NewAgent()
+	t.Cleanup(func() { _ = a.Close() })
+	a.attach(rec, nil)
+	s := &session{agent: a, id: "tool-input-session"}
+	state := cycleState{}
+	part := opencode.NativePart{ID: "part", CallID: "call", Type: partTool, Tool: nativeToolBash}
+	for _, data := range []string{
+		`{"status":"pending","input":{}}`,
+		`{"status":"running","input":{"command":"pwd"}}`,
+		`{"status":"completed","input":{"command":"pwd"},"output":"/work"}`,
+	} {
+		part.State = json.RawMessage(data)
+		require.NoError(t, s.projectPart(t.Context(), &state, part, roleAssistant))
+	}
+
+	var started int
+	var inputs []any
+	for _, notification := range rec.snapshot() {
+		if notification.Update.ToolCall != nil {
+			started++
+		}
+		if update := notification.Update.ToolCallUpdate; update != nil {
+			if input, ok := update.RawInput.(map[string]any); ok && input["command"] != nil {
+				inputs = append(inputs, input["command"])
+			}
+		}
+	}
+	require.Equal(t, 1, started)
+	require.Equal(t, []any{"pwd", "pwd"}, inputs, "running and terminal updates preserve the command")
+}

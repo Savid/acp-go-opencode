@@ -302,6 +302,10 @@ func (s *session) emitTool(ctx context.Context, state *cycleState, part opencode
 	}
 
 	if native.Status != "completed" && native.Status != "error" {
+		if native.Input != nil {
+			return s.emit(ctx, acp.UpdateToolCall(id, acp.WithUpdateRawInput(native.Input)))
+		}
+
 		return nil
 	}
 
@@ -332,7 +336,7 @@ func (s *session) emitTool(ctx context.Context, state *cycleState, part opencode
 		}
 	}
 
-	return s.emit(ctx, acp.UpdateToolCall(id, acp.WithUpdateStatus(status), acp.WithUpdateRawOutput(output), acp.WithUpdateContent(content)))
+	return s.emit(ctx, acp.UpdateToolCall(id, acp.WithUpdateStatus(status), acp.WithUpdateRawInput(native.Input), acp.WithUpdateRawOutput(output), acp.WithUpdateContent(content)))
 }
 func (s *session) emit(ctx context.Context, updates ...acp.SessionUpdate) error {
 	conn := s.agent.connection()
