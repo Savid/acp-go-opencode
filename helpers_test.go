@@ -41,7 +41,7 @@ func testOptions(t *testing.T, extra ...Option) []Option {
 	options := make([]Option, 0, 5+len(extra))
 	options = append(options,
 		WithExecutablePath(os.Args[0]),
-		WithEnv(map[string]string{fakeOpenCodeEnv: "1"}),
+		WithEnv(map[string]string{fakeOpenCodeEnv: "1", "GORACE": os.Getenv("GORACE") + " atexit_sleep_ms=0"}),
 		WithHome(filepath.Join(t.TempDir(), "home")),
 		WithScratchDir(filepath.Join(t.TempDir(), "scratch")),
 		WithLogger(slog.New(slog.DiscardHandler)),

@@ -238,7 +238,7 @@ func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, erro
 		return nil, err
 	}
 
-	events, err := rt.client.History(ctx, map[string]int64{})
+	events, err := opencode.ReadHistory(ctx, rt.server.executable, rt.server.environment, s.nativeID, map[string]int64{})
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +256,7 @@ func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, erro
 		}
 	}
 
-	next, err := rt.client.History(ctx, cursors)
+	next, err := opencode.ReadHistory(ctx, rt.server.executable, rt.server.environment, s.nativeID, cursors)
 	if err != nil {
 		return nil, err
 	}

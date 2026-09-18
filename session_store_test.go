@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -13,8 +14,50 @@ import (
 	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMirrorIncludesDescendantsAndExcludesUnrelatedSessions(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	cwd := t.TempDir()
+	root, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), root.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+	parent := s.nativeID
+	want := make([]string, 1, 3)
+	want[0] = parent
+	for range 2 {
+		var child opencode.NativeSession
+		require.NoError(t, rt.client.Do(t.Context(), cwd, http.MethodPost, "/session", map[string]string{"parentID": parent}, &child))
+		want = append(want, child.ID)
+		parent = child.ID
+	}
+	unrelated, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	require.NoError(t, s.commitMirror(t.Context(), rt))
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(root.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	events, err := decodeEvents(rows, s.nativeID)
+	require.NoError(t, err)
+	graph := syncGraph(events, s.nativeID)
+	require.Len(t, graph, len(want))
+	for _, id := range want {
+		require.Contains(t, graph, id)
+	}
+	require.NotContains(t, graph, string(unrelated.SessionId))
+}
 
 // A commit the session cannot attempt, and one with no complete native
 // snapshot to replace, both fail rather than report a success the store does

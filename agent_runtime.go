@@ -21,16 +21,18 @@ const sessionShutdownGrace = 2 * time.Second
 
 // runtime owns one shared server, SSE stream, and native home lock.
 type runtime struct {
-	proc      *process.Process
-	client    *opencode.Client
-	stream    *opencode.Stream
-	root      string
-	lock      *process.FileLock
-	cancel    context.CancelFunc
-	done      chan struct{}
-	closeOnce sync.Once
-	mu        sync.Mutex
-	bindings  map[string]*binding
+	proc        *process.Process
+	client      *opencode.Client
+	executable  string
+	environment []string
+	stream      *opencode.Stream
+	root        string
+	lock        *process.FileLock
+	cancel      context.CancelFunc
+	done        chan struct{}
+	closeOnce   sync.Once
+	mu          sync.Mutex
+	bindings    map[string]*binding
 }
 
 func (rt *runtime) alive() bool {
@@ -210,7 +212,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	rt := &runtime{proc: proc, client: client, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), bindings: map[string]*binding{}}
+	rt := &runtime{proc: proc, client: client, executable: executable, environment: base, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), bindings: map[string]*binding{}}
 	transferred = true
 
 	go rt.pump(runtimeCtx)

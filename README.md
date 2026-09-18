@@ -24,7 +24,7 @@ go install github.com/savid/acp-go-opencode/cmd/acp-go-opencode@latest
 acp-go-opencode [-path opencode] [-home DIR] [-scratch-dir DIR] [-model provider/id] [-seed-file rel=host]... [-debug]
 ```
 
-Verified against OpenCode 1.18.30. A bare `-path` is resolved on the inherited
+Verified against OpenCode 1.18.31. A bare `-path` is resolved on the inherited
 PATH. `-home` maps `DIR/data`, `DIR/config`, `DIR/cache`, and `DIR/state` to the
 four XDG home variables; omit it to use native home resolution. Native CLI
 continuation uses those same variables when a home was supplied.
@@ -90,8 +90,9 @@ Optional lifecycle negotiation supplies ordered session and turn updates.
 `SessionStoreFormat` is `opencode-sync-events-v1`. The main subpath holds native
 sync events for one conversation and its descendants. The `config` sidecar
 holds accepted options and captured local image bytes. Complete generations
-commit atomically before a prompt returns. A second native history read fences
-each snapshot. The adapter never opens OpenCode's database files.
+commit atomically before a prompt returns. Scoped `opencode db` queries read
+only that conversation graph; a second read fences each snapshot. The native
+CLI opens its own database files.
 
 Load imports missing events through the native sync API and replays ACP history.
 Resume imports without replay. Existing native history must agree at every

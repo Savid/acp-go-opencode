@@ -147,13 +147,6 @@ func (c *Client) Messages(ctx context.Context, dir, id string) ([]NativeMessage,
 func (c *Client) Interrupt(ctx context.Context, dir, id string) error {
 	return c.Do(ctx, dir, http.MethodPost, SessionPath(id)+"/abort", map[string]any{}, nil)
 }
-func (c *Client) History(ctx context.Context, cursors map[string]int64) ([]SyncEvent, error) {
-	var out []SyncEvent
-
-	err := c.Do(ctx, "", http.MethodPost, "/sync/history", cursors, &out)
-
-	return out, err
-}
 func (c *Client) Replay(ctx context.Context, dir string, events []SyncEvent) error {
 	rows := make([]map[string]any, 0, len(events))
 	for _, e := range events {

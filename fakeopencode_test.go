@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -50,9 +51,6 @@ func runFakeOpenCode(args []string) int {
 			port = args[i+1]
 		}
 	}
-	if port == "" {
-		return 2
-	}
 	f := &fakeOpenCode{sessions: map[string]opencode.NativeSession{}, subscribers: map[chan []byte]bool{}, pending: map[string]chan struct{}{}, answers: map[string]chan json.RawMessage{}, path: filepath.Join(os.Getenv("XDG_DATA_HOME"), "opencode", "fake.json")}
 	if data, err := os.ReadFile(f.path); err == nil {
 		if json.Unmarshal(data, &f.rows) != nil {
@@ -66,6 +64,12 @@ func runFakeOpenCode(args []string) int {
 				}
 			}
 		}
+	}
+	if len(args) == 4 && args[0] == "db" && args[2] == "--format" && args[3] == "json" {
+		return f.queryHistory(args[1])
+	}
+	if port == "" {
+		return 2
 	}
 	if hold := os.Getenv(fakeOpenCodeEnvStartHold); hold != "" {
 		if _, err := os.Stat(hold + ".armed"); err == nil {
@@ -114,9 +118,41 @@ func (f *fakeOpenCode) append(id, typ string, data map[string]any) {
 func (f *fakeOpenCode) save() {
 	data, _ := json.Marshal(f.rows)
 	_ = os.MkdirAll(filepath.Dir(f.path), 0700)
-	if err := os.WriteFile(f.path, data, 0600); err != nil {
+	if err := os.WriteFile(f.path+".tmp", data, 0600); err != nil {
 		panic(err)
 	}
+	if err := os.Rename(f.path+".tmp", f.path); err != nil {
+		panic(err)
+	}
+}
+
+func (f *fakeOpenCode) queryHistory(query string) int {
+	literals := regexp.MustCompile(`'(?:''|[^'])*'`).FindAllString(query, -1)
+	if len(literals) != 2 || !strings.HasPrefix(query, "WITH RECURSIVE wanted(id)") {
+		return 5
+	}
+	unquote := func(value string) string { return strings.ReplaceAll(value[1:len(value)-1], "''", "'") }
+	allowed := syncGraph(f.rows, unquote(literals[0]))
+	var cursors map[string]int64
+	if json.Unmarshal([]byte(unquote(literals[1])), &cursors) != nil {
+		return 6
+	}
+	rows := []map[string]any{}
+	for _, event := range f.rows {
+		if !allowed[event.AggregateID] {
+			continue
+		}
+		if seq, ok := cursors[event.AggregateID]; ok && event.Sequence <= seq {
+			continue
+		}
+		data, _ := json.Marshal(event.Data)
+		rows = append(rows, map[string]any{"id": event.ID, "aggregate_id": event.AggregateID, "seq": event.Sequence, "type": event.Type, "data": string(data)})
+	}
+	if json.NewEncoder(os.Stdout).Encode(rows) != nil {
+		return 7
+	}
+
+	return 0
 }
 func (f *fakeOpenCode) messages(id string) []opencode.NativeMessage {
 	rows := make([][]byte, 0, len(f.rows))
@@ -211,18 +247,6 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			statuses[id] = map[string]string{"type": "busy"}
 		}
 		fakeWrite(w, statuses)
-
-		return
-	case "/sync/history":
-		var cursors map[string]int64
-		_ = json.NewDecoder(r.Body).Decode(&cursors)
-		events := []opencode.SyncEvent{}
-		for _, event := range f.rows {
-			if n, ok := cursors[event.AggregateID]; !ok || event.Sequence > n {
-				events = append(events, event)
-			}
-		}
-		fakeWrite(w, events)
 
 		return
 	case "/sync/replay":
