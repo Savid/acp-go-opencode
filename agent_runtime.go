@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,9 @@ import (
 
 const sessionShutdownTimeout = 10 * time.Second
 const sessionShutdownGrace = 2 * time.Second
+
+const serverStartupTimeout = 2 * time.Minute
+const serverHealthTimeout = 2 * time.Second
 
 // runtime owns one shared server, SSE stream, and native home lock.
 type runtime struct {
@@ -162,33 +166,16 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		}
 	}()
 
-	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	started := time.Now()
+
+	readyCtx, cancel := context.WithTimeout(ctx, serverStartupTimeout)
 	defer cancel()
 
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		var health struct {
-			Healthy bool `json:"healthy"`
-		}
-		if healthErr := client.Do(readyCtx, "", http.MethodGet, "/global/health", nil, &health); healthErr == nil && health.Healthy {
-			break
-		}
-
-		select {
-		case <-proc.Done():
-			message := "opencode server exited before it was ready"
-			if line := proc.StderrLastLine(); line != "" {
-				message += ": " + line
-			}
-
-			return nil, errors.New(message)
-		case <-readyCtx.Done():
-			return nil, readyCtx.Err()
-		case <-ticker.C:
-		}
+	if healthErr := a.waitForServerHealth(readyCtx, client, proc); healthErr != nil {
+		return nil, fmt.Errorf("native health after %s: %w", time.Since(started).Round(time.Millisecond), healthErr)
 	}
+
+	healthDuration := time.Since(started)
 
 	var doc struct {
 		Components struct {
@@ -196,12 +183,15 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		} `json:"components"`
 	}
 	if docErr := client.Do(readyCtx, "", http.MethodGet, "/doc", nil, &doc); docErr != nil {
-		return nil, docErr
+		return nil, fmt.Errorf("native schema after %s: %w", time.Since(started).Round(time.Millisecond), docErr)
 	}
 
 	if doc.Components.Schemas["OutputFormatJsonSchema"] == nil {
 		return nil, errors.New("native structured output schema missing")
 	}
+
+	a.log.InfoContext(ctx, "opencode server ready",
+		slog.Duration("health_duration", healthDuration), slog.Duration("schema_duration", time.Since(started)-healthDuration))
 
 	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
 
@@ -219,6 +209,50 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 
 	return rt, nil
 }
+
+func (a *Agent) waitForServerHealth(ctx context.Context, client *opencode.Client, proc *process.Process) error {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		// A request accepted during startup can remain unanswered after the server becomes healthy.
+		probeCtx, cancel := context.WithTimeout(ctx, serverHealthTimeout)
+
+		var health struct {
+			Healthy bool `json:"healthy"`
+		}
+
+		err := client.Do(probeCtx, "", http.MethodGet, "/global/health", nil, &health)
+
+		cancel()
+
+		if err == nil && health.Healthy {
+			return nil
+		}
+
+		if err == nil {
+			err = errors.New("native server reports unhealthy")
+		}
+
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			a.log.InfoContext(ctx, "opencode health request stalled; retrying", slog.Duration("request_timeout", serverHealthTimeout))
+		}
+
+		select {
+		case <-proc.Done():
+			message := "opencode server exited before it was ready"
+			if line := proc.StderrLastLine(); line != "" {
+				message += ": " + line
+			}
+
+			return errors.New(message)
+		case <-ctx.Done():
+			return fmt.Errorf("last health request: %v: %w", err, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func (rt *runtime) pump(ctx context.Context) {
 	defer close(rt.done)
 

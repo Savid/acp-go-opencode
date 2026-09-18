@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -34,7 +35,10 @@ const fakeOpenCodeResumeHold = 30 * time.Second
 // once a sibling ".armed" file exists; it stays down until the file is removed.
 const fakeOpenCodeEnvStartHold = "ACP_GO_OPENCODE_TEST_START_HOLD"
 
+const fakeOpenCodeEnvHealthHold = "ACP_GO_OPENCODE_TEST_HEALTH_HOLD"
+
 type fakeOpenCode struct {
+	healthCalls atomic.Int32
 	mu          sync.Mutex
 	rows        []opencode.SyncEvent
 	sessions    map[string]opencode.NativeSession
@@ -215,6 +219,12 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch path {
 	case "/global/health":
+		if hold := os.Getenv(fakeOpenCodeEnvHealthHold); hold != "" && f.healthCalls.Add(1) == 1 {
+			_ = os.WriteFile(hold, []byte("held\n"), 0o600)
+			<-r.Context().Done()
+
+			return
+		}
 		fakeWrite(w, map[string]any{"healthy": true, "version": "1.18.30"})
 
 		return

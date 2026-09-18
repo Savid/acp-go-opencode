@@ -1,9 +1,11 @@
 package opencodeacp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/process"
@@ -11,6 +13,21 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
+
+func TestStartupRetriesStalledHealthRequest(t *testing.T) {
+	t.Parallel()
+	held := filepath.Join(t.TempDir(), "health-request")
+	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", fakeOpenCodeEnvHealthHold: held}))...)
+	t.Cleanup(func() { require.NoError(t, a.Close()) })
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := a.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	created, err := a.NewSession(ctx, wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	require.NotEmpty(t, created.SessionId)
+	require.FileExists(t, held)
+}
 
 // A seed file the adapter cannot own is refused as an invalid option naming
 // seedFiles, not reported as a native start failure.
