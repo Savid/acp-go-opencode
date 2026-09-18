@@ -62,16 +62,7 @@ func (s *session) configOptions() []acp.SessionConfigOption {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	models := acp.SessionConfigSelectOptionsUngrouped{}
-	seen := map[string]bool{}
-	add := func(id, name string, meta map[string]any) {
-		if id == "" || seen[id] {
-			return
-		}
-
-		seen[id] = true
-		models = append(models, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(id), Name: name, Meta: meta})
-	}
+	rows := make([]wire.ModelRow, 0, len(s.models.Providers))
 
 	for _, p := range s.models.Providers {
 		keys := make([]string, 0, len(p.Models))
@@ -92,7 +83,7 @@ func (s *session) configOptions() []acp.SessionConfigOption {
 
 			sort.Strings(variants)
 
-			meta := map[string]any{"modelId": id}
+			meta := map[string]any{}
 			if len(variants) > 0 {
 				meta["supportedEffortLevels"] = variants
 			}
@@ -101,15 +92,11 @@ func (s *session) configOptions() []acp.SessionConfigOption {
 				meta["contextWindow"] = window
 			}
 
-			add(id, p.Name+" / "+m.Name, map[string]any{vendor: meta})
+			rows = append(rows, wire.ModelRow{ID: id, Name: p.Name + " / " + m.Name, Meta: meta})
 		}
 	}
 
-	for _, id := range s.agent.options.ConfiguredModels {
-		add(id, id, nil)
-	}
-
-	add(s.model, s.model, nil)
+	models := wire.ModelSelectOptions(vendor, s.model, rows, s.agent.options.ConfiguredModels)
 
 	options := []acp.SessionConfigOption{}
 
@@ -213,7 +200,10 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 		return nil, wire.InternalFailure(vendor, "")
 	}
 
-	return s.configOptions(), nil
+	options := s.configOptions()
+	_ = s.emit(ctx, acp.SessionUpdate{ConfigOptionUpdate: &acp.SessionConfigOptionUpdate{ConfigOptions: options}})
+
+	return options, nil
 }
 func (s *session) emitCommands(ctx context.Context) error {
 	s.mu.Lock()

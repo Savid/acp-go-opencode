@@ -41,7 +41,8 @@ const (
 
 	vendor = "opencode"
 
-	capabilityMethodKey = "method"
+	capabilityMethodKey      = "method"
+	capabilityElicitationKey = "elicitation"
 )
 
 // client is the host side of the connection, as the sessions use it.
@@ -134,6 +135,7 @@ func (a *Agent) validateOptions() *acp.RequestError {
 		err   error
 	}{
 		{"home", process.ValidateOptionalAbsolutePath(options.Home)},
+		{"scratchDir", process.ValidateOptionalAbsolutePath(options.ScratchDir)},
 		{"inputHandoffRoot", image.ValidateHandoffRoot(options.InputHandoffRoot)},
 		{"defaultModel", validateOptionalModel(options.DefaultModel)},
 		{"configuredModels", validateConfiguredModels(options.ConfiguredModels)},
@@ -160,9 +162,7 @@ func validateOptionalModel(model string) error {
 		return nil
 	}
 
-	err := opencode.ModelSelectionShapeError(model)
-
-	return err
+	return opencode.ModelSelectionShapeError(model)
 }
 
 func validateConfiguredModels(ids []string) error {
@@ -249,18 +249,13 @@ func (a *Agent) Close() error {
 	}
 
 	a.closed = true
-	sessions := slices.Collect(func(yield func(*session) bool) {
-		for _, s := range a.sessions {
-			if !yield(s) {
-				return
-			}
-		}
-	})
-	a.conn = nil
+	sessions := slices.Collect(maps.Values(a.sessions))
 	a.mu.Unlock()
 
 	var errs []error
 
+	// The ladder's terminal events still need the connection, so it is cleared
+	// only once every session has run its own shutdown.
 	for _, s := range sessions {
 		if err := s.close(context.Background()); err != nil {
 			errs = append(errs, err)
@@ -271,6 +266,7 @@ func (a *Agent) Close() error {
 
 	a.mu.Lock()
 	clear(a.sessions)
+	a.conn = nil
 	a.mu.Unlock()
 
 	return errors.Join(errs...)
@@ -323,13 +319,13 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	capabilityMeta := map[string]any{
 		vendor: map[string]any{
 			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, opencodego.ProviderID, openrouter.ProviderID),
-			"elicitation":                  map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
+			capabilityElicitationKey:       map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
 			metaRawEventKey: map[string]any{
 				capabilityMethodKey: RawEventMethod, "enabledBy": "_meta.opencode.rawEvent.enabled",
 				"maxBytes": wire.RawEventMaxBytes, "defaultEnabled": false,
 			},
-			"structuredOutput": map[string]any{"config": "_meta.opencode.options.outputSchema", "result": "_meta.opencode.structuredOutput", "schema": "json_schema"},
-			"sessionStore":     map[string]any{"format": SessionStoreFormat, "key": []string{"sessionId", "subpath"}},
+			metaStructuredOutputKey: wire.StructuredOutputAdvertisement(vendor),
+			"sessionStore":          map[string]any{"format": SessionStoreFormat, "key": []string{"sessionId", "subpath"}},
 		},
 		wire.MediaEnvelopeKey: image.MediaEnvelope(a.options.ImageLimits.core(), image.Envelope{DocumentFormats: []string{}}),
 	}

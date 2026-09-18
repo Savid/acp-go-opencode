@@ -41,13 +41,13 @@ ORDER BY event.seq, event.id`
 		_ = os.Remove(output.Name())
 	}()
 
-	// The native CLI exits before large piped stdout writes finish. A regular
-	// file makes its writes synchronous; positional arguments keep the query
-	// and executable out of the shell program.
+	// The native CLI exits before large piped stdout writes finish, so its
+	// output goes straight to the file.
 	proc, err := process.Start(ctx, process.Request{
-		Executable: "/bin/sh",
-		Args:       []string{"-c", `output=$1; shift; exec "$@" > "$output"`, "opencode-history", output.Name(), executable, "db", query, "--format", "json"},
+		Executable: executable,
+		Args:       []string{"db", query, "--format", "json"},
 		Env:        environment,
+		Stdout:     output,
 	})
 	if err != nil {
 		return nil, err
@@ -79,6 +79,12 @@ ORDER BY event.seq, event.id`
 
 	if result.ExitCode != 0 {
 		return nil, fmt.Errorf("opencode database query exited with status %d", result.ExitCode)
+	}
+
+	// The child wrote through a duplicate of this descriptor, so the shared
+	// offset sits at the end of its output.
+	if _, err = output.Seek(0, io.SeekStart); err != nil {
+		return nil, err
 	}
 
 	data, err := io.ReadAll(io.LimitReader(output, MaxBodyBytes+1))

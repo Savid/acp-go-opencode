@@ -23,7 +23,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags := flag.NewFlagSet("acp-go-opencode", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
-	nativePath := flags.String("path", "", "opencode executable; a bare name is searched on PATH")
+	executablePath := flags.String("path", "", "opencode executable; a bare name is searched on PATH")
 	home := flags.String("home", "", "root for native XDG data, config, cache, and state; empty inherits native resolution")
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral adapter state; empty means the system temp directory")
 	model := flags.String("model", "", "default model for new sessions as provider/id")
@@ -49,21 +49,21 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
 
-	telemetry, err := configureTelemetry(ctx, logger, version())
+	telemetry, telemetryOptions, err := configureTelemetry(ctx, logger, version())
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "acp-go-opencode: configure OpenTelemetry: %v\n", err)
 
 		return 1
 	}
 
-	logger = telemetry.logger
+	logger = telemetry.Logger
 
 	ctx, stop := signal.NotifyContext(ctx, forwardedSignals()...)
 	defer stop()
 
 	options := []opencodeacp.Option{
 		opencodeacp.WithAgentVersion(version()),
-		opencodeacp.WithExecutablePath(*nativePath),
+		opencodeacp.WithExecutablePath(*executablePath),
 		opencodeacp.WithHome(*home),
 		opencodeacp.WithScratchDir(*scratchDir),
 		opencodeacp.WithDefaultModel(*model),
@@ -73,10 +73,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		options = append(options, opencodeacp.WithSeedFiles(seedFiles.Files))
 	}
 
-	options = append(options, telemetry.options...)
+	options = append(options, telemetryOptions...)
 
 	serveErr := opencodeacp.Serve(ctx, stdin, stdout, options...)
-	shutdownErr := telemetry.shutdown(context.Background())
+	shutdownErr := telemetry.Shutdown(context.Background())
 
 	if serveErr != nil && ctx.Err() == nil {
 		_, _ = fmt.Fprintf(stderr, "acp-go-opencode: %v\n", serveErr)

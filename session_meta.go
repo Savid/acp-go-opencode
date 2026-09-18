@@ -20,8 +20,12 @@ const (
 	metaOutputSchemaKey  = "outputSchema"
 	metaEffortKey        = "effort"
 	metaEnabledKey       = "enabled"
-	metaModeKey          = "mode"
-	metaPermissionKey    = "permission"
+
+	// metaStructuredOutputKey names both the discovery object and the result
+	// member native structured output lands on.
+	metaStructuredOutputKey = "structuredOutput"
+	metaModeKey             = "mode"
+	metaPermissionKey       = "permission"
 )
 
 // OpenCodeOptions is the per-session options struct carried at _meta.opencode.options.

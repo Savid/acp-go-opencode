@@ -388,7 +388,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	if len(t.state.structured) > 0 {
 		var value any
 		if json.Unmarshal(t.state.structured, &value) == nil {
-			meta = map[string]any{vendor: map[string]any{"structuredOutput": value}}
+			meta = map[string]any{vendor: map[string]any{metaStructuredOutputKey: value}}
 		}
 	}
 
