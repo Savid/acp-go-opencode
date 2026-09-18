@@ -14,6 +14,8 @@ func TestUsageAccessVerifiesNativeRoute(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct{ name, provider, npm, endpoint, options, modelOptions, headers, auth, key, reason string }{
 		{name: "native key", key: "native-key"},
+		{name: "Go OpenAI route", provider: "opencode-go", npm: "@ai-sdk/openai-compatible", endpoint: "https://opencode.ai/zen/go/v1", key: "native-key"},
+		{name: "Go Anthropic route", provider: "opencode-go", npm: "@ai-sdk/anthropic", endpoint: "https://opencode.ai/zen/go/v1", key: "native-key"},
 		{name: "effective override", options: `{"apiKey":"override"}`, key: "override"},
 		{name: "disabled override", options: `{"apiKey":""}`, reason: wire.AccountUsageNotAuthenticated},
 		{name: "proxy", options: `{"baseURL":"https://proxy.invalid/v1"}`, reason: wire.AccountUsageNotReported},
@@ -22,10 +24,6 @@ func TestUsageAccessVerifiesNativeRoute(t *testing.T) {
 		{name: "provider auth hook", auth: `{"openrouter":[{"type":"api","label":"Custom key"}]}`, reason: wire.AccountUsageNotReported},
 		{name: "provider auth loader without login methods", auth: `{"openrouter":[]}`, reason: wire.AccountUsageNotReported},
 		{name: "unrelated provider auth hook", auth: `{"kimi-for-coding-oauth":[{"type":"oauth","label":"Kimi"}]}`, key: "native-key"},
-		{name: "anthropic SDK default route", provider: "anthropic", npm: "@ai-sdk/anthropic", options: `{"headers":{"anthropic-beta":"oauth-2025-04-20"}}`, key: "native-key"},
-		{name: "anthropic explicit route", provider: "anthropic", npm: "@ai-sdk/anthropic", endpoint: "https://api.anthropic.com/v1", key: "native-key"},
-		{name: "anthropic proxy", provider: "anthropic", npm: "@ai-sdk/anthropic", options: `{"baseURL":"https://proxy.invalid/v1"}`, reason: wire.AccountUsageNotReported},
-		{name: "anthropic auth plugin", provider: "anthropic", npm: "@ai-sdk/anthropic", auth: `{"anthropic":[]}`, reason: wire.AccountUsageNotReported},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

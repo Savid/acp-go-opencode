@@ -123,7 +123,7 @@ model calls. Live tests copy native auth into temporary homes and spend tokens.
 ## Account usage
 
 `AccountUsageMethod` (`_opencode/accountUsage`) accepts `sessionId` and
-`providerId` (`opencode-go`, `openrouter`, or `anthropic`). Initialization advertises the
+`providerId` (`opencode-go` or `openrouter`). Initialization advertises the
 method, session scope, and supported providers. Reads hold the session's
 foreground gate and spend no model tokens.
 
@@ -141,7 +141,6 @@ remaining balance is preserved. Account credits and key caps remain separate.
 Each measurement retains its own observation and expiry times. Unavailable
 optional account credits do not discard key data.
 
-Anthropic OAuth and setup tokens expose Claude subscription windows and reported
-monetary spending. Ordinary Anthropic API keys return `not_reported`.
-OpenCode's ChatGPT authentication plugin does not expose its effective OAuth
-credential through the native provider catalog, so ChatGPT usage is not advertised.
+Claude and ChatGPT subscription usage require effective OAuth credentials from
+the native runtime. The provider catalog exposes API-key routes only; plugin
+credentials are private, so subscription usage is not advertised.

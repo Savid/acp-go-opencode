@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/savid/acp-go-core/usage"
-	"github.com/savid/acp-go-core/usage/anthropic"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
@@ -32,8 +31,6 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 	var reader usage.Reader
 
 	switch request.ProviderID {
-	case anthropic.ProviderID:
-		reader = anthropic.Reader{Transport: a.usageTransport}
 	case opencodego.ProviderID:
 		reader = opencodego.Reader{Transport: a.usageTransport}
 	case openrouter.ProviderID:
