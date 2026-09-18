@@ -129,8 +129,9 @@ foreground gate and spend no model tokens.
 
 The adapter resolves the directory's effective API key and route through the
 native server. Only official endpoints and verified API-key routes are read;
-custom plugins or authentication overrides yield `not_reported`. Credentials
-stay local. Provider HTTP reads come from `github.com/savid/acp-go-core/usage`.
+authentication plugins for the requested provider or unverified authentication
+overrides yield `not_reported`. Plugins for other providers do not block reads.
+Credentials stay local. Provider HTTP reads come from `github.com/savid/acp-go-core/usage`.
 
 OpenCode Go reports rolling, weekly, and monthly percentage windows. OpenRouter
 reports key spending caps, lifetime spend, free-model request counts, and any

@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/url"
-	"path/filepath"
 	"strings"
 
 	"github.com/savid/acp-go-core/usage"
@@ -91,9 +89,7 @@ func (s *session) readProviderUsage(ctx context.Context, rt *binding, providerID
 		modelID = ""
 	}
 
-	plugin := (&url.URL{Scheme: partFile, Path: filepath.ToSlash(filepath.Join(rt.server.root, "environment.mjs"))}).String()
-
-	access, err := rt.client.UsageAccess(ctx, s.cwd, providerID, modelID, plugin)
+	access, err := rt.client.UsageAccess(ctx, s.cwd, providerID, modelID)
 	if err != nil {
 		return wire.AccountUsageResponse{}, err
 	}
@@ -107,7 +103,7 @@ func (s *session) readProviderUsage(ctx context.Context, rt *binding, providerID
 		return wire.AccountUsageResponse{}, err
 	}
 
-	current, err := rt.client.UsageAccess(ctx, s.cwd, providerID, modelID, plugin)
+	current, err := rt.client.UsageAccess(ctx, s.cwd, providerID, modelID)
 	if err != nil {
 		return wire.AccountUsageResponse{}, err
 	}

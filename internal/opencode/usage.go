@@ -35,23 +35,19 @@ type usageProvider struct {
 }
 
 // UsageAccess resolves the addressed directory's effective credentials and model route.
-func (c *Client) UsageAccess(ctx context.Context, directory, providerID, modelID, ownPlugin string) (UsageAccess, error) {
-	var config *struct {
-		Plugin []json.RawMessage `json:"plugin"`
-	}
-	if err := c.Do(ctx, directory, http.MethodGet, "/config", nil, &config); err != nil {
+func (c *Client) UsageAccess(ctx context.Context, directory, providerID, modelID string) (UsageAccess, error) {
+	var auth map[string]json.RawMessage
+	if err := c.Do(ctx, directory, http.MethodGet, "/provider/auth", nil, &auth); err != nil {
 		return UsageAccess{}, err
 	}
 
-	if config == nil {
-		return UsageAccess{}, errors.New("native configuration missing")
+	if auth == nil {
+		return UsageAccess{}, errors.New("native authentication methods missing")
 	}
 
-	for _, entry := range config.Plugin {
-		var plugin string
-		if json.Unmarshal(entry, &plugin) != nil || plugin != ownPlugin {
-			return UsageAccess{Reason: wire.AccountUsageNotReported}, nil //nolint:nilerr // An unverifiable plugin makes the route unavailable.
-		}
+	// Native auth methods identify providers whose credentials are controlled by plugins.
+	if _, hooked := auth[providerID]; hooked {
+		return UsageAccess{Reason: wire.AccountUsageNotReported}, nil
 	}
 
 	var catalog struct {

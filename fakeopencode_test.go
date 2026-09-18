@@ -232,7 +232,7 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fakeWrite(w, map[string]any{"components": map[string]any{"schemas": map[string]any{"OutputFormatJsonSchema": map[string]any{}}}})
 
 		return
-	case "/config":
+	case "/provider/auth":
 		fakeWrite(w, map[string]any{})
 
 		return
