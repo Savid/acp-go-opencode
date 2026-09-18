@@ -22,6 +22,7 @@ import (
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/usage/anthropic"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
@@ -322,7 +323,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 
 	capabilityMeta := map[string]any{
 		vendor: map[string]any{
-			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, opencodego.ProviderID, openrouter.ProviderID),
+			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, opencodego.ProviderID, openrouter.ProviderID, anthropic.ProviderID),
 			"elicitation":                  map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
 			metaRawEventKey: map[string]any{
 				capabilityMethodKey: RawEventMethod, "enabledBy": "_meta.opencode.rawEvent.enabled",

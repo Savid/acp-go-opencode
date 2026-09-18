@@ -8,10 +8,13 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/savid/acp-go-core/usage/anthropic"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
 )
+
+const usageSDKAnthropic = "@ai-sdk/anthropic"
 
 // UsageAccess describes a verified native API-key route. Credential material stays local.
 type UsageAccess struct {
@@ -92,7 +95,7 @@ func (p usageProvider) usageAccess(providerID, modelID string) (UsageAccess, err
 		return unsupported, nil //nolint:nilerr // Unrecognized headers cannot establish authentication.
 	}
 
-	if !usageHeaders(headers) {
+	if !usageHeaders(providerID, headers) {
 		return unsupported, nil
 	}
 
@@ -116,7 +119,7 @@ func (p usageProvider) usageAccess(providerID, modelID string) (UsageAccess, err
 			endpoint = model.API.URL
 		}
 
-		if !usageRoute(providerID, endpoint, model.API.NPM) || !usageHeaders(model.Headers) {
+		if !usageRoute(providerID, endpoint, model.API.NPM) || !usageHeaders(providerID, model.Headers) {
 			return unsupported, nil
 		}
 
@@ -143,10 +146,14 @@ func (p usageProvider) usageAccess(providerID, modelID string) (UsageAccess, err
 	return UsageAccess{APIKey: key, Fingerprint: sha256.Sum256(raw)}, nil
 }
 
-func usageHeaders(headers map[string]string) bool {
+func usageHeaders(providerID string, headers map[string]string) bool {
 	for name := range headers {
 		switch strings.ToLower(name) {
 		case "http-referer", "x-title", "x-source":
+		case "anthropic-beta", "anthropic-version":
+			if providerID != anthropic.ProviderID {
+				return false
+			}
 		default:
 			return false
 		}
@@ -159,10 +166,12 @@ func usageRoute(providerID, endpoint, npm string) bool {
 	endpoint = strings.TrimSuffix(endpoint, "/")
 
 	switch providerID {
+	case anthropic.ProviderID:
+		return (endpoint == "" || strings.TrimSuffix(endpoint, "/v1") == strings.TrimSuffix(anthropic.Endpoint, "/api/oauth/usage")) && npm == usageSDKAnthropic
 	case openrouter.ProviderID:
 		return endpoint == strings.TrimSuffix(openrouter.Endpoint, "/key") && npm == "@openrouter/ai-sdk-provider"
 	case opencodego.ProviderID:
-		return endpoint == strings.TrimSuffix(opencodego.Endpoint, "/usage") && (npm == "@ai-sdk/openai-compatible" || npm == "@ai-sdk/anthropic" || npm == "@ai-sdk/openai")
+		return endpoint == strings.TrimSuffix(opencodego.Endpoint, "/usage") && (npm == "@ai-sdk/openai-compatible" || npm == usageSDKAnthropic || npm == "@ai-sdk/openai")
 	default:
 		return false
 	}

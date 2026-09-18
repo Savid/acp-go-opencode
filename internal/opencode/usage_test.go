@@ -12,7 +12,7 @@ import (
 
 func TestUsageAccessVerifiesNativeRoute(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct{ name, options, modelOptions, headers, auth, key, reason string }{
+	for _, tc := range []struct{ name, provider, npm, endpoint, options, modelOptions, headers, auth, key, reason string }{
 		{name: "native key", key: "native-key"},
 		{name: "effective override", options: `{"apiKey":"override"}`, key: "override"},
 		{name: "disabled override", options: `{"apiKey":""}`, reason: wire.AccountUsageNotAuthenticated},
@@ -22,9 +22,17 @@ func TestUsageAccessVerifiesNativeRoute(t *testing.T) {
 		{name: "provider auth hook", auth: `{"openrouter":[{"type":"api","label":"Custom key"}]}`, reason: wire.AccountUsageNotReported},
 		{name: "provider auth loader without login methods", auth: `{"openrouter":[]}`, reason: wire.AccountUsageNotReported},
 		{name: "unrelated provider auth hook", auth: `{"kimi-for-coding-oauth":[{"type":"oauth","label":"Kimi"}]}`, key: "native-key"},
+		{name: "anthropic SDK default route", provider: "anthropic", npm: "@ai-sdk/anthropic", options: `{"headers":{"anthropic-beta":"oauth-2025-04-20"}}`, key: "native-key"},
+		{name: "anthropic explicit route", provider: "anthropic", npm: "@ai-sdk/anthropic", endpoint: "https://api.anthropic.com/v1", key: "native-key"},
+		{name: "anthropic proxy", provider: "anthropic", npm: "@ai-sdk/anthropic", options: `{"baseURL":"https://proxy.invalid/v1"}`, reason: wire.AccountUsageNotReported},
+		{name: "anthropic auth plugin", provider: "anthropic", npm: "@ai-sdk/anthropic", auth: `{"anthropic":[]}`, reason: wire.AccountUsageNotReported},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			provider, npm, endpoint := tc.provider, tc.npm, tc.endpoint
+			if provider == "" {
+				provider, npm, endpoint = "openrouter", "@openrouter/ai-sdk-provider", "https://openrouter.ai/api/v1"
+			}
 			options, modelOptions, headers, auth := tc.options, tc.modelOptions, tc.headers, tc.auth
 			if options == "" {
 				options = `{}`
@@ -49,7 +57,7 @@ func TestUsageAccessVerifiesNativeRoute(t *testing.T) {
 				case "/provider/auth":
 					body = auth
 				case "/config/providers":
-					body = `{"providers":[{"id":"openrouter","key":"native-key","options":` + options + `,"models":{"model":{"api":{"url":"https://openrouter.ai/api/v1","npm":"@openrouter/ai-sdk-provider"},"headers":` + headers + `,"options":` + modelOptions + `}}}]}`
+					body = `{"providers":[{"id":"` + provider + `","key":"native-key","options":` + options + `,"models":{"model":{"api":{"url":"` + endpoint + `","npm":"` + npm + `"},"headers":` + headers + `,"options":` + modelOptions + `}}}]}`
 				default:
 					w.WriteHeader(http.StatusNotFound)
 
@@ -59,7 +67,7 @@ func TestUsageAccessVerifiesNativeRoute(t *testing.T) {
 			}))
 			defer server.Close()
 			client := &Client{URL: server.URL, http: server.Client()}
-			access, err := client.UsageAccess(t.Context(), "/workspace", "openrouter", "model")
+			access, err := client.UsageAccess(t.Context(), "/workspace", provider, "model")
 			require.NoError(t, err)
 			require.Equal(t, tc.reason, access.Reason)
 			require.Equal(t, tc.key, access.APIKey)
