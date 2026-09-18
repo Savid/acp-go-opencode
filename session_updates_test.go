@@ -118,8 +118,24 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 					Payload opencode.Event `json:"payload"`
 				}
 				require.NoError(t, json.Unmarshal(frame, &envelope))
-				s.handleEvent(t.Context(), rt, envelope.Payload)
+				rt.events <- envelope.Payload
 			}
+			require.Eventually(t, func() bool {
+				if failCommit {
+					select {
+					case <-rt.done:
+						return true
+					default:
+						return false
+					}
+				}
+				s.mu.Lock()
+				settled := s.cycle == nil
+				s.mu.Unlock()
+				entries := trace.snapshot()
+
+				return settled && len(entries) > 0 && entries[len(entries)-1] == "idle"
+			}, testTimeout, time.Millisecond)
 			require.NotEmpty(t, trace.snapshot())
 			require.Equal(t, "running", trace.snapshot()[0])
 			for _, event := range lifecycleEvents(rec.snapshot()) {
