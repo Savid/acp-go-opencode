@@ -43,11 +43,13 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 
 	return rt, nil
 }
+
 func (s *session) startFailure(ctx context.Context, err error) error {
-	s.agent.log.ErrorContext(ctx, "OpenCode session start failed", slog.String("reason", err.Error()))
+	s.agent.log.ErrorContext(ctx, "opencode session start failed", slog.String("reason", err.Error()))
 
 	return wire.InternalFailure(vendor, internalClassNativeStart)
 }
+
 func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expectID string) error {
 	var native opencode.NativeSession
 
@@ -138,6 +140,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expe
 
 	return nil
 }
+
 func (s *session) carrierMetadata(base map[string]any) map[string]any {
 	result := wire.CloneMap(base)
 	if result == nil {
@@ -153,6 +156,7 @@ func (s *session) carrierMetadata(base map[string]any) map[string]any {
 
 	return result
 }
+
 func (s *session) permissionRules() []map[string]string {
 	permission := s.options.Permission
 	if permission == "" {

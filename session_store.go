@@ -48,7 +48,7 @@ func (s *session) record() sessionRecord {
 }
 
 func (r sessionRecord) validate(id string) error {
-	if r.NativeSessionID == "" || r.SessionID != id || !filepath.IsAbs(r.Cwd) || r.UpdatedAtUnixMilli <= 0 {
+	if !validNativeSessionID(r.NativeSessionID) || r.SessionID != id || !filepath.IsAbs(r.Cwd) || r.UpdatedAtUnixMilli <= 0 {
 		return errors.New("invalid session record")
 	}
 
@@ -81,8 +81,23 @@ func (r sessionRecord) validate(id string) error {
 	return nil
 }
 
-// commitMirror replaces only a complete native snapshot and its matching
-// carrier, read through the binding the caller dispatched on.
+func validNativeSessionID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
+// commitMirror atomically stores a complete native snapshot and its configuration.
 func (s *session) commitMirror(ctx context.Context, rt *binding) error {
 	s.mirrorMu.Lock()
 	defer s.mirrorMu.Unlock()
@@ -199,6 +214,7 @@ func decodeEvents(rows [][]byte, id string) ([]opencode.SyncEvent, error) {
 
 	return events, nil
 }
+
 func syncGraph(events []opencode.SyncEvent, id string) map[string]bool {
 	parents := map[string]string{}
 
@@ -233,6 +249,7 @@ func syncGraph(events []opencode.SyncEvent, id string) map[string]bool {
 
 	return allowed
 }
+
 func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, error) {
 	if err := s.requireNativeIdle(ctx, rt); err != nil {
 		return nil, err
@@ -379,6 +396,7 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 
 	return result, nil
 }
+
 func sameSyncEvent(a, b opencode.SyncEvent) bool {
 	left, _ := json.Marshal(a)
 	right, _ := json.Marshal(b)
@@ -392,7 +410,7 @@ func sameSyncEvent(a, b opencode.SyncEvent) bool {
 }
 
 func (a *Agent) restoreRefused(ctx context.Context, id acp.SessionId, err error) error {
-	a.log.ErrorContext(ctx, "OpenCode session restore failed", slog.String(nativeSessionIDKey, string(id)), slog.String("reason", err.Error()))
+	a.log.ErrorContext(ctx, "opencode session restore failed", slog.String("session_id", string(id)), slog.String("reason", err.Error()))
 
 	return wire.RestoreFailed(vendor)
 }
@@ -490,6 +508,7 @@ func nativeMessages(rows [][]byte, id string) []opencode.NativeMessage {
 
 	return result
 }
+
 func (s *session) replay(ctx context.Context, rows [][]byte) error {
 	c := &cycle{}
 

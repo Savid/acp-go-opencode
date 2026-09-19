@@ -26,6 +26,7 @@ func ModelSelectionShapeError(value string) error {
 
 	return nil
 }
+
 func HomeEnvironment(home string) map[string]string {
 	owned := map[string]string{}
 
@@ -37,6 +38,7 @@ func HomeEnvironment(home string) map[string]string {
 
 	return owned
 }
+
 func DataDir(lookup func(string) (string, bool)) string {
 	if value, _ := lookup("XDG_DATA_HOME"); value != "" {
 		return filepath.Join(value, "opencode")
@@ -46,6 +48,7 @@ func DataDir(lookup func(string) (string, bool)) string {
 
 	return filepath.Join(home, ".local", "share", "opencode")
 }
+
 func ConfigDir(lookup func(string) (string, bool)) string {
 	if value, _ := lookup("XDG_CONFIG_HOME"); value != "" {
 		return filepath.Join(value, "opencode")
@@ -91,6 +94,7 @@ func WritePlugin(root, config string, ownsHome bool) (string, error) {
 
 	return string(data), err
 }
+
 func CheckPlugin(root, directory string) error {
 	canonical, err := filepath.EvalSymlinks(directory)
 	if err != nil {

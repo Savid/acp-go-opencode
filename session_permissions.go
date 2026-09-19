@@ -94,6 +94,7 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 		}
 	}()
 }
+
 func (s *session) requestPermission(ctx context.Context, c *cycle, request opencode.PermissionRequest) string {
 	conn := s.agent.connection()
 	if conn == nil || ctx.Err() != nil {
@@ -139,6 +140,7 @@ func (s *session) requestPermission(ctx context.Context, c *cycle, request openc
 
 	return choice
 }
+
 func (s *session) elicit(ctx context.Context, c *cycle, request opencode.QuestionRequest) [][]string {
 	conn := s.agent.connection()
 	if conn == nil || !s.agent.clientSupportsFormElicitation() || ctx.Err() != nil {
@@ -226,7 +228,7 @@ func announcedRequest[T any](
 	value, callErr := wire.CallAndAnnounce(ctx, s.agent.transportRef(), s.lc.Correlation(c.Cycle, actionID), send, func() {
 		if err := s.lc.ActionPending(ctx, c.Cycle, actionID, kind); err != nil {
 			s.agent.log.ErrorContext(ctx, "announce lifecycle action failed",
-				slog.String(nativeSessionIDKey, string(s.id)), slog.String("reason", err.Error()))
+				slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 		}
 	})
 
@@ -238,7 +240,7 @@ func announcedRequest[T any](
 
 	if err := s.lc.ActionResolved(context.WithoutCancel(ctx), c.Cycle, actionID, state); err != nil {
 		s.agent.log.ErrorContext(ctx, "resolve lifecycle action failed",
-			slog.String(nativeSessionIDKey, string(s.id)), slog.String("reason", err.Error()))
+			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 	}
 
 	return value, callErr

@@ -56,6 +56,7 @@ func NewClient() (*Client, error) {
 
 	return &Client{URL: "http://" + address, Password: NewID(""), http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
+
 func NewID(prefix string) string {
 	var value [24]byte
 
@@ -63,11 +64,13 @@ func NewID(prefix string) string {
 
 	return prefix + hex.EncodeToString(value[:])
 }
+
 func (c *Client) Args() []string {
 	_, port, _ := net.SplitHostPort(strings.TrimPrefix(c.URL, "http://"))
 
 	return []string{"serve", "--hostname", "127.0.0.1", "--port", port}
 }
+
 func (c *Client) request(ctx context.Context, directory, method, path string, body any) (*http.Response, error) {
 	var reader io.Reader
 
@@ -100,6 +103,7 @@ func (c *Client) request(ctx context.Context, directory, method, path string, bo
 
 	return response, nil
 }
+
 func (c *Client) Do(ctx context.Context, directory, method, path string, body, out any) error {
 	response, err := c.request(ctx, directory, method, path, body)
 	if err != nil {
@@ -129,6 +133,7 @@ func (c *Client) Do(ctx context.Context, directory, method, path string, body, o
 
 	return json.Unmarshal(data, out)
 }
+
 func SessionPath(id string) string { return "/session/" + url.PathEscape(id) }
 func (c *Client) Session(ctx context.Context, dir, id string) (NativeSession, error) {
 	var out NativeSession
@@ -137,6 +142,7 @@ func (c *Client) Session(ctx context.Context, dir, id string) (NativeSession, er
 
 	return out, err
 }
+
 func (c *Client) Messages(ctx context.Context, dir, id string) ([]NativeMessage, error) {
 	var out []NativeMessage
 
@@ -144,9 +150,11 @@ func (c *Client) Messages(ctx context.Context, dir, id string) ([]NativeMessage,
 
 	return out, err
 }
+
 func (c *Client) Interrupt(ctx context.Context, dir, id string) error {
 	return c.Do(ctx, dir, http.MethodPost, SessionPath(id)+"/abort", map[string]any{}, nil)
 }
+
 func (c *Client) Replay(ctx context.Context, dir string, events []SyncEvent) error {
 	rows := make([]map[string]any, 0, len(events))
 	for _, e := range events {
@@ -172,6 +180,7 @@ func (s *Stream) Err() error {
 
 	return s.err
 }
+
 func (s *Stream) Close() { s.cancel(); _ = s.body.Close(); <-s.done }
 
 //nolint:bodyclose // The returned stream owns the response body and closes it in its joined reader.
@@ -207,6 +216,7 @@ func (c *Client) Subscribe(ctx context.Context) (*Stream, error) {
 
 	return s, nil
 }
+
 func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), MaxBodyBytes)

@@ -43,6 +43,7 @@ func (s *session) refreshCatalogs(ctx context.Context, rt *binding) error {
 
 	return nil
 }
+
 func (s *session) modelImageCapability() *bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -58,6 +59,7 @@ func (s *session) modelImageCapability() *bool {
 
 	return nil
 }
+
 func (s *session) configOptions() []acp.SessionConfigOption {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -153,6 +155,7 @@ func (s *session) configOptions() []acp.SessionConfigOption {
 
 	return options
 }
+
 func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, value string) ([]acp.SessionConfigOption, error) {
 	if id != configModel && id != configMode && id != configEffort {
 		return nil, wire.Unsupported("configId")
@@ -186,6 +189,8 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 	}
 
 	s.mu.Lock()
+	oldModel, oldMode, oldEffort := s.model, s.mode, s.effort
+
 	switch id {
 	case configModel:
 		s.model = value
@@ -197,6 +202,10 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 	s.mu.Unlock()
 
 	if err := s.commitMirror(ctx, rt); err != nil {
+		s.mu.Lock()
+		s.model, s.mode, s.effort = oldModel, oldMode, oldEffort
+		s.mu.Unlock()
+
 		return nil, wire.InternalFailure(vendor, "")
 	}
 
@@ -205,6 +214,7 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 
 	return options, nil
 }
+
 func (s *session) emitCommands(ctx context.Context) error {
 	s.mu.Lock()
 	native := slices.Clone(s.commands)

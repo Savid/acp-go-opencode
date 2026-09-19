@@ -231,3 +231,26 @@ func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	require.Equal(t, record.NativeSessionID, after.NativeSessionID)
 	require.Equal(t, string(id), after.SessionID)
 }
+
+func TestFailedConfigChangeDoesNotReachTheNextCommit(t *testing.T) {
+	t.Parallel()
+	store := &recoveryFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	session := h.newSession()
+	var before sessionRecord
+	_, found, err := sessionlog.Load(t.Context(), store, string(session.SessionId), &before)
+	require.NoError(t, err)
+	require.True(t, found)
+	store.fail.Store(true)
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configModel, "fake/text"))
+	require.Error(t, err)
+	store.fail.Store(false)
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configEffort, "high"))
+	require.NoError(t, err)
+	var after sessionRecord
+	_, found, err = sessionlog.Load(t.Context(), store, string(session.SessionId), &after)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, before.Model, after.Model)
+}

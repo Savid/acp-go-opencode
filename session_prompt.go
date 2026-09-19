@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -25,10 +24,6 @@ const (
 	stopReasonLength    = "length"
 	stopReasonMaxTokens = "max_tokens"
 	stopReasonError     = "error"
-
-	// processExitGrace is how long failure classification waits for a dead
-	// child to be reaped after its stdout closed.
-	processExitGrace = 2 * time.Second
 )
 
 // nativePrompt retains ordered native parts and the text used for command routing.
@@ -262,31 +257,7 @@ func (s *session) dispatchFailure(ctx context.Context, rt *binding, err error) e
 // child's exit status and last stderr line where it died, otherwise the
 // transport error.
 func (s *session) transportFailure(ctx context.Context, rt *binding, err error) error {
-	waitCtx, cancel := context.WithTimeout(ctx, processExitGrace)
-	defer cancel()
-
-	if result, waitErr := rt.server.proc.Wait(waitCtx); waitErr == nil {
-		message := fmt.Sprintf("opencode process exited with status %d", result.ExitCode)
-		if result.Signal != 0 {
-			message = fmt.Sprintf("opencode process was killed by signal %d", result.Signal)
-		}
-
-		if line := rt.server.proc.StderrLastLine(); line != "" {
-			message += ": " + line
-		}
-
-		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProcessExit, Message: message})
-	}
-
-	if err == nil {
-		err = rt.server.stream.Err()
-	}
-
-	if err == nil {
-		err = errors.New("opencode event stream closed mid-turn")
-	}
-
-	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: err.Error()})
+	return wire.TurnFailed(vendor, wire.TransportFailure(ctx, rt.server.proc, "opencode process", err, rt.server.stream.Err))
 }
 
 // cycleVerdict is how one cycle ended, in the terms the lifecycle stream and
@@ -363,7 +334,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 		if err := s.commitMirror(settleCtx, rt); err != nil {
 			s.stopRuntime(settleCtx, rt)
 			s.lc.Fence()
-			verdict.failure = s.mirrorFailure(err)
+			verdict.failure = s.mirrorFailure(&t.state, err)
 			verdict.outcome = lifecycle.OutcomeFailed
 		}
 	}
@@ -399,11 +370,19 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	}, nil
 }
 
-// mirrorFailure reports a failed durability boundary without exposing native content.
-func (s *session) mirrorFailure(err error) error {
-	s.agent.log.Error("session mirror commit failed", slog.String(nativeSessionIDKey, string(s.id)), slog.String("reason", err.Error()))
+// mirrorFailure maps a failed mirror commit onto the turn-failure shape. A
+// turn that delivered image bytes lost their durable replay representation.
+func (s *session) mirrorFailure(state *cycleState, err error) error {
+	s.agent.log.Error("session mirror commit failed", slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 
-	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: "session mirror commit failed"})
+	failure := wire.TurnFailure{Cause: wire.CauseTransport, Message: "session mirror commit failed"}
+	if state.imagesEmitted {
+		failure.Message = "image output is no longer available from the artifact store"
+		failure.Stage = image.OutputStage
+		failure.Reason = image.ReasonStorageFailed
+	}
+
+	return wire.TurnFailed(vendor, failure)
 }
 
 // boundTo reports whether rt is still this session's live binding.

@@ -85,6 +85,7 @@ func (a *Agent) ensureRuntime(ctx context.Context) (*runtime, error) {
 
 	return rt, nil
 }
+
 func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 	executable, err := a.ensureExecutable(ctx)
 	if err != nil {
@@ -296,6 +297,7 @@ func (rt *runtime) pump(ctx context.Context) {
 	rt.mu.Unlock()
 	_ = os.RemoveAll(rt.root)
 }
+
 func (rt *runtime) close() { rt.closeOnce.Do(func() { rt.cancel(); rt.stream.Close(); <-rt.done }) }
 func (a *Agent) stopRuntime() {
 	a.runtimeMu.Lock()

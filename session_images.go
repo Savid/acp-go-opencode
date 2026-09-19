@@ -32,6 +32,7 @@ func cloneArtifacts(values map[string]imageArtifact) map[string]imageArtifact {
 
 	return result
 }
+
 func (s *session) imageBytes(file opencode.NativeAttachment) ([]byte, string, *image.OutputError) {
 	limit := s.agent.options.ImageLimits.core().EffectiveOutputPerImage()
 	s.mu.Lock()
@@ -107,6 +108,7 @@ func (s *session) imageBytes(file opencode.NativeAttachment) ([]byte, string, *i
 
 	return data, mime, nil
 }
+
 func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.ContentBlock {
 	if parsed, err := url.Parse(file.URL); err == nil && (parsed.Scheme == "https" || parsed.Scheme == "http") {
 		return []acp.ContentBlock{{ResourceLink: &acp.ContentBlockResourceLink{Uri: file.URL, Name: file.Filename}}}
@@ -197,6 +199,7 @@ func imageReference(value string) string {
 
 	return hex.EncodeToString(sum[:])
 }
+
 func validateStoredImages(rows [][]byte, record sessionRecord) error {
 	check := func(file opencode.NativeAttachment) error {
 		if !image.IsImageMIME(file.Mime) || strings.HasPrefix(file.URL, "data:") {

@@ -8,19 +8,13 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/savid/acp-go-core/usage"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
 )
 
 const usageSDKAnthropic = "@ai-sdk/anthropic"
-
-// UsageAccess describes a verified native API-key route. Credential material stays local.
-type UsageAccess struct {
-	APIKey      string
-	Reason      string
-	Fingerprint [32]byte
-}
 
 type usageProvider struct {
 	ID      string                     `json:"id"`
@@ -37,30 +31,30 @@ type usageProvider struct {
 }
 
 // UsageAccess resolves the addressed directory's effective credentials and model route.
-func (c *Client) UsageAccess(ctx context.Context, directory, providerID, modelID string) (UsageAccess, error) {
+func (c *Client) UsageAccess(ctx context.Context, directory, providerID, modelID string) (usage.Access, error) {
 	var auth map[string]json.RawMessage
 	if err := c.Do(ctx, directory, http.MethodGet, "/provider/auth", nil, &auth); err != nil {
-		return UsageAccess{}, err
+		return usage.Access{}, err
 	}
 
 	if auth == nil {
-		return UsageAccess{}, errors.New("native authentication methods missing")
+		return usage.Access{}, errors.New("native authentication methods missing")
 	}
 
 	// Native auth methods identify providers whose credentials are controlled by plugins.
 	if _, hooked := auth[providerID]; hooked {
-		return UsageAccess{Reason: wire.AccountUsageNotReported}, nil
+		return usage.Access{Reason: wire.AccountUsageNotReported}, nil
 	}
 
 	var catalog struct {
 		Providers []usageProvider `json:"providers"`
 	}
 	if err := c.Do(ctx, directory, http.MethodGet, "/config/providers", nil, &catalog); err != nil {
-		return UsageAccess{}, err
+		return usage.Access{}, err
 	}
 
 	if catalog.Providers == nil {
-		return UsageAccess{}, errors.New("native provider catalog missing")
+		return usage.Access{}, errors.New("native provider catalog missing")
 	}
 
 	for _, provider := range catalog.Providers {
@@ -71,11 +65,11 @@ func (c *Client) UsageAccess(ctx context.Context, directory, providerID, modelID
 		return provider.usageAccess(providerID, modelID)
 	}
 
-	return UsageAccess{Reason: wire.AccountUsageNotAuthenticated}, nil
+	return usage.Access{Reason: wire.AccountUsageNotAuthenticated}, nil
 }
 
-func (p usageProvider) usageAccess(providerID, modelID string) (UsageAccess, error) {
-	unsupported := UsageAccess{Reason: wire.AccountUsageNotReported}
+func (p usageProvider) usageAccess(providerID, modelID string) (usage.Access, error) {
+	unsupported := usage.Access{Reason: wire.AccountUsageNotReported}
 
 	key := p.Key
 	if raw, present := p.Options["apiKey"]; present {
@@ -134,15 +128,15 @@ func (p usageProvider) usageAccess(providerID, modelID string) (UsageAccess, err
 	}
 
 	if strings.TrimSpace(key) == "" {
-		return UsageAccess{Reason: wire.AccountUsageNotAuthenticated}, nil
+		return usage.Access{Reason: wire.AccountUsageNotAuthenticated}, nil
 	}
 
 	raw, err := json.Marshal(p)
 	if err != nil {
-		return UsageAccess{}, errors.New("native provider configuration invalid")
+		return usage.Access{}, errors.New("native provider configuration invalid")
 	}
 
-	return UsageAccess{APIKey: key, Fingerprint: sha256.Sum256(raw)}, nil
+	return usage.Access{APIKey: key, Fingerprint: sha256.Sum256(raw)}, nil
 }
 
 func usageHeaders(headers map[string]string) bool {

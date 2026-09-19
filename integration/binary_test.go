@@ -26,11 +26,9 @@ func TestNativePersistence(t *testing.T) {
 	if os.Getenv("ACP_GO_OPENCODE_RUN_INTEGRATION") != "1" {
 		t.Skip("set ACP_GO_OPENCODE_RUN_INTEGRATION=1")
 	}
-	if _, err := exec.LookPath("opencode"); err != nil {
-		t.Skip("opencode is not installed on PATH")
-	}
+	executable := harnessPath(t)
 	store := acpcore.NewInMemorySessionStore()
-	a := opencodeacp.NewAgent(opencodeacp.WithHome(t.TempDir()), opencodeacp.WithSessionStore(store))
+	a := opencodeacp.NewAgent(opencodeacp.WithExecutablePath(executable), opencodeacp.WithHome(t.TempDir()), opencodeacp.WithSessionStore(store))
 	t.Cleanup(func() { _ = a.Close() })
 	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
@@ -51,7 +49,7 @@ func TestNativePersistence(t *testing.T) {
 	}
 	require.Contains(t, mirrored.String(), marker)
 	require.NoError(t, a.Close())
-	b := opencodeacp.NewAgent(opencodeacp.WithHome(t.TempDir()), opencodeacp.WithSessionStore(store))
+	b := opencodeacp.NewAgent(opencodeacp.WithExecutablePath(executable), opencodeacp.WithHome(t.TempDir()), opencodeacp.WithSessionStore(store))
 	t.Cleanup(func() { _ = b.Close() })
 	_, err = b.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
@@ -87,7 +85,7 @@ func TestNativeContinuation(t *testing.T) {
 	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
 	h.stop()
-	command := exec.CommandContext(h.ctx(), "opencode", "run", "--dir", cwd, "--format", "json", "--session", nativeSessionID(t, session.Meta), "Remember the release label cobalt-lantern. Reply with the project slug and release label, and nothing else. Do not use tools.")
+	command := exec.CommandContext(h.ctx(), harnessPath(t), "run", "--dir", cwd, "--format", "json", "--session", nativeSessionID(t, session.Meta), "Remember the release label cobalt-lantern. Reply with the project slug and release label, and nothing else. Do not use tools.")
 	command.Args = append(command.Args, "--model", os.Getenv("ACP_GO_OPENCODE_MODEL"))
 	command.WaitDelay = 2 * time.Second
 	var stderr bytes.Buffer

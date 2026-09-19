@@ -43,17 +43,20 @@ type session struct {
 	commands         []opencode.NativeCommand
 	title            string
 	updatedAt        string
-	closing          bool
-	closeDone        chan struct{}
-	closeErr         error
-	poison           string
-	turn             *turn
-	cycle            *cycle
-	dialogs          map[string]*dialog
-	callbacks        sync.WaitGroup
-	mirrorMu         sync.Mutex
-	lcMu             sync.Mutex
-	lc               lifecycle.Publisher
+	// installed records that the agent published the session under its id,
+	// so close owes the store its final generation.
+	installed bool
+	closing   bool
+	closeDone chan struct{}
+	closeErr  error
+	poison    string
+	turn      *turn
+	cycle     *cycle
+	dialogs   map[string]*dialog
+	callbacks sync.WaitGroup
+	mirrorMu  sync.Mutex
+	lcMu      sync.Mutex
+	lc        lifecycle.Publisher
 }
 
 // binding routes the shared server's events to one held conversation.
@@ -305,6 +308,7 @@ func (s *session) clearRuntime(rt *binding) {
 		s.runtime = nil
 	}
 }
+
 func (s *session) stopRuntime(_ context.Context, rt *binding) { rt.cancel(); <-rt.done }
 
 // completeParent records a user message whose generation ended, so a later
@@ -356,7 +360,7 @@ func (s *session) abort(ctx context.Context, rt *binding) {
 	defer cancel()
 
 	if err := rt.client.Interrupt(abortCtx, s.cwd, s.nativeID); err != nil {
-		s.agent.log.DebugContext(abortCtx, "opencode abort failed", slog.String(nativeSessionIDKey, string(s.id)))
+		s.agent.log.DebugContext(abortCtx, "opencode abort failed", slog.String("session_id", string(s.id)))
 	}
 }
 
@@ -459,7 +463,7 @@ func (s *session) poisonSession(ctx context.Context, cause string) {
 
 	_ = s.emit(ctx, acp.SessionUpdate{AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{AvailableCommands: []acp.AvailableCommand{}}})
 	s.agent.log.ErrorContext(ctx, "opencode session poisoned",
-		slog.String(nativeSessionIDKey, string(s.id)), slog.String("cause", cause))
+		slog.String("session_id", string(s.id)), slog.String("cause", cause))
 }
 
 // acquireGate admits one foreground operation. limit names the backpressure
@@ -488,6 +492,7 @@ func (s *session) close(ctx context.Context) error {
 
 	s.closing = true
 	s.closeDone = make(chan struct{})
+	installed := s.installed
 
 	t, rt, closingCycle := s.turn, s.runtime, s.cycle
 	if t != nil {
@@ -529,8 +534,10 @@ func (s *session) close(ctx context.Context) error {
 	var errs []error
 
 	if rt != nil {
-		if err := s.commitMirror(commitCtx, rt); err != nil {
-			errs = append(errs, err)
+		if installed {
+			if err := s.commitMirror(commitCtx, rt); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
 		s.stopRuntime(commitCtx, rt)

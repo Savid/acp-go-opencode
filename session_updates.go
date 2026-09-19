@@ -14,15 +14,14 @@ import (
 )
 
 const (
-	statusComplete     = "complete"
-	statusInterrupted  = "interrupted"
-	fieldCwd           = "cwd"
-	nativeSessionIDKey = "session_id"
-	fieldValue         = "value"
-	fieldType          = "type"
-	fieldText          = "text"
-	roleUser           = "user"
-	roleAssistant      = "assistant"
+	statusComplete    = "complete"
+	statusInterrupted = "interrupted"
+	fieldCwd          = "cwd"
+	fieldValue        = "value"
+	fieldType         = "type"
+	fieldText         = "text"
+	roleUser          = "user"
+	roleAssistant     = "assistant"
 )
 
 const (
@@ -53,6 +52,7 @@ type cycleState struct {
 	contextUsed   int64
 	contextMax    int64
 	structured    json.RawMessage
+	imagesEmitted bool
 }
 
 func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.Event) {
@@ -111,12 +111,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 
 		c = &t.cycle
 	} else if c == nil && info.ID != "" {
-		c = &cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseActivity}, done: make(chan struct{})}
-		s.recordFailure(c, s.lc.OpenAgentCycle(ctx, &c.Cycle))
-
-		s.mu.Lock()
-		s.cycle = c
-		s.mu.Unlock()
+		c = s.openAgentCycle(ctx)
 	}
 
 	if c == nil {
@@ -129,6 +124,23 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		s.settleAgentCycle(ctx, rt, c)
 	}
 }
+
+// openAgentCycle reserves an idle session for native work under the prompt install lock.
+func (s *session) openAgentCycle(ctx context.Context) *cycle {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.turn != nil || s.cycle != nil || s.closing {
+		return nil
+	}
+
+	c := &cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseActivity}, done: make(chan struct{})}
+	s.recordFailure(c, s.lc.OpenAgentCycle(ctx, &c.Cycle))
+	s.cycle = c
+
+	return c
+}
+
 func nativeErrorText(native *opencode.NativeError) string {
 	if native == nil {
 		return "native request failed"
@@ -148,6 +160,7 @@ func nativeErrorText(native *opencode.NativeError) string {
 
 	return native.Type
 }
+
 func (s *session) projectInfo(_ context.Context, state *cycleState, info opencode.NativeMessageInfo) error {
 	if state.messages == nil {
 		state.messages = map[string]opencode.NativeMessageInfo{}
@@ -188,6 +201,7 @@ func (s *session) projectInfo(_ context.Context, state *cycleState, info opencod
 
 	return nil
 }
+
 func (s *session) projectMessage(ctx context.Context, c *cycle, message opencode.NativeMessage) error {
 	if err := s.projectInfo(ctx, &c.state, message.Info); err != nil {
 		return err
@@ -202,6 +216,7 @@ func (s *session) projectMessage(ctx context.Context, c *cycle, message opencode
 
 	return nil
 }
+
 func (s *session) projectPart(ctx context.Context, state *cycleState, part opencode.NativePart, role string) error {
 	if part.ID == "" {
 		return errors.New("native part identity missing")
@@ -261,11 +276,16 @@ func (s *session) projectPart(ctx context.Context, state *cycleState, part openc
 			if err := s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{Content: block}}); err != nil {
 				return err
 			}
+
+			if block.Image != nil {
+				state.imagesEmitted = true
+			}
 		}
 	}
 
 	return nil
 }
+
 func (s *session) emitTool(ctx context.Context, state *cycleState, part opencode.NativePart) error {
 	if part.CallID == "" {
 		return errors.New("native tool identity missing")
@@ -301,7 +321,7 @@ func (s *session) emitTool(ctx context.Context, state *cycleState, part opencode
 		state.tools[part.CallID] = true
 	}
 
-	if native.Status != "completed" && native.Status != "error" {
+	if native.Status != "completed" && native.Status != stopReasonError {
 		if native.Input != nil {
 			return s.emit(ctx, acp.UpdateToolCall(id, acp.WithUpdateRawInput(native.Input)))
 		}
@@ -313,7 +333,7 @@ func (s *session) emitTool(ctx context.Context, state *cycleState, part opencode
 	status := acp.ToolCallStatusCompleted
 
 	output := native.Output
-	if native.Status == "error" {
+	if native.Status == stopReasonError {
 		status = acp.ToolCallStatusFailed
 		output = native.Error
 	}
@@ -332,12 +352,22 @@ func (s *session) emitTool(ctx context.Context, state *cycleState, part opencode
 				status = acp.ToolCallStatusFailed
 			}
 
+			if block.Image != nil {
+				state.imagesEmitted = true
+			}
+
 			content = append(content, acp.ToolContent(block))
 		}
 	}
 
-	return s.emit(ctx, acp.UpdateToolCall(id, acp.WithUpdateStatus(status), acp.WithUpdateRawInput(native.Input), acp.WithUpdateRawOutput(output), acp.WithUpdateContent(content)))
+	opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(status), acp.WithUpdateRawInput(native.Input), acp.WithUpdateRawOutput(output)}
+	if len(content) > 0 {
+		opts = append(opts, acp.WithUpdateContent(content))
+	}
+
+	return s.emit(ctx, acp.UpdateToolCall(id, opts...))
 }
+
 func (s *session) emit(ctx context.Context, updates ...acp.SessionUpdate) error {
 	conn := s.agent.connection()
 	if conn == nil {
@@ -358,7 +388,7 @@ func (s *session) emitUsage(ctx context.Context, state *cycleState) {
 }
 
 func (s *session) emitRawEvent(ctx context.Context, event opencode.Event) {
-	if s.rawEvents == nil || !s.rawEvents.Enabled() {
+	if !s.rawEvents.Enabled() {
 		return
 	}
 
@@ -510,7 +540,7 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 	s.emitUsage(settleCtx, &c.state)
 
 	if err := s.commitMirror(settleCtx, rt); err != nil {
-		s.recordFailure(c, s.mirrorFailure(err))
+		s.recordFailure(c, s.mirrorFailure(&c.state, err))
 		s.lc.Fence()
 		// A fenced incarnation is terminal, so the binding ends with it and the
 		// next operation relaunches and opens a new one. This runs on the
@@ -574,6 +604,7 @@ func toolKind(name string) acp.ToolKind {
 		return acp.ToolKindOther
 	}
 }
+
 func (s *session) emitPlan(ctx context.Context, payload json.RawMessage) error {
 	var event struct {
 		Todos []opencode.NativeTodo `json:"todos"`

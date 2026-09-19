@@ -4,7 +4,8 @@
 // The smoke tier spends no model tokens; ACP_GO_OPENCODE_RUN_LIVE_TOKENS=1 enables
 // prompts that do.
 //
-// The harness binary comes from PATH; an absent binary skips. Live tests copy
+// ACP_GO_OPENCODE_HARNESS_PATH selects the harness binary, which otherwise comes
+// from PATH; an absent binary skips. Live tests copy
 // native credentials into a temporary home. ACP_GO_OPENCODE_MODEL selects the
 // model for live tests.
 package integration

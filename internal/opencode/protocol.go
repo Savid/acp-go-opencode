@@ -228,6 +228,7 @@ type Catalog struct {
 	Providers []ProviderInfo    `json:"providers"`
 	Default   map[string]string `json:"default"`
 }
+
 type PermissionRequest struct {
 	ID         string         `json:"id"`
 	SessionID  string         `json:"sessionID"`
@@ -235,12 +236,14 @@ type PermissionRequest struct {
 	Patterns   []string       `json:"patterns"`
 	Tool       PermissionTool `json:"tool"`
 }
+
 type QuestionRequest struct {
 	ID        string         `json:"id"`
 	SessionID string         `json:"sessionID"`
 	Questions []QuestionInfo `json:"questions"`
 	Tool      QuestionTool   `json:"tool"`
 }
+
 type SyncEvent struct {
 	Raw         json.RawMessage            `json:"-"`
 	ID          string                     `json:"id"`
@@ -263,6 +266,7 @@ func (e *SyncEvent) UnmarshalJSON(data []byte) error {
 
 	return nil
 }
+
 func (e SyncEvent) MarshalJSON() ([]byte, error) {
 	if e.Raw != nil {
 		return e.Raw, nil

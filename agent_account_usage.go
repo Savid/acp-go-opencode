@@ -3,7 +3,6 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 
 	"github.com/savid/acp-go-core/usage"
@@ -87,28 +86,7 @@ func (s *session) readProviderUsage(ctx context.Context, rt *binding, providerID
 		modelID = ""
 	}
 
-	access, err := rt.client.UsageAccess(ctx, s.cwd, providerID, modelID)
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
-
-	if access.Reason != "" {
-		return wire.AccountUsageUnavailable(access.Reason), nil
-	}
-
-	response, err := reader.Read(ctx, usage.Credential{Token: access.APIKey})
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
-
-	current, err := rt.client.UsageAccess(ctx, s.cwd, providerID, modelID)
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
-
-	if current != access {
-		return wire.AccountUsageResponse{}, errors.New("provider credentials or route changed")
-	}
-
-	return response, response.Validate()
+	return usage.ReadVerified(ctx, func(ctx context.Context) (usage.Access, error) {
+		return rt.client.UsageAccess(ctx, s.cwd, providerID, modelID)
+	}, reader)
 }
