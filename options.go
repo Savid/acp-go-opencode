@@ -1,346 +1,233 @@
 package opencodeacp
 
 import (
-	"context"
 	"log/slog"
+	"maps"
 	"slices"
-	"time"
 
-	"github.com/savid/acp-go-opencode/internal/opencode"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+
+	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/image"
 )
 
-const defaultAgentName = "acp-go-opencode"
-
-// Option configures the OpenCode ACP agent.
+// Option configures the opencode ACP agent.
 type Option func(*Options)
 
-// ConcurrencyLimits bounds work accepted by one Agent.
+// Options configures the ACP agent process and the shared OpenCode HTTP server.
+type Options struct {
+	// AgentName is the protocol identifier advertised during ACP initialize.
+	AgentName string
+	// AgentTitle is the human-readable agent name advertised during ACP initialize.
+	AgentTitle string
+	// AgentVersion is the agent version advertised during ACP initialize.
+	AgentVersion string
+
+	// ExecutablePath selects the opencode executable. A bare name is searched on the
+	// base PATH; a path containing a separator is used as given. Empty means
+	// "opencode".
+	ExecutablePath string
+	// Home contains data, config, cache, and state directories mapped to the
+	// corresponding XDG home variables. Empty leaves opencode to resolve its home from
+	// the inherited environment exactly as it would from a shell.
+	Home string
+	// ScratchDir is the parent directory for ephemeral adapter state. Empty
+	// means the system temp directory.
+	ScratchDir string
+	// InputHandoffRoot is the absolute directory under which handoff-form
+	// prompt images are read. Empty rejects the handoff form.
+	InputHandoffRoot string
+	// DefaultModel selects the model for new sessions as "provider/id".
+	DefaultModel string
+	// ConfiguredModels are the model ids the host lists explicitly, each as
+	// "provider/id".
+	ConfiguredModels []string
+	// Env is the static agent-scoped overlay on the inherited process
+	// environment every opencode process runs with.
+	Env map[string]string
+
+	// Logger receives structured diagnostic logs. If nil, the default logger is used.
+	Logger *slog.Logger
+	// TracerProvider records adapter spans. If nil, tracing is a no-op.
+	TracerProvider trace.TracerProvider
+	// MeterProvider records adapter metrics. If nil, metrics are no-ops.
+	MeterProvider metric.MeterProvider
+	// TextMapPropagator extracts trace context from ACP _meta. If nil, W3C
+	// trace context plus baggage propagation is used.
+	TextMapPropagator propagation.TextMapPropagator
+
+	// SessionStore is the durability boundary for session rows. Nil installs a
+	// fresh in-memory store.
+	SessionStore acpcore.SessionStore
+	// ConcurrencyLimits controls process-local backpressure.
+	ConcurrencyLimits ConcurrencyLimits
+	// SeedFiles maps paths relative to opencode's config root to file contents
+	// written there before each launch.
+	SeedFiles map[string]string
+	// ImageLimits bounds decoded image bytes on prompt input and emitted
+	// output. Every field defaults to 6 MiB when the option is omitted.
+	ImageLimits ImageLimits
+
+	imageLimitsSet bool
+}
+
+// ConcurrencyLimits controls per-agent backpressure. Zero fields use defaults.
 type ConcurrencyLimits struct {
 	MaxActiveSessions        int
 	MaxConcurrentClientCalls int
 }
 
-// Options configures the ACP agent process and OpenCode sessions it starts.
-type Options struct {
-	AgentName    string
-	AgentTitle   string
-	AgentVersion string
-
-	ExecutablePath string
-	HostAuthority  HostAuthority
-	// Home is the exclusive shared XDG root owned by this Agent runtime. Empty
-	// creates one beneath ScratchDir.
-	Home string
-	// ScratchDir is the parent for a generated shared runtime root and transient
-	// adapter scratch material. It is never a per-session OpenCode home.
-	ScratchDir string
-	// InputHandoffRoot is the only directory a prompt image may be read from.
-	// Empty rejects the handoff input form outright.
-	InputHandoffRoot string
-	// ProviderAuthRoot is the durable host-owned directory holding the
-	// values-free provider-auth ledger. Empty leaves every provider-auth method
-	// unadvertised.
-	ProviderAuthRoot string
-	// ProviderAuthDirectHome names a canonical native home an account-level
-	// provider-auth leg may read or clear. OpenCode removes a credential with a
-	// scoped per-provider call and has no such leg, so a configured value is
-	// rejected at session start.
-	ProviderAuthDirectHome string
-	DefaultModel           string
-	// ConfiguredModels are the model ids the host lists explicitly, each as
-	// <provider>/<model>. Each is a configured catalog entry: published after
-	// the native rows on every route under its provider group, standing aside
-	// for a native row of the same value, and carrying no invented facts.
-	ConfiguredModels []string
-	Env              map[string]string
-	// AmbientEnvironment replaces the adapter's own process environment as the
-	// block ordinary execution inherits from. Its names are judged exactly as
-	// inherited names are; WithEnv and session environments overlay it. Nil
-	// inherits from the adapter's process. Managed execution never reads it.
-	AmbientEnvironment map[string]string
-	Logger             *slog.Logger
-	TracerProvider     trace.TracerProvider
-	MeterProvider      metric.MeterProvider
-	TextMapPropagator  propagation.TextMapPropagator
-
-	SessionStore            SessionStore
-	SessionStoreLoadTimeout time.Duration
-	ConcurrencyLimits       ConcurrencyLimits
-	SeedFiles               map[string]string
-	ImageLimits             ImageLimits
-
-	DirectAPI          bool
-	Pure               bool
-	QuestionTool       bool
-	LogLevel           string
-	HealthCheckTimeout time.Duration
-	TurnTimeout        time.Duration
-	// PluginSeedDir is the adapter-owned cache of the npm tree OpenCode installs
-	// for its plugin loader, copied into each new runtime root before launch.
-	// Empty resolves to plugin-seed beneath the adapter's user cache directory.
-	// Managed execution leaves the cache unused because executable identity is
-	// owned by HostAuthority.
-	PluginSeedDir string
-	// PluginSeedDisabled turns the plugin seed cache off entirely: every cold
-	// runtime root then waits for OpenCode's own install.
-	PluginSeedDisabled      bool
-	clientFactory           func(context.Context, opencode.StartOptions) (opencode.Client, error)
-	implicitEnvironment     map[string]string
-	hostAuthorityConfigured bool
+// ImageLimits bounds decoded image bytes. A zero field disables that policy
+// limit; the frame clamp still applies.
+type ImageLimits struct {
+	MaxInputBytesPerImage     int64
+	MaxInputBytesPerPrompt    int64
+	MaxOutputBytesPerImage    int64
+	MaxOutputBytesPerToolCall int64
 }
+
+func (l ImageLimits) core() image.Limits {
+	return image.Limits{
+		MaxInputBytesPerImage:     l.MaxInputBytesPerImage,
+		MaxInputBytesPerPrompt:    l.MaxInputBytesPerPrompt,
+		MaxOutputBytesPerImage:    l.MaxOutputBytesPerImage,
+		MaxOutputBytesPerToolCall: l.MaxOutputBytesPerToolCall,
+	}
+}
+
+const (
+	defaultMaxActiveSessions        = 32
+	defaultMaxConcurrentClientCalls = 16
+)
 
 func applyOptions(opts []Option) Options {
 	options := Options{
-		AgentName:               defaultAgentName,
-		DirectAPI:               true,
-		AgentTitle:              defaultAgentName,
-		AgentVersion:            "0.1.0",
-		SessionStoreLoadTimeout: 10 * time.Second,
-		HealthCheckTimeout:      opencode.HealthCheckTimeout,
-		ImageLimits:             defaultImageLimits(),
-		clientFactory:           opencode.StartServer,
+		AgentName:    "acp-go-opencode",
+		AgentTitle:   "acp-go-opencode",
+		AgentVersion: "0.1.0",
 	}
+
 	for _, opt := range opts {
 		opt(&options)
 	}
 
-	options.implicitEnvironment = ambientEnvironmentSnapshot(ambientEnvironmentEntries(options))
+	if !options.imageLimitsSet {
+		limits := image.DefaultLimits()
+		options.ImageLimits = ImageLimits{
+			MaxInputBytesPerImage:     limits.MaxInputBytesPerImage,
+			MaxInputBytesPerPrompt:    limits.MaxInputBytesPerPrompt,
+			MaxOutputBytesPerImage:    limits.MaxOutputBytesPerImage,
+			MaxOutputBytesPerToolCall: limits.MaxOutputBytesPerToolCall,
+		}
+	}
+
+	if options.ConcurrencyLimits.MaxActiveSessions == 0 {
+		options.ConcurrencyLimits.MaxActiveSessions = defaultMaxActiveSessions
+	}
+
+	if options.ConcurrencyLimits.MaxConcurrentClientCalls == 0 {
+		options.ConcurrencyLimits.MaxConcurrentClientCalls = defaultMaxConcurrentClientCalls
+	}
 
 	return options
 }
 
+// WithLogger configures structured diagnostic logging.
 func WithLogger(logger *slog.Logger) Option {
-	return func(options *Options) {
-		options.Logger = logger
-	}
+	return func(options *Options) { options.Logger = logger }
 }
 
+// WithAgentName sets the protocol identifier advertised during ACP initialize.
 func WithAgentName(name string) Option {
-	return func(options *Options) {
-		options.AgentName = name
-	}
+	return func(options *Options) { options.AgentName = name }
 }
 
+// WithAgentTitle sets the human-readable agent name advertised during ACP initialize.
 func WithAgentTitle(title string) Option {
-	return func(options *Options) {
-		options.AgentTitle = title
-	}
+	return func(options *Options) { options.AgentTitle = title }
 }
 
+// WithAgentVersion sets the agent version advertised during ACP initialize.
 func WithAgentVersion(version string) Option {
-	return func(options *Options) {
-		options.AgentVersion = version
-	}
+	return func(options *Options) { options.AgentVersion = version }
 }
 
+// WithExecutablePath selects the opencode executable.
 func WithExecutablePath(path string) Option {
-	return func(options *Options) {
-		options.ExecutablePath = path
-	}
+	return func(options *Options) { options.ExecutablePath = path }
 }
 
-// WithHostAuthority routes native processes and tree ownership through authority.
-func WithHostAuthority(authority HostAuthority) Option {
-	return func(options *Options) {
-		options.HostAuthority = authority
-		options.hostAuthorityConfigured = true
-	}
-}
-
-// WithHome selects the exclusive shared OpenCode XDG root owned by the Agent.
+// WithHome sets opencode's native config root, passed to every session as
+// the four XDG home variables.
 func WithHome(path string) Option {
-	return func(options *Options) {
-		options.Home = path
-	}
+	return func(options *Options) { options.Home = path }
 }
 
-// WithScratchDir sets the parent directory for all ephemeral on-disk
-// materialization, including a generated shared runtime root. An empty value
-// uses the system temporary directory.
+// WithScratchDir sets the parent directory for ephemeral adapter state.
 func WithScratchDir(dir string) Option {
-	return func(options *Options) {
-		options.ScratchDir = dir
-	}
+	return func(options *Options) { options.ScratchDir = dir }
 }
 
-// WithInputHandoffRoot sets the absolute directory a prompt image may be read
-// from when it arrives in the handoff form: an image block with empty data, a
-// file URI, and a digest envelope. It is a read root only — the wrapper never
-// writes, moves, or deletes anything beneath it, and it materializes nothing,
-// so it carries no scratch semantics. Unset rejects every handoff-form block.
+// WithInputHandoffRoot sets the absolute directory under which handoff-form
+// prompt images are read. The adapter never writes there.
 func WithInputHandoffRoot(dir string) Option {
-	return func(options *Options) {
-		options.InputHandoffRoot = dir
-	}
+	return func(options *Options) { options.InputHandoffRoot = dir }
 }
 
-// WithProviderAuthRoot sets the absolute durable directory holding the
-// values-free provider-auth ledger. It sits outside session scratch, outlives
-// every session and native generation, and carries no config or
-// auth-resolution semantics. Unset — or set alongside no Home — leaves every
-// provider-auth method unadvertised.
-func WithProviderAuthRoot(path string) Option {
-	return func(options *Options) {
-		options.ProviderAuthRoot = path
-	}
-}
-
-// WithProviderAuthDirectHome names the canonical native home an operator
-// consents to an account-level provider-auth leg reading or clearing. OpenCode
-// removes a credential through a scoped per-provider call, so it has no leg to
-// gate and rejects any configured value at session start.
-func WithProviderAuthDirectHome(path string) Option {
-	return func(options *Options) {
-		options.ProviderAuthDirectHome = path
-	}
-}
-
+// WithDefaultModel selects the model for new sessions as "provider/id".
 func WithDefaultModel(model string) Option {
-	return func(options *Options) {
-		options.DefaultModel = model
-	}
+	return func(options *Options) { options.DefaultModel = model }
 }
 
 // WithConfiguredModels names the models the host lists explicitly.
 func WithConfiguredModels(ids []string) Option {
-	return func(options *Options) {
-		options.ConfiguredModels = slices.Clone(ids)
-	}
+	return func(options *Options) { options.ConfiguredModels = slices.Clone(ids) }
 }
 
-// WithEnv adds ordinary variables to the shared native runtime environment.
-// Managed home, XDG, database, and config roots are rejected during agent
-// initialization.
+// WithEnv sets the static agent-scoped environment overlay applied to every
+// opencode process after the inherited environment and before the session env.
 func WithEnv(env map[string]string) Option {
-	return func(options *Options) {
-		options.Env = cloneStringMap(env)
-	}
+	return func(options *Options) { options.Env = maps.Clone(env) }
 }
 
-// WithAmbientEnvironment supplies the block ordinary execution inherits from in
-// place of the adapter's own process environment. Entries are filtered like
-// inherited entries; an entry that could not be an environment entry fails
-// Agent construction. Managed execution reads nothing from it.
-func WithAmbientEnvironment(env map[string]string) Option {
-	return func(options *Options) {
-		options.AmbientEnvironment = cloneStringMap(env)
-	}
-}
-
+// WithTracerProvider configures the OpenTelemetry tracer provider.
 func WithTracerProvider(provider trace.TracerProvider) Option {
-	return func(options *Options) {
-		options.TracerProvider = provider
-	}
+	return func(options *Options) { options.TracerProvider = provider }
 }
 
+// WithMeterProvider configures the OpenTelemetry meter provider.
 func WithMeterProvider(provider metric.MeterProvider) Option {
-	return func(options *Options) {
-		options.MeterProvider = provider
-	}
+	return func(options *Options) { options.MeterProvider = provider }
 }
 
+// WithTextMapPropagator configures trace-context extraction from ACP _meta.
 func WithTextMapPropagator(propagator propagation.TextMapPropagator) Option {
-	return func(options *Options) {
-		options.TextMapPropagator = propagator
-	}
+	return func(options *Options) { options.TextMapPropagator = propagator }
 }
 
-func WithSessionStore(store SessionStore) Option {
-	return func(options *Options) {
-		options.SessionStore = store
-	}
+// WithSessionStore configures the session store.
+func WithSessionStore(store acpcore.SessionStore) Option {
+	return func(options *Options) { options.SessionStore = store }
 }
 
-// WithSessionStoreLoadTimeout bounds session store reads (load, list, and
-// subkey enumeration). Store writes use a separate fixed bound.
-func WithSessionStoreLoadTimeout(timeout time.Duration) Option {
-	return func(options *Options) {
-		options.SessionStoreLoadTimeout = timeout
-	}
-}
-
+// WithConcurrencyLimits sets process-local backpressure limits.
 func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
+	return func(options *Options) { options.ConcurrencyLimits = limits }
+}
+
+// WithImageLimits bounds decoded image bytes. A zero field disables that
+// policy limit; a negative field fails construction.
+func WithImageLimits(limits ImageLimits) Option {
 	return func(options *Options) {
-		options.ConcurrencyLimits = limits
+		options.ImageLimits = limits
+		options.imageLimitsSet = true
 	}
 }
 
-// WithSeedFiles writes immutable bootstrap files into the shared OpenCode
-// runtime config root before launching opencode serve. Keys are paths relative to
-// <XDG_CONFIG_HOME>/opencode/ directory mapped to file contents; absolute
-// paths, parent-directory escapes, and empty keys are rejected. All files are
-// materialized before a managed runtime tree is prepared for host authority.
-// A seeded opencode.json must not contain permission or MCP policy because those
-// values are bound to native sessions and directory scopes respectively. The
-// map is cloned like WithEnv.
+// WithSeedFiles registers files written into opencode's config root before each
+// launch. Keys are paths relative to that root; values are the contents.
 func WithSeedFiles(files map[string]string) Option {
-	return func(options *Options) {
-		options.SeedFiles = cloneStringMap(files)
-	}
-}
-
-func WithOpenCodePure(enabled bool) Option {
-	return func(options *Options) {
-		options.Pure = enabled
-	}
-}
-
-func WithOpenCodeQuestionTool(enabled bool) Option {
-	return func(options *Options) {
-		options.QuestionTool = enabled
-	}
-}
-
-func WithOpenCodeLogLevel(level string) Option {
-	return func(options *Options) {
-		options.LogLevel = level
-	}
-}
-
-func WithOpenCodeHealthCheckTimeout(timeout time.Duration) Option {
-	return func(options *Options) {
-		options.HealthCheckTimeout = timeout
-	}
-}
-
-// WithPluginSeedDir relocates the plugin seed cache. OpenCode installs its
-// plugin loader with npm into every fresh runtime root, which costs minutes on
-// a cold boot; the adapter keeps one copy of that install per native binary in
-// this directory and copies it into each new root before launch. A cache with
-// no entry for the running binary is filled by a priming launch — a throwaway
-// runtime that performs the install, serves no session, and is torn down —
-// before the runtime itself starts, in ordinary and managed execution alike.
-// The default is plugin-seed beneath the adapter's directory in the user cache
-// directory. The cache holds code OpenCode executes, so it must stay private to
-// the user running the adapter.
-func WithPluginSeedDir(dir string) Option {
-	return func(options *Options) {
-		options.PluginSeedDir = dir
-	}
-}
-
-// WithPluginSeed enables or disables the plugin seed cache. It is enabled by
-// default; disabling it leaves every cold runtime root to OpenCode's own
-// install and writes nothing beneath the seed directory.
-func WithPluginSeed(enabled bool) Option {
-	return func(options *Options) {
-		options.PluginSeedDisabled = !enabled
-	}
-}
-
-// WithTurnTimeout bounds how long a single prompt turn may run before the
-// wrapper aborts the native turn and fails the prompt with a turn-failure error
-// carrying cause "timeout". The default of 0 disables the deadline.
-func WithTurnTimeout(timeout time.Duration) Option {
-	return func(options *Options) {
-		options.TurnTimeout = timeout
-	}
-}
-
-// WithOpenCodeDirectAPI enables direct provider account-usage requests. It is enabled by default.
-func WithOpenCodeDirectAPI(enabled bool) Option {
-	return func(options *Options) { options.DirectAPI = enabled }
+	return func(options *Options) { options.SeedFiles = maps.Clone(files) }
 }

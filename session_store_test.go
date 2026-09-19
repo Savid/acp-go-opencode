@@ -2,518 +2,313 @@ package opencodeacp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"strings"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 
+	"github.com/coder/acp-go-sdk"
+	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/sessionlog"
+	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
-func TestInMemoryStoreReplaceTombstonesUnlistedSubpaths(t *testing.T) {
-	ctx := context.Background()
-	store := NewInMemorySessionStore()
-	main := SessionKey{SessionID: "s1", Subpath: SessionStoreMainSubpath}
-	if err := store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"format":"opencode-sync-events-v1"}`)}},
-		{Key: SessionKey{SessionID: "s1", Subpath: "idmap"}, Entries: []SessionStoreEntry{json.RawMessage(`{"sessionId":"s1"}`)}},
-		{Key: SessionKey{SessionID: "s1", Subpath: "old"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-	}); err != nil {
-		t.Fatalf("first replace: %v", err)
-	}
-	if err := store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"format":"opencode-sync-events-v1"}`)}},
-		{Key: SessionKey{SessionID: "s1", Subpath: "idmap"}, Entries: []SessionStoreEntry{json.RawMessage(`{"sessionId":"s1"}`)}},
-	}); err != nil {
-		t.Fatalf("second replace: %v", err)
-	}
-	subkeys, err := store.ListSubkeys(ctx, main)
-	if err != nil {
-		t.Fatalf("ListSubkeys: %v", err)
-	}
-	if len(subkeys) != 1 || subkeys[0] != "idmap" {
-		t.Fatalf("subkeys = %#v", subkeys)
-	}
-	old, err := store.Load(ctx, SessionKey{SessionID: "s1", Subpath: "old"})
-	if err != nil {
-		t.Fatalf("Load old: %v", err)
-	}
-	if len(old) != 0 {
-		t.Fatalf("old subpath visible: %#v", old)
-	}
-}
-
-func TestInMemoryStoreAppendLoadDeleteListAndErrors(t *testing.T) {
-	ctx := context.Background()
-	cancelled, cancel := context.WithCancel(ctx)
-	cancel()
-	key := SessionKey{SessionID: "s1", Subpath: SessionStoreMainSubpath}
-	subkey := SessionKey{SessionID: "s1", Subpath: "idmap"}
-	var nilStore *InMemorySessionStore
-
-	for name, fn := range map[string]func(context.Context) error{
-		"append": func(ctx context.Context) error {
-			return nilStore.Append(ctx, key, []SessionStoreEntry{json.RawMessage(`{}`)})
-		},
-		"load": func(ctx context.Context) error {
-			_, err := nilStore.Load(ctx, key)
-
-			return err
-		},
-		"replace": func(ctx context.Context) error {
-			return nilStore.Replace(ctx, key, []SessionStoreReplacement{{Key: key, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}}})
-		},
-		"delete": func(ctx context.Context) error { return nilStore.Delete(ctx, key) },
-		"list": func(ctx context.Context) error {
-			_, err := nilStore.ListSessions(ctx)
-
-			return err
-		},
-		"subkeys": func(ctx context.Context) error {
-			_, err := nilStore.ListSubkeys(ctx, key)
-
-			return err
-		},
-	} {
-		t.Run(name+" canceled", func(t *testing.T) {
-			if err := fn(cancelled); !errors.Is(err, context.Canceled) {
-				t.Fatalf("canceled err = %v", err)
-			}
-		})
-		t.Run(name+" nil", func(t *testing.T) {
-			if err := fn(ctx); err == nil {
-				t.Fatal("nil store call succeeded")
-			}
-		})
-	}
-
-	store := &InMemorySessionStore{}
-	if err := store.Append(ctx, key, nil); err != nil {
-		t.Fatalf("append empty: %v", err)
-	}
-	if err := store.Append(ctx, SessionKey{Subpath: "sub"}, []SessionStoreEntry{json.RawMessage(`{}`)}); err == nil ||
-		!strings.Contains(err.Error(), "session id is required") {
-		t.Fatalf("empty session id append err = %v", err)
-	}
-	if err := store.Replace(ctx, SessionKey{}, []SessionStoreReplacement{{Key: SessionKey{}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}}}); err == nil ||
-		!strings.Contains(err.Error(), "session id is required") {
-		t.Fatalf("empty session id replace err = %v", err)
-	}
-	// Deleting an empty-SessionID key is a pure no-op: no error, no tombstone.
-	if err := store.Delete(ctx, SessionKey{}); err != nil {
-		t.Fatalf("empty session id delete: %v", err)
-	}
-	store.mu.Lock()
-	if len(store.tombstones) != 0 {
-		store.mu.Unlock()
-		t.Fatalf("empty session id delete left tombstones: %#v", store.tombstones)
-	}
-	store.mu.Unlock()
-	snapshot := validSyncSnapshot("s1", "native-1", absTestPath("repo"))
-	snapshot.CapturedAtUnixMilli = 200
-	snapshot.Session.Title = "Stored"
-	entryBytes, err := json.Marshal(snapshot)
+func TestMirrorIncludesDescendantsAndExcludesUnrelatedSessions(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
-	entry := SessionStoreEntry(entryBytes)
-	if appendErr := store.Append(ctx, key, []SessionStoreEntry{entry}); appendErr != nil {
-		t.Fatalf("append main: %v", appendErr)
+	cwd := t.TempDir()
+	root, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), root.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+	parent := s.nativeID
+	want := make([]string, 1, 3)
+	want[0] = parent
+	for range 2 {
+		var child opencode.NativeSession
+		require.NoError(t, rt.client.Do(t.Context(), cwd, http.MethodPost, "/session", map[string]string{"parentID": parent}, &child))
+		want = append(want, child.ID)
+		parent = child.ID
 	}
-	entry[0] = '['
-	loaded, err := store.Load(ctx, key)
-	if err != nil {
-		t.Fatalf("load: %v", err)
+	unrelated, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	require.NoError(t, s.commitMirror(t.Context(), rt))
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(root.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	events, err := decodeEvents(rows, s.nativeID)
+	require.NoError(t, err)
+	graph := syncGraph(events, s.nativeID)
+	require.Len(t, graph, len(want))
+	for _, id := range want {
+		require.Contains(t, graph, id)
 	}
-	if string(loaded[0]) == string(entry) {
-		t.Fatal("store entry was not cloned")
-	}
-	loaded[0][0] = '['
-	loadedAgain, err := store.Load(ctx, key)
-	if err != nil {
-		t.Fatalf("load again: %v", err)
-	}
-	if loadedAgain[0][0] == '[' {
-		t.Fatal("loaded entry was not cloned")
-	}
-	if err = store.Append(ctx, subkey, []SessionStoreEntry{json.RawMessage(`{"sub":true}`)}); err != nil {
-		t.Fatalf("append subkey: %v", err)
-	}
-	if err = store.Append(ctx, SessionKey{SessionID: "s0", Subpath: SessionStoreMainSubpath}, []SessionStoreEntry{json.RawMessage(`{bad}`)}); err != nil {
-		t.Fatalf("append invalid summary: %v", err)
-	}
-	summaries, err := store.ListSessions(ctx)
-	if err != nil {
-		t.Fatalf("list sessions: %v", err)
-	}
-	var stored *SessionSummary
-	for i := range summaries {
-		if summaries[i].SessionID == "s1" {
-			stored = &summaries[i]
-		}
-	}
-	if len(summaries) != 2 || stored == nil || stored.Cwd != absTestPath("repo") || stored.Title != "Stored" {
-		t.Fatalf("summaries = %#v", summaries)
-	}
-	subkeys, err := store.ListSubkeys(ctx, key)
-	if err != nil {
-		t.Fatalf("list subkeys: %v", err)
-	}
-	if len(subkeys) != 1 || subkeys[0] != "idmap" {
-		t.Fatalf("subkeys = %#v", subkeys)
-	}
-	assertStoreTombstoneAndTieBreak(t, ctx, store, key, subkey)
+	require.NotContains(t, graph, string(unrelated.SessionId))
 }
 
-func assertStoreTombstoneAndTieBreak(t *testing.T, ctx context.Context, store *InMemorySessionStore, key, subkey SessionKey) {
-	t.Helper()
-	if err := store.Delete(ctx, SessionKey{SessionID: "missing", Subpath: "sub"}); err != nil {
-		t.Fatalf("delete missing: %v", err)
-	}
-	if err := store.Delete(ctx, subkey); err != nil {
-		t.Fatalf("delete subkey: %v", err)
-	}
-	if err := store.Append(ctx, subkey, []SessionStoreEntry{json.RawMessage(`{"ignored":true}`)}); err != nil {
-		t.Fatalf("append tombstoned subkey: %v", err)
-	}
-	loadedSubkey, err := store.Load(ctx, subkey)
-	if err != nil {
-		t.Fatalf("load tombstoned subkey: %v", err)
-	}
-	if len(loadedSubkey) != 0 {
-		t.Fatalf("tombstoned subkey loaded entries: %#v", loadedSubkey)
-	}
-	if err = store.Delete(ctx, key); err != nil {
-		t.Fatalf("delete main: %v", err)
-	}
-	if err = store.Append(ctx, SessionKey{SessionID: "s1", Subpath: "other"}, []SessionStoreEntry{json.RawMessage(`{"ignored":true}`)}); err != nil {
-		t.Fatalf("append tombstoned main subkey: %v", err)
-	}
-	loadedMain, err := store.Load(ctx, key)
-	if err != nil {
-		t.Fatalf("load tombstoned main: %v", err)
-	}
-	if len(loadedMain) != 0 {
-		t.Fatalf("tombstoned main loaded entries: %#v", loadedMain)
-	}
+// A commit the session cannot attempt, and one with no complete native
+// snapshot to replace, both fail rather than report a success the store does
+// not hold.
+func TestMirrorCommitRefusesWhatItCannotAttempt(t *testing.T) {
+	t.Parallel()
 
-	tieStore := NewInMemorySessionStore()
-	for _, id := range []string{"b", "a"} {
-		if err = tieStore.Append(ctx, SessionKey{SessionID: id, Subpath: SessionStoreMainSubpath}, []SessionStoreEntry{json.RawMessage(`{}`)}); err != nil {
-			t.Fatalf("append tie %s: %v", id, err)
-		}
-	}
-	tieStore.mu.Lock()
-	tieStore.updatedAt[SessionKey{SessionID: "a", Subpath: SessionStoreMainSubpath}] = 1
-	tieStore.updatedAt[SessionKey{SessionID: "b", Subpath: SessionStoreMainSubpath}] = 1
-	tieStore.mu.Unlock()
-	tied, err := tieStore.ListSessions(ctx)
-	if err != nil {
-		t.Fatalf("list tied sessions: %v", err)
-	}
-	if len(tied) != 2 || tied[0].SessionID != "a" || tied[1].SessionID != "b" {
-		t.Fatalf("tied summaries = %#v", tied)
-	}
-	if (&InMemorySessionStore{}).isTombstonedLocked(SessionKey{SessionID: "s"}) {
-		t.Fatal("nil tombstones reported tombstoned")
-	}
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+
+	require.Error(t, s.commitMirror(t.Context(), nil),
+		"a commit with no binding to read the native history through cannot be attempted")
+
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "FORGET"))
+	data := requestErrorData(t, err)
+	require.Equal(t, vendor+"_"+wire.TokenTurnFailed, data[wire.FieldError],
+		"a turn whose native history vanished is not durable")
+	require.Equal(t, wire.CauseTransport, data[wire.FieldCause])
 }
 
-func TestInMemoryStoreReplaceValidation(t *testing.T) {
-	ctx := context.Background()
-	store := NewInMemorySessionStore()
-	main := SessionKey{SessionID: "s1", Subpath: SessionStoreMainSubpath}
-	for name, replacements := range map[string][]SessionStoreReplacement{
-		"missing main":  {{Key: SessionKey{SessionID: "s1", Subpath: "sub"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}}},
-		"wrong session": {{Key: SessionKey{SessionID: "s2", Subpath: SessionStoreMainSubpath}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}}},
-		"duplicate main": {
-			{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-			{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if err := store.Replace(ctx, main, replacements); err == nil {
-				t.Fatal("replace unexpectedly succeeded")
-			}
-		})
-	}
-	// A refused duplicate names the key it refused, subpath included, so a caller
-	// holding a long replacement set is not left to diff it by hand.
-	require.ErrorContains(t, store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-		{Key: SessionKey{SessionID: "s1", Subpath: "idmap"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-		{Key: SessionKey{SessionID: "s1", Subpath: "idmap"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-	}), `duplicate replacement key: session "s1" subpath "idmap"`)
+// A generation whose native rows do not decode, and one whose captured image
+// the record no longer holds, both refuse the load instead of restoring a
+// partial session.
+func TestRestoreRefusesADamagedMirror(t *testing.T) {
+	t.Parallel()
 
-	require.ErrorContains(t, store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-	}), `duplicate replacement key: session "s1" subpath ""`)
-	require.ErrorContains(t, store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-		{Key: SessionKey{Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-	}), "replacement session id is required")
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
 
-	if err := store.Replace(ctx, SessionKey{}, nil); err == nil {
-		t.Fatal("replace accepted missing main session id")
-	}
-	if err := store.Replace(ctx, SessionKey{SessionID: "s1", Subpath: "sub"}, nil); err == nil {
-		t.Fatal("replace accepted non-main subpath")
-	}
-	if err := store.Replace(ctx, main, []SessionStoreReplacement{
-		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"ok":true}`)}},
-		{Key: SessionKey{SessionID: "s1", Subpath: "empty"}, Entries: nil},
-	}); err != nil {
-		t.Fatalf("replace with empty subkey: %v", err)
+	cwd := t.TempDir()
+
+	session, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	_, err = h.prompt(session.SessionId, "IMAGE", nil)
+	require.NoError(t, err)
+
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+
+	rows, err := loadEntries(t.Context(), store, acpcore.SessionKey{SessionID: string(session.SessionId)})
+	require.NoError(t, err)
+	require.NotEmpty(t, rows)
+
+	record := storedRecord(t, store, session.SessionId)
+	require.NotEmpty(t, record.Artifacts, "the native image is captured beside the rows")
+
+	stored := make([][]byte, 0, len(rows)+1)
+	for _, row := range rows {
+		stored = append(stored, row)
 	}
 
-	// A replacement leaves exactly the keys it lists alive: a listed key
-	// survives even when its Entries are empty, so the empty subkey stays live
-	// rather than being tombstoned.
-	subkeys, err := store.ListSubkeys(ctx, main)
-	if err != nil {
-		t.Fatalf("list subkeys: %v", err)
-	}
+	gap := fmt.Appendf(nil, `{"id":"evt_gap","aggregate_id":%q,"seq":9999,"type":"message.updated.1","data":{"sessionID":%q}}`,
+		session.SessionId, session.SessionId)
 
-	found := false
-	for _, subkey := range subkeys {
-		if subkey == "empty" {
-			found = true
-		}
-	}
+	require.NoError(t, sessionlog.Commit(t.Context(), store, string(session.SessionId), append(stored, gap), record))
 
-	if !found {
-		t.Fatalf("listed empty-entry subkey did not survive: %v", subkeys)
-	}
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
+	require.Equal(t, vendor+"_"+wire.TokenRestoreFailed, requestErrorData(t, err)[wire.FieldError],
+		"a native row out of sequence refuses the restore")
 
-	entries, err := store.Load(ctx, SessionKey{SessionID: "s1", Subpath: "empty"})
-	if err != nil {
-		t.Fatalf("load empty subkey: %v", err)
-	}
+	uncaptured := record
+	uncaptured.Artifacts = nil
 
-	if len(entries) != 0 {
-		t.Fatalf("empty subkey entries = %v", entries)
-	}
+	require.NoError(t, sessionlog.Commit(t.Context(), store, string(session.SessionId), stored, uncaptured))
+
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
+	require.Equal(t, vendor+"_"+wire.TokenRestoreFailed, requestErrorData(t, err)[wire.FieldError],
+		"a local image the record no longer captures refuses the restore")
 }
 
-// TestInMemoryStoreReplaceIsOneSessionsAndRefusesBeforeWriting is the
-// store-contract conformance fixture for the rule every host store owes: a
-// `Replace` is one session's. A replacement key naming another session, and a
-// `{SessionID, Subpath}` the set lists twice, are both refused with an error
-// naming the offending key — and refused *before* anything is written, so a set
-// the store will not accept leaves it byte-for-byte as it was.
-func TestInMemoryStoreReplaceIsOneSessionsAndRefusesBeforeWriting(t *testing.T) {
-	ctx := t.Context()
-	sMain := SessionKey{SessionID: "s"}
-	sArtifact := SessionKey{SessionID: "s", Subpath: "artifact"}
-	foreign := SessionKey{SessionID: "x", Subpath: "artifact"}
+// Residual native state with no store entry is neither listed nor adopted.
+func TestResidualNativeStateIsNeverAdopted(t *testing.T) {
+	t.Parallel()
 
-	seed := func(t *testing.T) *InMemorySessionStore {
-		t.Helper()
+	home, cwd := filepath.Join(t.TempDir(), "home"), t.TempDir()
+	orphan := "ses_orphan0000000000000000"
+	native := filepath.Join(home, "data", "opencode", "fake.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(native), 0o700))
+	require.NoError(t, os.WriteFile(native, []byte(`[{"id":"evt_orphan","aggregate_id":"`+orphan+`","seq":0,"type":"session.created.1","data":{"info":{"id":"`+orphan+`","directory":"`+cwd+`","agent":"build","model":{"id":"vision","providerID":"fake"},"time":{"created":1,"updated":1}},"sessionID":"`+orphan+`"}}]`), 0o600))
 
-		store := NewInMemorySessionStore()
-		require.NoError(t, store.Replace(ctx, sMain, []SessionStoreReplacement{
-			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"before"}`)}},
-			{Key: sArtifact, Entries: []SessionStoreEntry{json.RawMessage(`{"artifact":"before"}`)}},
-		}))
+	h := newHarness(t, WithHome(home))
+	h.initialize()
 
-		return store
-	}
+	list, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, list.Sessions)
 
-	requireUntouched := func(t *testing.T, store *InMemorySessionStore) {
-		t.Helper()
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(acp.SessionId(orphan), cwd))
+	require.Equal(t, "unknown session", requestErrorData(t, err)[wire.FieldError])
 
-		for key, expected := range map[SessionKey]string{
-			sMain:     `{"generation":"before"}`,
-			sArtifact: `{"artifact":"before"}`,
-		} {
-			stored, err := store.Load(ctx, key)
-			require.NoError(t, err)
-			require.Len(t, stored, 1, "a refused replacement wrote to %v", key)
-			require.JSONEq(t, expected, string(stored[0]), "a refused replacement rewrote %v", key)
-		}
-
-		stored, err := store.Load(ctx, foreign)
-		require.NoError(t, err)
-		require.Empty(t, stored, "a refused replacement wrote to an unaddressed session")
-
-		subkeys, err := store.ListSubkeys(ctx, sMain)
-		require.NoError(t, err)
-		require.Equal(t, []string{"artifact"}, subkeys, "a refused replacement changed the addressed subtree")
-	}
-
-	t.Run("foreign session id", func(t *testing.T) {
-		store := seed(t)
-		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
-			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
-			{Key: foreign, Entries: []SessionStoreEntry{json.RawMessage(`{"x":true}`)}},
-		})
-		// The refusal names the key it refused and the session that was addressed.
-		require.ErrorContains(t, err, `replacement key for a foreign session: session "x" subpath "artifact", addressed session "s"`)
-		requireUntouched(t, store)
-	})
-
-	t.Run("foreign main key", func(t *testing.T) {
-		store := seed(t)
-		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
-			{Key: SessionKey{SessionID: "x"}, Entries: []SessionStoreEntry{json.RawMessage(`{"x":true}`)}},
-		})
-		require.ErrorContains(t, err, `replacement key for a foreign session: session "x" subpath "", addressed session "s"`)
-		requireUntouched(t, store)
-	})
-
-	t.Run("duplicate key", func(t *testing.T) {
-		store := seed(t)
-		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
-			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
-			{Key: sArtifact, Entries: []SessionStoreEntry{json.RawMessage(`{"artifact":"one"}`)}},
-			{Key: sArtifact, Entries: []SessionStoreEntry{json.RawMessage(`{"artifact":"two"}`)}},
-		})
-		require.ErrorContains(t, err, `duplicate replacement key: session "s" subpath "artifact"`)
-		requireUntouched(t, store)
-	})
-
-	t.Run("duplicate main key", func(t *testing.T) {
-		store := seed(t)
-		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
-			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"one"}`)}},
-			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"two"}`)}},
-		})
-		require.ErrorContains(t, err, `duplicate replacement key: session "s" subpath ""`)
-		requireUntouched(t, store)
-	})
-
-	t.Run("no main key", func(t *testing.T) {
-		store := seed(t)
-		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
-			{Key: sArtifact, Entries: []SessionStoreEntry{json.RawMessage(`{"artifact":"only"}`)}},
-		})
-		require.ErrorContains(t, err, "replacements must include addressed main key exactly once")
-		requireUntouched(t, store)
-	})
-
-	t.Run("empty replacement session id", func(t *testing.T) {
-		store := seed(t)
-		err := store.Replace(ctx, sMain, []SessionStoreReplacement{
-			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"refused"}`)}},
-			{Key: SessionKey{Subpath: "artifact"}, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
-		})
-		require.ErrorContains(t, err, `replacement session id is required: session "" subpath "artifact"`)
-		requireUntouched(t, store)
-	})
-
-	// An accepted set replaces the addressed session's whole subtree, and a
-	// subpath it no longer lists does not survive as a stale sibling.
-	t.Run("accepted set replaces the whole subtree", func(t *testing.T) {
-		store := seed(t)
-		require.NoError(t, store.Replace(ctx, sMain, []SessionStoreReplacement{
-			{Key: sMain, Entries: []SessionStoreEntry{json.RawMessage(`{"generation":"after"}`)}},
-			{Key: SessionKey{SessionID: "s", Subpath: "other"}, Entries: []SessionStoreEntry{json.RawMessage(`{"other":true}`)}},
-		}))
-
-		stored, err := store.Load(ctx, sMain)
-		require.NoError(t, err)
-		require.JSONEq(t, `{"generation":"after"}`, string(stored[0]))
-
-		stored, err = store.Load(ctx, sArtifact)
-		require.NoError(t, err)
-		require.Empty(t, stored, "a subpath the new set omits survived the replacement")
-
-		subkeys, err := store.ListSubkeys(ctx, sMain)
-		require.NoError(t, err)
-		require.Equal(t, []string{"other"}, subkeys)
-	})
+	_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(acp.SessionId(orphan), cwd))
+	require.Equal(t, "unknown session", requestErrorData(t, err)[wire.FieldError])
 }
 
-// TestInMemoryStoreEnforcesTombstoneFinality proves the store itself is where a
-// deletion becomes final. Append and Replace addressed to a key Delete
-// tombstoned write nothing, clear nothing, and answer success: the deleted state
-// is already the caller's answer, and a store that left the rule to the adapter
-// above it would resurrect a session whenever a settlement raced the delete that
-// had already answered for it.
-func TestInMemoryStoreEnforcesTombstoneFinality(t *testing.T) {
-	ctx := context.Background()
-	main := SessionKey{SessionID: "s1", Subpath: SessionStoreMainSubpath}
-	subpath := SessionKey{SessionID: "s1", Subpath: "idmap"}
-	bundle := SessionStoreEntry(`{"format":"opencode-sync-events-v1"}`)
+type recoveryFaultStore struct {
+	acpcore.SessionStore
+	fail atomic.Bool
+}
 
-	seed := func(t *testing.T) *InMemorySessionStore {
-		t.Helper()
-
-		store := NewInMemorySessionStore()
-		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
-			{Key: main, Entries: []SessionStoreEntry{bundle}},
-			{Key: subpath, Entries: []SessionStoreEntry{bundle}},
-		}))
-		require.NoError(t, store.Delete(ctx, main))
-
-		return store
+func (s *recoveryFaultStore) Replace(ctx context.Context, main acpcore.SessionKey, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Load() {
+		return errors.New("injected store failure")
 	}
 
-	requireStillDeleted := func(t *testing.T, store *InMemorySessionStore) {
-		t.Helper()
+	return s.SessionStore.Replace(ctx, main, replacements)
+}
 
-		entries, err := store.Load(ctx, main)
-		require.NoError(t, err)
-		require.Empty(t, entries, "a write over a tombstone recreated the main key")
+func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	cwd := t.TempDir()
+	created, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	_, err = h.prompt(created.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotEmpty(t, record.NativeSessionID)
+	require.Equal(t, wire.NativeSessionMeta(vendor, record.NativeSessionID), created.Meta)
+	id := acp.SessionId("acp-conversation-independent-of-native-id")
+	record.SessionID = string(id)
+	require.NoError(t, sessionlog.Commit(t.Context(), store, string(id), rows, record))
+	require.NoError(t, store.Delete(t.Context(), acpcore.SessionKey{SessionID: string(created.SessionId)}))
 
-		entries, err = store.Load(ctx, subpath)
-		require.NoError(t, err)
-		require.Empty(t, entries, "a write over a tombstone recreated a subpath")
+	before := len(h.rec.snapshot())
+	loaded, err := h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(id, cwd))
+	require.NoError(t, err)
+	require.Equal(t, wire.NativeSessionMeta(vendor, record.NativeSessionID), loaded.Meta)
+	_, err = h.prompt(id, "HELLO", nil)
+	require.NoError(t, err)
+	for _, update := range h.rec.snapshot()[before:] {
+		require.Equal(t, id, update.SessionId)
+	}
+	listed, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Len(t, listed.Sessions, 1)
+	require.Equal(t, id, listed.Sessions[0].SessionId)
+	require.Equal(t, loaded.Meta, listed.Sessions[0].Meta)
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: id})
+	require.NoError(t, err)
+	listed, err = h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Len(t, listed.Sessions, 1)
+	require.Equal(t, loaded.Meta, listed.Sessions[0].Meta)
+	resumed, err := h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(id, cwd))
+	require.NoError(t, err)
+	require.Equal(t, loaded.Meta, resumed.Meta)
+	_, err = h.prompt(id, "HELLO", nil)
+	require.NoError(t, err)
+	var after sessionRecord
+	_, found, err = sessionlog.Load(t.Context(), store, string(id), &after)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, record.NativeSessionID, after.NativeSessionID)
+	require.Equal(t, string(id), after.SessionID)
+}
 
-		summaries, err := store.ListSessions(ctx)
-		require.NoError(t, err)
-		require.Empty(t, summaries, "a write over a tombstone made the session listable again")
+func TestFailedConfigChangeDoesNotReachTheNextCommit(t *testing.T) {
+	t.Parallel()
+	store := &recoveryFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	session := h.newSession()
+	var before sessionRecord
+	_, found, err := sessionlog.Load(t.Context(), store, string(session.SessionId), &before)
+	require.NoError(t, err)
+	require.True(t, found)
+	store.fail.Store(true)
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configModel, "fake/text"))
+	require.Error(t, err)
+	store.fail.Store(false)
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configEffort, "high"))
+	require.NoError(t, err)
+	var after sessionRecord
+	_, found, err = sessionlog.Load(t.Context(), store, string(session.SessionId), &after)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, before.Model, after.Model)
+}
 
-		subkeys, err := store.ListSubkeys(ctx, main)
-		require.NoError(t, err)
-		require.Empty(t, subkeys, "a write over a tombstone made a subpath visible again")
+type firstMirrorFailureStore struct {
+	acpcore.SessionStore
+	calls atomic.Int32
+}
+
+func (s *firstMirrorFailureStore) Replace(ctx context.Context, key acpcore.SessionKey, rows []acpcore.SessionStoreReplacement) error {
+	if s.calls.Add(1) == 1 {
+		return errors.New("initial mirror unavailable")
 	}
 
-	t.Run("append to a tombstoned main key", func(t *testing.T) {
-		store := seed(t)
-		require.NoError(t, store.Append(ctx, main, []SessionStoreEntry{bundle}))
-		requireStillDeleted(t, store)
-	})
+	return s.SessionStore.Replace(ctx, key, rows)
+}
 
-	t.Run("append to a tombstoned subpath", func(t *testing.T) {
-		store := seed(t)
-		require.NoError(t, store.Append(ctx, subpath, []SessionStoreEntry{bundle}))
-		requireStillDeleted(t, store)
-	})
+func TestFailedNewSessionDoesNotPersistDuringCleanup(t *testing.T) {
+	t.Parallel()
+	store := &firstMirrorFailureStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	response, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
+	require.Error(t, err)
+	require.Empty(t, response.SessionId)
+	rows, err := store.ListSessions(h.ctx())
+	require.NoError(t, err)
+	require.Empty(t, rows)
+	listed, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, listed.Sessions)
+}
 
-	t.Run("replace over a tombstoned session", func(t *testing.T) {
-		store := seed(t)
-		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
-			{Key: main, Entries: []SessionStoreEntry{bundle}},
-			{Key: subpath, Entries: []SessionStoreEntry{bundle}},
-		}))
-		requireStillDeleted(t, store)
-	})
+type firstOpenFailureClient struct {
+	*recorder
+	failed atomic.Bool
+}
 
-	// A sibling session's own deletion is not the addressed session's business:
-	// a Replace is one session's, so a delete of another id can neither refuse
-	// this call nor be resurrected by it.
-	t.Run("a sibling session's tombstone does not reach the addressed one", func(t *testing.T) {
-		store := NewInMemorySessionStore()
-		sibling := SessionKey{SessionID: "s2", Subpath: SessionStoreMainSubpath}
+func (c *firstOpenFailureClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	if c.failed.CompareAndSwap(false, true) {
+		return errors.New("initial publication unavailable")
+	}
 
-		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
-			{Key: main, Entries: []SessionStoreEntry{bundle}},
-		}))
-		require.NoError(t, store.Replace(ctx, sibling, []SessionStoreReplacement{
-			{Key: sibling, Entries: []SessionStoreEntry{bundle}},
-		}))
-		require.NoError(t, store.Delete(ctx, sibling))
+	return c.recorder.SessionUpdate(ctx, notification)
+}
 
-		require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
-			{Key: main, Entries: []SessionStoreEntry{bundle}},
-		}))
-
-		entries, err := store.Load(ctx, main)
-		require.NoError(t, err)
-		require.Len(t, entries, 1, "the addressed session was refused because a sibling was deleted")
-
-		entries, err = store.Load(ctx, sibling)
-		require.NoError(t, err)
-		require.Empty(t, entries, "a deleted sibling was resurrected by another session's replacement")
-	})
+func TestFailedSessionOpenReleasesActiveSlot(t *testing.T) {
+	t.Parallel()
+	a := NewAgent(testOptions(t, WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))...)
+	t.Cleanup(func() { _ = a.Close() })
+	a.attach(&firstOpenFailureClient{recorder: newRecorder()}, nil)
+	request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
+	withLifecycle()(&request)
+	_, err := a.Initialize(t.Context(), request)
+	require.NoError(t, err)
+	first, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.Error(t, err)
+	require.Empty(t, first.SessionId)
+	_, err = a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
 }

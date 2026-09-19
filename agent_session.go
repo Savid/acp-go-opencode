@@ -2,10 +2,9 @@ package opencodeacp
 
 import (
 	"context"
-	"encoding/base64"
-	"errors"
-	"fmt"
+	"encoding/json"
 	"log/slog"
+	"maps"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -14,976 +13,785 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/savid/acp-go-opencode/internal/opencode"
+
+	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/observer"
+	"github.com/savid/acp-go-core/wire"
 )
 
-func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
-	ctx = a.observe.Extract(ctx, params.Meta)
-	if err := a.ensureOpen(); err != nil {
-		return acp.NewSessionResponse{}, err
-	}
+const (
+	limitActiveSessions = "active_sessions"
+	limitSessionRestore = "session_restore"
+)
 
-	if err := refuseLifecycleMeta(params.Meta); err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	if err := validateProviderAuthOptions(a.options); err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	if err := validateSessionStartPaths(params.Cwd, params.AdditionalDirectories); err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	if err := validateMCPServers(params.McpServers); err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	meta, err := sessionMetaFromVendorOptions(params.Meta)
-	if err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	if meta.Model == "" {
-		meta.Model = a.options.DefaultModel
-	}
-
-	idValue, err := newSessionID()
-	if err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	id := acp.SessionId(idValue)
-
-	mcpConfigs := nativeMCPServerConfigs(params.McpServers)
-
-	carrier := newSessionCarrier(meta.Env, meta.ExtraPathDirs)
-
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, "", params.Cwd, mcpConfigs, carrier, params.AdditionalDirectories...)
-	if err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	native, err := client.CreateSessionWithPolicy(ctx, "", nativePermissionPolicy(meta.Permission))
-	if err != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return acp.NewSessionResponse{}, errors.Join(startupFailure(err), closeErr)
-	}
-
-	idmap := idmapRecord{
-		SessionID:       string(id),
-		NativeSessionID: native.ID,
-		Format:          SessionStoreFormat,
-	}
-
-	session := newSession(a, id, params.Cwd, params.AdditionalDirectories, native, client, meta, idmap)
-	session.directoryRelease = releaseDirectory
-
-	session.secretNeedles = append(mcpSecretNeedles(mcpConfigs), sensitiveEnvNeedles(meta.Env)...)
-	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
-	session.mcpRefreshPending = len(mcpConfigs) > 0
-	session.runtimeGeneration = generation
-	session.stampIncarnationGeneration(client, generation)
-
-	if err := a.storeStartedSession(session); err != nil {
-		return acp.NewSessionResponse{}, a.rollbackStartedSession(session, err)
-	}
-
-	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return acp.NewSessionResponse{}, errors.Join(err, closeErr)
-	}
-
-	return acp.NewSessionResponse{
-		SessionId:     id,
-		Meta:          sessionResponseMeta(session.snapshot()),
-		ConfigOptions: session.configOptions(ctx),
-	}, nil
+// sessionStart carries the validated inputs of one session-establishing
+// request.
+type sessionStart struct {
+	cwd                   string
+	additionalDirectories []string
+	meta                  sessionMeta
 }
 
-func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	ctx = a.observe.Extract(ctx, params.Meta)
+func (a *Agent) validateStart(params sessionStart, mcpServers []acp.McpServer, meta map[string]any) (sessionStart, error) {
+	if a.optionErr != nil {
+		return sessionStart{}, a.optionErr
+	}
 
-	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	parsed, err := parseSessionMeta(meta)
 	if err != nil {
-		return acp.LoadSessionResponse{}, err
-	}
-	defer release()
-
-	session, err := a.loadOrResumeSession(ctx, params.SessionId, params.Cwd, params.AdditionalDirectories, params.McpServers, params.Meta)
-	if err != nil {
-		return acp.LoadSessionResponse{}, err
+		return sessionStart{}, err
 	}
 
-	if err := session.replayMessages(ctx); err != nil {
-		return acp.LoadSessionResponse{}, err
+	if !filepath.IsAbs(params.cwd) {
+		return sessionStart{}, wire.Unsupported(fieldCwd)
 	}
 
-	return acp.LoadSessionResponse{
-		Meta:          sessionResponseMeta(session.snapshot()),
-		ConfigOptions: session.configOptions(ctx),
-	}, nil
-}
-
-func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
-	ctx = a.observe.Extract(ctx, params.Meta)
-	if err := validateMCPServers(params.McpServers); err != nil {
-		return acp.ResumeSessionResponse{}, err
+	for index, dir := range params.additionalDirectories {
+		if !filepath.IsAbs(dir) {
+			return sessionStart{}, wire.Unsupported("additionalDirectories[" + strconv.Itoa(index) + "]")
+		}
 	}
 
-	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
-	if err != nil {
-		return acp.ResumeSessionResponse{}, err
-	}
-	defer release()
-
-	session, err := a.loadOrResumeSession(ctx, params.SessionId, params.Cwd, params.AdditionalDirectories, params.McpServers, params.Meta)
-	if err != nil {
-		return acp.ResumeSessionResponse{}, err
-	}
-
-	return acp.ResumeSessionResponse{
-		Meta:          sessionResponseMeta(session.snapshot()),
-		ConfigOptions: session.configOptions(ctx),
-	}, nil
-}
-
-func (a *Agent) loadOrResumeSession(
-	ctx context.Context,
-	id acp.SessionId,
-	cwd string,
-	additionalDirectories []string,
-	mcpServers []acp.McpServer,
-	metaMap map[string]any,
-) (*session, error) {
-	if err := refuseLifecycleMeta(metaMap); err != nil {
-		return nil, err
+	if len(mcpServers) > 0 {
+		return sessionStart{}, wire.Unsupported("mcpServers")
 	}
 
 	if err := a.ensureOpen(); err != nil {
-		return nil, err
+		return sessionStart{}, err
 	}
 
-	if id == "" {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
+	params.meta = parsed
+
+	return params, nil
+}
+
+// newSession builds the session value for one establishing request; the
+// native identity arrives once opencode reports it.
+func (a *Agent) newSession(start sessionStart) *session {
+	s := &session{
+		agent:                 a,
+		cwd:                   start.cwd,
+		additionalDirectories: slices.Clone(start.additionalDirectories),
+		options:               start.meta.options.clone(),
+		gate:                  make(chan struct{}, 1),
 	}
 
-	if a.isDeleted(id) {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
-	}
+	return s
+}
 
-	if err := validateProviderAuthOptions(a.options); err != nil {
-		return nil, err
-	}
-
-	if err := validateSessionStartPaths(cwd, additionalDirectories); err != nil {
-		return nil, err
-	}
-
-	if err := validateMCPServers(mcpServers); err != nil {
-		return nil, err
-	}
-
-	meta, err := sessionMetaFromVendorOptions(metaMap)
-	if err != nil {
-		return nil, err
-	}
-
+// install publishes a configured session under its ACP id.
+func (a *Agent) install(ctx context.Context, s *session) error {
 	a.mu.Lock()
-	active := a.sessions[id]
+
+	var refusal error
+
+	switch {
+	case a.closed:
+		refusal = wire.AgentClosed()
+	case a.deleted[s.id]:
+		refusal = wire.UnknownSession()
+	case a.sessions[s.id] != nil:
+		refusal = wire.InternalFailure(vendor, internalClassNativeStart)
+	case len(a.sessions) >= a.options.ConcurrencyLimits.MaxActiveSessions:
+		refusal = wire.Backpressure(limitActiveSessions)
+	}
+
+	if refusal == nil {
+		a.sessions[s.id] = s
+	}
 	a.mu.Unlock()
 
-	if active != nil {
-		activeSnapshot := active.snapshot()
-		carrier := carrierFromMeta(meta, activeSnapshot.carrier)
+	if refusal != nil {
+		return refusal
+	}
 
-		if activeLoadRequestMatches(activeSnapshot, active, cwd, additionalDirectories, mcpServers, metaMap, meta, carrier) {
-			// An active logical session is already the newest incarnation. Reuse
-			// it instead of hydrating an older committed generation over it; if
-			// its shared runtime was lost, ensureRuntime performs the in-place
-			// rebind before the handler exposes the session again.
-			if ensureErr := active.ensureRuntime(ctx); ensureErr != nil {
-				return nil, ensureErr
+	a.observe.AddActiveSession(ctx, 1)
+
+	return nil
+}
+
+// scheduleOpen defers the opening publication behind the establishing
+// response on a served connection, and runs it inline for an embedded host.
+func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+
+	if t := a.transportRef(); t != nil {
+		return t.RegisterHook(ctx, s.id, func(hookCtx context.Context) {
+			// Establishment has committed; the gate keeps failure cleanup on its source.
+			release := wire.HoldSessionGate(s.gate)
+			defer release()
+
+			if err := s.openStream(hookCtx, rt); err != nil {
+				s.mu.Lock()
+				current := !s.closing && s.runtime == rt
+				s.mu.Unlock()
+
+				if current {
+					_ = s.close(context.WithoutCancel(hookCtx))
+					a.detach(hookCtx, s)
+				}
+
+				a.log.ErrorContext(hookCtx, "publish session open failed",
+					slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 			}
-
-			return active, nil
-		}
-
-		// A changed carrier or another binding-affecting option is a hard cut.
-		// The predecessor commits its latest generation and proves its native
-		// scope contained before the successor is even hydrated, so the two
-		// carrier bindings can never overlap and the active-session slot is
-		// released before capacity admission runs again.
-		// Replacement is detached from request cancellation because it must not
-		// abandon a predecessor halfway through containment. The deadline bounds
-		// waiting to enter the predecessor's recovery/close gate; after admission,
-		// CloseAndCommit runs its detached, internally bounded ladder to completion.
-		replacementTimeout := a.sessionReplacementTimeout
-		if replacementTimeout <= 0 {
-			replacementTimeout = settlementTimeout
-		}
-
-		replacementCtx, replacementCancel := context.WithTimeout(context.Background(), replacementTimeout)
-		closeErr := active.CloseAndCommit(replacementCtx)
-
-		replacementCancel()
-
-		if closeErr != nil {
-			return nil, closeErr
-		}
-
-		if !a.removeSessionIf(id, active) {
-			return nil, acp.NewInternalError(map[string]any{
-				jsonFieldError: valInternalFailure,
-				jsonFieldClass: classSessionReplacementRaced,
-			})
-		}
-
-		a.observe.AddActiveSession(ctx, -1)
-	}
-
-	storeCtx, cancel := a.sessionStoreContext(ctx)
-	idmap, snapshot, ok, err := hydrateStateFromStore(storeCtx, a.sessionStore(), string(id))
-
-	cancel()
-
-	if err != nil {
-		return nil, a.classifyRestoreFailure(ctx, id, err)
-	}
-
-	if !ok {
-		return nil, acp.NewInvalidParams(map[string]any{jsonFieldError: valSessionUnknown, jsonFieldField: jsonFieldSessionID})
-	}
-
-	if meta.Model == "" {
-		meta.Model = joinModelValue(snapshot.Session.Model.ProviderID, snapshot.Session.Model.ModelID)
-	}
-
-	if meta.Mode == "" {
-		meta.Mode = snapshot.Session.Model.Agent
-	}
-
-	meta.Effort = snapshot.Session.Model.Variant
-
-	carrier := carrierFromMeta(meta, newSessionCarrier(snapshot.Session.Env, snapshot.Session.ExtraPathDirs))
-	meta.Env, meta.ExtraPathDirs = carrier.Env, carrier.ExtraPathDirs
-
-	artifacts, artifactsErr := a.loadAndRehydrateArtifacts(ctx, string(id), snapshot.Events)
-	if artifactsErr != nil {
-		return nil, artifactsErr
-	}
-
-	mcpConfigs := nativeMCPServerConfigs(mcpServers)
-
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, acp.SessionId(idmap.ParentSessionID), cwd, mcpConfigs, carrier, additionalDirectories...)
-	if err != nil {
-		return nil, err
-	}
-
-	a.restoreMu.Lock()
-	native, err := restoreSyncState(ctx, client, snapshot, idmap.NativeSessionID, cwd)
-	a.restoreMu.Unlock()
-
-	if err != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return nil, errors.Join(a.classifyRestoreFailure(ctx, id, err), closeErr)
-	}
-
-	session := newSession(a, id, cwd, additionalDirectories, native, client, meta, idmap)
-	session.directoryRelease = releaseDirectory
-
-	session.secretNeedles = append(mcpSecretNeedles(mcpConfigs), sensitiveEnvNeedles(meta.Env)...)
-	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
-	session.mcpRefreshPending = len(mcpConfigs) > 0
-	session.runtimeGeneration = generation
-	session.stampIncarnationGeneration(client, generation)
-	session.setImageArtifacts(artifacts)
-
-	if err := a.storeStartedSession(session); err != nil {
-		// A delete that completed while this replacement was being prepared
-		// wins, however far the preparation got: the prepared session is torn
-		// down and the uniform unknown-session refusal reaches the host as it
-		// was raised.
-		return nil, a.rollbackStartedSession(session, err)
-	}
-
-	return session, nil
-}
-
-// classifyRestoreFailure names the one internal failure a host can act on. A
-// stored snapshot this adapter will not replay is a property of the stored
-// session rather than of the request that named it, so `session/load` and
-// `session/resume` answer a closed token instead of the unclassified handler
-// token every other unnamed error reduces to: a host can tell "this session is
-// not restorable" from "something else went wrong" without parsing prose. The
-// native and store detail never reaches the wire and stays in the debug stream.
-//
-// Both stages that read the stored snapshot answer the same token — validating
-// it on hydration and replaying its events into a native session — because they
-// are one operation as far as a host is concerned, and splitting them would
-// publish where this adapter keeps its state. A refusal that already carries its
-// own wire classification keeps it, and a store the host supplied that simply
-// failed its own I/O is that store's error and passes through unchanged: only a
-// snapshot this adapter will not replay is this adapter's verdict to name.
-func (a *Agent) classifyRestoreFailure(ctx context.Context, id acp.SessionId, err error) error {
-	var reqErr *acp.RequestError
-	if errors.As(err, &reqErr) {
-		return reqErr
-	}
-
-	if !errors.Is(err, errUnrestorableSnapshot) {
-		return err
-	}
-
-	if a.log != nil {
-		a.log.DebugContext(ctx, "OpenCode session restore failed",
-			slog.String("session_id", string(id)), loggableError(err))
-	}
-
-	return acp.NewInternalError(map[string]any{jsonFieldError: valRestoreFailed})
-}
-
-// activeLoadRequestMatches reports whether load/resume can keep the active
-// incarnation. Omitted options retain the active values; explicitly repeated
-// values are equally reusable. Anything that changes the native directory
-// binding or the session behavior requires the hard-cut path above.
-func activeLoadRequestMatches(
-	snapshot sessionSnapshot,
-	active *session,
-	cwd string,
-	additionalDirectories []string,
-	mcpServers []acp.McpServer,
-	metaMap map[string]any,
-	meta sessionMeta,
-	carrier sessionCarrier,
-) bool {
-	active.mu.Lock()
-	closed := active.closed
-	mcpConfigs := cloneNativeMCPServerConfigs(active.mcpServers)
-	outputSchema := cloneAnyMap(active.outputSchema)
-	active.mu.Unlock()
-
-	if closed || snapshot.cwd != cwd ||
-		!slices.Equal(snapshot.additionalDirectories, additionalDirectories) ||
-		!reflect.DeepEqual(mcpConfigs, nativeMCPServerConfigs(mcpServers)) ||
-		!snapshot.carrier.equal(carrier) {
-		return false
-	}
-
-	if meta.Model != "" && meta.Model != joinModelValue(snapshot.providerID, snapshot.modelID) {
-		return false
-	}
-
-	if meta.Mode != "" && meta.Mode != snapshot.mode {
-		return false
-	}
-
-	if meta.PermissionSet && normalizeOpenCodePermission(meta.Permission) != snapshot.permission {
-		return false
-	}
-
-	if meta.OutputSchema != nil && !reflect.DeepEqual(meta.OutputSchema, outputSchema) {
-		return false
-	}
-
-	opencodeMeta, _ := metaMap[opencodeMetaKey].(map[string]any)
-	_, rawMessagesSet := opencodeMeta[rawEventKey]
-
-	return !rawMessagesSet || meta.RawMessages == snapshot.rawMessages
-}
-
-func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
-	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
-		return acp.ListSessionsResponse{}, refusal
-	}
-
-	if err := a.ensureOpen(); err != nil {
-		return acp.ListSessionsResponse{}, err
-	}
-
-	if err := validateOptionalAbsolutePath(jsonFieldCwd, params.Cwd); err != nil {
-		return acp.ListSessionsResponse{}, err
-	}
-
-	a.mu.Lock()
-
-	active := make([]*session, 0, len(a.sessions))
-
-	for id, session := range a.sessions {
-		// A tombstoned id is hidden however this agent's own bookkeeping stands.
-		// A delete whose teardown failed keeps the handle so the scope it left
-		// running is still reachable for cleanup, and that retained ownership is
-		// this process's business: the host was already told the session is gone.
-		if _, deleted := a.deleted[id]; deleted {
-			continue
-		}
-
-		if params.Cwd != nil && session.cwd != *params.Cwd {
-			continue
-		}
-
-		active = append(active, session)
-	}
-	a.mu.Unlock()
-
-	infos := make([]acp.SessionInfo, 0, len(active))
-	seen := map[acp.SessionId]struct{}{}
-
-	for _, session := range active {
-		info := session.info()
-		infos = append(infos, info)
-		seen[info.SessionId] = struct{}{}
-	}
-
-	storeCtx, cancel := a.sessionStoreContext(ctx)
-	stored, err := a.sessionStore().ListSessions(storeCtx)
-
-	cancel()
-
-	if err != nil {
-		return acp.ListSessionsResponse{}, err
-	}
-
-	for _, summary := range stored {
-		id := acp.SessionId(summary.SessionID)
-		if _, ok := seen[id]; ok || a.isDeleted(id) {
-			continue
-		}
-
-		if params.Cwd != nil && summary.Cwd != "" && summary.Cwd != *params.Cwd {
-			continue
-		}
-
-		title := summary.Title
-		updated := time.UnixMilli(summary.UpdatedAtUnixMilli).UTC().Format(time.RFC3339)
-		infos = append(infos, acp.SessionInfo{
-			SessionId: id,
-			Cwd:       summary.Cwd,
-			Title:     &title,
-			UpdatedAt: &updated,
-			Meta:      summary.Meta,
 		})
 	}
 
-	slices.SortFunc(infos, func(left, right acp.SessionInfo) int {
-		l := *left.UpdatedAt
-		r := *right.UpdatedAt
+	return s.openStream(ctx, rt)
+}
 
-		if r != l {
-			return strings.Compare(r, l)
+// NewSession creates and starts a opencode session.
+func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (resp acp.NewSessionResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.NewSessionResponse{}, openErr
+	}
+
+	if transport := a.transportRef(); transport != nil {
+		ctx = transport.RequestContext(ctx, params.Meta)
+	}
+
+	ctx, finish := a.observe.StartACP(ctx, params.Meta, acp.AgentMethodSessionNew)
+	defer func() { finish(err) }()
+
+	start, err := a.validateStart(sessionStart{cwd: params.Cwd, additionalDirectories: params.AdditionalDirectories}, params.McpServers, params.Meta)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+
+	s := a.newSession(start)
+
+	rt, err := s.launch(ctx)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+
+	model := s.options.Model
+	if model == "" {
+		model = a.options.DefaultModel
+	}
+
+	if err := s.configureRuntime(ctx, rt, model, ""); err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), rt)
+
+		return acp.NewSessionResponse{}, err
+	}
+
+	s.rawEvents = wire.NewRawEvents(vendor, string(s.id), vendor, start.meta.rawEvents)
+
+	release := wire.HoldSessionGate(s.gate)
+	defer release()
+
+	if err := a.install(ctx, s); err != nil {
+		release()
+
+		_ = s.close(context.WithoutCancel(ctx))
+
+		return acp.NewSessionResponse{}, err
+	}
+
+	if err := s.commitMirror(ctx, rt); err != nil {
+		a.log.ErrorContext(ctx, "initial mirror commit failed",
+			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
+		release()
+
+		_ = s.close(context.WithoutCancel(ctx))
+		a.detach(ctx, s)
+
+		return acp.NewSessionResponse{}, wire.InternalFailure(vendor, "")
+	}
+
+	if err := a.scheduleOpen(ctx, s); err != nil {
+		release()
+
+		_ = s.close(context.WithoutCancel(ctx))
+		a.detach(ctx, s)
+
+		return acp.NewSessionResponse{}, err
+	}
+
+	return acp.NewSessionResponse{Meta: wire.NativeSessionMeta(vendor, s.nativeID), SessionId: s.id, ConfigOptions: s.configOptions()}, nil
+}
+
+// LoadSession restores a session and replays its history.
+func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) (resp acp.LoadSessionResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.LoadSessionResponse{}, openErr
+	}
+
+	if transport := a.transportRef(); transport != nil {
+		ctx = transport.RequestContext(ctx, params.Meta)
+	}
+
+	ctx, finish := a.observe.StartACP(ctx, params.Meta, acp.AgentMethodSessionLoad)
+	defer func() { finish(err) }()
+
+	s, release, err := a.restore(ctx, params.SessionId, sessionStart{cwd: params.Cwd, additionalDirectories: params.AdditionalDirectories}, params.McpServers, params.Meta, true)
+	if err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+
+	defer release()
+
+	return acp.LoadSessionResponse{Meta: wire.NativeSessionMeta(vendor, s.nativeID), ConfigOptions: s.configOptions()}, nil
+}
+
+// ResumeSession restores a session without replaying its history.
+func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (resp acp.ResumeSessionResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.ResumeSessionResponse{}, openErr
+	}
+
+	if transport := a.transportRef(); transport != nil {
+		ctx = transport.RequestContext(ctx, params.Meta)
+	}
+
+	ctx, finish := a.observe.StartACP(ctx, params.Meta, acp.AgentMethodSessionResume)
+	defer func() { finish(err) }()
+
+	s, release, err := a.restore(ctx, params.SessionId, sessionStart{cwd: params.Cwd, additionalDirectories: params.AdditionalDirectories}, params.McpServers, params.Meta, false)
+	if err != nil {
+		return acp.ResumeSessionResponse{}, err
+	}
+
+	defer release()
+
+	return acp.ResumeSessionResponse{Meta: wire.NativeSessionMeta(vendor, s.nativeID), ConfigOptions: s.configOptions()}, nil
+}
+
+// restore is the shared load and resume path. A live session whose carrier
+// matches is reused; a changed carrier closes it and re-prepares from the
+// store; a cold session is hydrated from the store and started.
+func (a *Agent) restore(
+	ctx context.Context,
+	sessionID acp.SessionId,
+	params sessionStart,
+	mcpServers []acp.McpServer,
+	meta map[string]any,
+	replay bool,
+) (*session, func(), error) {
+	if sessionID == "" {
+		return nil, nil, wire.UnknownSession()
+	}
+
+	start, err := a.validateStart(params, mcpServers, meta)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if transport := a.transportRef(); transport != nil {
+		if awaitErr := transport.AwaitSession(ctx, sessionID); awaitErr != nil {
+			return nil, nil, awaitErr
+		}
+	}
+
+	releaseRestore, err := a.restores.Acquire(sessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer releaseRestore()
+
+	a.mu.Lock()
+	deleted := a.deleted[sessionID]
+	active := a.sessions[sessionID]
+	a.mu.Unlock()
+
+	if deleted {
+		return nil, nil, wire.UnknownSession()
+	}
+
+	if active != nil {
+		release, gateErr := active.acquireGate(limitSessionRestore)
+		if gateErr != nil {
+			return nil, nil, gateErr
 		}
 
-		return strings.Compare(string(left.SessionId), string(right.SessionId))
-	})
+		if sameCarrier(active, start) {
+			return a.restoreActive(ctx, active, replay, release)
+		}
 
-	paged, next, err := paginateSessionInfos(infos, params.Cursor)
+		release()
+
+		closeErr := active.close(ctx)
+
+		a.detach(ctx, active)
+
+		if closeErr != nil {
+			return nil, nil, wire.RestoreFailed(vendor)
+		}
+	}
+
+	stored, err := a.loadStored(ctx, sessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !stored.found {
+		return nil, nil, wire.UnknownSession()
+	}
+
+	start.meta.options = inheritCarrier(start.meta, stored.record)
+	if start.additionalDirectories == nil {
+		start.additionalDirectories = slices.Clone(stored.record.AdditionalDirectories)
+	}
+
+	s := a.newSession(start)
+	s.id = sessionID
+	s.nativeID = stored.record.NativeSessionID
+	s.rawEvents = wire.NewRawEvents(vendor, string(sessionID), vendor, start.meta.rawEvents)
+	s.title = storedTitle(stored.record.NativeSessionID, stored.rows)
+
+	rt, err := s.launch(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rows, err := s.hydrate(ctx, rt, stored)
+	if err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), rt)
+
+		return nil, nil, err
+	}
+
+	if err := s.configureRuntime(ctx, rt, s.options.Model, s.nativeID); err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), rt)
+
+		return nil, nil, err
+	}
+
+	release := wire.HoldSessionGate(s.gate)
+
+	transferred := false
+	defer func() {
+		if !transferred {
+			release()
+		}
+	}()
+
+	if err := a.install(ctx, s); err != nil {
+		release()
+
+		_ = s.close(context.WithoutCancel(ctx))
+
+		return nil, nil, err
+	}
+
+	if err := s.commitMirror(ctx, rt); err != nil {
+		release()
+
+		_ = s.close(context.WithoutCancel(ctx))
+		a.detach(ctx, s)
+
+		return nil, nil, a.restoreRefused(ctx, sessionID, err)
+	}
+
+	if replay {
+		if err := s.replay(ctx, rows); err != nil {
+			release()
+
+			_ = s.close(context.WithoutCancel(ctx))
+			a.detach(ctx, s)
+
+			return nil, nil, err
+		}
+	}
+
+	if err := a.scheduleOpen(ctx, s); err != nil {
+		release()
+
+		_ = s.close(context.WithoutCancel(ctx))
+		a.detach(ctx, s)
+
+		return nil, nil, err
+	}
+
+	transferred = true
+
+	return s, release, nil
+}
+
+// restoreActive answers a load or resume from a session that is already
+// live, holding its foreground for the replay.
+func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, release func()) (*session, func(), error) {
+	if err := s.admissionError(); err != nil {
+		release()
+
+		return nil, nil, err
+	}
+
+	if !replay {
+		return s, release, nil
+	}
+
+	stored, err := a.loadStored(ctx, s.id)
+	if err != nil {
+		release()
+
+		return nil, nil, err
+	}
+
+	if err := s.replay(ctx, stored.rows); err != nil {
+		release()
+
+		return nil, nil, err
+	}
+
+	return s, release, nil
+}
+
+// sameCarrier reports whether a restore names the configuration the live
+// session already runs under. A field the request omits inherits.
+func sameCarrier(s *session, start sessionStart) bool {
+	record := s.record()
+	if record.Cwd != start.cwd {
+		return false
+	}
+
+	if start.additionalDirectories != nil && !slices.Equal(record.AdditionalDirectories, start.additionalDirectories) {
+		return false
+	}
+
+	current := inheritCarrier(sessionMeta{}, record)
+	requested := inheritCarrier(start.meta, record)
+
+	return reflect.DeepEqual(current.Meta(), requested.Meta())
+}
+
+// inheritCarrier fills the fields a restore omitted from the stored record.
+func inheritCarrier(meta sessionMeta, record sessionRecord) OpenCodeOptions {
+	options := meta.options.clone()
+
+	if !meta.presentEnv {
+		options.Env = maps.Clone(record.Env)
+	}
+
+	if !meta.presentExtraPathDirs {
+		options.ExtraPathDirs = slices.Clone(record.ExtraPathDirs)
+	}
+
+	if options.Model == "" {
+		options.Model = record.Model
+	}
+
+	if options.Effort == "" {
+		options.Effort = record.Effort
+	}
+
+	if options.Mode == "" {
+		options.Mode = record.Mode
+	}
+
+	if options.Permission == "" {
+		options.Permission = record.Permission
+	}
+
+	if options.OutputSchema == nil {
+		options.OutputSchema = wire.CloneMap(record.OutputSchema)
+	}
+
+	return options
+}
+
+// ListSessions lists live sessions and stored sessions, newest first.
+func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (resp acp.ListSessionsResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.ListSessionsResponse{}, openErr
+	}
+
+	ctx, finish := a.observe.StartACP(ctx, params.Meta, acp.AgentMethodSessionList)
+	defer func() { finish(err) }()
+
+	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
+		return acp.ListSessionsResponse{}, wire.ParamRefusal(refusal)
+	}
+
+	filter := ""
+	if params.Cwd != nil {
+		filter = strings.TrimSpace(*params.Cwd)
+	}
+
+	if filter != "" && !filepath.IsAbs(filter) {
+		return acp.ListSessionsResponse{}, wire.Unsupported(fieldCwd)
+	}
+
+	a.mu.Lock()
+	active := make([]*session, 0, len(a.sessions))
+
+	for id, s := range a.sessions {
+		if !a.deleted[id] && (filter == "" || filter == s.cwd) {
+			active = append(active, s)
+		}
+	}
+	a.mu.Unlock()
+
+	sessions := make([]acp.SessionInfo, 0, len(active))
+	seen := make(map[acp.SessionId]struct{}, len(active))
+
+	for _, s := range active {
+		sessions = append(sessions, s.sessionInfo())
+		seen[s.id] = struct{}{}
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, acpcore.SessionStoreTimeout)
+	defer cancel()
+
+	listCtx, finishList := a.observe.StartSessionStore(listCtx, "list")
+	summaries, err := a.store.ListSessions(listCtx)
+	finishList(err)
+
+	if err != nil {
+		return acp.ListSessionsResponse{}, wire.InternalFailure(vendor, "")
+	}
+
+	for _, summary := range summaries {
+		id := acp.SessionId(summary.SessionID)
+		if _, ok := seen[id]; ok || a.deletedSession(id) {
+			continue
+		}
+
+		stored, loadErr := a.loadStored(ctx, id)
+		if loadErr != nil {
+			return acp.ListSessionsResponse{}, wire.InternalFailure(vendor, "")
+		}
+
+		cwd := stored.record.Cwd
+
+		if filter != "" && cwd != filter {
+			continue
+		}
+
+		title := storedTitle(stored.record.NativeSessionID, stored.rows)
+		updatedAt := time.UnixMilli(summary.UpdatedAtUnixMilli).UTC().Format(time.RFC3339)
+
+		sessions = append(sessions, acp.SessionInfo{
+			Meta:                  wire.NativeSessionMeta(vendor, stored.record.NativeSessionID),
+			SessionId:             id,
+			Cwd:                   cwd,
+			AdditionalDirectories: slices.Clone(stored.record.AdditionalDirectories),
+			Title:                 &title,
+			UpdatedAt:             &updatedAt,
+		})
+		seen[id] = struct{}{}
+	}
+
+	page, next, err := wire.PaginateSessions(sessions, params.Cursor)
 	if err != nil {
 		return acp.ListSessionsResponse{}, err
 	}
 
-	return acp.ListSessionsResponse{Sessions: paged, NextCursor: next}, nil
+	return acp.ListSessionsResponse{Sessions: page, NextCursor: next}, nil
 }
 
-func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
-		return acp.CloseSessionResponse{}, refusal
+// Prompt sends one turn to opencode and streams updates until it settles.
+func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (resp acp.PromptResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.PromptResponse{}, openErr
 	}
 
-	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
+	s, err := a.session(ctx, params.SessionId)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	var raw json.RawMessage
+	if t := a.transportRef(); t != nil {
+		raw = t.TakeRawPrompt(params.SessionId, params.Meta)
+	}
+
+	ctx, finish := a.observe.StartPrompt(ctx, params.Meta, s.currentModel())
+	defer func() { finish(observer.PromptResultFrom(resp, err, s.currentModel(), "")) }()
+
+	return s.prompt(ctx, params, raw)
+}
+
+func (s *session) currentModel() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.model
+}
+
+// Cancel interrupts the session's in-flight turn. It is wire-silent on an
+// unknown session or with no turn in flight.
+func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) (err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return openErr
+	}
+
+	_, finish := a.observe.StartACP(ctx, params.Meta, acp.AgentMethodSessionCancel)
+	defer func() { finish(err) }()
+
+	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
+		return wire.ParamRefusal(refusal)
+	}
+
+	s, err := a.session(ctx, params.SessionId)
+	if err != nil {
+		return nil
+	}
+
+	s.cancel(ctx)
+
+	return nil
+}
+
+// CloseSession runs the shutdown ladder for one session.
+func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (resp acp.CloseSessionResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.CloseSessionResponse{}, openErr
+	}
+
+	ctx, finish := a.observe.StartACP(ctx, params.Meta, acp.AgentMethodSessionClose)
+	defer func() { finish(err) }()
+
+	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
+		return acp.CloseSessionResponse{}, wire.ParamRefusal(refusal)
+	}
+
+	s, err := a.session(ctx, params.SessionId)
 	if err != nil {
 		return acp.CloseSessionResponse{}, err
 	}
-	defer release()
 
-	session, err := a.session(params.SessionId)
-	if err != nil {
-		return acp.CloseSessionResponse{}, err
-	}
-
-	// Close is the containment-proving boundary and it owns the whole ladder:
-	// the containment proof runs first, the durable commit and the terminal
-	// transition follow only a proof that completed, and the stream is fenced
-	// either way. A boundary that did not complete answers with its containment
-	// error and keeps the handle addressable for a retry.
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-	closeErr := session.CloseAndCommit(closeCtx)
-
-	closeCancel()
+	closeErr := s.close(ctx)
+	a.detach(ctx, s)
 
 	if closeErr != nil {
-		return acp.CloseSessionResponse{}, closeErr
-	}
-
-	if a.removeSessionIf(params.SessionId, session) {
-		a.observe.AddActiveSession(ctx, -1)
+		return acp.CloseSessionResponse{}, wire.InternalFailure(vendor, "")
 	}
 
 	return acp.CloseSessionResponse{}, nil
 }
 
-// rollbackStartedSession answers a refused installation. The refusal is the
-// answer the request owes and it survives the rollback intact — a load that lost
-// its race with a delete gets the uniform unknown-session invalid params rather
-// than an internal error wrapped around it — so only a teardown that itself
-// failed is joined onto it.
-func (a *Agent) rollbackStartedSession(session *session, refusal error) error {
-	if closeErr := a.closeFailedSession(session); closeErr != nil {
-		return errors.Join(refusal, closeErr)
+// UnstableDeleteSession tombstones the session first, then closes any live
+// session with the same id. Native state stays in opencode's home.
+func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (resp acp.UnstableDeleteSessionResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.UnstableDeleteSessionResponse{}, openErr
 	}
 
-	return refusal
-}
+	ctx, finish := a.observe.StartACP(ctx, params.Meta, acp.AgentMethodSessionDelete)
+	defer func() { finish(err) }()
 
-func (a *Agent) UnstableDeleteSession(ctx context.Context, params acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
-	ctx = a.observe.Extract(ctx, params.Meta)
-	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
-		return acp.UnstableDeleteSessionResponse{}, refusal
+	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
+		return acp.UnstableDeleteSessionResponse{}, wire.ParamRefusal(refusal)
 	}
 
-	if err := a.ensureOpen(); err != nil {
-		return acp.UnstableDeleteSessionResponse{}, err
-	}
+	deleteCtx, cancel := context.WithTimeout(ctx, acpcore.SessionStoreTimeout)
+	defer cancel()
 
-	if params.SessionId == "" {
-		return acp.UnstableDeleteSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldSessionID: validationRequired})
-	}
-
-	release, err := a.acquireSessionLifecycle(ctx, params.SessionId)
-	if err != nil {
-		return acp.UnstableDeleteSessionResponse{}, err
-	}
-	defer release()
-
-	a.mu.Lock()
-	session := a.sessions[params.SessionId]
-	a.mu.Unlock()
-
-	// The durable tombstone is written before anything is torn down, and the id
-	// is hidden with it. A teardown that fails afterwards is reported to the
-	// caller, but it never leaves a session that delete already answered for
-	// still listable, loadable, or resumable: a deleted session is
-	// wire-indistinguishable from one that never existed. A store that could not
-	// record the tombstone is the one failure that leaves the handle exactly as
-	// it was, because nothing was promised.
-	storeCtx, cancel := a.sessionStoreContext(ctx)
-	err = a.sessionStore().Delete(storeCtx, SessionKey{SessionID: string(params.SessionId)})
-
-	cancel()
-
-	if err != nil {
-		return acp.UnstableDeleteSessionResponse{}, err
+	if err := a.store.Delete(deleteCtx, acpcore.SessionKey{SessionID: string(params.SessionId)}); err != nil {
+		return acp.UnstableDeleteSessionResponse{}, wire.InternalFailure(vendor, "")
 	}
 
 	a.mu.Lock()
-	a.deleted[params.SessionId] = struct{}{}
+	a.deleted[params.SessionId] = true
+	s := a.sessions[params.SessionId]
 	a.mu.Unlock()
 
-	if session == nil {
+	if s == nil {
 		return acp.UnstableDeleteSessionResponse{}, nil
 	}
 
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-	teardownErr := session.DeleteNativeAndClose(closeCtx)
+	closeErr := s.close(ctx)
+	a.detach(ctx, s)
 
-	closeCancel()
-
-	// Hidden is a wire fact, not a bookkeeping one. The tombstone above is what
-	// hides the id, and it hides it whatever happens here; the handle is released
-	// only once this session's native scope is proven contained. A teardown that
-	// failed leaves a live native scope, and dropping the only reference to it
-	// would leave nothing in this process able to reach it again: the retained
-	// handle is what a later delete retries the cleanup through and what
-	// `Agent.Close` sweeps on the way out.
-	if teardownErr != nil {
-		return acp.UnstableDeleteSessionResponse{}, teardownErr
-	}
-
-	if a.removeSessionIf(params.SessionId, session) {
-		a.observe.AddActiveSession(ctx, -1)
+	if closeErr != nil {
+		return acp.UnstableDeleteSessionResponse{}, wire.InternalFailure(vendor, "")
 	}
 
 	return acp.UnstableDeleteSessionResponse{}, nil
 }
 
-func (a *Agent) forkSession(ctx context.Context, params acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
-	ctx = a.observe.Extract(ctx, params.Meta)
-	if err := validateProviderAuthOptions(a.options); err != nil {
-		return acp.UnstableForkSessionResponse{}, err
+// SetSessionConfigOption applies one select value.
+func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (resp acp.SetSessionConfigOptionResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.SetSessionConfigOptionResponse{}, openErr
 	}
 
-	if err := validateSessionStartPaths(params.Cwd, params.AdditionalDirectories); err != nil {
-		return acp.UnstableForkSessionResponse{}, err
+	var meta map[string]any
+
+	switch {
+	case params.ValueId != nil:
+		meta = params.ValueId.Meta
+	case params.Boolean != nil:
+		meta = params.Boolean.Meta
 	}
 
-	if err := validateUnstableMCPServers(params.McpServers); err != nil {
-		return acp.UnstableForkSessionResponse{}, err
+	ctx, finish := a.observe.StartACP(ctx, meta, acp.AgentMethodSessionSetConfigOption)
+	defer func() { finish(err) }()
+
+	if refusal := lifecycle.RejectKey(meta); refusal != nil {
+		return acp.SetSessionConfigOptionResponse{}, wire.ParamRefusal(refusal)
 	}
 
-	meta, err := sessionMetaFromVendorOptions(params.Meta)
+	if params.ValueId == nil {
+		return acp.SetSessionConfigOptionResponse{}, wire.Unsupported(fieldType)
+	}
+
+	s, err := a.session(ctx, params.ValueId.SessionId)
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
+		return acp.SetSessionConfigOptionResponse{}, err
 	}
 
-	parent, err := a.session(params.SessionId)
+	options, err := s.setConfigOption(ctx, params.ValueId.ConfigId, string(params.ValueId.Value))
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
+		return acp.SetSessionConfigOptionResponse{}, err
 	}
 
-	parentSnapshot := parent.snapshot()
-
-	// OpenCode's native fork keeps the source session's directory. `POST
-	// /session/{id}/fork` accepts a `directory` query parameter and ignores it:
-	// the forked session's `directory` and `projectID` are the parent's whatever
-	// the request says, the directory header does not move it either, and
-	// `PATCH /session/{id}` cannot change a directory after the fact. A fork
-	// therefore inherits its parent's workspace, and a request naming another
-	// one is refused here rather than accepted and then stored as a lineage no
-	// restore could rebase. The parent's own spelling is what the fork carries,
-	// so the two nodes of the lineage record one identical source cwd.
-	if filepath.Clean(params.Cwd) != filepath.Clean(parentSnapshot.cwd) {
-		return acp.UnstableForkSessionResponse{}, unsupportedField(jsonFieldCwd)
-	}
-
-	cwd := parentSnapshot.cwd
-
-	if meta.PermissionSet && normalizeOpenCodePermission(meta.Permission) != parentSnapshot.permission {
-		return acp.UnstableForkSessionResponse{}, acp.NewInvalidParams(map[string]any{
-			jsonFieldError: "child_permission_must_inherit",
-			jsonFieldField: "_meta.opencode.options.permission",
-		})
-	}
-
-	meta.Permission = parentSnapshot.permission
-
-	carrier := carrierFromMeta(meta, parentSnapshot.carrier)
-	meta.Env, meta.ExtraPathDirs = carrier.Env, carrier.ExtraPathDirs
-
-	nativeChild, err := parentSnapshot.client.Fork(ctx, parentSnapshot.idmap.NativeSessionID, "")
-	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-
-	idValue, err := newSessionID()
-	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-
-	id := acp.SessionId(idValue)
-
-	if meta.Model == "" {
-		meta.Model = joinModelValue(parentSnapshot.providerID, parentSnapshot.modelID)
-	}
-
-	if meta.Mode == "" {
-		meta.Mode = parentSnapshot.mode
-	}
-
-	meta.Effort = parentSnapshot.variant
-
-	mcpConfigs := nativeMCPServerConfigsFromUnstable(params.McpServers)
-
-	client, releaseDirectory, generation, err := a.newOpenCodeClient(ctx, id, params.SessionId, cwd, mcpConfigs, carrier, params.AdditionalDirectories...)
-	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-
-	native, err := client.GetSession(ctx, nativeChild.ID)
-	if err != nil {
-		closeErr := a.closeDirectoryScope(client, releaseDirectory, generation)
-
-		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
-	}
-
-	idmap := idmapRecord{
-		SessionID:             string(id),
-		NativeSessionID:       native.ID,
-		ParentSessionID:       string(params.SessionId),
-		NativeParentSessionID: parentSnapshot.idmap.NativeSessionID,
-		Format:                SessionStoreFormat,
-	}
-
-	session := newSession(a, id, cwd, params.AdditionalDirectories, native, client, meta, idmap)
-	session.directoryRelease = releaseDirectory
-
-	session.secretNeedles = append(mcpSecretNeedles(mcpConfigs), sensitiveEnvNeedles(meta.Env)...)
-	session.mcpServers = cloneNativeMCPServerConfigs(mcpConfigs)
-	session.mcpRefreshPending = len(mcpConfigs) > 0
-	session.runtimeGeneration = generation
-	session.stampIncarnationGeneration(client, generation)
-	session.setImageArtifacts(parent.cloneImageArtifacts())
-
-	if err := a.storeStartedSession(session); err != nil {
-		return acp.UnstableForkSessionResponse{}, a.rollbackStartedSession(session, err)
-	}
-
-	if err := session.snapshotToStore(context.WithoutCancel(ctx)); err != nil {
-		closeErr := a.closeFailedSession(session)
-
-		return acp.UnstableForkSessionResponse{}, errors.Join(err, closeErr)
-	}
-
-	return acp.UnstableForkSessionResponse{
-		SessionId:     id,
-		Meta:          sessionResponseMeta(session.snapshot()),
-		ConfigOptions: unstableConfigOptions(session.configOptions(ctx)),
-	}, nil
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
 }
 
-// nativeMCPServerConfigs maps validated ACP MCP server declarations onto the
-// native launch config: HTTP servers become remote entries, stdio servers
-// become local entries. Call validateMCPServers first; unsupported transports
-// are skipped here.
-func nativeMCPServerConfigs(servers []acp.McpServer) []opencode.MCPServerConfig {
-	if len(servers) == 0 {
-		return nil
+// session resolves an addressed id to its live session. A deleted id is
+// indistinguishable from one that never existed.
+func (a *Agent) session(ctx context.Context, sessionID acp.SessionId) (*session, error) {
+	a.mu.Lock()
+
+	if a.closed {
+		a.mu.Unlock()
+
+		return nil, wire.AgentClosed()
 	}
 
-	configs := make([]opencode.MCPServerConfig, 0, len(servers))
+	s := a.sessions[sessionID]
+	if s == nil || a.deleted[sessionID] {
+		a.mu.Unlock()
 
-	for _, server := range servers {
-		switch {
-		case server.Http != nil:
-			configs = append(configs, opencode.MCPServerConfig{
-				Name:    server.Http.Name,
-				URL:     server.Http.Url,
-				Headers: httpHeaderMap(server.Http.Headers),
-			})
-		case server.Stdio != nil:
-			configs = append(configs, nativeStdioMCPServerConfig(server.Stdio))
+		return nil, wire.UnknownSession()
+	}
+
+	a.mu.Unlock()
+
+	if transport := a.transportRef(); transport != nil {
+		if err := transport.AwaitSession(ctx, sessionID); err != nil {
+			return nil, err
 		}
 	}
 
-	return configs
+	return s, nil
 }
 
-// nativeMCPServerConfigsFromUnstable is the fork-path equivalent of
-// nativeMCPServerConfigs for the unstable MCP server union.
-func nativeMCPServerConfigsFromUnstable(servers []acp.UnstableMcpServer) []opencode.MCPServerConfig {
-	if len(servers) == 0 {
-		return nil
-	}
+func (a *Agent) deletedSession(id acp.SessionId) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	configs := make([]opencode.MCPServerConfig, 0, len(servers))
-
-	for _, server := range servers {
-		switch {
-		case server.Http != nil:
-			configs = append(configs, opencode.MCPServerConfig{
-				Name:    server.Http.Name,
-				URL:     server.Http.Url,
-				Headers: httpHeaderMap(server.Http.Headers),
-			})
-		case server.Stdio != nil:
-			configs = append(configs, nativeStdioMCPServerConfig(server.Stdio))
-		}
-	}
-
-	return configs
+	return a.deleted[id]
 }
 
-func nativeStdioMCPServerConfig(server *acp.McpServerStdio) opencode.MCPServerConfig {
-	command := make([]string, 0, len(server.Args)+1)
-	command = append(command, server.Command)
-	command = append(command, server.Args...)
+// detach removes a session from the active map while it still resolves to
+// this exact session.
+func (a *Agent) detach(ctx context.Context, s *session) {
+	a.mu.Lock()
 
-	var env map[string]string
-
-	if len(server.Env) > 0 {
-		env = make(map[string]string, len(server.Env))
-		for _, variable := range server.Env {
-			env[variable.Name] = variable.Value
-		}
+	current := a.sessions[s.id] == s
+	if current {
+		delete(a.sessions, s.id)
 	}
+	a.mu.Unlock()
 
-	return opencode.MCPServerConfig{Name: server.Name, Command: command, Env: env}
-}
-
-func httpHeaderMap(headers []acp.HttpHeader) map[string]string {
-	if len(headers) == 0 {
-		return nil
+	if current {
+		a.observe.AddActiveSession(ctx, -1)
 	}
-
-	values := make(map[string]string, len(headers))
-	for _, header := range headers {
-		values[header.Name] = header.Value
-	}
-
-	return values
-}
-
-// newOpenCodeClient admits one logical session to its canonical directory and
-// opens its directory-scoped native client. parentID is the session's ACP fork
-// parent, or the empty id for a lineage root; it is what lets a fork share the
-// directory principal its parent holds.
-func (a *Agent) newOpenCodeClient(
-	ctx context.Context,
-	id acp.SessionId,
-	parentID acp.SessionId,
-	cwd string,
-	mcpServers []opencode.MCPServerConfig,
-	carrier sessionCarrier,
-	additionalDirectories ...string,
-) (opencode.Client, func(), uint64, error) {
-	a.rememberImageWorkspaces(cwd, additionalDirectories)
-
-	for {
-		releaseDirectory, err := a.bindDirectory(id, parentID, cwd, mcpServers)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-
-		runtime, generation, err := a.sharedRuntimeBinding(ctx)
-		if err != nil {
-			releaseDirectory()
-
-			return nil, nil, 0, startupFailure(err)
-		}
-
-		client, err := runtime.Scope(ctx, carrier.scopeOptions(cwd, mcpServers))
-		if err == nil {
-			return client, releaseDirectory, generation, nil
-		}
-
-		startupErr := startupFailure(err)
-
-		current := a.runtimeGenerationIsCurrent(generation)
-		if !current || !errors.Is(err, opencode.ErrMCPDisconnectUnproven) {
-			releaseDirectory()
-		} else {
-			a.quarantineRuntimeConfiguration(generation, startupErr)
-		}
-
-		if current {
-			return nil, nil, 0, startupErr
-		}
-
-		if err := ctx.Err(); err != nil {
-			return nil, nil, 0, err
-		}
-	}
-}
-
-func cloneNativeMCPServerConfigs(configs []opencode.MCPServerConfig) []opencode.MCPServerConfig {
-	if configs == nil {
-		return nil
-	}
-
-	cloned := make([]opencode.MCPServerConfig, len(configs))
-	for index := range configs {
-		cloned[index] = configs[index]
-		cloned[index].Headers = cloneStringMap(configs[index].Headers)
-		cloned[index].Command = append([]string(nil), configs[index].Command...)
-		cloned[index].Env = cloneStringMap(configs[index].Env)
-	}
-
-	return cloned
-}
-
-func nativePermissionPolicy(permission string) []opencode.PermissionRule {
-	return []opencode.PermissionRule{{Permission: "*", Pattern: "*", Action: normalizeOpenCodePermission(permission)}}
-}
-
-func mcpSecretNeedles(configs []opencode.MCPServerConfig) []string {
-	var needles []string
-
-	for _, config := range configs {
-		for _, value := range config.Headers {
-			if value != "" {
-				needles = append(needles, value)
-			}
-		}
-
-		for _, value := range config.Env {
-			if value != "" {
-				needles = append(needles, value)
-			}
-		}
-	}
-
-	return needles
-}
-
-func validateUnstableMCPServers(servers []acp.UnstableMcpServer) error {
-	seen := make(map[string]struct{}, len(servers))
-
-	for index, server := range servers {
-		if server.Sse != nil {
-			return acp.NewInvalidParams(map[string]any{jsonFieldError: valUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Sse.Name})
-		}
-
-		if server.Acp != nil {
-			return acp.NewInvalidParams(map[string]any{jsonFieldError: valUnsupported, jsonFieldField: fmt.Sprintf("mcpServers[%d]", index), jsonFieldServer: server.Acp.Name})
-		}
-
-		var name string
-
-		switch {
-		case server.Http != nil:
-			name = server.Http.Name
-		case server.Stdio != nil:
-			name = server.Stdio.Name
-		default:
-			return acp.NewInvalidParams(map[string]any{
-				jsonFieldError: valNoTransport,
-				jsonFieldField: fmt.Sprintf("mcpServers[%d]", index),
-			})
-		}
-
-		if strings.TrimSpace(name) == "" {
-			return acp.NewInvalidParams(map[string]any{fmt.Sprintf("mcpServers[%d].name", index): validationRequired})
-		}
-
-		if _, ok := seen[name]; ok {
-			return acp.NewInvalidParams(map[string]any{fmt.Sprintf("mcpServers[%d].name", index): validationDuplicate})
-		}
-
-		seen[name] = struct{}{}
-	}
-
-	return nil
-}
-
-func paginateSessionInfos(infos []acp.SessionInfo, cursor *string) ([]acp.SessionInfo, *string, error) {
-	offset, err := decodeListCursor(cursor)
-	if err != nil {
-		return nil, nil, acp.NewInvalidParams(map[string]any{"cursor": "invalid cursor"})
-	}
-
-	if offset > len(infos) {
-		return nil, nil, acp.NewInvalidParams(map[string]any{"cursor": "cursor is past end"})
-	}
-
-	end := offset + listSessionsPageSize
-	if end >= len(infos) {
-		return infos[offset:], nil, nil
-	}
-
-	next := encodeListCursor(end)
-
-	return infos[offset:end], &next, nil
-}
-
-func decodeListCursor(cursor *string) (int, error) {
-	if cursor == nil || *cursor == "" {
-		return 0, nil
-	}
-
-	data, err := base64.RawURLEncoding.DecodeString(*cursor)
-	if err != nil {
-		return 0, err
-	}
-
-	offset, err := strconv.Atoi(string(data))
-	if err != nil || offset < 0 {
-		return 0, strconv.ErrSyntax
-	}
-
-	return offset, nil
-}
-
-func encodeListCursor(offset int) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset)))
 }
