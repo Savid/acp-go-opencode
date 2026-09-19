@@ -43,9 +43,8 @@ type session struct {
 	commands         []opencode.NativeCommand
 	title            string
 	updatedAt        string
-	// installed records that the agent published the session under its id,
-	// so close owes the store its final generation.
-	installed bool
+	// persisted marks a successfully committed mirror.
+	persisted bool
 	closing   bool
 	closeDone chan struct{}
 	closeErr  error
@@ -54,6 +53,7 @@ type session struct {
 	cycle     *cycle
 	dialogs   map[string]*dialog
 	callbacks sync.WaitGroup
+	openMu    sync.Mutex
 	mirrorMu  sync.Mutex
 	lcMu      sync.Mutex
 	lc        lifecycle.Publisher
@@ -171,7 +171,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 		return nil, err
 	}
 
-	if err := s.publishOpen(ctx); err != nil {
+	if err := s.openStream(ctx, rt); err != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
 		return nil, err
@@ -293,7 +293,7 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 	}
 
 	if !closing {
-		s.lc.Fence()
+		s.fenceStream()
 	}
 
 	s.clearRuntime(rt)
@@ -491,8 +491,8 @@ func (s *session) close(ctx context.Context) error {
 	}
 
 	s.closing = true
+	joinEstablishment := !s.persisted
 	s.closeDone = make(chan struct{})
-	installed := s.installed
 
 	t, rt, closingCycle := s.turn, s.runtime, s.cycle
 	if t != nil {
@@ -528,13 +528,23 @@ func (s *session) close(ctx context.Context) error {
 		}
 	}
 
+	// An initial mirror may not have started yet; its establishment owns the gate.
+	if joinEstablishment {
+		s.gate <- struct{}{}
+		defer func() { <-s.gate }()
+	}
+
+	s.mu.Lock()
+	persisted := s.persisted
+	s.mu.Unlock()
+
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()
 
 	var errs []error
 
 	if rt != nil {
-		if installed {
+		if persisted {
 			if err := s.commitMirror(commitCtx, rt); err != nil {
 				errs = append(errs, err)
 			}
@@ -543,7 +553,7 @@ func (s *session) close(ctx context.Context) error {
 		s.stopRuntime(commitCtx, rt)
 	}
 
-	s.lc.Fence()
+	s.fenceStream()
 	s.mu.Lock()
 	s.closeErr = errors.Join(errs...)
 	close(s.closeDone)

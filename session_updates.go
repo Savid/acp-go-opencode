@@ -541,7 +541,7 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 
 	if err := s.commitMirror(settleCtx, rt); err != nil {
 		s.recordFailure(c, s.mirrorFailure(&c.state, err))
-		s.lc.Fence()
+		s.fenceStream()
 		// A fenced incarnation is terminal, so the binding ends with it and the
 		// next operation relaunches and opens a new one. This runs on the
 		// binding's own pump, which joins itself, so the cancel is the drop.

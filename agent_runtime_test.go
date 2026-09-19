@@ -29,6 +29,34 @@ func TestStartupRetriesStalledHealthRequest(t *testing.T) {
 	require.FileExists(t, held)
 }
 
+func TestStartupCancellationBeforeAddress(t *testing.T) {
+	t.Parallel()
+
+	held := filepath.Join(t.TempDir(), "startup-held")
+	require.NoError(t, os.WriteFile(held+".armed", nil, 0o600))
+	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", fakeOpenCodeEnvStartHold: held}))...)
+	t.Cleanup(func() { require.NoError(t, a.Close()) })
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() {
+		_, err := a.startRuntime(ctx)
+		finished <- err
+	}()
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(held)
+
+		return err == nil
+	}, testTimeout, time.Millisecond)
+	cancel()
+	select {
+	case err := <-finished:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled startup did not join its native process and stdout reader")
+	}
+}
+
 // A seed file the adapter cannot own is refused as an invalid option naming
 // seedFiles, not reported as a native start failure.
 func TestInvalidSeedFileRefusesTheStart(t *testing.T) {

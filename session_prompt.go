@@ -333,7 +333,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 
 		if err := s.commitMirror(settleCtx, rt); err != nil {
 			s.stopRuntime(settleCtx, rt)
-			s.lc.Fence()
+			s.fenceStream()
 			verdict.failure = s.mirrorFailure(&t.state, err)
 			verdict.outcome = lifecycle.OutcomeFailed
 		}
@@ -347,7 +347,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	// the turn ended: a native exit after a settled turn must not leave the
 	// next process publishing on this stream.
 	if t.ended == turnTransportEnded || !s.boundTo(rt) {
-		s.lc.Fence()
+		s.fenceStream()
 	}
 
 	if verdict.failure != nil {

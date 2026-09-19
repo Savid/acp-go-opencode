@@ -10,8 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -43,18 +43,8 @@ func IsMissing(err error) bool {
 	return errors.As(err, &e) && e.Status == http.StatusNotFound
 }
 
-func NewClient() (*Client, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
-	}
-
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		return nil, err
-	}
-
-	return &Client{URL: "http://" + address, Password: NewID(""), http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+func NewClient() *Client {
+	return &Client{Password: NewID(""), http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
 func NewID(prefix string) string {
@@ -66,9 +56,35 @@ func NewID(prefix string) string {
 }
 
 func (c *Client) Args() []string {
-	_, port, _ := net.SplitHostPort(strings.TrimPrefix(c.URL, "http://"))
+	return []string{"serve", "--hostname", "127.0.0.1", "--port", "0"}
+}
 
-	return []string{"serve", "--hostname", "127.0.0.1", "--port", port}
+// ReadAddress reads the owned server's bound loopback address before any HTTP request.
+func (c *Client) ReadAddress(stdout io.Reader) error {
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		address, announced := strings.CutPrefix(scanner.Text(), "opencode server listening on ")
+		if !announced {
+			continue
+		}
+
+		host, httpAddress := strings.CutPrefix(address, "http://")
+
+		endpoint, err := netip.ParseAddrPort(host)
+		if !httpAddress || err != nil || endpoint.Addr().String() != "127.0.0.1" || endpoint.Port() == 0 {
+			return errors.New("opencode announced an invalid server address")
+		}
+
+		c.URL = address
+
+		return nil
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("opencode server address: %w", err)
+	}
+
+	return errors.New("opencode server exited without announcing its address")
 }
 
 func (c *Client) request(ctx context.Context, directory, method, path string, body any) (*http.Response, error) {

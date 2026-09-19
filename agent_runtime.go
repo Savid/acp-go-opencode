@@ -34,6 +34,7 @@ type runtime struct {
 	lock        *process.FileLock
 	cancel      context.CancelFunc
 	done        chan struct{}
+	stdoutDone  <-chan struct{}
 	closeOnce   sync.Once
 	mu          sync.Mutex
 	bindings    map[string]*binding
@@ -92,10 +93,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	client, err := opencode.NewClient()
-	if err != nil {
-		return nil, err
-	}
+	client := opencode.NewClient()
 
 	root, err := a.scratchDir("plugin")
 	if err != nil {
@@ -152,7 +150,16 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	go func() { _, _ = io.Copy(io.Discard, proc.Stdout()) }()
+	addressReady := make(chan error, 1)
+	stdoutDone := make(chan struct{})
+
+	go func() {
+		defer close(stdoutDone)
+
+		addressReady <- client.ReadAddress(proc.Stdout())
+
+		_, _ = io.Copy(io.Discard, proc.Stdout())
+	}()
 
 	defer func() {
 		if !transferred {
@@ -164,6 +171,8 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 
 			_ = proc.Shutdown(shutdownCtx, sessionShutdownGrace)
 			_ = proc.Close()
+
+			<-stdoutDone
 		}
 	}()
 
@@ -171,6 +180,15 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 
 	readyCtx, cancel := context.WithTimeout(ctx, serverStartupTimeout)
 	defer cancel()
+
+	select {
+	case addressErr := <-addressReady:
+		if addressErr != nil {
+			return nil, addressErr
+		}
+	case <-readyCtx.Done():
+		return nil, fmt.Errorf("native server address: %w", readyCtx.Err())
+	}
 
 	if healthErr := a.waitForServerHealth(readyCtx, client, proc); healthErr != nil {
 		return nil, fmt.Errorf("native health after %s: %w", time.Since(started).Round(time.Millisecond), healthErr)
@@ -203,7 +221,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	rt := &runtime{proc: proc, client: client, executable: executable, environment: base, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), bindings: map[string]*binding{}}
+	rt := &runtime{proc: proc, client: client, executable: executable, environment: base, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), stdoutDone: stdoutDone, bindings: map[string]*binding{}}
 	transferred = true
 
 	go rt.pump(runtimeCtx)
@@ -287,6 +305,7 @@ func (rt *runtime) pump(ctx context.Context) {
 	}
 
 	_ = rt.proc.Close()
+	<-rt.stdoutDone
 	_ = rt.lock.Close()
 	rt.mu.Lock()
 	for _, b := range rt.bindings {

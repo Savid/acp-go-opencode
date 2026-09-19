@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -87,7 +88,12 @@ func runFakeOpenCode(args []string) int {
 		}
 	}
 	server := &http.Server{Addr: "127.0.0.1:" + port, Handler: f, ReadHeaderTimeout: time.Second}
-	if err := server.ListenAndServe(); err != nil {
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		return 4
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "opencode server listening on http://"+listener.Addr().String())
+	if err := server.Serve(listener); err != nil {
 		return 4
 	}
 

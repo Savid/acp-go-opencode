@@ -215,9 +215,10 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 	return options, nil
 }
 
+// emitCommands publishes a snapshot of the current catalog.
 func (s *session) emitCommands(ctx context.Context) error {
 	s.mu.Lock()
-	native := slices.Clone(s.commands)
+	native := append([]opencode.NativeCommand(nil), s.commands...)
 	s.mu.Unlock()
 
 	commands := []acp.AvailableCommand{}
