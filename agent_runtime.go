@@ -254,7 +254,7 @@ func (a *Agent) waitForServerHealth(ctx context.Context, client *opencode.Client
 		}
 
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			a.log.InfoContext(ctx, "opencode health request stalled; retrying", slog.Duration("request_timeout", serverHealthTimeout))
+			a.log.WarnContext(ctx, "opencode health request stalled; retrying", slog.Duration("request_timeout", serverHealthTimeout))
 		}
 
 		select {
