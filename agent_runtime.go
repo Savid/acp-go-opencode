@@ -260,8 +260,8 @@ func (a *Agent) waitForServerHealth(ctx context.Context, client *opencode.Client
 		select {
 		case <-proc.Done():
 			message := "opencode server exited before it was ready"
-			if line := proc.StderrLastLine(); line != "" {
-				message += ": " + line
+			if tail := proc.StderrTail(); tail != "" {
+				message += ": " + tail
 			}
 
 			return errors.New(message)
