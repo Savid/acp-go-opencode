@@ -151,7 +151,7 @@ func TestAccountUsageReadsThroughCatalogGateway(t *testing.T) {
 	response, err := a.accountUsage(t.Context(), params)
 	require.NoError(t, err)
 	require.True(t, response.Available)
-	require.Equal(t, "5h", response.Limits[0].ID)
+	require.Equal(t, "session", response.Limits[0].ID)
 	require.Equal(t, []string{"gateway.example/v1/usage Bearer gateway-key"}, asked)
 
 	params, err = json.Marshal(map[string]any{usageSessionField: session.SessionId, "providerId": "openrouter"})
