@@ -124,3 +124,39 @@ func TestAccountUsageRPCRefusals(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, `{"available":false,"reason":"not_authenticated"}`, string(raw))
 }
+
+const gatewayReport = `{"generatedAt":1,"reports":[{"provider":"anthropic","fetchedAt":1789807237831,"limits":[{"id":"anthropic:5h","label":"Claude 5 Hour","window":{"id":"5h","durationMs":18000000,"resetsAt":1789817399682},"amount":{"usedFraction":0.25,"unit":"percent"},"status":"ok"}],"metadata":{}}]}`
+
+// A provider the catalog routes through a gateway is read from that gateway's
+// report, with an {env:NAME} key resolved from the session environment.
+func TestAccountUsageReadsThroughCatalogGateway(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "providers.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"providers":[{"id":"omp","name":"omp","options":{"baseURL":"https://gateway.example/v1","apiKey":"{env:OMP_GATEWAY_KEY}"},"models":{"m":{"id":"m","name":"M"}}}],"default":{"omp":"m"}}`), 0o600))
+	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", "ACP_GO_OPENCODE_TEST_PROVIDERS": path, "OMP_GATEWAY_KEY": "gateway-key"}))...)
+	t.Cleanup(func() { require.NoError(t, a.Close()) })
+	var asked []string
+	a.usageTransport = usageTransportFunc(func(r *http.Request) (*http.Response, error) {
+		asked = append(asked, r.URL.Host+r.URL.Path+" "+r.Header.Get("Authorization"))
+
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(gatewayReport))}, nil
+	})
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	session, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	params, err := json.Marshal(map[string]any{usageSessionField: session.SessionId, "providerId": "anthropic"})
+	require.NoError(t, err)
+	response, err := a.accountUsage(t.Context(), params)
+	require.NoError(t, err)
+	require.True(t, response.Available)
+	require.Equal(t, "5h", response.Limits[0].ID)
+	require.Equal(t, []string{"gateway.example/v1/usage Bearer gateway-key"}, asked)
+
+	params, err = json.Marshal(map[string]any{usageSessionField: session.SessionId, "providerId": "openrouter"})
+	require.NoError(t, err)
+	response, err = a.accountUsage(t.Context(), params)
+	require.NoError(t, err)
+	require.Equal(t, wire.AccountUsageUnavailable(wire.AccountUsageNotAuthenticated), response)
+}

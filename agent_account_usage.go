@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/savid/acp-go-core/process"
 	"github.com/savid/acp-go-core/usage"
+	"github.com/savid/acp-go-core/usage/anthropic"
+	"github.com/savid/acp-go-core/usage/gateway"
+	"github.com/savid/acp-go-core/usage/openaicodex"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
@@ -25,6 +29,8 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 		return wire.AccountUsageResponse{}, wire.Missing("providerId")
 	}
 
+	// A provider without a native reader is read only through the gateways
+	// the catalog routes to.
 	var reader usage.Reader
 
 	switch request.ProviderID {
@@ -32,6 +38,7 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 		reader = opencodego.Reader{Transport: a.usageTransport}
 	case openrouter.ProviderID:
 		reader = openrouter.Reader{Transport: a.usageTransport}
+	case anthropic.ProviderID, openaicodex.ProviderID:
 	default:
 		return wire.AccountUsageResponse{}, wire.Unsupported("providerId")
 	}
@@ -86,7 +93,30 @@ func (s *session) readProviderUsage(ctx context.Context, rt *binding, providerID
 		modelID = ""
 	}
 
-	return usage.ReadVerified(ctx, func(ctx context.Context) (usage.Access, error) {
-		return rt.client.UsageAccess(ctx, s.cwd, providerID, modelID)
-	}, reader)
+	response := wire.AccountUsageUnavailable(wire.AccountUsageNotAuthenticated)
+
+	if reader != nil {
+		var err error
+
+		response, err = usage.ReadVerified(ctx, func(ctx context.Context) (usage.Access, error) {
+			return rt.client.UsageAccess(ctx, s.cwd, providerID, modelID)
+		}, reader)
+		if err != nil || response.Available {
+			return response, err
+		}
+	}
+
+	// A provider opencode holds no native account for may be brokered by a
+	// gateway the catalog routes to.
+	env, err := s.agent.environment(s.options.Env, nil).Build()
+	if err != nil {
+		return wire.AccountUsageResponse{}, err
+	}
+
+	routes, err := rt.client.UsageGateways(ctx, s.cwd, func(key string) (string, bool) { return process.Lookup(env, key) })
+	if err != nil {
+		return wire.AccountUsageResponse{}, err
+	}
+
+	return gateway.ReadRoutes(ctx, s.agent.usageTransport, routes, providerID, response)
 }

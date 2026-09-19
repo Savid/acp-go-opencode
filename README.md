@@ -123,8 +123,10 @@ model calls. Live tests copy native auth into temporary homes and spend tokens.
 ## Account usage
 
 `AccountUsageMethod` (`_opencode/accountUsage`) accepts `sessionId` and
-`providerId` (`opencode-go` or `openrouter`). Initialization advertises the
-method, session scope, and supported providers. Reads hold the session's
+`providerId` (`opencode-go`, `openrouter`, `anthropic`, or `openai-codex`).
+Initialization advertises the method, session scope, and supported providers.
+A provider the catalog routes through a gateway that publishes a usage report is
+read from that report with the catalog's key for it. Reads hold the session's
 foreground gate and spend no model tokens.
 
 The adapter resolves the directory's effective API key and route through the

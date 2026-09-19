@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/savid/acp-go-core/usage"
+	"github.com/savid/acp-go-core/usage/gateway"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
@@ -162,4 +163,41 @@ func usageRoute(providerID, endpoint, npm string) bool {
 	default:
 		return false
 	}
+}
+
+// UsageGateways lists the catalog providers configured with their own base
+// URL: the routes opencode sends requests through, each with the key the
+// catalog holds for it, an {env:NAME} key resolved through lookup.
+func (c *Client) UsageGateways(ctx context.Context, directory string, lookup func(string) (string, bool)) ([]gateway.Route, error) {
+	var catalog struct {
+		Providers []usageProvider `json:"providers"`
+	}
+	if err := c.Do(ctx, directory, http.MethodGet, "/config/providers", nil, &catalog); err != nil {
+		return nil, err
+	}
+
+	routes := make([]gateway.Route, 0, len(catalog.Providers))
+
+	for _, provider := range catalog.Providers {
+		var base string
+		if raw, present := provider.Options["baseURL"]; !present || json.Unmarshal(raw, &base) != nil || base == "" {
+			continue
+		}
+
+		key := provider.Key
+		if raw, present := provider.Options["apiKey"]; present {
+			var configured string
+			if json.Unmarshal(raw, &configured) == nil {
+				key = configured
+			}
+		}
+
+		if name, ok := strings.CutPrefix(key, "{env:"); ok && strings.HasSuffix(name, "}") {
+			key, _ = lookup(strings.TrimSuffix(name, "}"))
+		}
+
+		routes = append(routes, gateway.Route{Provider: provider.ID, BaseURL: base, Token: key})
+	}
+
+	return routes, nil
 }
