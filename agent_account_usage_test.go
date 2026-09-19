@@ -132,8 +132,8 @@ const gatewayReport = `{"generatedAt":1,"reports":[{"provider":"anthropic","fetc
 func TestAccountUsageReadsThroughCatalogGateway(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "providers.json")
-	require.NoError(t, os.WriteFile(path, []byte(`{"providers":[{"id":"omp","name":"omp","options":{"baseURL":"https://gateway.example/v1","apiKey":"{env:OMP_GATEWAY_KEY}"},"models":{"m":{"id":"m","name":"M"}}}],"default":{"omp":"m"}}`), 0o600))
-	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", "ACP_GO_OPENCODE_TEST_PROVIDERS": path, "OMP_GATEWAY_KEY": "gateway-key"}))...)
+	require.NoError(t, os.WriteFile(path, []byte(`{"providers":[{"id":"gateway","name":"gateway","options":{"baseURL":"https://gateway.example/v1","apiKey":"{env:GATEWAY_GATEWAY_KEY}"},"models":{"m":{"id":"m","name":"M"}}}],"default":{"gateway":"m"}}`), 0o600))
+	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", "ACP_GO_OPENCODE_TEST_PROVIDERS": path, "GATEWAY_GATEWAY_KEY": "gateway-key"}))...)
 	t.Cleanup(func() { require.NoError(t, a.Close()) })
 	var asked []string
 	a.usageTransport = usageTransportFunc(func(r *http.Request) (*http.Response, error) {

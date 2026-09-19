@@ -184,7 +184,9 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 	select {
 	case addressErr := <-addressReady:
 		if addressErr != nil {
-			return nil, addressErr
+			failure := wire.TransportFailure(readyCtx, proc, "opencode server", addressErr, nil)
+
+			return nil, errors.New(failure.Message)
 		}
 	case <-readyCtx.Done():
 		return nil, fmt.Errorf("native server address: %w", readyCtx.Err())

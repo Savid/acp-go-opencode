@@ -94,9 +94,12 @@ type nativePromptResult struct {
 
 type cycle struct {
 	lifecycle.Cycle
-	state   cycleState
-	failure error
-	done    chan struct{}
+	cancelled bool
+	settling  bool
+	terminal  bool
+	state     cycleState
+	failure   error
+	done      chan struct{}
 }
 
 type turnEnd int
@@ -116,7 +119,6 @@ type turn struct {
 	// a live turn.
 	cancelTurn context.CancelFunc
 	accepted   bool
-	cancelled  bool
 	ended      turnEnd
 	settled    chan struct{}
 	settleOnce sync.Once
@@ -233,8 +235,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 				s.completeParent(t.messageID)
 			}
 
-			s.cancelDialogs()
-			s.callbacks.Wait()
+			s.beginSettlement(&t.cycle)
 			t.settle(end)
 
 			select {
@@ -364,32 +365,77 @@ func (s *session) abort(ctx context.Context, rt *binding) {
 	}
 }
 
-// cancel implements session/cancel: it cancels the in-flight turn, resolves
-// its pending dialogs, and interrupts opencode. It is a silent no-op with no turn.
+// cancel marks the foreground cancelled, ends its dialogs, and interrupts
+// native work. The interrupt is joined by the session's shutdown ladder.
 func (s *session) cancel(ctx context.Context) {
 	s.mu.Lock()
-	t := s.turn
+	t, c := s.turn, s.cycle
 	rt := s.runtime
 
-	if t == nil || t.cancelled {
+	if t != nil {
+		c = &t.cycle
+	}
+
+	if c == nil || c.cancelled || c.terminal {
 		s.mu.Unlock()
 
 		return
 	}
 
-	t.cancelled = true
+	c.cancelled = true
+
+	interrupt := !c.settling && rt != nil && !s.closing && rt.alive()
+	if interrupt {
+		s.callbacks.Add(1)
+	}
 	s.mu.Unlock()
-	t.cancelTurn()
+
+	if t != nil {
+		t.cancelTurn()
+	}
+
 	s.cancelDialogs()
 
-	if rt != nil {
-		s.abort(ctx, rt)
+	if interrupt {
+		go func() {
+			defer s.callbacks.Done()
+
+			s.abort(ctx, rt)
+		}()
 	}
+}
+
+// beginSettlement closes callback admission before joining native interrupts
+// and dialogs, so none can reach a later foreground on this runtime.
+func (s *session) beginSettlement(c *cycle) {
+	s.mu.Lock()
+	c.settling = true
+	s.mu.Unlock()
+	s.cancelDialogs()
+	s.callbacks.Wait()
+}
+
+// claimCancellation fixes the cancellation verdict before terminal delivery.
+func (s *session) claimCancellation(c *cycle) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c.terminal = true
+
+	return c.cancelled
+}
+
+// cycleCancelled reads cancellation under the foreground admission lock.
+func (s *session) cycleCancelled(c *cycle) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return c.cancelled
 }
 
 func (s *session) registerDialog(id string, cancel context.CancelCauseFunc) (func(), bool) {
 	s.mu.Lock()
-	if s.dialogs[id] != nil || s.closing || s.runtime == nil || (s.turn != nil && s.turn.cancelled) {
+	if s.dialogs[id] != nil || s.closing || s.runtime == nil || ((s.turn != nil && (s.turn.cancelled || s.turn.settling)) || (s.cycle != nil && (s.cycle.cancelled || s.cycle.settling))) {
 		s.mu.Unlock()
 		cancel(errDialogCancelled)
 

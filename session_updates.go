@@ -111,7 +111,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 
 		c = &t.cycle
 	} else if c == nil && info.ID != "" {
-		c = s.openAgentCycle(ctx)
+		c = s.openAgentCycle(ctx, rt)
 	}
 
 	if c == nil {
@@ -125,18 +125,25 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 	}
 }
 
-// openAgentCycle reserves an idle session for native work under the prompt install lock.
-func (s *session) openAgentCycle(ctx context.Context) *cycle {
+// openAgentCycle reserves the foreground before publishing native work.
+func (s *session) openAgentCycle(ctx context.Context, rt *binding) *cycle {
+	c := &cycle{Cycle: s.lc.NewAgentCycle(), done: make(chan struct{})}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.turn != nil || s.cycle != nil || s.closing || s.runtime != rt {
+		s.mu.Unlock()
 
-	if s.turn != nil || s.cycle != nil || s.closing {
 		return nil
 	}
 
-	c := &cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseActivity}, done: make(chan struct{})}
-	s.recordFailure(c, s.lc.OpenAgentCycle(ctx, &c.Cycle))
 	s.cycle = c
+	s.mu.Unlock()
+	s.recordFailure(c, s.lc.OpenAgentCycle(ctx, c.Cycle))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.runtime != rt || s.cycle != c || s.closing {
+		return nil
+	}
 
 	return c
 }
@@ -496,6 +503,22 @@ func (s *session) eventInfo(event opencode.Event, props eventProperties) (openco
 }
 
 func (s *session) projectEvent(ctx context.Context, rt *binding, c *cycle, event opencode.Event, props eventProperties, info opencode.NativeMessageInfo) error {
+	if s.cycleCancelled(c) {
+		if info.ID != "" {
+			if c.state.messages == nil {
+				c.state.messages = make(map[string]opencode.NativeMessageInfo)
+			}
+
+			c.state.messages[info.ID] = info
+		}
+
+		if event.Type == eventPermissionAsked || event.Type == eventQuestionAsked {
+			s.handleControl(ctx, rt, c, event)
+		}
+
+		return nil
+	}
+
 	var err error
 
 	switch event.Type {
@@ -530,8 +553,7 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()
 
-	s.cancelDialogs()
-	s.callbacks.Wait()
+	s.beginSettlement(c)
 
 	if c.state.stopReason == "" {
 		c.state.stopReason = statusComplete
@@ -548,7 +570,7 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 		rt.cancel()
 	}
 
-	verdict := judgeCycle(c, s.cycleFailure(c), false)
+	verdict := judgeCycle(c, s.cycleFailure(c), s.claimCancellation(c))
 	_ = s.lc.Idle(settleCtx, c.Cycle, verdict.stopReason, verdict.outcome)
 	close(c.done)
 
@@ -622,7 +644,7 @@ func (s *session) emitPlan(ctx context.Context, payload json.RawMessage) error {
 			status = acp.PlanEntryStatusInProgress
 		case "completed":
 			status = acp.PlanEntryStatusCompleted
-		case "cancelled":
+		case lifecycle.StopReasonCancelled:
 			continue
 		}
 

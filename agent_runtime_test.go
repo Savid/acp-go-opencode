@@ -95,3 +95,12 @@ func TestLockedHomeMustNotBeSeeded(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "original", string(content), "startup mutated the locked home's config before refusing its lock")
 }
+
+func TestStartupDeathRetainsStderr(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "dying-opencode")
+	require.NoError(t, os.WriteFile(executable, []byte("#!/bin/sh\nprintf 'FATAL_NATIVE_START\n' >&2\nexit 7\n"), 0700))
+	a := NewAgent(testOptions(t, WithExecutablePath(executable))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.startRuntime(t.Context())
+	require.ErrorContains(t, err, "FATAL_NATIVE_START")
+}

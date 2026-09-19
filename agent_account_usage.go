@@ -108,15 +108,12 @@ func (s *session) readProviderUsage(ctx context.Context, rt *binding, providerID
 
 	// A provider opencode holds no native account for may be brokered by a
 	// gateway the catalog routes to.
-	env, err := s.agent.environment(s.options.Env, nil).Build()
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
+	return gateway.ReadRoutes(ctx, s.agent.usageTransport, func(ctx context.Context) ([]gateway.Route, error) {
+		env, err := s.agent.environment(s.options.Env, nil).Build()
+		if err != nil {
+			return nil, err
+		}
 
-	routes, err := rt.client.UsageGateways(ctx, s.cwd, func(key string) (string, bool) { return process.Lookup(env, key) })
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
-
-	return gateway.ReadRoutes(ctx, s.agent.usageTransport, routes, providerID, response)
+		return rt.client.UsageGateways(ctx, s.cwd, func(key string) (string, bool) { return process.Lookup(env, key) })
+	}, providerID, response)
 }
