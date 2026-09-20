@@ -284,12 +284,13 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 	}
 
 	if c != nil {
-		verdict := cycleVerdict{outcome: lifecycle.OutcomeFailed}
-		if closing {
-			verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
+		// close commits owed state before it terminalizes an open agent-origin
+		// cycle, so a failed commit leaves no terminal idle. The pump only
+		// signals here that it has stopped touching the cycle.
+		if !closing {
+			_ = s.lc.Idle(context.WithoutCancel(ctx), c.Cycle, "", lifecycle.OutcomeFailed)
 		}
 
-		_ = s.lc.Idle(context.WithoutCancel(ctx), c.Cycle, verdict.stopReason, verdict.outcome)
 		close(c.done)
 	}
 
@@ -597,6 +598,12 @@ func (s *session) close(ctx context.Context) error {
 		}
 
 		s.stopRuntime(commitCtx, rt)
+	}
+
+	// An open agent-origin cycle terminalizes as cancelled only after its owed
+	// state has committed; a failed commit fences with no terminal idle.
+	if closingCycle != nil && len(errs) == 0 {
+		_ = s.lc.Idle(context.WithoutCancel(ctx), closingCycle.Cycle, lifecycle.StopReasonCancelled, lifecycle.OutcomeCancelled)
 	}
 
 	s.fenceStream()

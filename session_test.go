@@ -775,3 +775,65 @@ func TestTerminalPublicationCannotInterruptNextCycle(t *testing.T) {
 	s.callbacks.Wait()
 	a.attach(rec, nil)
 }
+
+// TestCloseCommitsAnAgentCycleBeforeTerminalizing proves close commits owed
+// state before it terminalizes an open agent-origin cycle: a failed commit
+// fences with no terminal idle, and a clean commit emits the cancelled idle.
+func TestCloseCommitsAnAgentCycleBeforeTerminalizing(t *testing.T) {
+	for _, failCommit := range []bool{false, true} {
+		name := "committed"
+		if failCommit {
+			name = "failed commit"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			store := &nativeFixtureStore{SessionStore: acpcore.NewInMemorySessionStore(), trace: &traceLog{}}
+			a := NewAgent(testOptions(t, WithSessionStore(store))...)
+			t.Cleanup(func() { _ = a.Close() })
+			rec := newRecorder()
+			a.attach(rec, nil)
+			request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
+			withLifecycle()(&request)
+			_, err := a.Initialize(t.Context(), request)
+			require.NoError(t, err)
+			created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+			require.NoError(t, err)
+			s, err := a.session(t.Context(), created.SessionId)
+			require.NoError(t, err)
+
+			s.mu.Lock()
+			rt := s.runtime
+			s.mu.Unlock()
+
+			require.NoError(t, s.commitMirror(t.Context(), rt), "a first mirror makes the session persisted")
+			s.openAgentCycle(t.Context(), rt)
+			s.mu.Lock()
+			require.NotNil(t, s.cycle)
+			s.mu.Unlock()
+
+			store.fail.Store(failCommit)
+			closeErr := s.close(t.Context())
+
+			terminalIdle := false
+			for _, notification := range rec.snapshot() {
+				envelope, _ := notification.Meta[wire.LifecycleKey].(map[string]any)
+				event, _ := envelope["event"].(map[string]any)
+				if event["type"] == "state_update" && event["state"] == "idle" {
+					if _, ok := event["outcome"]; ok {
+						terminalIdle = true
+					}
+				}
+			}
+
+			if failCommit {
+				require.Error(t, closeErr, "a failed commit fails the close")
+				require.False(t, terminalIdle, "a failed commit leaves no terminal idle")
+
+				return
+			}
+
+			require.NoError(t, closeErr)
+			require.True(t, terminalIdle, "a clean commit terminalizes the agent cycle")
+		})
+	}
+}
