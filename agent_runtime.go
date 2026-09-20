@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencode/internal/opencode"
@@ -26,6 +27,7 @@ const serverHealthTimeout = 2 * time.Second
 // runtime owns one shared server, SSE stream, and native home lock.
 type runtime struct {
 	proc        *process.Process
+	observe     *observer.Observer
 	client      *opencode.Client
 	executable  string
 	environment []string
@@ -223,7 +225,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	rt := &runtime{proc: proc, client: client, executable: executable, environment: base, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), stdoutDone: stdoutDone, bindings: map[string]*binding{}}
+	rt := &runtime{proc: proc, observe: a.observe, client: client, executable: executable, environment: base, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), stdoutDone: stdoutDone, bindings: map[string]*binding{}}
 	transferred = true
 
 	go rt.pump(runtimeCtx)
@@ -305,6 +307,9 @@ func (rt *runtime) pump(ctx context.Context) {
 	if err := rt.proc.Shutdown(shutdownCtx, sessionShutdownGrace); err != nil {
 		_ = rt.proc.Kill()
 	}
+
+	_, waitErr := rt.proc.Wait(shutdownCtx)
+	rt.observe.RecordProcessExit(ctx, "exited", waitErr)
 
 	_ = rt.proc.Close()
 	<-rt.stdoutDone

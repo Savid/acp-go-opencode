@@ -88,7 +88,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 	}
 
 	if event.Type == "session.deleted" {
-		s.poisonSession(ctx, "native_session_id_drift")
+		s.poisonSession(ctx, "native_session_identity_drift")
 		rt.cancel()
 
 		return

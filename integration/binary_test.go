@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,6 +49,14 @@ func TestNativePersistence(t *testing.T) {
 		mirrored.Write(row)
 	}
 	require.Contains(t, mirrored.String(), marker)
+	raw, err := a.HandleExtensionMethod(t.Context(), opencodeacp.AccountUsageMethod, json.RawMessage(`{"sessionId":"`+string(session.SessionId)+`","providerId":"opencode-go"}`))
+	require.NoError(t, err)
+	encoded, err := json.Marshal(raw)
+	require.NoError(t, err)
+	var usage wire.AccountUsageResponse
+	require.NoError(t, json.Unmarshal(encoded, &usage))
+	require.NoError(t, usage.Validate())
+	require.Equal(t, wire.AccountUsageUnavailable(wire.AccountUsageNotAuthenticated), usage, "an isolated home holds no OpenCode Go account")
 	require.NoError(t, a.Close())
 	b := opencodeacp.NewAgent(opencodeacp.WithExecutablePath(executable), opencodeacp.WithHome(t.TempDir()), opencodeacp.WithSessionStore(store))
 	t.Cleanup(func() { _ = b.Close() })

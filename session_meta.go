@@ -239,7 +239,7 @@ func parseOpenCodeOptions(values map[string]any) (OpenCodeOptions, *acp.RequestE
 			}
 		case metaModelKey:
 			model, ok := item.(string)
-			if !ok {
+			if !ok || model == "" {
 				return OpenCodeOptions{}, wire.Unsupported(wire.MetaOptionPath(vendor, key))
 			}
 
