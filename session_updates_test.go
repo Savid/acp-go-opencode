@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
@@ -96,7 +97,7 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			a := NewAgent(testOptions(t, WithSessionStore(store))...)
 			t.Cleanup(func() { _ = a.Close() })
 			a.attach(rec, nil)
-			_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber, Meta: map[string]any{wire.LifecycleKey: map[string]any{"version": 1}}})
+			initResponse, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber, Meta: map[string]any{wire.LifecycleKey: map[string]any{"version": 1}}})
 			require.NoError(t, err)
 			created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
 			require.NoError(t, err)
@@ -148,6 +149,7 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			s.mu.Lock()
 			require.Nil(t, s.cycle)
 			s.mu.Unlock()
+			require.NoError(t, lifecycle.CheckAttribution(negotiatedAnswer(t, initResponse), sessionFrames(t, rec.snapshot(), created.SessionId)))
 			if !failCommit {
 				entries := trace.snapshot()
 				require.Equal(t, []string{"commit", "idle"}, entries[len(entries)-2:])
