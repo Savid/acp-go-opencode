@@ -34,6 +34,7 @@ type session struct {
 	effort                string
 	models                opencode.Catalog
 	artifacts             map[string]imageArtifact
+	artifactOrder         []string
 	// nativeMessages is the latest native message info by id, and
 	// completedParents the user messages whose generation already ended.
 	nativeMessages   map[string]opencode.NativeMessageInfo

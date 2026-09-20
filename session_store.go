@@ -330,6 +330,7 @@ func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, erro
 func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession) ([][]byte, error) {
 	s.mu.Lock()
 	s.artifacts = cloneArtifacts(stored.record.Artifacts)
+	s.artifactOrder = slices.Sorted(maps.Keys(s.artifacts))
 	s.mu.Unlock()
 
 	want, err := decodeEvents(stored.rows, s.nativeID)

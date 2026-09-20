@@ -26,6 +26,41 @@ type imageArtifact struct {
 	Reference string `json:"reference"`
 }
 
+// Artifacts a session keeps for prompt references are bounded by count and by
+// retained bytes; the oldest are dropped first.
+const (
+	maxArtifacts     = 32
+	maxArtifactBytes = 64 << 20
+)
+
+// keepArtifact records one artifact and evicts the oldest past the bounds.
+func (s *session) keepArtifact(id string, artifact imageArtifact) {
+	if s.artifacts == nil {
+		s.artifacts = map[string]imageArtifact{}
+	}
+
+	if _, present := s.artifacts[id]; !present {
+		s.artifactOrder = append(s.artifactOrder, id)
+	}
+
+	s.artifacts[id] = artifact
+
+	for len(s.artifactOrder) > maxArtifacts || artifactBytes(s.artifacts) > maxArtifactBytes {
+		oldest := s.artifactOrder[0]
+		s.artifactOrder = s.artifactOrder[1:]
+		delete(s.artifacts, oldest)
+	}
+}
+
+func artifactBytes(artifacts map[string]imageArtifact) int {
+	total := 0
+	for _, artifact := range artifacts {
+		total += len(artifact.Data)
+	}
+
+	return total
+}
+
 func cloneArtifacts(values map[string]imageArtifact) map[string]imageArtifact {
 	result := make(map[string]imageArtifact, len(values))
 	maps.Copy(result, values)
@@ -98,11 +133,7 @@ func (s *session) imageBytes(file opencode.NativeAttachment) ([]byte, string, *i
 
 	if storableArtifact(file) {
 		s.mu.Lock()
-		if s.artifacts == nil {
-			s.artifacts = map[string]imageArtifact{}
-		}
-
-		s.artifacts[file.ID] = imageArtifact{Data: base64.StdEncoding.EncodeToString(data), MIME: mime, Reference: imageReference(file.URL)}
+		s.keepArtifact(file.ID, imageArtifact{Data: base64.StdEncoding.EncodeToString(data), MIME: mime, Reference: imageReference(file.URL)})
 		s.mu.Unlock()
 	}
 
@@ -129,11 +160,7 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 	if refusal != nil {
 		if storableArtifact(file) {
 			s.mu.Lock()
-			if s.artifacts == nil {
-				s.artifacts = map[string]imageArtifact{}
-			}
-
-			s.artifacts[file.ID] = imageArtifact{Refusal: refusal.Reason, Reference: imageReference(file.URL)}
+			s.keepArtifact(file.ID, imageArtifact{Refusal: refusal.Reason, Reference: imageReference(file.URL)})
 			s.mu.Unlock()
 		}
 
