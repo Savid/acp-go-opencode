@@ -180,6 +180,10 @@ func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 	if err := s.openStream(ctx, rt); err != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
+		if errors.Is(err, errSessionClosing) {
+			return nil, s.closingRefusal()
+		}
+
 		return nil, err
 	}
 
