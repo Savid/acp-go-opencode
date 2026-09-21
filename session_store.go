@@ -97,8 +97,14 @@ func validNativeSessionID(id string) bool {
 	return true
 }
 
-// commitMirror atomically stores a complete native snapshot and its configuration.
+// commitMirror atomically stores a complete native snapshot and its
+// configuration. An ephemeral session commits nothing: opencode's own database
+// holds it until the host deletes it.
 func (s *session) commitMirror(ctx context.Context, rt *binding) error {
+	if s.ephemeral {
+		return nil
+	}
+
 	s.mirrorMu.Lock()
 	defer s.mirrorMu.Unlock()
 

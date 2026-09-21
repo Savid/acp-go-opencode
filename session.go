@@ -46,6 +46,9 @@ type session struct {
 	updatedAt        string
 	// persisted marks a successfully committed mirror.
 	persisted bool
+	// ephemeral marks a session the host deletes without needing it back: it
+	// is never written to the store and never listed.
+	ephemeral bool
 	closing   bool
 	closeDone chan struct{}
 	closeErr  error
