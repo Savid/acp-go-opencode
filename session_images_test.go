@@ -1,0 +1,200 @@
+package opencodeacp
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	acp "github.com/coder/acp-go-sdk"
+	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/image"
+	"github.com/savid/acp-go-core/wire"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPromptImageGates(t *testing.T) {
+	t.Parallel()
+
+	raster := promptRaster(t)
+
+	cases := []struct {
+		name   string
+		option Option
+		block  acp.ContentBlock
+		code   string
+		field  string
+	}{
+		{"too large", WithImageLimits(ImageLimits{MaxInputBytesPerImage: 1}), acp.ImageBlock(raster, image.MIMEPNG), image.ErrorTooLarge, image.FieldPromptImage},
+		{"invalid base64", nil, acp.ImageBlock("not base64", image.MIMEPNG), image.ErrorInvalidBase64, image.FieldPromptImage},
+		{"media type mismatch", nil, acp.ImageBlock(raster, image.MIMEGIF), image.ErrorMediaTypeMismatch, image.FieldPromptImage},
+		{"invalid media type", nil, acp.ImageBlock(raster, "image/bmp"), image.ErrorInvalidMediaType, image.FieldPromptImage},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			options := []Option{}
+			if tc.option != nil {
+				options = append(options, tc.option)
+			}
+
+			h := newHarness(t, options...)
+			h.initialize()
+			session := h.newSession()
+
+			_, err := h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, tc.block))
+			require.Equal(t, -32602, requestErrorCode(t, err))
+
+			data := requestErrorData(t, err)
+			require.Equal(t, tc.code, data[wire.FieldError])
+			require.Equal(t, tc.field, data["field"])
+		})
+	}
+}
+
+func TestPromptImageRefusedByTextOnlyModel(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+
+	session, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir(),
+		WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeModel("fake/text")))))
+	require.NoError(t, err)
+
+	_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.ImageBlock(promptRaster(t), image.MIMEPNG)))
+	require.Equal(t, image.ErrorUnsupportedByModel, requestErrorData(t, err)[wire.FieldError])
+}
+
+// handoffBlock builds an image block in the handoff form. An empty digest is
+// derived from the file so a caller only states one to force a mismatch.
+func handoffBlock(t *testing.T, path string, digest string, size int64) acp.ContentBlock {
+	t.Helper()
+
+	if digest == "" {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			sum := sha256.Sum256(data)
+			digest = hex.EncodeToString(sum[:])
+			size = int64(len(data))
+		} else {
+			digest = hex.EncodeToString(make([]byte, sha256.Size))
+		}
+	}
+
+	uri := "file://" + path
+
+	return acp.ContentBlock{Image: &acp.ContentBlockImage{
+		Type:     "image",
+		MimeType: image.MIMEPNG,
+		Uri:      &uri,
+		Meta: map[string]any{wire.HandoffKey: map[string]any{
+			"version": 1, "digest": digest, "sizeBytes": size,
+		}},
+	}}
+}
+
+func TestPromptHandoffReadsAndVerifies(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := filepath.Join(root, "input.png")
+	decoded, err := base64.StdEncoding.DecodeString(promptRaster(t))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, decoded, 0o600))
+
+	// The pinned SDK drops a content block's _meta when it encodes a prompt, so
+	// the handoff envelope reaches the gates only through the embedded Go API.
+	prompt := func(t *testing.T, options []Option, block acp.ContentBlock) error {
+		t.Helper()
+
+		a := NewAgent(testOptions(t, options...)...)
+		t.Cleanup(func() { _ = a.Close() })
+
+		_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+		require.NoError(t, err)
+
+		session, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+		require.NoError(t, err)
+
+		_, err = a.Prompt(t.Context(), wire.PromptRequest(session.SessionId, acp.TextBlock("look"), block))
+
+		return err
+	}
+
+	require.NoError(t, prompt(t, []Option{WithInputHandoffRoot(root)}, handoffBlock(t, path, "", 0)))
+
+	mismatch := prompt(t, []Option{WithInputHandoffRoot(root)},
+		handoffBlock(t, path, hex.EncodeToString(make([]byte, sha256.Size)), int64(len(decoded))))
+	require.Equal(t, image.ErrorDigestMismatch, requestErrorData(t, mismatch)[wire.FieldError])
+
+	unset := prompt(t, nil, handoffBlock(t, path, "", 0))
+	require.Equal(t, image.ErrorInvalidHandoff, requestErrorData(t, unset)[wire.FieldError])
+}
+
+func TestPromptImagesReplayAndAreNotStoredTwice(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+
+	cwd := t.TempDir()
+	session, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	raster := promptRaster(t)
+
+	_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.TextBlock("look"), acp.ImageBlock(raster, image.MIMEPNG)))
+	require.NoError(t, err)
+
+	require.Empty(t, storedRecord(t, store, session.SessionId).Artifacts,
+		"a prompt image already rides the mirrored native row")
+
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+
+	restored := newHarness(t, WithSessionStore(store))
+	restored.initialize()
+
+	_, err = restored.conn.LoadSession(restored.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
+	require.NoError(t, err)
+
+	images := 0
+
+	for _, notification := range restored.rec.snapshot() {
+		if chunk := notification.Update.UserMessageChunk; chunk != nil && chunk.Content.Image != nil {
+			images++
+
+			require.Equal(t, raster, chunk.Content.Image.Data)
+		}
+	}
+
+	require.Equal(t, 1, images, "load replays the user's image, not only the text")
+}
+
+func TestKeepArtifactEvictsTheOldestPastTheBounds(t *testing.T) {
+	t.Parallel()
+
+	s := &session{}
+	for i := range maxArtifacts + 4 {
+		s.keepArtifact("file-"+strconv.Itoa(i), imageArtifact{Data: "x"})
+	}
+
+	require.Len(t, s.artifacts, maxArtifacts)
+	require.NotContains(t, s.artifacts, "file-0")
+	require.NotContains(t, s.artifacts, "file-3")
+	require.Contains(t, s.artifacts, "file-4")
+
+	large := strings.Repeat("y", maxArtifactBytes/2+1)
+	s.keepArtifact("large-1", imageArtifact{Data: large})
+	s.keepArtifact("large-2", imageArtifact{Data: large})
+	require.NotContains(t, s.artifacts, "large-1", "retained bytes stay under the bound")
+	require.Contains(t, s.artifacts, "large-2")
+}

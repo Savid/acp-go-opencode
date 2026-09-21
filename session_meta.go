@@ -1,414 +1,307 @@
 package opencodeacp
 
 import (
-	"encoding/json"
-	"fmt"
 	"maps"
-	"os"
-	"path/filepath"
-	"strings"
+	"slices"
 
 	"github.com/coder/acp-go-sdk"
+
+	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 const (
-	// metaVendorPath and its descendants are the request paths every refusal on
-	// this namespace names. A malformed member is refused with the same
-	// {error, field} shape as an unknown one: a host switching on `error` and
-	// reading `field` must not have to fall back to prose for one of the two.
-	metaVendorPath   = "_meta." + opencodeMetaKey
-	metaOptionsPath  = metaVendorPath + "." + metaOptionsKey
-	metaRawEventPath = metaVendorPath + "." + rawEventKey
+	metaOptionsKey       = "options"
+	metaRawEventKey      = "rawEvent"
+	metaModelKey         = "model"
+	metaEnvKey           = "env"
+	metaExtraPathDirsKey = "extraPathDirs"
+	metaOutputSchemaKey  = "outputSchema"
+	metaEffortKey        = "effort"
+	metaEnabledKey       = "enabled"
 
-	envOptionPath           = metaOptionsPath + "." + metaEnvKey
-	extraPathDirsOptionPath = metaOptionsPath + "." + metaExtraPathDirsKey
+	// metaStructuredOutputKey names both the discovery object and the result
+	// member native structured output lands on.
+	metaStructuredOutputKey = "structuredOutput"
+	metaModeKey             = "mode"
+	metaPermissionKey       = "permission"
 )
 
-type sessionMeta struct {
-	Model        string
-	OutputSchema map[string]any
-	Mode         string
-	// Effort is the native request preset a restored or forked session starts
-	// with. No session-start option sets it; a host chooses one on the live
-	// session through the effort config option.
-	Effort           string
-	Permission       string
-	PermissionSet    bool
-	Env              map[string]string
-	EnvSet           bool
-	ExtraPathDirs    []string
-	ExtraPathDirsSet bool
-	RawMessages      rawMessageConfig
+// OpenCodeOptions is the per-session options struct carried at _meta.opencode.options.
+type OpenCodeOptions struct {
+	// Mode selects a native agent.
+	Mode string `json:"mode,omitempty"`
+	// Permission selects ask, allow, or deny for native tools.
+	Permission string `json:"permission,omitempty"`
+	// Model selects the opencode model for this session as "provider/id".
+	Model string `json:"model,omitempty"`
+	// Env overlays the session's opencode process environment.
+	Env map[string]string `json:"env,omitempty"`
+	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
+	// of this session's opencode process.
+	ExtraPathDirs []string `json:"extraPathDirs,omitempty"`
+	// OutputSchema requests native structured output.
+	OutputSchema map[string]any `json:"outputSchema,omitempty"`
+	// Effort is a reasoning-level value passed unchanged to opencode.
+	Effort string `json:"effort,omitempty"`
 }
 
-// sessionMetaFromVendorOptions reads the session-start options this adapter
-// carries in its own vendor namespace.
-func sessionMetaFromVendorOptions(meta map[string]any) (sessionMeta, error) {
-	if err := validateVendorOptionsMeta(meta); err != nil {
-		return sessionMeta{}, err
+// OpenCodeOption configures OpenCodeOptions values.
+type OpenCodeOption func(*OpenCodeOptions)
+
+// NewOpenCodeOptions constructs OpenCodeOptions from functional options.
+func NewOpenCodeOptions(opts ...OpenCodeOption) OpenCodeOptions {
+	options := OpenCodeOptions{}
+	for _, opt := range opts {
+		opt(&options)
 	}
 
-	options, err := opencodeOptionsFromMeta(meta)
+	return options.clone()
+}
+
+// WithOpenCodeModel configures the session model as "provider/id".
+func WithOpenCodeModel(model string) OpenCodeOption {
+	return func(options *OpenCodeOptions) { options.Model = model }
+}
+
+// WithOpenCodeEnv configures the session environment overlay.
+func WithOpenCodeEnv(env map[string]string) OpenCodeOption {
+	cloned := maps.Clone(env)
+
+	return func(options *OpenCodeOptions) { options.Env = maps.Clone(cloned) }
+}
+
+// WithOpenCodeExtraPathDirs configures the directories prepended to the session PATH.
+func WithOpenCodeExtraPathDirs(dirs ...string) OpenCodeOption {
+	cloned := slices.Clone(dirs)
+
+	return func(options *OpenCodeOptions) { options.ExtraPathDirs = slices.Clone(cloned) }
+}
+
+// WithOpenCodeOutputSchema configures native structured output.
+func WithOpenCodeOutputSchema(schema map[string]any) OpenCodeOption {
+	cloned := wire.CloneMap(schema)
+
+	return func(options *OpenCodeOptions) { options.OutputSchema = wire.CloneMap(cloned) }
+}
+
+// WithOpenCodeEffort configures the reasoning level passed to opencode.
+func WithOpenCodeEffort(level string) OpenCodeOption {
+	return func(options *OpenCodeOptions) { options.Effort = level }
+}
+
+// Meta returns exactly {"opencode": {"options": {...}}} with the selected fields.
+func (options OpenCodeOptions) Meta() map[string]any {
+	values := map[string]any{}
+	if options.Mode != "" {
+		values[metaModeKey] = options.Mode
+	}
+
+	if options.Permission != "" {
+		values[metaPermissionKey] = options.Permission
+	}
+
+	if options.Model != "" {
+		values[metaModelKey] = options.Model
+	}
+
+	if options.Env != nil {
+		values[metaEnvKey] = maps.Clone(options.Env)
+	}
+
+	if options.ExtraPathDirs != nil {
+		values[metaExtraPathDirsKey] = slices.Clone(options.ExtraPathDirs)
+	}
+
+	if options.OutputSchema != nil {
+		values[metaOutputSchemaKey] = wire.CloneMap(options.OutputSchema)
+	}
+
+	if options.Effort != "" {
+		values[metaEffortKey] = options.Effort
+	}
+
+	return map[string]any{vendor: map[string]any{metaOptionsKey: values}}
+}
+
+func (options OpenCodeOptions) clone() OpenCodeOptions {
+	cloned := options
+	cloned.Env = maps.Clone(options.Env)
+	cloned.ExtraPathDirs = slices.Clone(options.ExtraPathDirs)
+	cloned.OutputSchema = wire.CloneMap(options.OutputSchema)
+
+	return cloned
+}
+
+// ValidateOpenCodeSessionMeta runs the owned-namespace parsing of a session
+// lifecycle request's _meta without an Agent and returns the same refusal.
+func ValidateOpenCodeSessionMeta(meta map[string]any) error {
+	_, err := parseSessionMeta(meta)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// sessionMeta is what one session lifecycle request's _meta.opencode carried.
+type sessionMeta struct {
+	options   OpenCodeOptions
+	rawEvents bool
+	// present records which carrier fields the request named, so a load or
+	// resume inherits the stored value only for fields it left out.
+	presentEnv           bool
+	presentExtraPathDirs bool
+}
+
+// parseSessionMeta validates the owned _meta.opencode namespace of one session
+// lifecycle request. Unknown own-namespace keys fail closed; foreign
+// namespaces are ignored; the lifecycle literal is refused by name.
+func parseSessionMeta(meta map[string]any) (sessionMeta, *acp.RequestError) {
+	if refusal := lifecycle.RejectKey(meta); refusal != nil {
+		return sessionMeta{}, wire.ParamRefusal(refusal)
+	}
+
+	raw, exists := meta[vendor]
+	if !exists {
+		return sessionMeta{}, nil
+	}
+
+	vendorMeta, ok := raw.(map[string]any)
+	if !ok {
+		return sessionMeta{}, wire.Unsupported("_meta." + vendor)
+	}
+
+	parsed := sessionMeta{}
+
+	for key := range vendorMeta {
+		switch key {
+		case metaOptionsKey, metaRawEventKey:
+		default:
+			return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + key)
+		}
+	}
+
+	if rawEvent, ok := vendorMeta[metaRawEventKey]; ok {
+		values, ok := rawEvent.(map[string]any)
+		if !ok {
+			return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + metaRawEventKey)
+		}
+
+		for key, item := range values {
+			enabled, ok := item.(bool)
+			if key != metaEnabledKey || !ok {
+				return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + metaRawEventKey + "." + key)
+			}
+
+			parsed.rawEvents = enabled
+		}
+	}
+
+	rawOptions, hasOptions := vendorMeta[metaOptionsKey]
+	if !hasOptions {
+		return parsed, nil
+	}
+
+	values, isObject := rawOptions.(map[string]any)
+	if !isObject {
+		return sessionMeta{}, wire.Unsupported(wire.MetaOptionPath(vendor, ""))
+	}
+
+	options, err := parseOpenCodeOptions(values)
 	if err != nil {
 		return sessionMeta{}, err
 	}
 
-	outputSchema, _ := options.OutputSchema.(map[string]any)
+	parsed.options = options
+	_, parsed.presentEnv = values[metaEnvKey]
+	_, parsed.presentExtraPathDirs = values[metaExtraPathDirsKey]
 
-	return sessionMeta{
-		Model:            options.Model,
-		OutputSchema:     outputSchema,
-		Mode:             options.Mode,
-		Permission:       normalizeOpenCodePermission(options.Permission),
-		PermissionSet:    options.PermissionSet,
-		Env:              cloneStringMap(options.Env),
-		EnvSet:           options.EnvSet,
-		ExtraPathDirs:    append([]string(nil), options.ExtraPathDirs...),
-		ExtraPathDirsSet: options.ExtraPathDirsSet,
-		RawMessages:      rawMessageConfigFromMeta(meta),
-	}, nil
+	return parsed, nil
 }
 
-type opencodeMetaOptions struct {
-	Model            string
-	OutputSchema     any
-	Mode             string
-	Permission       string
-	PermissionSet    bool
-	Env              map[string]string
-	EnvSet           bool
-	ExtraPathDirs    []string
-	ExtraPathDirsSet bool
-}
+func parseOpenCodeOptions(values map[string]any) (OpenCodeOptions, *acp.RequestError) {
+	options := OpenCodeOptions{}
 
-func opencodeOptionsFromMeta(meta map[string]any) (opencodeMetaOptions, error) {
-	opencodeMeta, _ := meta[opencodeMetaKey].(map[string]any)
-
-	optionsMap, _ := opencodeMeta[metaOptionsKey].(map[string]any)
-	if optionsMap == nil {
-		return opencodeMetaOptions{}, nil
-	}
-
-	options := opencodeMetaOptions{}
-
-	if rawEnv, ok := optionsMap[metaEnvKey]; ok {
-		env, err := sessionEnvFromMeta(rawEnv)
-		if err != nil {
-			return opencodeMetaOptions{}, err
-		}
-
-		options.Env = env
-		options.EnvSet = true
-	}
-
-	if rawDirs, ok := optionsMap[metaExtraPathDirsKey]; ok {
-		dirs, err := extraPathDirsFromMeta(rawDirs)
-		if err != nil {
-			return opencodeMetaOptions{}, err
-		}
-
-		options.ExtraPathDirs = dirs
-		options.ExtraPathDirsSet = true
-	}
-
-	if rawModel, ok := optionsMap[metaModelKey]; ok {
-		model, ok := rawModel.(string)
-		if !ok {
-			return opencodeMetaOptions{}, unsupportedField(metaOptionsPath + "." + metaModelKey)
-		}
-
-		options.Model = model
-	}
-
-	if schema, ok := optionsMap[metaOutputSchemaKey]; ok {
-		if err := validateSchemaObject(schema); err != nil {
-			return opencodeMetaOptions{}, err
-		}
-
-		options.OutputSchema = cloneAny(schema)
-	}
-
-	if rawMode, ok := optionsMap[metaModeKey]; ok {
-		mode, ok := rawMode.(string)
-		if !ok {
-			return opencodeMetaOptions{}, unsupportedField(metaOptionsPath + "." + metaModeKey)
-		}
-
-		options.Mode = mode
-	}
-
-	if rawPermission, ok := optionsMap[metaPermissionKey]; ok {
-		permission, ok := rawPermission.(string)
-		if !ok {
-			return opencodeMetaOptions{}, unsupportedField(metaOptionsPath + "." + metaPermissionKey)
-		}
-
-		if err := validateOpenCodePermission(permission); err != nil {
-			return opencodeMetaOptions{}, err
-		}
-
-		options.Permission = normalizeOpenCodePermission(permission)
-		options.PermissionSet = true
-	}
-
-	return options, nil
-}
-
-// sessionEnvFromMeta reads the environment carried on the addressed native
-// session. A host may send it as JSON or hand it over in process, so both
-// shapes are accepted. Values are preserved exactly, including empty strings:
-// an operation that clears a variable is asking for the empty value, not for
-// the key to be dropped.
-func sessionEnvFromMeta(value any) (map[string]string, error) {
-	var env map[string]string
-
-	switch typed := value.(type) {
-	case map[string]string:
-		env = cloneStringMap(typed)
-	case map[string]any:
-		env = make(map[string]string, len(typed))
-		for key, raw := range typed {
-			text, ok := raw.(string)
-			if !ok {
-				return nil, unsupportedField(envOptionPath + "." + key)
-			}
-
-			env[key] = text
-		}
-	default:
-		return nil, unsupportedField(envOptionPath)
-	}
-
-	if err := validateSessionEnv(env, envOptionPath); err != nil {
-		return nil, err
-	}
-
-	return env, nil
-}
-
-// extraPathDirsFromMeta reads the directories placed ahead of the inherited
-// PATH. Relative entries are refused: the native process resolves them against
-// its own working directory, not the session's.
-func extraPathDirsFromMeta(value any) ([]string, error) {
-	var raw []any
-
-	switch typed := value.(type) {
-	case []string:
-		raw = make([]any, 0, len(typed))
-		for _, entry := range typed {
-			raw = append(raw, entry)
-		}
-	case []any:
-		raw = typed
-	default:
-		return nil, unsupportedField(extraPathDirsOptionPath)
-	}
-
-	dirs := make([]string, 0, len(raw))
-
-	for index, entry := range raw {
-		field := fmt.Sprintf("%s[%d]", extraPathDirsOptionPath, index)
-
-		dir, ok := entry.(string)
-		if !ok {
-			return nil, unsupportedField(field)
-		}
-
-		if dir == "" || !filepath.IsAbs(dir) || strings.ContainsRune(dir, os.PathListSeparator) {
-			return nil, unsupportedField(field)
-		}
-
-		dirs = append(dirs, dir)
-	}
-
-	return dirs, nil
-}
-
-// validateVendorOptionsMeta refuses any member of this adapter's own
-// `_meta.opencode` namespace that it does not fix. It is the vendor-options
-// validator and has nothing to do with the family lifecycle extension, whose
-// negotiation and correlation values live in their own reserved literal.
-func validateVendorOptionsMeta(meta map[string]any) error {
-	if len(meta) == 0 {
-		return nil
-	}
-
-	opencodeMeta, ok := meta[opencodeMetaKey].(map[string]any)
-	if !ok {
-		if _, exists := meta[opencodeMetaKey]; exists {
-			return unsupportedField(metaVendorPath)
-		}
-
-		return nil
-	}
-
-	for key, value := range opencodeMeta {
+	for key, item := range values {
 		switch key {
-		case metaOptionsKey:
-			optionsMap, ok := value.(map[string]any)
-			if !ok {
-				return unsupportedField(metaOptionsPath)
+		case metaModeKey, metaPermissionKey:
+			value, ok := item.(string)
+			if !ok || value == "" {
+				return OpenCodeOptions{}, wire.Unsupported(wire.MetaOptionPath(vendor, key))
 			}
 
-			for optionKey := range optionsMap {
-				switch optionKey {
-				case configModel, "outputSchema", configMode, metaPermissionKey, metaEnvKey, metaExtraPathDirsKey:
-				default:
-					return unsupportedField(metaOptionsPath + "." + optionKey)
-				}
+			if key == metaModeKey {
+				options.Mode = value
+			} else {
+				options.Permission = value
 			}
-		case rawEventKey:
-			rawEvent, ok := value.(map[string]any)
-			if !ok {
-				return unsupportedField(metaRawEventPath)
+		case metaModelKey:
+			model, ok := item.(string)
+			if !ok || model == "" {
+				return OpenCodeOptions{}, wire.Unsupported(wire.MetaOptionPath(vendor, key))
 			}
 
-			for rawKey, rawValue := range rawEvent {
-				switch rawKey {
-				case rawEventEnabledKey:
-					if _, ok := rawValue.(bool); !ok {
-						return unsupportedField(metaRawEventPath + "." + rawEventEnabledKey)
-					}
-				default:
-					return unsupportedField(metaRawEventPath + "." + rawKey)
-				}
+			options.Model = model
+		case metaEnvKey:
+			env, err := wire.StringMapOption(item, wire.MetaOptionPath(vendor, key))
+			if err != nil {
+				return OpenCodeOptions{}, err
 			}
+
+			options.Env = env
+		case metaExtraPathDirsKey:
+			dirs, err := wire.StringSliceOption(item, wire.MetaOptionPath(vendor, key))
+			if err != nil {
+				return OpenCodeOptions{}, err
+			}
+
+			options.ExtraPathDirs = dirs
+		case metaOutputSchemaKey:
+			schema, ok := item.(map[string]any)
+			if !ok {
+				return OpenCodeOptions{}, wire.Unsupported(wire.MetaOptionPath(vendor, key))
+			}
+
+			options.OutputSchema = wire.CloneMap(schema)
+		case metaEffortKey:
+			level, ok := item.(string)
+			if !ok || level == "" {
+				return OpenCodeOptions{}, wire.Unsupported(wire.MetaOptionPath(vendor, key))
+			}
+
+			options.Effort = level
 		default:
-			return unsupportedField(metaVendorPath + "." + key)
+			return OpenCodeOptions{}, wire.Unsupported(wire.MetaOptionPath(vendor, key))
 		}
 	}
 
-	return nil
+	return options, validateOpenCodeOptions(options)
 }
 
-func unsupportedField(path string) error {
-	return unsupportedRequest(path)
+func validateOpenCodeOptions(options OpenCodeOptions) *acp.RequestError {
+	if options.OutputSchema != nil && len(options.OutputSchema) == 0 {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaOutputSchemaKey))
+	}
+
+	if options.Model != "" {
+		if err := opencode.ModelSelectionShapeError(options.Model); err != nil {
+			return wire.Unsupported(wire.MetaOptionPath(vendor, metaModelKey))
+		}
+	}
+
+	if options.Permission != "" && !slices.Contains([]string{"ask", "allow", "deny"}, options.Permission) {
+		return wire.Unsupported(wire.MetaOptionPath(vendor, metaPermissionKey))
+	}
+
+	return wire.ValidateSessionEnvironment(options.Env, options.ExtraPathDirs, wire.MetaOptionPath(vendor, ""))
 }
 
-// unsupportedRequest is the uniform refusal of one request member, typed for
-// the in-process handlers that answer with the JSON-RPC error directly.
-func unsupportedRequest(path string) *acp.RequestError {
-	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: valUnsupported,
-		jsonFieldField: path,
-	})
-}
+// WithOpenCodeMode selects a native agent.
+func WithOpenCodeMode(mode string) OpenCodeOption { return func(o *OpenCodeOptions) { o.Mode = mode } }
 
-// missingField refuses a reserved key the contract requires on this surface and
-// the caller left out. It is the sibling verdict of unsupportedField and never
-// substituted for it: `unsupported` always means a value that is present and
-// refused, `missing` always means one that is required and absent.
-func missingField(path string) error {
-	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: valMissing,
-		jsonFieldField: path,
-	})
-}
-
-func validateOpenCodePermission(permission string) error {
-	switch permission {
-	case "", openCodePermissionAsk, openCodePermissionAllow, openCodePermissionDeny:
-		return nil
-	default:
-		return unsupportedField(metaOptionsPath + "." + metaPermissionKey)
-	}
-}
-
-func normalizeOpenCodePermission(permission string) string {
-	if permission == "" {
-		return openCodePermissionAsk
-	}
-
-	return permission
-}
-
-// validateSchemaObject refuses an output schema this adapter will not forward.
-// Both refusals name the option path rather than describing the value: an
-// embedded Go caller can hand over a map no JSON encoder accepts, and the host
-// is owed the same {error, field} shape either way.
-func validateSchemaObject(schema any) error {
-	obj, ok := schema.(map[string]any)
-	if !ok || len(obj) == 0 {
-		return unsupportedField(outputSchemaOptionPath)
-	}
-
-	if _, err := json.Marshal(obj); err != nil {
-		return unsupportedField(outputSchemaOptionPath)
-	}
-
-	return nil
-}
-
-func cloneAnyMap(values map[string]any) map[string]any {
-	if values == nil {
-		return nil
-	}
-
-	cloned := make(map[string]any, len(values))
-	for key, value := range values {
-		cloned[key] = cloneAny(value)
-	}
-
-	return cloned
-}
-
-func cloneAnySlice(values []any) []any {
-	if values == nil {
-		return nil
-	}
-
-	cloned := make([]any, len(values))
-	for i, value := range values {
-		cloned[i] = cloneAny(value)
-	}
-
-	return cloned
-}
-
-func cloneAny(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		return cloneAnyMap(typed)
-	case map[string]string:
-		return cloneStringMap(typed)
-	case []any:
-		return cloneAnySlice(typed)
-	default:
-		return value
-	}
-}
-
-func cloneStringMap(values map[string]string) map[string]string {
-	if values == nil {
-		return nil
-	}
-
-	cloned := make(map[string]string, len(values))
-	maps.Copy(cloned, values)
-
-	return cloned
-}
-
-func sessionResponseMeta(snapshot sessionSnapshot) map[string]any {
-	opencodeMeta := map[string]any{
-		opencodeNativeIDMetaKey: snapshot.idmap.NativeSessionID,
-	}
-	if model := joinModelValue(snapshot.providerID, snapshot.modelID); model != "" {
-		opencodeMeta[configModel] = model
-		opencodeMeta["modelId"] = model
-	}
-
-	if snapshot.mode != "" {
-		opencodeMeta[configMode] = snapshot.mode
-	}
-
-	return map[string]any{opencodeMetaKey: opencodeMeta}
-}
-
-func sessionInfoMeta(snapshot sessionSnapshot) map[string]any {
-	opencodeMeta, _ := sessionResponseMeta(snapshot)[opencodeMetaKey].(map[string]any)
-
-	return map[string]any{
-		opencodeMetaKey: cloneAnyMap(opencodeMeta),
-	}
+// WithOpenCodePermission selects native tool permission behavior.
+func WithOpenCodePermission(permission string) OpenCodeOption {
+	return func(o *OpenCodeOptions) { o.Permission = permission }
 }
