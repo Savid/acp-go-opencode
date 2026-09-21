@@ -3,7 +3,6 @@ package opencodeacp
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/wire"
@@ -50,7 +49,7 @@ func (s *session) openStream(ctx context.Context, rt *binding) error {
 		return err
 	}
 
-	if err := s.lc.Open(ctx, fmt.Sprintf("%s:%d", s.id, s.agent.nextIncarnation()), s.lifecycleNegotiated(), s.deliverLifecycle); err != nil {
+	if err := s.lc.Open(ctx, lifecycle.NewIncarnation(string(s.id)), s.lifecycleNegotiated(), s.deliverLifecycle); err != nil {
 		return err
 	}
 
