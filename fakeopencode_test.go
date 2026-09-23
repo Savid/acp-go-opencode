@@ -23,6 +23,13 @@ import (
 
 const fakeOpenCodeEnv = "ACP_GO_OPENCODE_TEST_FAKE"
 
+// fakeOpenCodeEnvHistoryAdvance names a file whose content selects a row the
+// fake appends before answering a cursor read, so a test can place native
+// writes between the two reads of a snapshot. "once" updates the addressed
+// session and is consumed, "child" creates a child session and is consumed,
+// "always" updates the addressed session on every cursor read.
+const fakeOpenCodeEnvHistoryAdvance = "ACP_GO_OPENCODE_TEST_HISTORY_ADVANCE"
+
 // fakeOpenCodeEnvResumeHold names a file the fake creates when a session
 // lookup arrives that it will not answer, so a test can act while the adapter
 // is still relaunching.
@@ -109,6 +116,28 @@ func (f *fakeOpenCode) publish(typ string, properties any) {
 		}
 	}
 }
+func (f *fakeOpenCode) advanceHistory(marker, id string) {
+	mode, err := os.ReadFile(marker)
+	if err != nil {
+		return
+	}
+	if string(mode) != "always" {
+		_ = os.Remove(marker)
+	}
+	if string(mode) == "child" {
+		child := f.sessions[id]
+		child.ID = opencode.NewID("ses_")
+		child.ParentID = id
+		child.Title = "late history child"
+		f.sessions[child.ID] = child
+		f.append(child.ID, "session.created", map[string]any{"info": child})
+
+		return
+	}
+	session := f.sessions[id]
+	session.Title = "late history row"
+	f.append(id, "session.updated", map[string]any{"info": session})
+}
 func (f *fakeOpenCode) append(id, typ string, data map[string]any) {
 	seq := int64(0)
 	for _, event := range f.rows {
@@ -142,11 +171,15 @@ func (f *fakeOpenCode) queryHistory(query string) int {
 		return 5
 	}
 	unquote := func(value string) string { return strings.ReplaceAll(value[1:len(value)-1], "''", "'") }
-	allowed := syncGraph(f.rows, unquote(literals[0]))
+	id := unquote(literals[0])
 	var cursors map[string]int64
 	if json.Unmarshal([]byte(unquote(literals[1])), &cursors) != nil {
 		return 6
 	}
+	if marker := os.Getenv(fakeOpenCodeEnvHistoryAdvance); marker != "" && len(cursors) > 0 {
+		f.advanceHistory(marker, id)
+	}
+	allowed := syncGraph(f.rows, id)
 	rows := []map[string]any{}
 	for _, event := range f.rows {
 		if !allowed[event.AggregateID] {

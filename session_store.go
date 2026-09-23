@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -262,38 +263,87 @@ func syncGraph(events []opencode.SyncEvent, id string) map[string]bool {
 	return allowed
 }
 
+// snapshotAttempts bounds how often a snapshot restarts after native history
+// advanced between its two reads. OpenCode keeps writing after a turn reports
+// idle: title generation and compaction pruning run detached from the turn.
+const (
+	snapshotAttempts   = 5
+	snapshotRetryDelay = 100 * time.Millisecond
+)
+
+// readSyncRows snapshots the native session graph once it holds still: every
+// session in the graph is idle and two consecutive reads agree. A snapshot is
+// never committed with a row missing between its reads.
 func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, error) {
-	if err := s.requireNativeIdle(ctx, rt); err != nil {
-		return nil, err
-	}
+	started := time.Now()
 
-	events, err := opencode.ReadHistory(ctx, rt.server.executable, rt.server.root, rt.server.environment, s.nativeID, map[string]int64{})
-	if err != nil {
-		return nil, err
-	}
+	var late []opencode.SyncEvent
 
-	allowed := syncGraph(events, s.nativeID)
-	selected := make([]opencode.SyncEvent, 0)
-	cursors := map[string]int64{}
+	for attempt := 1; ; attempt++ {
+		rows, next, err := s.snapshotSyncRows(ctx, rt)
+		if err != nil {
+			return nil, err
+		}
 
-	for _, event := range events {
-		if allowed[event.AggregateID] {
-			selected = append(selected, event)
-			if n, ok := cursors[event.AggregateID]; !ok || n < event.Sequence {
-				cursors[event.AggregateID] = event.Sequence
-			}
+		if len(next) == 0 {
+			return rows, nil
+		}
+
+		late = next
+		for _, event := range next {
+			s.agent.log.DebugContext(ctx, "native history advanced during snapshot",
+				slog.String("session_id", string(s.id)), slog.Int("attempt", attempt),
+				slog.String("aggregate_id", event.AggregateID), slog.Int64("sequence", event.Sequence),
+				slog.String("event_type", event.Type))
+		}
+
+		if attempt == snapshotAttempts {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(snapshotRetryDelay * time.Duration(attempt)):
 		}
 	}
 
-	next, err := opencode.ReadHistory(ctx, rt.server.executable, rt.server.root, rt.server.environment, s.nativeID, cursors)
+	last := late[len(late)-1]
+
+	return nil, fmt.Errorf("native history changed while snapshotting: %d late rows on attempt %d after %s, last %s seq %d %s",
+		len(late), snapshotAttempts, time.Since(started).Round(time.Millisecond), last.AggregateID, last.Sequence, last.Type)
+}
+
+// snapshotSyncRows reads the graph, requires it idle, then reads again past
+// the first read's cursors. Rows the second read returns arrived after the
+// first, and the snapshot is discarded; otherwise the encoded rows are returned.
+func (s *session) snapshotSyncRows(ctx context.Context, rt *binding) ([][]byte, []opencode.SyncEvent, error) {
+	events, err := opencode.ReadHistory(ctx, rt.server.executable, rt.server.root, rt.server.environment, s.nativeID, map[string]int64{})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	fencedGraph := syncGraph(append(append([]opencode.SyncEvent{}, selected...), next...), s.nativeID)
-	for _, event := range next {
-		if fencedGraph[event.AggregateID] {
-			return nil, errors.New("native history changed while snapshotting")
+	cursors := map[string]int64{}
+	for _, event := range events {
+		if n, ok := cursors[event.AggregateID]; !ok || n < event.Sequence {
+			cursors[event.AggregateID] = event.Sequence
+		}
+	}
+
+	allowed := syncGraph(events, s.nativeID)
+	if idleErr := s.requireNativeIdle(ctx, rt, allowed); idleErr != nil {
+		return nil, nil, idleErr
+	}
+
+	late, err := opencode.ReadHistory(ctx, rt.server.executable, rt.server.root, rt.server.environment, s.nativeID, cursors)
+	if err != nil || len(late) > 0 {
+		return nil, late, err
+	}
+
+	selected := make([]opencode.SyncEvent, 0, len(events))
+	for _, event := range events {
+		if allowed[event.AggregateID] {
+			selected = append(selected, event)
 		}
 	}
 
@@ -309,7 +359,7 @@ func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, erro
 	for _, event := range selected {
 		row, err := json.Marshal(event)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		if event.Raw != nil {
@@ -321,15 +371,11 @@ func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, erro
 
 	if len(rows) > 0 {
 		if _, err := decodeEvents(rows, s.nativeID); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	if err := s.requireNativeIdle(ctx, rt); err != nil {
-		return nil, err
-	}
-
-	return rows, nil
+	return rows, nil, nil
 }
 
 // hydrate replays only a missing suffix. Existing events must agree exactly.
@@ -557,14 +603,18 @@ func (s *session) replay(ctx context.Context, rows [][]byte) error {
 	return nil
 }
 
-func (s *session) requireNativeIdle(ctx context.Context, rt *binding) error {
+// requireNativeIdle refuses while the root session or any session in graph is
+// running. The native status route lists only sessions that are not idle.
+func (s *session) requireNativeIdle(ctx context.Context, rt *binding, graph map[string]bool) error {
 	var statuses map[string]opencode.NativeSessionStatus
 	if err := rt.client.Do(ctx, s.cwd, http.MethodGet, "/session/status", nil, &statuses); err != nil {
 		return err
 	}
 
-	if state := statuses[s.nativeID].Type; state != "" && state != statusIdle {
-		return errors.New("native session is still running")
+	for id, status := range statuses {
+		if (id == s.nativeID || graph[id]) && status.Type != "" && status.Type != statusIdle {
+			return errors.New("native session is still running")
+		}
 	}
 
 	return nil

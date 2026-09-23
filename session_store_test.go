@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
@@ -17,6 +19,129 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMirrorRetriesLateNativeHistory(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []string{"once", "child", "always"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			marker := filepath.Join(t.TempDir(), "history-advance")
+			store := acpcore.NewInMemorySessionStore()
+			a := NewAgent(testOptions(t,
+				WithEnv(map[string]string{fakeOpenCodeEnv: "1", fakeOpenCodeEnvHistoryAdvance: marker, "GORACE": os.Getenv("GORACE") + " atexit_sleep_ms=0"}),
+				WithSessionStore(store),
+			)...)
+			t.Cleanup(func() { _ = a.Close() })
+			_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+			require.NoError(t, err)
+			created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+			require.NoError(t, err)
+			s, err := a.session(t.Context(), created.SessionId)
+			require.NoError(t, err)
+			var record sessionRecord
+			before, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.NoError(t, os.WriteFile(marker, []byte(mode), 0o600))
+
+			_, promptErr := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+			after, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+			require.NoError(t, err)
+			require.True(t, found)
+
+			if mode == "always" {
+				data := requestErrorData(t, promptErr)
+				require.Equal(t, vendor+"_"+wire.TokenTurnFailed, data[wire.FieldError])
+				require.Equal(t, wire.CauseTransport, data[wire.FieldCause])
+				require.Equal(t, "session mirror commit failed", data[wire.FieldMessage])
+				require.Equal(t, before, after)
+
+				return
+			}
+
+			require.NoError(t, promptErr)
+			require.Greater(t, len(after), len(before))
+			events, err := decodeEvents(after, s.nativeID)
+			require.NoError(t, err)
+			wantTitle := "late history row"
+			if mode == "child" {
+				wantTitle = "late history child"
+			}
+			late := 0
+			for _, event := range events {
+				if event.Type != "session.updated.1" && event.Type != "session.created.1" {
+					continue
+				}
+				var info opencode.NativeSession
+				require.NoError(t, json.Unmarshal(event.Data["info"], &info))
+				if info.Title != wantTitle {
+					continue
+				}
+				if mode == "child" {
+					require.Equal(t, s.nativeID, info.ParentID)
+				} else {
+					require.Equal(t, s.nativeID, event.AggregateID)
+				}
+				late++
+			}
+			require.Equal(t, 1, late)
+		})
+	}
+}
+
+func TestMirrorRefusesWhileChildSessionRuns(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	cwd := t.TempDir()
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+	var child opencode.NativeSession
+	require.NoError(t, rt.client.Do(t.Context(), cwd, http.MethodPost, "/session", map[string]string{"parentID": s.nativeID}, &child))
+
+	promptCtx, stop := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		request := opencode.MessageRequest{MessageID: opencode.NewMessageID(), Parts: []map[string]any{{"type": "text", "text": "SLOW"}}}
+		done <- rt.client.Do(promptCtx, cwd, http.MethodPost, opencode.SessionPath(child.ID)+"/message", request, nil)
+	}()
+	require.Eventually(t, func() bool {
+		var statuses map[string]opencode.NativeSessionStatus
+		if rt.client.Do(t.Context(), cwd, http.MethodGet, "/session/status", nil, &statuses) != nil {
+			return false
+		}
+
+		return statuses[child.ID].Type == "busy"
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.ErrorContains(t, s.commitMirror(t.Context(), rt), "native session is still running")
+
+	stop()
+	<-done
+	require.NoError(t, s.commitMirror(t.Context(), rt))
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	events, err := decodeEvents(rows, s.nativeID)
+	require.NoError(t, err)
+	childRows := 0
+	for _, event := range events {
+		if event.AggregateID == child.ID {
+			childRows++
+		}
+	}
+	require.Greater(t, childRows, 1)
+}
 
 func TestMirrorIncludesDescendantsAndExcludesUnrelatedSessions(t *testing.T) {
 	t.Parallel()
