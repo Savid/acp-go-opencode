@@ -221,8 +221,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			if result.err != nil {
 				s.recordFailure(&t.cycle, s.dispatchFailure(ctx, rt, result.err))
 
-				var nativeErr *opencode.HTTPError
-				if !errors.As(result.err, &nativeErr) {
+				if _, ok := errors.AsType[*opencode.HTTPError](result.err); !ok {
 					end = turnTransportEnded
 				}
 			} else {
