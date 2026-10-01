@@ -33,13 +33,20 @@ type NativeMessageInfo struct {
 	ModelID    string          `json:"modelID"`
 	ProviderID string          `json:"providerID"`
 	Finish     string          `json:"finish"`
-	Tokens     NativeTokens    `json:"tokens"`
+	Summary    json.RawMessage `json:"summary,omitempty"`
 	Structured json.RawMessage `json:"structured,omitempty"`
 	Error      *NativeError    `json:"error,omitempty"`
 	Time       struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
 	} `json:"time"`
+}
+
+// CompactionSummary reports whether an assistant message is a compaction
+// summary. The member is true there; on a user message it holds the
+// message's change summary instead.
+func (i NativeMessageInfo) CompactionSummary() bool {
+	return string(i.Summary) == "true"
 }
 
 type NativeError struct {
@@ -63,6 +70,7 @@ type NativePart struct {
 	Mime      string          `json:"mime"`
 	Filename  string          `json:"filename"`
 	URL       string          `json:"url"`
+	Tokens    NativeTokens    `json:"tokens"`
 	Raw       json.RawMessage `json:"-"`
 }
 
@@ -91,6 +99,8 @@ func (p *NativePart) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// NativeTokens is one model call's usage. Input excludes the cached prompt,
+// which Cache counts, and Output excludes Reasoning.
 type NativeTokens struct {
 	Input     float64 `json:"input"`
 	Output    float64 `json:"output"`

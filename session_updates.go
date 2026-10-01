@@ -37,6 +37,9 @@ const (
 	statusIdle           = "idle"
 	modeBuild            = "build"
 	partReasoning        = "reasoning"
+	partStepFinish       = "step-finish"
+	eventMessageUpdated  = "message.updated"
+	eventPartUpdated     = "message.part.updated"
 	fieldID              = "id"
 )
 
@@ -46,11 +49,14 @@ type cycleState struct {
 	tools         map[string]bool
 	terminalTools map[string]bool
 	files         map[string]bool
-	messages      map[string]opencode.NativeMessageInfo
+	// parents are the user messages whose generations the cycle carried.
+	parents map[string]bool
+	// usage sums the tokens of every call the cycle reported; lastStep is the
+	// step-finish part of the latest one.
+	usage         *acp.Usage
+	lastStep      string
 	stopReason    string
 	errorMessage  string
-	contextUsed   int64
-	contextMax    int64
 	structured    json.RawMessage
 	imagesEmitted bool
 }
@@ -101,6 +107,13 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 	if t != nil {
 		if info.ID != "" {
 			if info.ID != t.messageID && info.ParentID != t.messageID {
+				// A native steer or compaction continues the turn's run under
+				// another user message. Its calls fill this session's context,
+				// so their usage joins the turn.
+				if event.Type == eventPartUpdated && props.Part.Type == partStepFinish && s.turnAccepted(t) {
+					s.recordFailure(&t.cycle, s.emitResponseUsage(ctx, &t.cycle, props.Part, info))
+				}
+
 				return
 			}
 
@@ -168,12 +181,22 @@ func nativeErrorText(native *opencode.NativeError) string {
 	return native.Type
 }
 
-func (s *session) projectInfo(_ context.Context, state *cycleState, info opencode.NativeMessageInfo) error {
-	if state.messages == nil {
-		state.messages = map[string]opencode.NativeMessageInfo{}
+// recordParent notes the user message whose generation a message belongs to.
+func (state *cycleState) recordParent(info opencode.NativeMessageInfo) {
+	if state.parents == nil {
+		state.parents = map[string]bool{}
 	}
 
-	state.messages[info.ID] = info
+	if info.Role == roleUser {
+		state.parents[info.ID] = true
+	} else if info.ParentID != "" {
+		state.parents[info.ParentID] = true
+	}
+}
+
+func (s *session) projectInfo(_ context.Context, state *cycleState, info opencode.NativeMessageInfo) error {
+	state.recordParent(info)
+
 	if info.Role != roleAssistant {
 		return nil
 	}
@@ -189,24 +212,80 @@ func (s *session) projectInfo(_ context.Context, state *cycleState, info opencod
 		state.structured = append(json.RawMessage(nil), info.Structured...)
 	}
 
-	state.contextUsed = int64(info.Tokens.Input + info.Tokens.Cache.Read + info.Tokens.Cache.Write)
+	if info.ProviderID != "" && info.ModelID != "" {
+		s.mu.Lock()
+		s.model = info.ProviderID + "/" + info.ModelID
+		s.mu.Unlock()
+	}
 
+	return nil
+}
+
+// contextTokens is the context a finished call leaves occupied, counted as
+// opencode's own context display counts it: the call's input, cached input,
+// output, and reasoning tokens. A call without usage has no usable figure.
+func contextTokens(tokens opencode.NativeTokens) (int, bool) {
+	used := int(tokens.Input + tokens.Output + tokens.Reasoning + tokens.Cache.Read + tokens.Cache.Write)
+
+	return used, used > 0
+}
+
+// emitResponseUsage reports one finished call from its step-finish part,
+// which carries that call's own tokens. Aborted and failed calls end without
+// one. Every call counts toward the cycle's consumption; a compaction summary
+// reports no context, since its input is the conversation it replaces.
+func (s *session) emitResponseUsage(ctx context.Context, c *cycle, part opencode.NativePart, info opencode.NativeMessageInfo) error {
+	if s.cycleCancelled(c) || info.Role != roleAssistant {
+		return nil
+	}
+
+	c.state.lastStep = part.ID
+
+	used, ok := contextTokens(part.Tokens)
+	if !ok {
+		return nil
+	}
+
+	c.state.usage = addUsage(c.state.usage, part.Tokens)
+
+	if info.CompactionSummary() {
+		return nil
+	}
+
+	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: s.knownContextWindow(info.ProviderID, info.ModelID), Used: used}})
+}
+
+// addUsage adds one call's tokens to the cycle's consumption.
+func addUsage(total *acp.Usage, tokens opencode.NativeTokens) *acp.Usage {
+	if total == nil {
+		total = &acp.Usage{CachedReadTokens: new(0), CachedWriteTokens: new(0), ThoughtTokens: new(0)}
+	}
+
+	total.InputTokens += int(tokens.Input)
+	total.OutputTokens += int(tokens.Output)
+	*total.CachedReadTokens += int(tokens.Cache.Read)
+	*total.CachedWriteTokens += int(tokens.Cache.Write)
+	*total.ThoughtTokens += int(tokens.Reasoning)
+	total.TotalTokens = total.InputTokens + total.OutputTokens + *total.CachedReadTokens + *total.CachedWriteTokens + *total.ThoughtTokens
+
+	return total
+}
+
+// knownContextWindow is the catalog context window of the model a call ran
+// on, else 0.
+func (s *session) knownContextWindow(providerID, modelID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if info.ProviderID != "" && info.ModelID != "" {
-		s.model = info.ProviderID + "/" + info.ModelID
-	}
-
 	for _, provider := range s.models.Providers {
-		if provider.ID == info.ProviderID {
-			if n, ok := provider.Models[info.ModelID].Limit["context"].(float64); ok {
-				state.contextMax = int64(n)
+		if provider.ID == providerID {
+			if n, ok := provider.Models[modelID].Limit["context"].(float64); ok {
+				return int(n)
 			}
 		}
 	}
 
-	return nil
+	return 0
 }
 
 func (s *session) projectMessage(ctx context.Context, c *cycle, message opencode.NativeMessage) error {
@@ -390,10 +469,6 @@ func (s *session) emit(ctx context.Context, updates ...acp.SessionUpdate) error 
 	return nil
 }
 
-func (s *session) emitUsage(ctx context.Context, state *cycleState) {
-	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: int(state.contextMax), Used: int(state.contextUsed)}})
-}
-
 func (s *session) emitRawEvent(ctx context.Context, event opencode.Event) {
 	if !s.rawEvents.Enabled() {
 		return
@@ -476,10 +551,10 @@ func (s *session) eventInfo(event opencode.Event, props eventProperties) (openco
 	var info opencode.NativeMessageInfo
 
 	switch event.Type {
-	case "message.updated":
+	case eventMessageUpdated:
 		info = props.Info
 		s.rememberMessage(info)
-	case "message.part.updated":
+	case eventPartUpdated:
 		info = s.nativeMessage(props.Part.MessageID)
 	case "message.part.delta":
 		info = s.nativeMessage(props.MessageID)
@@ -505,11 +580,7 @@ func (s *session) eventInfo(event opencode.Event, props eventProperties) (openco
 func (s *session) projectEvent(ctx context.Context, rt *binding, c *cycle, event opencode.Event, props eventProperties, info opencode.NativeMessageInfo) error {
 	if s.cycleCancelled(c) {
 		if info.ID != "" {
-			if c.state.messages == nil {
-				c.state.messages = make(map[string]opencode.NativeMessageInfo)
-			}
-
-			c.state.messages[info.ID] = info
+			c.state.recordParent(info)
 		}
 
 		if event.Type == eventPermissionAsked || event.Type == eventQuestionAsked {
@@ -522,10 +593,14 @@ func (s *session) projectEvent(ctx context.Context, rt *binding, c *cycle, event
 	var err error
 
 	switch event.Type {
-	case "message.updated":
+	case eventMessageUpdated:
 		err = s.projectInfo(ctx, &c.state, info)
-	case "message.part.updated":
-		err = s.projectPart(ctx, &c.state, props.Part, info.Role)
+	case eventPartUpdated:
+		if props.Part.Type == partStepFinish {
+			err = s.emitResponseUsage(ctx, c, props.Part, info)
+		} else {
+			err = s.projectPart(ctx, &c.state, props.Part, info.Role)
+		}
 	case "message.part.delta":
 		if props.Field == fieldText && props.Delta != "" && info.Role == roleAssistant {
 			if c.state.text == nil {
@@ -559,8 +634,6 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 		c.state.stopReason = statusComplete
 	}
 
-	s.emitUsage(settleCtx, &c.state)
-
 	if err := s.commitMirror(settleCtx, rt); err != nil {
 		s.recordFailure(c, s.mirrorFailure(&c.state, err))
 		s.fenceStream()
@@ -574,13 +647,8 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 	_ = s.lc.Idle(settleCtx, c.Cycle, verdict.stopReason, verdict.outcome)
 	close(c.done)
 
-	for id := range c.state.messages {
-		m := c.state.messages[id]
-		if m.Role == roleUser {
-			s.completeParent(id)
-		} else {
-			s.completeParent(m.ParentID)
-		}
+	for id := range c.state.parents {
+		s.completeParent(id)
 	}
 
 	s.mu.Lock()

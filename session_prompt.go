@@ -304,8 +304,8 @@ func judgeCycle(c *cycle, failure error, cancelled bool) cycleVerdict {
 }
 
 // settleTurn is the one settlement point every accepted prompt reaches:
-// usage and session info, the durable mirror commit, the terminal idle, and
-// only then the response or error.
+// session info, the durable mirror commit, the terminal idle, and only then
+// the response or error.
 func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params acp.PromptRequest) (acp.PromptResponse, error) {
 	s.beginSettlement(&t.cycle)
 
@@ -331,7 +331,6 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 
 	if t.ended == turnSettled {
 		if !cancelled {
-			s.emitUsage(settleCtx, &t.state)
 			s.emitSessionInfo(settleCtx, params.Prompt)
 		}
 
@@ -374,7 +373,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	}
 
 	return acp.PromptResponse{
-		Meta: meta, Usage: promptUsage(&t.state),
+		Meta: meta, Usage: t.state.usage,
 		StopReason:    acp.StopReason(verdict.stopReason),
 		UserMessageId: params.MessageId,
 	}, nil
@@ -429,33 +428,4 @@ func (s *session) promptRequest(mapped nativePrompt, id string) (string, any) {
 	}
 
 	return "/message", req
-}
-
-func promptUsage(state *cycleState) *acp.Usage {
-	if len(state.messages) == 0 {
-		return nil
-	}
-
-	usage := &acp.Usage{}
-	read, write, thought := 0, 0, 0
-
-	for id := range state.messages {
-		message := state.messages[id]
-		if message.Role != roleAssistant {
-			continue
-		}
-
-		usage.InputTokens += int(message.Tokens.Input)
-		usage.OutputTokens += int(message.Tokens.Output)
-		read += int(message.Tokens.Cache.Read)
-		write += int(message.Tokens.Cache.Write)
-		thought += int(message.Tokens.Reasoning)
-	}
-
-	usage.TotalTokens = usage.InputTokens + usage.OutputTokens + read + write + thought
-	usage.CachedReadTokens = &read
-	usage.CachedWriteTokens = &write
-	usage.ThoughtTokens = &thought
-
-	return usage
 }

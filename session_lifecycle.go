@@ -80,6 +80,14 @@ func (s *session) acceptTurn(ctx context.Context, t *turn) {
 	}
 }
 
+// turnAccepted reports whether the turn's prompt has been accepted.
+func (s *session) turnAccepted(t *turn) bool {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	return t.accepted
+}
+
 // recordFailure keeps the first failure one cycle observed. The pump and the
 // prompt both reach it, so every write and read goes through lcMu.
 func (s *session) recordFailure(c *cycle, err error) {

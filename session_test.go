@@ -899,3 +899,22 @@ func TestDeleteAwaitsDeferredOpening(t *testing.T) {
 	a.mu.Unlock()
 	require.False(t, installed)
 }
+
+// TestUsageRecoversUndeliveredResponses proves a call whose event has not
+// reached the stream when the prompt answers reports from native history,
+// once, after the calls the stream did deliver.
+func TestUsageRecoversUndeliveredResponses(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	resp, err := h.prompt(session.SessionId, "LAGGED", nil)
+	require.NoError(t, err)
+	require.Equal(t, []acp.SessionUsageUpdate{
+		{Size: fakeContextWindow, Used: 1120},
+		{Size: fakeContextWindow, Used: 1200},
+	}, usageUpdates(h.rec.snapshot()))
+	require.Equal(t, 2320, resp.Usage.TotalTokens)
+}

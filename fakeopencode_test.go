@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -139,6 +140,13 @@ func (f *fakeOpenCode) advanceHistory(marker, id string) {
 	f.append(id, "session.updated", map[string]any{"info": session})
 }
 func (f *fakeOpenCode) append(id, typ string, data map[string]any) {
+	f.record(id, typ, data)
+	f.publish(typ, data)
+}
+
+// record stores one native row without publishing it, as a row whose event
+// the stream has not delivered yet.
+func (f *fakeOpenCode) record(id, typ string, data map[string]any) {
 	seq := int64(0)
 	for _, event := range f.rows {
 		if event.AggregateID == id {
@@ -152,7 +160,109 @@ func (f *fakeOpenCode) append(id, typ string, data map[string]any) {
 	}
 	f.rows = append(f.rows, opencode.SyncEvent{ID: opencode.NewID("evt_"), AggregateID: id, Sequence: seq, Type: typ + ".1", Data: encoded})
 	f.save()
-	f.publish(typ, data)
+}
+
+// fakeTokens is one model call's native usage: the new input, the cached
+// prompt the call resent, and the output.
+func fakeTokens(input, cacheRead, output float64) opencode.NativeTokens {
+	tokens := opencode.NativeTokens{Input: input, Output: output}
+	tokens.Cache.Read = cacheRead
+
+	return tokens
+}
+
+// part appends one part of a native message.
+func (f *fakeOpenCode) part(info opencode.NativeMessageInfo, part opencode.NativePart) {
+	part.ID, part.SessionID, part.MessageID = opencode.NewID("prt_"), info.SessionID, info.ID
+	f.append(info.SessionID, "message.part.updated", map[string]any{"part": part, "time": time.Now().UnixMilli()})
+}
+
+// call runs one tool-using model call as opencode does: a new assistant
+// message under parent, its step-start, a tool part, the step-finish carrying
+// the call's own tokens, and the completed message. A compaction summary is
+// marked as opencode marks it.
+func (f *fakeOpenCode) call(model opencode.NativeMessageInfo, parent string, summary bool, tokens opencode.NativeTokens) {
+	call := model
+	call.ID, call.ParentID = opencode.NewMessageID(), parent
+	if summary {
+		call.Summary = json.RawMessage(`true`)
+	}
+	f.append(call.SessionID, "message.updated", map[string]any{"info": call})
+	f.part(call, opencode.NativePart{Type: "step-start"})
+	f.part(call, opencode.NativePart{Type: partTool, CallID: opencode.NewID("call_"), Tool: nativeToolBash, State: json.RawMessage(`{"status":"completed","input":{"command":"ls"},"output":"notes.txt"}`)})
+	f.part(call, opencode.NativePart{Type: partStepFinish, Tokens: tokens})
+	call.Finish, call.Time.Completed = "tool-calls", time.Now().UnixMilli()
+	f.append(call.SessionID, "message.updated", map[string]any{"info": call})
+}
+
+// earlierCalls runs the model calls a script makes before its final one and
+// returns the final call's parent and tokens.
+func (f *fakeOpenCode) earlierCalls(id, text string, model opencode.NativeMessageInfo, parent string) (string, opencode.NativeTokens) {
+	switch text {
+	case "MULTI":
+		// Three model calls, each resending the context the previous one left.
+		f.call(model, parent, false, fakeTokens(100, 1000, 20))
+		f.call(model, parent, false, fakeTokens(50, 1120, 30))
+
+		return parent, fakeTokens(40, 1200, 10)
+	case "STEER", "STEERSLOW":
+		// A native client adds a message mid-run; opencode's loop answers it
+		// in the same run, under the new message.
+		f.call(model, parent, false, fakeTokens(100, 1000, 20))
+		parent = f.userMessage(id, opencode.NativePart{Type: fieldText, Text: "also this"})
+		f.call(model, parent, false, fakeTokens(50, 1120, 30))
+
+		return parent, fakeTokens(40, 1200, 10)
+	case "COMPACT":
+		// The context overflows, so opencode summarizes it in a call of its
+		// own and continues the run on the compacted context.
+		f.call(model, parent, false, fakeTokens(100, 1000, 20))
+		compaction := f.userMessage(id, opencode.NativePart{Type: "compaction"})
+		f.call(model, compaction, true, fakeTokens(1120, 0, 200))
+		f.publish("session.compacted", map[string]any{"sessionID": id})
+
+		return f.userMessage(id, opencode.NativePart{Type: fieldText, Text: "Continue if you have next steps."}), fakeTokens(300, 0, 20)
+	case "STEPSLOW", "LAGGED":
+		f.call(model, parent, false, fakeTokens(100, 1000, 20))
+
+		return parent, fakeTokens(50, 1120, 30)
+	case "FLAKY":
+		return parent, fakeTokens(100, 1000, 20)
+	}
+
+	return parent, fakeTokens(10, 0, 3)
+}
+
+// startCall opens the final call. FLAKY fails its first attempt, which
+// opencode retries inside the same message.
+func (f *fakeOpenCode) startCall(info opencode.NativeMessageInfo, text string) {
+	f.part(info, opencode.NativePart{Type: "step-start"})
+	if text == "FLAKY" {
+		f.publish("session.status", map[string]any{"sessionID": info.SessionID, "status": map[string]any{"type": "retry", "attempt": 1, "message": "overloaded"}})
+		f.part(info, opencode.NativePart{Type: "step-start"})
+	}
+}
+
+// finishCall stores the final call's step-finish. LAGGED stores it before
+// the prompt answers without its event reaching the stream yet.
+func (f *fakeOpenCode) finishCall(info opencode.NativeMessageInfo, tokens opencode.NativeTokens, text string) {
+	finish := opencode.NativePart{ID: opencode.NewID("prt_"), SessionID: info.SessionID, MessageID: info.ID, Type: partStepFinish, Tokens: tokens}
+	if text == "LAGGED" {
+		f.record(info.SessionID, "message.part.updated", map[string]any{"part": finish, "time": time.Now().UnixMilli()})
+
+		return
+	}
+	f.append(info.SessionID, "message.part.updated", map[string]any{"part": finish, "time": time.Now().UnixMilli()})
+}
+
+// userMessage appends a native user message that did not come from the
+// adapter, as a native client or a compaction writes one.
+func (f *fakeOpenCode) userMessage(id string, part opencode.NativePart) string {
+	info := opencode.NativeMessageInfo{ID: opencode.NewMessageID(), SessionID: id, Role: roleUser}
+	f.append(id, "message.updated", map[string]any{"info": info})
+	f.part(info, part)
+
+	return info.ID
 }
 func (f *fakeOpenCode) save() {
 	data, _ := json.Marshal(f.rows)
@@ -412,16 +522,20 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 		native.URL, _ = part["url"].(string)
 		f.append(id, "message.part.updated", map[string]any{"part": native, "time": time.Now().UnixMilli()})
 	}
-	info := opencode.NativeMessageInfo{ID: opencode.NewMessageID(), ParentID: user.ID, SessionID: id, Role: roleAssistant, ModelID: session.Model.ID, ProviderID: session.Model.ProviderID}
+	model := opencode.NativeMessageInfo{SessionID: id, Role: roleAssistant, ModelID: session.Model.ID, ProviderID: session.Model.ProviderID}
 	if request.Model != nil {
-		info.ModelID = request.Model.ModelID
-		info.ProviderID = request.Model.ProviderID
+		model.ModelID = request.Model.ModelID
+		model.ProviderID = request.Model.ProviderID
 	}
+	parent, tokens := f.earlierCalls(id, text.String(), model, user.ID)
+	info := model
+	info.ID, info.ParentID = opencode.NewMessageID(), parent
 	f.append(id, "message.updated", map[string]any{"info": info})
+	f.startCall(info, text.String())
 	pending := make(chan struct{})
 	f.pending[id] = pending
 	f.mu.Unlock()
-	if text.String() == "SLOW" {
+	if slices.Contains([]string{"SLOW", "STEPSLOW", "STEERSLOW"}, text.String()) {
 		select {
 		case <-pending:
 		case <-r.Context().Done():
@@ -479,13 +593,12 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 		output = string(data)
 	}
 	info.Time.Completed = time.Now().UnixMilli()
-	info.Tokens.Input = 10
-	info.Tokens.Output = 3
 	if request.Format != nil {
 		info.Structured = json.RawMessage(`{"answer":"ok"}`)
 	}
 	part := opencode.NativePart{ID: opencode.NewID("prt_"), SessionID: id, MessageID: info.ID, Type: "text", Text: output}
 	f.append(id, "message.part.updated", map[string]any{"part": part, "time": time.Now().UnixMilli()})
+	f.finishCall(info, tokens, text.String())
 	if text.String() == "IMAGE" {
 		path := filepath.Join(session.Directory, "output.png")
 		file, err := os.Create(path)
