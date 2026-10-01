@@ -1,0 +1,604 @@
+[
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_0",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "id": "msg_fixture_0",
+          "model": {
+            "modelID": "qwen/qwen3.8-flash",
+            "providerID": "openrouter"
+          },
+          "role": "user",
+          "sessionID": "fixture-session",
+          "time": {
+            "created": 1790864259651
+          }
+        },
+        "sessionID": "fixture-session"
+      },
+      "type": "message.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_1",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_0",
+          "messageID": "msg_fixture_0",
+          "sessionID": "fixture-session",
+          "text": "Reply with the word hi.",
+          "type": "text"
+        },
+        "sessionID": "fixture-session",
+        "time": 1790864259657
+      },
+      "type": "message.part.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_2",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_3",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0,
+          "id": "msg_fixture_1",
+          "mode": "build",
+          "modelID": "qwen/qwen3.8-flash",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "providerID": "openrouter",
+          "role": "assistant",
+          "sessionID": "fixture-session",
+          "time": {
+            "created": 1790864259664
+          },
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 0,
+            "output": 0,
+            "reasoning": 0
+          }
+        },
+        "sessionID": "fixture-session"
+      },
+      "type": "message.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_4",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "id": "msg_fixture_0",
+          "model": {
+            "modelID": "qwen/qwen3.8-flash",
+            "providerID": "openrouter"
+          },
+          "role": "user",
+          "sessionID": "fixture-session",
+          "summary": {
+            "diffs": []
+          },
+          "time": {
+            "created": 1790864259651
+          }
+        },
+        "sessionID": "fixture-session"
+      },
+      "type": "message.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_5",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_6",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "attempt": 1,
+          "message": "[Alibaba] qwen/qwen3.8-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+          "next": 1790864267194,
+          "type": "retry"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_7",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_8",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "attempt": 2,
+          "message": "[Alibaba] qwen/qwen3.8-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+          "next": 1790864278730,
+          "type": "retry"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_9",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_10",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "attempt": 3,
+          "message": "[Alibaba] qwen/qwen3.8-flash is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations",
+          "next": 1790864291954,
+          "type": "retry"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_11",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_12",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_1",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "sessionID": "fixture-session",
+        "time": 1790864293261
+      },
+      "type": "message.part.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_13",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "text": "",
+          "time": {
+            "start": 1790864293263
+          },
+          "type": "reasoning"
+        },
+        "sessionID": "fixture-session",
+        "time": 1790864293264
+      },
+      "type": "message.part.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_14",
+      "properties": {
+        "delta": "The",
+        "field": "text",
+        "messageID": "msg_fixture_1",
+        "partID": "prt_fixture_2",
+        "sessionID": "fixture-session"
+      },
+      "type": "message.part.delta"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_15",
+      "properties": {
+        "delta": " user wants me to",
+        "field": "text",
+        "messageID": "msg_fixture_1",
+        "partID": "prt_fixture_2",
+        "sessionID": "fixture-session"
+      },
+      "type": "message.part.delta"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_16",
+      "properties": {
+        "delta": " reply with just the",
+        "field": "text",
+        "messageID": "msg_fixture_1",
+        "partID": "prt_fixture_2",
+        "sessionID": "fixture-session"
+      },
+      "type": "message.part.delta"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_17",
+      "properties": {
+        "delta": " word \"hi\".",
+        "field": "text",
+        "messageID": "msg_fixture_1",
+        "partID": "prt_fixture_2",
+        "sessionID": "fixture-session"
+      },
+      "type": "message.part.delta"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_18",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "metadata": {
+            "openrouter": {
+              "reasoning_details": [
+                {
+                  "format": "unknown",
+                  "index": 0,
+                  "text": "The user wants me to reply with just the word \"hi\".",
+                  "type": "reasoning.text"
+                }
+              ]
+            }
+          },
+          "sessionID": "fixture-session",
+          "text": "The user wants me to reply with just the word \"hi\".",
+          "time": {
+            "end": 1790864293496,
+            "start": 1790864293263
+          },
+          "type": "reasoning"
+        },
+        "sessionID": "fixture-session",
+        "time": 1790864293496
+      },
+      "type": "message.part.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_19",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_3",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "text": "",
+          "time": {
+            "start": 1790864293498
+          },
+          "type": "text"
+        },
+        "sessionID": "fixture-session",
+        "time": 1790864293498
+      },
+      "type": "message.part.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_20",
+      "properties": {
+        "delta": "hi",
+        "field": "text",
+        "messageID": "msg_fixture_1",
+        "partID": "prt_fixture_3",
+        "sessionID": "fixture-session"
+      },
+      "type": "message.part.delta"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_21",
+      "properties": {
+        "part": {
+          "id": "prt_fixture_3",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "text": "hi",
+          "time": {
+            "end": 1790864293666,
+            "start": 1790864293498
+          },
+          "type": "text"
+        },
+        "sessionID": "fixture-session",
+        "time": 1790864293666
+      },
+      "type": "message.part.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_22",
+      "properties": {
+        "part": {
+          "cost": 0.000502412,
+          "id": "prt_fixture_4",
+          "messageID": "msg_fixture_1",
+          "reason": "stop",
+          "sessionID": "fixture-session",
+          "tokens": {
+            "cache": {
+              "read": 1792,
+              "write": 0
+            },
+            "input": 3105,
+            "output": 4,
+            "reasoning": 13,
+            "total": 4914
+          },
+          "type": "step-finish"
+        },
+        "sessionID": "fixture-session",
+        "time": 1790864293669
+      },
+      "type": "message.part.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_23",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0.000502412,
+          "finish": "stop",
+          "id": "msg_fixture_1",
+          "mode": "build",
+          "modelID": "qwen/qwen3.8-flash",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "providerID": "openrouter",
+          "role": "assistant",
+          "sessionID": "fixture-session",
+          "time": {
+            "completed": 1790864293673,
+            "created": 1790864259664
+          },
+          "tokens": {
+            "cache": {
+              "read": 1792,
+              "write": 0
+            },
+            "input": 3105,
+            "output": 4,
+            "reasoning": 13,
+            "total": 4914
+          }
+        },
+        "sessionID": "fixture-session"
+      },
+      "type": "message.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_24",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "cost": 0.000502412,
+          "finish": "stop",
+          "id": "msg_fixture_1",
+          "mode": "build",
+          "modelID": "qwen/qwen3.8-flash",
+          "parentID": "msg_fixture_0",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "providerID": "openrouter",
+          "role": "assistant",
+          "sessionID": "fixture-session",
+          "time": {
+            "completed": 1790864293673,
+            "created": 1790864259664
+          },
+          "tokens": {
+            "cache": {
+              "read": 1792,
+              "write": 0
+            },
+            "input": 3105,
+            "output": 4,
+            "reasoning": 13,
+            "total": 4914
+          }
+        },
+        "sessionID": "fixture-session"
+      },
+      "type": "message.updated"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_25",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_26",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "type": "session.status"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_27",
+      "properties": {
+        "sessionID": "fixture-session"
+      },
+      "type": "session.idle"
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_28",
+      "properties": {
+        "info": {
+          "agent": "build",
+          "id": "msg_fixture_0",
+          "model": {
+            "modelID": "qwen/qwen3.8-flash",
+            "providerID": "openrouter"
+          },
+          "role": "user",
+          "sessionID": "fixture-session",
+          "summary": {
+            "diffs": []
+          },
+          "time": {
+            "created": 1790864259651
+          }
+        },
+        "sessionID": "fixture-session"
+      },
+      "type": "message.updated"
+    }
+  }
+]

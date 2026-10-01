@@ -397,11 +397,10 @@ func TestCancelledTurnReportsNoUsageAfterCancel(t *testing.T) {
 		"the call that finished after the cancel reports nothing")
 }
 
-// TestAgentOriginUsageFollowsEachResponse replays captured native runs as
-// agent-origin work: every call reports its own context, with the window the
-// catalog knows for its model, and a compaction summary reports nothing.
-func TestAgentOriginUsageFollowsEachResponse(t *testing.T) {
-	t.Parallel()
+// nativeCatalog is a provider catalog holding the models the captured native
+// runs used.
+func nativeCatalog(t *testing.T) string {
+	t.Helper()
 
 	catalog := filepath.Join(t.TempDir(), "providers.json")
 	require.NoError(t, os.WriteFile(catalog, []byte(`{"providers":[
@@ -409,6 +408,63 @@ func TestAgentOriginUsageFollowsEachResponse(t *testing.T) {
 		{"id":"openrouter","name":"OpenRouter","models":{"qwen/qwen3.8-flash":{"id":"qwen/qwen3.8-flash","name":"Qwen3.8 Flash","limit":{"context":1000000,"output":131072}}}},
 		{"id":"omp","name":"Gateway","models":{"openrouter/qwen/qwen3.8-flash":{"id":"openrouter/qwen/qwen3.8-flash","name":"Qwen3.8 Flash","limit":{"context":0,"output":0}}}}
 	],"default":{"fake":"vision"}}`), 0o600))
+
+	return catalog
+}
+
+// replayNativeRun feeds a captured native run to a fresh session as
+// agent-origin work and returns its updates once the cycle settles with
+// usageReports usage updates delivered.
+func replayNativeRun(t *testing.T, catalog, fixture string, usageReports int) (acp.SessionId, []acp.SessionNotification) {
+	t.Helper()
+
+	rec := newRecorder()
+	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", "ACP_GO_OPENCODE_TEST_PROVIDERS": catalog}))...)
+	t.Cleanup(func() { _ = a.Close() })
+	a.attach(rec, nil)
+	initResponse, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber, Meta: map[string]any{wire.LifecycleKey: map[string]any{"version": 1}}})
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+
+	data, err := os.ReadFile(fixture)
+	require.NoError(t, err)
+
+	var frames []struct {
+		Payload opencode.Event `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(data, &frames))
+
+	for _, frame := range frames {
+		rt.events <- frame.Payload
+	}
+
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		settled := s.cycle == nil
+		s.mu.Unlock()
+
+		return settled && len(usageUpdates(rec.snapshot())) == usageReports
+	}, testTimeout, time.Millisecond)
+
+	updates := rec.snapshot()
+	require.NoError(t, lifecycle.CheckAttribution(negotiatedAnswer(t, initResponse), sessionFrames(t, updates, created.SessionId)))
+
+	return created.SessionId, updates
+}
+
+// TestAgentOriginUsageFollowsEachResponse replays captured native runs as
+// agent-origin work: every call reports its own context, with the window the
+// catalog knows for its model, and a compaction summary reports nothing.
+func TestAgentOriginUsageFollowsEachResponse(t *testing.T) {
+	t.Parallel()
+
+	catalog := nativeCatalog(t)
 
 	for name, tc := range map[string]struct {
 		fixture string
@@ -434,43 +490,93 @@ func TestAgentOriginUsageFollowsEachResponse(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			rec := newRecorder()
-			a := NewAgent(testOptions(t, WithEnv(map[string]string{fakeOpenCodeEnv: "1", "ACP_GO_OPENCODE_TEST_PROVIDERS": catalog}))...)
-			t.Cleanup(func() { _ = a.Close() })
-			a.attach(rec, nil)
-			initResponse, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber, Meta: map[string]any{wire.LifecycleKey: map[string]any{"version": 1}}})
-			require.NoError(t, err)
-			created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
-			require.NoError(t, err)
-			s, err := a.session(t.Context(), created.SessionId)
-			require.NoError(t, err)
-			s.mu.Lock()
-			rt := s.runtime
-			s.mu.Unlock()
-
-			data, err := os.ReadFile(tc.fixture)
-			require.NoError(t, err)
-
-			var frames []struct {
-				Payload opencode.Event `json:"payload"`
-			}
-			require.NoError(t, json.Unmarshal(data, &frames))
-
-			for _, frame := range frames {
-				rt.events <- frame.Payload
-			}
-
-			require.Eventually(t, func() bool {
-				s.mu.Lock()
-				settled := s.cycle == nil
-				s.mu.Unlock()
-
-				return settled && len(usageUpdates(rec.snapshot())) == len(tc.want)
-			}, testTimeout, time.Millisecond)
-			require.Equal(t, tc.want, usageUpdates(rec.snapshot()))
-			require.NoError(t, lifecycle.CheckAttribution(negotiatedAnswer(t, initResponse), sessionFrames(t, rec.snapshot(), created.SessionId)))
+			_, updates := replayNativeRun(t, catalog, tc.fixture, len(tc.want))
+			require.Equal(t, tc.want, usageUpdates(updates))
 		})
 	}
+}
+
+// responseChunk is one agent message or thought chunk as a client sees it.
+type responseChunk struct {
+	thought   bool
+	text      string
+	messageID *string
+}
+
+// responseChunks returns the agent message and thought chunks of one session
+// in delivery order.
+func responseChunks(updates []acp.SessionNotification, id acp.SessionId) []responseChunk {
+	var chunks []responseChunk
+
+	for _, update := range updates {
+		if update.SessionId != id {
+			continue
+		}
+
+		if chunk := update.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil {
+			chunks = append(chunks, responseChunk{text: chunk.Content.Text.Text, messageID: chunk.MessageId})
+		}
+
+		if chunk := update.Update.AgentThoughtChunk; chunk != nil && chunk.Content.Text != nil {
+			chunks = append(chunks, responseChunk{thought: true, text: chunk.Content.Text.Text, messageID: chunk.MessageId})
+		}
+	}
+
+	return chunks
+}
+
+// TestResponsesCarryNoGatewayID proves the adapter attributes no response id.
+// opencode keeps none of the gateway's response ids: its message and part ids
+// are its own, so chunks carry no message id and call usage no response id.
+// The captured run is one OpenRouter call that streamed its reasoning and
+// text; the gateway answered it with a generation id opencode never surfaced.
+func TestResponsesCarryNoGatewayID(t *testing.T) {
+	t.Parallel()
+
+	t.Run("streamed", func(t *testing.T) {
+		t.Parallel()
+
+		id, updates := replayNativeRun(t, nativeCatalog(t), "testdata/native/response.json", 1)
+		require.Equal(t, []responseChunk{
+			{thought: true, text: "The"},
+			{thought: true, text: " user wants me to"},
+			{thought: true, text: " reply with just the"},
+			{thought: true, text: ` word "hi".`},
+			{text: "hi"},
+		}, responseChunks(updates, id))
+
+		report := usageUpdates(updates)
+		require.Equal(t, []acp.SessionUsageUpdate{callReport(1000000, 4914, 3105, 1792, 0, 17)}, report)
+
+		call, ok := report[0].Meta[wire.CallUsageKey].(map[string]any)
+		require.True(t, ok)
+		require.NotContains(t, call, "responseId")
+	})
+
+	t.Run("replayed", func(t *testing.T) {
+		t.Parallel()
+
+		store := acpcore.NewInMemorySessionStore()
+		h := newHarness(t, WithSessionStore(store))
+		h.initialize()
+		cwd := t.TempDir()
+		created, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+		require.NoError(t, err)
+		_, err = h.prompt(created.SessionId, "HELLO", nil)
+		require.NoError(t, err)
+		_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: created.SessionId})
+		require.NoError(t, err)
+
+		before := len(h.rec.snapshot())
+		_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(created.SessionId, cwd))
+		require.NoError(t, err)
+
+		replayed := responseChunks(h.rec.snapshot()[before:], created.SessionId)
+		require.NotEmpty(t, replayed)
+		for _, chunk := range replayed {
+			require.Nil(t, chunk.messageID)
+		}
+	})
 }
 
 // TestCallTokens proves one call's native tokens give the context it left

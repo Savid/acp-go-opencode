@@ -30,6 +30,16 @@ provider and `qwen/qwen3.8-flash`, whose catalog context limit is 1,000,000.
 While a native prompt's first call ran a slow `ls`, a second native prompt
 arrived; opencode answered it in the same run under the new user message.
 
-The last two fixtures retain message, part, status, idle, and compaction
-frames and drop text deltas and frames unrelated to the session. Every model
-call reports its usage only on its `step-finish` part.
+## response.json
+
+Captured from OpenCode 1.18.33 on 2026-10-01 with the built-in `openrouter`
+provider and `qwen/qwen3.8-flash`, through the adapter's raw event channel,
+which forwards each `/global/event` payload. One prompt asked for the word
+`hi`; the call was retried three times on upstream rate limits, then streamed
+its reasoning and text. OpenRouter answered the call with a `gen-` generation
+id that no frame carries.
+
+The `compaction`, `steer` and `response` fixtures retain message, part, status,
+idle, and compaction frames and drop frames unrelated to the session;
+`response` alone keeps its text deltas. Every model call reports its usage only
+on its `step-finish` part.
