@@ -223,17 +223,31 @@ func (s *session) projectInfo(_ context.Context, state *cycleState, info opencod
 
 // contextTokens is the context a finished call leaves occupied, counted as
 // opencode's own context display counts it: the call's input, cached input,
-// output, and reasoning tokens. A call without usage has no usable figure.
-func contextTokens(tokens opencode.NativeTokens) (int, bool) {
-	used := int(tokens.Input + tokens.Output + tokens.Reasoning + tokens.Cache.Read + tokens.Cache.Write)
+// output, and reasoning tokens.
+func contextTokens(tokens opencode.NativeTokens) int {
+	return int(tokens.Input + tokens.Output + tokens.Reasoning + tokens.Cache.Read + tokens.Cache.Write)
+}
 
-	return used, used > 0
+// callUsage is one call's token breakdown. opencode's input already excludes
+// the tokens read from and written to the prompt cache, and its output
+// excludes reasoning, so output and reasoning together are what the call
+// generated.
+func callUsage(tokens opencode.NativeTokens) wire.CallUsage {
+	return wire.CallUsage{
+		InputTokens:       new(int(tokens.Input)),
+		CachedReadTokens:  new(int(tokens.Cache.Read)),
+		CachedWriteTokens: new(int(tokens.Cache.Write)),
+		OutputTokens:      new(int(tokens.Output + tokens.Reasoning)),
+	}
 }
 
 // emitResponseUsage reports one finished call from its step-finish part,
-// which carries that call's own tokens. Aborted and failed calls end without
-// one. Every call counts toward the cycle's consumption; a compaction summary
-// reports no context, since its input is the conversation it replaces.
+// which carries that call's own tokens and is the call's only usage report.
+// Aborted and failed calls end without one. A step-finish without any token
+// is unknown, as a gateway's response cache reports a replayed call, so it
+// neither reports nor counts. Every other call counts toward the cycle's
+// consumption; a compaction summary reports no context, since its input is
+// the conversation it replaces.
 func (s *session) emitResponseUsage(ctx context.Context, c *cycle, part opencode.NativePart, info opencode.NativeMessageInfo) error {
 	if s.cycleCancelled(c) || info.Role != roleAssistant {
 		return nil
@@ -241,8 +255,8 @@ func (s *session) emitResponseUsage(ctx context.Context, c *cycle, part opencode
 
 	c.state.lastStep = part.ID
 
-	used, ok := contextTokens(part.Tokens)
-	if !ok {
+	call := callUsage(part.Tokens)
+	if !call.Known() {
 		return nil
 	}
 
@@ -252,7 +266,11 @@ func (s *session) emitResponseUsage(ctx context.Context, c *cycle, part opencode
 		return nil
 	}
 
-	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: s.knownContextWindow(info.ProviderID, info.ModelID), Used: used}})
+	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+		Size: s.knownContextWindow(info.ProviderID, info.ModelID),
+		Used: contextTokens(part.Tokens),
+		Meta: call.Apply(nil),
+	}})
 }
 
 // addUsage adds one call's tokens to the cycle's consumption.

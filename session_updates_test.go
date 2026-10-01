@@ -250,9 +250,9 @@ func TestUsageFollowsEachResponse(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: fakeContextWindow, Used: 1120},
-		{Size: fakeContextWindow, Used: 1200},
-		{Size: fakeContextWindow, Used: 1250},
+		callReport(fakeContextWindow, 1120, 100, 1000, 0, 20),
+		callReport(fakeContextWindow, 1200, 50, 1120, 0, 30),
+		callReport(fakeContextWindow, 1250, 40, 1200, 0, 10),
 	}, usageUpdates(h.rec.snapshot()))
 	require.NotNil(t, resp.Usage)
 	require.Equal(t, 190, resp.Usage.InputTokens)
@@ -283,9 +283,9 @@ func TestUsageFollowsSteeredResponses(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: fakeContextWindow, Used: 1120},
-		{Size: fakeContextWindow, Used: 1200},
-		{Size: fakeContextWindow, Used: 1250},
+		callReport(fakeContextWindow, 1120, 100, 1000, 0, 20),
+		callReport(fakeContextWindow, 1200, 50, 1120, 0, 30),
+		callReport(fakeContextWindow, 1250, 40, 1200, 0, 10),
 	}, usageUpdates(rec.snapshot()))
 	require.Equal(t, 3570, resp.Usage.TotalTokens)
 	require.NoError(t, lifecycle.CheckAttribution(negotiatedAnswer(t, initResponse), sessionFrames(t, rec.snapshot(), created.SessionId)))
@@ -334,8 +334,8 @@ func TestSteeredUsageArrivesInsideTheTurn(t *testing.T) {
 
 	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool { return len(usageUpdates(updates)) == 2 })
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: fakeContextWindow, Used: 1120},
-		{Size: fakeContextWindow, Used: 1200},
+		callReport(fakeContextWindow, 1120, 100, 1000, 0, 20),
+		callReport(fakeContextWindow, 1200, 50, 1120, 0, 30),
 	}, usageUpdates(h.rec.snapshot()))
 	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
@@ -352,7 +352,7 @@ func TestUnusableResponsesReportNoUsage(t *testing.T) {
 
 	resp, err := h.prompt(session.SessionId, "FLAKY", nil)
 	require.NoError(t, err)
-	require.Equal(t, []acp.SessionUsageUpdate{{Size: fakeContextWindow, Used: 1120}}, usageUpdates(h.rec.snapshot()))
+	require.Equal(t, []acp.SessionUsageUpdate{callReport(fakeContextWindow, 1120, 100, 1000, 0, 20)}, usageUpdates(h.rec.snapshot()))
 	require.Equal(t, 1120, resp.Usage.TotalTokens)
 }
 
@@ -369,8 +369,8 @@ func TestUsageAfterCompaction(t *testing.T) {
 	resp, err := h.prompt(session.SessionId, "COMPACT", nil)
 	require.NoError(t, err)
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: fakeContextWindow, Used: 1120},
-		{Size: fakeContextWindow, Used: 320},
+		callReport(fakeContextWindow, 1120, 100, 1000, 0, 20),
+		callReport(fakeContextWindow, 320, 300, 0, 0, 20),
 	}, usageUpdates(h.rec.snapshot()))
 	require.Equal(t, 1120+1320+320, resp.Usage.TotalTokens)
 }
@@ -393,7 +393,7 @@ func TestCancelledTurnReportsNoUsageAfterCancel(t *testing.T) {
 	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
 
-	require.Equal(t, []acp.SessionUsageUpdate{{Size: fakeContextWindow, Used: 1120}}, usageUpdates(h.rec.snapshot()),
+	require.Equal(t, []acp.SessionUsageUpdate{callReport(fakeContextWindow, 1120, 100, 1000, 0, 20)}, usageUpdates(h.rec.snapshot()),
 		"the call that finished after the cancel reports nothing")
 }
 
@@ -415,10 +415,20 @@ func TestAgentOriginUsageFollowsEachResponse(t *testing.T) {
 		want    []acp.SessionUsageUpdate
 	}{
 		"gateway without a context window, compacted": {"testdata/native/compaction.json", []acp.SessionUsageUpdate{
-			{Used: 10561}, {Used: 10735}, {Used: 10938}, {Used: 11202}, {Used: 11363}, {Used: 11512}, {Used: 11556}, {Used: 11263},
+			callReport(0, 10561, 3041, 7424, 0, 96),
+			callReport(0, 10735, 383, 10240, 0, 112),
+			callReport(0, 10938, 301, 10496, 0, 141),
+			callReport(0, 11202, 248, 10752, 0, 202),
+			callReport(0, 11363, 530, 10752, 0, 81),
+			callReport(0, 11512, 165, 11264, 0, 83),
+			callReport(0, 11556, 274, 11264, 0, 18),
+			callReport(0, 11263, 686, 10240, 0, 337),
 		}},
 		"provider with a context window, steered": {"testdata/native/steer.json", []acp.SessionUsageUpdate{
-			{Size: 1000000, Used: 10703}, {Size: 1000000, Used: 10970}, {Size: 1000000, Used: 11183}, {Size: 1000000, Used: 11302},
+			callReport(1000000, 10703, 3130, 7424, 0, 149),
+			callReport(1000000, 10970, 248, 10496, 0, 226),
+			callReport(1000000, 11183, 492, 10496, 0, 195),
+			callReport(1000000, 11302, 465, 10752, 0, 85),
 		}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -463,7 +473,10 @@ func TestAgentOriginUsageFollowsEachResponse(t *testing.T) {
 	}
 }
 
-func TestContextTokens(t *testing.T) {
+// TestCallTokens proves one call's native tokens give the context it left
+// occupied and its breakdown: opencode's input is already uncached, and its
+// reasoning joins the output. A call without any token is unknown.
+func TestCallTokens(t *testing.T) {
 	t.Parallel()
 
 	tokens := func(input, output, reasoning, read, write float64) opencode.NativeTokens {
@@ -474,21 +487,25 @@ func TestContextTokens(t *testing.T) {
 	}
 
 	for name, tc := range map[string]struct {
-		tokens opencode.NativeTokens
-		want   int
-		ok     bool
+		tokens                     opencode.NativeTokens
+		used                       int
+		input, read, write, output int
+		known                      bool
 	}{
-		"every component":              {tokens(1, 2, 3, 4, 5), 15, true},
-		"cache reads, no cache writes": {tokens(3041, 72, 24, 7424, 0), 10561, true},
-		"no cache reported":            {tokens(9524, 57, 17, 0, 0), 9598, true},
-		"no usage":                     {opencode.NativeTokens{}, 0, false},
+		"every component":              {tokens(1, 2, 3, 4, 5), 15, 1, 4, 5, 5, true},
+		"cache reads, no cache writes": {tokens(3041, 72, 24, 7424, 0), 10561, 3041, 7424, 0, 96, true},
+		"no cache reported":            {tokens(9524, 57, 17, 0, 0), 9598, 9524, 0, 0, 74, true},
+		"reasoning only":               {tokens(0, 0, 7, 0, 0), 7, 0, 0, 0, 7, true},
+		"replayed from a cache":        {opencode.NativeTokens{}, 0, 0, 0, 0, 0, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			used, ok := contextTokens(tc.tokens)
-			require.Equal(t, tc.want, used)
-			require.Equal(t, tc.ok, ok)
+			require.Equal(t, tc.used, contextTokens(tc.tokens))
+
+			call := callUsage(tc.tokens)
+			require.Equal(t, wire.CallUsage{InputTokens: &tc.input, CachedReadTokens: &tc.read, CachedWriteTokens: &tc.write, OutputTokens: &tc.output}, call)
+			require.Equal(t, tc.known, call.Known())
 		})
 	}
 }

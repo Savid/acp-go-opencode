@@ -913,8 +913,39 @@ func TestUsageRecoversUndeliveredResponses(t *testing.T) {
 	resp, err := h.prompt(session.SessionId, "LAGGED", nil)
 	require.NoError(t, err)
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: fakeContextWindow, Used: 1120},
-		{Size: fakeContextWindow, Used: 1200},
+		callReport(fakeContextWindow, 1120, 100, 1000, 0, 20),
+		callReport(fakeContextWindow, 1200, 50, 1120, 0, 30),
 	}, usageUpdates(h.rec.snapshot()))
 	require.Equal(t, 2320, resp.Usage.TotalTokens)
+}
+
+// TestUsageIgnoresReplayedResponses proves a call reported without any token,
+// as a gateway answering from its response cache reports it, emits nothing
+// and counts toward nothing, whether the stream delivers it or settlement
+// recovers it from native history. The real call before it keeps the last
+// figure.
+func TestUsageIgnoresReplayedResponses(t *testing.T) {
+	t.Parallel()
+
+	for _, script := range []string{"REPLAY", "LAGGEDREPLAY"} {
+		t.Run(script, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.initialize()
+			session := h.newSession()
+
+			resp, err := h.prompt(session.SessionId, script, nil)
+			require.NoError(t, err)
+			require.Equal(t, []acp.SessionUsageUpdate{
+				callReport(fakeContextWindow, 1175, 100, 1000, 50, 25),
+			}, usageUpdates(h.rec.snapshot()))
+			require.Equal(t, 100, resp.Usage.InputTokens)
+			require.Equal(t, 20, resp.Usage.OutputTokens)
+			require.Equal(t, 1000, *resp.Usage.CachedReadTokens)
+			require.Equal(t, 50, *resp.Usage.CachedWriteTokens)
+			require.Equal(t, 5, *resp.Usage.ThoughtTokens)
+			require.Equal(t, 1175, resp.Usage.TotalTokens)
+		})
+	}
 }

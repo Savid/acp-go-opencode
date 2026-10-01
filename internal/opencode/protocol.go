@@ -99,8 +99,9 @@ func (p *NativePart) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// NativeTokens is one model call's usage. Input excludes the cached prompt,
-// which Cache counts, and Output excludes Reasoning.
+// NativeTokens is one model call's usage. Input excludes the tokens read
+// from and written to the prompt cache, which Cache counts, and Output
+// excludes Reasoning.
 type NativeTokens struct {
 	Input     float64 `json:"input"`
 	Output    float64 `json:"output"`

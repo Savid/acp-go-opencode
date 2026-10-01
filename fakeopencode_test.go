@@ -226,6 +226,14 @@ func (f *fakeOpenCode) earlierCalls(id, text string, model opencode.NativeMessag
 		f.call(model, parent, false, fakeTokens(100, 1000, 20))
 
 		return parent, fakeTokens(50, 1120, 30)
+	case "REPLAY", "LAGGEDREPLAY":
+		// A real call, then one a gateway answers from its response cache,
+		// which reports no token at all.
+		tokens := fakeTokens(100, 1000, 20)
+		tokens.Cache.Write, tokens.Reasoning = 50, 5
+		f.call(model, parent, false, tokens)
+
+		return parent, opencode.NativeTokens{}
 	case "FLAKY":
 		return parent, fakeTokens(100, 1000, 20)
 	}
@@ -243,11 +251,12 @@ func (f *fakeOpenCode) startCall(info opencode.NativeMessageInfo, text string) {
 	}
 }
 
-// finishCall stores the final call's step-finish. LAGGED stores it before
-// the prompt answers without its event reaching the stream yet.
+// finishCall stores the final call's step-finish. LAGGED and LAGGEDREPLAY
+// store it before the prompt answers without its event reaching the stream
+// yet.
 func (f *fakeOpenCode) finishCall(info opencode.NativeMessageInfo, tokens opencode.NativeTokens, text string) {
 	finish := opencode.NativePart{ID: opencode.NewID("prt_"), SessionID: info.SessionID, MessageID: info.ID, Type: partStepFinish, Tokens: tokens}
-	if text == "LAGGED" {
+	if text == "LAGGED" || text == "LAGGEDREPLAY" {
 		f.record(info.SessionID, "message.part.updated", map[string]any{"part": finish, "time": time.Now().UnixMilli()})
 
 		return
