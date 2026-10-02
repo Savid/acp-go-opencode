@@ -24,9 +24,9 @@ go install github.com/savid/acp-go-opencode/cmd/acp-go-opencode@latest
 acp-go-opencode [-path opencode] [-home DIR] [-scratch-dir DIR] [-model provider/id] [-seed-file rel=host]... [-debug]
 ```
 
-Verified against OpenCode 1.18.31. A bare `-path` is resolved on the inherited
-PATH. `-home` maps `DIR/data`, `DIR/config`, `DIR/cache`, and `DIR/state` to the
-four XDG home variables; omit it to use native home resolution. Native CLI
+A bare `-path` is resolved on the inherited PATH. `-home` maps `DIR/data`,
+`DIR/config`, `DIR/cache`, and `DIR/state` to the four XDG home variables; omit
+it to use native home resolution. Native CLI
 continuation uses those same variables when a home was supplied.
 `-seed-file` writes a relative file inside OpenCode's configuration directory.
 `-scratch-dir` holds the temporary environment plugin. `-version` prints the
