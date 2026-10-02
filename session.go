@@ -229,7 +229,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 
 				messages, err := rt.client.Messages(ctx, s.cwd, s.nativeID)
 				if err != nil {
-					s.recordFailure(&t.cycle, err)
+					s.recordFailure(&t.cycle, s.transportFailure(ctx, rt, err))
 				} else {
 					for index := range messages {
 						message := &messages[index]

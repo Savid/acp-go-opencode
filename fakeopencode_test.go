@@ -481,6 +481,14 @@ func (f *fakeOpenCode) events(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+func fakePromptError(text string) *opencode.NativeError {
+	if text == "ERROR" {
+		return &opencode.NativeError{Name: "APIError", Message: "provider refused"}
+	}
+
+	return nil
+}
+
 func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 	id := strings.Split(strings.Trim(r.URL.Path, "/"), "/")[1]
 	var request opencode.MessageRequest
@@ -602,6 +610,7 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 		output = string(data)
 	}
 	info.Time.Completed = time.Now().UnixMilli()
+	info.Error = fakePromptError(text.String())
 	if request.Format != nil {
 		info.Structured = json.RawMessage(`{"answer":"ok"}`)
 	}
@@ -625,6 +634,7 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 		// The native store lost this session's history, so the turn's mirror
 		// commit has no complete snapshot to replace with.
 		f.rows = nil
+		delete(f.sessions, id)
 		f.save()
 	}
 	f.publish("session.status", map[string]any{"sessionID": id, "status": map[string]string{"type": "idle"}})
