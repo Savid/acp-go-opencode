@@ -1,0 +1,3474 @@
+[
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_0",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_0",
+          "role": "user",
+          "sessionID": "fixture-session",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          }
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_1",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "text",
+          "text": "Use the read tool to read notes.txt, then use the bash tool to run: ls. Then reply with the single word done.",
+          "messageID": "msg_fixture_0",
+          "sessionID": "fixture-session",
+          "id": "prt_fixture_0"
+        },
+        "time": 1790826861485
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_2",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_3",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_1",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826861492
+          },
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_4",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "id": "msg_fixture_0",
+          "sessionID": "fixture-session",
+          "summary": {
+            "diffs": []
+          }
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_5",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_6",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_1",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826861825
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_7",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826862844
+          }
+        },
+        "time": 1790826862844
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_8",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_2",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "The user wants me to read notes.md in the current directory. Simple task, so I'll use the Read tool.",
+          "time": {
+            "start": 1790826862844,
+            "end": 1790826863506
+          }
+        },
+        "time": 1790826863506
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_9",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_3",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_0|fc_tmp_jv484yry98",
+          "state": {
+            "status": "pending",
+            "input": {},
+            "raw": ""
+          }
+        },
+        "time": 1790826863508
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_10",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_0|fc_tmp_jv484yry98",
+          "state": {
+            "status": "running",
+            "input": {
+              "filePath": "/workspace/notes.md",
+              "offset": "1",
+              "limit": "2000"
+            },
+            "time": {
+              "start": 1790826864160
+            }
+          },
+          "id": "prt_fixture_3",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_1"
+        },
+        "time": 1790826864160
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_11",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_0|fc_tmp_jv484yry98",
+          "state": {
+            "status": "error",
+            "input": {
+              "filePath": "/workspace/notes.md",
+              "offset": "1",
+              "limit": "2000"
+            },
+            "error": "The read tool was called with invalid arguments: SchemaError(Expected number | undefined, got \"1\"\n  at [\"offset\"]).\nPlease rewrite the input so it satisfies the expected schema.",
+            "time": {
+              "start": 1790826864160,
+              "end": 1790826864162
+            }
+          },
+          "id": "prt_fixture_3",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_1"
+        },
+        "time": 1790826864162
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_12",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_4",
+          "reason": "tool-calls",
+          "messageID": "msg_fixture_1",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 10561,
+            "input": 3041,
+            "output": 72,
+            "reasoning": 24,
+            "cache": {
+              "write": 0,
+              "read": 7424
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826864167
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_13",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_1",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 10561,
+            "input": 3041,
+            "output": 72,
+            "reasoning": 24,
+            "cache": {
+              "write": 0,
+              "read": 7424
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826861492,
+            "completed": 1790826864171
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_14",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_1",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 10561,
+            "input": 3041,
+            "output": 72,
+            "reasoning": 24,
+            "cache": {
+              "write": 0,
+              "read": 7424
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826861492,
+            "completed": 1790826864171
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_15",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_16",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_2",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826864173
+          },
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_17",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "summary": {
+            "diffs": []
+          },
+          "id": "msg_fixture_0",
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_18",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_19",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_5",
+          "messageID": "msg_fixture_2",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826864201
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_20",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_6",
+          "messageID": "msg_fixture_2",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826865055
+          }
+        },
+        "time": 1790826865055
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_21",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_6",
+          "messageID": "msg_fixture_2",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "The user said notes.txt, so I'll read notes.txt. I ended up writing notes.md \u2014 either way, it needs to be corrected. Let me read notes.txt, and after that run ls.\n",
+          "time": {
+            "start": 1790826865055,
+            "end": 1790826865995
+          }
+        },
+        "time": 1790826865996
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_22",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_7",
+          "messageID": "msg_fixture_2",
+          "sessionID": "fixture-session",
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_1|fc_tmp_hz8dhuubu2",
+          "state": {
+            "status": "pending",
+            "input": {},
+            "raw": ""
+          }
+        },
+        "time": 1790826865997
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_23",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_1|fc_tmp_hz8dhuubu2",
+          "state": {
+            "status": "running",
+            "input": {
+              "filePath": "/workspace/notes.txt",
+              "offset": "1",
+              "limit": "200"
+            },
+            "time": {
+              "start": 1790826866754
+            }
+          },
+          "id": "prt_fixture_7",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_2"
+        },
+        "time": 1790826866754
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_24",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_1|fc_tmp_hz8dhuubu2",
+          "state": {
+            "status": "error",
+            "input": {
+              "filePath": "/workspace/notes.txt",
+              "offset": "1",
+              "limit": "200"
+            },
+            "error": "The read tool was called with invalid arguments: SchemaError(Expected number | undefined, got \"1\"\n  at [\"offset\"]).\nPlease rewrite the input so it satisfies the expected schema.",
+            "time": {
+              "start": 1790826866754,
+              "end": 1790826866756
+            }
+          },
+          "id": "prt_fixture_7",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_2"
+        },
+        "time": 1790826866756
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_25",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_8",
+          "reason": "tool-calls",
+          "messageID": "msg_fixture_2",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 10735,
+            "input": 383,
+            "output": 71,
+            "reasoning": 41,
+            "cache": {
+              "write": 0,
+              "read": 10240
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826866759
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_26",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_2",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 10735,
+            "input": 383,
+            "output": 71,
+            "reasoning": 41,
+            "cache": {
+              "write": 0,
+              "read": 10240
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826864173,
+            "completed": 1790826866761
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_27",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_2",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 10735,
+            "input": 383,
+            "output": 71,
+            "reasoning": 41,
+            "cache": {
+              "write": 0,
+              "read": 10240
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826864173,
+            "completed": 1790826866761
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_28",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_29",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_3",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826866763
+          },
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_30",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "summary": {
+            "diffs": []
+          },
+          "id": "msg_fixture_0",
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_31",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_32",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_9",
+          "messageID": "msg_fixture_3",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826866782
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_33",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_10",
+          "messageID": "msg_fixture_3",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826867933
+          }
+        },
+        "time": 1790826867933
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_34",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_10",
+          "messageID": "msg_fixture_3",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "The read tool returned a schema error saying it passed \"1\" to offset, so I need to rewrite the input to pass a number instead of a string. Interestingly, when I called it normally in the previous turn, it was reported as invalid. Let me try calling it once more. This time, it might be fine to just omit offset and limit.",
+          "time": {
+            "start": 1790826867933,
+            "end": 1790826869112
+          }
+        },
+        "time": 1790826869112
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_35",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_11",
+          "messageID": "msg_fixture_3",
+          "sessionID": "fixture-session",
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_2|fc_tmp_2x2qd9d7gzr",
+          "state": {
+            "status": "pending",
+            "input": {},
+            "raw": ""
+          }
+        },
+        "time": 1790826869114
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_36",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_2|fc_tmp_2x2qd9d7gzr",
+          "state": {
+            "status": "running",
+            "input": {
+              "filePath": "/workspace/notes.txt",
+              "offset": "0",
+              "limit": "0"
+            },
+            "time": {
+              "start": 1790826869497
+            }
+          },
+          "id": "prt_fixture_11",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_3"
+        },
+        "time": 1790826869497
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_37",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_2|fc_tmp_2x2qd9d7gzr",
+          "state": {
+            "status": "error",
+            "input": {
+              "filePath": "/workspace/notes.txt",
+              "offset": "0",
+              "limit": "0"
+            },
+            "error": "The read tool was called with invalid arguments: SchemaError(Expected number | undefined, got \"0\"\n  at [\"offset\"]).\nPlease rewrite the input so it satisfies the expected schema.",
+            "time": {
+              "start": 1790826869497,
+              "end": 1790826869499
+            }
+          },
+          "id": "prt_fixture_11",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_3"
+        },
+        "time": 1790826869499
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_38",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_12",
+          "reason": "tool-calls",
+          "messageID": "msg_fixture_3",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 10938,
+            "input": 301,
+            "output": 69,
+            "reasoning": 72,
+            "cache": {
+              "write": 0,
+              "read": 10496
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826869541
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_39",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_3",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 10938,
+            "input": 301,
+            "output": 69,
+            "reasoning": 72,
+            "cache": {
+              "write": 0,
+              "read": 10496
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826866763,
+            "completed": 1790826869544
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_40",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_3",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 10938,
+            "input": 301,
+            "output": 69,
+            "reasoning": 72,
+            "cache": {
+              "write": 0,
+              "read": 10496
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826866763,
+            "completed": 1790826869544
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_41",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_42",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_4",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826869546
+          },
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_43",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "summary": {
+            "diffs": []
+          },
+          "id": "msg_fixture_0",
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_44",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_45",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_13",
+          "messageID": "msg_fixture_4",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826869568
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_46",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_14",
+          "messageID": "msg_fixture_4",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826870540
+          }
+        },
+        "time": 1790826870541
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_47",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_14",
+          "messageID": "msg_fixture_4",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "The read tool keeps failing due to a schema error \u2014 it seems to be interpreting numbers as strings. Maybe I should try omitting offset/limit entirely. But in the schema, are these required? The schema says `\"offset\": anyOf integer/null`. The error says it received \"1\" (a string) for offset. That's weird \u2014 maybe it's a serialization issue on the caller side. Let me try calling with only filePath\u2026 but required lists offset and limit. Actually, in the tool schema `\"required\": [\"filePath\", \"offset\", \"limit\"]` is specified. Hmm, but maybe I could pass null? The error was expecting `number | undefined`. A JSON null might fail as well. Let me try again without these fields and see how it goes.\n",
+          "time": {
+            "start": 1790826870540,
+            "end": 1790826873500
+          }
+        },
+        "time": 1790826873500
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_48",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_15",
+          "messageID": "msg_fixture_4",
+          "sessionID": "fixture-session",
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_3|fc_tmp_4y7lvosvmsb",
+          "state": {
+            "status": "pending",
+            "input": {},
+            "raw": ""
+          }
+        },
+        "time": 1790826873503
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_49",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_3|fc_tmp_4y7lvosvmsb",
+          "state": {
+            "status": "running",
+            "input": {
+              "filePath": "/workspace/notes.txt"
+            },
+            "time": {
+              "start": 1790826873718
+            }
+          },
+          "id": "prt_fixture_15",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_4"
+        },
+        "time": 1790826873719
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_50",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_fixture_3|fc_tmp_4y7lvosvmsb",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "/workspace/notes.txt"
+            },
+            "output": "<path>/workspace/notes.txt</path>\n<type>file</type>\n<content>\n1: hello file\n\n(End of file - total 1 lines)\n</content>",
+            "metadata": {
+              "preview": "hello file",
+              "truncated": false,
+              "loaded": [],
+              "display": {
+                "type": "file",
+                "path": "/workspace/notes.txt",
+                "text": "hello file",
+                "lineStart": 1,
+                "lineEnd": 1,
+                "totalLines": 1,
+                "truncated": false
+              }
+            },
+            "title": "workspace/notes.txt",
+            "time": {
+              "start": 1790826873718,
+              "end": 1790826873733
+            }
+          },
+          "id": "prt_fixture_15",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_4"
+        },
+        "time": 1790826873734
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_51",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_16",
+          "reason": "tool-calls",
+          "messageID": "msg_fixture_4",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 11202,
+            "input": 248,
+            "output": 45,
+            "reasoning": 157,
+            "cache": {
+              "write": 0,
+              "read": 10752
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826873768
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_52",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_4",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11202,
+            "input": 248,
+            "output": 45,
+            "reasoning": 157,
+            "cache": {
+              "write": 0,
+              "read": 10752
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826869546,
+            "completed": 1790826873774
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_53",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_4",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11202,
+            "input": 248,
+            "output": 45,
+            "reasoning": 157,
+            "cache": {
+              "write": 0,
+              "read": 10752
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826869546,
+            "completed": 1790826873774
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_54",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_55",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_5",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826873777
+          },
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_56",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "summary": {
+            "diffs": []
+          },
+          "id": "msg_fixture_0",
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_57",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_58",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_17",
+          "messageID": "msg_fixture_5",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826873834
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_59",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_18",
+          "messageID": "msg_fixture_5",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826874706
+          }
+        },
+        "time": 1790826874706
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_60",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_18",
+          "messageID": "msg_fixture_5",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "Okay, let's run ls in bash.",
+          "time": {
+            "start": 1790826874706,
+            "end": 1790826875022
+          }
+        },
+        "time": 1790826875022
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_61",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_19",
+          "messageID": "msg_fixture_5",
+          "sessionID": "fixture-session",
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fixture_4|fc_tmp_oj2ktahbvmp",
+          "state": {
+            "status": "pending",
+            "input": {},
+            "raw": ""
+          }
+        },
+        "time": 1790826875024
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_62",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fixture_4|fc_tmp_oj2ktahbvmp",
+          "state": {
+            "status": "running",
+            "input": {
+              "command": "ls",
+              "workdir": "/workspace",
+              "timeout": "10000"
+            },
+            "time": {
+              "start": 1790826875856
+            }
+          },
+          "id": "prt_fixture_19",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_5"
+        },
+        "time": 1790826875856
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_63",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fixture_4|fc_tmp_oj2ktahbvmp",
+          "state": {
+            "status": "error",
+            "input": {
+              "command": "ls",
+              "workdir": "/workspace",
+              "timeout": "10000"
+            },
+            "error": "The bash tool was called with invalid arguments: SchemaError(Expected number | undefined, got \"10000\"\n  at [\"timeout\"]).\nPlease rewrite the input so it satisfies the expected schema.",
+            "time": {
+              "start": 1790826875856,
+              "end": 1790826875857
+            }
+          },
+          "id": "prt_fixture_19",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_5"
+        },
+        "time": 1790826875857
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_64",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_20",
+          "reason": "tool-calls",
+          "messageID": "msg_fixture_5",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 11363,
+            "input": 530,
+            "output": 72,
+            "reasoning": 9,
+            "cache": {
+              "write": 0,
+              "read": 10752
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826875918
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_65",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_5",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11363,
+            "input": 530,
+            "output": 72,
+            "reasoning": 9,
+            "cache": {
+              "write": 0,
+              "read": 10752
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826873777,
+            "completed": 1790826875921
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_66",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_5",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11363,
+            "input": 530,
+            "output": 72,
+            "reasoning": 9,
+            "cache": {
+              "write": 0,
+              "read": 10752
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826873777,
+            "completed": 1790826875921
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_67",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_68",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_6",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826875922
+          },
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_69",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "summary": {
+            "diffs": []
+          },
+          "id": "msg_fixture_0",
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_70",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_71",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_21",
+          "messageID": "msg_fixture_6",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826875935
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_72",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_22",
+          "messageID": "msg_fixture_6",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826877385
+          }
+        },
+        "time": 1790826877385
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_73",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_22",
+          "messageID": "msg_fixture_6",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "There's a weird schema error where numbers are being passed as strings. Let me try reading and bash without the optional numeric parameters. Reading without offset/limit succeeded. For bash, timeout is optional. Let me try omitting timeout and workdir (since they're optional).",
+          "time": {
+            "start": 1790826877385,
+            "end": 1790826878851
+          }
+        },
+        "time": 1790826878851
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_74",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_23",
+          "messageID": "msg_fixture_6",
+          "sessionID": "fixture-session",
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fixture_5|fc_tmp_ys98x7xrk1m",
+          "state": {
+            "status": "pending",
+            "input": {},
+            "raw": ""
+          }
+        },
+        "time": 1790826878853
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_75",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fixture_5|fc_tmp_ys98x7xrk1m",
+          "state": {
+            "status": "running",
+            "input": {
+              "command": "ls"
+            },
+            "time": {
+              "start": 1790826878998
+            }
+          },
+          "id": "prt_fixture_23",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_6"
+        },
+        "time": 1790826878998
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_76",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fixture_5|fc_tmp_ys98x7xrk1m",
+          "state": {
+            "metadata": {
+              "output": ""
+            },
+            "status": "running",
+            "input": {
+              "command": "ls"
+            },
+            "time": {
+              "start": 1790826878998
+            }
+          },
+          "id": "prt_fixture_23",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_6"
+        },
+        "time": 1790826879041
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_77",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fixture_5|fc_tmp_ys98x7xrk1m",
+          "state": {
+            "metadata": {
+              "output": "notes.txt\n"
+            },
+            "status": "running",
+            "input": {
+              "command": "ls"
+            },
+            "time": {
+              "start": 1790826878998
+            }
+          },
+          "id": "prt_fixture_23",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_6"
+        },
+        "time": 1790826879053
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_78",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fixture_5|fc_tmp_ys98x7xrk1m",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "ls"
+            },
+            "output": "notes.txt\n",
+            "metadata": {
+              "output": "notes.txt\n",
+              "exit": 0,
+              "truncated": false
+            },
+            "title": "ls",
+            "time": {
+              "start": 1790826878998,
+              "end": 1790826879056
+            }
+          },
+          "id": "prt_fixture_23",
+          "sessionID": "fixture-session",
+          "messageID": "msg_fixture_6"
+        },
+        "time": 1790826879056
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_79",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_24",
+          "reason": "tool-calls",
+          "messageID": "msg_fixture_6",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 11512,
+            "input": 165,
+            "output": 28,
+            "reasoning": 55,
+            "cache": {
+              "write": 0,
+              "read": 11264
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826879061
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_80",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_6",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11512,
+            "input": 165,
+            "output": 28,
+            "reasoning": 55,
+            "cache": {
+              "write": 0,
+              "read": 11264
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826875922,
+            "completed": 1790826879064
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_81",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_6",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11512,
+            "input": 165,
+            "output": 28,
+            "reasoning": 55,
+            "cache": {
+              "write": 0,
+              "read": 11264
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826875922,
+            "completed": 1790826879064
+          },
+          "sessionID": "fixture-session",
+          "finish": "tool-calls"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_82",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_83",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_7",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826879066
+          },
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_84",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "summary": {
+            "diffs": []
+          },
+          "id": "msg_fixture_0",
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_85",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_86",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_25",
+          "messageID": "msg_fixture_7",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826879086
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_87",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_26",
+          "messageID": "msg_fixture_7",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826880551
+          }
+        },
+        "time": 1790826880551
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_88",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_26",
+          "messageID": "msg_fixture_7",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "Both are complete. I'll respond in one word: \"done\".\n",
+          "time": {
+            "start": 1790826880551,
+            "end": 1790826880879
+          }
+        },
+        "time": 1790826880879
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_89",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_27",
+          "messageID": "msg_fixture_7",
+          "sessionID": "fixture-session",
+          "type": "text",
+          "text": "",
+          "time": {
+            "start": 1790826880881
+          }
+        },
+        "time": 1790826880881
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_90",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_27",
+          "messageID": "msg_fixture_7",
+          "sessionID": "fixture-session",
+          "type": "text",
+          "text": "done",
+          "time": {
+            "start": 1790826880881,
+            "end": 1790826880884
+          }
+        },
+        "time": 1790826880884
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_91",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_28",
+          "reason": "stop",
+          "messageID": "msg_fixture_7",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 11556,
+            "input": 274,
+            "output": 4,
+            "reasoning": 14,
+            "cache": {
+              "write": 0,
+              "read": 11264
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826880885
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_92",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_7",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11556,
+            "input": 274,
+            "output": 4,
+            "reasoning": 14,
+            "cache": {
+              "write": 0,
+              "read": 11264
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826879066,
+            "completed": 1790826880887
+          },
+          "sessionID": "fixture-session",
+          "finish": "stop"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_93",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_7",
+          "parentID": "msg_fixture_0",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11556,
+            "input": 274,
+            "output": 4,
+            "reasoning": 14,
+            "cache": {
+              "write": 0,
+              "read": 11264
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826879066,
+            "completed": 1790826880887
+          },
+          "sessionID": "fixture-session",
+          "finish": "stop"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_94",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_95",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "idle"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_96",
+      "type": "session.idle",
+      "properties": {
+        "sessionID": "fixture-session"
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_97",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826861479
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "summary": {
+            "diffs": []
+          },
+          "id": "msg_fixture_0",
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_98",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_8",
+          "role": "user",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "sessionID": "fixture-session",
+          "agent": "build",
+          "time": {
+            "created": 1790826880897
+          }
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_99",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_29",
+          "messageID": "msg_fixture_8",
+          "sessionID": "fixture-session",
+          "type": "compaction",
+          "auto": false
+        },
+        "time": 1790826880898
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_100",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_101",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_9",
+          "role": "assistant",
+          "parentID": "msg_fixture_8",
+          "sessionID": "fixture-session",
+          "mode": "compaction",
+          "agent": "compaction",
+          "summary": true,
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "output": 0,
+            "input": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826880902
+          }
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_102",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_103",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_30",
+          "messageID": "msg_fixture_9",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826880915
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_104",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_31",
+          "messageID": "msg_fixture_9",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826881811
+          }
+        },
+        "time": 1790826881811
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_105",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_31",
+          "messageID": "msg_fixture_9",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "We need respond to user with structured summary only. Need analyze in same language as user's request? User request English. Need produce final Markdown template exactly. Need include exact paths, commands, errors maybe. Conversation: User asked use read tool to read notes.txt, then bash tool run ls, reply single word done. Assistant did. Need summarize so another coding agent continue. Important details: workdir /workspace? ls output notes.txt. Read result \"hello file\". Schema errors with numeric string params: offset/limit/timeout expected number | undefined but got string; omit optional numeric args works. Need state completed. Active none? Blocked none. Next move none? Since task done. Relevant files: notes.txt. Could mention notes.md attempted due mistake? Maybe not essential but important? Use exact file paths. Output no extra text. Ensure sections.",
+          "time": {
+            "start": 1790826881811,
+            "end": 1790826885319
+          }
+        },
+        "time": 1790826885319
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_106",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_32",
+          "messageID": "msg_fixture_9",
+          "sessionID": "fixture-session",
+          "type": "text",
+          "text": "",
+          "time": {
+            "start": 1790826885321
+          }
+        },
+        "time": 1790826885321
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_107",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_32",
+          "messageID": "msg_fixture_9",
+          "sessionID": "fixture-session",
+          "type": "text",
+          "text": "## Objective\n- Read `notes.txt` with the `read` tool, run `ls` with the `bash` tool, then reply with only `done`.\n\n## Important Details\n- Task is already completed.\n- Correct target file is `notes.txt`, not `notes.md`.\n- `read` and `bash` numeric optional parameters caused schema errors when provided as strings:\n  - `SchemaError(Expected number | undefined, got \"1\" at [\"offset\"])`\n  - `SchemaError(Expected number | undefined, got \"10000\" at [\"timeout\"])`\n- Omitting optional numeric parameters succeeded.\n\n## Work State\n### Completed\n- Read `/workspace/notes.txt`; content was `hello file`.\n- Ran `ls` in the working context; output was `notes.txt`.\n- Final assistant reply was `done`.\n\n### Active\n- (none)\n\n### Blocked\n- (none)\n\n## Next Move\n1. (none)\n2. (none)\n\n## Relevant Files\n- `/workspace/notes.txt`: required file to read; contained `hello file`.",
+          "time": {
+            "start": 1790826885321,
+            "end": 1790826889156
+          }
+        },
+        "time": 1790826889156
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_108",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_33",
+          "reason": "stop",
+          "messageID": "msg_fixture_9",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 1822,
+            "input": 1367,
+            "output": 269,
+            "reasoning": 186,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826889158
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_109",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_9",
+          "role": "assistant",
+          "parentID": "msg_fixture_8",
+          "sessionID": "fixture-session",
+          "mode": "compaction",
+          "agent": "compaction",
+          "summary": true,
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 1822,
+            "input": 1367,
+            "output": 269,
+            "reasoning": 186,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826880902,
+            "completed": 1790826889160
+          },
+          "finish": "stop"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_110",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_9",
+          "role": "assistant",
+          "parentID": "msg_fixture_8",
+          "sessionID": "fixture-session",
+          "mode": "compaction",
+          "agent": "compaction",
+          "summary": true,
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 1822,
+            "input": 1367,
+            "output": 269,
+            "reasoning": 186,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826880902,
+            "completed": 1790826889160
+          },
+          "finish": "stop"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_111",
+      "type": "session.compacted",
+      "properties": {
+        "sessionID": "fixture-session"
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_112",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_113",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "idle"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_114",
+      "type": "session.idle",
+      "properties": {
+        "sessionID": "fixture-session"
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_115",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "agent": "build",
+          "time": {
+            "created": 1790826880897
+          },
+          "id": "msg_fixture_8",
+          "sessionID": "fixture-session",
+          "summary": {
+            "diffs": []
+          }
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_116",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_10",
+          "role": "user",
+          "sessionID": "fixture-session",
+          "time": {
+            "created": 1790826891217
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          }
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_117",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "type": "text",
+          "text": "Reply with the single word: ok",
+          "messageID": "msg_fixture_10",
+          "sessionID": "fixture-session",
+          "id": "prt_fixture_34"
+        },
+        "time": 1790826891219
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_118",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_119",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_11",
+          "parentID": "msg_fixture_10",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826891222
+          },
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_120",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826891217
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "id": "msg_fixture_10",
+          "sessionID": "fixture-session",
+          "summary": {
+            "diffs": []
+          }
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_121",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_122",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_35",
+          "messageID": "msg_fixture_11",
+          "sessionID": "fixture-session",
+          "type": "step-start"
+        },
+        "time": 1790826891236
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_123",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_36",
+          "messageID": "msg_fixture_11",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1790826893643
+          }
+        },
+        "time": 1790826893643
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_124",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_36",
+          "messageID": "msg_fixture_11",
+          "sessionID": "fixture-session",
+          "type": "reasoning",
+          "text": "We need to respond to user: \"What did we do so far?...\" Wait the immediate user asked \"What did we do so far?\" The developer then gave template. We need output structured summary only. We have to include analysis in thinking. Need ensure response no tool. Need final only sections. Let's craft. We need summarize previous interaction: asked read notes.txt and run ls and reply done, completed. Include errors, exact paths, commands. No next steps.",
+          "time": {
+            "start": 1790826893643,
+            "end": 1790826896334
+          }
+        },
+        "time": 1790826896334
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_125",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_37",
+          "messageID": "msg_fixture_11",
+          "sessionID": "fixture-session",
+          "type": "text",
+          "text": "",
+          "time": {
+            "start": 1790826896335
+          }
+        },
+        "time": 1790826896335
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_126",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_37",
+          "messageID": "msg_fixture_11",
+          "sessionID": "fixture-session",
+          "type": "text",
+          "text": "## Objective\n- Read `notes.txt`, run `ls`, and reply `done`.\n\n## Important Details\n- All requested steps were completed.\n- Initial `read` and `bash` calls failed because optional numeric parameters were passed as strings:\n  - `SchemaError(Expected number | undefined, got \"1\" at [\"offset\"])`\n  - `SchemaError(Expected number | undefined, got \"300\" at [\"limit\"])`\n  - `SchemaError(Expected number | undefined, got \"10\" at [\"timeout\"])`\n- Calls succeeded after omitting optional numeric parameters.\n- `notes.txt` contained: `hello file`\n- `ls` output: `notes.txt`\n\n## Work State\n### Completed\n- Read `/workspace/notes.txt`\n- Ran `ls` in `/workspace`\n\n### Active\n- None\n\n### Blocked\n- None\n\n## Next Move\n1. No remaining task steps.\n2. Wait for a new user request.",
+          "time": {
+            "start": 1790826896335,
+            "end": 1790826899928
+          }
+        },
+        "time": 1790826899929
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_127",
+      "type": "message.part.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "part": {
+          "id": "prt_fixture_38",
+          "reason": "stop",
+          "messageID": "msg_fixture_11",
+          "sessionID": "fixture-session",
+          "type": "step-finish",
+          "tokens": {
+            "total": 11263,
+            "input": 686,
+            "output": 241,
+            "reasoning": 96,
+            "cache": {
+              "write": 0,
+              "read": 10240
+            }
+          },
+          "cost": 0
+        },
+        "time": 1790826899930
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_128",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_11",
+          "parentID": "msg_fixture_10",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11263,
+            "input": 686,
+            "output": 241,
+            "reasoning": 96,
+            "cache": {
+              "write": 0,
+              "read": 10240
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826891222,
+            "completed": 1790826899932
+          },
+          "sessionID": "fixture-session",
+          "finish": "stop"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_129",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "id": "msg_fixture_11",
+          "parentID": "msg_fixture_10",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {
+            "cwd": "/workspace",
+            "root": "/"
+          },
+          "cost": 0,
+          "tokens": {
+            "total": 11263,
+            "input": 686,
+            "output": 241,
+            "reasoning": 96,
+            "cache": {
+              "write": 0,
+              "read": 10240
+            }
+          },
+          "modelID": "openrouter/qwen/qwen3.8-flash",
+          "providerID": "omp",
+          "time": {
+            "created": 1790826891222,
+            "completed": 1790826899932
+          },
+          "sessionID": "fixture-session",
+          "finish": "stop"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_130",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "busy"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_131",
+      "type": "session.status",
+      "properties": {
+        "sessionID": "fixture-session",
+        "status": {
+          "type": "idle"
+        }
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_132",
+      "type": "session.idle",
+      "properties": {
+        "sessionID": "fixture-session"
+      }
+    }
+  },
+  {
+    "directory": "/workspace",
+    "project": "global",
+    "payload": {
+      "id": "evt_fixture_133",
+      "type": "message.updated",
+      "properties": {
+        "sessionID": "fixture-session",
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1790826891217
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "omp",
+            "modelID": "openrouter/qwen/qwen3.8-flash"
+          },
+          "summary": {
+            "diffs": []
+          },
+          "id": "msg_fixture_10",
+          "sessionID": "fixture-session"
+        }
+      }
+    }
+  }
+]

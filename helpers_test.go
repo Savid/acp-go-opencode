@@ -317,6 +317,49 @@ func agentText(updates []acp.SessionNotification) string {
 	return text.String()
 }
 
+// usageUpdates returns the recorded usage_update payloads in delivery order,
+// without the variant discriminator the wire decoding fills in, and with
+// their meta in its wire form.
+func usageUpdates(updates []acp.SessionNotification) []acp.SessionUsageUpdate {
+	var usage []acp.SessionUsageUpdate
+
+	for _, update := range updates {
+		if payload := update.Update.UsageUpdate; payload != nil {
+			usage = append(usage, acp.SessionUsageUpdate{Size: payload.Size, Used: payload.Used, Cost: payload.Cost, Meta: wireMeta(payload.Meta)})
+		}
+	}
+
+	return usage
+}
+
+// wireMeta is meta as a client decodes it.
+func wireMeta(meta map[string]any) map[string]any {
+	if meta == nil {
+		return nil
+	}
+
+	data, err := json.Marshal(meta)
+	if err != nil {
+		panic(err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		panic(err)
+	}
+
+	return decoded
+}
+
+// callReport is the usage_update reporting one call's response: the context
+// it left occupied and its breakdown of uncached input, cache reads, cache
+// writes, and output with reasoning.
+func callReport(size, used, input, read, write, output int) acp.SessionUsageUpdate {
+	call := wire.CallUsage{InputTokens: &input, CachedReadTokens: &read, CachedWriteTokens: &write, OutputTokens: &output}
+
+	return acp.SessionUsageUpdate{Size: size, Used: used, Meta: wireMeta(call.Apply(nil))}
+}
+
 // lifecycleEvents extracts the lifecycle envelopes in delivery order.
 func lifecycleEvents(updates []acp.SessionNotification) []map[string]any {
 	events := make([]map[string]any, 0)

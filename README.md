@@ -85,6 +85,11 @@ Remote URLs become resource links. `_meta.opencode.rawEvent.enabled` enables
 `_opencode/rawEvent`; image bytes are omitted from that diagnostic channel.
 Optional lifecycle negotiation supplies ordered session and turn updates.
 
+Each model call reports a `usage_update` with its token breakdown when its
+`step-finish` part arrives. Agent message and thought chunks carry no
+`messageId`, and the breakdown carries no `responseId`: OpenCode keeps none of
+the gateway's response ids, and its own message and part ids are not response ids.
+
 ### Persistence and runtime
 
 `SessionStoreFormat` is `opencode-sync-events-v1`. The main subpath holds native

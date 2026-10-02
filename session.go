@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -220,8 +221,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			if result.err != nil {
 				s.recordFailure(&t.cycle, s.dispatchFailure(ctx, rt, result.err))
 
-				var nativeErr *opencode.HTTPError
-				if !errors.As(result.err, &nativeErr) {
+				if _, ok := errors.AsType[*opencode.HTTPError](result.err); !ok {
 					end = turnTransportEnded
 				}
 			} else {
@@ -240,6 +240,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 				}
 
 				s.recordFailure(&t.cycle, s.projectMessage(ctx, &t.cycle, result.message))
+				s.recordFailure(&t.cycle, s.settleTurnHistory(ctx, t, messages))
 				s.completeParent(t.messageID)
 			}
 
@@ -255,6 +256,57 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			return
 		}
 	}
+}
+
+// settleTurnHistory reads the run a completed prompt started from native
+// history: every message after the prompt's own belongs to it, including the
+// work of a native steer or compaction. It reports the calls the event stream
+// has not delivered yet, in native order after the last one it did, and
+// completes the user messages that joined the run.
+func (s *session) settleTurnHistory(ctx context.Context, t *turn, messages []opencode.NativeMessage) error {
+	start := slices.IndexFunc(messages, func(message opencode.NativeMessage) bool { return message.Info.ID == t.messageID })
+	if start < 0 {
+		return nil
+	}
+
+	type step struct{ message, part int }
+
+	var steps []step
+
+	run := messages[start+1:]
+	for index := range run {
+		message := &run[index]
+		if message.Info.Role == roleUser {
+			s.completeParent(message.Info.ID)
+		}
+
+		for part := range message.Parts {
+			if message.Parts[part].Type == partStepFinish {
+				steps = append(steps, step{message: index, part: part})
+			}
+		}
+	}
+
+	next := 0
+
+	if t.state.lastStep != "" {
+		next = len(steps)
+
+		for index, delivered := range steps {
+			if run[delivered.message].Parts[delivered.part].ID == t.state.lastStep {
+				next = index + 1
+			}
+		}
+	}
+
+	for _, undelivered := range steps[next:] {
+		message := &run[undelivered.message]
+		if err := s.emitResponseUsage(ctx, &t.cycle, message.Parts[undelivered.part], message.Info); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // runtimeEnded ends this generation: it runs the incarnation's lifecycle tail
