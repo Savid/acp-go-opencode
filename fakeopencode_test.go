@@ -46,6 +46,11 @@ const fakeOpenCodeEnvStartHold = "ACP_GO_OPENCODE_TEST_START_HOLD"
 
 const fakeOpenCodeEnvHealthHold = "ACP_GO_OPENCODE_TEST_HEALTH_HOLD"
 
+// fakeOpenCodeEnvNativeWork names a file the fake appends one line to for
+// each server start and each request that creates, imports, or binds a native
+// session.
+const fakeOpenCodeEnvNativeWork = "ACP_GO_OPENCODE_TEST_NATIVE_WORK"
+
 type fakeOpenCode struct {
 	healthCalls atomic.Int32
 	mu          sync.Mutex
@@ -84,6 +89,7 @@ func runFakeOpenCode(args []string) int {
 	if port == "" {
 		return 2
 	}
+	recordNativeWork("start")
 	if hold := os.Getenv(fakeOpenCodeEnvStartHold); hold != "" {
 		if _, err := os.Stat(hold + ".armed"); err == nil {
 			_ = os.WriteFile(hold, []byte("held\n"), 0o600)
@@ -106,6 +112,20 @@ func runFakeOpenCode(args []string) int {
 	}
 
 	return 0
+}
+
+// recordNativeWork appends one line naming kind to the native-work file.
+func recordNativeWork(kind string) {
+	path := os.Getenv(fakeOpenCodeEnvNativeWork)
+	if path == "" {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		panic(err)
+	}
+	_, _ = file.WriteString(kind + "\n")
+	_ = file.Close()
 }
 func (f *fakeOpenCode) publish(typ string, properties any) {
 	data, _ := json.Marshal(map[string]any{"directory": "", "payload": map[string]any{"id": opencode.NewID("evt_"), "type": typ, "properties": properties}})
@@ -437,6 +457,7 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		return
 	case "/session":
+		recordNativeWork("create")
 		var session opencode.NativeSession
 		_ = json.NewDecoder(r.Body).Decode(&session)
 		session.ID = opencode.NewID("ses_")
@@ -657,6 +678,7 @@ func (f *fakeOpenCode) replay(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+	recordNativeWork("import")
 	for _, item := range body.Events {
 		event := opencode.SyncEvent{ID: item.ID, AggregateID: item.AggregateID, Sequence: item.Sequence, Type: item.Type, Data: item.Data}
 		f.rows = append(f.rows, event)
@@ -714,6 +736,7 @@ func (f *fakeOpenCode) sessionRoute(w http.ResponseWriter, r *http.Request, path
 		return
 	}
 	if len(pieces) == 2 {
+		recordNativeWork("bind")
 		if r.Method == http.MethodPatch {
 			var patch struct {
 				Metadata map[string]any `json:"metadata"`
