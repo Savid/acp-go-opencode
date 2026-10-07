@@ -151,3 +151,17 @@ optional account credits do not discard key data.
 Claude and ChatGPT subscription usage require effective OAuth credentials from
 the native runtime. The provider catalog exposes API-key routes only; plugin
 credentials are private, so subscription usage is not advertised.
+
+## Context compaction
+
+Reports summary creation as progress, summary errors as failure or
+cancellation, and the native compaction success event as completion. The
+parent compaction part identifies the automatic or manual trigger when
+present. Context counts are unavailable.
+
+Notifications carry `acp-go.dev/compaction` on the notification’s `_meta`,
+with an otherwise empty `session_info_update`. The value is `acp-go-core`
+`wire.Compaction`: a required `compactionId` and `status`, and optional
+`trigger`, `contextBefore`, and `contextAfter`. A start and its outcome share
+an ID. Unknown facts are omitted. These are live notifications; historical
+replay emits none. Usage accounting is independent.

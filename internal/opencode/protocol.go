@@ -59,6 +59,7 @@ type NativeError struct {
 }
 
 type NativePart struct {
+	Auto      *bool           `json:"auto,omitempty"`
 	ID        string          `json:"id"`
 	SessionID string          `json:"sessionID"`
 	MessageID string          `json:"messageID"`

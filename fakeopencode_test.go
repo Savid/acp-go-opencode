@@ -237,7 +237,7 @@ func (f *fakeOpenCode) earlierCalls(id, text string, model opencode.NativeMessag
 		// The context overflows, so opencode summarizes it in a call of its
 		// own and continues the run on the compacted context.
 		f.call(model, parent, false, fakeTokens(100, 1000, 20))
-		compaction := f.userMessage(id, opencode.NativePart{Type: "compaction"})
+		compaction := f.userMessage(id, opencode.NativePart{Type: "compaction", Auto: new(true)})
 		f.call(model, compaction, true, fakeTokens(1120, 0, 200))
 		f.publish("session.compacted", map[string]any{"sessionID": id})
 

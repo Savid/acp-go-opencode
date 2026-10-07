@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -98,6 +99,11 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		rt.cancel()
 
 		return
+	}
+
+	if err := s.projectCompaction(ctx, event, props); err != nil {
+		s.agent.log.WarnContext(ctx, "compaction notification failed",
+			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 	}
 
 	if info.ID != "" && s.parentCompleted(info.ID, info.ParentID) {

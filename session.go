@@ -21,6 +21,11 @@ const (
 
 // session owns one native conversation and one binding to the shared server.
 type session struct {
+	compactionTriggers    map[string]string
+	compactions           wire.Compactions
+	compactionMessage     string
+	compactionEvents      map[string]bool
+	compactionMessages    map[string]bool
 	agent                 *Agent
 	id                    acp.SessionId
 	nativeID              string
