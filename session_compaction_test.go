@@ -46,6 +46,11 @@ func TestCompactionTransport(t *testing.T) {
 		_, err := h.prompt(created.SessionId, "COMPACT", nil)
 		require.NoError(t, err)
 	}
+	// The pump may settle a prompt before the stream delivers the native
+	// compaction event that ended its compaction, so the reports are awaited.
+	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
+		return len(compactionReports(t, updates)) >= 4
+	})
 	reports := compactionReports(t, h.rec.snapshot())
 	require.Len(t, reports, 4)
 	require.NotEqual(t, reports[0].CompactionID, reports[2].CompactionID)
