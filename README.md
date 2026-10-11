@@ -93,32 +93,22 @@ the gateway's response ids, and its own message and part ids are not response id
 
 ### Persistence and runtime
 
-`SessionStoreFormat` is `opencode-sync-events-v2`. The main subpath holds native
-sync events for one conversation and its descendants. The `config` sidecar
-holds accepted options, the session title, and captured local image bytes.
-A session's title is its first prompt's first non-empty text; listing reads
-stored sessions from their `config` record alone.
+`WithSessionStore` supplies the durable store; the default is in memory. Store
+semantics, commit ordering, and restore rules are those of
+[acp-go-core's sessions and store contract](https://github.com/savid/acp-go-core/blob/master/docs/03-sessions-and-store.md).
 
-The first commit publishes the whole conversation graph. Each settled turn
-then reads the events added since the last commit with a scoped `opencode db`
-query, with the graph idle before and after the read, and appends them before
-the prompt returns. Each read selects about 8 MiB of event data, so a long
-history reads in several queries. A graph that starts running during a read is
-read again once it is idle. Events OpenCode writes after a turn reports idle,
-such as a generated title, join the next commit. A configuration change
-appends only the new configuration and reads no native history; a commit with
-neither writes nothing. A turn reads its own
-messages a page at a time from the newest, never the whole session. The
-native CLI opens its own database files.
+`SessionStoreFormat` is `opencode-sync-events-v2`. The main subpath holds the
+native sync events of one conversation and its descendants, read from
+OpenCode's database with scoped `opencode db` queries of about 8 MiB of event
+data each. The `config` record holds the session and native IDs, the listing
+title, cwd, additional directories, environment, ordered paths, model, effort,
+mode, permission, output schema, and captured local image bytes or refusals.
+`session/list` reads only the records.
 
-Load imports missing events through the native sync API, one conversation at a
-time with parents first, and replays ACP history. Resume imports without
-replay. Restore adopts the stored history and commits only newer native events
-and the configuration. Existing native history must agree at every
-shared sequence; newer native events are adopted after the stored ones, which
-stay an exact prefix of the restored history. Local image replay remains
-available after its original file is removed. The default store is in memory;
-supply a durable store to restore across adapter restarts.
+A commit reads native history with the conversation graph idle before and
+after the read, waiting up to five seconds for a running graph. A turn reads
+its own messages a page at a time from the newest. A restore imports missing
+events one conversation at a time, parents first.
 
 Close releases one session while peers retain the shared server. A server crash
 fails affected work, and the next operation starts a replacement and rebinds the
