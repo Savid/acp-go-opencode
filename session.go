@@ -55,11 +55,10 @@ type session struct {
 	commands         []opencode.NativeCommand
 	title            string
 	updatedAt        string
-	// mirror publishes the session to the store, and synced is the latest
-	// committed native sequence of each conversation in its graph. Both are
-	// guarded by mirrorMu.
-	mirror *sessionlog.Mirror
-	synced map[string]int64
+	// mirror publishes the session to the store; persisted marks a
+	// successfully committed generation.
+	mirror    *sessionlog.Mirror
+	persisted bool
 	// ephemeral marks a session the host deletes without needing it back: it
 	// is never written to the store and never listed.
 	ephemeral bool
@@ -72,7 +71,6 @@ type session struct {
 	dialogs   map[string]*dialog
 	callbacks sync.WaitGroup
 	openMu    sync.Mutex
-	mirrorMu  sync.Mutex
 	lcMu      sync.Mutex
 	lc        lifecycle.Publisher
 }
@@ -179,7 +177,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 		return nil, err
 	}
 
-	if _, _, err := s.hydrate(ctx, rt, stored); err != nil {
+	if _, err := s.hydrate(ctx, rt, stored); err != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
 		return nil, err
@@ -622,6 +620,7 @@ func (s *session) close(ctx context.Context) error {
 	}
 
 	s.closing = true
+	joinEstablishment := !s.persisted
 	s.closeDone = make(chan struct{})
 
 	t, rt, closingCycle := s.turn, s.binding, s.cycle
@@ -629,8 +628,6 @@ func (s *session) close(ctx context.Context) error {
 		t.cancelled = true
 	}
 	s.mu.Unlock()
-
-	joinEstablishment := !s.committed()
 
 	if t != nil {
 		t.cancelTurn()
@@ -666,7 +663,9 @@ func (s *session) close(ctx context.Context) error {
 		defer func() { <-s.gate }()
 	}
 
-	persisted := s.committed()
+	s.mu.Lock()
+	persisted := s.persisted
+	s.mu.Unlock()
 
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()

@@ -95,6 +95,12 @@ func WritePlugin(root, config string, ownsHome bool) (string, error) {
 	return string(data), err
 }
 
+// AdvancePluginGeneration makes the environment plugin forget the session
+// carriers it read, so the next shell in each session reads its carrier again.
+func AdvancePluginGeneration(root string) error {
+	return os.WriteFile(filepath.Join(root, "generation"), []byte(NewID("")), 0o600)
+}
+
 func CheckPlugin(root, directory string) error {
 	canonical, err := filepath.EvalSymlinks(directory)
 	if err != nil {

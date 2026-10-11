@@ -10,7 +10,7 @@ import (
 func TestDecodeHistory(t *testing.T) {
 	t.Parallel()
 
-	rows, err := DecodeHistory(strings.NewReader(`[
+	rows, size, err := DecodeHistory(strings.NewReader(`[
   {
     "id": "evt_0",
     "aggregate_id": "ses_a",
@@ -26,9 +26,12 @@ func TestDecodeHistory(t *testing.T) {
 		`{"aggregate_id":"ses_a","data":{"sessionID":"ses_a"},"id":"evt_1","seq":1,"type":"session.updated.1"}`,
 	}, []string{string(rows[0]), string(rows[1])}, "a row's members are in name order and its data compact")
 
-	empty, err := DecodeHistory(strings.NewReader("[]\n"))
+	require.EqualValues(t, len(`{"sessionID": "ses_a", "info": {"title": "<b> & </b>"}}`)+len(`{"sessionID":"ses_a"}`), size)
+
+	empty, size, err := DecodeHistory(strings.NewReader("[]\n"))
 	require.NoError(t, err)
 	require.Empty(t, empty)
+	require.Zero(t, size)
 
 	for name, output := range map[string]string{
 		"not an array":    `{}`,
@@ -36,7 +39,7 @@ func TestDecodeHistory(t *testing.T) {
 		"data not JSON":   `[{"id":"evt_0","aggregate_id":"ses_a","seq":0,"type":"t","data":"{nope"}]`,
 		"data not object": `[{"id":"evt_0","aggregate_id":"ses_a","seq":0,"type":"t","data":"[]"}]`,
 	} {
-		_, err := DecodeHistory(strings.NewReader(output))
+		_, _, err := DecodeHistory(strings.NewReader(output))
 		require.Error(t, err, name)
 	}
 }

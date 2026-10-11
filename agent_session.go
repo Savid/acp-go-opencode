@@ -429,7 +429,7 @@ func (a *Agent) restore(
 		return nil, nil, err
 	}
 
-	rows, synced, err := s.hydrate(ctx, rt, stored)
+	found, err := s.hydrate(ctx, rt, stored)
 	if err != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
@@ -461,17 +461,24 @@ func (a *Agent) restore(
 
 	releaseSlot()
 
-	if err := s.commitRows(ctx, rows, synced); err != nil {
+	// The store holds the stored generation, so restore commits only the
+	// native events after it and the configuration.
+	commitErr := s.mirror.Adopt(stored.rows, stored.record, sessionlog.Position(stored.position))
+	if commitErr == nil {
+		commitErr = s.commit(ctx, rt, s.restoredSource(ctx, rt, found.rows, found.next))
+	}
+
+	if commitErr != nil {
 		release()
 
 		_ = s.close(context.WithoutCancel(ctx))
 		a.detach(ctx, s)
 
-		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
+		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, sessionID, commitErr)
 	}
 
 	if replay {
-		if err := s.replay(ctx, rows); err != nil {
+		if err := s.replay(ctx, append(slices.Clip(stored.rows), found.rows...)); err != nil {
 			release()
 
 			_ = s.close(context.WithoutCancel(ctx))
@@ -620,7 +627,7 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 	listCtx, cancel := context.WithTimeout(ctx, acpcore.SessionStoreTimeout)
 	defer cancel()
 
-	listCtx, finishList := a.observe.StartSessionStore(listCtx, "list")
+	listCtx, finishList := a.observe.StartSessionStore(listCtx, observer.SessionStoreList)
 	summaries, err := a.store.ListSessions(listCtx)
 	finishList(err)
 
@@ -887,7 +894,7 @@ func (a *Agent) deletedSession(id acp.SessionId) bool {
 
 // loadRecord reads only a stored session's configuration record.
 func (a *Agent) loadRecord(ctx context.Context, id acp.SessionId) (sessionRecord, bool, error) {
-	ctx, finish := a.observe.StartSessionStore(ctx, "load_record")
+	ctx, finish := a.observe.StartSessionStore(ctx, observer.SessionStoreLoadRecord)
 
 	var record sessionRecord
 

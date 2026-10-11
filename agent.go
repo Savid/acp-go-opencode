@@ -38,7 +38,7 @@ const (
 	// SessionStoreFormat identifies the store layout this package writes: the
 	// native sync-event graph under main plus the adapter's session record
 	// under the config subpath.
-	SessionStoreFormat = "opencode-sync-events-v1"
+	SessionStoreFormat = "opencode-sync-events-v2"
 
 	vendor = "opencode"
 
@@ -64,6 +64,8 @@ type Agent struct {
 	// processEnv is the adapter's own environment, read once at construction.
 	processEnv []string
 	store      acpcore.SessionStore
+	// historyPageBytes bounds the event data one native history read selects.
+	historyPageBytes int64
 
 	mu                 sync.Mutex
 	conn               client
@@ -120,12 +122,13 @@ func NewAgent(opts ...Option) *Agent {
 			TracerProvider: options.TracerProvider,
 			Version:        options.AgentVersion,
 		}),
-		processEnv:  os.Environ(),
-		store:       store,
-		sessions:    make(map[acp.SessionId]*session),
-		deleted:     make(map[acp.SessionId]bool),
-		ephemeral:   make(map[acp.SessionId]bool),
-		clientCalls: make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
+		processEnv:       os.Environ(),
+		store:            store,
+		historyPageBytes: opencode.HistoryPageBytes,
+		sessions:         make(map[acp.SessionId]*session),
+		deleted:          make(map[acp.SessionId]bool),
+		ephemeral:        make(map[acp.SessionId]bool),
+		clientCalls:      make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
 	}
 	agent.optionErr = agent.validateOptions()
 

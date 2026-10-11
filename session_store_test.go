@@ -42,7 +42,7 @@ func decodeRows(t *testing.T, rows [][]byte) []opencode.SyncEvent {
 func replaceStored(t *testing.T, store acpcore.SessionStore, id string, rows [][]byte, record sessionRecord) {
 	t.Helper()
 
-	require.NoError(t, sessionlog.NewMirror(store, id).Commit(t.Context(), sessionlog.Rows(rows), record))
+	require.NoError(t, sessionlog.NewMirror(store, id).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil }))
 }
 
 // Native writes that land while a commit reads, as opencode keeps writing
@@ -724,6 +724,151 @@ func TestCommitsReadOnlyNewNativeHistory(t *testing.T) {
 
 	_, err = os.Stat(messageReads)
 	require.ErrorIs(t, err, os.ErrNotExist, "no turn reads every message of its session")
+
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	require.Equal(t, 5, nativeReads(t, work), "close reads the events since the last commit")
+	require.EqualValues(t, 4, store.appends.Load(), "a commit with no new event and the same configuration writes nothing")
+	require.EqualValues(t, 1, store.replaces.Load())
+}
+
+// A restore into a home without the session imports each conversation of the
+// graph with its own native replay, the parent before its child, and commits
+// only the configuration over the adopted history.
+func TestRestoreImportsEachConversationParentFirst(t *testing.T) {
+	t.Parallel()
+
+	store := &countingStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	first := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = first.Close() })
+	_, err := first.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	cwd := t.TempDir()
+	created, err := first.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	s, err := first.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.binding
+	s.mu.Unlock()
+	var child opencode.NativeSession
+	require.NoError(t, rt.client.Do(t.Context(), cwd, http.MethodPost, "/session", map[string]string{"parentID": s.nativeID}, &child))
+	_, err = first.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+	require.NoError(t, err)
+	require.NoError(t, first.Close())
+
+	var record sessionRecord
+	stored, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	synced, err := checkSync(stored, s.nativeID, nil)
+	require.NoError(t, err)
+	require.Contains(t, synced, child.ID, "the stored graph holds the child")
+
+	work := filepath.Join(t.TempDir(), "work")
+	second := NewAgent(testOptions(t, WithSessionStore(store), WithEnv(map[string]string{
+		fakeOpenCodeEnv: "1", fakeOpenCodeEnvNativeWork: work, "GORACE": os.Getenv("GORACE") + " atexit_sleep_ms=0",
+	}))...)
+	t.Cleanup(func() { _ = second.Close() })
+	_, err = second.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	replaces := store.replaces.Load()
+	_, err = second.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, cwd))
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(work)
+	require.NoError(t, err)
+	require.Equal(t, 2, strings.Count(string(data), "import\n"), "one replay per conversation")
+	require.Equal(t, replaces, store.replaces.Load(), "a restore never republishes the adopted history")
+
+	restored, _, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.Equal(t, stored, restored[:len(stored)], "the stored history stays a prefix")
+}
+
+// A native run that starts between a commit's read and its idle check delays
+// the commit; the finished turn still succeeds.
+func TestCommitRereadsAfterANativeRunEnds(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	work, script := filepath.Join(dir, "work"), filepath.Join(dir, "status")
+	h := newHarness(t, WithEnv(map[string]string{
+		fakeOpenCodeEnv: "1", fakeOpenCodeEnvNativeWork: work, fakeOpenCodeEnvStatusScript: script,
+		"GORACE": os.Getenv("GORACE") + " atexit_sleep_ms=0",
+	}))
+	h.initialize()
+	created := h.newSession()
+	reads := nativeReads(t, work)
+	require.NoError(t, os.WriteFile(script, []byte("idle busy"), 0o600))
+
+	_, err := h.prompt(created.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	require.Equal(t, reads+2, nativeReads(t, work), "the read the run overlapped is taken again")
+}
+
+// History reads page through a conversation larger than one page, and a
+// restore pages through the native history it compares.
+func TestHistoryReadsInPages(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	work := filepath.Join(t.TempDir(), "work")
+	env := WithEnv(map[string]string{fakeOpenCodeEnv: "1", fakeOpenCodeEnvNativeWork: work, "GORACE": os.Getenv("GORACE") + " atexit_sleep_ms=0"})
+	a := NewAgent(testOptions(t, WithSessionStore(store), env)...)
+	a.historyPageBytes = 1
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	cwd := t.TempDir()
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "MULTI"))
+	require.NoError(t, err)
+
+	var record sessionRecord
+	stored, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	_, err = checkSync(stored, string(created.SessionId), nil)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, nativeReads(t, work), len(stored), "each page holds one event")
+
+	_, err = a.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, cwd))
+	require.NoError(t, err)
+}
+
+// A configuration of a session's runtime makes the environment plugin read
+// carriers again.
+func TestConfigurationAdvancesPluginGeneration(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	cwd := t.TempDir()
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	generation := func() string {
+		a.runtimeMu.Lock()
+		root := a.runtime.root
+		a.runtimeMu.Unlock()
+		data, readErr := os.ReadFile(filepath.Join(root, "generation"))
+		require.NoError(t, readErr)
+
+		return string(data)
+	}
+
+	before := generation()
+	require.NotEmpty(t, before)
+	option := wire.WithSessionMetaValue(map[string]any{"opencode": map[string]any{"options": map[string]any{"env": map[string]string{"CARRIER": "changed"}}}})
+	_, err = a.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, cwd, option))
+	require.NoError(t, err)
+	require.NotEqual(t, before, generation())
 }
 
 func TestCheckSync(t *testing.T) {
@@ -828,7 +973,7 @@ func BenchmarkTurnCommit(b *testing.B) {
 		turn    = 64
 	)
 
-	full, err := opencode.DecodeHistory(bytes.NewReader(syntheticHistory(root, 0, history)))
+	full, _, err := opencode.DecodeHistory(bytes.NewReader(syntheticHistory(root, 0, history)))
 	require.NoError(b, err)
 
 	s := NewAgent().newSession(sessionStart{cwd: b.TempDir()})
@@ -837,7 +982,13 @@ func BenchmarkTurnCommit(b *testing.B) {
 
 	synced, err := checkSync(full, root, nil)
 	require.NoError(b, err)
-	require.NoError(b, s.commitRows(b.Context(), full, synced))
+
+	record := func(tail sessionlog.Tail) (any, error) {
+		s.captureImages(tail.Rows)
+
+		return s.record(), nil
+	}
+	require.NoError(b, s.mirror.Commit(b.Context(), sessionlog.Rows(full), record))
 
 	output := syntheticHistory(root, history, turn)
 
@@ -845,7 +996,7 @@ func BenchmarkTurnCommit(b *testing.B) {
 	b.SetBytes(int64(len(output)))
 
 	for b.Loop() {
-		rows, err := opencode.DecodeHistory(bytes.NewReader(output))
+		rows, _, err := opencode.DecodeHistory(bytes.NewReader(output))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -854,13 +1005,11 @@ func BenchmarkTurnCommit(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		s.captureImages(rows)
-
 		// Every iteration appends the same turn, so the mirror's continuation
 		// is the only source it reads.
 		if err := s.mirror.Commit(b.Context(), func(sessionlog.Cursor) (sessionlog.Tail, error) {
 			return sessionlog.Tail{Rows: rows}, nil
-		}, s.record()); err != nil {
+		}, record); err != nil {
 			b.Fatal(err)
 		}
 	}

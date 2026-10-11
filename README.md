@@ -63,8 +63,8 @@ Pass `_meta.opencode.options` on new, load, or resume, or use
 | `outputSchema` | Nonempty JSON Schema passed through native structured output |
 
 The environment plugin reads the addressed session's metadata through OpenCode's
-API once and keeps it current from native session updates. Child sessions
-inherit that carrier through their native parent. OpenCode
+API once, and again after the adapter changes any session's carrier. Child
+sessions inherit that carrier through their native parent. OpenCode
 keeps its native authentication and configuration. Nonempty `mcpServers` and
 unknown owned options are invalid parameters.
 
@@ -93,23 +93,28 @@ the gateway's response ids, and its own message and part ids are not response id
 
 ### Persistence and runtime
 
-`SessionStoreFormat` is `opencode-sync-events-v1`. The main subpath holds native
+`SessionStoreFormat` is `opencode-sync-events-v2`. The main subpath holds native
 sync events for one conversation and its descendants. The `config` sidecar
 holds accepted options, the session title, and captured local image bytes.
 A session's title is its first prompt's first non-empty text; listing reads
 stored sessions from their `config` record alone.
 
 The first commit publishes the whole conversation graph. Each settled turn
-then runs one scoped `opencode db` query for the events added since the last
-commit, with the graph idle before and after it, and appends them before the
-prompt returns. Events OpenCode writes after a turn reports idle, such as a
-generated title, join the next commit. A configuration change appends only
-the new configuration and reads no native history. A turn reads its own
+then reads the events added since the last commit with a scoped `opencode db`
+query, with the graph idle before and after the read, and appends them before
+the prompt returns. Each read selects about 8 MiB of event data, so a long
+history reads in several queries. A graph that starts running during a read is
+read again once it is idle. Events OpenCode writes after a turn reports idle,
+such as a generated title, join the next commit. A configuration change
+appends only the new configuration and reads no native history; a commit with
+neither writes nothing. A turn reads its own
 messages a page at a time from the newest, never the whole session. The
 native CLI opens its own database files.
 
-Load imports missing events through the native sync API and replays ACP history.
-Resume imports without replay. Existing native history must agree at every
+Load imports missing events through the native sync API, one conversation at a
+time with parents first, and replays ACP history. Resume imports without
+replay. Restore adopts the stored history and commits only newer native events
+and the configuration. Existing native history must agree at every
 shared sequence; newer native events are adopted after the stored ones, which
 stay an exact prefix of the restored history. Local image replay remains
 available after its original file is removed. The default store is in memory;

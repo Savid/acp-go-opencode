@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,35 +28,48 @@ type SyncEvent struct {
 	Type        string          `json:"type"`
 }
 
-// ReadHistory reads the sync events of one conversation graph through the
-// native database command: the session id and every descendant, each from
-// after its cursor, or whole when the cursor map has no entry for it. It
-// returns each event as its encoded mirror row, ordered by sequence and id.
-// The HTTP history route exports every session in the account in one response.
-func ReadHistory(ctx context.Context, executable, scratchDir string, environment []string, id string, cursors map[string]int64) ([][]byte, error) {
+// HistoryPageBytes bounds the event data one history read selects, so a
+// long conversation reads as several bounded pages.
+const HistoryPageBytes = 8 << 20
+
+// ReadHistory reads one page of the sync events of a conversation graph
+// through the native database command: the session id and every descendant,
+// each from after its cursor, or from its start when the cursor map has no
+// entry for it. Events are ordered by sequence and id, so each conversation's
+// events in a page continue its cursor without a gap. A page holds events
+// until their data reaches pageBytes, and always at least one; more reports
+// that the page reached the bound, so later events may remain. It returns
+// each event as its encoded mirror row. The HTTP history route exports every
+// session in the account in one response.
+func ReadHistory(ctx context.Context, executable, scratchDir string, environment []string, id string, cursors map[string]int64, pageBytes int64) (rows [][]byte, more bool, err error) {
 	if cursors == nil {
 		cursors = map[string]int64{}
 	}
 
 	encoded, err := json.Marshal(cursors)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
 	query := `WITH RECURSIVE wanted(id) AS (
  VALUES (` + quote(id) + `)
  UNION SELECT session.id FROM session JOIN wanted ON session.parent_id = wanted.id
-), cursors AS (SELECT key, value FROM json_each(` + quote(string(encoded)) + `))
-SELECT event.id, event.aggregate_id, event.seq, event.type, event.data
-FROM event JOIN wanted ON event.aggregate_id = wanted.id
-LEFT JOIN cursors ON cursors.key = event.aggregate_id
-WHERE event.seq > COALESCE(cursors.value, -1)
-ORDER BY event.seq, event.id`
+), cursors AS (SELECT key, value FROM json_each(` + quote(string(encoded)) + `)
+), selected AS (
+ SELECT event.id, event.aggregate_id, event.seq, event.type, event.data,
+  SUM(length(event.data)) OVER (ORDER BY event.seq, event.id ROWS UNBOUNDED PRECEDING) - length(event.data) AS before
+ FROM event JOIN wanted ON event.aggregate_id = wanted.id
+ LEFT JOIN cursors ON cursors.key = event.aggregate_id
+ WHERE event.seq > COALESCE(cursors.value, -1)
+)
+SELECT id, aggregate_id, seq, type, data FROM selected
+WHERE before < ` + strconv.FormatInt(pageBytes, 10) + `
+ORDER BY seq, id`
 
 	output, err := os.CreateTemp(scratchDir, "acp-go-opencode-history-*.json")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() {
 		_ = output.Close()
@@ -71,7 +85,7 @@ ORDER BY event.seq, event.id`
 		Stdout:     output,
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	defer func() {
@@ -95,43 +109,49 @@ ORDER BY event.seq, event.id`
 
 	result, err := proc.Wait(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if result.ExitCode != 0 {
-		return nil, fmt.Errorf("opencode database query exited with status %d", result.ExitCode)
+		return nil, false, fmt.Errorf("opencode database query exited with status %d", result.ExitCode)
 	}
 
 	info, err := output.Stat()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if info.Size() > MaxBodyBytes {
-		return nil, errors.New("native session history exceeds size limit")
+		return nil, false, errors.New("native session history exceeds size limit")
 	}
 
 	// The child wrote through a duplicate of this descriptor, so the shared
 	// offset sits at the end of its output.
 	if _, err = output.Seek(0, io.SeekStart); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return DecodeHistory(bufio.NewReader(output))
+	rows, size, err := DecodeHistory(bufio.NewReader(output))
+
+	return rows, size >= pageBytes, err
 }
 
 // DecodeHistory decodes the native database command's JSON rows into mirror
-// rows one row at a time. The database keeps each event's data as JSON text.
+// rows one row at a time and returns the bytes of event data they held. The
+// database keeps each event's data as JSON text.
 //
 //nolint:tagliatelle // The native event table names its aggregate column aggregate_id.
-func DecodeHistory(reader io.Reader) ([][]byte, error) {
+func DecodeHistory(reader io.Reader) ([][]byte, int64, error) {
 	decoder := json.NewDecoder(reader)
 
 	if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
-		return nil, errors.New("native history is not a row array")
+		return nil, 0, errors.New("native history is not a row array")
 	}
 
-	var rows [][]byte
+	var (
+		rows [][]byte
+		size int64
+	)
 
 	for decoder.More() {
 		var row struct {
@@ -142,25 +162,26 @@ func DecodeHistory(reader io.Reader) ([][]byte, error) {
 			Data        string `json:"data"`
 		}
 		if err := decoder.Decode(&row); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		data := strings.TrimSpace(row.Data)
 		if !strings.HasPrefix(data, "{") {
-			return nil, errors.New("native sync event data is not an object")
+			return nil, 0, errors.New("native sync event data is not an object")
 		}
 
 		encoded, err := json.Marshal(SyncEvent{ID: row.ID, AggregateID: row.AggregateID, Sequence: row.Sequence, Type: row.Type, Data: json.RawMessage(data)})
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		rows = append(rows, encoded)
+		size += int64(len(row.Data))
 	}
 
 	if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
-		return nil, errors.New("native history row array is incomplete")
+		return nil, 0, errors.New("native history row array is incomplete")
 	}
 
-	return rows, nil
+	return rows, size, nil
 }

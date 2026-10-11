@@ -823,6 +823,7 @@ func TestCloseCommitsAnAgentCycleBeforeTerminalizing(t *testing.T) {
 			require.NotNil(t, s.cycle)
 			s.mu.Unlock()
 
+			addNativeRow(t, s, rt)
 			store.fail.Store(failCommit)
 			closeErr := s.close(t.Context())
 

@@ -1,6 +1,6 @@
-import { mkdirSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { createHash } from "node:crypto"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 const proofRoot = __PROOF_ROOT__
 const ownedKeys = __OWNED_KEYS__
@@ -9,24 +9,24 @@ const carrierKey = "acp-go-opencode"
 export const SessionEnvironment = async ({ client, directory }) => {
   mkdirSync(proofRoot, { recursive: true, mode: 0o700 })
   writeFileSync(join(proofRoot, createHash("sha256").update(directory).digest("hex")), directory, { mode: 0o600 })
-  // Sessions this instance has looked up: their immutable parent and current
-  // carrier. Session updates refresh an entry and deletion drops it, so a
-  // shell spawn reads the native API only for a session it has not seen.
+  // Sessions this instance has looked up: their parent and carrier. The
+  // adapter rewrites the generation file after it changes any carrier, and a
+  // changed generation drops every entry, so a shell spawn reads the native
+  // API only for a session it has not seen since.
+  const root = dirname(proofRoot)
   const sessions = new Map()
-  const remember = (info) => {
-    const entry = { parentID: info.parentID, carrier: info.metadata?.[carrierKey] }
-    sessions.set(info.id, entry)
-    return entry
-  }
+  let generation
   return {
-    event: async ({ event }) => {
-      const info = event.properties?.info
-      if (!info?.id || !sessions.has(info.id)) return
-      if (event.type === "session.updated") remember(info)
-      else if (event.type === "session.deleted") sessions.delete(info.id)
-    },
     "shell.env": async (input, output) => {
       if (!input.sessionID) return
+      let current = ""
+      try {
+        current = readFileSync(join(root, "generation"), "utf8")
+      } catch {}
+      if (current !== generation) {
+        generation = current
+        sessions.clear()
+      }
       let id = input.sessionID
       const seen = new Set()
       let carrier
@@ -36,7 +36,8 @@ export const SessionEnvironment = async ({ client, directory }) => {
         if (!entry) {
           const response = await client.session.get({ path: { id }, query: { directory: input.cwd ?? directory } })
           if (response.error || !response.data) throw Error("session environment lookup failed")
-          entry = remember(response.data)
+          entry = { parentID: response.data.parentID, carrier: response.data.metadata?.[carrierKey] }
+          if (current === generation) sessions.set(id, entry)
         }
         carrier = entry.carrier
         if (carrier) break

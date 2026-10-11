@@ -96,6 +96,11 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expe
 		return s.startFailure(ctx, err)
 	}
 
+	// The carrier may have changed, so the plugin reads it again.
+	if err := opencode.AdvancePluginGeneration(rt.server.root); err != nil {
+		return s.startFailure(ctx, err)
+	}
+
 	s.mu.Lock()
 
 	s.model = model

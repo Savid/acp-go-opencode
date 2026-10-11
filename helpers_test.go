@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
 func TestMain(m *testing.M) {
@@ -485,4 +487,12 @@ func (w *requestWriter) cancelPrompt() error {
 	_, err = w.Writer.Write(append(data, '\n'))
 
 	return err
+}
+
+// addNativeRow writes one native event to the session's history, so its next
+// commit has an event to publish.
+func addNativeRow(t *testing.T, s *session, b *binding) {
+	t.Helper()
+
+	require.NoError(t, b.client.Do(t.Context(), s.cwd, http.MethodPatch, opencode.SessionPath(s.nativeID), map[string]any{"metadata": s.carrierMetadata(nil)}, nil))
 }

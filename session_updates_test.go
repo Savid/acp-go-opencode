@@ -126,6 +126,7 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			data = []byte(strings.ReplaceAll(string(data), "fixture-session", string(s.id)))
 			var frames []json.RawMessage
 			require.NoError(t, json.Unmarshal(data, &frames))
+			addNativeRow(t, s, rt)
 			trace.reset()
 			store.fail.Store(failCommit)
 			for _, frame := range frames {

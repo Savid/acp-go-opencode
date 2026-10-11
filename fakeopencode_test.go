@@ -370,8 +370,12 @@ func (f *fakeOpenCode) queryHistory(query string) int {
 		f.advanceHistory(marker, id)
 	}
 	recordNativeWork("db")
+	budget, err := strconv.ParseInt(regexp.MustCompile(`before < (\d+)`).FindStringSubmatch(query)[1], 10, 64)
+	if err != nil {
+		return 8
+	}
 	allowed := fakeGraph(f.rows, id)
-	rows := []map[string]any{}
+	selected := []opencode.SyncEvent{}
 	for _, event := range f.rows {
 		if !allowed[event.AggregateID] {
 			continue
@@ -379,6 +383,22 @@ func (f *fakeOpenCode) queryHistory(query string) int {
 		if seq, ok := cursors[event.AggregateID]; ok && event.Sequence <= seq {
 			continue
 		}
+		selected = append(selected, event)
+	}
+	slices.SortStableFunc(selected, func(a, b opencode.SyncEvent) int {
+		if a.Sequence != b.Sequence {
+			return int(a.Sequence - b.Sequence)
+		}
+
+		return strings.Compare(a.ID, b.ID)
+	})
+	rows := []map[string]any{}
+	before := int64(0)
+	for _, event := range selected {
+		if before >= budget {
+			break
+		}
+		before += int64(len(event.Data))
 		rows = append(rows, map[string]any{"id": event.ID, "aggregate_id": event.AggregateID, "seq": event.Sequence, "type": event.Type, "data": string(event.Data)})
 	}
 	if json.NewEncoder(os.Stdout).Encode(rows) != nil {
@@ -395,6 +415,45 @@ func (f *fakeOpenCode) messages(id string) []opencode.NativeMessage {
 	}
 
 	return nativeMessages(rows, id)
+}
+
+// fakeOpenCodeEnvStatusScript names a file of space-separated words, one
+// consumed by each status read: "busy" reports every session running, any
+// other word reports the usual statuses.
+const fakeOpenCodeEnvStatusScript = "ACP_GO_OPENCODE_TEST_STATUS_SCRIPT"
+
+// statuses lists the sessions that are not idle.
+func (f *fakeOpenCode) statuses() map[string]any {
+	statuses := map[string]any{}
+	for id := range f.pending {
+		statuses[id] = map[string]string{"type": "busy"}
+	}
+	if f.scriptedBusy() {
+		for id := range f.sessions {
+			statuses[id] = map[string]string{"type": "busy"}
+		}
+	}
+
+	return statuses
+}
+
+// scriptedBusy consumes the next word of the status script.
+func (f *fakeOpenCode) scriptedBusy() bool {
+	path := os.Getenv(fakeOpenCodeEnvStatusScript)
+	if path == "" {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	words := strings.Fields(string(data))
+	if len(words) == 0 {
+		return false
+	}
+	_ = os.WriteFile(path, []byte(strings.Join(words[1:], " ")), 0o600)
+
+	return words[0] == "busy"
 }
 
 // fakeOpenCodeEnvMessageReads names a file the fake appends one line to for
@@ -535,11 +594,7 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		return
 	case "/session/status":
-		statuses := map[string]any{}
-		for id := range f.pending {
-			statuses[id] = map[string]string{"type": "busy"}
-		}
-		fakeWrite(w, statuses)
+		fakeWrite(w, f.statuses())
 
 		return
 	case "/sync/replay":
@@ -767,6 +822,17 @@ func (f *fakeOpenCode) replay(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
 
 		return
+	}
+	// The native replay route takes one conversation's contiguous events, and
+	// a child conversation joins through a parent that already exists.
+	for index, item := range body.Events {
+		info := fakeSessionInfo(opencode.SyncEvent{Type: item.Type, Data: item.Data})
+		_, parent := f.sessions[info.ParentID]
+		if item.AggregateID != body.Events[0].AggregateID || item.Sequence != body.Events[0].Sequence+int64(index) || info.ParentID != "" && !parent {
+			w.WriteHeader(http.StatusInternalServerError)
+
+			return
+		}
 	}
 	recordNativeWork("import")
 	for _, item := range body.Events {
