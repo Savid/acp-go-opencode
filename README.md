@@ -63,7 +63,8 @@ Pass `_meta.opencode.options` on new, load, or resume, or use
 | `outputSchema` | Nonempty JSON Schema passed through native structured output |
 
 The environment plugin reads the addressed session's metadata through OpenCode's
-API. Child sessions inherit that carrier through their native parent. OpenCode
+API once and keeps it current from native session updates. Child sessions
+inherit that carrier through their native parent. OpenCode
 keeps its native authentication and configuration. Nonempty `mcpServers` and
 unknown owned options are invalid parameters.
 
