@@ -3,7 +3,6 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -116,10 +115,12 @@ func TestStreamDecodesEachFrameOnce(t *testing.T) {
 		``,
 		`data: {"payload":{"id":"evt_4","type":"server.heartbeat","properties":{}}}`,
 		``,
+		`data: {"directory":"/w","payload":{"id":"evt_5","properties":{}}}`,
+		``,
 	}, "\n")
 
 	stream := &Stream{Events: make(chan Event, EventCapacity)}
-	require.ErrorIs(t, stream.read(t.Context(), strings.NewReader(frames)), io.EOF)
+	require.EqualError(t, stream.read(t.Context(), strings.NewReader(frames)), "native event type missing", "a frame without an event type ends the stream")
 	close(stream.Events)
 
 	var got []Event

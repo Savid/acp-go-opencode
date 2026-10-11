@@ -298,7 +298,7 @@ const syncEventType = "sync"
 
 // read dispatches each server-sent event frame. A frame's data is the global
 // envelope, decoded once; the sync copy of a durable event is skipped without
-// decoding its body.
+// decoding its body, and a frame without an event type ends the stream.
 func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 	lines := wire.NewLineReader(reader, MaxBodyBytes)
 
@@ -317,7 +317,11 @@ func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 		}
 
 		event := frame.Payload
-		if event.Type == "" || event.Type == syncEventType {
+
+		switch event.Type {
+		case "":
+			return errors.New("native event type missing")
+		case syncEventType:
 			return nil
 		}
 
