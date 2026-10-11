@@ -38,11 +38,22 @@ type sessionRecord struct {
 	Artifacts             map[string]imageArtifact `json:"artifacts,omitempty"`
 }
 
-func (s *session) record() sessionRecord {
+func (s *session) record() sessionRecord { return s.recordWith(nil) }
+
+// recordWith is the session's configuration with captured artifacts recorded
+// in a copy of its artifacts, leaving the session's own unchanged.
+func (s *session) recordWith(captured []capturedImage) sessionRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Title: s.title, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, OutputSchema: wire.CloneMap(s.options.OutputSchema), Artifacts: cloneArtifacts(s.artifacts)}
+	artifacts := cloneArtifacts(s.artifacts)
+	order := slices.Clone(s.artifactOrder)
+
+	for _, image := range captured {
+		order = keepArtifact(artifacts, order, image.id, image.artifact)
+	}
+
+	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Title: s.title, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, OutputSchema: wire.CloneMap(s.options.OutputSchema), Artifacts: artifacts}
 }
 
 func (r sessionRecord) validate(id string) error {
@@ -143,14 +154,18 @@ func (s *session) commit(ctx context.Context, b *binding, source sessionlog.Sour
 		return errors.New("session has no native binding")
 	}
 
-	var committed sessionlog.Tail
+	// Commit may read and encode more than once; only the last read is the
+	// one it commits, so its captured images are recorded after it succeeds.
+	var (
+		committed sessionlog.Tail
+		captured  []capturedImage
+	)
 
 	ctx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
 	err := s.mirror.Commit(ctx, source, func(tail sessionlog.Tail) (any, error) {
-		committed = tail
-		s.captureImages(tail.Rows)
+		committed, captured = tail, s.captureImages(tail.Rows)
 
-		return s.record(), nil
+		return s.recordWith(captured), nil
 	})
 	finish(err)
 
@@ -159,6 +174,10 @@ func (s *session) commit(ctx context.Context, b *binding, source sessionlog.Sour
 	}
 
 	s.mu.Lock()
+	for _, image := range captured {
+		s.keepArtifact(image.id, image.artifact)
+	}
+
 	s.persisted = true
 	s.mu.Unlock()
 
@@ -194,16 +213,14 @@ func (s *session) nativeSource(ctx context.Context, b *binding, configOnly bool)
 	}
 }
 
-// restoredSource continues the adopted stored history with the native events
-// restore found after it, then reads native history as nativeSource does.
+// restoredSource continues the adopted stored history, the only position the
+// mirror holds during the restore's commit, with the native events restore
+// found after it, and reads the whole graph as nativeSource does.
 func (s *session) restoredSource(ctx context.Context, b *binding, rows [][]byte, next syncPosition) sessionlog.Source {
 	native := s.nativeSource(ctx, b, false)
-	pending := true
 
 	return func(from sessionlog.Cursor) (sessionlog.Tail, error) {
-		if _, continues := from.Position().(syncPosition); continues && pending {
-			pending = false
-
+		if _, continues := from.Position().(syncPosition); continues {
 			return sessionlog.Tail{Rows: rows, Next: sessionlog.Position(next)}, nil
 		}
 

@@ -39,17 +39,24 @@ func (s *session) keepArtifact(id string, artifact imageArtifact) {
 		s.artifacts = map[string]imageArtifact{}
 	}
 
-	if _, present := s.artifacts[id]; !present {
-		s.artifactOrder = append(s.artifactOrder, id)
+	s.artifactOrder = keepArtifact(s.artifacts, s.artifactOrder, id, artifact)
+}
+
+// keepArtifact records one artifact in artifacts, whose ids are in order
+// oldest first, evicts the oldest past the bounds, and returns the order.
+func keepArtifact(artifacts map[string]imageArtifact, order []string, id string, artifact imageArtifact) []string {
+	if _, present := artifacts[id]; !present {
+		order = append(order, id)
 	}
 
-	s.artifacts[id] = artifact
+	artifacts[id] = artifact
 
-	for len(s.artifactOrder) > maxArtifacts || artifactBytes(s.artifacts) > maxArtifactBytes {
-		oldest := s.artifactOrder[0]
-		s.artifactOrder = s.artifactOrder[1:]
-		delete(s.artifacts, oldest)
+	for len(order) > maxArtifacts || artifactBytes(artifacts) > maxArtifactBytes {
+		delete(artifacts, order[0])
+		order = order[1:]
 	}
+
+	return order
 }
 
 func artifactBytes(artifacts map[string]imageArtifact) int {
@@ -68,7 +75,9 @@ func cloneArtifacts(values map[string]imageArtifact) map[string]imageArtifact {
 	return result
 }
 
-func (s *session) imageBytes(file opencode.NativeAttachment) ([]byte, string, *image.OutputError) {
+// readImage reads one image through the per-image output gate, from the
+// session's captured artifact when it still names the same location.
+func (s *session) readImage(file opencode.NativeAttachment) ([]byte, string, *image.OutputError) {
 	limit := s.agent.options.ImageLimits.core().EffectiveOutputPerImage()
 	s.mu.Lock()
 	cached, ok := s.artifacts[file.ID]
@@ -131,13 +140,57 @@ func (s *session) imageBytes(file opencode.NativeAttachment) ([]byte, string, *i
 		}
 	}
 
-	if storableArtifact(file) {
-		s.mu.Lock()
-		s.keepArtifact(file.ID, imageArtifact{Data: base64.StdEncoding.EncodeToString(data), MIME: mime, Reference: imageReference(file.URL)})
-		s.mu.Unlock()
+	return data, mime, nil
+}
+
+// admittedImage is one image through the output gate: the bytes to show or
+// the refusal, and for a storable file the artifact a replay needs and
+// whether the session has yet to record it.
+type admittedImage struct {
+	data     []byte
+	mime     string
+	refusal  *image.OutputError
+	artifact imageArtifact
+	record   bool
+}
+
+// admitImage runs one image through the output gates, counting its bytes
+// against used when a tool call shares that bound. It records nothing.
+func (s *session) admitImage(file opencode.NativeAttachment, used *int64) admittedImage {
+	data, mime, refusal := s.readImage(file)
+	if refusal == nil && used != nil {
+		*used += int64(len(data))
+		if *used > s.agent.options.ImageLimits.core().EffectiveOutputPerToolCall() {
+			refusal = &image.OutputError{Reason: image.ReasonTooLarge}
+		}
 	}
 
-	return data, mime, nil
+	admitted := admittedImage{data: data, mime: mime, refusal: refusal}
+	if !storableArtifact(file) {
+		return admitted
+	}
+
+	reference := imageReference(file.URL)
+
+	s.mu.Lock()
+	cached, held := s.artifacts[file.ID]
+	s.mu.Unlock()
+
+	reason := ""
+	if refusal != nil {
+		reason = refusal.Reason
+	}
+
+	switch {
+	case held && cached.Reference == reference && cached.Refusal == reason:
+		admitted.artifact = cached
+	case refusal != nil:
+		admitted.artifact, admitted.record = imageArtifact{Refusal: reason, Reference: reference}, true
+	default:
+		admitted.artifact, admitted.record = imageArtifact{Data: base64.StdEncoding.EncodeToString(data), MIME: mime, Reference: reference}, true
+	}
+
+	return admitted
 }
 
 func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.ContentBlock {
@@ -149,39 +202,45 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 		return nil
 	}
 
-	data, mime, refusal := s.imageBytes(file)
-	if refusal == nil && used != nil {
-		*used += int64(len(data))
-		if *used > s.agent.options.ImageLimits.core().EffectiveOutputPerToolCall() {
-			refusal = &image.OutputError{Reason: image.ReasonTooLarge}
-		}
+	admitted := s.admitImage(file, used)
+	if admitted.record {
+		s.mu.Lock()
+		s.keepArtifact(file.ID, admitted.artifact)
+		s.mu.Unlock()
 	}
 
-	if refusal != nil {
-		if storableArtifact(file) {
-			s.mu.Lock()
-			s.keepArtifact(file.ID, imageArtifact{Refusal: refusal.Reason, Reference: imageReference(file.URL)})
-			s.mu.Unlock()
-		}
-
-		guidance, _ := refusal.Guidance()
+	if admitted.refusal != nil {
+		guidance, _ := admitted.refusal.Guidance()
 
 		return []acp.ContentBlock{acp.TextBlock(guidance)}
 	}
 
-	return []acp.ContentBlock{acp.ImageBlock(base64.StdEncoding.EncodeToString(data), mime)}
+	return []acp.ContentBlock{acp.ImageBlock(base64.StdEncoding.EncodeToString(admitted.data), admitted.mime)}
+}
+
+// capturedImage is an artifact a commit records once it succeeds.
+type capturedImage struct {
+	id       string
+	artifact imageArtifact
 }
 
 // captureImages admits every image the mirror cannot replay from its own rows
-// through the output gate, which stores the sidecar copy a later replay reads.
-// It reads the part updates among the rows a commit adds, since each carries
-// its whole part. Only a storable artifact is decoded: a data URL carries its
-// bytes in the mirrored row, so rastering it here would cost a decode on every
-// commit and store nothing.
-func (s *session) captureImages(rows [][]byte) {
+// through the output gate and returns the artifacts the session has yet to
+// record, which a later replay reads. It reads the part updates among the
+// rows a commit adds, since each carries its whole part, and records nothing,
+// so a commit can call it again. Only a storable artifact is decoded: a data
+// URL carries its bytes in the mirrored row, so rastering it here would cost
+// a decode on every commit and store nothing.
+func (s *session) captureImages(rows [][]byte) []capturedImage {
+	var captured []capturedImage
+
 	capture := func(file opencode.NativeAttachment, used *int64) {
-		if image.IsImageMIME(file.Mime) && storableArtifact(file) {
-			_ = s.outputFile(file, used)
+		if !image.IsImageMIME(file.Mime) || !storableArtifact(file) {
+			return
+		}
+
+		if admitted := s.admitImage(file, used); admitted.record {
+			captured = append(captured, capturedImage{id: file.ID, artifact: admitted.artifact})
 		}
 	}
 
@@ -212,6 +271,8 @@ func (s *session) captureImages(rows [][]byte) {
 			}
 		}
 	}
+
+	return captured
 }
 
 // storableArtifact reports whether an admitted image needs its own sidecar

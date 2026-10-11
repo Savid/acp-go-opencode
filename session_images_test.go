@@ -4,6 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
+	stdimage "image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +16,7 @@ import (
 	acp "github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/image"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/stretchr/testify/require"
 )
@@ -197,4 +201,35 @@ func TestKeepArtifactEvictsTheOldestPastTheBounds(t *testing.T) {
 	s.keepArtifact("large-2", imageArtifact{Data: large})
 	require.NotContains(t, s.artifacts, "large-1", "retained bytes stay under the bound")
 	require.Contains(t, s.artifacts, "large-2")
+}
+
+// A commit records the images it captured only once the store holds the
+// commit, however often it reads.
+func TestCommitRecordsCapturedImagesOnlyOnceDurable(t *testing.T) {
+	t.Parallel()
+
+	cwd := t.TempDir()
+	path := filepath.Join(cwd, "captured.png")
+	file, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, png.Encode(file, stdimage.NewRGBA(stdimage.Rect(0, 0, 2, 2))))
+	require.NoError(t, file.Close())
+
+	root := "ses_capture"
+	created := fmt.Appendf(nil, `{"aggregate_id":%q,"data":{"info":{"id":%q},"sessionID":%q},"id":"evt_0","seq":0,"type":"session.created.1"}`, root, root, root)
+	part := fmt.Appendf(nil, `{"aggregate_id":%q,"data":{"part":{"id":"prt_image","messageID":"msg","sessionID":%q,"type":"file","mime":"image/png","url":%q},"sessionID":%q},"id":"evt_1","seq":1,"type":"message.part.updated.1"}`, root, root, path, root)
+
+	store := &recoveryFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	s := NewAgent().newSession(sessionStart{cwd: cwd})
+	s.id, s.nativeID = acp.SessionId(root), root
+	s.mirror = sessionlog.NewMirror(store, root)
+
+	store.fail.Store(true)
+	require.Error(t, s.commit(t.Context(), &binding{}, sessionlog.Rows([][]byte{created, part})))
+	require.Empty(t, s.artifacts, "a failed commit records no captured image")
+
+	store.fail.Store(false)
+	require.NoError(t, s.commit(t.Context(), &binding{}, sessionlog.Rows([][]byte{created, part})))
+	require.Contains(t, s.artifacts, "prt_image")
+	require.Contains(t, storedRecord(t, store, acp.SessionId(root)).Artifacts, "prt_image")
 }

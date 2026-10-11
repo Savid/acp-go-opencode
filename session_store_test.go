@@ -984,9 +984,7 @@ func BenchmarkTurnCommit(b *testing.B) {
 	require.NoError(b, err)
 
 	record := func(tail sessionlog.Tail) (any, error) {
-		s.captureImages(tail.Rows)
-
-		return s.record(), nil
+		return s.recordWith(s.captureImages(tail.Rows)), nil
 	}
 	require.NoError(b, s.mirror.Commit(b.Context(), sessionlog.Rows(full), record))
 
