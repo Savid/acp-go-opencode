@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -134,4 +135,72 @@ func TestStreamDecodesEachFrameOnce(t *testing.T) {
 	require.JSONEq(t, `{"part":{"sessionID":"ses_a","id":"prt"}}`, string(got[0].Properties))
 	require.Equal(t, "ses_b", got[1].SessionID, "a multi-line frame joins its data lines")
 	require.Empty(t, got[2].SessionID)
+}
+
+// A turn read that stops making progress, or passes its byte or time bound,
+// fails instead of reading forever.
+func TestTurnMessagesStopsWithoutProgress(t *testing.T) {
+	t.Parallel()
+
+	page := func(w http.ResponseWriter, cursor string, messages []NativeMessage) {
+		w.Header().Set("X-Next-Cursor", cursor)
+		_ = json.NewEncoder(w).Encode(messages)
+	}
+	one := []NativeMessage{{Info: NativeMessageInfo{ID: "msg_other"}}}
+
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+		bytes   int
+		timeout time.Duration
+		err     string
+	}{
+		{
+			name:    "repeated cursor",
+			handler: func(w http.ResponseWriter, _ *http.Request) { page(w, "msg_same", one) },
+			err:     "native message cursor repeats",
+		},
+		{
+			name:    "empty page",
+			handler: func(w http.ResponseWriter, _ *http.Request) { page(w, "msg_next", nil) },
+			err:     "native message page is empty but names a next page",
+		},
+		{
+			name: "byte bound",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				page(w, "msg_"+r.URL.Query().Get("before")+"x", one)
+			},
+			bytes: 200,
+			err:   "turn messages exceed 200 bytes",
+		},
+		{
+			name: "deadline",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				<-r.Context().Done()
+			},
+			timeout: 50 * time.Millisecond,
+			err:     "context deadline exceeded",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(tc.handler)
+			t.Cleanup(server.Close)
+
+			client := NewClient()
+			client.URL = server.URL
+
+			if tc.bytes > 0 {
+				client.turnReadBytes = tc.bytes
+			}
+
+			if tc.timeout > 0 {
+				client.turnReadTimeout = tc.timeout
+			}
+
+			_, err := client.TurnMessages(t.Context(), "/work", "ses", "msg_turn")
+			require.ErrorContains(t, err, tc.err)
+		})
+	}
 }

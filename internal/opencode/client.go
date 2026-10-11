@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/savid/acp-go-core/wire"
 )
@@ -34,6 +35,9 @@ type Client struct {
 	URL      string
 	Password string
 	http     *http.Client
+	// turnReadBytes and turnReadTimeout bound one turn's message read.
+	turnReadBytes   int
+	turnReadTimeout time.Duration
 }
 
 type HTTPError struct {
@@ -49,7 +53,7 @@ func IsMissing(err error) bool {
 }
 
 func NewClient() *Client {
-	return &Client{Password: NewID(""), http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	return &Client{Password: NewID(""), turnReadBytes: MaxBodyBytes, turnReadTimeout: turnReadTimeout, http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
 func NewID(prefix string) string {
@@ -135,40 +139,40 @@ func (c *Client) request(ctx context.Context, directory, method, path string, qu
 }
 
 func (c *Client) Do(ctx context.Context, directory, method, path string, body, out any) error {
-	_, err := c.do(ctx, directory, method, path, nil, body, out)
+	_, _, err := c.do(ctx, directory, method, path, nil, body, out)
 
 	return err
 }
 
-// do performs one request and returns the response headers.
-func (c *Client) do(ctx context.Context, directory, method, path string, query url.Values, body, out any) (http.Header, error) {
+// do performs one request and returns the response headers and body size.
+func (c *Client) do(ctx context.Context, directory, method, path string, query url.Values, body, out any) (http.Header, int, error) {
 	response, err := c.request(ctx, directory, method, path, query, body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer response.Body.Close()
 
 	data, err := io.ReadAll(io.LimitReader(response.Body, MaxBodyBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	if len(data) > MaxBodyBytes {
-		return nil, errors.New("opencode response exceeds size limit")
+		return nil, 0, errors.New("opencode response exceeds size limit")
 	}
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		e := &HTTPError{Status: response.StatusCode}
 		_ = json.Unmarshal(data, &e.Native)
 
-		return nil, e
+		return nil, 0, e
 	}
 
 	if out == nil || len(data) == 0 {
-		return response.Header, nil
+		return response.Header, len(data), nil
 	}
 
-	return response.Header, json.Unmarshal(data, out)
+	return response.Header, len(data), json.Unmarshal(data, out)
 }
 
 func SessionPath(id string) string { return "/session/" + url.PathEscape(id) }
@@ -180,24 +184,39 @@ func (c *Client) Session(ctx context.Context, dir, id string) (NativeSession, er
 	return out, err
 }
 
-// turnPageSize is how many messages one page of a turn read holds.
-const turnPageSize = 32
+// turnPageSize is how many messages one page of a turn read holds, and
+// turnReadTimeout bounds a whole turn read.
+const (
+	turnPageSize    = 32
+	turnReadTimeout = time.Minute
+)
 
 // TurnMessages reads the session's messages from the user message messageID
 // onward, in native order. It pages back from the newest message until a
 // page holds messageID, so the read costs the turn rather than the whole
 // conversation; when the session has no such message it reads every message.
+// A read that stops making progress, through an empty page or a cursor it
+// already followed, fails, as does one past its byte or time bound.
 func (c *Client) TurnMessages(ctx context.Context, dir, id, messageID string) ([]NativeMessage, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.turnReadTimeout)
+	defer cancel()
+
 	query := url.Values{"limit": {strconv.Itoa(turnPageSize)}}
+	followed := map[string]bool{}
+	read := 0
 
 	var messages []NativeMessage
 
 	for {
 		page := make([]NativeMessage, 0, turnPageSize)
 
-		header, err := c.do(ctx, dir, http.MethodGet, SessionPath(id)+"/message", query, nil, &page)
+		header, size, err := c.do(ctx, dir, http.MethodGet, SessionPath(id)+"/message", query, nil, &page)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read turn messages: %w", err)
+		}
+
+		if read += size; read > c.turnReadBytes {
+			return nil, fmt.Errorf("turn messages exceed %d bytes", c.turnReadBytes)
 		}
 
 		messages = append(page, messages...)
@@ -207,9 +226,17 @@ func (c *Client) TurnMessages(ctx context.Context, dir, id, messageID string) ([
 		}
 
 		next := header.Get("X-Next-Cursor")
-		if next == "" {
+
+		switch {
+		case next == "":
 			return messages, nil
+		case len(page) == 0:
+			return nil, errors.New("native message page is empty but names a next page")
+		case followed[next]:
+			return nil, errors.New("native message cursor repeats")
 		}
+
+		followed[next] = true
 
 		query.Set("before", next)
 	}
