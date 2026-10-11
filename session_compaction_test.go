@@ -72,7 +72,7 @@ func TestCompactionSummaryOutcomes(t *testing.T) {
 		{"success", "", wire.CompactionCompleted},
 	} {
 		info := opencode.NativeMessageInfo{ID: test.id, SessionID: "root", Role: roleAssistant, Summary: json.RawMessage(`true`)}
-		event := opencode.Event{Type: eventMessageUpdated, Properties: json.RawMessage(`{"sessionID":"root"}`)}
+		event := opencode.Event{Type: eventMessageUpdated, Properties: json.RawMessage(`{"sessionID":"root"}`), SessionID: "root"}
 		require.NoError(t, s.projectCompaction(t.Context(), event, eventProperties{Info: info}))
 		require.NoError(t, s.projectCompaction(t.Context(), event, eventProperties{Info: info}))
 		if test.failure != "" {
@@ -88,7 +88,7 @@ func TestCompactionSummaryOutcomes(t *testing.T) {
 		require.Empty(t, reports[len(reports)-1].Trigger)
 		require.Equal(t, reports[len(reports)-2].CompactionID, reports[len(reports)-1].CompactionID)
 	}
-	event := opencode.Event{Type: "session.compacted", Properties: json.RawMessage(`{"sessionID":"child"}`)}
+	event := opencode.Event{Type: "session.compacted", Properties: json.RawMessage(`{"sessionID":"child"}`), SessionID: "child"}
 	require.NoError(t, s.projectCompaction(t.Context(), event, eventProperties{}))
 	require.Len(t, compactionReports(t, rec.snapshot()), 6)
 }
@@ -145,7 +145,7 @@ func TestCompactionSendFailureKeepsRuntime(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	rt := &binding{cancel: cancel}
-	s.runtime = rt
+	s.binding = rt
 	for _, id := range []string{"failed", "next"} {
 		s.handleEvent(ctx, rt, opencode.Event{ID: id, Type: "session.compacted", Properties: json.RawMessage(`{"sessionID":"root"}`)})
 	}

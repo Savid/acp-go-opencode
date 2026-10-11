@@ -81,7 +81,7 @@ func (a *Agent) ensureRuntime(ctx context.Context) (*runtime, error) {
 			return nil, wire.RuntimeUnavailable(vendor)
 		}
 
-		return nil, wire.InternalFailure(vendor, internalClassNativeStart)
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	a.runtime = rt
@@ -198,23 +198,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, fmt.Errorf("native health after %s: %w", time.Since(started).Round(time.Millisecond), healthErr)
 	}
 
-	healthDuration := time.Since(started)
-
-	var doc struct {
-		Components struct {
-			Schemas map[string]any `json:"schemas"`
-		} `json:"components"`
-	}
-	if docErr := client.Do(readyCtx, "", http.MethodGet, "/doc", nil, &doc); docErr != nil {
-		return nil, fmt.Errorf("native schema after %s: %w", time.Since(started).Round(time.Millisecond), docErr)
-	}
-
-	if doc.Components.Schemas["OutputFormatJsonSchema"] == nil {
-		return nil, errors.New("native structured output schema missing")
-	}
-
-	a.log.InfoContext(ctx, "opencode server ready",
-		slog.Duration("health_duration", healthDuration), slog.Duration("schema_duration", time.Since(started)-healthDuration))
+	a.log.InfoContext(ctx, "opencode server ready", slog.Duration("health_duration", time.Since(started)))
 
 	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
 
@@ -263,12 +247,7 @@ func (a *Agent) waitForServerHealth(ctx context.Context, client *opencode.Client
 
 		select {
 		case <-proc.Done():
-			message := "opencode server exited before it was ready"
-			if tail := proc.StderrTail(); tail != "" {
-				message += ": " + tail
-			}
-
-			return errors.New(message)
+			return process.LaunchFailure(proc, "opencode server", err)
 		case <-ctx.Done():
 			return fmt.Errorf("last health request: %v: %w", err, ctx.Err())
 		case <-ticker.C:
@@ -280,7 +259,7 @@ func (rt *runtime) pump(ctx context.Context) {
 	defer close(rt.done)
 
 	for event := range rt.stream.Events {
-		id := event.SessionID()
+		id := event.SessionID
 		if id == "" {
 			continue
 		}

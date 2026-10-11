@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
@@ -173,19 +172,17 @@ func validateOptionalModel(model string) error {
 	return opencode.ModelSelectionShapeError(model)
 }
 
+// validateConfiguredModels refuses a listed id that is not a unique,
+// provider-qualified model id.
 func validateConfiguredModels(ids []string) error {
-	seen := make(map[string]struct{}, len(ids))
+	if err := wire.ValidateConfiguredModels(ids); err != nil {
+		return err
+	}
 
 	for index, id := range ids {
-		if err := opencode.ModelSelectionShapeError(id); err != nil || id != strings.TrimSpace(id) {
+		if err := opencode.ModelSelectionShapeError(id); err != nil {
 			return fmt.Errorf("configured model %d %q is not a model id", index, id)
 		}
-
-		if _, duplicate := seen[id]; duplicate {
-			return fmt.Errorf("configured model %q is listed twice", id)
-		}
-
-		seen[id] = struct{}{}
 	}
 
 	return nil
@@ -378,11 +375,7 @@ func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) 
 		return acp.AuthenticateResponse{}, openErr
 	}
 
-	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
-		return acp.AuthenticateResponse{}, wire.ParamRefusal(refusal)
-	}
-
-	return acp.AuthenticateResponse{}, acp.NewInvalidParams(map[string]any{"methodId": params.MethodId})
+	return acp.AuthenticateResponse{}, wire.AuthenticateRefused(params)
 }
 
 // Logout exists because the SDK interface requires it.
@@ -486,7 +479,7 @@ func (a *Agent) ensureExecutable(ctx context.Context) (string, error) {
 
 	a.log.ErrorContext(ctx, "opencode executable resolution failed", slog.String("reason", err.Error()))
 
-	return "", wire.InternalFailure(vendor, internalClassNativeStart)
+	return "", wire.InternalFailure(vendor, wire.ClassNativeStart)
 }
 
 // environment builds the merge for one launch: the inherited process
@@ -505,7 +498,3 @@ func (a *Agent) environment(sessionEnv map[string]string, owned map[string]strin
 		InternalPrefix: opencode.InternalEnvPrefix,
 	}
 }
-
-// internalClassNativeStart is the opencode_internal_failure class of a native
-// opencode process that could not be started or configured for a session.
-const internalClassNativeStart = "native_start"

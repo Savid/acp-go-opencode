@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,9 +27,9 @@ const fakeOpenCodeEnv = "ACP_GO_OPENCODE_TEST_FAKE"
 
 // fakeOpenCodeEnvHistoryAdvance names a file whose content selects a row the
 // fake appends before answering a cursor read, so a test can place native
-// writes between the two reads of a snapshot. "once" updates the addressed
-// session and is consumed, "child" creates a child session and is consumed,
-// "always" updates the addressed session on every cursor read.
+// writes after a turn reports idle. "once" updates the addressed session and
+// is consumed, "child" creates a child session and is consumed, "always"
+// updates the addressed session on every cursor read.
 const fakeOpenCodeEnvHistoryAdvance = "ACP_GO_OPENCODE_TEST_HISTORY_ADVANCE"
 
 // fakeOpenCodeEnvResumeHold names a file the fake creates when a session
@@ -75,11 +76,8 @@ func runFakeOpenCode(args []string) int {
 			return 3
 		}
 		for _, event := range f.rows {
-			if strings.HasPrefix(event.Type, "session.") {
-				var s opencode.NativeSession
-				if json.Unmarshal(event.Data["info"], &s) == nil && s.ID != "" {
-					f.sessions[s.ID] = s
-				}
+			if s := fakeSessionInfo(event); s.ID != "" {
+				f.sessions[s.ID] = s
 			}
 		}
 	}
@@ -112,6 +110,45 @@ func runFakeOpenCode(args []string) int {
 	}
 
 	return 0
+}
+
+// fakeSessionInfo is the session a session event carries.
+func fakeSessionInfo(event opencode.SyncEvent) opencode.NativeSession {
+	var data struct {
+		Info opencode.NativeSession `json:"info"`
+	}
+	if !strings.HasPrefix(event.Type, "session.") || json.Unmarshal(event.Data, &data) != nil {
+		return opencode.NativeSession{}
+	}
+
+	return data.Info
+}
+
+// fakeGraph is the conversation graph rooted at id: the root and every
+// descendant its rows created.
+func fakeGraph(rows []opencode.SyncEvent, id string) map[string]bool {
+	parents := map[string]string{}
+	for _, event := range rows {
+		if info := fakeSessionInfo(event); event.Type == "session.created.1" && info.ID == event.AggregateID {
+			parents[info.ID] = info.ParentID
+		}
+	}
+	allowed := map[string]bool{}
+	if _, ok := parents[id]; !ok {
+		return allowed
+	}
+	allowed[id] = true
+	for changed := true; changed; {
+		changed = false
+		for child, parent := range parents {
+			if !allowed[child] && allowed[parent] {
+				allowed[child] = true
+				changed = true
+			}
+		}
+	}
+
+	return allowed
 }
 
 // recordNativeWork appends one line naming kind to the native-work file.
@@ -160,26 +197,40 @@ func (f *fakeOpenCode) advanceHistory(marker, id string) {
 	f.append(id, "session.updated", map[string]any{"info": session})
 }
 func (f *fakeOpenCode) append(id, typ string, data map[string]any) {
-	f.record(id, typ, data)
+	event := f.record(id, typ, data)
 	f.publish(typ, data)
+	f.publishSync(event)
+}
+
+// publishSync sends the stream's sync mirror of a durable event, which
+// carries no bus event of its own.
+func (f *fakeOpenCode) publishSync(event opencode.SyncEvent) {
+	data, _ := json.Marshal(map[string]any{"directory": "", "payload": map[string]any{"type": "sync", "syncEvent": map[string]any{"id": event.ID, "type": event.Type, "seq": event.Sequence, "aggregateID": event.AggregateID, "data": event.Data}}})
+	for ch := range f.subscribers {
+		select {
+		case ch <- data:
+		default:
+			panic("fake SSE overflow")
+		}
+	}
 }
 
 // record stores one native row without publishing it, as a row whose event
 // the stream has not delivered yet.
-func (f *fakeOpenCode) record(id, typ string, data map[string]any) {
+func (f *fakeOpenCode) record(id, typ string, data map[string]any) opencode.SyncEvent {
 	seq := int64(0)
 	for _, event := range f.rows {
 		if event.AggregateID == id {
 			seq = event.Sequence + 1
 		}
 	}
-	encoded := map[string]json.RawMessage{}
 	data["sessionID"] = id
-	for key, value := range data {
-		encoded[key], _ = json.Marshal(value)
-	}
-	f.rows = append(f.rows, opencode.SyncEvent{ID: opencode.NewID("evt_"), AggregateID: id, Sequence: seq, Type: typ + ".1", Data: encoded})
+	encoded, _ := json.Marshal(data)
+	event := opencode.SyncEvent{ID: opencode.NewID("evt_"), AggregateID: id, Sequence: seq, Type: typ + ".1", Data: encoded}
+	f.rows = append(f.rows, event)
 	f.save()
+
+	return event
 }
 
 // fakeTokens is one model call's native usage: the new input, the cached
@@ -318,7 +369,8 @@ func (f *fakeOpenCode) queryHistory(query string) int {
 	if marker := os.Getenv(fakeOpenCodeEnvHistoryAdvance); marker != "" && len(cursors) > 0 {
 		f.advanceHistory(marker, id)
 	}
-	allowed := syncGraph(f.rows, id)
+	recordNativeWork("db")
+	allowed := fakeGraph(f.rows, id)
 	rows := []map[string]any{}
 	for _, event := range f.rows {
 		if !allowed[event.AggregateID] {
@@ -327,8 +379,7 @@ func (f *fakeOpenCode) queryHistory(query string) int {
 		if seq, ok := cursors[event.AggregateID]; ok && event.Sequence <= seq {
 			continue
 		}
-		data, _ := json.Marshal(event.Data)
-		rows = append(rows, map[string]any{"id": event.ID, "aggregate_id": event.AggregateID, "seq": event.Sequence, "type": event.Type, "data": string(data)})
+		rows = append(rows, map[string]any{"id": event.ID, "aggregate_id": event.AggregateID, "seq": event.Sequence, "type": event.Type, "data": string(event.Data)})
 	}
 	if json.NewEncoder(os.Stdout).Encode(rows) != nil {
 		return 7
@@ -344,6 +395,49 @@ func (f *fakeOpenCode) messages(id string) []opencode.NativeMessage {
 	}
 
 	return nativeMessages(rows, id)
+}
+
+// fakeOpenCodeEnvMessageReads names a file the fake appends one line to for
+// each message read that asks for a whole session
+// rather than a page.
+const fakeOpenCodeEnvMessageReads = "ACP_GO_OPENCODE_TEST_MESSAGE_READS"
+
+// pageMessages answers a message read as opencode does: newest first in
+// pages of limit, chronological within a page, with the cursor of the next
+// older page in X-Next-Cursor; without a limit it answers every message.
+func (f *fakeOpenCode) pageMessages(w http.ResponseWriter, r *http.Request, id string) {
+	messages := f.messages(id)
+	query := r.URL.Query()
+	if query.Get("limit") == "" {
+		if path := os.Getenv(fakeOpenCodeEnvMessageReads); path != "" {
+			file, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+			_, _ = file.WriteString("all\n")
+			_ = file.Close()
+		}
+		fakeWrite(w, messages)
+
+		return
+	}
+	limit, err := strconv.Atoi(query.Get("limit"))
+	if err != nil || limit <= 0 {
+		w.WriteHeader(http.StatusBadRequest)
+
+		return
+	}
+	end := len(messages)
+	if before := query.Get("before"); before != "" {
+		end = slices.IndexFunc(messages, func(message opencode.NativeMessage) bool { return message.Info.ID == before })
+		if end < 0 {
+			w.WriteHeader(http.StatusBadRequest)
+
+			return
+		}
+	}
+	start := max(end-limit, 0)
+	if start > 0 {
+		w.Header().Set("X-Next-Cursor", messages[start].Info.ID)
+	}
+	fakeWrite(w, messages[start:end])
 }
 
 // noiseIfAsked writes one non-JSON line to stdout and one to stderr for the
@@ -404,10 +498,6 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fakeWrite(w, map[string]any{"healthy": true, "version": "1.18.30"})
-
-		return
-	case "/doc":
-		fakeWrite(w, map[string]any{"components": map[string]any{"schemas": map[string]any{"OutputFormatJsonSchema": map[string]any{}}}})
 
 		return
 	case "/provider/auth":
@@ -666,11 +756,11 @@ func (f *fakeOpenCode) prompt(w http.ResponseWriter, r *http.Request) {
 func (f *fakeOpenCode) replay(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Events []struct {
-			ID          string                     `json:"id"`
-			AggregateID string                     `json:"aggregateID"`
-			Sequence    int64                      `json:"seq"`
-			Type        string                     `json:"type"`
-			Data        map[string]json.RawMessage `json:"data"`
+			ID          string          `json:"id"`
+			AggregateID string          `json:"aggregateID"`
+			Sequence    int64           `json:"seq"`
+			Type        string          `json:"type"`
+			Data        json.RawMessage `json:"data"`
 		} `json:"events"`
 	}
 	if json.NewDecoder(r.Body).Decode(&body) != nil {
@@ -682,9 +772,7 @@ func (f *fakeOpenCode) replay(w http.ResponseWriter, r *http.Request) {
 	for _, item := range body.Events {
 		event := opencode.SyncEvent{ID: item.ID, AggregateID: item.AggregateID, Sequence: item.Sequence, Type: item.Type, Data: item.Data}
 		f.rows = append(f.rows, event)
-		if strings.HasPrefix(event.Type, "session.") {
-			var s opencode.NativeSession
-			_ = json.Unmarshal(event.Data["info"], &s)
+		if s := fakeSessionInfo(event); s.ID != "" {
 			f.sessions[s.ID] = s
 		}
 	}
@@ -752,7 +840,7 @@ func (f *fakeOpenCode) sessionRoute(w http.ResponseWriter, r *http.Request, path
 	}
 	switch pieces[2] {
 	case "message":
-		fakeWrite(w, f.messages(id))
+		f.pageMessages(w, r, id)
 	case "abort":
 		if pending := f.pending[id]; pending != nil {
 			close(pending)

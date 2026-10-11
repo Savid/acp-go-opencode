@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
@@ -21,11 +23,13 @@ const (
 
 // session owns one native conversation and one binding to the shared server.
 type session struct {
+	// compactionTriggers is the trigger of each compaction request message
+	// whose summary has not ended, compactionMessage the summary in progress,
+	// and compactionEvent the latest native completion event.
 	compactionTriggers    map[string]string
 	compactions           wire.Compactions
 	compactionMessage     string
-	compactionEvents      map[string]bool
-	compactionMessages    map[string]bool
+	compactionEvent       string
 	agent                 *Agent
 	id                    acp.SessionId
 	nativeID              string
@@ -35,14 +39,15 @@ type session struct {
 	rawEvents             *wire.RawEvents
 	gate                  chan struct{}
 	mu                    sync.Mutex
-	runtime               *binding
+	binding               *binding
 	model                 string
 	effort                string
 	models                opencode.Catalog
 	artifacts             map[string]imageArtifact
 	artifactOrder         []string
-	// nativeMessages is the latest native message info by id, and
-	// completedParents the user messages whose generation already ended.
+	// nativeMessages is the latest native message info by id of messages
+	// whose generation is still open, and completedParents the user messages
+	// whose generation already ended.
 	nativeMessages   map[string]opencode.NativeMessageInfo
 	completedParents map[string]bool
 	mode             string
@@ -50,8 +55,11 @@ type session struct {
 	commands         []opencode.NativeCommand
 	title            string
 	updatedAt        string
-	// persisted marks a successfully committed mirror.
-	persisted bool
+	// mirror publishes the session to the store, and synced is the latest
+	// committed native sequence of each conversation in its graph. Both are
+	// guarded by mirrorMu.
+	mirror *sessionlog.Mirror
+	synced map[string]int64
 	// ephemeral marks a session the host deletes without needing it back: it
 	// is never written to the store and never listed.
 	ephemeral bool
@@ -123,7 +131,7 @@ const (
 type turn struct {
 	cycle
 	submission lifecycle.Submission
-	runtime    *binding
+	binding    *binding
 	// cancelTurn ends the turn's own context. The session owns it, so a
 	// refused peer prompt cancelling this prompt's request context never ends
 	// a live turn.
@@ -146,7 +154,7 @@ var errDialogCancelled = errors.New("dialog cancelled by the session")
 
 func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 
 	if rt != nil && rt.alive() {
@@ -171,7 +179,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 		return nil, err
 	}
 
-	if _, err := s.hydrate(ctx, rt, stored); err != nil {
+	if _, _, err := s.hydrate(ctx, rt, stored); err != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
 		return nil, err
@@ -232,7 +240,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			} else {
 				s.acceptTurn(ctx, t)
 
-				messages, err := rt.client.Messages(ctx, s.cwd, s.nativeID)
+				messages, err := rt.client.TurnMessages(ctx, s.cwd, s.nativeID, t.messageID)
 				if err != nil {
 					s.recordFailure(&t.cycle, s.transportFailure(ctx, rt, err))
 				} else {
@@ -264,8 +272,9 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 }
 
 // settleTurnHistory reads the run a completed prompt started from native
-// history: every message after the prompt's own belongs to it, including the
-// work of a native steer or compaction. It reports the calls the event stream
+// history, which holds the prompt's own message and every later one: each
+// message after the prompt's own belongs to it, including the work of a
+// native steer or compaction. It reports the calls the event stream
 // has not delivered yet, in native order after the last one it did, and
 // completes the user messages that joined the run.
 func (s *session) settleTurnHistory(ctx context.Context, t *turn, messages []opencode.NativeMessage) error {
@@ -324,14 +333,14 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 	}
 	rt.server.mu.Unlock()
 	s.mu.Lock()
-	if s.runtime != rt {
+	if s.binding != rt {
 		s.mu.Unlock()
 
 		return
 	}
 
 	t, c, closing := s.turn, s.cycle, s.closing
-	if t != nil && t.runtime != rt {
+	if t != nil && t.binding != rt {
 		t = nil
 	}
 
@@ -343,7 +352,7 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 	if t != nil {
 		t.cancelTurn()
 		t.settle(turnTransportEnded)
-		s.clearRuntime(rt)
+		s.dropRuntime(rt)
 
 		return
 	}
@@ -363,23 +372,24 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 		s.fenceStream()
 	}
 
-	s.clearRuntime(rt)
+	s.dropRuntime(rt)
 }
 
-// clearRuntime drops the binding once its generation's lifecycle tail has run.
-func (s *session) clearRuntime(rt *binding) {
+// dropRuntime drops the binding once its generation's lifecycle tail has run.
+func (s *session) dropRuntime(rt *binding) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.runtime == rt {
-		s.runtime = nil
+	if s.binding == rt {
+		s.binding = nil
 	}
 }
 
 func (s *session) stopRuntime(_ context.Context, rt *binding) { rt.cancel(); <-rt.done }
 
 // completeParent records a user message whose generation ended, so a later
-// native event naming it opens no agent cycle.
+// native event naming it opens no agent cycle, and forgets the info of that
+// generation's messages: a late event of one finds no info and is dropped.
 func (s *session) completeParent(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -389,6 +399,10 @@ func (s *session) completeParent(id string) {
 	}
 
 	s.completedParents[id] = true
+
+	maps.DeleteFunc(s.nativeMessages, func(messageID string, info opencode.NativeMessageInfo) bool {
+		return messageID == id || info.ParentID == id
+	})
 }
 
 // parentCompleted reports whether either identity belongs to a generation that
@@ -400,10 +414,15 @@ func (s *session) parentCompleted(id string, parentID string) bool {
 	return s.completedParents[id] || s.completedParents[parentID]
 }
 
-// rememberMessage stores the latest native info for one message.
+// rememberMessage stores the latest native info for one message of an open
+// generation.
 func (s *session) rememberMessage(info opencode.NativeMessageInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.completedParents[info.ID] || s.completedParents[info.ParentID] {
+		return
+	}
 
 	if s.nativeMessages == nil {
 		s.nativeMessages = map[string]opencode.NativeMessageInfo{}
@@ -436,7 +455,7 @@ func (s *session) abort(ctx context.Context, rt *binding) {
 func (s *session) cancel(ctx context.Context) {
 	s.mu.Lock()
 	t, c := s.turn, s.cycle
-	rt := s.runtime
+	rt := s.binding
 
 	if t != nil {
 		c = &t.cycle
@@ -501,7 +520,7 @@ func (s *session) cycleCancelled(c *cycle) bool {
 
 func (s *session) registerDialog(id string, cancel context.CancelCauseFunc) (func(), bool) {
 	s.mu.Lock()
-	if s.dialogs[id] != nil || s.closing || s.runtime == nil || ((s.turn != nil && (s.turn.cancelled || s.turn.settling)) || (s.cycle != nil && (s.cycle.cancelled || s.cycle.settling))) {
+	if s.dialogs[id] != nil || s.closing || s.binding == nil || ((s.turn != nil && (s.turn.cancelled || s.turn.settling)) || (s.cycle != nil && (s.cycle.cancelled || s.cycle.settling))) {
 		s.mu.Unlock()
 		cancel(errDialogCancelled)
 
@@ -603,14 +622,15 @@ func (s *session) close(ctx context.Context) error {
 	}
 
 	s.closing = true
-	joinEstablishment := !s.persisted
 	s.closeDone = make(chan struct{})
 
-	t, rt, closingCycle := s.turn, s.runtime, s.cycle
+	t, rt, closingCycle := s.turn, s.binding, s.cycle
 	if t != nil {
 		t.cancelled = true
 	}
 	s.mu.Unlock()
+
+	joinEstablishment := !s.committed()
 
 	if t != nil {
 		t.cancelTurn()
@@ -646,9 +666,7 @@ func (s *session) close(ctx context.Context) error {
 		defer func() { <-s.gate }()
 	}
 
-	s.mu.Lock()
-	persisted := s.persisted
-	s.mu.Unlock()
+	persisted := s.committed()
 
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()

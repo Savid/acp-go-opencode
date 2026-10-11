@@ -1,13 +1,17 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,7 +24,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMirrorRetriesLateNativeHistory(t *testing.T) {
+// decodeRows decodes mirror rows into their events.
+func decodeRows(t *testing.T, rows [][]byte) []opencode.SyncEvent {
+	t.Helper()
+
+	events := make([]opencode.SyncEvent, 0, len(rows))
+	for _, row := range rows {
+		var event opencode.SyncEvent
+		require.NoError(t, json.Unmarshal(row, &event))
+		events = append(events, event)
+	}
+
+	return events
+}
+
+// replaceStored publishes rows and record as the session's whole generation.
+func replaceStored(t *testing.T, store acpcore.SessionStore, id string, rows [][]byte, record sessionRecord) {
+	t.Helper()
+
+	require.NoError(t, sessionlog.NewMirror(store, id).Commit(t.Context(), sessionlog.Rows(rows), record))
+}
+
+// Native writes that land while a commit reads, as opencode keeps writing
+// after a turn reports idle, join that commit or the next one; they never
+// fail the turn.
+func TestMirrorKeepsNativeWritesAfterIdle(t *testing.T) {
 	t.Parallel()
 
 	for _, mode := range []string{"once", "child", "always"} {
@@ -45,36 +73,29 @@ func TestMirrorRetriesLateNativeHistory(t *testing.T) {
 			require.True(t, found)
 			require.NoError(t, os.WriteFile(marker, []byte(mode), 0o600))
 
-			_, promptErr := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+			for range 2 {
+				_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+				require.NoError(t, err)
+			}
+
 			after, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
 			require.NoError(t, err)
 			require.True(t, found)
-
-			if mode == "always" {
-				data := requestErrorData(t, promptErr)
-				require.Equal(t, vendor+"_"+wire.TokenTurnFailed, data[wire.FieldError])
-				require.Equal(t, wire.CauseTransport, data[wire.FieldCause])
-				require.Equal(t, "session mirror commit failed", data[wire.FieldMessage])
-				require.Equal(t, before, after)
-
-				return
-			}
-
-			require.NoError(t, promptErr)
-			require.Greater(t, len(after), len(before))
-			events, err := decodeEvents(after, s.nativeID)
+			require.Equal(t, before, after[:len(before)], "a commit extends the stored history")
+			_, err = checkSync(after, s.nativeID, nil)
 			require.NoError(t, err)
-			wantTitle := "late history row"
-			if mode == "child" {
+
+			wantTitle, wantLate := "late history row", 1
+			switch mode {
+			case "child":
 				wantTitle = "late history child"
+			case "always":
+				wantLate = 2
 			}
+
 			late := 0
-			for _, event := range events {
-				if event.Type != "session.updated.1" && event.Type != "session.created.1" {
-					continue
-				}
-				var info opencode.NativeSession
-				require.NoError(t, json.Unmarshal(event.Data["info"], &info))
+			for _, event := range decodeRows(t, after) {
+				info := fakeSessionInfo(event)
 				if info.Title != wantTitle {
 					continue
 				}
@@ -85,7 +106,7 @@ func TestMirrorRetriesLateNativeHistory(t *testing.T) {
 				}
 				late++
 			}
-			require.Equal(t, 1, late)
+			require.Equal(t, wantLate, late)
 		})
 	}
 }
@@ -103,7 +124,7 @@ func TestMirrorRefusesWhileChildSessionRuns(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 	var child opencode.NativeSession
 	require.NoError(t, rt.client.Do(t.Context(), cwd, http.MethodPost, "/session", map[string]string{"parentID": s.nativeID}, &child))
@@ -132,10 +153,10 @@ func TestMirrorRefusesWhileChildSessionRuns(t *testing.T) {
 	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
 	require.NoError(t, err)
 	require.True(t, found)
-	events, err := decodeEvents(rows, s.nativeID)
+	_, err = checkSync(rows, s.nativeID, nil)
 	require.NoError(t, err)
 	childRows := 0
-	for _, event := range events {
+	for _, event := range decodeRows(t, rows) {
 		if event.AggregateID == child.ID {
 			childRows++
 		}
@@ -156,7 +177,7 @@ func TestMirrorIncludesDescendantsAndExcludesUnrelatedSessions(t *testing.T) {
 	s, err := a.session(t.Context(), root.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 	parent := s.nativeID
 	want := make([]string, 1, 3)
@@ -174,9 +195,9 @@ func TestMirrorIncludesDescendantsAndExcludesUnrelatedSessions(t *testing.T) {
 	rows, found, err := sessionlog.Load(t.Context(), store, string(root.SessionId), &record)
 	require.NoError(t, err)
 	require.True(t, found)
-	events, err := decodeEvents(rows, s.nativeID)
+	synced, err := checkSync(rows, s.nativeID, nil)
 	require.NoError(t, err)
-	graph := syncGraph(events, s.nativeID)
+	graph := slices.Collect(maps.Keys(synced))
 	require.Len(t, graph, len(want))
 	for _, id := range want {
 		require.Contains(t, graph, id)
@@ -250,7 +271,7 @@ func TestRestoreRefusesADamagedMirror(t *testing.T) {
 	gap := fmt.Appendf(nil, `{"id":"evt_gap","aggregate_id":%q,"seq":9999,"type":"message.updated.1","data":{"sessionID":%q}}`,
 		session.SessionId, session.SessionId)
 
-	require.NoError(t, sessionlog.Commit(t.Context(), store, string(session.SessionId), append(stored, gap), record))
+	replaceStored(t, store, string(session.SessionId), append(stored, gap), record)
 
 	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
 	require.Equal(t, vendor+"_"+wire.TokenRestoreFailed, requestErrorData(t, err)[wire.FieldError],
@@ -259,7 +280,7 @@ func TestRestoreRefusesADamagedMirror(t *testing.T) {
 	uncaptured := record
 	uncaptured.Artifacts = nil
 
-	require.NoError(t, sessionlog.Commit(t.Context(), store, string(session.SessionId), stored, uncaptured))
+	replaceStored(t, store, string(session.SessionId), stored, uncaptured)
 
 	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
 	require.Equal(t, vendor+"_"+wire.TokenRestoreFailed, requestErrorData(t, err)[wire.FieldError],
@@ -303,6 +324,14 @@ func (s *recoveryFaultStore) Replace(ctx context.Context, main acpcore.SessionKe
 	return s.SessionStore.Replace(ctx, main, replacements)
 }
 
+func (s *recoveryFaultStore) Append(ctx context.Context, main acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Load() {
+		return errors.New("injected store failure")
+	}
+
+	return s.SessionStore.Append(ctx, main, base, entries, replacements)
+}
+
 func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	t.Parallel()
 	store := acpcore.NewInMemorySessionStore()
@@ -323,7 +352,7 @@ func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	require.Equal(t, wire.NativeSessionMeta(vendor, record.NativeSessionID), created.Meta)
 	id := acp.SessionId("acp-conversation-independent-of-native-id")
 	record.SessionID = string(id)
-	require.NoError(t, sessionlog.Commit(t.Context(), store, string(id), rows, record))
+	replaceStored(t, store, string(id), rows, record)
 	require.NoError(t, store.Delete(t.Context(), acpcore.SessionKey{SessionID: string(created.SessionId)}))
 
 	before := len(h.rec.snapshot())
@@ -497,6 +526,7 @@ func TestDeleteWinsAgainstPreparedLoad(t *testing.T) {
 type countingStore struct {
 	acpcore.SessionStore
 	replaces atomic.Int32
+	appends  atomic.Int32
 	deletes  atomic.Int32
 }
 
@@ -504,6 +534,12 @@ func (s *countingStore) Replace(ctx context.Context, main acpcore.SessionKey, re
 	s.replaces.Add(1)
 
 	return s.SessionStore.Replace(ctx, main, replacements)
+}
+
+func (s *countingStore) Append(ctx context.Context, main acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	s.appends.Add(1)
+
+	return s.SessionStore.Append(ctx, main, base, entries, replacements)
 }
 
 func (s *countingStore) Delete(ctx context.Context, key acpcore.SessionKey) error {
@@ -536,7 +572,7 @@ func TestEphemeralSessionNeverReachesTheStore(t *testing.T) {
 	_, err = h.conn.UnstableDeleteSession(h.ctx(), wire.DeleteSessionRequest(ephemeral.SessionId))
 	require.NoError(t, err)
 
-	require.Zero(t, store.replaces.Load(), "an ephemeral session is never mirrored")
+	require.Zero(t, store.replaces.Load()+store.appends.Load(), "an ephemeral session is never mirrored")
 	require.Zero(t, store.deletes.Load(), "an ephemeral session leaves no tombstone")
 	list, err = h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
 	require.NoError(t, err)
@@ -621,5 +657,211 @@ func TestMirrorFailureFencesTurnAndAllowsRetry(t *testing.T) {
 			require.Len(t, streams, 2)
 			require.NotEqual(t, streams[0], streams[1])
 		})
+	}
+}
+
+// nativeReads counts the native database reads the fake has recorded in path.
+func nativeReads(t *testing.T, path string) int {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+
+	require.NoError(t, err)
+
+	return strings.Count(string(data), "db\n")
+}
+
+// A settled turn reads native history once and appends only the events it
+// added; a configuration change reads none and leaves the history as it is;
+// a turn reads its own messages, never the whole session.
+func TestCommitsReadOnlyNewNativeHistory(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	work, messageReads := filepath.Join(dir, "work"), filepath.Join(dir, "message-reads")
+	store := &countingStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	h := newHarness(t, WithSessionStore(store), WithEnv(map[string]string{
+		fakeOpenCodeEnv: "1", fakeOpenCodeEnvNativeWork: work, fakeOpenCodeEnvMessageReads: messageReads,
+		"GORACE": os.Getenv("GORACE") + " atexit_sleep_ms=0",
+	}))
+	h.initialize()
+	created := h.newSession()
+	require.Equal(t, 1, nativeReads(t, work), "establishment reads the new graph once")
+	require.EqualValues(t, 1, store.replaces.Load())
+
+	stored := func() [][]byte {
+		var record sessionRecord
+		rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+		require.NoError(t, err)
+		require.True(t, found)
+
+		return rows
+	}
+
+	history := stored()
+	for turn := 1; turn <= 3; turn++ {
+		_, err := h.prompt(created.SessionId, "MULTI", nil)
+		require.NoError(t, err)
+		require.Equal(t, 1+turn, nativeReads(t, work), "each settled turn reads native history once")
+		require.EqualValues(t, turn, store.appends.Load(), "each settled turn appends")
+		require.EqualValues(t, 1, store.replaces.Load(), "no settled turn republishes the history")
+
+		after := stored()
+		require.Greater(t, len(after), len(history))
+		require.Equal(t, history, after[:len(history)], "a commit extends the stored history")
+		history = after
+	}
+
+	_, err := h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(created.SessionId, configEffort, "high"))
+	require.NoError(t, err)
+	require.Equal(t, 4, nativeReads(t, work), "a configuration change reads no native history")
+	require.EqualValues(t, 4, store.appends.Load())
+	require.Equal(t, history, stored(), "a configuration change leaves the history as it is")
+	require.Equal(t, "high", storedRecord(t, store, created.SessionId).Effort)
+
+	_, err = os.Stat(messageReads)
+	require.ErrorIs(t, err, os.ErrNotExist, "no turn reads every message of its session")
+}
+
+func TestCheckSync(t *testing.T) {
+	t.Parallel()
+
+	row := func(id, aggregate string, seq int64, typ, data string) []byte {
+		return fmt.Appendf(nil, `{"id":%q,"aggregate_id":%q,"seq":%d,"type":%q,"data":%s}`, id, aggregate, seq, typ, data)
+	}
+	created := func(id, aggregate, parent string) []byte {
+		return row(id, aggregate, 0, "session.created.1", fmt.Sprintf(`{"sessionID":%q,"info":{"id":%q,"parentID":%q}}`, aggregate, aggregate, parent))
+	}
+	updated := func(id, aggregate string, seq int64) []byte {
+		return row(id, aggregate, seq, "session.updated.1", fmt.Sprintf(`{"sessionID":%q}`, aggregate))
+	}
+
+	for _, tc := range []struct {
+		name string
+		rows [][]byte
+		from map[string]int64
+		want map[string]int64
+		err  string
+	}{
+		{name: "whole graph", rows: [][]byte{created("e0", "root", ""), created("e1", "child", "root"), updated("e2", "root", 1)}, want: map[string]int64{"root": 1, "child": 0}},
+		{name: "continuation", rows: [][]byte{updated("e3", "root", 2), created("e4", "late", "child")}, from: map[string]int64{"root": 1, "child": 0}, want: map[string]int64{"root": 2, "child": 0, "late": 0}},
+		{name: "nothing new", from: map[string]int64{"root": 1}, want: map[string]int64{"root": 1}},
+		{name: "gap", rows: [][]byte{updated("e3", "root", 3)}, from: map[string]int64{"root": 1}, err: "native sync sequence gap"},
+		{name: "replayed sequence", rows: [][]byte{updated("e3", "root", 1)}, from: map[string]int64{"root": 1}, err: "native sync sequence gap"},
+		{name: "root missing", rows: [][]byte{created("e1", "child", "root")}, err: "native root session missing"},
+		{name: "unrelated", rows: [][]byte{created("e0", "other", "")}, from: map[string]int64{"root": 0}, err: "unrelated native sync aggregate"},
+		{name: "identity", rows: [][]byte{row("e1", "root", 1, "session.updated.1", `{"sessionID":"other"}`)}, from: map[string]int64{"root": 0}, err: "native sync identity mismatch"},
+		{name: "duplicate", rows: [][]byte{created("e0", "root", ""), updated("e0", "root", 1)}, err: "invalid native sync event"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			synced, err := checkSync(tc.rows, "root", tc.from)
+			if tc.err != "" {
+				require.EqualError(t, err, tc.err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, synced)
+		})
+	}
+}
+
+// syntheticHistory renders native database rows first..first+n of a long
+// conversation as the database command prints them: alternating assistant
+// messages, text parts, and tool parts with sizable output.
+//
+//nolint:tagliatelle // The native event table names its aggregate column aggregate_id.
+func syntheticHistory(root string, first, n int) []byte {
+	type dbRow struct {
+		ID          string `json:"id"`
+		AggregateID string `json:"aggregate_id"`
+		Sequence    int    `json:"seq"`
+		Type        string `json:"type"`
+		Data        string `json:"data"`
+	}
+
+	text := strings.Repeat("synthetic assistant text ", 16)
+	output := strings.Repeat("synthetic tool output line\n", 160)
+	rows := make([]dbRow, 0, n)
+
+	for seq := first; seq < first+n; seq++ {
+		message := fmt.Sprintf("msg_%08d", seq/4)
+
+		var typ string
+
+		var data any
+
+		switch {
+		case seq == 0:
+			typ, data = "session.created.1", map[string]any{"sessionID": root, "info": map[string]any{"id": root, "directory": "/work", "title": "synthetic"}}
+		case seq%4 == 1:
+			typ, data = syncMessageUpdated, map[string]any{"sessionID": root, "info": map[string]any{"id": message, "sessionID": root, "role": roleAssistant, "parentID": "msg_user"}}
+		case seq%4 == 2:
+			typ, data = syncPartUpdated, map[string]any{"sessionID": root, "part": map[string]any{"id": fmt.Sprintf("prt_%08d", seq), "sessionID": root, "messageID": message, "type": fieldText, "text": text}}
+		default:
+			typ, data = syncPartUpdated, map[string]any{"sessionID": root, "part": map[string]any{"id": fmt.Sprintf("prt_%08d", seq), "sessionID": root, "messageID": message, "type": partTool, "callID": fmt.Sprintf("call_%d", seq), "tool": nativeToolBash, "state": map[string]any{"status": "completed", "input": map[string]any{"command": "ls"}, "output": output}}}
+		}
+
+		encoded, _ := json.Marshal(data)
+		rows = append(rows, dbRow{ID: fmt.Sprintf("evt_%08d", seq), AggregateID: root, Sequence: seq, Type: typ, Data: string(encoded)})
+	}
+
+	encoded, _ := json.MarshalIndent(rows, "", "  ")
+
+	return encoded
+}
+
+// BenchmarkTurnCommit measures the mirror work of one settled turn that adds
+// 64 events to a 20,000-event conversation, excluding the native database
+// process every read starts: decoding the turn's database output, validating
+// it, capturing images, and committing it to the store.
+func BenchmarkTurnCommit(b *testing.B) {
+	const (
+		root    = "ses_root"
+		history = 20000
+		turn    = 64
+	)
+
+	full, err := opencode.DecodeHistory(bytes.NewReader(syntheticHistory(root, 0, history)))
+	require.NoError(b, err)
+
+	s := NewAgent().newSession(sessionStart{cwd: b.TempDir()})
+	s.id, s.nativeID = root, root
+	s.mirror = sessionlog.NewMirror(acpcore.NewInMemorySessionStore(), root)
+
+	synced, err := checkSync(full, root, nil)
+	require.NoError(b, err)
+	require.NoError(b, s.commitRows(b.Context(), full, synced))
+
+	output := syntheticHistory(root, history, turn)
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(output)))
+
+	for b.Loop() {
+		rows, err := opencode.DecodeHistory(bytes.NewReader(output))
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if _, err := checkSync(rows, root, synced); err != nil {
+			b.Fatal(err)
+		}
+
+		s.captureImages(rows)
+
+		// Every iteration appends the same turn, so the mirror's continuation
+		// is the only source it reads.
+		if err := s.mirror.Commit(b.Context(), func(sessionlog.Cursor) (sessionlog.Tail, error) {
+			return sessionlog.Tail{Rows: rows}, nil
+		}, s.record()); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

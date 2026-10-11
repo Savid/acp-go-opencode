@@ -72,7 +72,6 @@ type NativePart struct {
 	Filename  string          `json:"filename"`
 	URL       string          `json:"url"`
 	Tokens    NativeTokens    `json:"tokens"`
-	Raw       json.RawMessage `json:"-"`
 }
 
 // NativeAttachment is a native file part carried inside a completed tool
@@ -84,20 +83,6 @@ type NativeAttachment struct {
 	Mime     string `json:"mime"`
 	Filename string `json:"filename"`
 	URL      string `json:"url"`
-}
-
-func (p *NativePart) UnmarshalJSON(data []byte) error {
-	type alias NativePart
-
-	var value alias
-	if err := json.Unmarshal(data, &value); err != nil {
-		return err
-	}
-
-	*p = NativePart(value)
-	p.Raw = append(p.Raw[:0], data...)
-
-	return nil
 }
 
 // NativeTokens is one model call's usage. Input excludes the tokens read
@@ -134,25 +119,13 @@ type NativeCommand struct {
 	Hints       []string `json:"hints"`
 }
 
+// Event is one native bus event from the global stream.
 type Event struct {
 	ID         string          `json:"id"`
 	Type       string          `json:"type"`
 	Properties json.RawMessage `json:"properties"`
-	Raw        json.RawMessage `json:"-"`
-}
-
-func (e *Event) UnmarshalJSON(data []byte) error {
-	type alias Event
-
-	var value alias
-	if err := json.Unmarshal(data, &value); err != nil {
-		return err
-	}
-
-	*e = Event(value)
-	e.Raw = append(e.Raw[:0], data...)
-
-	return nil
+	// SessionID is the native session the event addresses, or empty.
+	SessionID string `json:"-"`
 }
 
 type PermissionTool struct {
@@ -254,39 +227,6 @@ type QuestionRequest struct {
 	SessionID string         `json:"sessionID"`
 	Questions []QuestionInfo `json:"questions"`
 	Tool      QuestionTool   `json:"tool"`
-}
-
-type SyncEvent struct {
-	Raw         json.RawMessage            `json:"-"`
-	ID          string                     `json:"id"`
-	AggregateID string                     `json:"aggregate_id"`
-	Sequence    int64                      `json:"seq"`
-	Type        string                     `json:"type"`
-	Data        map[string]json.RawMessage `json:"data"`
-}
-
-func (e *SyncEvent) UnmarshalJSON(data []byte) error {
-	type alias SyncEvent
-
-	var value alias
-	if err := json.Unmarshal(data, &value); err != nil {
-		return err
-	}
-
-	*e = SyncEvent(value)
-	e.Raw = append(e.Raw[:0], data...)
-
-	return nil
-}
-
-func (e SyncEvent) MarshalJSON() ([]byte, error) {
-	if e.Raw != nil {
-		return e.Raw, nil
-	}
-
-	type alias SyncEvent
-
-	return json.Marshal(alias(e))
 }
 
 // AllowsCustom applies the native question default.

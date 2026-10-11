@@ -7,8 +7,11 @@ import (
 	"github.com/savid/acp-go-opencode/internal/opencode"
 )
 
+// projectCompaction publishes the compaction progress a native event reports.
+// The pump owns the compaction state and forgets each request once its
+// summary ends.
 func (s *session) projectCompaction(ctx context.Context, event opencode.Event, props eventProperties) error {
-	if event.SessionID() != "" && event.SessionID() != s.nativeID {
+	if event.SessionID != "" && event.SessionID != s.nativeID {
 		return nil
 	}
 
@@ -41,42 +44,36 @@ func (s *session) projectCompaction(ctx context.Context, event opencode.Event, p
 			return nil
 		}
 
-		if s.compactionMessages == nil {
-			s.compactionMessages = make(map[string]bool)
-		}
-
-		if !s.compactionMessages[key] {
-			s.compactionMessages[key] = true
-			s.compactionMessage = key
-		}
-
-		if info.Error != nil {
+		switch {
+		case info.Error != nil:
 			if s.compactionMessage == key {
 				s.compactionMessage = ""
 			}
+
+			delete(s.compactionTriggers, info.ParentID)
 
 			value.Status = wire.CompactionFailed
 			if info.Error.Name == "MessageAbortedError" {
 				value.Status = wire.CompactionCancelled
 			}
-		} else {
-			if info.Time.Completed != 0 {
-				return nil
+		case info.Time.Completed != 0:
+			// Success arrives as the session's compaction event.
+			if s.compactionMessage == "" {
+				s.compactionMessage = key
 			}
 
+			return nil
+		default:
+			s.compactionMessage = key
 			value.Status = wire.CompactionInProgress
 		}
 	case event.Type == "session.compacted":
 		if event.ID != "" {
-			if s.compactionEvents[event.ID] {
+			if s.compactionEvent == event.ID {
 				return nil
 			}
 
-			if s.compactionEvents == nil {
-				s.compactionEvents = make(map[string]bool)
-			}
-
-			s.compactionEvents[event.ID] = true
+			s.compactionEvent = event.ID
 		}
 
 		key = s.compactionMessage
@@ -86,6 +83,7 @@ func (s *session) projectCompaction(ctx context.Context, event opencode.Event, p
 
 		value.Status = wire.CompactionCompleted
 		s.compactionMessage = ""
+		clear(s.compactionTriggers)
 	default:
 		return nil
 	}

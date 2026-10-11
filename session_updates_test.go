@@ -67,6 +67,18 @@ func (s *nativeFixtureStore) Replace(ctx context.Context, key acpcore.SessionKey
 	return nil
 }
 
+func (s *nativeFixtureStore) Append(ctx context.Context, key acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Load() {
+		return errors.New("fixture mirror failure")
+	}
+	if err := s.SessionStore.Append(ctx, key, base, entries, replacements); err != nil {
+		return err
+	}
+	s.trace.add("commit")
+
+	return nil
+}
+
 type nativeFixtureRecorder struct {
 	*recorder
 	trace *traceLog
@@ -106,7 +118,7 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			s, err := a.session(t.Context(), created.SessionId)
 			require.NoError(t, err)
 			s.mu.Lock()
-			rt := s.runtime
+			rt := s.binding
 			require.Nil(t, s.turn)
 			s.mu.Unlock()
 			data, err := os.ReadFile("testdata/native/agent-origin.json")
@@ -147,7 +159,8 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 				}
 				require.NotEqual(t, "prompt_accepted", event["type"])
 			}
-			require.Equal(t, "msg_fixture_0", s.nativeMessage("msg_fixture_0").ID)
+			require.True(t, s.parentCompleted("msg_fixture_0", ""), "the settled cycle completes its generation")
+			require.Empty(t, s.nativeMessage("msg_fixture_0").ID, "a completed generation's message info is forgotten")
 			s.mu.Lock()
 			require.Nil(t, s.cycle)
 			s.mu.Unlock()
@@ -295,9 +308,9 @@ func TestUsageFollowsSteeredResponses(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
-	messages, err := rt.client.Messages(t.Context(), s.cwd, s.nativeID)
+	messages, err := rt.client.TurnMessages(t.Context(), s.cwd, s.nativeID, "")
 	require.NoError(t, err)
 	steer := slices.IndexFunc(messages, func(message opencode.NativeMessage) bool {
 		return message.Info.Role == roleUser && message.Parts[0].Text == "also this"
@@ -429,7 +442,7 @@ func replayNativeRun(t *testing.T, catalog, fixture string, usageReports int) (a
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 
 	data, err := os.ReadFile(fixture)

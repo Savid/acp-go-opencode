@@ -201,7 +201,7 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 	}
 	s.mu.Unlock()
 
-	if err := s.commitMirror(ctx, rt); err != nil {
+	if err := s.commitConfig(ctx, rt); err != nil {
 		s.mu.Lock()
 		s.model, s.mode, s.effort = oldModel, oldMode, oldEffort
 		s.mu.Unlock()

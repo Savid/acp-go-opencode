@@ -1,6 +1,7 @@
 package opencodeacp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/observer"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 )
 
@@ -123,7 +125,7 @@ func (a *Agent) install(ctx context.Context, s *session) error {
 	case a.deleted[s.id]:
 		refusal = wire.UnknownSession()
 	case a.sessions[s.id] != nil:
-		refusal = wire.InternalFailure(vendor, internalClassNativeStart)
+		refusal = wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	if refusal == nil {
@@ -148,7 +150,7 @@ func (a *Agent) install(ctx context.Context, s *session) error {
 // response on a served connection, and runs it inline for an embedded host.
 func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 
 	if t := a.transportRef(); t != nil {
@@ -163,7 +165,7 @@ func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
 			}
 
 			s.mu.Lock()
-			current := !s.closing && s.runtime == rt
+			current := !s.closing && s.binding == rt
 			s.mu.Unlock()
 
 			if current {
@@ -238,6 +240,8 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 
 		return acp.NewSessionResponse{}, err
 	}
+
+	s.mirror = sessionlog.NewMirror(a.store, string(s.id))
 
 	s.rawEvents = wire.NewRawEvents(vendor, string(s.id), vendor, start.meta.rawEvents)
 
@@ -417,14 +421,15 @@ func (a *Agent) restore(
 	s.id = sessionID
 	s.nativeID = stored.record.NativeSessionID
 	s.rawEvents = wire.NewRawEvents(vendor, string(sessionID), vendor, start.meta.rawEvents)
-	s.title = storedTitle(stored.record.NativeSessionID, stored.rows)
+	s.title = stored.record.Title
+	s.mirror = sessionlog.NewMirror(a.store, string(sessionID))
 
 	rt, err := s.launch(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, err := s.hydrate(ctx, rt, stored)
+	rows, synced, err := s.hydrate(ctx, rt, stored)
 	if err != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
@@ -456,13 +461,13 @@ func (a *Agent) restore(
 
 	releaseSlot()
 
-	if err := s.commitMirror(ctx, rt); err != nil {
+	if err := s.commitRows(ctx, rows, synced); err != nil {
 		release()
 
 		_ = s.close(context.WithoutCancel(ctx))
 		a.detach(ctx, s)
 
-		return nil, nil, a.restoreRefused(ctx, sessionID, err)
+		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
 	}
 
 	if replay {
@@ -629,25 +634,23 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 			continue
 		}
 
-		stored, loadErr := a.loadStored(ctx, id)
+		record, found, loadErr := a.loadRecord(ctx, id)
 		if loadErr != nil {
 			return acp.ListSessionsResponse{}, wire.InternalFailure(vendor, "")
 		}
 
-		cwd := stored.record.Cwd
-
-		if filter != "" && cwd != filter {
+		if !found || filter != "" && record.Cwd != filter {
 			continue
 		}
 
-		title := storedTitle(stored.record.NativeSessionID, stored.rows)
+		title := cmp.Or(record.Title, string(id))
 		updatedAt := time.UnixMilli(summary.UpdatedAtUnixMilli).UTC().Format(time.RFC3339)
 
 		sessions = append(sessions, acp.SessionInfo{
-			Meta:                  wire.NativeSessionMeta(vendor, stored.record.NativeSessionID),
+			Meta:                  wire.NativeSessionMeta(vendor, record.NativeSessionID),
 			SessionId:             id,
-			Cwd:                   cwd,
-			AdditionalDirectories: slices.Clone(stored.record.AdditionalDirectories),
+			Cwd:                   record.Cwd,
+			AdditionalDirectories: record.AdditionalDirectories,
 			Title:                 &title,
 			UpdatedAt:             &updatedAt,
 		})
@@ -880,6 +883,18 @@ func (a *Agent) deletedSession(id acp.SessionId) bool {
 	defer a.mu.Unlock()
 
 	return a.deleted[id]
+}
+
+// loadRecord reads only a stored session's configuration record.
+func (a *Agent) loadRecord(ctx context.Context, id acp.SessionId) (sessionRecord, bool, error) {
+	ctx, finish := a.observe.StartSessionStore(ctx, "load_record")
+
+	var record sessionRecord
+
+	found, err := sessionlog.LoadRecord(ctx, a.store, string(id), &record)
+	finish(err)
+
+	return record, found, err
 }
 
 // detach removes a session from the active map while it still resolves to

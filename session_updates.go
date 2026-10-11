@@ -45,7 +45,7 @@ const (
 )
 
 type cycleState struct {
-	text          map[string]string
+	text          wire.StreamedText
 	roles         map[string]string
 	tools         map[string]bool
 	terminalTools map[string]bool
@@ -74,7 +74,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 
 	s.mu.Lock()
 	t, c, closing := s.turn, s.cycle, s.closing
-	current := s.runtime == rt
+	current := s.binding == rt
 	s.mu.Unlock()
 
 	if !current || closing && t == nil && c == nil {
@@ -95,7 +95,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 	}
 
 	if event.Type == "session.deleted" {
-		s.poisonSession(ctx, "native_session_identity_drift")
+		s.poisonSession(ctx, wire.CauseNativeSessionIdentityDrift)
 		rt.cancel()
 
 		return
@@ -148,7 +148,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 func (s *session) openAgentCycle(ctx context.Context, rt *binding) *cycle {
 	c := &cycle{Cycle: s.lc.NewAgentCycle(), done: make(chan struct{})}
 	s.mu.Lock()
-	if s.turn != nil || s.cycle != nil || s.closing || s.runtime != rt {
+	if s.turn != nil || s.cycle != nil || s.closing || s.binding != rt {
 		s.mu.Unlock()
 
 		return nil
@@ -160,7 +160,7 @@ func (s *session) openAgentCycle(ctx context.Context, rt *binding) *cycle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.runtime != rt || s.cycle != c || s.closing {
+	if s.binding != rt || s.cycle != c || s.closing {
 		return nil
 	}
 
@@ -334,7 +334,6 @@ func (s *session) projectPart(ctx context.Context, state *cycleState, part openc
 
 	if state.roles == nil {
 		state.roles = map[string]string{}
-		state.text = map[string]string{}
 		state.tools = map[string]bool{}
 		state.terminalTools = map[string]bool{}
 		state.files = map[string]bool{}
@@ -348,15 +347,11 @@ func (s *session) projectPart(ctx context.Context, state *cycleState, part openc
 
 	switch part.Type {
 	case fieldText, partReasoning:
-		previous := state.text[part.ID]
-
-		suffix, ok := strings.CutPrefix(part.Text, previous)
-		if !ok {
+		if !strings.HasPrefix(part.Text, state.text.Text(part.ID)) {
 			return errors.New("native text changed after publication")
 		}
 
-		state.text[part.ID] = part.Text
-
+		suffix := state.text.Suffix(part.ID, part.Text)
 		if suffix == "" {
 			return nil
 		}
@@ -503,12 +498,17 @@ func (s *session) emitRawEvent(ctx context.Context, event opencode.Event) {
 		return
 	}
 
-	var payload map[string]any
-	if json.Unmarshal(event.Raw, &payload) != nil {
+	var properties any
+	if json.Unmarshal(event.Properties, &properties) != nil {
 		return
 	}
 
-	redactImageURLs(payload)
+	redactImageURLs(properties)
+
+	payload := map[string]any{fieldType: event.Type, "properties": properties}
+	if event.ID != "" {
+		payload[fieldID] = event.ID
+	}
 
 	if err := s.rawEvents.Emit(ctx, func(ctx context.Context, method string, params map[string]any) error {
 		return conn.NotifyExtension(ctx, method, params)
@@ -571,6 +571,7 @@ type eventProperties struct {
 	Error     *opencode.NativeError        `json:"error"`
 }
 
+// eventInfo is the info of the message an event belongs to.
 func (s *session) eventInfo(event opencode.Event, props eventProperties) (opencode.NativeMessageInfo, bool) {
 	var info opencode.NativeMessageInfo
 
@@ -582,15 +583,10 @@ func (s *session) eventInfo(event opencode.Event, props eventProperties) (openco
 		info = s.nativeMessage(props.Part.MessageID)
 	case "message.part.delta":
 		info = s.nativeMessage(props.MessageID)
-	case eventPermissionAsked:
-		var request opencode.PermissionRequest
-		if json.Unmarshal(event.Properties, &request) != nil {
-			return opencode.NativeMessageInfo{}, false
+	case eventPermissionAsked, eventQuestionAsked:
+		var request struct {
+			Tool opencode.PermissionTool `json:"tool"`
 		}
-
-		info = s.nativeMessage(request.Tool.MessageID)
-	case eventQuestionAsked:
-		var request opencode.QuestionRequest
 		if json.Unmarshal(event.Properties, &request) != nil {
 			return opencode.NativeMessageInfo{}, false
 		}
@@ -627,11 +623,8 @@ func (s *session) projectEvent(ctx context.Context, rt *binding, c *cycle, event
 		}
 	case "message.part.delta":
 		if props.Field == fieldText && props.Delta != "" && info.Role == roleAssistant {
-			if c.state.text == nil {
-				c.state.text = map[string]string{}
-			}
+			c.state.text.Add(props.PartID, props.Delta)
 
-			c.state.text[props.PartID] += props.Delta
 			if c.state.roles[props.PartID] == partReasoning {
 				err = s.emit(ctx, acp.UpdateAgentThoughtText(props.Delta))
 			} else {

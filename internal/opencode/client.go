@@ -10,11 +10,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/savid/acp-go-core/wire"
 )
 
 const MaxBodyBytes = 64 << 20
@@ -87,7 +92,7 @@ func (c *Client) ReadAddress(stdout io.Reader) error {
 	return errors.New("opencode server exited without announcing its address")
 }
 
-func (c *Client) request(ctx context.Context, directory, method, path string, body any) (*http.Response, error) {
+func (c *Client) request(ctx context.Context, directory, method, path string, query url.Values, body any) (*http.Response, error) {
 	var reader io.Reader
 
 	if body != nil {
@@ -99,9 +104,18 @@ func (c *Client) request(ctx context.Context, directory, method, path string, bo
 		reader = bytes.NewReader(data)
 	}
 
-	target := c.URL + path
 	if directory != "" {
-		target += "?directory=" + url.QueryEscape(directory)
+		query = maps.Clone(query)
+		if query == nil {
+			query = url.Values{}
+		}
+
+		query.Set("directory", directory)
+	}
+
+	target := c.URL + path
+	if len(query) > 0 {
+		target += "?" + query.Encode()
 	}
 
 	request, err := http.NewRequestWithContext(ctx, method, target, reader)
@@ -121,33 +135,40 @@ func (c *Client) request(ctx context.Context, directory, method, path string, bo
 }
 
 func (c *Client) Do(ctx context.Context, directory, method, path string, body, out any) error {
-	response, err := c.request(ctx, directory, method, path, body)
+	_, err := c.do(ctx, directory, method, path, nil, body, out)
+
+	return err
+}
+
+// do performs one request and returns the response headers.
+func (c *Client) do(ctx context.Context, directory, method, path string, query url.Values, body, out any) (http.Header, error) {
+	response, err := c.request(ctx, directory, method, path, query, body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer response.Body.Close()
 
 	data, err := io.ReadAll(io.LimitReader(response.Body, MaxBodyBytes+1))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if len(data) > MaxBodyBytes {
-		return errors.New("opencode response exceeds size limit")
+		return nil, errors.New("opencode response exceeds size limit")
 	}
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		e := &HTTPError{Status: response.StatusCode}
 		_ = json.Unmarshal(data, &e.Native)
 
-		return e
+		return nil, e
 	}
 
 	if out == nil || len(data) == 0 {
-		return nil
+		return response.Header, nil
 	}
 
-	return json.Unmarshal(data, out)
+	return response.Header, json.Unmarshal(data, out)
 }
 
 func SessionPath(id string) string { return "/session/" + url.PathEscape(id) }
@@ -159,22 +180,60 @@ func (c *Client) Session(ctx context.Context, dir, id string) (NativeSession, er
 	return out, err
 }
 
-func (c *Client) Messages(ctx context.Context, dir, id string) ([]NativeMessage, error) {
-	var out []NativeMessage
+// turnPageSize is how many messages one page of a turn read holds.
+const turnPageSize = 32
 
-	err := c.Do(ctx, dir, http.MethodGet, SessionPath(id)+"/message", nil, &out)
+// TurnMessages reads the session's messages from the user message messageID
+// onward, in native order. It pages back from the newest message until a
+// page holds messageID, so the read costs the turn rather than the whole
+// conversation; when the session has no such message it reads every message.
+func (c *Client) TurnMessages(ctx context.Context, dir, id, messageID string) ([]NativeMessage, error) {
+	query := url.Values{"limit": {strconv.Itoa(turnPageSize)}}
 
-	return out, err
+	var messages []NativeMessage
+
+	for {
+		page := make([]NativeMessage, 0, turnPageSize)
+
+		header, err := c.do(ctx, dir, http.MethodGet, SessionPath(id)+"/message", query, nil, &page)
+		if err != nil {
+			return nil, err
+		}
+
+		messages = append(page, messages...)
+
+		if start := slices.IndexFunc(page, func(message NativeMessage) bool { return message.Info.ID == messageID }); start >= 0 {
+			return messages[start:], nil
+		}
+
+		next := header.Get("X-Next-Cursor")
+		if next == "" {
+			return messages, nil
+		}
+
+		query.Set("before", next)
+	}
 }
 
 func (c *Client) Interrupt(ctx context.Context, dir, id string) error {
 	return c.Do(ctx, dir, http.MethodPost, SessionPath(id)+"/abort", map[string]any{}, nil)
 }
 
+// Replay imports sync events through the native replay route.
+//
+//nolint:tagliatelle // The native replay route names the aggregate aggregateID.
 func (c *Client) Replay(ctx context.Context, dir string, events []SyncEvent) error {
-	rows := make([]map[string]any, 0, len(events))
+	type replayEvent struct {
+		ID          string          `json:"id"`
+		AggregateID string          `json:"aggregateID"`
+		Sequence    int64           `json:"seq"`
+		Type        string          `json:"type"`
+		Data        json.RawMessage `json:"data"`
+	}
+
+	rows := make([]replayEvent, 0, len(events))
 	for _, e := range events {
-		rows = append(rows, map[string]any{"id": e.ID, "aggregateID": e.AggregateID, "seq": e.Sequence, "type": e.Type, "data": e.Data})
+		rows = append(rows, replayEvent{ID: e.ID, AggregateID: e.AggregateID, Sequence: e.Sequence, Type: e.Type, Data: e.Data})
 	}
 
 	return c.Do(ctx, dir, http.MethodPost, "/sync/replay", map[string]any{"directory": dir, "events": rows}, nil)
@@ -203,7 +262,7 @@ func (s *Stream) Close() { s.cancel(); _ = s.body.Close(); <-s.done }
 func (c *Client) Subscribe(ctx context.Context) (*Stream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 
-	response, err := c.request(streamCtx, "", http.MethodGet, "/global/event", nil)
+	response, err := c.request(streamCtx, "", http.MethodGet, "/global/event", nil, nil)
 	if err != nil {
 		cancel()
 
@@ -233,9 +292,15 @@ func (c *Client) Subscribe(ctx context.Context) (*Stream, error) {
 	return s, nil
 }
 
+// syncEventType marks the stream's copy of a durable event, which repeats a
+// bus event the stream also delivers.
+const syncEventType = "sync"
+
+// read dispatches each server-sent event frame. A frame's data is the global
+// envelope, decoded once; the sync copy of a durable event is skipped without
+// decoding its body.
 func (s *Stream) read(ctx context.Context, reader io.Reader) error {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 4096), MaxBodyBytes)
+	lines := wire.NewLineReader(reader, MaxBodyBytes)
 
 	var data []byte
 
@@ -244,26 +309,19 @@ func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 			return nil
 		}
 
-		var envelope struct {
-			Payload json.RawMessage `json:"payload"`
+		var frame struct {
+			Payload Event `json:"payload"`
 		}
-		if err := json.Unmarshal(data, &envelope); err != nil {
+		if err := json.Unmarshal(data, &frame); err != nil {
 			return err
 		}
 
-		raw := data
-		if len(envelope.Payload) != 0 {
-			raw = envelope.Payload
+		event := frame.Payload
+		if event.Type == "" || event.Type == syncEventType {
+			return nil
 		}
 
-		var event Event
-		if err := json.Unmarshal(raw, &event); err != nil {
-			return err
-		}
-
-		if event.Type == "" {
-			return errors.New("native event type missing")
-		}
+		event.SessionID = eventSession(event.Type, event.Properties)
 
 		select {
 		case s.Events <- event:
@@ -275,9 +333,17 @@ func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 		}
 	}
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+	for {
+		line, err := lines.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if len(line) == 0 {
 			if err := dispatch(); err != nil {
 				return err
 			}
@@ -287,20 +353,22 @@ func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 			continue
 		}
 
-		if value, ok := strings.CutPrefix(line, "data:"); ok {
-			if len(data) > 0 {
-				data = append(data, '\n')
-			}
-
-			data = append(data, strings.TrimPrefix(value, " ")...)
-			if len(data) > MaxBodyBytes {
-				return errors.New("opencode event exceeds size limit")
-			}
+		value, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			continue
 		}
-	}
 
-	if err := scanner.Err(); err != nil {
-		return err
+		value = bytes.TrimPrefix(value, []byte(" "))
+
+		if data == nil {
+			data = value
+		} else {
+			data = append(append(data, '\n'), value...)
+		}
+
+		if len(data) > MaxBodyBytes {
+			return errors.New("opencode event exceeds size limit")
+		}
 	}
 
 	if err := dispatch(); err != nil {
@@ -310,8 +378,10 @@ func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 	return io.EOF
 }
 
+// eventSession names the native session an event's properties address.
+//
 //nolint:tagliatelle // Native event payloads spell ID in uppercase.
-func (e Event) SessionID() string {
+func eventSession(typ string, properties json.RawMessage) string {
 	var p struct {
 		SessionID string `json:"sessionID"`
 		Info      struct {
@@ -322,25 +392,20 @@ func (e Event) SessionID() string {
 			SessionID string `json:"sessionID"`
 		} `json:"part"`
 	}
-	if json.Unmarshal(e.Properties, &p) != nil {
+	if json.Unmarshal(properties, &p) != nil {
 		return ""
 	}
 
-	if p.SessionID != "" {
+	switch {
+	case p.SessionID != "":
 		return p.SessionID
-	}
-
-	if p.Part.SessionID != "" {
+	case p.Part.SessionID != "":
 		return p.Part.SessionID
-	}
-
-	if p.Info.SessionID != "" {
+	case p.Info.SessionID != "":
 		return p.Info.SessionID
-	}
-
-	if strings.HasPrefix(e.Type, "session.") {
+	case strings.HasPrefix(typ, "session."):
 		return p.Info.ID
+	default:
+		return ""
 	}
-
-	return ""
 }

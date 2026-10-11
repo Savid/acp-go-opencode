@@ -174,9 +174,10 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 
 // captureImages admits every image the mirror cannot replay from its own rows
 // through the output gate, which stores the sidecar copy a later replay reads.
-// Only a storable artifact is decoded: a data URL carries its bytes in the
-// mirrored row, so rastering it here would cost a decode on every commit and
-// store nothing.
+// It reads the part updates among the rows a commit adds, since each carries
+// its whole part. Only a storable artifact is decoded: a data URL carries its
+// bytes in the mirrored row, so rastering it here would cost a decode on every
+// commit and store nothing.
 func (s *session) captureImages(rows [][]byte) {
 	capture := func(file opencode.NativeAttachment, used *int64) {
 		if image.IsImageMIME(file.Mime) && storableArtifact(file) {
@@ -184,29 +185,30 @@ func (s *session) captureImages(rows [][]byte) {
 		}
 	}
 
-	messages := nativeMessages(rows, s.nativeID)
-	for index := range messages {
-		message := &messages[index]
-		for index := range message.Parts {
-			part := &message.Parts[index]
-			if part.Type == partFile {
-				capture(opencode.NativeAttachment{ID: part.ID, Mime: part.Mime, URL: part.URL}, nil)
+	for _, row := range rows {
+		var event messageEvent
+		if json.Unmarshal(row, &event) != nil || event.AggregateID != s.nativeID || event.Type != syncPartUpdated {
+			continue
+		}
+
+		part := &event.Data.Part
+		if part.Type == partFile {
+			capture(opencode.NativeAttachment{ID: part.ID, Mime: part.Mime, URL: part.URL}, nil)
+		}
+
+		if part.Type == partTool {
+			var state struct {
+				Attachments []opencode.NativeAttachment `json:"attachments"`
+			}
+			if json.Unmarshal(part.State, &state) != nil {
+				continue
 			}
 
-			if part.Type == partTool {
-				var state struct {
-					Attachments []opencode.NativeAttachment `json:"attachments"`
-				}
-				if json.Unmarshal(part.State, &state) != nil {
-					continue
-				}
+			used := int64(0)
 
-				used := int64(0)
-
-				for index, file := range state.Attachments {
-					file.ID = attachmentID(part.ID, index)
-					capture(file, &used)
-				}
+			for index, file := range state.Attachments {
+				file.ID = attachmentID(part.ID, index)
+				capture(file, &used)
 			}
 		}
 	}

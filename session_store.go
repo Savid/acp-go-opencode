@@ -1,23 +1,18 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"log/slog"
 	"maps"
 	"net/http"
 	"path/filepath"
-	"reflect"
 	"slices"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 
-	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/image"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
@@ -28,6 +23,7 @@ import (
 type sessionRecord struct {
 	SessionID             string                   `json:"sessionId"`
 	NativeSessionID       string                   `json:"nativeSessionId"`
+	Title                 string                   `json:"title,omitempty"`
 	Cwd                   string                   `json:"cwd"`
 	AdditionalDirectories []string                 `json:"additionalDirectories,omitempty"`
 	Env                   map[string]string        `json:"env,omitempty"`
@@ -45,7 +41,7 @@ func (s *session) record() sessionRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, OutputSchema: wire.CloneMap(s.options.OutputSchema), Artifacts: cloneArtifacts(s.artifacts), UpdatedAtUnixMilli: time.Now().UnixMilli()}
+	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Title: s.title, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, OutputSchema: wire.CloneMap(s.options.OutputSchema), Artifacts: cloneArtifacts(s.artifacts), UpdatedAtUnixMilli: time.Now().UnixMilli()}
 }
 
 func (r sessionRecord) validate(id string) error {
@@ -98,54 +94,133 @@ func validNativeSessionID(id string) bool {
 	return true
 }
 
-// commitMirror atomically stores a complete native snapshot and its
-// configuration. An ephemeral session commits nothing: opencode's own database
-// holds it until the host deletes it.
-func (s *session) commitMirror(ctx context.Context, rt *binding) error {
+// committed reports whether the store holds a generation of this session.
+func (s *session) committed() bool { return s.mirror != nil && s.mirror.Committed() }
+
+// commitMirror durably publishes the native events added since the last
+// commit and the current configuration. A committed mirror continues from the
+// latest sequence it holds of each conversation in the graph, so one native
+// read returns only the new events; otherwise the whole graph publishes. An
+// ephemeral session commits nothing: opencode's own database holds it until
+// the host deletes it. A commit that cannot be attempted is an error: the
+// turn it belongs to is not durable.
+func (s *session) commitMirror(ctx context.Context, b *binding) error {
+	return s.commit(ctx, b, false)
+}
+
+// commitConfig durably publishes a configuration change. Once the store holds
+// the session it reads no native history: events opencode wrote since the
+// last commit join the next one.
+func (s *session) commitConfig(ctx context.Context, b *binding) error {
+	return s.commit(ctx, b, true)
+}
+
+func (s *session) commit(ctx context.Context, b *binding, configOnly bool) error {
 	if s.ephemeral {
 		return nil
+	}
+
+	if b == nil {
+		return errors.New("session has no native binding")
 	}
 
 	s.mirrorMu.Lock()
 	defer s.mirrorMu.Unlock()
 
-	rows, err := s.snapshotRows(ctx, rt)
-	if err != nil {
-		return err
+	var from map[string]int64
+	if s.mirror.Committed() {
+		from = s.synced
 	}
 
-	ctx, finish := s.agent.observe.StartSessionStore(ctx, "replace")
-	err = sessionlog.Commit(ctx, s.agent.store, string(s.id), rows, s.record())
+	var (
+		rows   [][]byte
+		synced = from
+	)
+
+	if !configOnly || len(from) == 0 {
+		var err error
+		if rows, synced, err = s.readNative(ctx, b, from); err != nil {
+			return err
+		}
+
+		if len(from) == 0 && len(rows) == 0 {
+			return errors.New("native session history missing")
+		}
+
+		s.captureImages(rows)
+	}
+
+	reads := 0
+	source := func(sessionlog.Cursor) (sessionlog.Tail, error) {
+		reads++
+		if reads == 1 {
+			return sessionlog.Tail{Rows: rows, Full: len(from) == 0}, nil
+		}
+
+		// The store refused the continuation, so the whole graph republishes.
+		full, fullSynced, readErr := s.readNative(ctx, b, nil)
+		if readErr != nil {
+			return sessionlog.Tail{}, readErr
+		}
+
+		synced = fullSynced
+
+		return sessionlog.Tail{Rows: full, Full: true}, nil
+	}
+
+	ctx, finish := s.agent.observe.StartSessionStore(ctx, "commit")
+	err := s.mirror.Commit(ctx, source, s.record())
 	finish(err)
 
 	if err == nil {
-		s.mu.Lock()
-		s.persisted = true
-		s.mu.Unlock()
+		s.synced = synced
 	}
 
 	return err
 }
 
-// snapshotRows reads the whole native history of this session. A commit that
-// cannot be attempted is an error: the turn it belongs to is not durable.
-func (s *session) snapshotRows(ctx context.Context, rt *binding) ([][]byte, error) {
-	if rt == nil {
-		return nil, errors.New("session has no native binding")
+// commitRows publishes a restored history whole with the current
+// configuration.
+func (s *session) commitRows(ctx context.Context, rows [][]byte, synced map[string]int64) error {
+	s.mirrorMu.Lock()
+	defer s.mirrorMu.Unlock()
+
+	ctx, finish := s.agent.observe.StartSessionStore(ctx, "commit")
+	err := s.mirror.Commit(ctx, sessionlog.Rows(rows), s.record())
+	finish(err)
+
+	if err == nil {
+		s.synced = synced
 	}
 
-	rows, err := s.readSyncRows(ctx, rt)
+	return err
+}
+
+// readNative reads the graph's native events after from with the graph idle
+// before and after the read, and returns them with the latest sequence of
+// each conversation. One database query is one consistent snapshot; events
+// opencode writes after its turn reports idle, such as a generated title or
+// pruned tool output, reach the next commit.
+func (s *session) readNative(ctx context.Context, b *binding, from map[string]int64) ([][]byte, map[string]int64, error) {
+	if err := s.requireNativeIdle(ctx, b, from); err != nil {
+		return nil, nil, err
+	}
+
+	rows, err := opencode.ReadHistory(ctx, b.server.executable, b.server.root, b.server.environment, s.nativeID, from)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	if len(rows) == 0 {
-		return nil, errors.New("native session history missing")
+	synced, err := checkSync(rows, s.nativeID, from)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	s.captureImages(rows)
+	if err := s.requireNativeIdle(ctx, b, synced); err != nil {
+		return nil, nil, err
+	}
 
-	return rows, nil
+	return rows, synced, nil
 }
 
 type storedSession struct {
@@ -155,9 +230,6 @@ type storedSession struct {
 }
 
 func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession, error) {
-	ctx, cancel := context.WithTimeout(ctx, acpcore.SessionStoreTimeout)
-	defer cancel()
-
 	ctx, finish := a.observe.StartSessionStore(ctx, "load")
 
 	var record sessionRecord
@@ -168,7 +240,7 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 	}
 
 	if err == nil && found {
-		_, err = decodeEvents(rows, record.NativeSessionID)
+		_, err = checkSync(rows, record.NativeSessionID, nil)
 	}
 
 	if err == nil && found {
@@ -178,76 +250,115 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 	finish(err)
 
 	if err != nil {
-		return storedSession{}, a.restoreRefused(ctx, id, err)
+		return storedSession{}, wire.RestoreRefused(ctx, a.log, vendor, id, err)
 	}
 
 	return storedSession{rows: rows, record: record, found: found}, nil
 }
 
-// decodeEvents validates identities and contiguous sequences before native replay.
-func decodeEvents(rows [][]byte, id string) ([]opencode.SyncEvent, error) {
-	events := make([]opencode.SyncEvent, 0, len(rows))
-	seq := map[string]int64{}
-	seen := map[string]bool{}
-
-	for _, row := range rows {
-		var event opencode.SyncEvent
-		if decodeErr := json.Unmarshal(row, &event); decodeErr != nil {
-			return nil, decodeErr
-		}
-
-		if event.ID == "" || event.AggregateID == "" || event.Type == "" || event.Data == nil || seen[event.ID] {
-			return nil, errors.New("invalid native sync event")
-		}
-
-		if event.Sequence != seq[event.AggregateID] {
-			return nil, errors.New("native sync sequence gap")
-		}
-
-		var sessionID string
-		if err := json.Unmarshal(event.Data["sessionID"], &sessionID); err != nil || sessionID != event.AggregateID {
-			return nil, errors.New("native sync identity mismatch")
-		}
-
-		seen[event.ID] = true
-		seq[event.AggregateID]++
-		events = append(events, event)
-	}
-
-	allowed := syncGraph(events, id)
-	if !allowed[id] {
-		return nil, errors.New("native root session missing")
-	}
-
-	for _, event := range events {
-		if !allowed[event.AggregateID] {
-			return nil, errors.New("unrelated native sync aggregate")
-		}
-	}
-
-	return events, nil
+// syncKey identifies one native sync event by conversation and sequence.
+type syncKey struct {
+	aggregate string
+	sequence  int64
 }
 
-func syncGraph(events []opencode.SyncEvent, id string) map[string]bool {
-	parents := map[string]string{}
+// syncHeader is the identity of one mirror row.
+//
+//nolint:tagliatelle // The native event table names its aggregate column aggregate_id.
+type syncHeader struct {
+	ID          string `json:"id"`
+	AggregateID string `json:"aggregate_id"`
+	Sequence    int64  `json:"seq"`
+	Type        string `json:"type"`
+	Data        struct {
+		SessionID string `json:"sessionID"`
+		Info      struct {
+			ID       string `json:"id"`
+			ParentID string `json:"parentID"`
+		} `json:"info"`
+	} `json:"data"`
+}
 
-	for _, event := range events {
-		if event.Type != "session.created.1" {
-			continue
-		}
+func (h syncHeader) key() syncKey { return syncKey{aggregate: h.AggregateID, sequence: h.Sequence} }
 
-		var info opencode.NativeSession
-		if json.Unmarshal(event.Data["info"], &info) == nil && info.ID == event.AggregateID {
-			parents[info.ID] = info.ParentID
-		}
+func decodeHeader(row []byte) (syncHeader, error) {
+	var header syncHeader
+	if err := json.Unmarshal(row, &header); err != nil {
+		return syncHeader{}, err
+	}
+
+	if header.ID == "" || header.AggregateID == "" || header.Type == "" {
+		return syncHeader{}, errors.New("invalid native sync event")
+	}
+
+	if header.Data.SessionID != header.AggregateID {
+		return syncHeader{}, errors.New("native sync identity mismatch")
+	}
+
+	return header, nil
+}
+
+// checkSync validates rows as the continuation of from, the latest sequence
+// of each conversation already held, and returns the sequences after rows.
+// Every conversation continues without a gap from its held sequence, or from
+// zero when it is new; every event names its own conversation; and every
+// conversation belongs to root's graph, joining it through its creation
+// event's parent. An empty from requires root's creation among nonempty rows.
+func checkSync(rows [][]byte, root string, from map[string]int64) (map[string]int64, error) {
+	synced := maps.Clone(from)
+	if synced == nil {
+		synced = map[string]int64{}
+	}
+
+	if len(rows) == 0 {
+		return synced, nil
 	}
 
 	allowed := map[string]bool{}
-	if _, ok := parents[id]; !ok {
-		return allowed
+	for aggregate := range from {
+		allowed[aggregate] = true
 	}
 
-	allowed[id] = true
+	parents := map[string]string{}
+	seen := make(map[string]bool, len(rows))
+	aggregates := make([]string, 0, len(rows))
+
+	for _, row := range rows {
+		header, err := decodeHeader(row)
+		if err != nil {
+			return nil, err
+		}
+
+		if seen[header.ID] {
+			return nil, errors.New("invalid native sync event")
+		}
+
+		seen[header.ID] = true
+
+		expected := int64(0)
+		if last, held := synced[header.AggregateID]; held {
+			expected = last + 1
+		}
+
+		if header.Sequence != expected {
+			return nil, errors.New("native sync sequence gap")
+		}
+
+		synced[header.AggregateID] = header.Sequence
+		aggregates = append(aggregates, header.AggregateID)
+
+		if header.Type == "session.created.1" && header.Data.Info.ID == header.AggregateID {
+			parents[header.AggregateID] = header.Data.Info.ParentID
+		}
+	}
+
+	if len(from) == 0 {
+		if _, created := parents[root]; !created {
+			return nil, errors.New("native root session missing")
+		}
+
+		allowed[root] = true
+	}
 
 	for changed := true; changed; {
 		changed = false
@@ -260,241 +371,155 @@ func syncGraph(events []opencode.SyncEvent, id string) map[string]bool {
 		}
 	}
 
-	return allowed
+	for _, aggregate := range aggregates {
+		if !allowed[aggregate] {
+			return nil, errors.New("unrelated native sync aggregate")
+		}
+	}
+
+	return synced, nil
 }
 
-// snapshotAttempts bounds how often a snapshot restarts after native history
-// advanced between its two reads. OpenCode keeps writing after a turn reports
-// idle: title generation and compaction pruning run detached from the turn.
-const (
-	snapshotAttempts   = 5
-	snapshotRetryDelay = 100 * time.Millisecond
-)
-
-// readSyncRows snapshots the native session graph once it holds still: every
-// session in the graph is idle and two consecutive reads agree. A snapshot is
-// never committed with a row missing between its reads.
-func (s *session) readSyncRows(ctx context.Context, rt *binding) ([][]byte, error) {
-	started := time.Now()
-
-	var late []opencode.SyncEvent
-
-	for attempt := 1; ; attempt++ {
-		rows, next, err := s.snapshotSyncRows(ctx, rt)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(next) == 0 {
-			return rows, nil
-		}
-
-		late = next
-		for _, event := range next {
-			s.agent.log.DebugContext(ctx, "native history advanced during snapshot",
-				slog.String("session_id", string(s.id)), slog.Int("attempt", attempt),
-				slog.String("aggregate_id", event.AggregateID), slog.Int64("sequence", event.Sequence),
-				slog.String("event_type", event.Type))
-		}
-
-		if attempt == snapshotAttempts {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(snapshotRetryDelay * time.Duration(attempt)):
-		}
-	}
-
-	last := late[len(late)-1]
-
-	return nil, fmt.Errorf("native history changed while snapshotting: %d late rows on attempt %d after %s, last %s seq %d %s",
-		len(late), snapshotAttempts, time.Since(started).Round(time.Millisecond), last.AggregateID, last.Sequence, last.Type)
-}
-
-// snapshotSyncRows reads the graph, requires it idle, then reads again past
-// the first read's cursors. Rows the second read returns arrived after the
-// first, and the snapshot is discarded; otherwise the encoded rows are returned.
-func (s *session) snapshotSyncRows(ctx context.Context, rt *binding) ([][]byte, []opencode.SyncEvent, error) {
-	events, err := opencode.ReadHistory(ctx, rt.server.executable, rt.server.root, rt.server.environment, s.nativeID, map[string]int64{})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cursors := map[string]int64{}
-	for _, event := range events {
-		if n, ok := cursors[event.AggregateID]; !ok || n < event.Sequence {
-			cursors[event.AggregateID] = event.Sequence
-		}
-	}
-
-	allowed := syncGraph(events, s.nativeID)
-	if idleErr := s.requireNativeIdle(ctx, rt, allowed); idleErr != nil {
-		return nil, nil, idleErr
-	}
-
-	late, err := opencode.ReadHistory(ctx, rt.server.executable, rt.server.root, rt.server.environment, s.nativeID, cursors)
-	if err != nil || len(late) > 0 {
-		return nil, late, err
-	}
-
-	selected := make([]opencode.SyncEvent, 0, len(events))
-	for _, event := range events {
-		if allowed[event.AggregateID] {
-			selected = append(selected, event)
-		}
-	}
-
-	sort.SliceStable(selected, func(i, j int) bool {
-		if selected[i].Sequence != selected[j].Sequence {
-			return selected[i].Sequence < selected[j].Sequence
-		}
-
-		return selected[i].ID < selected[j].ID
-	})
-
-	rows := make([][]byte, 0, len(selected))
-	for _, event := range selected {
-		row, err := json.Marshal(event)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if event.Raw != nil {
-			row = append([]byte(nil), event.Raw...)
-		}
-
-		rows = append(rows, row)
-	}
-
-	if len(rows) > 0 {
-		if _, err := decodeEvents(rows, s.nativeID); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	return rows, nil, nil
-}
-
-// hydrate replays only a missing suffix. Existing events must agree exactly.
-func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession) ([][]byte, error) {
+// hydrate imports the stored events native history lacks and returns the
+// restored history: the stored rows, then the newer native events, so the
+// stored history stays an exact prefix. Events both hold must agree.
+func (s *session) hydrate(ctx context.Context, b *binding, stored storedSession) ([][]byte, map[string]int64, error) {
 	s.mu.Lock()
 	s.artifacts = cloneArtifacts(stored.record.Artifacts)
 	s.artifactOrder = slices.Sorted(maps.Keys(s.artifacts))
 	s.mu.Unlock()
 
-	want, err := decodeEvents(stored.rows, s.nativeID)
-	if err != nil {
-		return nil, s.agent.restoreRefused(ctx, s.id, err)
+	refuse := func(err error) ([][]byte, map[string]int64, error) {
+		return nil, nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 	}
 
-	rows, err := s.readSyncRows(ctx, rt)
+	native, nativeSynced, err := s.readNative(ctx, b, nil)
 	if err != nil {
-		return nil, s.agent.restoreRefused(ctx, s.id, err)
+		return refuse(err)
 	}
 
-	have := map[string]map[int64]opencode.SyncEvent{}
+	have, err := indexRows(native)
+	if err != nil {
+		return refuse(err)
+	}
 
-	for _, row := range rows {
-		var event opencode.SyncEvent
-		if decodeErr := json.Unmarshal(row, &event); decodeErr != nil {
-			return nil, decodeErr
+	held := make(map[syncKey]bool, len(stored.rows))
+
+	var (
+		missing     []opencode.SyncEvent
+		missingRows [][]byte
+	)
+
+	for _, row := range stored.rows {
+		header, decodeErr := decodeHeader(row)
+		if decodeErr != nil {
+			return refuse(decodeErr)
 		}
 
-		if have[event.AggregateID] == nil {
-			have[event.AggregateID] = map[int64]opencode.SyncEvent{}
-		}
+		held[header.key()] = true
 
-		have[event.AggregateID][event.Sequence] = event
-	}
-
-	missing := make([]opencode.SyncEvent, 0)
-
-	for _, event := range want {
-		if existing, ok := have[event.AggregateID][event.Sequence]; ok {
-			if !sameSyncEvent(event, existing) {
-				return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native history conflicts with mirror"))
+		existing, ok := have[header.key()]
+		if !ok {
+			var event opencode.SyncEvent
+			if decodeErr := json.Unmarshal(row, &event); decodeErr != nil {
+				return refuse(decodeErr)
 			}
-		} else {
+
 			missing = append(missing, event)
+			missingRows = append(missingRows, row)
+
+			continue
+		}
+
+		if !bytes.Equal(row, existing) {
+			return refuse(errors.New("native history conflicts with mirror"))
 		}
 	}
 
 	if len(missing) > 0 {
-		if replayErr := rt.client.Replay(ctx, s.cwd, missing); replayErr != nil {
-			return nil, s.agent.restoreRefused(ctx, s.id, replayErr)
+		if replayErr := b.client.Replay(ctx, s.cwd, missing); replayErr != nil {
+			return refuse(replayErr)
+		}
+
+		late, _, lateErr := s.readNative(ctx, b, nativeSynced)
+		if lateErr != nil {
+			return refuse(lateErr)
+		}
+
+		imported, indexErr := indexRows(late)
+		if indexErr != nil {
+			return refuse(indexErr)
+		}
+
+		for index, event := range missing {
+			row, ok := imported[syncKey{aggregate: event.AggregateID, sequence: event.Sequence}]
+			if !ok {
+				return refuse(errors.New("native replay incomplete"))
+			}
+
+			if !bytes.Equal(missingRows[index], row) {
+				return refuse(errors.New("native replay changed event content"))
+			}
+		}
+
+		native = append(native, late...)
+	}
+
+	rows := slices.Clip(slices.Clone(stored.rows))
+
+	for _, row := range native {
+		header, decodeErr := decodeHeader(row)
+		if decodeErr != nil {
+			return refuse(decodeErr)
+		}
+
+		if !held[header.key()] {
+			rows = append(rows, row)
 		}
 	}
 
-	result, err := s.readSyncRows(ctx, rt)
+	synced, err := checkSync(rows, s.nativeID, nil)
 	if err != nil {
-		return nil, s.agent.restoreRefused(ctx, s.id, err)
+		return refuse(err)
 	}
 
-	verified, decodeErr := decodeEvents(result, s.nativeID)
-	if decodeErr != nil {
-		return nil, s.agent.restoreRefused(ctx, s.id, decodeErr)
-	}
-
-	committed := map[string]opencode.SyncEvent{}
-	for _, event := range verified {
-		committed[event.ID] = event
-	}
-
-	for _, event := range want {
-		if !sameSyncEvent(event, committed[event.ID]) {
-			return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native replay changed event content"))
-		}
-	}
-
-	if len(result) < len(stored.rows) {
-		return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native replay incomplete"))
-	}
-
-	return result, nil
+	return rows, synced, nil
 }
 
-func sameSyncEvent(a, b opencode.SyncEvent) bool {
-	left, _ := json.Marshal(a)
-	right, _ := json.Marshal(b)
-
-	var x, y any
-	if json.Unmarshal(left, &x) != nil || json.Unmarshal(right, &y) != nil {
-		return false
-	}
-
-	return reflect.DeepEqual(x, y)
-}
-
-func (a *Agent) restoreRefused(ctx context.Context, id acp.SessionId, err error) error {
-	a.log.ErrorContext(ctx, "opencode session restore failed", slog.String("session_id", string(id)), slog.String("reason", err.Error()))
-
-	return wire.RestoreFailed(vendor)
-}
-
-func storedTitle(id string, rows [][]byte) string {
-	title := id
+// indexRows maps each row to its sync identity.
+func indexRows(rows [][]byte) (map[syncKey][]byte, error) {
+	index := make(map[syncKey][]byte, len(rows))
 
 	for _, row := range rows {
-		var event opencode.SyncEvent
-		if json.Unmarshal(row, &event) != nil {
-			continue
+		header, err := decodeHeader(row)
+		if err != nil {
+			return nil, err
 		}
 
-		if event.AggregateID != id || !strings.HasPrefix(event.Type, "session.") {
-			continue
-		}
-
-		var info opencode.NativeSession
-		if json.Unmarshal(event.Data["info"], &info) == nil && info.Title != "" {
-			title = info.Title
-		}
+		index[header.key()] = row
 	}
 
-	return title
+	return index, nil
 }
+
+// messageEvent is the message and part view of one mirror row.
+//
+//nolint:tagliatelle // The native event table names its aggregate column aggregate_id; event data spells ID in uppercase.
+type messageEvent struct {
+	AggregateID string `json:"aggregate_id"`
+	Type        string `json:"type"`
+	Data        struct {
+		Info      opencode.NativeMessageInfo `json:"info"`
+		Part      opencode.NativePart        `json:"part"`
+		MessageID string                     `json:"messageID"`
+		PartID    string                     `json:"partID"`
+	} `json:"data"`
+}
+
+const (
+	syncMessageUpdated = "message.updated.1"
+	syncPartUpdated    = "message.part.updated.1"
+)
 
 // nativeMessages reduces the durable sync stream to the final message/part view.
 func nativeMessages(rows [][]byte, id string) []opencode.NativeMessage {
@@ -503,18 +528,14 @@ func nativeMessages(rows [][]byte, id string) []opencode.NativeMessage {
 	parts := map[string]map[string]int{}
 
 	for _, row := range rows {
-		var event opencode.SyncEvent
+		var event messageEvent
 		if json.Unmarshal(row, &event) != nil || event.AggregateID != id {
 			continue
 		}
 
 		switch event.Type {
-		case "message.updated.1":
-			var info opencode.NativeMessageInfo
-			if json.Unmarshal(event.Data["info"], &info) != nil {
-				continue
-			}
-
+		case syncMessageUpdated:
+			info := event.Data.Info
 			if messages[info.ID] == nil {
 				messages[info.ID] = &opencode.NativeMessage{}
 				order = append(order, info.ID)
@@ -522,11 +543,8 @@ func nativeMessages(rows [][]byte, id string) []opencode.NativeMessage {
 			}
 
 			messages[info.ID].Info = info
-		case "message.part.updated.1":
-			var part opencode.NativePart
-			if json.Unmarshal(event.Data["part"], &part) != nil {
-				continue
-			}
+		case syncPartUpdated:
+			part := event.Data.Part
 
 			message := messages[part.MessageID]
 			if message == nil {
@@ -540,18 +558,10 @@ func nativeMessages(rows [][]byte, id string) []opencode.NativeMessage {
 				message.Parts = append(message.Parts, part)
 			}
 		case "message.removed.1":
-			var messageID string
-
-			_ = json.Unmarshal(event.Data["messageID"], &messageID)
-			delete(messages, messageID)
+			delete(messages, event.Data.MessageID)
 		case "message.part.removed.1":
-			var messageID, partID string
-
-			_ = json.Unmarshal(event.Data["messageID"], &messageID)
-
-			_ = json.Unmarshal(event.Data["partID"], &partID)
-			if message := messages[messageID]; message != nil {
-				if index, ok := parts[messageID][partID]; ok {
+			if message := messages[event.Data.MessageID]; message != nil {
+				if index, ok := parts[event.Data.MessageID][event.Data.PartID]; ok {
 					message.Parts[index] = opencode.NativePart{}
 				}
 			}
@@ -605,14 +615,15 @@ func (s *session) replay(ctx context.Context, rows [][]byte) error {
 
 // requireNativeIdle refuses while the root session or any session in graph is
 // running. The native status route lists only sessions that are not idle.
-func (s *session) requireNativeIdle(ctx context.Context, rt *binding, graph map[string]bool) error {
+func (s *session) requireNativeIdle(ctx context.Context, b *binding, graph map[string]int64) error {
 	var statuses map[string]opencode.NativeSessionStatus
-	if err := rt.client.Do(ctx, s.cwd, http.MethodGet, "/session/status", nil, &statuses); err != nil {
+	if err := b.client.Do(ctx, s.cwd, http.MethodGet, "/session/status", nil, &statuses); err != nil {
 		return err
 	}
 
 	for id, status := range statuses {
-		if (id == s.nativeID || graph[id]) && status.Type != "" && status.Type != statusIdle {
+		_, member := graph[id]
+		if (id == s.nativeID || member) && status.Type != "" && status.Type != statusIdle {
 			return errors.New("native session is still running")
 		}
 	}

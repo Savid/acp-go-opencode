@@ -27,7 +27,7 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 	closing := s.closing
 
 	if !closing {
-		s.runtime = rt
+		s.binding = rt
 	}
 	s.mu.Unlock()
 
@@ -47,7 +47,7 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 func (s *session) startFailure(ctx context.Context, err error) error {
 	s.agent.log.ErrorContext(ctx, "opencode session start failed", slog.String("reason", err.Error()))
 
-	return wire.InternalFailure(vendor, internalClassNativeStart)
+	return wire.InternalFailure(vendor, wire.ClassNativeStart)
 }
 
 func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expectID string) error {
@@ -75,7 +75,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expe
 
 		native, err = rt.client.Session(ctx, s.cwd, expectID)
 		if err != nil {
-			return s.agent.restoreRefused(ctx, s.id, err)
+			return wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
 	}
 
@@ -113,7 +113,6 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, model, expe
 	}
 
 	s.effort = s.options.Effort
-	s.title = native.Title
 	s.updatedAt = time.UnixMilli(native.Time.Updated).UTC().Format(time.RFC3339)
 	s.mu.Unlock()
 
