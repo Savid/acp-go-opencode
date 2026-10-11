@@ -496,3 +496,28 @@ func addNativeRow(t *testing.T, s *session, b *binding) {
 
 	require.NoError(t, b.client.Do(t.Context(), s.cwd, http.MethodPatch, opencode.SessionPath(s.nativeID), map[string]any{"metadata": s.carrierMetadata(nil)}, nil))
 }
+
+// logBuffer collects an agent's text log for a test to read.
+type logBuffer struct {
+	mu   sync.Mutex
+	data strings.Builder
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.data.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.data.String()
+}
+
+// logger writes every level into the buffer.
+func (b *logBuffer) logger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(b, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}

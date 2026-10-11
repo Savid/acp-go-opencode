@@ -114,7 +114,8 @@ func TestMirrorKeepsNativeWritesAfterIdle(t *testing.T) {
 func TestMirrorRefusesWhileChildSessionRuns(t *testing.T) {
 	t.Parallel()
 	store := acpcore.NewInMemorySessionStore()
-	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	logs := &logBuffer{}
+	a := NewAgent(testOptions(t, WithSessionStore(store), WithLogger(logs.logger()))...)
 	t.Cleanup(func() { _ = a.Close() })
 	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
@@ -144,7 +145,11 @@ func TestMirrorRefusesWhileChildSessionRuns(t *testing.T) {
 		return statuses[child.ID].Type == "busy"
 	}, 5*time.Second, 10*time.Millisecond)
 
-	require.ErrorContains(t, s.commitMirror(t.Context(), rt), "native session is still running")
+	err = s.commitMirror(t.Context(), rt)
+	require.ErrorContains(t, err, "native session is still running")
+	require.ErrorContains(t, err, "native session "+s.nativeID+" graph still running after 5", "the error names the session and the wait")
+	require.Contains(t, logs.String(), "waiting for the native session graph to become idle")
+	require.Contains(t, logs.String(), "native session graph stayed running")
 
 	stop()
 	<-done
@@ -793,7 +798,8 @@ func TestCommitRereadsAfterANativeRunEnds(t *testing.T) {
 
 	dir := t.TempDir()
 	work, script := filepath.Join(dir, "work"), filepath.Join(dir, "status")
-	h := newHarness(t, WithEnv(map[string]string{
+	logs := &logBuffer{}
+	h := newHarness(t, WithLogger(logs.logger()), WithEnv(map[string]string{
 		fakeOpenCodeEnv: "1", fakeOpenCodeEnvNativeWork: work, fakeOpenCodeEnvStatusScript: script,
 		"GORACE": os.Getenv("GORACE") + " atexit_sleep_ms=0",
 	}))
@@ -805,6 +811,8 @@ func TestCommitRereadsAfterANativeRunEnds(t *testing.T) {
 	_, err := h.prompt(created.SessionId, "HELLO", nil)
 	require.NoError(t, err)
 	require.Equal(t, reads+2, nativeReads(t, work), "the read the run overlapped is taken again")
+	require.Contains(t, logs.String(), "waiting for the native session graph to become idle")
+	require.Contains(t, logs.String(), "native session graph became idle")
 }
 
 // History reads page through a conversation larger than one page, and a

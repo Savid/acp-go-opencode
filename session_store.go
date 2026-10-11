@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -248,14 +249,35 @@ const (
 // failing it; begin runs before every attempt, so the caller can drop the
 // pages of an abandoned one.
 func (s *session) readNative(ctx context.Context, b *binding, from map[string]int64, begin func(), visit func(rows [][]byte) error) (map[string]int64, error) {
-	deadline := time.Now().Add(nativeIdleWait)
+	started := time.Now()
+	waited := false
 
 	for {
 		begin()
 
 		next, err := s.readIdle(ctx, b, from, visit)
-		if !errors.Is(err, errNativeRunning) || !time.Now().Before(deadline) {
+
+		switch {
+		case !errors.Is(err, errNativeRunning):
+			if waited && err == nil {
+				s.agent.log.InfoContext(ctx, "native session graph became idle",
+					slog.String("session_id", string(s.id)), slog.String("native_session_id", s.nativeID),
+					slog.Duration("waited", time.Since(started)))
+			}
+
 			return next, err
+		case time.Since(started) >= nativeIdleWait:
+			s.agent.log.WarnContext(ctx, "native session graph stayed running",
+				slog.String("session_id", string(s.id)), slog.String("native_session_id", s.nativeID),
+				slog.Duration("waited", time.Since(started)))
+
+			return nil, fmt.Errorf("native session %s graph still running after %s: %w", s.nativeID, time.Since(started).Round(time.Millisecond), err)
+		case !waited:
+			waited = true
+
+			s.agent.log.InfoContext(ctx, "waiting for the native session graph to become idle",
+				slog.String("session_id", string(s.id)), slog.String("native_session_id", s.nativeID),
+				slog.Duration("limit", nativeIdleWait))
 		}
 
 		select {
