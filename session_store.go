@@ -172,7 +172,7 @@ func (s *session) commit(ctx context.Context, b *binding, source sessionlog.Sour
 	finish(err)
 
 	if report.Recovery() {
-		s.agent.log.WarnContext(ctx, "session mirror republished",
+		s.agent.log.WarnContext(ctx, "session mirror republished", slog.String("session_id", string(s.id)),
 			slog.String("reason", string(report.Republish)), slog.Any("append_error", report.AppendErr))
 	}
 

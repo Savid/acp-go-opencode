@@ -1054,6 +1054,7 @@ func TestCommitWarnsWhenItRepublishes(t *testing.T) {
 	_, err := h.prompt(created.SessionId, "HELLO", nil)
 	require.NoError(t, err)
 	require.Contains(t, logs.String(), "session mirror republished")
+	require.Contains(t, logs.String(), "session_id="+string(created.SessionId))
 	require.Contains(t, logs.String(), "reason="+string(sessionlog.RepublishAppendFailed))
 	require.Contains(t, logs.String(), "injected append failure")
 
