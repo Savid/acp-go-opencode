@@ -163,12 +163,18 @@ func (s *session) commit(ctx context.Context, b *binding, source sessionlog.Sour
 	)
 
 	ctx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
-	err := s.mirror.Commit(ctx, source, func(tail sessionlog.Tail) (any, error) {
+	report, err := s.mirror.Commit(ctx, source, func(tail sessionlog.Tail) (any, error) {
 		committed, captured = tail, s.captureImages(tail.Rows)
 
 		return s.recordWith(captured), nil
 	})
+	s.agent.observe.RecordRepublish(ctx, string(report.Republish))
 	finish(err)
+
+	if report.Recovery() {
+		s.agent.log.WarnContext(ctx, "session mirror republished",
+			slog.String("reason", string(report.Republish)), slog.Any("append_error", report.AppendErr))
+	}
 
 	if err != nil {
 		return err

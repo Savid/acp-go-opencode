@@ -42,7 +42,8 @@ func decodeRows(t *testing.T, rows [][]byte) []opencode.SyncEvent {
 func replaceStored(t *testing.T, store acpcore.SessionStore, id string, rows [][]byte, record sessionRecord) {
 	t.Helper()
 
-	require.NoError(t, sessionlog.NewMirror(store, id).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil }))
+	_, err := sessionlog.NewMirror(store, id).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil })
+	require.NoError(t, err)
 }
 
 // Native writes that land while a commit reads, as opencode keeps writing
@@ -994,7 +995,8 @@ func BenchmarkTurnCommit(b *testing.B) {
 	record := func(tail sessionlog.Tail) (any, error) {
 		return s.recordWith(s.captureImages(tail.Rows)), nil
 	}
-	require.NoError(b, s.mirror.Commit(b.Context(), sessionlog.Rows(full), record))
+	_, err = s.mirror.Commit(b.Context(), sessionlog.Rows(full), record)
+	require.NoError(b, err)
 
 	output := syntheticHistory(root, history, turn)
 
@@ -1013,10 +1015,52 @@ func BenchmarkTurnCommit(b *testing.B) {
 
 		// Every iteration appends the same turn, so the mirror's continuation
 		// is the only source it reads.
-		if err := s.mirror.Commit(b.Context(), func(sessionlog.Cursor) (sessionlog.Tail, error) {
+		if _, err := s.mirror.Commit(b.Context(), func(sessionlog.Cursor) (sessionlog.Tail, error) {
 			return sessionlog.Tail{Rows: rows}, nil
 		}, record); err != nil {
 			b.Fatal(err)
 		}
 	}
+}
+
+// appendFailingStore refuses one append, as a store does when it holds a
+// generation the mirror did not commit.
+type appendFailingStore struct {
+	acpcore.SessionStore
+	fail atomic.Bool
+}
+
+func (s *appendFailingStore) Append(ctx context.Context, main acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.CompareAndSwap(true, false) {
+		return errors.New("injected append failure")
+	}
+
+	return s.SessionStore.Append(ctx, main, base, entries, replacements)
+}
+
+// A commit whose append the store refuses republishes the whole history and
+// warns with the reason and the append's error.
+func TestCommitWarnsWhenItRepublishes(t *testing.T) {
+	t.Parallel()
+
+	store := &appendFailingStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	logs := &logBuffer{}
+	h := newHarness(t, WithSessionStore(store), WithLogger(logs.logger()))
+	h.initialize()
+	created := h.newSession()
+	require.NotContains(t, logs.String(), "session mirror republished", "the first commit publishes without recovery")
+
+	store.fail.Store(true)
+	_, err := h.prompt(created.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	require.Contains(t, logs.String(), "session mirror republished")
+	require.Contains(t, logs.String(), "reason="+string(sessionlog.RepublishAppendFailed))
+	require.Contains(t, logs.String(), "injected append failure")
+
+	var record sessionRecord
+	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	_, err = checkSync(rows, string(created.SessionId), nil)
+	require.NoError(t, err)
 }
